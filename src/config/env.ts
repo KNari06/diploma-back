@@ -1,0 +1,81 @@
+import dotenv from 'dotenv';
+import { z } from 'zod';
+
+// Load environment variables
+dotenv.config();
+
+// Environment schema validation
+const envSchema = z.object({
+  // Server
+  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+  PORT: z.string().transform(Number).default('3000'),
+  API_VERSION: z.string().default('v1'),
+
+  // Supabase
+  SUPABASE_URL: z.string().min(1, 'SUPABASE_URL is required'),
+  SUPABASE_ANON_KEY: z.string().min(1, 'SUPABASE_ANON_KEY is required'),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().min(1, 'SUPABASE_SERVICE_ROLE_KEY is required'),
+  SUPABASE_BUCKET_NAME: z.string().default('qai-screenshots'),
+
+  // Redis
+  REDIS_URL: z.string().default('redis://localhost:6379'),
+  REDIS_HOST: z.string().default('localhost'),
+  REDIS_PORT: z.string().transform(Number).default('6379'),
+  REDIS_PASSWORD: z.string().optional(),
+
+  // OpenAI
+  OPENAI_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required'),
+  OPENAI_MODEL: z.string().default('gpt-4o'),
+  OPENAI_MAX_TOKENS: z.string().transform(Number).default('4000'),
+
+  // Queue
+  QUEUE_CONCURRENCY: z.string().transform(Number).default('5'),
+  QUEUE_RETRY_ATTEMPTS: z.string().transform(Number).default('3'),
+  QUEUE_RETRY_DELAY: z.string().transform(Number).default('5000'),
+
+  // Agent
+  AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
+  AGENT_MAX_RETRIES: z.string().transform(Number).default('3'),
+  AGENT_BASE_URL: z.string().default('http://localhost:3001'),
+
+  // Logging
+  LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
+  LOG_FORMAT: z.enum(['combined', 'common', 'dev', 'short', 'tiny']).default('combined'),
+
+  // Rate Limiting
+  RATE_LIMIT_WINDOW_MS: z.string().transform(Number).default('900000'), // 15 minutes
+  RATE_LIMIT_MAX_REQUESTS: z.string().transform(Number).default('100'),
+
+  // Security
+  JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+  API_KEY_SECRET: z.string().min(32, 'API_KEY_SECRET must be at least 32 characters'),
+
+  // Billing (Future)
+  STRIPE_SECRET_KEY: z.string().optional(),
+  STRIPE_WEBHOOK_SECRET: z.string().optional(),
+
+  // Integrations (Future)
+  JIRA_BASE_URL: z.string().optional(),
+  JIRA_USERNAME: z.string().optional(),
+  JIRA_API_TOKEN: z.string().optional(),
+  SLACK_WEBHOOK_URL: z.string().optional(),
+});
+
+// Parse and validate environment variables
+const parseResult = envSchema.safeParse(process.env);
+
+if (!parseResult.success) {
+  console.error('❌ Invalid environment variables:');
+  console.error(parseResult.error.format());
+  process.exit(1);
+}
+
+export const env = parseResult.data;
+
+// Type-safe environment configuration
+export type EnvConfig = typeof env;
+
+// Helper functions
+export const isDevelopment = env.NODE_ENV === 'development';
+export const isProduction = env.NODE_ENV === 'production';
+export const isTest = env.NODE_ENV === 'test';

@@ -1,0 +1,182 @@
+---
+description: Code quality and common mistakes prevention
+alwaysApply: false
+---
+
+# Проверки качества кода
+
+## Проверка импортов при рефакторинге
+
+### КРИТИЧНО: При изменении exports ВСЕГДА проверяй imports
+
+Если меняешь экспорт в файле:
+
+```bash
+# 1. Найди ВСЕ файлы которые импортируют этот модуль
+grep -r "import.*from.*@/" src/
+grep -r "require.*@/" src/
+
+# 2. Проверь каждый файл что импорт правильный
+# 3. Обнови импорты ВЕЗДЕ где нужно
+```
+
+### Пример проблемы:
+
+```typescript
+// ❌ БЫЛО (types/index.ts)
+export interface User {
+  id: string;
+}
+
+// ✅ СТАЛО (types/index.ts)
+export interface User {
+  id: string;
+}
+export interface UserService {
+  getUserById(id: string): Promise<User>;
+}
+
+// ⚠️ ПРОБЛЕМА: Все файлы которые делали:
+import { User } from "@/types";
+// Теперь могут сломаться! Проверь импорты везде
+```
+
+## Проверка полей базы данных
+
+### Перед использованием поля - проверь что оно существует
+
+```typescript
+// ✅ ПРАВИЛЬНО - проверь схему БД перед использованием
+const test = await supabase
+  .from("tests")
+  .select("id, url, status, created_at") // эти поля есть в БД
+  .single();
+
+// ❌ НЕПРАВИЛЬНО - используешь несуществующее поле
+const test = await supabase
+  .from("tests")
+  .select("test_id, created_date") // этих полей нет!
+  .single();
+```
+
+### Проверить схему:
+
+```bash
+# В коде посмотри на CREATE TABLE statement
+grep -r "create table.*tests" supabase-schema.sql
+
+# Или в коде найди примеры использования
+grep -r "\.select.*tests" src/
+```
+
+## Проверка на дубликаты
+
+### Перед созданием нового файла
+
+```bash
+# Проверь есть ли уже похожий файл
+find src/ -name "*service*"
+find src/ -name "*auth*"
+find src/ -name "*test*"
+
+# Поищи по содержимому
+grep -r "function_you_want_to_add" src/
+```
+
+### Признаки дубликатов:
+
+- Два файла с похожими именами
+- Функции делают одно и то же
+- Один файл помечен как "improved", "v2", "new"
+
+## Синтаксические проверки
+
+### Перед коммитом или деплоем
+
+```bash
+# Проверь синтаксис всех .ts файлов
+npm run type-check
+
+# Проверь линтер
+npm run lint
+
+# Или автоматически все измененные
+git diff --name-only | grep '\.ts$' | xargs -I {} sh -c 'npx tsc --noEmit {} && echo "✅ {}"'
+```
+
+## Логические проверки
+
+### Проверь что данные соответствуют ожиданиям
+
+```typescript
+// ✅ Хорошо - проверка перед использованием
+if (!test || !test.id) {
+  logger.error("Test missing required field");
+  return null;
+}
+
+// ✅ Хорошо - проверка типов
+if (typeof score !== "number" || score < 0 || score > 100) {
+  logger.error("Invalid score value");
+  return null;
+}
+
+// ❌ Плохо - не проверяешь данные
+const testId = result.test.id; // может быть undefined!
+```
+
+## Проверка зависимостей
+
+### При добавлении новых зависимостей
+
+```typescript
+// ✅ Хорошо - проверяешь что модуль установлен
+try {
+  const module = require("new-module");
+} catch (err) {
+  logger.error("Module not installed:", err);
+}
+
+// ⚠️ Не забудь добавить в package.json
+// npm install new-module --save
+// npm install @types/new-module --save-dev (если нужны типы)
+```
+
+## Performance проверки
+
+### Избегай N+1 запросов
+
+```typescript
+// ❌ ПЛОХО - N+1 запросы
+for (const result of testResults) {
+  const test = await supabase
+    .from("tests")
+    .select("*")
+    .eq("id", result.test_id)
+    .single();
+}
+
+// ✅ ХОРОШО - один запрос
+const testIds = testResults.map((r) => r.test_id);
+const { data: tests } = await supabase
+  .from("tests")
+  .select("*")
+  .in("id", testIds);
+```
+
+## Безопасность
+
+### Не хардкодь токены
+
+```javascript
+// ❌ НИКОГДА
+const API_KEY = "sk-proj-abc123...";
+
+// ✅ ВСЕГДА используй .env
+const API_KEY = process.env.OPENAI_API_KEY;
+
+// ✅ Проверяй что переменная установлена
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error("OPENAI_API_KEY not set");
+}
+```

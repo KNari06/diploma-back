@@ -1,0 +1,147 @@
+---
+description: Database schema for QAI Backend tables and correct field usage
+globs: src/**/*.ts,src/**/*.js
+---
+
+# Database Schema: QAI Backend
+
+## Primary Tables
+
+### **tests** - основная таблица для тестов
+
+```sql
+id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+url TEXT NOT NULL
+status TEXT NOT NULL DEFAULT 'pending'
+browsers TEXT[] NOT NULL
+project_id UUID NOT NULL
+user_id UUID
+options JSONB
+created_at TIMESTAMP DEFAULT NOW()
+updated_at TIMESTAMP DEFAULT NOW()
+started_at TIMESTAMP
+completed_at TIMESTAMP
+```
+
+### **test_results** - результаты тестов
+
+```sql
+id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+test_id UUID NOT NULL REFERENCES tests(id)
+browser TEXT NOT NULL
+status TEXT NOT NULL
+screenshot TEXT
+dom TEXT
+logs TEXT
+network_logs JSONB
+errors JSONB
+performance JSONB
+ai_summary JSONB
+created_at TIMESTAMP DEFAULT NOW()
+completed_at TIMESTAMP
+```
+
+### **projects** - проекты пользователей
+
+```sql
+id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+name TEXT NOT NULL
+description TEXT
+user_id UUID NOT NULL
+settings JSONB
+created_at TIMESTAMP DEFAULT NOW()
+updated_at TIMESTAMP DEFAULT NOW()
+```
+
+### **users** - пользователи
+
+```sql
+id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+email TEXT UNIQUE NOT NULL
+name TEXT
+credits INTEGER DEFAULT 0
+subscription_plan TEXT
+created_at TIMESTAMP DEFAULT NOW()
+updated_at TIMESTAMP DEFAULT NOW()
+```
+
+### **credit_transactions** - транзакции кредитов
+
+```sql
+id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+user_id UUID NOT NULL REFERENCES users(id)
+amount INTEGER NOT NULL
+type TEXT NOT NULL
+description TEXT
+created_at TIMESTAMP DEFAULT NOW()
+```
+
+## Правильное использование
+
+### ✅ ПРАВИЛЬНО:
+
+```typescript
+const { data } = await supabase
+  .from("tests")
+  .select("id, url, status, created_at")
+  .eq("status", "completed");
+
+const testId = test.id;
+const createdAt = test.created_at;
+```
+
+### ❌ НЕПРАВИЛЬНО:
+
+```typescript
+const testId = test.test_id; // ❌ поля "test_id" нет
+const createdAt = test.created_date; // ❌ неправильное название
+```
+
+## Связанные таблицы
+
+### test_results
+
+```sql
+test_id UUID REFERENCES tests(id)
+```
+
+### projects
+
+```sql
+user_id UUID REFERENCES users(id)
+```
+
+### credit_transactions
+
+```sql
+user_id UUID REFERENCES users(id)
+```
+
+## Проверка перед использованием
+
+```bash
+# Найти использование неправильных полей
+grep -r "\.test\.test_id" src/
+grep -r "created_date" src/
+grep -r "published_date" src/
+```
+
+## TypeScript типы
+
+Используй правильные типы из `src/types/index.ts`:
+
+```typescript
+interface Test {
+  id: string;
+  url: string;
+  status: TestStatus;
+  browsers: BrowserType[];
+  project_id: string;
+  user_id?: string;
+  options?: TestOptions;
+  created_at: string;
+  updated_at: string;
+  started_at?: string;
+  completed_at?: string;
+}
+```
