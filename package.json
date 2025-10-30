@@ -14,8 +14,7 @@
     "lint": "eslint src/**/*.ts",
     "lint:fix": "eslint src/**/*.ts --fix",
     "type-check": "tsc --noEmit",
-    "setup": "./setup-env.sh",
-    "setup:env": "./setup-env.sh",
+    "setup": "cp env.example .env && echo '✅ Created .env file. Please edit it with your credentials.'",
     "prepare": "husky install"
   },
   "keywords": [
