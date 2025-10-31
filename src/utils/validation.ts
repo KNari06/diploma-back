@@ -9,7 +9,7 @@ export const emailSchema = z.string().email('Invalid email format');
 // Browser type validation
 export const browserTypeSchema = z.enum([
   'chrome',
-  'firefox', 
+  'firefox',
   'safari',
   'edge',
   'mobile-chrome',
@@ -95,7 +95,7 @@ export const projectSchema = z.object({
 export const userSchema = z.object({
   email: emailSchema,
   name: z.string().min(1, 'Name is required').max(255, 'Name too long').optional(),
-  role: z.enum(['admin', 'user', 'viewer']).optional(),
+  role: z.enum(['admin', 'user', 'ai']).optional(),
 });
 
 // Validation helper functions
@@ -150,7 +150,7 @@ export const sanitizeHtml = (html: string): string => {
 };
 
 export const sanitizeLogs = (logs: string[]): string[] => {
-  return logs.map(log => 
+  return logs.map(log =>
     log
       .replace(/[\x00-\x1F\x7F-\x9F]/g, '') // Remove control characters
       .substring(0, 10000) // Limit length
@@ -162,7 +162,7 @@ export const validateBrowserCompatibility = (browsers: string[], options?: any):
   const mobileBrowsers = ['mobile-chrome', 'mobile-safari'];
   const hasMobileBrowser = browsers.some(b => mobileBrowsers.includes(b));
   const hasDesktopBrowser = browsers.some(b => !mobileBrowsers.includes(b));
-  
+
   if (hasMobileBrowser && hasDesktopBrowser && options?.mobile === true) {
     throw new ValidationError('Cannot mix mobile and desktop browsers when mobile option is true');
   }
@@ -201,10 +201,10 @@ export const validateRateLimit = (userId: string, action: string): void => {
     'test.retry': 5, // 5 retries per minute
     'project.create': 3, // 3 projects per hour
   };
-  
+
   const limit = limits[action as keyof typeof limits];
   if (!limit) return;
-  
+
   // TODO: Implement actual rate limiting check
   // This would involve checking Redis for user's action count
 };
@@ -212,13 +212,13 @@ export const validateRateLimit = (userId: string, action: string): void => {
 // File validation
 export const validateScreenshot = (screenshot: string): void => {
   if (!screenshot) return;
-  
+
   // Check if it's a valid base64 string
   const base64Regex = /^data:image\/(png|jpeg|jpg|gif|webp);base64,/;
   if (!base64Regex.test(screenshot)) {
     throw new ValidationError('Screenshot must be a valid base64 encoded image');
   }
-  
+
   // Check size (max 10MB)
   const sizeInBytes = (screenshot.length * 3) / 4;
   const maxSize = 10 * 1024 * 1024; // 10MB
@@ -229,13 +229,13 @@ export const validateScreenshot = (screenshot: string): void => {
 
 export const validateDom = (dom: string): void => {
   if (!dom) return;
-  
+
   // Check size (max 1MB)
   const maxSize = 1024 * 1024; // 1MB
   if (dom.length > maxSize) {
     throw new ValidationError('DOM size exceeds 1MB limit');
   }
-  
+
   // Basic HTML structure validation
   if (!dom.includes('<html') || !dom.includes('</html>')) {
     throw new ValidationError('DOM must contain valid HTML structure');

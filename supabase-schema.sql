@@ -1,23 +1,26 @@
 -- QAI Database Schema for Supabase
 -- This file contains the complete database schema for the QAI platform
 
--- Enable necessary extensions
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- Note: gen_random_uuid() is built-in PostgreSQL function (available from PostgreSQL 13+)
+-- Supabase uses PostgreSQL 15+, so we don't need uuid-ossp extension
+
+-- Enable vector extension for embeddings (RAG)
+CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Create custom types
 CREATE TYPE test_status AS ENUM ('pending', 'running', 'completed', 'failed', 'cancelled', 'timeout');
 CREATE TYPE browser_type AS ENUM ('chrome', 'firefox', 'safari', 'edge', 'mobile-chrome', 'mobile-safari');
-CREATE TYPE user_role AS ENUM ('admin', 'user', 'viewer');
+CREATE TYPE user_role AS ENUM ('admin', 'user', 'ai');
 CREATE TYPE subscription_plan AS ENUM ('free', 'starter', 'professional', 'enterprise');
 CREATE TYPE subscription_status AS ENUM ('active', 'cancelled', 'past_due', 'unpaid');
 CREATE TYPE credit_transaction_type AS ENUM ('purchase', 'usage', 'refund', 'bonus');
 CREATE TYPE bug_severity AS ENUM ('low', 'medium', 'high', 'critical');
 CREATE TYPE bug_category AS ENUM ('visual', 'functional', 'performance', 'accessibility', 'security');
+CREATE TYPE chat_role AS ENUM ('user', 'ai');
 
 -- Users table
 CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email VARCHAR(255) UNIQUE NOT NULL,
     name VARCHAR(255),
     role user_role DEFAULT 'user',
@@ -29,7 +32,7 @@ CREATE TABLE users (
 
 -- Projects table
 CREATE TABLE projects (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(255) NOT NULL,
     description TEXT,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -40,7 +43,7 @@ CREATE TABLE projects (
 
 -- Tests table
 CREATE TABLE tests (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     url TEXT NOT NULL,
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -55,7 +58,7 @@ CREATE TABLE tests (
 
 -- Test results table
 CREATE TABLE test_results (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     test_id UUID NOT NULL REFERENCES tests(id) ON DELETE CASCADE,
     browser browser_type NOT NULL,
     status test_status DEFAULT 'pending',
@@ -72,7 +75,7 @@ CREATE TABLE test_results (
 
 -- Credit transactions table
 CREATE TABLE credit_transactions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     amount INTEGER NOT NULL,
     type credit_transaction_type NOT NULL,
@@ -83,11 +86,56 @@ CREATE TABLE credit_transactions (
 
 -- Webhook events table (for future integrations)
 CREATE TABLE webhook_events (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     type VARCHAR(100) NOT NULL,
     data JSONB NOT NULL,
     signature TEXT,
     processed BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Chat sessions table
+CREATE TABLE chat_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
+    title TEXT,
+    context JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Chat messages table
+CREATE TABLE chat_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role chat_role NOT NULL,
+    content TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- API test logs table
+CREATE TABLE api_test_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    method TEXT NOT NULL,
+    url TEXT NOT NULL,
+    status INTEGER,
+    success BOOLEAN,
+    duration_ms INTEGER,
+    request JSONB DEFAULT '{}',
+    response JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- AI embeddings table (for RAG)
+CREATE TABLE ai_embeddings (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    source TEXT,
+    content TEXT,
+    embedding VECTOR(1536),
+    metadata JSONB DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -103,6 +151,18 @@ CREATE INDEX idx_credit_transactions_user_id ON credit_transactions(user_id);
 CREATE INDEX idx_credit_transactions_created_at ON credit_transactions(created_at DESC);
 CREATE INDEX idx_webhook_events_processed ON webhook_events(processed);
 CREATE INDEX idx_webhook_events_type ON webhook_events(type);
+CREATE INDEX idx_chat_sessions_user_id ON chat_sessions(user_id);
+CREATE INDEX idx_chat_sessions_project_id ON chat_sessions(project_id);
+CREATE INDEX idx_chat_sessions_created_at ON chat_sessions(created_at DESC);
+CREATE INDEX idx_chat_messages_session_id ON chat_messages(session_id);
+CREATE INDEX idx_chat_messages_created_at ON chat_messages(created_at DESC);
+CREATE INDEX idx_api_test_logs_user_id ON api_test_logs(user_id);
+CREATE INDEX idx_api_test_logs_created_at ON api_test_logs(created_at DESC);
+CREATE INDEX idx_api_test_logs_url ON api_test_logs(url);
+CREATE INDEX idx_ai_embeddings_project_id ON ai_embeddings(project_id);
+CREATE INDEX idx_ai_embeddings_source ON ai_embeddings(source);
+-- Vector similarity search index for embeddings (using HNSW)
+CREATE INDEX idx_ai_embeddings_vector ON ai_embeddings USING hnsw (embedding vector_cosine_ops);
 
 -- Row Level Security (RLS) policies
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
@@ -110,6 +170,10 @@ ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE test_results ENABLE ROW LEVEL SECURITY;
 ALTER TABLE credit_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chat_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chat_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE api_test_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_embeddings ENABLE ROW LEVEL SECURITY;
 
 -- Users can only see and modify their own data
 CREATE POLICY "Users can view own profile" ON users
@@ -135,8 +199,8 @@ CREATE POLICY "Users can delete own projects" ON projects
 CREATE POLICY "Users can view tests from own projects" ON tests
     FOR SELECT USING (
         EXISTS (
-            SELECT 1 FROM projects 
-            WHERE projects.id = tests.project_id 
+            SELECT 1 FROM projects
+            WHERE projects.id = tests.project_id
             AND projects.user_id = auth.uid()
         )
     );
@@ -144,8 +208,8 @@ CREATE POLICY "Users can view tests from own projects" ON tests
 CREATE POLICY "Users can create tests in own projects" ON tests
     FOR INSERT WITH CHECK (
         EXISTS (
-            SELECT 1 FROM projects 
-            WHERE projects.id = tests.project_id 
+            SELECT 1 FROM projects
+            WHERE projects.id = tests.project_id
             AND projects.user_id = auth.uid()
         )
     );
@@ -153,8 +217,8 @@ CREATE POLICY "Users can create tests in own projects" ON tests
 CREATE POLICY "Users can update tests from own projects" ON tests
     FOR UPDATE USING (
         EXISTS (
-            SELECT 1 FROM projects 
-            WHERE projects.id = tests.project_id 
+            SELECT 1 FROM projects
+            WHERE projects.id = tests.project_id
             AND projects.user_id = auth.uid()
         )
     );
@@ -163,9 +227,9 @@ CREATE POLICY "Users can update tests from own projects" ON tests
 CREATE POLICY "Users can view test results from own projects" ON test_results
     FOR SELECT USING (
         EXISTS (
-            SELECT 1 FROM tests 
+            SELECT 1 FROM tests
             JOIN projects ON projects.id = tests.project_id
-            WHERE tests.id = test_results.test_id 
+            WHERE tests.id = test_results.test_id
             AND projects.user_id = auth.uid()
         )
     );
@@ -173,9 +237,9 @@ CREATE POLICY "Users can view test results from own projects" ON test_results
 CREATE POLICY "Users can create test results for own tests" ON test_results
     FOR INSERT WITH CHECK (
         EXISTS (
-            SELECT 1 FROM tests 
+            SELECT 1 FROM tests
             JOIN projects ON projects.id = tests.project_id
-            WHERE tests.id = test_results.test_id 
+            WHERE tests.id = test_results.test_id
             AND projects.user_id = auth.uid()
         )
     );
@@ -183,9 +247,9 @@ CREATE POLICY "Users can create test results for own tests" ON test_results
 CREATE POLICY "Users can update test results from own tests" ON test_results
     FOR UPDATE USING (
         EXISTS (
-            SELECT 1 FROM tests 
+            SELECT 1 FROM tests
             JOIN projects ON projects.id = tests.project_id
-            WHERE tests.id = test_results.test_id 
+            WHERE tests.id = test_results.test_id
             AND projects.user_id = auth.uid()
         )
     );
@@ -193,6 +257,103 @@ CREATE POLICY "Users can update test results from own tests" ON test_results
 -- Credit transactions policies
 CREATE POLICY "Users can view own credit transactions" ON credit_transactions
     FOR SELECT USING (auth.uid() = user_id);
+
+-- Chat sessions policies
+CREATE POLICY "Users can view own chat sessions" ON chat_sessions
+    FOR SELECT USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can create own chat sessions" ON chat_sessions
+    FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Users can update own chat sessions" ON chat_sessions
+    FOR UPDATE USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can delete own chat sessions" ON chat_sessions
+    FOR DELETE USING (auth.uid() = user_id);
+
+-- Chat messages policies
+CREATE POLICY "Users can view messages from own sessions" ON chat_messages
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM chat_sessions
+            WHERE chat_sessions.id = chat_messages.session_id
+            AND chat_sessions.user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Users can create messages in own sessions" ON chat_messages
+    FOR INSERT WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM chat_sessions
+            WHERE chat_sessions.id = chat_messages.session_id
+            AND chat_sessions.user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Users can update messages in own sessions" ON chat_messages
+    FOR UPDATE USING (
+        EXISTS (
+            SELECT 1 FROM chat_sessions
+            WHERE chat_sessions.id = chat_messages.session_id
+            AND chat_sessions.user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Users can delete messages from own sessions" ON chat_messages
+    FOR DELETE USING (
+        EXISTS (
+            SELECT 1 FROM chat_sessions
+            WHERE chat_sessions.id = chat_messages.session_id
+            AND chat_sessions.user_id = auth.uid()
+        )
+    );
+
+-- API test logs policies
+CREATE POLICY "Users can view own API test logs" ON api_test_logs
+    FOR SELECT USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can create own API test logs" ON api_test_logs
+    FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Users can delete own API test logs" ON api_test_logs
+    FOR DELETE USING (auth.uid() = user_id);
+
+-- AI embeddings policies
+CREATE POLICY "Users can view embeddings from own projects" ON ai_embeddings
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM projects
+            WHERE projects.id = ai_embeddings.project_id
+            AND projects.user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Users can create embeddings in own projects" ON ai_embeddings
+    FOR INSERT WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM projects
+            WHERE projects.id = ai_embeddings.project_id
+            AND projects.user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Users can update embeddings in own projects" ON ai_embeddings
+    FOR UPDATE USING (
+        EXISTS (
+            SELECT 1 FROM projects
+            WHERE projects.id = ai_embeddings.project_id
+            AND projects.user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Users can delete embeddings from own projects" ON ai_embeddings
+    FOR DELETE USING (
+        EXISTS (
+            SELECT 1 FROM projects
+            WHERE projects.id = ai_embeddings.project_id
+            AND projects.user_id = auth.uid()
+        )
+    );
 
 -- Functions for automatic timestamp updates
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -222,7 +383,7 @@ BEGIN
     SELECT COALESCE(SUM(amount), 0) INTO total_credits
     FROM credit_transactions
     WHERE user_id = user_uuid;
-    
+
     RETURN total_credits;
 END;
 $$ LANGUAGE plpgsql;
@@ -241,21 +402,21 @@ BEGIN
     SELECT credits INTO current_credits
     FROM users
     WHERE id = user_uuid;
-    
+
     -- Check if user has enough credits
     IF current_credits < credit_amount THEN
         RETURN FALSE;
     END IF;
-    
+
     -- Deduct credits
     UPDATE users
     SET credits = credits - credit_amount
     WHERE id = user_uuid;
-    
+
     -- Record transaction
     INSERT INTO credit_transactions (user_id, amount, type, description, test_id)
     VALUES (user_uuid, -credit_amount, 'usage', 'Test execution', test_uuid);
-    
+
     RETURN TRUE;
 END;
 $$ LANGUAGE plpgsql;
@@ -276,7 +437,7 @@ BEGIN
     ) INTO stats
     FROM tests
     WHERE project_id = project_uuid;
-    
+
     RETURN stats;
 END;
 $$ LANGUAGE plpgsql;
@@ -291,7 +452,7 @@ CREATE POLICY "Public read access for screenshots" ON storage.objects
 
 CREATE POLICY "Authenticated users can upload screenshots" ON storage.objects
     FOR INSERT WITH CHECK (
-        bucket_id = 'qai-screenshots' 
+        bucket_id = 'qai-screenshots'
         AND auth.role() = 'authenticated'
     );
 
