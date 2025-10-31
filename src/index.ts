@@ -13,6 +13,7 @@ import { QueueManager } from '@/config/queues';
 import testRoutes from '@/api/test.routes';
 import chatRoutes from '@/api/chat/chat.route';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
+import jiraRoutes from '@/api/jira/jira.route';
 
 // Create Express app
 const app = express();
@@ -140,6 +141,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 app.use(`/api/${env.API_VERSION}/tests`, testRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
+app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
@@ -154,6 +156,7 @@ app.get('/', (req: express.Request, res: express.Response) => {
         tests: `/api/${env.API_VERSION}/tests`,
         chat: `/api/${env.API_VERSION}/chat`,
         apiTest: `/api/${env.API_VERSION}/api-test`,
+        jira: `/api/${env.API_VERSION}/jira`,
         docs: '/api/docs',
         docsJson: '/api/docs.json',
       },

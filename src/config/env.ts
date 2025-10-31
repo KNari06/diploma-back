@@ -54,7 +54,10 @@ const envSchema = z.object({
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_WEBHOOK_SECRET: z.string().optional(),
 
-  // Integrations (Future)
+  // Integrations
+  JIRA_CLIENT_ID: z.string().optional(),
+  JIRA_CLIENT_SECRET: z.string().optional(),
+  JIRA_CALLBACK_URL: z.string().url().optional(),
   JIRA_BASE_URL: z.string().optional(),
   JIRA_USERNAME: z.string().optional(),
   JIRA_API_TOKEN: z.string().optional(),

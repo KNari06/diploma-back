@@ -307,6 +307,48 @@ export interface ApiTestResponse {
   matchesExpected?: boolean; // true if status matches expectedStatus
 }
 
+// Jira OAuth types
+export interface JiraTokenResponse {
+  access_token: string;
+  refresh_token?: string;
+  expires_in: number;
+  scope: string;
+  token_type: string;
+}
+
+export interface JiraAccessibleResource {
+  id: string; // cloud_id
+  name: string;
+  url: string;
+  scopes: string[];
+  avatarUrl?: string;
+}
+
+export interface JiraTokenData {
+  id: string;
+  user_id: string;
+  access_token: string;
+  refresh_token?: string;
+  expires_at?: string | Date; // ISO string from DB or Date
+  scope?: string;
+  cloud_id?: string;
+  site_url?: string;
+  token_type?: string;
+  created_at: string | Date; // ISO string from DB or Date
+  updated_at: string | Date; // ISO string from DB or Date
+}
+
+export interface JiraProject {
+  id: string;
+  key: string;
+  name: string;
+  projectTypeKey: string;
+  simplified: boolean;
+  style: string;
+  isPrivate: boolean;
+  properties?: Record<string, any>;
+}
+
 // Intent Parsing types
 export type IntentType =
   | 'check_element'

@@ -99,6 +99,10 @@ const options: swaggerJsdoc.Options = {
         name: 'API Test',
         description: 'Прямое тестирование API endpoints',
       },
+      {
+        name: 'Jira',
+        description: 'Jira OAuth 2.0 интеграция',
+      },
     ],
   },
   apis: [
