@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { runApiTest } from './apiTest.controller';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
@@ -104,7 +104,7 @@ const apiTestRequestSchema = z.object({
  * POST /api-test/run
  * Execute API test request
  */
-router.post('/run', asyncHandler(async (req, res) => {
+router.post('/run', asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
     const validatedData = apiTestRequestSchema.parse(req.body);

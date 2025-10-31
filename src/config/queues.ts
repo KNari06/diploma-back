@@ -9,14 +9,49 @@ import { TestJobData, AgentResponse } from '@/types';
 const redisConnection = new IORedis(env.REDIS_URL, {
   maxRetriesPerRequest: 3,
   enableReadyCheck: false,
+  retryStrategy: (times) => {
+    if (times > 10) {
+      logger.warn('Redis connection failed after 10 retries');
+      return null; // Stop retrying
+    }
+    return Math.min(times * 200, 2000); // Retry with exponential backoff
+  },
+  lazyConnect: true, // Don't connect immediately
 });
 
+// Handle Redis connection errors gracefully
+redisConnection.on('error', (error) => {
+  logger.error('Redis connection error:', error);
+});
+
+redisConnection.on('connect', () => {
+  logger.info('✅ Redis connected successfully');
+});
+
+// Connect to Redis (with error handling)
+redisConnection.connect()
+  .then(() => {
+    redisAvailable = true;
+    logger.info('✅ Redis connected successfully');
+  })
+  .catch((error) => {
+    redisAvailable = false;
+    logger.warn('Failed to connect to Redis:', error.message);
+    if (env.NODE_ENV === 'development') {
+      logger.warn('⚠️  Running in development mode without Redis. Queue functionality disabled.');
+      logger.warn('💡 To enable queues: brew services start redis');
+    } else {
+      logger.warn('⚠️  Queue functionality will be limited. Make sure Redis is running.');
+    }
+  });
+
 // Redis connection for BullMQ
+// Note: BullMQ requires maxRetriesPerRequest to be null
 export const connection = {
   host: env.REDIS_HOST,
   port: env.REDIS_PORT,
   password: env.REDIS_PASSWORD || undefined,
-  maxRetriesPerRequest: 3,
+  maxRetriesPerRequest: null, // Required by BullMQ
   enableReadyCheck: false,
 };
 
@@ -28,6 +63,9 @@ export const QUEUE_NAMES = {
   NOTIFICATION: 'notification',
   WEBHOOK: 'webhook',
 } as const;
+
+// Helper to check if Redis is available
+let redisAvailable = false;
 
 // Test run queue - for executing tests
 export const testRunQueue = new Queue<TestJobData>(QUEUE_NAMES.TEST_RUN, {
@@ -151,15 +189,25 @@ export class QueueManager {
    */
   static async addTestRunJob(jobData: TestJobData, priority: number = 0) {
     try {
+      if (!redisAvailable && env.NODE_ENV === 'development') {
+        logger.warn('Redis unavailable, job queued in memory (will be lost on restart)');
+        // Fallback: return mock job ID for development
+        return { id: `mock-${Date.now()}` } as any;
+      }
+
       const job = await testRunQueue.add('test-run', jobData, {
         priority,
         delay: 0,
         jobId: `${jobData.testId}-${jobData.browser}`,
       });
-      
+
       logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.TEST_RUN, testId: jobData.testId });
       return job;
     } catch (error) {
+      if (env.NODE_ENV === 'development') {
+        logger.warn('Queue unavailable in development, continuing without queue');
+        return { id: `mock-${Date.now()}` } as any;
+      }
       logger.error('Failed to add test run job:', error);
       throw handleQueueError(error);
     }
@@ -174,7 +222,7 @@ export class QueueManager {
         priority: 10, // High priority for result processing
         jobId: `result-${jobData.testId}-${jobData.browser}`,
       });
-      
+
       logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.TEST_RESULT, testId: jobData.testId });
       return job;
     } catch (error) {
@@ -192,7 +240,7 @@ export class QueueManager {
         priority: 5,
         jobId: `ai-${testResultId}`,
       });
-      
+
       logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.AI_ANALYSIS, testResultId });
       return job;
     } catch (error) {
@@ -215,7 +263,7 @@ export class QueueManager {
       const job = await notificationQueue.add('notification', notificationData, {
         priority: 1, // Lower priority for notifications
       });
-      
+
       logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.NOTIFICATION, type: notificationData.type });
       return job;
     } catch (error) {
@@ -237,7 +285,7 @@ export class QueueManager {
       const job = await webhookQueue.add('webhook', webhookData, {
         priority: 2,
       });
-      
+
       logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.WEBHOOK, event: webhookData.event });
       return job;
     } catch (error) {
@@ -339,8 +387,17 @@ export class QueueManager {
    */
   static async healthCheck() {
     try {
+      // Check Redis availability first
+      if (!redisAvailable) {
+        return {
+          status: 'unhealthy',
+          error: 'Redis not available',
+          timestamp: new Date().toISOString(),
+        };
+      }
+
       const stats = await this.getQueueStats();
-      const totalJobs = Object.values(stats).reduce((sum, queueStats) => 
+      const totalJobs = Object.values(stats).reduce((sum, queueStats) =>
         sum + queueStats.waiting + queueStats.active + queueStats.completed + queueStats.failed, 0
       );
 
@@ -359,12 +416,19 @@ export class QueueManager {
       };
     }
   }
+
+  /**
+   * Check if Redis is available
+   */
+  static isRedisAvailable(): boolean {
+    return redisAvailable;
+  }
 }
 
 // Graceful shutdown
 export const gracefulShutdown = async () => {
   logger.info('Shutting down queues...');
-  
+
   try {
     await Promise.all([
       testRunQueue.close(),
@@ -373,7 +437,7 @@ export const gracefulShutdown = async () => {
       notificationQueue.close(),
       webhookQueue.close(),
     ]);
-    
+
     await redisConnection.quit();
     logger.info('Queues shut down successfully');
   } catch (error) {

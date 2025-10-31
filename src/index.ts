@@ -176,11 +176,16 @@ const startServer = async () => {
       process.exit(1);
     }
 
-    // Test queue connection
+    // Test queue connection (non-blocking in development)
     const queueHealth = await QueueManager.healthCheck();
     if (queueHealth.status !== 'healthy') {
-      logger.error('Queue service is unhealthy. Exiting...');
-      process.exit(1);
+      if (env.NODE_ENV === 'development') {
+        logger.warn('⚠️  Queue service is unavailable. Running in limited mode.');
+        logger.warn('💡 To enable full functionality, start Redis: redis-server');
+      } else {
+        logger.error('Queue service is unhealthy. Exiting...');
+        process.exit(1);
+      }
     }
 
     // Start HTTP server

@@ -47,8 +47,8 @@ const envSchema = z.object({
   RATE_LIMIT_MAX_REQUESTS: z.string().transform(Number).default('100'),
 
   // Security
-  JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
-  API_KEY_SECRET: z.string().min(32, 'API_KEY_SECRET must be at least 32 characters'),
+  JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters').optional(),
+  API_KEY_SECRET: z.string().min(32, 'API_KEY_SECRET must be at least 32 characters').optional(),
 
   // Billing (Future)
   STRIPE_SECRET_KEY: z.string().optional(),
@@ -70,7 +70,28 @@ if (!parseResult.success) {
   process.exit(1);
 }
 
-export const env = parseResult.data;
+// Generate secrets for development if not provided
+let parsedEnv = parseResult.data;
+const crypto = require('crypto');
+
+if (process.env.NODE_ENV === 'development') {
+  if (!parsedEnv.JWT_SECRET) {
+    parsedEnv.JWT_SECRET = crypto.randomBytes(32).toString('hex');
+    console.log('⚠️  JWT_SECRET not provided, generated random secret for development');
+  }
+  if (!parsedEnv.API_KEY_SECRET) {
+    parsedEnv.API_KEY_SECRET = crypto.randomBytes(32).toString('hex');
+    console.log('⚠️  API_KEY_SECRET not provided, generated random secret for development');
+  }
+} else {
+  // In production, these are required
+  if (!parsedEnv.JWT_SECRET || !parsedEnv.API_KEY_SECRET) {
+    console.error('❌ JWT_SECRET and API_KEY_SECRET are required in production');
+    process.exit(1);
+  }
+}
+
+export const env = parsedEnv;
 
 // Type-safe environment configuration
 export type EnvConfig = typeof env;
