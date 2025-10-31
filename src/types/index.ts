@@ -197,7 +197,7 @@ export interface User {
   updatedAt: Date;
 }
 
-export type UserRole = 'admin' | 'user' | 'viewer';
+export type UserRole = 'admin' | 'user' | 'ai';
 
 export interface Subscription {
   id: string;
@@ -236,7 +236,7 @@ export interface WebhookEvent {
   signature: string;
 }
 
-export type WebhookEventType = 
+export type WebhookEventType =
   | 'test.completed'
   | 'test.failed'
   | 'test.cancelled'
@@ -284,4 +284,77 @@ export class RateLimitError extends QAIError {
     super(message, 'RATE_LIMIT_EXCEEDED', 429);
     this.name = 'RateLimitError';
   }
+}
+
+// API Test types
+export interface ApiTestRequest {
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | string;
+  url: string;
+  headers?: Record<string, string>;
+  body?: any;
+  expectedStatus?: number;
+  timeout?: number; // milliseconds, default 10000
+}
+
+export interface ApiTestResponse {
+  success: boolean;
+  status: number;
+  statusText?: string;
+  durationMs: number;
+  responseHeaders: Record<string, string>;
+  responseBody: any;
+  error?: string;
+  matchesExpected?: boolean; // true if status matches expectedStatus
+}
+
+// Intent Parsing types
+export type IntentType =
+  | 'check_element'
+  | 'fill_form'
+  | 'login_flow'
+  | 'assert_ui'
+  | 'navigate'
+  | 'api_test'
+  | 'general_chat'
+  | string; // Allow custom intents for flexibility
+
+export type ElementType =
+  | 'button'
+  | 'input'
+  | 'text'
+  | 'link'
+  | 'image'
+  | 'form'
+  | 'select'
+  | 'checkbox'
+  | 'radio'
+  | string; // Allow custom element types
+
+export type ViewportType = 'mobile' | 'desktop' | string;
+export type ActionType =
+  | 'click'
+  | 'visible'
+  | 'input'
+  | 'submit'
+  | 'check'
+  | 'navigate'
+  | string; // Allow custom actions
+
+export interface IntentResult {
+  intent: IntentType;
+  elementType?: ElementType;
+  elementLabel?: string;
+  page?: string;
+  viewport?: ViewportType;
+  action?: ActionType;
+  value?: string; // For input actions
+  confidence?: number; // 0-1, how confident the parser is
+  rawText?: string; // Original user message for reference
+  metadata?: Record<string, any>; // Additional flexible data
+  // API test specific fields
+  apiMethod?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | string;
+  apiUrl?: string;
+  apiBody?: any;
+  apiHeaders?: Record<string, string>;
+  expectedStatus?: number;
 }

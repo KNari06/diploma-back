@@ -3,12 +3,16 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
+import swaggerUi from 'swagger-ui-express';
+import { swaggerSpec } from '@/config/swagger';
 import { env, isDevelopment } from '@/config/env';
 import { logger, morganStream } from '@/utils/logger';
 import { errorHandler, notFoundHandler } from '@/utils/error-handler';
 import { testSupabaseConnection } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
 import testRoutes from '@/api/test.routes';
+import chatRoutes from '@/api/chat/chat.route';
+import apiTestRoutes from '@/api/apiTest/apiTest.route';
 
 // Create Express app
 const app = express();
@@ -56,6 +60,51 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Logging middleware
 app.use(morgan(env.LOG_FORMAT, { stream: morganStream }));
 
+// Swagger documentation
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+  customCss: '.swagger-ui .topbar { display: none }',
+  customSiteTitle: 'QAI API Documentation',
+}));
+
+// Swagger JSON endpoint
+app.get('/api/docs.json', (req: express.Request, res: express.Response) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.send(swaggerSpec);
+});
+
+/**
+ * @swagger
+ * /health:
+ *   get:
+ *     summary: Health check endpoint
+ *     description: Проверка состояния сервисов (БД, очередь)
+ *     tags: [Health]
+ *     responses:
+ *       200:
+ *         description: Все сервисы работают
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status:
+ *                   type: string
+ *                   example: healthy
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *                 services:
+ *                   type: object
+ *                   properties:
+ *                     database:
+ *                       type: string
+ *                       example: healthy
+ *                     queue:
+ *                       type: string
+ *                       example: healthy
+ *       503:
+ *         description: Один или несколько сервисов недоступны
+ */
 // Health check endpoint
 app.get('/health', async (req: express.Request, res: express.Response) => {
   try {
@@ -89,6 +138,8 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 
 // API routes
 app.use(`/api/${env.API_VERSION}/tests`, testRoutes);
+app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
+app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
@@ -98,11 +149,14 @@ app.get('/', (req: express.Request, res: express.Response) => {
     version: process.env.npm_package_version || '1.0.0',
     environment: env.NODE_ENV,
     timestamp: new Date().toISOString(),
-    endpoints: {
-      health: '/health',
-      tests: `/api/${env.API_VERSION}/tests`,
-      docs: '/api/docs', // Future: API documentation
-    },
+      endpoints: {
+        health: '/health',
+        tests: `/api/${env.API_VERSION}/tests`,
+        chat: `/api/${env.API_VERSION}/chat`,
+        apiTest: `/api/${env.API_VERSION}/api-test`,
+        docs: '/api/docs',
+        docsJson: '/api/docs.json',
+      },
   });
 });
 
@@ -122,11 +176,16 @@ const startServer = async () => {
       process.exit(1);
     }
 
-    // Test queue connection
+    // Test queue connection (non-blocking in development)
     const queueHealth = await QueueManager.healthCheck();
     if (queueHealth.status !== 'healthy') {
-      logger.error('Queue service is unhealthy. Exiting...');
-      process.exit(1);
+      if (env.NODE_ENV === 'development') {
+        logger.warn('⚠️  Queue service is unavailable. Running in limited mode.');
+        logger.warn('💡 To enable full functionality, start Redis: redis-server');
+      } else {
+        logger.error('Queue service is unhealthy. Exiting...');
+        process.exit(1);
+      }
     }
 
     // Start HTTP server
@@ -134,16 +193,16 @@ const startServer = async () => {
       logger.info(`🚀 QAI Backend API started on port ${env.PORT}`);
       logger.info(`📊 Environment: ${env.NODE_ENV}`);
       logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
-      logger.info(`📚 API docs: http://localhost:${env.PORT}/api/${env.API_VERSION}/tests`);
+      logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
     });
 
     // Graceful shutdown
     const gracefulShutdown = async (signal: string) => {
       logger.info(`Received ${signal}. Starting graceful shutdown...`);
-      
+
       server.close(async () => {
         logger.info('HTTP server closed');
-        
+
         try {
           // Close queue connections
           await import('@/config/queues').then(module => module.gracefulShutdown());
@@ -151,7 +210,7 @@ const startServer = async () => {
         } catch (error) {
           logger.error('Error during queue shutdown:', error);
         }
-        
+
         logger.info('Graceful shutdown completed');
         process.exit(0);
       });

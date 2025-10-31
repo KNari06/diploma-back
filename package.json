@@ -4,18 +4,17 @@
   "description": "QAI - Quality Assurance Intelligence Backend API",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "nodemon src/index.ts",
+    "dev": "nodemon --exec ts-node -r tsconfig-paths/register src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "worker": "nodemon src/worker/index.ts",
+    "worker": "nodemon --exec ts-node -r tsconfig-paths/register src/worker/index.ts",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "lint": "eslint src/**/*.ts",
     "lint:fix": "eslint src/**/*.ts --fix",
     "type-check": "tsc --noEmit",
-    "setup": "./setup-env.sh",
-    "setup:env": "./setup-env.sh",
+    "setup": "cp env.example .env && echo '✅ Created .env file. Please edit it with your credentials.'",
     "prepare": "husky install"
   },
   "keywords": [
@@ -30,6 +29,8 @@
   "license": "MIT",
   "dependencies": {
     "@supabase/supabase-js": "^2.38.4",
+    "@types/swagger-jsdoc": "^6.0.4",
+    "@types/swagger-ui-express": "^4.1.8",
     "axios": "^1.6.2",
     "bullmq": "^4.15.4",
     "cors": "^2.8.5",
@@ -41,6 +42,8 @@
     "joi": "^17.11.0",
     "morgan": "^1.10.0",
     "openai": "^4.20.1",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
     "uuid": "^9.0.1",
     "winston": "^3.11.0",
     "zod": "^3.22.4"
@@ -60,6 +63,7 @@
     "nodemon": "^3.0.1",
     "ts-jest": "^29.1.1",
     "ts-node": "^10.9.1",
+    "tsconfig-paths": "^4.2.0",
     "typescript": "^5.2.2"
   },
   "engines": {
