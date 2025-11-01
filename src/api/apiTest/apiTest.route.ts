@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { runApiTest } from './apiTest.controller';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
+import { requireAuth } from '@/middleware/auth.middleware';
 
 const router = Router();
 
@@ -22,6 +23,8 @@ const apiTestRequestSchema = z.object({
  *     summary: Выполнить API-тест
  *     description: Прямое выполнение HTTP-запроса (без чата). Поддерживает GET, POST, PUT, DELETE, PATCH
  *     tags: [API Test]
+ *     security:
+ *       - bearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -104,7 +107,7 @@ const apiTestRequestSchema = z.object({
  * POST /api-test/run
  * Execute API test request
  */
-router.post('/run', asyncHandler(async (req: Request, res: Response) => {
+router.post('/run', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
     const validatedData = apiTestRequestSchema.parse(req.body);

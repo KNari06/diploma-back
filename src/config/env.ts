@@ -54,6 +54,9 @@ const envSchema = z.object({
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_WEBHOOK_SECRET: z.string().optional(),
 
+  // Frontend
+  FRONTEND_URL: z.string().url().optional().default('http://localhost:3000'),
+
   // Integrations
   JIRA_CLIENT_ID: z.string().optional(),
   JIRA_CLIENT_SECRET: z.string().optional(),

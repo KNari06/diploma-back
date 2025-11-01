@@ -1,7 +1,6 @@
 import { IntentResult } from '@/types';
 
 export interface ChatRequest {
-  userId?: string;
   message: string;
   context?: string; // For future RAG integration
   sessionId?: string; // Existing chat session ID

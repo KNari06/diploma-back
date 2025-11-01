@@ -1,3 +1,22 @@
+// Auth types
+export interface AuthUser {
+  id: string;
+  email: string;
+  name?: string;
+  role: string;
+}
+
+export interface AuthTokens {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+}
+
+export interface AuthResponse {
+  user: AuthUser;
+  tokens: AuthTokens;
+}
+
 // Test related types
 export interface TestRunRequest {
   url: string;

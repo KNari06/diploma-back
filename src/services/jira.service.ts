@@ -22,10 +22,9 @@ export function generateOAuthState(): string {
 /**
  * Build OAuth authorization URL
  * @param state - Random state for security
- * @param userId - User ID for state validation
  * @returns Authorization URL
  */
-export function buildJiraAuthUrl(state: string, userId?: string): string {
+export function buildJiraAuthUrl(state: string): string {
   const clientId = env.JIRA_CLIENT_ID;
   const callbackUrl = env.JIRA_CALLBACK_URL || `http://localhost:${env.PORT}/api/jira/callback`;
 
@@ -49,12 +48,10 @@ export function buildJiraAuthUrl(state: string, userId?: string): string {
 /**
  * Exchange authorization code for access token
  * @param code - Authorization code from callback
- * @param state - State parameter for validation
  * @returns Token response
  */
 export async function exchangeCodeForToken(
-  code: string,
-  state: string
+  code: string
 ): Promise<JiraTokenResponse> {
   const clientId = env.JIRA_CLIENT_ID;
   const clientSecret = env.JIRA_CLIENT_SECRET;

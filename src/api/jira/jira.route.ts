@@ -1,6 +1,7 @@
-import { asyncHandler } from '@/utils/error-handler';
 import { Router } from 'express';
-import { getProjects, handleJiraCallback, startJiraAuth } from './jira.controller';
+import { startJiraAuth, handleJiraCallback, getProjects } from './jira.controller';
+import { asyncHandler } from '@/utils/error-handler';
+import { requireAuth } from '@/middleware/auth.middleware';
 
 const router = Router();
 
@@ -11,15 +12,8 @@ const router = Router();
  *     summary: Начать авторизацию Jira OAuth 2.0
  *     description: Редиректит пользователя на страницу авторизации Atlassian. После авторизации пользователь будет перенаправлен на callback URL.
  *     tags: [Jira]
- *     parameters:
- *       - in: query
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *           format: uuid
- *         description: ID пользователя для привязки токенов
- *         example: "00000000-0000-0000-0000-000000000002"
+ *     security:
+ *       - bearerAuth: []
  *     responses:
  *       302:
  *         description: Редирект на страницу авторизации Atlassian
@@ -44,7 +38,7 @@ const router = Router();
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/auth/start', asyncHandler(startJiraAuth));
+router.get('/auth/start', requireAuth, asyncHandler(startJiraAuth));
 
 /**
  * @swagger
@@ -130,15 +124,9 @@ router.get('/callback', asyncHandler(handleJiraCallback));
  *     summary: Получить список проектов Jira
  *     description: Возвращает список проектов из Jira используя сохранённый токен пользователя. Токен автоматически обновляется если истёк.
  *     tags: [Jira]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
- *       - in: query
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *           format: uuid
- *         description: ID пользователя
- *         example: "00000000-0000-0000-0000-000000000002"
  *       - in: query
  *         name: cloudId
  *         required: false
@@ -210,6 +198,6 @@ router.get('/callback', asyncHandler(handleJiraCallback));
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/projects', asyncHandler(getProjects));
+router.get('/projects', requireAuth, asyncHandler(getProjects));
 
 export default router;

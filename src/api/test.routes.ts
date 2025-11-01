@@ -4,6 +4,7 @@ import { TestService } from '@/services/test.service';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { logger } from '@/utils/logger';
 import { TestRunRequest } from '@/types';
+import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
 
 const router = Router();
 
@@ -12,7 +13,6 @@ const testRunSchema = z.object({
   url: z.string().url('Invalid URL format'),
   browsers: z.array(z.enum(['chrome', 'firefox', 'safari', 'edge', 'mobile-chrome', 'mobile-safari'])).min(1, 'At least one browser is required'),
   projectId: z.string().uuid('Invalid project ID format'),
-  userId: z.string().uuid('Invalid user ID format').optional(),
   options: z.object({
     mobile: z.boolean().optional(),
     viewport: z.object({
@@ -48,14 +48,14 @@ const paginationSchema = z.object({
  * POST /tests/run
  * Run a new test
  */
-router.post('/run', asyncHandler(async (req: Request, res: Response) => {
+router.post('/run', requireAuth, requireCredits(1), asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
     const validatedData = testRunSchema.parse(req.body);
-    
-    // Extract user ID from auth (in real implementation, this would come from JWT)
-    const userId = req.headers['x-user-id'] as string || validatedData.userId;
-    
+
+    // Use user ID from auth middleware
+    const userId = req.user!.id;
+
     const testRequest: TestRunRequest = {
       url: validatedData.url,
       browsers: validatedData.browsers,
@@ -63,11 +63,11 @@ router.post('/run', asyncHandler(async (req: Request, res: Response) => {
       userId,
       options: validatedData.options,
     };
-    
+
     const result = await TestService.runTest(testRequest);
-    
+
     logger.info(`Test created: ${result.data?.id} for URL: ${validatedData.url}`);
-    
+
     res.status(201).json(result);
   } catch (error) {
     handleValidationError(error);
@@ -82,11 +82,11 @@ router.post('/result', asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
     const validatedData = testResultSchema.parse(req.body);
-    
+
     const result = await TestService.processTestResult(validatedData);
-    
+
     logger.info(`Test result processed: ${validatedData.testId} (${validatedData.browser})`);
-    
+
     res.status(200).json(result);
   } catch (error) {
     handleValidationError(error);
@@ -97,12 +97,12 @@ router.post('/result', asyncHandler(async (req: Request, res: Response) => {
  * GET /tests/:id
  * Get test by ID
  */
-router.get('/:id', asyncHandler(async (req: Request, res: Response) => {
+router.get('/:id', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const userId = req.headers['x-user-id'] as string;
-  
+  const userId = req.user!.id;
+
   const result = await TestService.getTest(id, userId);
-  
+
   res.status(200).json(result);
 }));
 
@@ -110,12 +110,12 @@ router.get('/:id', asyncHandler(async (req: Request, res: Response) => {
  * GET /tests/:id/result
  * Get test results
  */
-router.get('/:id/result', asyncHandler(async (req: Request, res: Response) => {
+router.get('/:id/result', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const userId = req.headers['x-user-id'] as string;
-  
+  const userId = req.user!.id;
+
   const result = await TestService.getTestResults(id, userId);
-  
+
   res.status(200).json(result);
 }));
 
@@ -123,29 +123,20 @@ router.get('/:id/result', asyncHandler(async (req: Request, res: Response) => {
  * GET /tests/project/:projectId
  * Get tests by project with pagination
  */
-router.get('/project/:projectId', asyncHandler(async (req: Request, res: Response) => {
+router.get('/project/:projectId', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { projectId } = req.params;
-  const userId = req.headers['x-user-id'] as string;
-  
-  if (!userId) {
-    res.status(401).json({
-      success: false,
-      error: 'User ID required',
-      timestamp: new Date(),
-    });
-    return;
-  }
-  
+  const userId = req.user!.id;
+
   // Validate pagination parameters
   const pagination = paginationSchema.parse(req.query);
-  
+
   const result = await TestService.getTestsByProject(
     projectId,
     userId,
     pagination.page,
     pagination.limit
   );
-  
+
   res.status(200).json(result);
 }));
 
@@ -153,21 +144,12 @@ router.get('/project/:projectId', asyncHandler(async (req: Request, res: Respons
  * GET /tests/project/:projectId/stats
  * Get test statistics for project
  */
-router.get('/project/:projectId/stats', asyncHandler(async (req: Request, res: Response) => {
+router.get('/project/:projectId/stats', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { projectId } = req.params;
-  const userId = req.headers['x-user-id'] as string;
-  
-  if (!userId) {
-    res.status(401).json({
-      success: false,
-      error: 'User ID required',
-      timestamp: new Date(),
-    });
-    return;
-  }
-  
+  const userId = req.user!.id;
+
   const result = await TestService.getTestStats(projectId, userId);
-  
+
   res.status(200).json(result);
 }));
 
@@ -175,14 +157,14 @@ router.get('/project/:projectId/stats', asyncHandler(async (req: Request, res: R
  * POST /tests/:id/cancel
  * Cancel a running test
  */
-router.post('/:id/cancel', asyncHandler(async (req: Request, res: Response) => {
+router.post('/:id/cancel', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const userId = req.headers['x-user-id'] as string;
-  
+  const userId = req.user!.id;
+
   const result = await TestService.cancelTest(id, userId);
-  
+
   logger.info(`Test cancelled: ${id}`);
-  
+
   res.status(200).json(result);
 }));
 
@@ -190,14 +172,14 @@ router.post('/:id/cancel', asyncHandler(async (req: Request, res: Response) => {
  * POST /tests/:id/retry
  * Retry a failed test
  */
-router.post('/:id/retry', asyncHandler(async (req: Request, res: Response) => {
+router.post('/:id/retry', requireAuth, requireCredits(1), asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const userId = req.headers['x-user-id'] as string;
-  
+  const userId = req.user!.id;
+
   const result = await TestService.retryTest(id, userId);
-  
+
   logger.info(`Test retry initiated: ${id}`);
-  
+
   res.status(200).json(result);
 }));
 
@@ -205,12 +187,12 @@ router.post('/:id/retry', asyncHandler(async (req: Request, res: Response) => {
  * GET /tests/:id/status
  * Get test status (lightweight endpoint for polling)
  */
-router.get('/:id/status', asyncHandler(async (req: Request, res: Response) => {
+router.get('/:id/status', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const userId = req.headers['x-user-id'] as string;
-  
+  const userId = req.user!.id;
+
   const test = await TestService.getTest(id, userId);
-  
+
   // Return only status information
   res.status(200).json({
     success: true,
@@ -228,13 +210,13 @@ router.get('/:id/status', asyncHandler(async (req: Request, res: Response) => {
  * GET /tests/:id/summary
  * Get test summary with AI analysis
  */
-router.get('/:id/summary', asyncHandler(async (req: Request, res: Response) => {
+router.get('/:id/summary', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const userId = req.headers['x-user-id'] as string;
-  
+  const userId = req.user!.id;
+
   const test = await TestService.getTest(id, userId);
   const results = await TestService.getTestResults(id, userId);
-  
+
   // Calculate summary
   const summary = {
     test: {
@@ -259,11 +241,11 @@ router.get('/:id/summary', asyncHandler(async (req: Request, res: Response) => {
       completedBrowsers: results.data?.filter(r => r.status === 'completed').length || 0,
       failedBrowsers: results.data?.filter(r => r.status === 'failed').length || 0,
       totalBugs: results.data?.reduce((sum, r) => sum + (r.aiSummary?.bugs?.length || 0), 0) || 0,
-      criticalBugs: results.data?.reduce((sum, r) => 
+      criticalBugs: results.data?.reduce((sum, r) =>
         sum + (r.aiSummary?.bugs?.filter((b: any) => b.severity === 'critical').length || 0), 0) || 0,
     },
   };
-  
+
   res.status(200).json({
     success: true,
     data: summary,

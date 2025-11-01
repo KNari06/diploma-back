@@ -456,13 +456,8 @@ CREATE POLICY "Authenticated users can upload screenshots" ON storage.objects
         AND auth.role() = 'authenticated'
     );
 
--- Sample data for development
-INSERT INTO users (id, email, name, role, credits) VALUES
-    ('00000000-0000-0000-0000-000000000001', 'admin@qai.so', 'Admin User', 'admin', 1000),
-    ('00000000-0000-0000-0000-000000000002', 'user@qai.so', 'Test User', 'user', 100);
-
-INSERT INTO projects (id, name, description, user_id, settings) VALUES
-    ('00000000-0000-0000-0000-000000000001', 'QAI Demo Project', 'Demo project for testing QAI platform', '00000000-0000-0000-0000-000000000002', '{"defaultBrowsers": ["chrome", "firefox"], "notifications": {"email": true, "slack": false}}');
+-- Sample data removed - users should register through Auth API
+-- To create users, use POST /api/v1/auth/signup
 
 -- Grant necessary permissions
 GRANT USAGE ON SCHEMA public TO authenticated;

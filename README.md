@@ -226,11 +226,14 @@ npm run test:e2e
 
 Полная документация находится в папке [`docs/`](./docs/):
 
-- **🚀 Быстрый старт**: [docs/setup/](./docs/setup/) - установка и настройка
+- **🚀 Быстрый старт**: [docs/quickstart/](./docs/quickstart/) - быстрое начало работы
+- **⚙️ Установка**: [docs/setup/](./docs/setup/) - настройка проекта, auth, Supabase
+- **🏗️ Архитектура**: [docs/architecture/](./docs/architecture/) - дизайн системы, статус проекта
 - **🔌 API**: [docs/api/](./docs/api/) - документация API и примеры
-- **💻 Разработка**: [docs/development/](./docs/development/) - руководство разработчика
-- **🏗️ Архитектура**: [docs/architecture/](./docs/architecture/) - архитектура системы
+- **💻 Разработка**: [docs/development/](./docs/development/) - руководство разработчика, auth детали
 - **🤝 Участие**: [docs/contributing/](./docs/contributing/) - как участвовать в проекте
+
+**Swagger UI:** `http://localhost:3000/api/docs` - интерактивная документация API
 
 ## 👨‍💻 Автор проекта
 

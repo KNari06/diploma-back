@@ -2,12 +2,12 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { handleChat } from './chat.controller';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
+import { requireAuth } from '@/middleware/auth.middleware';
 
 const router = Router();
 
 // Validation schema for chat request
 const chatRequestSchema = z.object({
-  userId: z.string().uuid('Invalid user ID format').optional(),
   message: z.string().min(1, 'Message cannot be empty').max(5000, 'Message too long'),
   context: z.string().optional(),
 });
@@ -19,6 +19,8 @@ const chatRequestSchema = z.object({
  *     summary: Отправить сообщение в AI чат
  *     description: Чат с AI + автоматическое распознавание намерений и выполнение API-тестов
  *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -28,11 +30,6 @@ const chatRequestSchema = z.object({
  *             required:
  *               - message
  *             properties:
- *               userId:
- *                 type: string
- *                 format: uuid
- *                 description: ID пользователя (опционально, для сохранения истории)
- *                 example: "00000000-0000-0000-0000-000000000002"
  *               message:
  *                 type: string
  *                 minLength: 1
@@ -45,7 +42,7 @@ const chatRequestSchema = z.object({
  *               sessionId:
  *                 type: string
  *                 format: uuid
- *                 description: ID существующей сессии чата (опционально)
+ *                 description: ID существующей сессии чата (опционально, для продолжения диалога)
  *     responses:
  *       200:
  *         description: Успешный ответ
@@ -87,18 +84,12 @@ const chatRequestSchema = z.object({
  * POST /api/v1/chat
  * Send message to AI chat
  */
-router.post('/', asyncHandler(async (req: Request, res: Response) => {
+router.post('/', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
     const validatedData = chatRequestSchema.parse(req.body);
 
-    // Build request with validated data
-    const chatRequest = {
-      userId: validatedData.userId,
-      message: validatedData.message,
-      context: validatedData.context,
-    };
-
+    // User ID comes from auth middleware (req.user)
     await handleChat(req, res);
   } catch (error) {
     handleValidationError(error);

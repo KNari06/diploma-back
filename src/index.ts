@@ -14,6 +14,7 @@ import testRoutes from '@/api/test.routes';
 import chatRoutes from '@/api/chat/chat.route';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import jiraRoutes from '@/api/jira/jira.route';
+import authRoutes from '@/api/auth/auth.route';
 
 // Create Express app
 const app = express();
@@ -138,6 +139,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 });
 
 // API routes
+app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
 app.use(`/api/${env.API_VERSION}/tests`, testRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
@@ -153,6 +155,7 @@ app.get('/', (req: express.Request, res: express.Response) => {
     timestamp: new Date().toISOString(),
       endpoints: {
         health: '/health',
+        auth: `/api/${env.API_VERSION}/auth`,
         tests: `/api/${env.API_VERSION}/tests`,
         chat: `/api/${env.API_VERSION}/chat`,
         apiTest: `/api/${env.API_VERSION}/api-test`,

@@ -12,7 +12,8 @@ import { ChatRequest } from './chat.types';
  */
 export const handleChat = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { userId, message, context, sessionId } = req.body as ChatRequest & { sessionId?: string };
+    const { message, context, sessionId } = req.body as ChatRequest & { sessionId?: string };
+    const userId = req.user?.id; // From auth middleware
 
     logger.info('Chat request received', { userId, messageLength: message.length, sessionId });
 

@@ -1,0 +1,445 @@
+import { Router, Request, Response } from 'express';
+import { z } from 'zod';
+import {
+  signup,
+  login,
+  sendMagicLink,
+  getOAuthUrlHandler,
+  logout,
+  refresh,
+  me,
+  passwordResetRequest,
+  passwordUpdate,
+} from './auth.controller';
+import { asyncHandler, handleValidationError } from '@/utils/error-handler';
+
+const router = Router();
+
+// Validation schemas
+const signupSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  password: z.string().min(6, 'Password must be at least 6 characters'),
+  name: z.string().optional(),
+});
+
+const loginSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  password: z.string().min(1, 'Password is required'),
+});
+
+const magicLinkSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  redirectTo: z.string().url().optional(),
+});
+
+const refreshSchema = z.object({
+  refresh_token: z.string().min(1, 'Refresh token is required'),
+});
+
+const passwordResetSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  redirectTo: z.string().url().optional(),
+});
+
+const passwordUpdateSchema = z.object({
+  newPassword: z.string().min(6, 'Password must be at least 6 characters'),
+});
+
+/**
+ * @swagger
+ * /api/v1/auth/signup:
+ *   post:
+ *     summary: Регистрация нового пользователя
+ *     description: Создает нового пользователя через Supabase Auth с Email и Password
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - password
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 example: "user@example.com"
+ *               password:
+ *                 type: string
+ *                 minLength: 6
+ *                 example: "password123"
+ *               name:
+ *                 type: string
+ *                 example: "John Doe"
+ *     responses:
+ *       201:
+ *         description: Пользователь зарегистрирован успешно
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     user:
+ *                       $ref: '#/components/schemas/AuthUser'
+ *                     tokens:
+ *                       $ref: '#/components/schemas/AuthTokens'
+ *       400:
+ *         description: Ошибка валидации
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+router.post('/signup', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = signupSchema.parse(req.body);
+    req.body = validatedData;
+    await signup(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
+
+/**
+ * @swagger
+ * /api/v1/auth/login:
+ *   post:
+ *     summary: Вход с Email и Password
+ *     description: Авторизация пользователя через Supabase Auth
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - password
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 example: "user@example.com"
+ *               password:
+ *                 type: string
+ *                 example: "password123"
+ *     responses:
+ *       200:
+ *         description: Вход выполнен успешно
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     user:
+ *                       $ref: '#/components/schemas/AuthUser'
+ *                     tokens:
+ *                       $ref: '#/components/schemas/AuthTokens'
+ *       401:
+ *         description: Неверные credentials
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+router.post('/login', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = loginSchema.parse(req.body);
+    req.body = validatedData;
+    await login(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
+
+/**
+ * @swagger
+ * /api/v1/auth/magic-link:
+ *   post:
+ *     summary: Отправить Magic Link
+ *     description: Отправляет ссылку для входа без пароля на email
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 example: "user@example.com"
+ *               redirectTo:
+ *                 type: string
+ *                 format: uri
+ *                 example: "http://localhost:3000/auth/verify"
+ *     responses:
+ *       200:
+ *         description: Magic link отправлен
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Magic link sent to your email"
+ *       400:
+ *         description: Ошибка валидации
+ */
+router.post('/magic-link', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = magicLinkSchema.parse(req.body);
+    req.body = validatedData;
+    await sendMagicLink(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
+
+/**
+ * @swagger
+ * /api/v1/auth/oauth/{provider}:
+ *   get:
+ *     summary: OAuth авторизация
+ *     description: Редирект на OAuth провайдера (Google, GitHub, GitLab, Bitbucket)
+ *     tags: [Auth]
+ *     parameters:
+ *       - in: path
+ *         name: provider
+ *         required: true
+ *         schema:
+ *           type: string
+ *           enum: [google, github, gitlab, bitbucket]
+ *         description: OAuth провайдер
+ *       - in: query
+ *         name: redirectTo
+ *         schema:
+ *           type: string
+ *           format: uri
+ *         description: URL для редиректа после OAuth
+ *     responses:
+ *       302:
+ *         description: Редирект на OAuth провайдера
+ *       400:
+ *         description: Неверный провайдер
+ */
+router.get('/oauth/:provider', asyncHandler(getOAuthUrlHandler));
+
+/**
+ * @swagger
+ * /api/v1/auth/logout:
+ *   post:
+ *     summary: Выход из системы
+ *     description: Инвалидирует текущую сессию пользователя
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Выход выполнен успешно
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Logged out successfully"
+ *       400:
+ *         description: Ошибка выхода
+ */
+router.post('/logout', asyncHandler(logout));
+
+/**
+ * @swagger
+ * /api/v1/auth/refresh:
+ *   post:
+ *     summary: Обновить access token
+ *     description: Получить новый access token используя refresh token
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - refresh_token
+ *             properties:
+ *               refresh_token:
+ *                 type: string
+ *                 example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+ *     responses:
+ *       200:
+ *         description: Токен обновлен успешно
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   $ref: '#/components/schemas/AuthTokens'
+ *       401:
+ *         description: Неверный refresh token
+ */
+router.post('/refresh', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = refreshSchema.parse(req.body);
+    req.body = validatedData;
+    await refresh(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
+
+/**
+ * @swagger
+ * /api/v1/auth/me:
+ *   get:
+ *     summary: Получить текущего пользователя
+ *     description: Возвращает данные текущего авторизованного пользователя
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Данные пользователя
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     id:
+ *                       type: string
+ *                       format: uuid
+ *                     email:
+ *                       type: string
+ *                     name:
+ *                       type: string
+ *                     role:
+ *                       type: string
+ *                     credits:
+ *                       type: integer
+ *                     subscription:
+ *                       type: object
+ *       401:
+ *         description: Не авторизован
+ */
+router.get('/me', asyncHandler(me));
+
+/**
+ * @swagger
+ * /api/v1/auth/password/reset-request:
+ *   post:
+ *     summary: Запрос на сброс пароля
+ *     description: Отправляет ссылку для сброса пароля на email
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 example: "user@example.com"
+ *               redirectTo:
+ *                 type: string
+ *                 format: uri
+ *     responses:
+ *       200:
+ *         description: Ссылка отправлена
+ *       400:
+ *         description: Ошибка отправки
+ */
+router.post('/password/reset-request', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = passwordResetSchema.parse(req.body);
+    req.body = validatedData;
+    await passwordResetRequest(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
+
+/**
+ * @swagger
+ * /api/v1/auth/password/update:
+ *   post:
+ *     summary: Обновить пароль
+ *     description: Обновляет пароль авторизованного пользователя
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - newPassword
+ *             properties:
+ *               newPassword:
+ *                 type: string
+ *                 minLength: 6
+ *                 example: "newpassword123"
+ *     responses:
+ *       200:
+ *         description: Пароль обновлен
+ *       401:
+ *         description: Не авторизован
+ */
+router.post('/password/update', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = passwordUpdateSchema.parse(req.body);
+    req.body = validatedData;
+    await passwordUpdate(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
+
+export default router;

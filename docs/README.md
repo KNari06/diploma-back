@@ -8,12 +8,14 @@
 
 - [**Установка и настройка**](./setup/README.md) - как запустить проект локально
 - [**Первые шаги**](./quickstart/README.md) - быстрый старт для разработчиков
+- [**Auth Quick Start**](./quickstart/auth-quick-start.md) - аутентификация за 7 шагов
 
 ### 🏗️ Архитектура
 
 - [**Обзор системы**](./architecture/README.md) - общая архитектура проекта
 - [**Схема базы данных**](./architecture/database.md) - структура БД и связи
-- [**API дизайн**](./architecture/api-design.md) - принципы проектирования API
+- [**Статус проекта**](./architecture/project-status.md) - текущий прогресс и roadmap
+- [**OAuth Flow**](./architecture/oauth-flow.md) - детальное объяснение OAuth процесса
 
 ### 🔌 API
 
@@ -25,8 +27,14 @@
 
 - [**Руководство разработчика**](./development/README.md) - как разрабатывать
 - [**Стандарты кодирования**](./development/coding-standards.md) - правила написания кода
-- [**Тестирование**](./development/testing.md) - как писать и запускать тесты
-- [**Отладка**](./development/debugging.md) - инструменты и методы отладки
+- [**Auth Implementation**](./development/auth-implementation.md) - технические детали аутентификации
+- [**Auth Validation**](./development/auth-validation.md) - отчет проверки auth файлов
+
+## ⚙️ Setup & Configuration
+
+- [**Setup Instructions**](./setup/README.md) - базовая установка проекта
+- [**Auth Setup**](./setup/auth-setup.md) - полная настройка аутентификации
+- [**Supabase Setup**](./setup/supabase-setup.md) - миграции и конфигурация БД
 
 ### 🚀 Деплой
 
@@ -34,17 +42,16 @@
 - [**Конфигурация сервера**](./deployment/server-config.md) - настройка окружения
 - [**Мониторинг**](./deployment/monitoring.md) - отслеживание состояния
 
-### 🤝 Участие в проекте
+## 🤝 Участие в проекте
 
 - [**Руководство контрибьютора**](./contributing/README.md) - как участвовать в разработке
 - [**Правила коммитов**](./contributing/commit-conventions.md) - стандарты коммитов
-- [**Code Review**](./contributing/code-review.md) - процесс ревью кода
 
-### 📋 Правила и стандарты
+## 📋 Правила и стандарты
 
 - [**Обзор правил**](./rules/README.md) - все правила проекта
 - [**Проверки качества**](./rules/code-quality.md) - автоматические проверки
-- [**Безопасность**](./rules/security.md) - правила безопасности
+- [**Overview**](./rules/overview.md) - общий обзор
 
 ## 🔍 Быстрый поиск
 

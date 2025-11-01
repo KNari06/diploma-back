@@ -30,18 +30,10 @@ setInterval(() => {
  */
 export const startJiraAuth = async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = req.query.userId as string || req.headers['x-user-id'] as string;
-
-    if (!userId) {
-      res.status(400).json({
-        success: false,
-        error: 'User ID is required (userId query param or X-User-ID header)',
-      });
-      return;
-    }
+    const userId = req.user!.id; // From auth middleware
 
     const state = generateOAuthState();
-    const authUrl = buildJiraAuthUrl(state, userId);
+    const authUrl = buildJiraAuthUrl(state);
 
     // Store state with expiration (10 minutes)
     oauthStates.set(state, {
@@ -109,7 +101,7 @@ export const handleJiraCallback = async (req: Request, res: Response): Promise<v
     oauthStates.delete(state as string);
 
     // Exchange code for token
-    const tokenData = await exchangeCodeForToken(code as string, state as string);
+    const tokenData = await exchangeCodeForToken(code as string);
 
     // Get accessible resources (cloud IDs)
     const resources = await getAccessibleResources(tokenData.access_token);
@@ -160,16 +152,8 @@ export const handleJiraCallback = async (req: Request, res: Response): Promise<v
  */
 export const getProjects = async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = req.query.userId as string || req.headers['x-user-id'] as string;
+    const userId = req.user!.id; // From auth middleware
     const cloudId = req.query.cloudId as string;
-
-    if (!userId) {
-      res.status(400).json({
-        success: false,
-        error: 'User ID is required (userId query param or X-User-ID header)',
-      });
-      return;
-    }
 
     // Get token from database
     const tokenData = await getJiraToken(userId, cloudId);
