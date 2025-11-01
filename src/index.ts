@@ -10,7 +10,7 @@ import { logger, morganStream } from '@/utils/logger';
 import { errorHandler, notFoundHandler } from '@/utils/error-handler';
 import { testSupabaseConnection } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
-import testRoutes from '@/api/test.routes';
+import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import chatRoutes from '@/api/chat/chat.route';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import jiraRoutes from '@/api/jira/jira.route';
@@ -140,7 +140,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 
 // API routes
 app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
-app.use(`/api/${env.API_VERSION}/tests`, testRoutes);
+app.use(`/api/${env.API_VERSION}/manual-test`, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
 app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
@@ -156,7 +156,7 @@ app.get('/', (req: express.Request, res: express.Response) => {
       endpoints: {
         health: '/health',
         auth: `/api/${env.API_VERSION}/auth`,
-        tests: `/api/${env.API_VERSION}/tests`,
+        manualTest: `/api/${env.API_VERSION}/manual-test`,
         chat: `/api/${env.API_VERSION}/chat`,
         apiTest: `/api/${env.API_VERSION}/api-test`,
         jira: `/api/${env.API_VERSION}/jira`,

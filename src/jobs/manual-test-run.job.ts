@@ -7,13 +7,13 @@ import { QueueManager } from '@/config/queues';
 import { env } from '@/config/env';
 import axios from 'axios';
 
-export class TestRunJobHandler {
+export class ManualTestRunJobHandler {
   /**
    * Process test run job
    */
   static async process(job: Job<TestJobData>) {
     const { testId, url, browser, options, projectId, userId, retryCount = 0 } = job.data;
-    
+
     logger.info(`Processing test run job: ${testId} (${browser})`);
     logQueueEvent('processing', job.id!, { testId, browser });
 
@@ -44,7 +44,7 @@ export class TestRunJobHandler {
       if (agentResponse.success) {
         // Add result processing job
         await QueueManager.addTestResultJob(agentResponse);
-        
+
         logger.info(`Test sent to agent successfully: ${testId} (${browser})`);
         logAgentCommunication('test_sent', agentUrl, { testId, browser });
       } else {
@@ -53,12 +53,12 @@ export class TestRunJobHandler {
 
     } catch (error) {
       logger.error(`Test run job failed: ${testId} (${browser})`, error);
-      
+
       // Check if we should retry
       if (shouldRetry(error, retryCount, env.AGENT_MAX_RETRIES)) {
         const delay = calculateRetryDelay(retryCount);
         logger.info(`Retrying test run job in ${delay}ms: ${testId} (${browser})`);
-        
+
         // Update retry count and delay
         await job.updateData({ ...job.data, retryCount: retryCount + 1 });
         throw new Error(`Retry ${retryCount + 1}/${env.AGENT_MAX_RETRIES}: ${(error as Error).message}`);
@@ -72,7 +72,7 @@ export class TestRunJobHandler {
 
       // Send failure notification
       await this.sendFailureNotification(testId, error);
-      
+
       throw handleAgentError(error as Error);
     }
   }
@@ -96,7 +96,7 @@ export class TestRunJobHandler {
           const response = await axios.get(`${agentUrl}/health`, {
             timeout: 5000,
           });
-          
+
           if (response.status === 200 && response.data.status === 'healthy') {
             return agentUrl;
           }
@@ -164,13 +164,13 @@ export class TestRunJobHandler {
 /**
  * Test result processing job handler
  */
-export class TestResultJobHandler {
+export class ManualTestResultJobHandler {
   /**
    * Process test result job
    */
   static async process(job: Job<AgentResponse>) {
     const { testId, browser, result, error } = job.data;
-    
+
     logger.info(`Processing test result: ${testId} (${browser})`);
     logQueueEvent('processing', job.id!, { testId, browser });
 
@@ -207,23 +207,23 @@ export class TestResultJobHandler {
 
     } catch (error) {
       logger.error(`Test result processing failed: ${testId} (${browser})`, error);
-      
+
       // Mark test result as failed
       await dbAdminService.createTestResult({
         test_id: testId,
         browser,
         status: 'failed',
-        errors: [{ 
-          type: 'other', 
-          message: (error as Error).message, 
-          timestamp: new Date() 
+        errors: [{
+          type: 'other',
+          message: (error as Error).message,
+          timestamp: new Date()
         }],
         completed_at: new Date().toISOString(),
       });
 
       // Update test status
       await this.updateTestStatus(testId);
-      
+
       throw error;
     }
   }
@@ -235,7 +235,7 @@ export class TestResultJobHandler {
     try {
       // Get all results for this test
       const results = await dbAdminService.getTestResults(testId) as any[];
-      
+
       if (results.length === 0) {
         return;
       }
@@ -246,7 +246,7 @@ export class TestResultJobHandler {
       const allCompleted = results.every((r: any) => r.status === 'completed' || r.status === 'failed');
 
       let status: 'running' | 'completed' | 'failed' = 'running';
-      
+
       if (allCompleted) {
         status = hasFailed ? 'failed' : 'completed';
       }
@@ -271,8 +271,8 @@ export class TestResultJobHandler {
    * Send completion notification
    */
   private static async sendCompletionNotification(
-    testId: string, 
-    status: string, 
+    testId: string,
+    status: string,
     results: any[]
   ) {
     try {

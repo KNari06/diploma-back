@@ -2,7 +2,7 @@ import { Worker } from 'bullmq';
 import { env } from '@/config/env';
 import { logger } from '@/utils/logger';
 import { connection } from '@/config/queues';
-import { TestRunJobHandler, TestResultJobHandler } from '@/jobs/test-run.job';
+import { ManualTestRunJobHandler, ManualTestResultJobHandler } from '@/jobs/manual-test-run.job';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
 import { QUEUE_NAMES } from '@/config/queues';
 
@@ -18,8 +18,8 @@ const workerOptions = {
 const testRunWorker = new Worker(
   QUEUE_NAMES.TEST_RUN,
   async (job) => {
-    logger.info(`Processing test run job: ${job.id}`);
-    return await TestRunJobHandler.process(job);
+    logger.info(`Processing manual test run job: ${job.id}`);
+    return await ManualTestRunJobHandler.process(job);
   },
   workerOptions
 );
@@ -27,8 +27,8 @@ const testRunWorker = new Worker(
 const testResultWorker = new Worker(
   QUEUE_NAMES.TEST_RESULT,
   async (job) => {
-    logger.info(`Processing test result job: ${job.id}`);
-    return await TestResultJobHandler.process(job);
+    logger.info(`Processing manual test result job: ${job.id}`);
+    return await ManualTestResultJobHandler.process(job);
   },
   workerOptions
 );
@@ -97,7 +97,7 @@ setupWorkerEvents(webhookWorker, 'Webhook');
 // Graceful shutdown
 const gracefulShutdown = async (signal: string) => {
   logger.info(`Received ${signal}. Starting graceful worker shutdown...`);
-  
+
   try {
     await Promise.all([
       testRunWorker.close(),
@@ -106,7 +106,7 @@ const gracefulShutdown = async (signal: string) => {
       notificationWorker.close(),
       webhookWorker.close(),
     ]);
-    
+
     logger.info('All workers closed successfully');
     process.exit(0);
   } catch (error) {

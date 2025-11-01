@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
-import { TestService } from '@/services/test.service';
+import { ManualTestService } from '@/services/manualTest.service';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { logger } from '@/utils/logger';
 import { TestRunRequest } from '@/types';
@@ -45,8 +45,18 @@ const paginationSchema = z.object({
 });
 
 /**
- * POST /tests/run
- * Run a new test
+ * @swagger
+ * /api/v1/manual-test/run:
+ *   post:
+ *     summary: Запустить ручной тест
+ *     description: Создает и запускает Playwright тест для веб-приложения
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ */
+/**
+ * POST /manual-test/run
+ * Run a new manual test
  */
 router.post('/run', requireAuth, requireCredits(1), asyncHandler(async (req: Request, res: Response) => {
   try {
@@ -64,7 +74,7 @@ router.post('/run', requireAuth, requireCredits(1), asyncHandler(async (req: Req
       options: validatedData.options,
     };
 
-    const result = await TestService.runTest(testRequest);
+    const result = await ManualTestService.runTest(testRequest);
 
     logger.info(`Test created: ${result.data?.id} for URL: ${validatedData.url}`);
 
@@ -75,15 +85,15 @@ router.post('/run', requireAuth, requireCredits(1), asyncHandler(async (req: Req
 }));
 
 /**
- * POST /tests/result
- * Receive test result from agent
+ * POST /manual-test/result
+ * Receive test result from Playwright agent
  */
 router.post('/result', asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
     const validatedData = testResultSchema.parse(req.body);
 
-    const result = await TestService.processTestResult(validatedData);
+    const result = await ManualTestService.processTestResult(validatedData);
 
     logger.info(`Test result processed: ${validatedData.testId} (${validatedData.browser})`);
 
@@ -94,34 +104,34 @@ router.post('/result', asyncHandler(async (req: Request, res: Response) => {
 }));
 
 /**
- * GET /tests/:id
- * Get test by ID
+ * GET /manual-test/:id
+ * Get manual test by ID
  */
 router.get('/:id', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = req.user!.id;
 
-  const result = await TestService.getTest(id, userId);
+  const result = await ManualTestService.getTest(id, userId);
 
   res.status(200).json(result);
 }));
 
 /**
- * GET /tests/:id/result
- * Get test results
+ * GET /manual-test/:id/result
+ * Get manual test results
  */
 router.get('/:id/result', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = req.user!.id;
 
-  const result = await TestService.getTestResults(id, userId);
+  const result = await ManualTestService.getTestResults(id, userId);
 
   res.status(200).json(result);
 }));
 
 /**
- * GET /tests/project/:projectId
- * Get tests by project with pagination
+ * GET /manual-test/project/:projectId
+ * Get manual tests by project with pagination
  */
 router.get('/project/:projectId', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { projectId } = req.params;
@@ -130,7 +140,7 @@ router.get('/project/:projectId', requireAuth, asyncHandler(async (req: Request,
   // Validate pagination parameters
   const pagination = paginationSchema.parse(req.query);
 
-  const result = await TestService.getTestsByProject(
+  const result = await ManualTestService.getTestsByProject(
     projectId,
     userId,
     pagination.page,
@@ -141,27 +151,27 @@ router.get('/project/:projectId', requireAuth, asyncHandler(async (req: Request,
 }));
 
 /**
- * GET /tests/project/:projectId/stats
- * Get test statistics for project
+ * GET /manual-test/project/:projectId/stats
+ * Get manual test statistics for project
  */
 router.get('/project/:projectId/stats', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { projectId } = req.params;
   const userId = req.user!.id;
 
-  const result = await TestService.getTestStats(projectId, userId);
+  const result = await ManualTestService.getTestStats(projectId, userId);
 
   res.status(200).json(result);
 }));
 
 /**
- * POST /tests/:id/cancel
- * Cancel a running test
+ * POST /manual-test/:id/cancel
+ * Cancel a running manual test
  */
 router.post('/:id/cancel', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = req.user!.id;
 
-  const result = await TestService.cancelTest(id, userId);
+  const result = await ManualTestService.cancelTest(id, userId);
 
   logger.info(`Test cancelled: ${id}`);
 
@@ -169,14 +179,14 @@ router.post('/:id/cancel', requireAuth, asyncHandler(async (req: Request, res: R
 }));
 
 /**
- * POST /tests/:id/retry
- * Retry a failed test
+ * POST /manual-test/:id/retry
+ * Retry a failed manual test
  */
 router.post('/:id/retry', requireAuth, requireCredits(1), asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = req.user!.id;
 
-  const result = await TestService.retryTest(id, userId);
+  const result = await ManualTestService.retryTest(id, userId);
 
   logger.info(`Test retry initiated: ${id}`);
 
@@ -184,14 +194,14 @@ router.post('/:id/retry', requireAuth, requireCredits(1), asyncHandler(async (re
 }));
 
 /**
- * GET /tests/:id/status
- * Get test status (lightweight endpoint for polling)
+ * GET /manual-test/:id/status
+ * Get manual test status (lightweight endpoint for polling)
  */
 router.get('/:id/status', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = req.user!.id;
 
-  const test = await TestService.getTest(id, userId);
+  const test = await ManualTestService.getTest(id, userId);
 
   // Return only status information
   res.status(200).json({
@@ -207,15 +217,15 @@ router.get('/:id/status', requireAuth, asyncHandler(async (req: Request, res: Re
 }));
 
 /**
- * GET /tests/:id/summary
+ * GET /manual-test/:id/summary
  * Get test summary with AI analysis
  */
 router.get('/:id/summary', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = req.user!.id;
 
-  const test = await TestService.getTest(id, userId);
-  const results = await TestService.getTestResults(id, userId);
+  const test = await ManualTestService.getTest(id, userId);
+  const results = await ManualTestService.getTestResults(id, userId);
 
   // Calculate summary
   const summary = {

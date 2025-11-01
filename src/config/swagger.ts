@@ -136,8 +136,8 @@ const options: swaggerJsdoc.Options = {
         description: 'Health check endpoints',
       },
       {
-        name: 'Tests',
-        description: 'UI тестирование веб-приложений (требует auth)',
+        name: 'Manual Tests',
+        description: 'Ручное тестирование веб-приложений через Playwright (требует auth)',
       },
       {
         name: 'Chat',
