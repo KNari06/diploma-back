@@ -1,21 +1,23 @@
-import express from 'express';
+import apiTestRoutes from '@/api/apiTest/apiTest.route';
+import authRoutes from '@/api/auth/auth.route';
+import chatRoutes from '@/api/chat/chat.route';
+import jiraRoutes from '@/api/jira/jira.route';
+import kbRoutes from '@/api/kb/kb.route';
+import manualTestRoutes from '@/api/manualTest/manualTest.route';
+import playwrightRoutes from '@/api/playwright/playwright.route';
+import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
+import { env, isDevelopment } from '@/config/env';
+import { QueueManager } from '@/config/queues';
+import { swaggerSpec } from '@/config/swagger';
+import { testSupabaseConnection } from '@/db/supabase';
+import { errorHandler, notFoundHandler } from '@/utils/error-handler';
+import { logger, morganStream } from '@/utils/logger';
 import cors from 'cors';
+import express from 'express';
+import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import morgan from 'morgan';
-import rateLimit from 'express-rate-limit';
 import swaggerUi from 'swagger-ui-express';
-import { swaggerSpec } from '@/config/swagger';
-import { env, isDevelopment } from '@/config/env';
-import { logger, morganStream } from '@/utils/logger';
-import { errorHandler, notFoundHandler } from '@/utils/error-handler';
-import { testSupabaseConnection } from '@/db/supabase';
-import { QueueManager } from '@/config/queues';
-import manualTestRoutes from '@/api/manualTest/manualTest.route';
-import chatRoutes from '@/api/chat/chat.route';
-import apiTestRoutes from '@/api/apiTest/apiTest.route';
-import jiraRoutes from '@/api/jira/jira.route';
-import authRoutes from '@/api/auth/auth.route';
-import kbRoutes from '@/api/kb/kb.route';
 
 // Create Express app
 const app = express();
@@ -146,6 +148,8 @@ app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
 app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
 app.use(`/api/${env.API_VERSION}/kb`, kbRoutes);
+app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
+app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
@@ -155,17 +159,19 @@ app.get('/', (req: express.Request, res: express.Response) => {
     version: process.env.npm_package_version || '1.0.0',
     environment: env.NODE_ENV,
     timestamp: new Date().toISOString(),
-      endpoints: {
-        health: '/health',
-        auth: `/api/${env.API_VERSION}/auth`,
-        manualTest: `/api/${env.API_VERSION}/manual-test`,
-        chat: `/api/${env.API_VERSION}/chat`,
-        apiTest: `/api/${env.API_VERSION}/api-test`,
-        jira: `/api/${env.API_VERSION}/jira`,
-        kb: `/api/${env.API_VERSION}/kb`,
-        docs: '/api/docs',
-        docsJson: '/api/docs.json',
-      },
+    endpoints: {
+      health: '/health',
+      auth: `/api/${env.API_VERSION}/auth`,
+      manualTest: `/api/${env.API_VERSION}/manual-test`,
+      chat: `/api/${env.API_VERSION}/chat`,
+      apiTest: `/api/${env.API_VERSION}/api-test`,
+      jira: `/api/${env.API_VERSION}/jira`,
+      kb: `/api/${env.API_VERSION}/kb`,
+      playwright: `/api/${env.API_VERSION}/playwright`,
+      testVisualization: `/api/${env.API_VERSION}/test-visualization`,
+      docs: '/api/docs',
+      docsJson: '/api/docs.json',
+    },
   });
 });
 

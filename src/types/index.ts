@@ -368,6 +368,88 @@ export interface JiraProject {
   properties?: Record<string, any>;
 }
 
+// Playwright test visualization types
+export * from './playwright.types';
+
+// Playwright trace upload types
+export type TraceFileStatus = 'uploaded' | 'parsing' | 'parsed' | 'failed';
+
+export interface TraceFile {
+  id: string;
+  user_id: string;
+  test_id?: string;
+  file_name: string;
+  storage_path: string;
+  file_size?: number;
+  browser?: string;
+  status: TraceFileStatus;
+  parsed_data?: any;
+  public_url?: string;
+  created_at: string;
+  updated_at: string;
+  parsed_at?: string;
+}
+
+export interface TraceUploadRequest {
+  userId: string;
+  testId?: string;
+  browser?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface TraceUploadResponse {
+  success: boolean;
+  message: string;
+  data?: {
+    id: string;
+    fileName: string;
+    storagePath: string;
+    publicUrl?: string;
+    fileSize: number;
+    uploadedAt: string;
+    testId?: string;
+    userId: string;
+  };
+  error?: string;
+}
+
+export interface TraceFileListItem {
+  id: string;
+  fileName: string;
+  testId?: string;
+  uploadedAt: string;
+  size: number;
+  status: TraceFileStatus;
+  browser?: string;
+  publicUrl?: string;
+}
+
+export interface TraceStep {
+  stepId: number;
+  type: string;
+  selector?: string;
+  text?: string;
+  url?: string;
+  timestamp?: number;
+  screenshotUrl?: string;
+  description?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface TraceStepsResponse {
+  success: boolean;
+  data?: {
+    testId: string;
+    userId: string;
+    fileName: string;
+    totalSteps: number;
+    steps: TraceStep[];
+    parsedAt: string;
+  };
+  error?: string;
+  message?: string;
+}
+
 // Intent Parsing types
 export type IntentType =
   | 'check_element'

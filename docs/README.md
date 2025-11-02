@@ -22,6 +22,7 @@
 - [**API Reference**](./api/README.md) - полная документация API
 - [**Примеры использования**](./api/examples.md) - практические примеры
 - [**Аутентификация**](./api/authentication.md) - работа с токенами и ключами
+- [**Playwright API**](./api/playwright.md) - загрузка trace файлов
 
 ### 💻 Разработка
 

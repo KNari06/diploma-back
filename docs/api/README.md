@@ -92,6 +92,19 @@ https://api.qai.so/api/v1
 #### `PUT /users/profile`
 Обновление профиля
 
+### Playwright
+
+#### `POST /playwright/upload-trace`
+Загрузка Playwright trace файла
+
+#### `GET /playwright/trace/:filename`
+Скачивание trace файла
+
+#### `GET /playwright/traces/:testId`
+Список всех trace для теста
+
+[📖 Подробная документация Playwright API](./playwright.md)
+
 ## 📊 Коды ошибок
 
 | Код | Описание |
