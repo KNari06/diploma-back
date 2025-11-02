@@ -8,9 +8,11 @@ import { ChatContext } from '@/api/chat/chat.types';
 export function buildChatPrompt({ message, context }: ChatContext): string {
   let prompt = message;
 
-  // Add context if provided (for future RAG integration)
+  // Add context if provided (for RAG integration)
   if (context) {
-    prompt = `${context}\n\nВопрос: ${message}`;
+    // Handle both string and object context
+    const contextStr = typeof context === 'string' ? context : JSON.stringify(context);
+    prompt = `${contextStr}\n\nВопрос: ${message}`;
   }
 
   return prompt;

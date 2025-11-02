@@ -2,7 +2,7 @@ import { IntentResult } from '@/types';
 
 export interface ChatRequest {
   message: string;
-  context?: string; // For future RAG integration
+  context?: string | { projectId?: string; [key: string]: any }; // For RAG integration with projectId
   sessionId?: string; // Existing chat session ID
 }
 
@@ -20,5 +20,5 @@ export interface ChatMessage {
 export interface ChatContext {
   userId?: string;
   message: string;
-  context?: string;
+  context?: string | { projectId?: string; [key: string]: any };
 }

@@ -15,6 +15,7 @@ import chatRoutes from '@/api/chat/chat.route';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import jiraRoutes from '@/api/jira/jira.route';
 import authRoutes from '@/api/auth/auth.route';
+import kbRoutes from '@/api/kb/kb.route';
 
 // Create Express app
 const app = express();
@@ -144,6 +145,7 @@ app.use(`/api/${env.API_VERSION}/manual-test`, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
 app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
+app.use(`/api/${env.API_VERSION}/kb`, kbRoutes);
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
@@ -160,6 +162,7 @@ app.get('/', (req: express.Request, res: express.Response) => {
         chat: `/api/${env.API_VERSION}/chat`,
         apiTest: `/api/${env.API_VERSION}/api-test`,
         jira: `/api/${env.API_VERSION}/jira`,
+        kb: `/api/${env.API_VERSION}/kb`,
         docs: '/api/docs',
         docsJson: '/api/docs.json',
       },

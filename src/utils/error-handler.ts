@@ -2,6 +2,29 @@ import { Request, Response, NextFunction } from 'express';
 import { logger } from './logger';
 import { QAIError, ValidationError, NotFoundError, UnauthorizedError, RateLimitError } from '@/types';
 
+/**
+ * Send success response
+ */
+export const successResponse = (res: Response, data: any, statusCode: number = 200): void => {
+  res.status(statusCode).json({
+    success: true,
+    data,
+    timestamp: new Date().toISOString(),
+  });
+};
+
+/**
+ * Send error response
+ */
+export const errorResponse = (res: Response, message: string, statusCode: number = 400, code?: string): void => {
+  res.status(statusCode).json({
+    success: false,
+    error: message,
+    code: code || 'ERROR',
+    timestamp: new Date().toISOString(),
+  });
+};
+
 // Error handler middleware
 export const errorHandler = (
   error: Error,
@@ -113,8 +136,8 @@ export const errorHandler = (
 
   // Default error response
   const statusCode = 500;
-  const message = process.env.NODE_ENV === 'production' 
-    ? 'Internal server error' 
+  const message = process.env.NODE_ENV === 'production'
+    ? 'Internal server error'
     : error.message;
 
   res.status(statusCode).json({
@@ -149,19 +172,19 @@ export const handleValidationError = (error: any) => {
       field: detail.path.join('.'),
       message: detail.message,
     }));
-    
+
     throw new ValidationError('Validation failed', details);
   }
-  
+
   if (error.name === 'ZodError') {
     const details = error.errors.map((err: any) => ({
       field: err.path.join('.'),
       message: err.message,
     }));
-    
+
     throw new ValidationError('Validation failed', details);
   }
-  
+
   throw error;
 };
 
@@ -170,15 +193,15 @@ export const handleDatabaseError = (error: any) => {
   if (error.code === '23505') { // Unique constraint violation
     throw new ValidationError('Resource already exists');
   }
-  
+
   if (error.code === '23503') { // Foreign key constraint violation
     throw new ValidationError('Referenced resource not found');
   }
-  
+
   if (error.code === '23502') { // Not null constraint violation
     throw new ValidationError('Required field is missing');
   }
-  
+
   throw error;
 };
 
@@ -187,11 +210,11 @@ export const handleQueueError = (error: any) => {
   if (error.message.includes('Connection is closed')) {
     throw new QAIError('Queue service unavailable', 'QUEUE_UNAVAILABLE', 503);
   }
-  
+
   if (error.message.includes('Job not found')) {
     throw new NotFoundError('Job', 'unknown');
   }
-  
+
   throw error;
 };
 
@@ -200,15 +223,15 @@ export const handleAIError = (error: any) => {
   if (error.status === 429) {
     throw new RateLimitError('AI service rate limit exceeded');
   }
-  
+
   if (error.status === 401) {
     throw new QAIError('AI service authentication failed', 'AI_AUTH_ERROR', 401);
   }
-  
+
   if (error.status === 403) {
     throw new QAIError('AI service access forbidden', 'AI_ACCESS_FORBIDDEN', 403);
   }
-  
+
   throw new QAIError('AI service error', 'AI_SERVICE_ERROR', 503, error.message);
 };
 
@@ -217,19 +240,19 @@ export const handleAgentError = (error: any) => {
   if (error.code === 'ECONNREFUSED') {
     throw new QAIError('Test agent unavailable', 'AGENT_UNAVAILABLE', 503);
   }
-  
+
   if (error.code === 'ETIMEDOUT') {
     throw new QAIError('Test agent timeout', 'AGENT_TIMEOUT', 504);
   }
-  
+
   if (error.status >= 400 && error.status < 500) {
     throw new QAIError('Test agent client error', 'AGENT_CLIENT_ERROR', error.status);
   }
-  
+
   if (error.status >= 500) {
     throw new QAIError('Test agent server error', 'AGENT_SERVER_ERROR', 503);
   }
-  
+
   throw new QAIError('Test agent communication error', 'AGENT_COMMUNICATION_ERROR', 503);
 };
 
@@ -250,27 +273,27 @@ export const shouldRetry = (error: any, attempt: number, maxAttempts: number): b
   if (attempt >= maxAttempts) {
     return false;
   }
-  
+
   // Retry on network errors
   if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
     return true;
   }
-  
+
   // Retry on rate limit errors (with exponential backoff)
   if (error.status === 429) {
     return true;
   }
-  
+
   // Retry on server errors (5xx)
   if (error.status >= 500) {
     return true;
   }
-  
+
   // Don't retry on client errors (4xx) except rate limiting
   if (error.status >= 400 && error.status < 500) {
     return false;
   }
-  
+
   // Retry on unknown errors
   return true;
 };

@@ -1,10 +1,10 @@
-import { Request, Response } from 'express';
-import { getChatCompletion } from '@/services/openai.service';
-import { parseUserIntent } from '@/services/intentParser.service';
+import { supabaseAdmin } from '@/db/supabase';
 import { executeApiTest } from '@/services/apiTest.service';
+import { parseUserIntent } from '@/services/intentParser.service';
+import { getChatCompletion } from '@/services/openai.service';
 import { buildChatPrompt } from '@/utils/buildChatPrompt';
 import { logger } from '@/utils/logger';
-import { supabaseAdmin } from '@/db/supabase';
+import { Request, Response } from 'express';
 import { ChatRequest } from './chat.types';
 
 /**
@@ -129,12 +129,51 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
         gptResponse = `❌ Ошибка при выполнении API-запроса: ${error instanceof Error ? error.message : 'Unknown error'}`;
       }
     } else {
-      // Regular chat flow
-      // (Будет) Поиск контекста в векторной памяти (RAG)
-      // const platformContext = await getPlatformContext(userId);
+      // Regular chat flow with RAG
+      const prompt = buildChatPrompt({
+        message,
+        context: context as string | { projectId?: string; [key: string]: any } | undefined
+      });
 
-      const prompt = buildChatPrompt({ message, context });
-      gptResponse = await getChatCompletion(prompt, context);
+      // Get KB context if available
+      let kbContext = '';
+      if (userId) {
+        try {
+          const { searchKB } = await import('@/services/kb.service');
+
+          // Get user's current project (if in context)
+          const projectId = typeof context === 'object' ? context?.projectId : undefined;
+
+          // Search KB (global first, then project)
+          const kbResults = await searchKB(message, projectId, {
+            matchThreshold: 0.7,
+            matchCount: 5,
+          });
+
+          if (kbResults.chunks.length > 0) {
+            kbContext = '\n\n--- Knowledge Base Context ---\n';
+            kbContext += kbResults.chunks.map((chunk, idx) => {
+              const source = chunk.source_file || chunk.file_name || 'Unknown';
+              const sourceType = chunk.source_file ? 'Global' : 'Project';
+              return `[${sourceType} - ${source}]:\n${chunk.content}`;
+            }).join('\n\n');
+
+            logger.info('KB context retrieved', {
+              globalSources: kbResults.sources.global.length,
+              projectSources: kbResults.sources.project.length,
+              chunkCount: kbResults.chunks.length,
+            });
+          }
+        } catch (kbError) {
+          logger.warn('Failed to retrieve KB context', kbError);
+          // Continue without KB context
+        }
+      }
+
+      const finalContext = context
+        ? (typeof context === 'string' ? `${context}${kbContext}` : kbContext)
+        : kbContext;
+      gptResponse = await getChatCompletion(prompt, finalContext);
     }
 
     // Save user message to database
