@@ -56,11 +56,6 @@ jspm_packages/
 # Yarn Integrity file
 .yarn-integrity
 
-# dotenv environment variables file
-.env
-.env.test
-.env.local
-.env.production
 
 # parcel-bundler cache
 .cache
@@ -145,12 +140,6 @@ jspm_packages/
 # Yarn Integrity file
 .yarn-integrity
 
-# dotenv environment variables file
-.env
-.env.test
-.env.local
-.env.production
-
 # parcel-bundler cache
 .cache
 .parcel-cache
@@ -202,11 +191,6 @@ build/
 test-results/
 coverage/
 
-# Docker
-.dockerignore
-Dockerfile
-docker-compose.yml
-docker-compose.override.yml
 
 # Database
 *.db
@@ -231,6 +215,3 @@ ecosystem.config.js
 
 # Render
 .render
-
-# Uploads (trace files, etc.)
-uploads/
