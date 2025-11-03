@@ -1,115 +1,46 @@
-name: 🚀 CI/CD Pipeline
+name: Deploy QAI Backend
 
 on:
   push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main, develop ]
+    branches:
+      - main
 
 jobs:
-  test:
-    name: 🧪 Test & Lint
-    runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        node-version: [18.x, 20.x]
-
-    steps:
-    - name: 📥 Checkout code
-      uses: actions/checkout@v4
-
-    - name: 📦 Setup Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
-        cache: 'npm'
-
-    - name: 📥 Install dependencies
-      run: npm ci
-
-    - name: 🔍 Type check
-      run: npm run type-check
-
-    - name: 🧹 Lint
-      run: npm run lint
-
-    - name: 🧪 Run tests
-      run: npm test
-
-    - name: 📊 Test coverage
-      run: npm run test:coverage
-
-  build:
-    name: 🏗️ Build
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-    - name: 📥 Checkout code
-      uses: actions/checkout@v4
-
-    - name: 📦 Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20.x'
-        cache: 'npm'
-
-    - name: 📥 Install dependencies
-      run: npm ci
-
-    - name: 🏗️ Build project
-      run: npm run build
-
-    - name: 📦 Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-files
-        path: dist/
-
-  security:
-    name: 🔒 Security Audit
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: 📥 Checkout code
-      uses: actions/checkout@v4
-
-    - name: 📦 Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20.x'
-        cache: 'npm'
-
-    - name: 📥 Install dependencies
-      run: npm ci
-
-    - name: 🔒 Security audit
-      run: npm audit --audit-level moderate
-
-    - name: 🔍 CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
-      with:
-        languages: javascript
-
   deploy:
-    name: 🚀 Deploy
     runs-on: ubuntu-latest
-    needs: [test, build, security]
-    if: github.ref == 'refs/heads/main'
 
     steps:
-    - name: 📥 Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: 📦 Download build artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: build-files
-        path: dist/
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-    - name: 🚀 Deploy to production
-      run: |
-        echo "Deploying to production..."
-        # Add your deployment commands here
-        # For example: Railway, Render, or custom deployment
+      - name: Deploy to remote server
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            set -e
+            cd ~/QAI---BackEnd || exit 1
+
+            echo "Updating repository..."
+            git fetch origin main && git reset --hard origin/main
+
+            echo "Stopping old container..."
+            docker stop qai-backend || true
+            docker rm qai-backend || true
+
+            echo "Building new Docker image..."
+            docker build -t qai-backend .
+
+            echo "Starting new container..."
+            docker run -d \
+              --restart always \
+              --name qai-backend \
+              -p 3000:3000 \
+              --env-file .env \
+              qai-backend
+
+            echo "Deployment completed successfully."
+          EOF
