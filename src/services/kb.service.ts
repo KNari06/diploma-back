@@ -1,9 +1,10 @@
 import { supabase } from '@/db/supabase';
+import { chunkMarkdown, chunkText } from '@/utils/chunking';
+import { getFileSizeMB, isValidFileType, parseFile } from '@/utils/fileParser';
 import { logger } from '@/utils/logger';
-import { generateEmbedding, generateEmbeddings } from './embedding.service';
-import { chunkText, chunkMarkdown } from '@/utils/chunking';
-import { parseFile, isValidFileType, getFileSizeMB } from '@/utils/fileParser';
 import { promises as fs } from 'fs';
+import { generateEmbedding, generateEmbeddings } from './embedding.service';
+import { searchLocalGlobalKB } from './localKB.service';
 
 const MAX_FILE_SIZE_MB = 10; // Maximum file size
 
@@ -28,6 +29,11 @@ export interface KBSearchResult {
 
 /**
  * Upload and process file for global KB (admin only)
+ *
+ * @deprecated Global KB is now stored locally in data/global-kb/
+ * Use markdown files in data/global-kb/sources/ and run npm run build-kb instead
+ *
+ * This function is kept for backwards compatibility but not recommended
  */
 export async function uploadGlobalKB(
   filePath: string,
@@ -180,7 +186,7 @@ export async function uploadProjectKB(
 }
 
 /**
- * Search KB using RAG (global first, then project)
+ * Search KB using RAG (local global KB first, then project KB from Supabase)
  */
 export async function searchKB(
   query: string,
@@ -197,18 +203,21 @@ export async function searchKB(
     // Generate query embedding
     const queryEmbedding = await generateEmbedding(query);
 
-    // Search global KB first
-    const { data: globalResults, error: globalError } = await supabase.rpc('search_global_kb', {
-      query_embedding: JSON.stringify(queryEmbedding),
-      match_threshold: matchThreshold,
-      match_count: matchCount,
+    // Search LOCAL global KB (faster, no DB query!)
+    const localGlobalResults = await searchLocalGlobalKB(queryEmbedding, {
+      threshold: matchThreshold,
+      limit: matchCount,
     });
 
-    if (globalError) {
-      logger.error('Global KB search failed', { globalError });
-    }
-
-    const globalChunks: KBChunk[] = globalResults || [];
+    const globalChunks: KBChunk[] = localGlobalResults.map((chunk) => ({
+      id: chunk.id,
+      content: chunk.content,
+      source_file: chunk.source_file,
+      tags: chunk.tags,
+      metadata: chunk.metadata,
+      similarity: chunk.similarity,
+      created_at: new Date().toISOString(), // Local KB doesn't have created_at
+    }));
 
     // Search project KB if projectId provided
     let projectChunks: KBChunk[] = [];

@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { logger } from '@/utils/logger';
 import { errorResponse, successResponse } from '@/utils/error-handler';
 import * as kbService from '@/services/kb.service';
+import { rebuildGlobalKB, getLocalKBStats } from '@/services/localKB.service';
 import { supabase } from '@/db/supabase';
 
 /**
@@ -257,20 +258,68 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
 
     const projectId = req.query.projectId as string;
 
-    // If projectId provided, verify ownership
+    // Get local global KB stats
+    const localStats = await getLocalKBStats();
+
+    // If projectId provided, verify ownership and get project stats
+    let projectStats = null;
     if (projectId) {
       const isOwner = await isProjectOwner(userId, projectId);
       if (!isOwner) {
         errorResponse(res, 'Access denied to this project', 403);
         return;
       }
+
+      projectStats = await kbService.getKBStats(projectId);
     }
 
-    const stats = await kbService.getKBStats(projectId);
-
-    successResponse(res, stats);
+    successResponse(res, {
+      global: {
+        type: 'local',
+        totalChunks: localStats.totalChunks,
+        totalFiles: localStats.totalFiles,
+        model: localStats.model,
+        version: localStats.version,
+        lastGenerated: localStats.lastGenerated,
+      },
+      project: projectStats,
+    });
   } catch (error: any) {
     logger.error('Get KB stats failed', { error });
     errorResponse(res, error.message || 'Failed to get stats', 500);
+  }
+}
+
+/**
+ * Rebuild global KB from source files (admin only)
+ */
+export async function rebuildKB(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      errorResponse(res, 'Unauthorized', 401);
+      return;
+    }
+
+    // Check admin role
+    const admin = await isAdmin(userId);
+    if (!admin) {
+      errorResponse(res, 'Admin access required', 403);
+      return;
+    }
+
+    logger.info('Rebuilding global KB', { userId });
+
+    // Rebuild KB (generates new embeddings.json and reloads into memory)
+    const result = await rebuildGlobalKB();
+
+    successResponse(res, {
+      message: 'Global KB rebuilt successfully',
+      chunks: result.chunks,
+      files: result.files,
+    });
+  } catch (error: any) {
+    logger.error('Rebuild KB failed', { error });
+    errorResponse(res, error.message || 'Failed to rebuild KB', 500);
   }
 }

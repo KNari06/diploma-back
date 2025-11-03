@@ -16,6 +16,7 @@
 - [**Схема базы данных**](./architecture/database.md) - структура БД и связи
 - [**Статус проекта**](./architecture/project-status.md) - текущий прогресс и roadmap
 - [**OAuth Flow**](./architecture/oauth-flow.md) - детальное объяснение OAuth процесса
+- [**Chat Processing Flow**](./architecture/chat-flow.md) - как обрабатываются пользовательские запросы
 
 ### 🔌 API
 

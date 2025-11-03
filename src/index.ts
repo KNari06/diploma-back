@@ -22,17 +22,35 @@ import swaggerUi from 'swagger-ui-express';
 // Create Express app
 const app = express();
 
-// Security middleware
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "https:"],
+// Security middleware with Swagger-friendly CSP
+app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+  // Disable strict CSP for Swagger UI
+  if (req.path.startsWith('/api/docs')) {
+    return next();
+  }
+
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrc: ["'self'"],
+        imgSrc: ["'self'", "data:", "https:"],
+      },
     },
-  },
-}));
+    crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+  })(req, res, next);
+});
+
+// Relaxed security for Swagger UI
+app.use('/api/docs', (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginOpenerPolicy: false,
+    crossOriginResourcePolicy: false,
+  })(req, res, next);
+}, swaggerUi.serve);
 
 // CORS configuration
 app.use(cors({
@@ -65,10 +83,13 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Logging middleware
 app.use(morgan(env.LOG_FORMAT, { stream: morganStream }));
 
-// Swagger documentation
-app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+// Swagger documentation setup (middleware already registered above)
+app.use('/api/docs', swaggerUi.setup(swaggerSpec, {
   customCss: '.swagger-ui .topbar { display: none }',
   customSiteTitle: 'QAI API Documentation',
+  swaggerOptions: {
+    persistAuthorization: true,
+  },
 }));
 
 // Swagger JSON endpoint
@@ -184,6 +205,14 @@ app.use(errorHandler);
 // Start server
 const startServer = async () => {
   try {
+    // Initialize global KB (load into memory)
+    try {
+      const { initializeGlobalKB } = await import('@/services/localKB.service');
+      await initializeGlobalKB();
+    } catch (kbError) {
+      logger.warn('Failed to initialize global KB, continuing without it', { error: kbError });
+    }
+
     // Test database connection
     const dbConnected = await testSupabaseConnection();
     if (!dbConnected) {

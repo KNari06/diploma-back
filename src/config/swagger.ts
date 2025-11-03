@@ -23,8 +23,12 @@ const options: swaggerJsdoc.Options = {
         description: 'Development server',
       },
       {
-        url: 'https://api.qai.so',
+        url: process.env.API_BASE_URL || `http://localhost:${env.PORT}`,
         description: 'Production server',
+      },
+      {
+        url: 'https://api.qai.so',
+        description: 'Production server (HTTPS)',
       },
     ],
     components: {

@@ -170,7 +170,7 @@ router.delete('/project-files', kbController.deleteProjectFile);
  * @swagger
  * /api/kb/stats:
  *   get:
- *     summary: Get KB statistics
+ *     summary: Get KB statistics (local global KB + project KB)
  *     tags: [Knowledge Base]
  *     security:
  *       - bearerAuth: []
@@ -185,5 +185,38 @@ router.delete('/project-files', kbController.deleteProjectFile);
  *         description: KB statistics
  */
 router.get('/stats', kbController.getKBStats);
+
+/**
+ * @swagger
+ * /api/kb/rebuild:
+ *   post:
+ *     summary: Rebuild global KB from source files (admin only)
+ *     description: Regenerates embeddings.json from markdown files in data/global-kb/sources/ and reloads into memory
+ *     tags: [Knowledge Base]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: KB rebuilt successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     message:
+ *                       type: string
+ *                     chunks:
+ *                       type: number
+ *                     files:
+ *                       type: number
+ *       403:
+ *         description: Admin access required
+ */
+router.post('/rebuild', kbController.rebuildKB);
 
 export default router;

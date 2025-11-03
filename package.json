@@ -10,6 +10,7 @@
     "start": "node -r tsconfig-paths/register dist/index.js",
     "worker": "nodemon --exec ts-node -r tsconfig-paths/register src/worker/index.ts",
     "start:worker": "node -r tsconfig-paths/register dist/worker/index.js",
+    "build-kb": "ts-node -r tsconfig-paths/register src/scripts/build-global-kb.ts",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",

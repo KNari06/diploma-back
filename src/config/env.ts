@@ -10,6 +10,7 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.string().transform(Number).default('3000'),
   API_VERSION: z.string().default('v1'),
+  API_BASE_URL: z.string().optional(),
 
   // Supabase
   SUPABASE_URL: z.string().min(1, 'SUPABASE_URL is required'),
