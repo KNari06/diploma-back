@@ -175,6 +175,8 @@ export interface TestJobData {
   projectId: string;
   userId?: string;
   retryCount?: number;
+  commands?: PlaywrightCommand[]; // Playwright commands to execute
+  intent?: string; // Original user intent for context
 }
 
 export interface AgentResponse {
@@ -500,4 +502,62 @@ export interface IntentResult {
   apiBody?: any;
   apiHeaders?: Record<string, string>;
   expectedStatus?: number;
+  selector?: string; // For UI testing intents
+  // Playwright commands generated from intent
+  commands?: PlaywrightCommand[];
+}
+
+// Playwright Command types
+export type PlaywrightActionType =
+  | 'goto'          // Navigate to URL
+  | 'click'         // Click element
+  | 'fill'          // Fill input field
+  | 'type'          // Type text (slower, with events)
+  | 'select'        // Select from dropdown
+  | 'check'         // Check checkbox
+  | 'uncheck'       // Uncheck checkbox
+  | 'hover'         // Hover over element
+  | 'wait'          // Wait for condition
+  | 'waitForSelector' // Wait for element
+  | 'waitForNavigation' // Wait for page navigation
+  | 'screenshot'    // Take screenshot
+  | 'scroll'        // Scroll page/element
+  | 'press'         // Press keyboard key
+  | 'assertVisible' // Assert element is visible
+  | 'assertText'    // Assert element contains text
+  | 'assertValue'   // Assert input has value
+  | 'assertUrl'     // Assert current URL
+  | 'assertCount'   // Assert number of elements
+  | 'extract'       // Extract data from element
+  | 'evaluate'      // Execute JS in browser
+  | string;
+
+export interface PlaywrightCommand {
+  action: PlaywrightActionType;
+  selector?: string;        // CSS selector, text selector, or xpath
+  value?: string | number;  // Value for fill, type, select, etc.
+  url?: string;             // For goto action
+  timeout?: number;         // Timeout in ms (default: 30000)
+  waitFor?: 'load' | 'domcontentloaded' | 'networkidle'; // Wait strategy for goto
+  description?: string;     // Human-readable description of what this does
+  screenshot?: boolean;     // Take screenshot after this action
+  continueOnError?: boolean; // Continue test even if this step fails
+  assertion?: {             // For assert actions
+    type: 'visible' | 'hidden' | 'text' | 'value' | 'count' | 'url' | 'enabled' | 'disabled';
+    expected: string | number | boolean;
+    operator?: '=' | '!=' | '>' | '<' | 'contains' | 'startsWith' | 'endsWith';
+  };
+  extract?: {               // For extract action
+    name: string;           // Variable name to store extracted value
+    attribute?: string;     // Attribute to extract (e.g., 'href', 'src')
+    property?: 'text' | 'value' | 'innerHTML'; // Property to extract
+  };
+}
+
+export interface PlaywrightTestPlan {
+  url: string;              // Starting URL
+  description: string;      // What this test does
+  commands: PlaywrightCommand[];
+  viewport?: ViewportType;
+  expectedOutcome: string;  // What should happen if test passes
 }

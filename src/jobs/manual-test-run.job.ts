@@ -5,6 +5,7 @@ import { TestJobData, AgentResponse } from '@/types';
 import { dbAdminService } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
 import { env } from '@/config/env';
+import { executePlaywrightTestWithRetry } from '@/agent';
 import axios from 'axios';
 
 export class ManualTestRunJobHandler {
@@ -24,31 +25,55 @@ export class ManualTestRunJobHandler {
         started_at: new Date().toISOString(),
       });
 
-      // Find available agent
-      const agentUrl = await this.findAvailableAgent();
-      if (!agentUrl) {
-        throw new Error('No available test agents');
-      }
-
-      // Send test to agent
-      const agentResponse = await this.sendTestToAgent(agentUrl, {
+      logger.info('Executing Playwright test locally', {
         testId,
-        url,
         browser,
-        options,
-        projectId,
-        userId,
-      }) as any;
+        url,
+      });
 
-      // Process agent response
-      if (agentResponse.success) {
-        // Add result processing job
-        await QueueManager.addTestResultJob(agentResponse);
+      // Execute test using local Playwright agent (integrated)
+      const result = await executePlaywrightTestWithRetry(
+        {
+          testId,
+          url,
+          browser,
+          options,
+          projectId,
+          userId,
+        },
+        env.AGENT_MAX_RETRIES || 2
+      );
 
-        logger.info(`Test sent to agent successfully: ${testId} (${browser})`);
-        logAgentCommunication('test_sent', agentUrl, { testId, browser });
+      // Process result
+      if (result.success) {
+        // Create test result in database
+        await dbAdminService.createTestResult({
+          test_id: testId,
+          browser,
+          status: result.status as any,
+          screenshot: result.screenshot,
+          dom: result.dom,
+          logs: result.logs,
+          network_logs: result.networkLogs,
+          errors: result.errors,
+          performance: result.performance,
+          completed_at: new Date().toISOString(),
+        });
+
+        // Add AI analysis job
+        const testResult = await dbAdminService.getTestResultByTestAndBrowser(testId, browser);
+        if (testResult) {
+          await QueueManager.addAIAnalysisJob(testResult.id, testId);
+        }
+
+        logger.info('Test completed successfully', {
+          testId,
+          browser,
+          logsCount: result.logs.length,
+          errorsCount: result.errors.length,
+        });
       } else {
-        throw new Error(agentResponse.error || 'Agent failed to process test');
+        throw new Error(result.error || 'Test execution failed');
       }
 
     } catch (error) {

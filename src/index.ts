@@ -248,6 +248,15 @@ const startServer = async () => {
         logger.info('HTTP server closed');
 
         try {
+          // Close browser pool
+          const { browserPool } = await import('@/agent');
+          await browserPool.closeAll();
+          logger.info('Browser pool closed');
+        } catch (error) {
+          logger.error('Error closing browsers:', error);
+        }
+
+        try {
           // Close queue connections
           await import('@/config/queues').then(module => module.gracefulShutdown());
           logger.info('Queue connections closed');

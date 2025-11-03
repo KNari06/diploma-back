@@ -17,8 +17,7 @@
     "lint": "eslint src/**/*.ts",
     "lint:fix": "eslint src/**/*.ts --fix",
     "type-check": "tsc --noEmit",
-    "setup": "cp env.example .env && echo '✅ Created .env file. Please edit it with your credentials.'",
-    "prepare": "husky install"
+    "setup": "cp env.example .env && echo '✅ Created .env file. Please edit it with your credentials.'"
   },
   "keywords": [
     "qa",
@@ -51,6 +50,7 @@
     "multer": "^2.0.2",
     "openai": "^4.20.1",
     "pdf-parse": "^2.4.5",
+    "playwright": "^1.56.1",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
     "tiktoken": "^1.0.22",
@@ -70,7 +70,6 @@
     "@typescript-eslint/eslint-plugin": "^6.12.0",
     "@typescript-eslint/parser": "^6.12.0",
     "eslint": "^8.54.0",
-    "husky": "^8.0.3",
     "jest": "^29.7.0",
     "nodemon": "^3.0.1",
     "ts-jest": "^29.1.1",

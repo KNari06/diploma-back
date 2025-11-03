@@ -33,6 +33,9 @@ export class ManualTestService {
           options: testRequest.options,
           projectId: testRequest.projectId,
           userId: testRequest.userId,
+          // Pass Playwright commands if available
+          commands: (testRequest as any).commands,
+          intent: (testRequest as any).intent,
         });
       }
 

@@ -23,6 +23,10 @@ const options: swaggerJsdoc.Options = {
         description: 'Development server',
       },
       {
+        url: 'http://34.10.193.13:3000',
+        description: 'Cloud server (GCP)',
+      },
+      {
         url: process.env.API_BASE_URL || `http://localhost:${env.PORT}`,
         description: 'Production server',
       },

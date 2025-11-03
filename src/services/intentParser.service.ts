@@ -1,7 +1,7 @@
 import { env } from '@/config/env';
 import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
-import { buildIntentPrompt } from '@/ai/prompts/intentParserPrompt';
+import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/intentParserPrompt';
 import { IntentResult } from '@/types';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
@@ -9,11 +9,24 @@ const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 /**
  * Parse user's natural language message into structured intent
  * @param message - User's message
+ * @param context - Additional context from RAG, traces, etc.
  * @returns Parsed intent result or null if parsing failed
  */
-export async function parseUserIntent(message: string): Promise<IntentResult | null> {
+export async function parseUserIntent(
+  message: string,
+  context?: IntentParserContext
+): Promise<IntentResult | null> {
   try {
-    const prompt = buildIntentPrompt(message);
+    const prompt = buildIntentPrompt(message, context);
+
+    // Log context usage
+    if (context) {
+      logger.info('Intent parsing with enriched context', {
+        hasDocumentation: !!context.documentation && context.documentation.length > 0,
+        hasSelectors: !!context.knownSelectors && Object.keys(context.knownSelectors).length > 0,
+        hasTraces: !!context.tracesContext,
+      });
+    }
     const model = env.OPENAI_MODEL || 'gpt-4o-mini';
 
     // JSON mode supported by: gpt-4-turbo, gpt-4o, gpt-4o-mini, o1, o3

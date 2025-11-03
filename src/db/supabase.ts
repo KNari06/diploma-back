@@ -34,12 +34,12 @@ export const testSupabaseConnection = async (): Promise<boolean> => {
       .from('tests')
       .select('count')
       .limit(1);
-    
+
     if (error) {
       logger.error('Supabase connection test failed:', error);
       return false;
     }
-    
+
     logger.info('✅ Supabase connection successful');
     return true;
   } catch (error) {
@@ -170,6 +170,20 @@ export class SupabaseService {
     return data as any;
   }
 
+  async getTestResultByTestAndBrowser(testId: string, browser: string) {
+    const { data, error } = await this.client
+      .from('test_results')
+      .select('*')
+      .eq('test_id', testId)
+      .eq('browser', browser)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error) throw error;
+    return data as any;
+  }
+
   // Project operations
   async createProject(projectData: any) {
     const { data, error } = await this.client
@@ -219,7 +233,7 @@ export class SupabaseService {
   async updateUserCredits(userId: string, amount: number) {
     const { data, error } = await (this.client as any)
       .from('users')
-      .update({ 
+      .update({
         credits: amount,
         updated_at: new Date().toISOString()
       })
