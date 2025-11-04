@@ -103,6 +103,14 @@ export async function findTracesByUrl(
   limit: number = 5
 ): Promise<TraceFile[]> {
   try {
+    // Check if projectId is a valid UUID
+    const isValidUUID = projectId && projectId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+    if (!isValidUUID) {
+      logger.info('Skipping trace search - projectId is not a valid UUID', { projectId });
+      return [];
+    }
+
     // Extract domain from URL for matching
     const domain = extractDomain(url);
 

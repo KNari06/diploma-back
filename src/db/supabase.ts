@@ -1,6 +1,6 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { env } from '@/config/env';
 import { logger } from '@/utils/logger';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 // Create Supabase client
 const supabaseUrl = env.SUPABASE_URL;
@@ -84,14 +84,36 @@ export class SupabaseService {
 
   // Test operations
   async createTest(testData: any) {
+    logger.info('[DB] Creating test in database', {
+      testId: testData.id,
+      projectId: testData.project_id,
+      userId: testData.user_id,
+    });
+
     const { data, error } = await this.client
       .from('tests')
       .insert(testData)
       .select()
-      .single();
+      .maybeSingle(); // Use maybeSingle() to avoid errors
 
-    if (error) throw error;
-    return data;
+    if (error) {
+      logger.error('[DB] Failed to create test', {
+        error,
+        errorMessage: error.message,
+        errorDetails: error.details,
+        errorHint: error.hint,
+        testData,
+      });
+      throw error;
+    }
+
+    if (!data) {
+      logger.error('[DB] Test insert returned no data', { testData });
+      throw new Error('Test insert returned no data');
+    }
+
+    logger.info('[DB] Test created successfully', { testId: (data as any).id });
+    return data as any;
   }
 
   async getTest(id: string) {
@@ -102,19 +124,23 @@ export class SupabaseService {
         test_results (*)
       `)
       .eq('id', id)
-      .single();
+      .maybeSingle(); // Use maybeSingle() instead of single() - returns null if not found, doesn't throw
 
-    if (error) throw error;
+    if (error) {
+      logger.error('Error fetching test', { id, error });
+      throw error;
+    }
+
     return data as any;
   }
 
   async updateTest(id: string, updates: any) {
     const { data, error } = await (this.client as any)
       .from('tests')
-      .update({ ...updates, updated_at: new Date().toISOString() })
+      .update(updates) // Don't add updated_at - tests table doesn't have it
       .eq('id', id)
       .select()
-      .single();
+      .maybeSingle();
 
     if (error) throw error;
     return data as any;
@@ -150,7 +176,7 @@ export class SupabaseService {
   async updateTestResult(id: string, updates: any) {
     const { data, error } = await (this.client as any)
       .from('test_results')
-      .update({ ...updates, updated_at: new Date().toISOString() })
+      .update(updates) // Don't add updated_at - column doesn't exist in test_results
       .eq('id', id)
       .select()
       .single();

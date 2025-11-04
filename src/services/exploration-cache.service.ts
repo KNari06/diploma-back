@@ -12,10 +12,15 @@ export async function saveExplorationToCache(
   projectId: string
 ): Promise<{ id: string; success: boolean }> {
   try {
+    // If userId is not a valid UUID, use null (anonymous user)
+    const validUserId = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+      ? userId
+      : null;
+
     const { data, error } = await supabaseAdmin
       .from('exploration_cache')
       .insert({
-        user_id: userId,
+        user_id: validUserId,
         project_id: projectId,
         url: exploration.url,
         scope: exploration.pageInfo.title || 'Unknown',
@@ -104,11 +109,16 @@ export async function saveTestPlan(
   explorationId?: string
 ): Promise<{ success: boolean }> {
   try {
+    // If userId is not a valid UUID, use null (anonymous user)
+    const validUserId = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+      ? userId
+      : null;
+
     const { error } = await supabaseAdmin
       .from('test_plans')
       .insert({
         id: testPlan.id,
-        user_id: userId,
+        user_id: validUserId,
         project_id: projectId,
         url: testPlan.url,
         scope: testPlan.scope,
@@ -125,7 +135,13 @@ export async function saveTestPlan(
       });
 
     if (error) {
-      logger.error('Failed to save test plan', { error });
+      logger.error('Failed to save test plan', {
+        error,
+        errorMessage: error.message,
+        errorDetails: error.details,
+        testPlanId: testPlan.id,
+        userId: validUserId,
+      });
       throw error;
     }
 
@@ -149,14 +165,26 @@ export async function getTestPlan(
   userId: string
 ): Promise<TestPlan | null> {
   try {
-    const { data, error } = await supabaseAdmin
+    // Check if userId is valid UUID
+    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+    let query = supabaseAdmin
       .from('test_plans')
       .select('*')
-      .eq('id', planId)
-      .eq('user_id', userId) // Security: only owner can access
-      .single();
+      .eq('id', planId);
+
+    // Only filter by user_id if it's a valid UUID
+    if (isValidUUID) {
+      query = query.eq('user_id', userId);
+    } else {
+      // For invalid UUIDs, look for plans with NULL user_id (anonymous)
+      query = query.is('user_id', null);
+    }
+
+    const { data, error } = await query.single();
 
     if (error || !data) {
+      logger.warn('Test plan not found', { planId, userId, isValidUUID });
       return null;
     }
 
@@ -189,20 +217,30 @@ export async function confirmTestPlan(
   userId: string
 ): Promise<{ success: boolean; plan?: TestPlan }> {
   try {
-    const { data, error } = await supabaseAdmin
+    // Check if userId is valid UUID
+    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+    let query = supabaseAdmin
       .from('test_plans')
       .update({
         status: 'confirmed',
         confirmed_at: new Date().toISOString(),
       })
       .eq('id', planId)
-      .eq('user_id', userId)
-      .eq('status', 'pending_confirmation') // Only confirm if still pending
-      .select()
-      .single();
+      .eq('status', 'pending_confirmation'); // Only confirm if still pending
+
+    // Only filter by user_id if it's a valid UUID
+    if (isValidUUID) {
+      query = query.eq('user_id', userId);
+    } else {
+      // For invalid UUIDs, match NULL user_id (anonymous)
+      query = query.is('user_id', null);
+    }
+
+    const { data, error } = await query.select().single();
 
     if (error || !data) {
-      logger.warn('Failed to confirm test plan', { planId, error });
+      logger.warn('Failed to confirm test plan', { planId, userId, isValidUUID, error });
       return { success: false };
     }
 
@@ -241,7 +279,10 @@ export async function rejectTestPlan(
   reason?: string
 ): Promise<{ success: boolean }> {
   try {
-    const { error } = await supabaseAdmin
+    // Check if userId is valid UUID
+    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+    let query = supabaseAdmin
       .from('test_plans')
       .update({
         status: 'rejected',
@@ -249,8 +290,17 @@ export async function rejectTestPlan(
         rejection_reason: reason,
       })
       .eq('id', planId)
-      .eq('user_id', userId)
       .eq('status', 'pending_confirmation');
+
+    // Only filter by user_id if it's a valid UUID
+    if (isValidUUID) {
+      query = query.eq('user_id', userId);
+    } else {
+      // For invalid UUIDs, match NULL user_id (anonymous)
+      query = query.is('user_id', null);
+    }
+
+    const { error } = await query;
 
     if (error) {
       logger.error('Failed to reject test plan', { error });

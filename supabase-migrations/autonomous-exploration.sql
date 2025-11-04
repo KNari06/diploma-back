@@ -6,7 +6,7 @@
 -- Stores results of autonomous product explorations
 CREATE TABLE IF NOT EXISTS exploration_cache (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL,
+  user_id UUID, -- Nullable for anonymous users
   project_id TEXT NOT NULL,
   url TEXT NOT NULL,
   scope TEXT NOT NULL,
@@ -36,7 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_exploration_cache_expires
 -- Stores test plans awaiting user confirmation
 CREATE TABLE IF NOT EXISTS test_plans (
   id TEXT PRIMARY KEY, -- plan_timestamp_random
-  user_id UUID NOT NULL,
+  user_id UUID, -- Nullable for anonymous users
   project_id TEXT NOT NULL,
 
   -- Plan details
@@ -128,31 +128,31 @@ ALTER TABLE exploration_cache ENABLE ROW LEVEL SECURITY;
 ALTER TABLE test_plans ENABLE ROW LEVEL SECURITY;
 ALTER TABLE test_credentials ENABLE ROW LEVEL SECURITY;
 
--- Exploration cache policies
+-- Exploration cache policies (allow anonymous + authenticated)
 CREATE POLICY "Users can view their own exploration cache"
   ON exploration_cache FOR SELECT
-  USING (auth.uid() = user_id);
+  USING (auth.uid() = user_id OR user_id IS NULL);
 
 CREATE POLICY "Users can insert their own exploration cache"
   ON exploration_cache FOR INSERT
-  WITH CHECK (auth.uid() = user_id);
+  WITH CHECK (auth.uid() = user_id OR user_id IS NULL);
 
 CREATE POLICY "Users can update their own exploration cache"
   ON exploration_cache FOR UPDATE
-  USING (auth.uid() = user_id);
+  USING (auth.uid() = user_id OR user_id IS NULL);
 
--- Test plans policies
+-- Test plans policies (allow anonymous + authenticated)
 CREATE POLICY "Users can view their own test plans"
   ON test_plans FOR SELECT
-  USING (auth.uid() = user_id);
+  USING (auth.uid() = user_id OR user_id IS NULL);
 
 CREATE POLICY "Users can insert their own test plans"
   ON test_plans FOR INSERT
-  WITH CHECK (auth.uid() = user_id);
+  WITH CHECK (auth.uid() = user_id OR user_id IS NULL);
 
 CREATE POLICY "Users can update their own test plans"
   ON test_plans FOR UPDATE
-  USING (auth.uid() = user_id);
+  USING (auth.uid() = user_id OR user_id IS NULL);
 
 -- Credentials policies (most restrictive)
 CREATE POLICY "Users can view their own credentials"

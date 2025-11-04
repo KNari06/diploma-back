@@ -1,10 +1,9 @@
-import { Worker } from 'bullmq';
 import { env } from '@/config/env';
-import { logger } from '@/utils/logger';
-import { connection } from '@/config/queues';
-import { ManualTestRunJobHandler, ManualTestResultJobHandler } from '@/jobs/manual-test-run.job';
+import { connection, QUEUE_NAMES } from '@/config/queues';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
-import { QUEUE_NAMES } from '@/config/queues';
+import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
+import { logger } from '@/utils/logger';
+import { Worker } from 'bullmq';
 
 // Worker configuration
 const workerOptions = {
@@ -12,17 +11,46 @@ const workerOptions = {
   concurrency: env.QUEUE_CONCURRENCY,
   removeOnComplete: { count: 100 },
   removeOnFail: { count: 50 },
+  lockDuration: 300000, // 5 minutes - для долгих Playwright тестов
+  stalledInterval: 60000, // 1 minute - проверка stalled jobs
+  maxStalledCount: 2, // Максимум 2 stalled перед permanent fail
 };
 
 // Create workers for each queue
+logger.info(`Creating TestRun worker for queue: ${QUEUE_NAMES.TEST_RUN}`);
+
 const testRunWorker = new Worker(
   QUEUE_NAMES.TEST_RUN,
   async (job) => {
-    logger.info(`Processing manual test run job: ${job.id}`);
-    return await ManualTestRunJobHandler.process(job);
+    // This should execute when job is picked up
+    logger.info(`🎯 [CRITICAL] TestRun worker picked up job: ${job.id}`);
+
+    try {
+      logger.info(`[WRAPPER] Received job: ${job.id}`, {
+        jobData: JSON.stringify(job.data).substring(0, 200),
+      });
+      logger.info(`Processing manual test run job: ${job.id}`);
+
+      // Check if handler exists
+      if (!ManualTestRunJobHandler || typeof ManualTestRunJobHandler.process !== 'function') {
+        throw new Error('ManualTestRunJobHandler.process is not a function!');
+      }
+
+      const result = await ManualTestRunJobHandler.process(job);
+      logger.info(`[WRAPPER] Job completed successfully: ${job.id}`);
+      return result;
+    } catch (error) {
+      logger.error(`[WRAPPER] Job handler threw error: ${job.id}`, {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw error;
+    }
   },
   workerOptions
 );
+
+logger.info(`TestRun worker created successfully`);
 
 const testResultWorker = new Worker(
   QUEUE_NAMES.TEST_RESULT,
@@ -63,11 +91,11 @@ const webhookWorker = new Worker(
 // Worker event listeners
 const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('ready', () => {
-    logger.info(`✅ ${workerName} worker ready`);
+    logger.info(`✅ ${workerName} worker ready and waiting for jobs`);
   });
 
   worker.on('active', (job) => {
-    logger.info(`🔄 ${workerName} worker processing job: ${job.id}`);
+    logger.info(`🔄 ${workerName} worker ACTIVE (started processing): ${job.id}`);
   });
 
   worker.on('completed', (job, result) => {
@@ -75,11 +103,18 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
   });
 
   worker.on('failed', (job, err) => {
-    logger.error(`❌ ${workerName} worker failed job: ${job?.id}`, err);
+    logger.error(`❌ ${workerName} worker FAILED job: ${job?.id}`, {
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+      jobData: job?.data ? JSON.stringify(job.data).substring(0, 200) : 'N/A',
+    });
   });
 
   worker.on('error', (err) => {
-    logger.error(`❌ ${workerName} worker error:`, err);
+    logger.error(`❌ ${workerName} worker ERROR:`, {
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+    });
   });
 
   worker.on('stalled', (jobId) => {
@@ -121,24 +156,44 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
-  logger.error('Uncaught exception in worker:', error);
-  process.exit(1);
+  logger.error('🚨 Uncaught exception in worker:', {
+    error: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined,
+  });
+  // Don't exit immediately - let it retry
+  // process.exit(1);
 });
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled rejection in worker:', reason);
-  process.exit(1);
+  logger.error('🚨 Unhandled rejection in worker:', {
+    reason: reason instanceof Error ? reason.message : String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
+  // Don't exit immediately - let it retry
+  // process.exit(1);
 });
 
 logger.info('🚀 QAI Worker started');
 logger.info(`📊 Concurrency: ${env.QUEUE_CONCURRENCY}`);
 logger.info(`🔧 Environment: ${env.NODE_ENV}`);
+logger.info(`🔌 Redis: ${env.REDIS_HOST}:${env.REDIS_PORT}`);
+logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`);
+
+// Test Redis connection
+(async () => {
+  try {
+    const Redis = await import('ioredis');
+    const testRedis = new Redis.default(connection as any);
+    await testRedis.ping();
+    logger.info('✅ Redis connection test PASSED');
+    await testRedis.quit();
+  } catch (error) {
+    logger.error('❌ Redis connection test FAILED', error);
+  }
+})();
 
 export {
-  testRunWorker,
-  testResultWorker,
   aiAnalysisWorker,
-  notificationWorker,
-  webhookWorker,
+  notificationWorker, testResultWorker, testRunWorker, webhookWorker
 };

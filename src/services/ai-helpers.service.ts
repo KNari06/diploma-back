@@ -8,6 +8,111 @@ import { getChatCompletionWithMessages } from '@/services/openai.service';
  */
 
 /**
+ * Detect user approval/rejection of test plan
+ * Universal AI-powered detection - user can write ANYTHING
+ * Uses GPT-3.5-turbo for cost efficiency
+ */
+export async function detectUserApproval(
+  userMessage: string
+): Promise<{
+  approved: boolean | null; // true = approve, false = reject, null = unclear
+  confidence: number; // 0.0-1.0
+  reasoning?: string;
+}> {
+  try {
+    logger.info('Detecting user approval with AI', {
+      message: userMessage.substring(0, 50),
+    });
+
+    const prompt = `Analyze if user APPROVES or REJECTS the proposed action.
+
+User can write ANYTHING in ANY language. Your task: detect approval/rejection intent.
+
+Approval examples: да, давай, ок, согласен, хорошо, запускай, подтверждаю, го, go, yes, ok, sure, proceed, confirm, accept, let's do it, sounds good, +
+Rejection examples: нет, отмена, не надо, отклоняю, стоп, no, cancel, reject, abort, stop, don't, -
+
+User message: "${userMessage}"
+
+Return ONLY JSON:
+{
+  "approved": true | false | null,
+  "confidence": 0.0-1.0,
+  "reasoning": "why you decided this"
+}
+
+Examples:
+
+User: "Да!"
+{"approved": true, "confidence": 0.95, "reasoning": "Clear approval"}
+
+User: "го"
+{"approved": true, "confidence": 0.9, "reasoning": "Slang approval"}
+
+User: "Нет, не надо"
+{"approved": false, "confidence": 0.95, "reasoning": "Clear rejection"}
+
+User: "А можно изменить шаг 3?"
+{"approved": null, "confidence": 0.2, "reasoning": "User wants modification, not clear approval/rejection"}
+
+User: "Давай, но измени URL"
+{"approved": true, "confidence": 0.7, "reasoning": "Approval with condition"}
+
+Analyze: "${userMessage}"
+JSON:`;
+
+    const response = await getChatCompletionWithMessages([
+      {
+        role: 'system',
+        content: 'You are an intent detection expert. Detect approval/rejection from ANY natural language input. Return ONLY valid JSON with approved (boolean|null), confidence (number), reasoning (string).',
+      },
+      {
+        role: 'user',
+        content: prompt,
+      },
+    ], {
+      model: 'gpt-3.5-turbo',
+      temperature: 0.2, // Low temp for consistent results
+      max_tokens: 100,
+    });
+
+    const parsed = JSON.parse(response);
+
+    logger.info('User approval detected', {
+      approved: parsed.approved,
+      confidence: parsed.confidence,
+      reasoning: parsed.reasoning,
+    });
+
+    return {
+      approved: parsed.approved,
+      confidence: parsed.confidence || 0,
+      reasoning: parsed.reasoning,
+    };
+  } catch (error) {
+    logger.error('Failed to detect user approval', { error });
+
+    // Fallback: simple keyword matching
+    const message = userMessage.toLowerCase().trim();
+
+    const approvalKeywords = ['да', 'давай', 'ок', 'согласен', 'го', 'хорошо', 'go', 'yes', 'ok', 'sure', 'запускай', '+', 'подтверждаю', 'accept'];
+    const rejectionKeywords = ['нет', 'не надо', 'отмена', 'стоп', 'no', 'cancel', 'reject', 'stop', '-', 'отклоняю'];
+
+    // Check approval
+    if (approvalKeywords.some(k => message.includes(k))) {
+      return { approved: true, confidence: 0.6, reasoning: 'Keyword matching (fallback)' };
+    }
+
+    // Check rejection
+    if (rejectionKeywords.some(k => message.includes(k))) {
+      return { approved: false, confidence: 0.6, reasoning: 'Keyword matching (fallback)' };
+    }
+
+    // Unclear
+    return { approved: null, confidence: 0.1, reasoning: 'No clear intent (fallback)' };
+  }
+}
+
+/**
  * Detect login page using AI (fallback to hardcode)
  * Uses GPT-3.5-turbo for cost efficiency
  */

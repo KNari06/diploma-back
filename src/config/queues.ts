@@ -1,9 +1,9 @@
+import { AgentResponse, TestJobData } from '@/types';
+import { handleQueueError } from '@/utils/error-handler';
+import { logger, logQueueEvent } from '@/utils/logger';
 import { Queue, QueueEvents } from 'bullmq';
 import IORedis from 'ioredis';
 import { env } from './env';
-import { logger, logQueueEvent } from '@/utils/logger';
-import { handleQueueError } from '@/utils/error-handler';
-import { TestJobData, AgentResponse } from '@/types';
 
 // Redis connection configuration
 const redisConnection = new IORedis(env.REDIS_URL, {
@@ -447,5 +447,5 @@ export const gracefulShutdown = async () => {
 
 // Export all queues and utilities
 export {
-  redisConnection,
+  redisConnection
 };
