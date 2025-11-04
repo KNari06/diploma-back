@@ -3,7 +3,7 @@ name: Deploy QAI Backend
 on:
   push:
     branches:
-      - main2
+      - main-04-11
 
 jobs:
   deploy:

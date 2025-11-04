@@ -1,50 +1,29 @@
-# QAI Backend Dockerfile
-FROM node:18-alpine AS base
-
-# Install dependencies only when needed
-FROM base AS deps
-RUN apk add --no-cache libc6-compat
+# --- Build stage ---
+FROM node:22-slim AS builder
 WORKDIR /app
 
-# Install dependencies based on the preferred package manager
-COPY package.json package-lock.json* ./
-RUN npm ci --only=production
+COPY package*.json ./
+ENV HUSKY=0
+RUN npm ci
 
-# Rebuild the source code only when needed
-FROM base AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
+# Копируем исходники и билдим без тестов
 COPY . .
+RUN npx tsc -p tsconfig.build.json
 
-# Build the application
-RUN npm run build
-
-# Production image, copy all the files and run the app
-FROM base AS runner
+# --- Runtime stage ---
+FROM node:22-slim AS runner
 WORKDIR /app
 
-# Create a non-root user
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 qai
+COPY package*.json ./
+RUN npm ci --omit=dev --ignore-scripts
 
-# Copy built application
+# Кладём сборку
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/tsconfig.json ./tsconfig.json
 
-# Create logs directory
-RUN mkdir -p logs && chown -R qai:nodejs logs
+# Минимальный tsconfig для tsconfig-paths в рантайме (alias @/* -> dist/*)
+RUN printf '{\n  "compilerOptions": {\n    "baseUrl": ".",\n    "paths": { "@/*": ["dist/*"] }\n  }\n}\n' > /app/tsconfig.json
 
-# Switch to non-root user
-USER qai
-
-# Expose port
+ENV NODE_ENV=production
 EXPOSE 3000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:3000/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) })"
-
-# Start the application with tsconfig-paths support
 CMD ["node", "-r", "tsconfig-paths/register", "dist/index.js"]

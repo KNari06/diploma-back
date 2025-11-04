@@ -218,6 +218,3 @@ ecosystem.config.js
 
 # Render
 .render
-
-# Uploads (trace files, etc.)
-uploads/
