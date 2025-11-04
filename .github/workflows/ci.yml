@@ -16,16 +16,24 @@ jobs:
       - name: Set up SSH
         uses: webfactory/ssh-agent@v0.8.0
         with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          ssh-private-key: |
+            -----BEGIN OPENSSH PRIVATE KEY-----
+            b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+            QyNTUxOQAAACByCxK0xU2MGZHuQEWXrVQofEEfTy4UgxIzs8n/7zNVegAAAMjD8QZkw/EG
+            ZAAAAAtzc2gtZWQyNTUxOQAAACByCxK0xU2MGZHuQEWXrVQofEEfTy4UgxIzs8n/7zNVeg
+            AAAED4afrqNEaigeQlZClDVnN6wCuaQrBTxhJRtw9dj0zC43ILErTFTYwZke5ARZetVCh8
+            QR9PLhSDEjOzyf/vM1V6AAAAQHJvb3RAaW5zdGFuY2UtMS51cy1jZW50cmFsMS1jLmMuZm
+            lyc3QtZm9vdGluZy00NzY3MTUtYzYuaW50ZXJuYWwBAgMEBQ==
+            -----END OPENSSH PRIVATE KEY-----
 
       - name: Deploy to remote server
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+          ssh -o StrictHostKeyChecking=no root@34.10.193.13 << 'EOF'
             set -e
             cd ~/QAI---BackEnd || exit 1
 
             echo "Updating repository..."
-            git fetch origin main && git reset --hard origin/main
+            git fetch origin main-04-11 && git reset --hard origin/main-04-11
 
             echo "Stopping old container..."
             docker stop qai-backend || true
