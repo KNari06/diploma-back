@@ -6,6 +6,7 @@ export interface ChatRequest {
   sessionId?: string; // Existing chat session ID
   conversationId?: string; // For multi-turn conversations (questions/answers)
   answers?: Record<string, any>; // Answers to clarifying questions
+  userId?: string; // Optional userId for testing/dev (when no auth token)
 }
 
 export interface ChatResponse {

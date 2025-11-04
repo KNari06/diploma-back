@@ -245,10 +245,11 @@ export function formatTestPlanForConfirmation(plan: TestPlan): string {
   markdown += `\n---\n\n`;
   markdown += `**Plan ID:** \`${plan.id}\`\n`;
   markdown += `**Expires:** ${new Date(plan.expiresAt).toLocaleString()}\n\n`;
-  markdown += `✅ **Чтобы продолжить, подтвердите этот plan:**\n`;
-  markdown += `\`/confirm ${plan.id}\`\n\n`;
-  markdown += `❌ **Чтобы отменить:**\n`;
-  markdown += `\`/reject ${plan.id}\` с указанием причины\n`;
+  markdown += `💬 **Подтвердить тест план?**\n\n`;
+  markdown += `Напишите свой ответ (любыми словами):\n`;
+  markdown += `- ✅ Да / Давай / Ок / Go / Запускай → Выполнить тест\n`;
+  markdown += `- ❌ Нет / Отмена / Стоп / Cancel → Отклонить\n\n`;
+  markdown += `AI поймёт ваш ответ на любом языке! 🤖\n`;
 
   return markdown;
 }

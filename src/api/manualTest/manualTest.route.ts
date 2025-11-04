@@ -1,10 +1,10 @@
-import { Router, Request, Response } from 'express';
-import { z } from 'zod';
+import { optionalAuth, requireAuth, requireCredits } from '@/middleware/auth.middleware';
 import { ManualTestService } from '@/services/manualTest.service';
+import { TestRunRequest } from '@/types';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { logger } from '@/utils/logger';
-import { TestRunRequest } from '@/types';
-import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
+import { Request, Response, Router } from 'express';
+import { z } from 'zod';
 
 const router = Router();
 
@@ -107,9 +107,9 @@ router.post('/result', asyncHandler(async (req: Request, res: Response) => {
  * GET /manual-test/:id
  * Get manual test by ID
  */
-router.get('/:id', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+router.get('/:id', optionalAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const userId = req.user!.id;
+  const userId = req.user?.id;
 
   const result = await ManualTestService.getTest(id, userId);
 
@@ -197,9 +197,9 @@ router.post('/:id/retry', requireAuth, requireCredits(1), asyncHandler(async (re
  * GET /manual-test/:id/status
  * Get manual test status (lightweight endpoint for polling)
  */
-router.get('/:id/status', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+router.get('/:id/status', optionalAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const userId = req.user!.id;
+  const userId = req.user?.id;
 
   const test = await ManualTestService.getTest(id, userId);
 

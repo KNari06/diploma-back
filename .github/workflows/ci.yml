@@ -33,7 +33,7 @@ jobs:
             cd ~/QAI---BackEnd || exit 1
 
             echo "Updating repository..."
-            git fetch origin main-04-11 && git reset --hard origin/main-04-11
+            git fetch origin main && git reset --hard origin/main
 
             echo "Stopping and removing existing containers..."
             docker rm -f qai-backend qai-worker || true

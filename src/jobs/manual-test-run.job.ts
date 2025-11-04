@@ -13,22 +13,28 @@ export class ManualTestRunJobHandler {
    * Process test run job
    */
   static async process(job: Job<TestJobData>) {
-    const { testId, url, browser, options, projectId, userId, retryCount = 0 } = job.data;
+    const { testId, url, browser, options, projectId, userId, retryCount = 0, commands, intent } = job.data;
 
-    logger.info(`Processing test run job: ${testId} (${browser})`);
+    logger.info(`[WORKER] Step 1: Processing test run job: ${testId} (${browser})`, {
+      hasCommands: !!commands,
+      commandsCount: commands?.length,
+      intent,
+    });
     logQueueEvent('processing', job.id!, { testId, browser });
 
     try {
       // Update test status to running
+      logger.info('[WORKER] Step 2: Updating test status to running');
       await dbAdminService.updateTest(testId, {
         status: 'running',
         started_at: new Date().toISOString(),
       });
 
-      logger.info('Executing Playwright test locally', {
+      logger.info('[WORKER] Step 3: Executing Playwright test locally', {
         testId,
         browser,
         url,
+        hasCommands: !!commands,
       });
 
       // Execute test using local Playwright agent (integrated)
@@ -40,12 +46,20 @@ export class ManualTestRunJobHandler {
           options,
           projectId,
           userId,
+          commands,
+          intent,
         },
         env.AGENT_MAX_RETRIES || 2
       );
 
       // Process result
+      logger.info('[WORKER] Step 4: Test execution completed', {
+        success: result.success,
+        status: result.status,
+      });
+
       if (result.success) {
+        logger.info('[WORKER] Step 5: Creating test result in database');
         // Create test result in database
         await dbAdminService.createTestResult({
           test_id: testId,

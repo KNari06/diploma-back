@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { logger, logTestEvent } from '@/utils/logger';
 import { ValidationError, NotFoundError, QAIError } from '@/types';
-import { dbAdminService, dbService } from '@/db/supabase';
+import { dbAdminService, dbService, supabaseAdmin } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
 import { TestRunRequest, Test, TestResult, BrowserType, TestOptions, ApiResponse, PaginatedResponse } from '@/types';
 
@@ -16,9 +16,14 @@ export class ManualTestService {
       // Validate test request
       this.validateTestRequest(testRequest);
 
-      // Check user credits if userId provided
+      // Check user credits if userId provided AND is valid UUID
       if (testRequest.userId) {
-        await this.checkUserCredits(testRequest.userId, testRequest.browsers);
+        const isValidUserUUID = testRequest.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+        if (isValidUserUUID) {
+          await this.checkUserCredits(testRequest.userId, testRequest.browsers);
+        } else {
+          logger.info('Skipping credit check for anonymous user', { userId: testRequest.userId });
+        }
       }
 
       // Create test record
@@ -39,9 +44,12 @@ export class ManualTestService {
         });
       }
 
-      // Deduct credits if userId provided
+      // Deduct credits if userId provided AND is valid UUID
       if (testRequest.userId) {
-        await this.deductCredits(testRequest.userId, testRequest.browsers);
+        const isValidUserUUID = testRequest.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+        if (isValidUserUUID) {
+          await this.deductCredits(testRequest.userId, testRequest.browsers);
+        }
       }
 
       logTestEvent('created', test.id, { url: testRequest.url, browsers: testRequest.browsers });
@@ -351,17 +359,86 @@ export class ManualTestService {
    * Create test record
    */
   private static async createTest(testRequest: TestRunRequest): Promise<Test> {
+    // Validate userId is a valid UUID, otherwise use null
+    const isValidUUID = testRequest.userId && testRequest.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    const validUserId = isValidUUID ? testRequest.userId : null;
+
+    // Validate projectId is a valid UUID, otherwise get/create default project
+    const isValidProjectUUID = testRequest.projectId && testRequest.projectId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    let validProjectId = isValidProjectUUID ? testRequest.projectId : null;
+
+    if (!validProjectId) {
+      logger.warn('Invalid projectId provided, getting default project', { projectId: testRequest.projectId });
+      validProjectId = await this.getOrCreateDefaultProject();
+    }
+
     const testData = {
       id: uuidv4(),
       url: testRequest.url,
-      project_id: testRequest.projectId,
-      user_id: testRequest.userId,
+      project_id: validProjectId,
+      user_id: validUserId,
       status: 'pending' as const,
       browsers: testRequest.browsers,
       options: testRequest.options || {},
     };
 
-    return await dbAdminService.createTest(testData);
+    logger.info('[CREATE_TEST] Attempting to create test in DB', {
+      testId: testData.id,
+      projectId: validProjectId,
+      userId: validUserId,
+    });
+
+    const createdTest = await dbAdminService.createTest(testData);
+
+    logger.info('[CREATE_TEST] Test created successfully in DB', {
+      testId: (createdTest as any).id,
+    });
+
+    return createdTest;
+  }
+
+  /**
+   * Get or create default project for anonymous users
+   */
+  private static async getOrCreateDefaultProject(): Promise<string> {
+    const DEFAULT_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
+
+    try {
+      // Check if default project exists
+      const { data: existingProject } = await supabaseAdmin
+        .from('projects')
+        .select('id')
+        .eq('id', DEFAULT_PROJECT_ID)
+        .single();
+
+      if (existingProject) {
+        return DEFAULT_PROJECT_ID;
+      }
+
+      // Create default project for anonymous users
+      const { data: newProject, error } = await supabaseAdmin
+        .from('projects')
+        .insert({
+          id: DEFAULT_PROJECT_ID,
+          name: 'Default Project (Anonymous)',
+          description: 'Default project for anonymous test users',
+          user_id: DEFAULT_PROJECT_ID, // Self-reference for system project
+          settings: {},
+        })
+        .select()
+        .single();
+
+      if (error) {
+        logger.error('Failed to create default project', error);
+        throw error;
+      }
+
+      logger.info('Created default project for anonymous users', { id: DEFAULT_PROJECT_ID });
+      return DEFAULT_PROJECT_ID;
+    } catch (error) {
+      logger.error('Error getting/creating default project', error);
+      throw error;
+    }
   }
 
   /**

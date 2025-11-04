@@ -1,16 +1,16 @@
-import { logger } from '@/utils/logger';
-import { generateClarifyingQuestions, parseAnswers } from '@/services/question-generator.service';
 import { exploreProduct } from '@/services/autonomous-explorer.service';
-import { generateTestPlan, formatTestPlanForConfirmation } from '@/services/test-plan-generator.service';
+import { retrieveCredentials, storeCredentials } from '@/services/credentials-manager.service';
 import {
-  saveExplorationToCache,
-  getCachedExploration,
-  saveTestPlan,
   confirmTestPlan as confirmPlanInDB,
+  getCachedExploration,
+  getTestPlan,
   rejectTestPlan as rejectPlanInDB,
-  getTestPlan
+  saveExplorationToCache,
+  saveTestPlan
 } from '@/services/exploration-cache.service';
-import { storeCredentials, retrieveCredentials } from '@/services/credentials-manager.service';
+import { generateClarifyingQuestions, parseAnswers } from '@/services/question-generator.service';
+import { formatTestPlanForConfirmation, generateTestPlan } from '@/services/test-plan-generator.service';
+import { logger } from '@/utils/logger';
 
 /**
  * Autonomous testing workflow orchestrator
@@ -26,24 +26,39 @@ export function needsAutonomousMode(context: {
   hasDocumentation: boolean;
   intent: string;
 }): boolean {
-  // If intent is general_chat or api_test, not needed
-  if (context.intent === 'general_chat' || context.intent === 'api_test') {
+  logger.info('[AUTONOMOUS] Checking if autonomous mode needed', {
+    hasUrl: context.hasUrl,
+    hasTraces: context.hasTraces,
+    hasDocumentation: context.hasDocumentation,
+    intent: context.intent,
+  });
+
+  // Skip only for general chat and API testing (explicitly non-UI intents)
+  const skipIntents = ['general_chat', 'api_test'];
+  if (skipIntents.includes(context.intent)) {
+    logger.info('[AUTONOMOUS] Skipping - intent is general_chat or api_test');
     return false;
   }
 
   // If we have no URL, definitely need it
   if (!context.hasUrl) {
+    logger.info('[AUTONOMOUS] Activating - no URL provided');
     return true;
   }
 
   // If we have traces or documentation, we have enough context
   if (context.hasTraces || context.hasDocumentation) {
+    logger.info('[AUTONOMOUS] Skipping - we have traces or documentation');
     return false;
   }
 
-  // If UI testing intent but no context, need autonomous mode
-  const uiTestIntents = ['check_element', 'fill_form', 'login_flow', 'assert_ui', 'navigate'];
-  return uiTestIntents.includes(context.intent);
+  // For ANY other intent with URL but no context → need autonomous mode
+  // This is universal: custom, ui_test, check_element, login_flow, etc.
+  logger.info('[AUTONOMOUS] Decision: Activating', {
+    reason: `Intent '${context.intent}' needs UI testing but lacks context (no traces/docs)`,
+  });
+
+  return true;
 }
 
 /**
@@ -81,21 +96,28 @@ export async function runAutonomousExploration(params: {
   const { userMessage, answers, userId, projectId } = params;
 
   try {
+    logger.info('[AUTONOMOUS] Step 1: Starting exploration', { userId, projectId });
+
     // Parse answers
+    logger.info('[AUTONOMOUS] Step 2: Parsing answers', { answers });
     const parsedAnswers = parseAnswers(answers);
+    logger.info('[AUTONOMOUS] Step 3: Parsed answers', { parsedAnswers });
 
     if (!parsedAnswers.url) {
+      logger.error('[AUTONOMOUS] ERROR: URL is missing in parsed answers');
       throw new Error('URL is required for autonomous exploration');
     }
 
-    logger.info('Starting autonomous exploration workflow', {
+    logger.info('[AUTONOMOUS] Step 4: Starting workflow', {
       url: parsedAnswers.url,
       scope: parsedAnswers.scope,
       needsAuth: parsedAnswers.needsAuth,
     });
 
     // Check cache first
+    logger.info('[AUTONOMOUS] Step 5: Checking cache');
     const cached = await getCachedExploration(parsedAnswers.url, projectId);
+    logger.info('[AUTONOMOUS] Step 6: Cache result', { hasCached: !!cached });
     let exploration: any;
     let explorationId: string | undefined;
 
@@ -104,10 +126,15 @@ export async function runAutonomousExploration(params: {
       exploration = cached;
     } else {
       // Run fresh exploration
-      logger.info('Running fresh autonomous exploration');
+      logger.info('[AUTONOMOUS] Step 7: Running fresh exploration');
 
       // Retrieve credentials if needed
       let credentials;
+      logger.info('[AUTONOMOUS] Step 8: Handling credentials', {
+        needsAuth: parsedAnswers.needsAuth,
+        hasCredentials: !!parsedAnswers.credentials,
+      });
+
       if (parsedAnswers.needsAuth && parsedAnswers.credentials) {
         // Store credentials securely
         const stored = await storeCredentials({
@@ -126,6 +153,11 @@ export async function runAutonomousExploration(params: {
       }
 
       // Explore product
+      logger.info('[AUTONOMOUS] Step 9: Launching browser and exploring product', {
+        url: parsedAnswers.url,
+        scope: parsedAnswers.scope,
+      });
+
       exploration = await exploreProduct({
         url: parsedAnswers.url,
         scope: parsedAnswers.scope || 'general',
@@ -133,18 +165,21 @@ export async function runAutonomousExploration(params: {
         needsAuth: parsedAnswers.needsAuth,
       });
 
+      logger.info('[AUTONOMOUS] Step 10: Exploration completed successfully');
+
       // Save to cache
       const cacheResult = await saveExplorationToCache(exploration, userId, projectId);
       explorationId = cacheResult.id;
     }
 
     // Generate test plan from exploration
-    logger.info('Generating test plan from exploration');
+    logger.info('[AUTONOMOUS] Step 11: Generating test plan');
     const testPlan = await generateTestPlan(exploration, {
       message: userMessage,
       scope: parsedAnswers.scope || 'general',
       additionalInfo: parsedAnswers.additionalInfo,
     });
+    logger.info('[AUTONOMOUS] Step 12: Test plan generated', { planId: testPlan.id });
 
     // Save test plan
     await saveTestPlan(testPlan, userId, projectId, explorationId);
@@ -163,7 +198,10 @@ export async function runAutonomousExploration(params: {
       message: formattedPlan,
     };
   } catch (error) {
-    logger.error('Autonomous exploration workflow failed', { error });
+    logger.error('[AUTONOMOUS] ERROR: Workflow failed', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     throw error;
   }
 }

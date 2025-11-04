@@ -1,30 +1,31 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { detectUserApproval, parseNaturalAnswers } from '@/services/ai-helpers.service';
 import { executeApiTest } from '@/services/apiTest.service';
+import {
+  confirmAndExecuteTestPlan,
+  needsAutonomousMode,
+  rejectPlan,
+  requestMissingInformation,
+  runAutonomousExploration
+} from '@/services/autonomous-orchestrator.service';
+import { enrichContextForCommands, extractUrlFromMessage } from '@/services/context-enrichment.service';
+import { getTestPlan } from '@/services/exploration-cache.service';
 import { parseUserIntent } from '@/services/intentParser.service';
-import { getChatCompletion } from '@/services/openai.service';
 import { ManualTestService } from '@/services/manualTest.service';
+import { getChatCompletion } from '@/services/openai.service';
 import { buildChatPrompt } from '@/utils/buildChatPrompt';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 import { ChatRequest } from './chat.types';
-import { enrichContextForCommands, extractUrlFromMessage } from '@/services/context-enrichment.service';
-import {
-  needsAutonomousMode,
-  requestMissingInformation,
-  runAutonomousExploration,
-  confirmAndExecuteTestPlan,
-  rejectPlan
-} from '@/services/autonomous-orchestrator.service';
-import { getTestPlan } from '@/services/exploration-cache.service';
-import { parseNaturalAnswers } from '@/services/ai-helpers.service';
 
 /**
  * Handle chat request from user
  */
 export const handleChat = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { message, context, sessionId, conversationId, answers } = req.body as ChatRequest;
-    const userId = req.user?.id; // From auth middleware
+    const { message, context, sessionId, conversationId, answers, userId: bodyUserId } = req.body as ChatRequest;
+    // Use userId from auth middleware, fallback to body (for testing/dev)
+    const userId = req.user?.id || bodyUserId;
 
     logger.info('Chat request received', {
       userId,
@@ -36,7 +37,10 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     // Get or create chat session
     let chatSessionId = sessionId;
-    if (userId && !chatSessionId) {
+    // Only create session if userId is a valid UUID
+    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+    if (isValidUUID && !chatSessionId) {
       // Create new session if userId provided but no sessionId
       const { data: newSession, error: sessionError } = await supabaseAdmin
         .from('chat_sessions')
@@ -75,21 +79,42 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     // === AUTONOMOUS MODE HANDLING ===
 
-    // Handle plan confirmation/rejection commands
-    if (message.trim().startsWith('/confirm') || message.trim().startsWith('/reject')) {
-      const parts = message.trim().split(' ');
-      const command = parts[0];
-      const planId = parts[1];
+    // Check if there's a pending test plan for this conversation
+    let pendingPlan = null;
+    if (conversationId) {
+      pendingPlan = await getTestPlan(conversationId, userId || 'anonymous');
 
-      if (!planId) {
-        res.json({
-          reply: '❌ Укажите ID плана: /confirm plan_xxx или /reject plan_xxx',
-          timestamp: new Date().toISOString(),
+      if (pendingPlan && pendingPlan.status === 'pending_confirmation') {
+        logger.info('Found pending plan, detecting user approval', {
+          conversationId,
+          planId: pendingPlan.id,
+          message: message.substring(0, 50),
         });
-        return;
-      }
 
-      if (command === '/confirm') {
+        // AI-powered approval detection - user can write ANYTHING
+        const approvalResult = await detectUserApproval(message);
+
+        logger.info('Approval detection result', {
+          approved: approvalResult.approved,
+          confidence: approvalResult.confidence,
+          reasoning: approvalResult.reasoning,
+        });
+
+        // Process based on confidence
+        if (approvalResult.confidence < 0.5) {
+          // Too unclear - ask for clarification
+          res.json({
+            reply: `❓ Не совсем понял ваш ответ.\n\n✅ Подтвердить тест план?\n❌ Отклонить?`,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        if (approvalResult.approved === true) {
+          // APPROVED - execute test plan
+          logger.info('User approved test plan', { planId: pendingPlan.id });
+
+          const planId = pendingPlan.id;
         // Confirm and execute test plan
         const result = await confirmAndExecuteTestPlan(planId, userId || 'anonymous');
 
@@ -120,27 +145,45 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           }
         }
 
-        res.json({
-          reply: result.message,
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
+          res.json({
+            reply: result.message,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        } else if (approvalResult.approved === false) {
+          // REJECTED
+          logger.info('User rejected test plan', { planId: pendingPlan.id });
 
-      if (command === '/reject') {
-        const reason = parts.slice(2).join(' ') || 'No reason provided';
-        const result = await rejectPlan(planId, userId || 'anonymous', reason);
+          const reason = message || 'User rejected';
+          const result = await rejectPlan(pendingPlan.id, userId || 'anonymous', reason);
 
-        res.json({
-          reply: result.message,
-          timestamp: new Date().toISOString(),
-        });
-        return;
+          res.json({
+            reply: result.message,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        } else {
+          // NULL - very unclear, but confidence is >= 0.5 (shouldn't happen normally)
+          res.json({
+            reply: `❓ Не понял ваш ответ. Пожалуйста, ответьте чётче:\n\n✅ Подтвердить?\n❌ Отклонить?`,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
       }
     }
 
     // Parse user intent from natural language with enriched context
     const parsedIntent = await parseUserIntent(message, enrichedContext);
+
+    logger.info('[CHAT] Parsed intent result', {
+      intent: parsedIntent?.intent,
+      hasCommands: !!parsedIntent?.commands,
+      commandsCount: parsedIntent?.commands?.length || 0,
+      action: parsedIntent?.action,
+      apiMethod: parsedIntent?.apiMethod,
+      apiUrl: parsedIntent?.apiUrl,
+    });
 
     // Check if autonomous mode is needed
     const hasTraces = !!(enrichedContext.knownSelectors && Object.keys(enrichedContext.knownSelectors).length > 0);
@@ -151,6 +194,14 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       hasTraces,
       hasDocumentation,
       intent: parsedIntent?.intent || 'unknown',
+    });
+
+    logger.info('[CHAT] Autonomous mode check', {
+      needsAutonomous,
+      hasUrl: !!contextUrl,
+      hasTraces,
+      hasDocumentation,
+      intent: parsedIntent?.intent,
     });
 
     // If autonomous mode needed and no answers provided yet
@@ -222,21 +273,39 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       logger.info('Running autonomous exploration with user answers', {
         conversationId,
         answerCount: Object.keys(answers).length,
+        answers: JSON.stringify(answers),
       });
 
-      const explorationResult = await runAutonomousExploration({
-        userMessage: message,
-        answers,
-        userId: userId || 'anonymous',
-        projectId,
-      });
+      try {
+        const explorationResult = await runAutonomousExploration({
+          userMessage: message,
+          answers,
+          userId: userId || 'anonymous',
+          projectId,
+        });
 
-      res.json({
-        reply: explorationResult.message,
-        testPlan: explorationResult.testPlan,
-        timestamp: new Date().toISOString(),
-      });
-      return;
+        res.json({
+          reply: explorationResult.message,
+          testPlan: explorationResult.testPlan,
+          conversationId,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      } catch (error) {
+        logger.error('Autonomous exploration failed in controller', {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          answers,
+        });
+
+        res.status(500).json({
+          success: false,
+          error: 'Autonomous exploration failed',
+          message: error instanceof Error ? error.message : 'Unknown error',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
     }
 
     let gptResponse: string;
@@ -260,10 +329,13 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         } else if (!projectId) {
           gptResponse = `❌ Для создания теста нужно указать projectId в контексте.`;
         } else {
-          logger.info('Creating Playwright test from chat', {
+          logger.info('[CHAT] Creating Playwright test from chat', {
             intent: parsedIntent.intent,
+            action: parsedIntent.action,
             url: testUrl,
             projectId,
+            hasCommands: !!parsedIntent.commands,
+            commandsCount: parsedIntent.commands?.length || 0,
           });
 
           // Determine browser based on viewport
@@ -320,9 +392,11 @@ GET /api/v1/manual-test/${testCreated.data?.id}/result`;
     // Check if intent is API test
     else if (parsedIntent?.intent === 'api_test' && parsedIntent.apiMethod && parsedIntent.apiUrl) {
       try {
-        logger.info('Executing API test from chat', {
+        logger.info('[CHAT] Executing API test from chat', {
           method: parsedIntent.apiMethod,
           url: parsedIntent.apiUrl,
+          headers: parsedIntent.apiHeaders,
+          body: parsedIntent.apiBody,
         });
 
         // Execute API test
@@ -332,6 +406,11 @@ GET /api/v1/manual-test/${testCreated.data?.id}/result`;
           headers: parsedIntent.apiHeaders,
           body: parsedIntent.apiBody,
           expectedStatus: parsedIntent.expectedStatus,
+        });
+
+        logger.info('[CHAT] API test executed successfully', {
+          success: apiTestResult.success,
+          status: apiTestResult.status,
         });
 
         // Format API test result for chat response
@@ -361,7 +440,7 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
           gptResponse += `\n\nТело ответа (первые 200 символов):\n${bodyPreview}...`;
         }
 
-        logger.info('API test completed from chat', {
+        logger.info('[CHAT] API test completed from chat', {
           status: apiTestResult.status,
           success: apiTestResult.success,
           durationMs: apiTestResult.durationMs,
@@ -399,8 +478,15 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
           }
         }
       } catch (error) {
-        logger.error('API test failed in chat', error);
-        gptResponse = `❌ Ошибка при выполнении API-запроса: ${error instanceof Error ? error.message : 'Unknown error'}`;
+        logger.error('[CHAT] API test failed in chat', {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          parsedIntent: {
+            method: parsedIntent.apiMethod,
+            url: parsedIntent.apiUrl,
+          },
+        });
+        gptResponse = `❌ Ошибка при выполнении API-запроса.\n\nОшибка: ${error instanceof Error ? error.message : String(error)}\n\nПроверьте URL и параметры.`;
       }
     } else {
       // Regular chat flow with RAG

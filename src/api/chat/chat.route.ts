@@ -1,15 +1,19 @@
-import { Router, Request, Response } from 'express';
+import { optionalAuth } from '@/middleware/auth.middleware';
+import { asyncHandler, handleValidationError } from '@/utils/error-handler';
+import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import { handleChat } from './chat.controller';
-import { asyncHandler, handleValidationError } from '@/utils/error-handler';
-import { requireAuth } from '@/middleware/auth.middleware';
 
 const router = Router();
 
 // Validation schema for chat request
 const chatRequestSchema = z.object({
   message: z.string().min(1, 'Message cannot be empty').max(5000, 'Message too long'),
-  context: z.string().optional(),
+  context: z.union([z.string(), z.record(z.any())]).optional(),
+  sessionId: z.string().optional(),
+  conversationId: z.string().optional(),
+  answers: z.record(z.any()).optional(),
+  userId: z.string().optional(),
 });
 
 /**
@@ -84,7 +88,7 @@ const chatRequestSchema = z.object({
  * POST /api/v1/chat
  * Send message to AI chat
  */
-router.post('/', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+router.post('/', optionalAuth, asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
     const validatedData = chatRequestSchema.parse(req.body);
