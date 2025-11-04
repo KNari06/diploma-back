@@ -16,31 +16,34 @@ jobs:
       - name: Set up SSH
         uses: webfactory/ssh-agent@v0.8.0
         with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          ssh-private-key: |
+            -----BEGIN OPENSSH PRIVATE KEY-----
+            b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+            QyNTUxOQAAACByCxK0xU2MGZHuQEWXrVQofEEfTy4UgxIzs8n/7zNVegAAAMjD8QZkw/EG
+            ZAAAAAtzc2gtZWQyNTUxOQAAACByCxK0xU2MGZHuQEWXrVQofEEfTy4UgxIzs8n/7zNVeg
+            AAAED4afrqNEaigeQlZClDVnN6wCuaQrBTxhJRtw9dj0zC43ILErTFTYwZke5ARZetVCh8
+            QR9PLhSDEjOzyf/vM1V6AAAAQHJvb3RAaW5zdGFuY2UtMS51cy1jZW50cmFsMS1jLmMuZm
+            lyc3QtZm9vdGluZy00NzY3MTUtYzYuaW50ZXJuYWwBAgMEBQ==
+            -----END OPENSSH PRIVATE KEY-----
 
       - name: Deploy to remote server
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+          ssh -o StrictHostKeyChecking=no root@34.10.193.13 << 'EOF'
             set -e
             cd ~/QAI---BackEnd || exit 1
 
             echo "Updating repository..."
             git fetch origin main && git reset --hard origin/main
 
-            echo "Stopping old container..."
-            docker stop qai-backend || true
-            docker rm qai-backend || true
+            echo "Stopping and removing existing containers..."
+            docker rm -f qai-backend qai-worker || true
+            docker compose down -v --remove-orphans || true
 
-            echo "Building new Docker image..."
-            docker build -t qai-backend .
+            echo "Pruning Docker builder cache..."
+            docker builder prune -f
 
-            echo "Starting new container..."
-            docker run -d \
-              --restart always \
-              --name qai-backend \
-              -p 3000:3000 \
-              --env-file .env \
-              qai-backend
+            echo "Building and starting containers..."
+            docker compose up -d --build
 
             echo "Deployment completed successfully."
           EOF
