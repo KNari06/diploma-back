@@ -1,0 +1,23 @@
+services:
+  backend:
+    container_name: qai-backend
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    restart: always
+
+  worker:
+    container_name: qai-worker
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    command: ["node", "-r", "tsconfig-paths/register", "dist/worker/index.js"]
+    env_file:
+      - .env
+    restart: always
