@@ -5,7 +5,7 @@ const options: swaggerJsdoc.Options = {
   definition: {
     openapi: '3.0.0',
     info: {
-      title: 'QAI Backend API',
+      title: 'QAI Backend API TEST',
       version: '1.0.0',
       description: 'Quality Assurance Intelligence Backend API - автоматизированное тестирование веб-приложений с AI',
       contact: {
