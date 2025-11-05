@@ -1,5 +1,5 @@
 import { Job } from 'bullmq';
-import { logger, logQueueEvent, logAgentCommunication } from '@/utils/logger';
+import { logger, logQueueEvent } from '@/utils/logger';
 import { handleAgentError, shouldRetry, calculateRetryDelay } from '@/utils/error-handler';
 import { TestJobData, AgentResponse } from '@/types';
 import { dbAdminService } from '@/db/supabase';
@@ -281,7 +281,7 @@ export class ManualTestResultJobHandler {
 
       // Determine overall test status
       const hasFailed = results.some((r: any) => r.status === 'failed');
-      const hasRunning = results.some((r: any) => r.status === 'running' || r.status === 'pending');
+      // const hasRunning = results.some((r: any) => r.status === 'running' || r.status === 'pending');
       const allCompleted = results.every((r: any) => r.status === 'completed' || r.status === 'failed');
 
       let status: 'running' | 'completed' | 'failed' = 'running';

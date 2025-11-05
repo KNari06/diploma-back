@@ -105,8 +105,10 @@ export const getOAuthUrlHandler = async (req: Request, res: Response): Promise<v
       redirectTo as string
     );
 
-    // Redirect to OAuth URL
-    res.redirect(result.url);
+    res.json({
+      success: true,
+      data: result,
+    });
   } catch (error: any) {
     logger.error('OAuth URL error', error);
     res.status(400).json({

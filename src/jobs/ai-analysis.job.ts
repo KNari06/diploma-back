@@ -11,7 +11,7 @@ export class AIAnalysisJobHandler {
    */
   static async process(job: Job<{ testResultId: string; testId: string }>) {
     const { testResultId, testId } = job.data;
-    
+
     logger.info(`Processing AI analysis: ${testResultId}`);
     logQueueEvent('processing', job.id!, { testResultId, testId });
 
@@ -44,7 +44,7 @@ export class AIAnalysisJobHandler {
 
     } catch (error) {
       logger.error(`AI analysis failed: ${testResultId}`, error);
-      
+
       // Mark analysis as failed in database
       await dbAdminService.updateTestResult(testResultId, {
         ai_summary: {
@@ -56,7 +56,7 @@ export class AIAnalysisJobHandler {
           generatedAt: new Date(),
         },
       });
-      
+
       throw handleAIError(error);
     }
   }
@@ -115,7 +115,7 @@ export class AIAnalysisJobHandler {
   private static async handleCriticalIssues(testId: string, aiSummary: any) {
     try {
       const criticalBugs = aiSummary.bugs?.filter((bug: any) => bug.severity === 'critical') || [];
-      
+
       if (criticalBugs.length === 0) {
         return;
       }
@@ -163,7 +163,7 @@ export class AIAnalysisJobHandler {
       }
 
       const webhookUrl = project.settings.integrations.webhook;
-      
+
       // Send webhook notification
       await QueueManager.addWebhookJob({
         url: webhookUrl,
@@ -202,7 +202,7 @@ export class NotificationJobHandler {
     data?: any;
   }>) {
     const { type, recipient, subject, message, data } = job.data;
-    
+
     logger.info(`Processing notification: ${type} to ${recipient}`);
     logQueueEvent('processing', job.id!, { type, recipient });
 
@@ -236,13 +236,13 @@ export class NotificationJobHandler {
     recipient: string,
     subject: string,
     message: string,
-    data?: any
+    _data?: any
   ) {
     // In a real implementation, you would integrate with an email service
     // like SendGrid, AWS SES, or similar
     logger.info(`Email notification: ${recipient} - ${subject}`);
     logger.info(`Message: ${message}`);
-    
+
     // For now, just log the email
     // TODO: Implement actual email sending
   }
@@ -254,12 +254,12 @@ export class NotificationJobHandler {
     recipient: string,
     subject: string,
     message: string,
-    data?: any
+    _data?: any
   ) {
     // In a real implementation, you would use Slack Web API
     logger.info(`Slack notification: ${recipient} - ${subject}`);
     logger.info(`Message: ${message}`);
-    
+
     // For now, just log the Slack message
     // TODO: Implement actual Slack integration
   }
@@ -270,13 +270,13 @@ export class NotificationJobHandler {
   private static async sendWebhookNotification(
     url: string,
     event: string,
-    data: any,
-    headers?: Record<string, string>
+    _data: any,
+    _headers?: Record<string, string>
   ) {
     // In a real implementation, you would make HTTP requests to webhook URLs
     logger.info(`Webhook notification: ${url} - ${event}`);
-    logger.info(`Data: ${JSON.stringify(data, null, 2)}`);
-    
+    logger.info(`Data: ${JSON.stringify(_data, null, 2)}`);
+
     // For now, just log the webhook
     // TODO: Implement actual webhook sending
   }
@@ -295,8 +295,8 @@ export class WebhookJobHandler {
     data: any;
     headers?: Record<string, string>;
   }>) {
-    const { url, event, data, headers = {} } = job.data;
-    
+    const { url, event, data } = job.data;
+
     logger.info(`Processing webhook: ${event} to ${url}`);
     logQueueEvent('processing', job.id!, { event, url });
 
@@ -305,7 +305,7 @@ export class WebhookJobHandler {
       // For now, just log the webhook
       logger.info(`Webhook sent: ${event} to ${url}`);
       logger.info(`Data: ${JSON.stringify(data, null, 2)}`);
-      
+
       // TODO: Implement actual webhook sending with retry logic
 
     } catch (error) {

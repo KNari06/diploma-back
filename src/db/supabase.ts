@@ -30,7 +30,7 @@ export const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
 // Test connection
 export const testSupabaseConnection = async (): Promise<boolean> => {
   try {
-    const { data, error } = await supabaseAdmin
+    const { error } = await supabaseAdmin
       .from('tests')
       .select('count')
       .limit(1);

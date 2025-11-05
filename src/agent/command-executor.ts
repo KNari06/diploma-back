@@ -110,12 +110,13 @@ export class CommandExecutor {
           }
           break;
 
-        case 'screenshot':
+        case 'screenshot': {
           const screenshot = await this.page.screenshot({ type: 'png', fullPage: false });
           return {
             success: true,
             screenshot: `data:image/png;base64,${screenshot.toString('base64')}`,
           };
+        }
 
         case 'assertVisible':
           if (!selector) throw new Error('Selector is required for assertVisible action');
@@ -138,15 +139,16 @@ export class CommandExecutor {
 
         case 'assertCount':
           if (!selector) throw new Error('Selector is required for assertCount action');
-          await this.assertCount(selector, command.assertion, timeout);
+          await this.assertCount(selector, command.assertion);
           break;
 
-        case 'extract':
+        case 'extract': {
           if (!selector) throw new Error('Selector is required for extract action');
           if (!command.extract) throw new Error('Extract config is required for extract action');
           const extractedValue = await this.extractData(selector, command.extract);
           this.extractedData.set(command.extract.name, extractedValue);
           return { success: true, extractedValue };
+        }
 
         case 'evaluate':
           if (!value) throw new Error('Script is required for evaluate action');
@@ -322,7 +324,6 @@ export class CommandExecutor {
   private async assertCount(
     selector: string,
     assertion: PlaywrightCommand['assertion'],
-    timeout?: number
   ): Promise<void> {
     if (!assertion) throw new Error('Assertion config is required');
 

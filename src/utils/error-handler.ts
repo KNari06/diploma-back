@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { logger } from './logger';
-import { QAIError, ValidationError, NotFoundError, UnauthorizedError, RateLimitError } from '@/types';
+import { QAIError, ValidationError, NotFoundError, RateLimitError } from '@/types';
 
 /**
  * Send success response
@@ -30,7 +30,7 @@ export const errorHandler = (
   error: Error,
   req: Request,
   res: Response,
-  next: NextFunction
+  _next: NextFunction
 ): void => {
   // Log the error
   logger.error({

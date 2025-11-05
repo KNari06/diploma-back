@@ -27,11 +27,34 @@ export async function signUpWithEmail(
     });
 
     if (error) throw error;
-    if (!data.user || !data.session) {
-      throw new Error('Sign up failed: no user or session returned');
+    if (!data.user) {
+      throw new Error('Sign up failed: no user returned');
     }
 
-    logger.info('User signed up', { userId: data.user.id, email });
+    // Check if email confirmation is required
+    if (!data.session && !data.user.email_confirmed_at) {
+      logger.info('User signed up, email confirmation required', { userId: data.user.id, email });
+
+      return {
+        user: {
+          id: data.user.id,
+          email: data.user.email!,
+          name: data.user.user_metadata?.name,
+          role: 'user',
+        },
+        tokens: {
+          access_token: '', // No tokens until email is confirmed
+          refresh_token: '',
+          expires_in: 0,
+        },
+      };
+    }
+
+    if (!data.session) {
+      throw new Error('Sign up failed: no session returned');
+    }
+
+    logger.info('User signed up with session', { userId: data.user.id, email, confirmed: !!data.user.email_confirmed_at });
 
     return {
       user: {
@@ -130,26 +153,32 @@ export async function signInWithMagicLink(
  * Get OAuth URL for provider
  * @param provider - OAuth provider (google, github, etc.)
  * @param redirectTo - Redirect URL after OAuth
- * @returns OAuth URL
+ * @returns OAuth URL with state for CSRF protection
  */
 export async function getOAuthUrl(
   provider: 'google' | 'github' | 'gitlab' | 'bitbucket',
   redirectTo?: string
-): Promise<{ url: string }> {
+): Promise<{ url: string; state: string }> {
   try {
+    // Generate CSRF state parameter
+    const state = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+
     const { data, error } = await supabase.auth.signInWithOAuth({
       provider,
       options: {
         redirectTo: redirectTo || `${env.FRONTEND_URL}/auth/callback`,
+        queryParams: {
+          state,
+        },
       },
     });
 
     if (error) throw error;
     if (!data.url) throw new Error('No OAuth URL returned');
 
-    logger.info('OAuth URL generated', { provider });
+    logger.info('OAuth URL generated', { provider, state });
 
-    return { url: data.url };
+    return { url: data.url, state };
   } catch (error) {
     logger.error('OAuth URL generation error', error);
     throw error;
@@ -212,6 +241,12 @@ export async function refreshAccessToken(
  */
 export async function verifyToken(accessToken: string): Promise<AuthUser | null> {
   try {
+    // Verify token format first
+    if (!accessToken || typeof accessToken !== 'string' || accessToken.length < 10) {
+      logger.debug('Invalid token format');
+      return null;
+    }
+
     const { data, error } = await supabase.auth.getUser(accessToken);
 
     if (error) {
@@ -220,6 +255,12 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
     }
 
     if (!data.user) return null;
+
+    // Check if user is confirmed (for email verification)
+    if (!data.user.email_confirmed_at) {
+      logger.debug('User email not confirmed', { userId: data.user.id });
+      return null;
+    }
 
     // Get additional user data from public.users
     const { data: userData } = await supabaseAdmin
@@ -260,9 +301,42 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
       .maybeSingle();
 
     if (dbError) throw dbError;
+
+    // If user not found in public.users, create them (fallback for missing sync)
     if (!userData) {
-      logger.warn('User not found in public.users, may not be synced yet', { userId: data.user.id });
-      throw new Error('User data not found. Please try logging in again.');
+      logger.warn('User not found in public.users, creating fallback entry', { userId: data.user.id });
+
+      const fallbackUser = {
+        id: data.user.id,
+        email: data.user.email!,
+        name: data.user.user_metadata?.name || data.user.email!.split('@')[0],
+        role: 'user',
+        credits: 0,
+        subscription: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+
+      const { data: createdUser, error: createError } = await supabaseAdmin
+        .from('users')
+        .insert(fallbackUser)
+        .select('*')
+        .maybeSingle();
+
+      if (createError) {
+        logger.error('Failed to create fallback user', { error: createError, userId: data.user.id });
+        throw new Error('User data not found and could not be created. Please try logging in again.');
+      }
+
+      return {
+        id: data.user.id,
+        email: data.user.email,
+        name: createdUser?.name,
+        role: createdUser?.role,
+        credits: createdUser?.credits,
+        subscription: createdUser?.subscription,
+        created_at: createdUser?.created_at,
+      };
     }
 
     return {

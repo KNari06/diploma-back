@@ -133,7 +133,7 @@ export async function generateClarifyingQuestions(
  */
 async function shouldAskAboutAuth(
   userMessage: string,
-  context: any
+  _context: any
 ): Promise<boolean> {
   // Keywords that suggest auth is needed
   const authKeywords = [

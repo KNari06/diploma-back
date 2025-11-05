@@ -1,9 +1,9 @@
 import { v4 as uuidv4 } from 'uuid';
 import { logger, logTestEvent } from '@/utils/logger';
-import { ValidationError, NotFoundError, QAIError } from '@/types';
+import { ValidationError, NotFoundError } from '@/types';
 import { dbAdminService, dbService, supabaseAdmin } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
-import { TestRunRequest, Test, TestResult, BrowserType, TestOptions, ApiResponse, PaginatedResponse } from '@/types';
+import { TestRunRequest, Test, TestResult, BrowserType, ApiResponse, PaginatedResponse } from '@/types';
 
 export class ManualTestService {
   /**
@@ -416,7 +416,7 @@ export class ManualTestService {
       }
 
       // Create default project for anonymous users
-      const { data: newProject, error } = await supabaseAdmin
+      const { error } = await supabaseAdmin
         .from('projects')
         .insert({
           id: DEFAULT_PROJECT_ID,
