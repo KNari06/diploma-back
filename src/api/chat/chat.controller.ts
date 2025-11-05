@@ -57,7 +57,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
             providedSessionId: chatSessionId,
             userId
           });
-          chatSessionId = null; // Will create new session below
+          chatSessionId = undefined; // Will create new session below
         }
       }
 
