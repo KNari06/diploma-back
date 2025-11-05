@@ -5,7 +5,7 @@ const options: swaggerJsdoc.Options = {
   definition: {
     openapi: '3.0.0',
     info: {
-      title: 'QAI Backend API TEST',
+      title: 'QAI Backend API',
       version: '1.0.0',
       description: 'Quality Assurance Intelligence Backend API - автоматизированное тестирование веб-приложений с AI',
       contact: {
@@ -162,10 +162,11 @@ const options: swaggerJsdoc.Options = {
     ],
   },
   apis: [
-    './src/api/**/*.route.ts',
-    './src/api/**/*.routes.ts',
-    './src/index.ts',
-  ], // Путь к файлам с аннотациями
+    // Динамически определяем путь в зависимости от окружения
+    process.env.NODE_ENV === 'production'
+      ? ['./dist/api/**/*.js', './dist/index.js']
+      : ['./src/api/**/*.route.ts', './src/api/**/*.routes.ts', './src/index.ts']
+  ].flat(), // Путь к файлам с аннотациями
 };
 
 export const swaggerSpec = swaggerJsdoc(options);
