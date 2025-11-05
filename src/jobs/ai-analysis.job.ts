@@ -4,6 +4,12 @@ import { handleAIError } from '@/utils/error-handler';
 import { aiService } from '@/services/ai.service';
 import { dbAdminService } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
+import { webSocketService } from '@/websocket/websocket.service';
+import {
+  AIAnalysisStartedPayload,
+  AIAnalysisCompletedPayload,
+  AIBugFoundPayload,
+} from '@/websocket/types';
 
 export class AIAnalysisJobHandler {
   /**
@@ -22,6 +28,14 @@ export class AIAnalysisJobHandler {
         throw new Error(`Test result not found: ${testResultId}`);
       }
 
+      // Emit WebSocket: AI analysis started
+      const analysisStartedPayload: AIAnalysisStartedPayload = {
+        testId,
+        resultId: testResultId,
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitAIAnalysisStarted(testId, analysisStartedPayload);
+
       // Convert database result to TestResult type
       const testResultData = this.convertToTestResult(testResult);
 
@@ -32,6 +46,41 @@ export class AIAnalysisJobHandler {
       await dbAdminService.updateTestResult(testResultId, {
         ai_summary: aiSummary,
       });
+
+      // Emit WebSocket: AI bugs found (one by one)
+      if (aiSummary.bugs && aiSummary.bugs.length > 0) {
+        for (const bug of aiSummary.bugs) {
+          const bugFoundPayload: AIBugFoundPayload = {
+            testId,
+            resultId: testResultId,
+            bug: {
+              severity: bug.severity as 'critical' | 'high' | 'medium' | 'low',
+              message: (bug as any).message || bug.description,
+              location: (bug as any).location || (bug as any).selector,
+            },
+            timestamp: new Date().toISOString(),
+          };
+          webSocketService.emitAIBugFound(testId, bugFoundPayload);
+        }
+      }
+
+      // Emit WebSocket: AI analysis completed
+      const analysisCompletedPayload: AIAnalysisCompletedPayload = {
+        testId,
+        resultId: testResultId,
+        summary: {
+          summary: aiSummary.summary,
+          bugs: aiSummary.bugs.map((bug: any) => ({
+            severity: bug.severity as 'critical' | 'high' | 'medium' | 'low',
+            message: bug.message || bug.description,
+            location: bug.location || bug.selector,
+          })),
+          recommendations: aiSummary.recommendations,
+          confidence: aiSummary.confidence,
+        },
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitAIAnalysisCompleted(testId, analysisCompletedPayload);
 
       // Send notifications if critical issues found
       await this.handleCriticalIssues(testId, aiSummary);
@@ -209,13 +258,13 @@ export class NotificationJobHandler {
     try {
       switch (type) {
         case 'email':
-          await this.sendEmailNotification(recipient, subject, message, data);
+          await this.sendEmailNotification(recipient, subject, message);
           break;
         case 'slack':
-          await this.sendSlackNotification(recipient, subject, message, data);
+          await this.sendSlackNotification(recipient, subject, message);
           break;
         case 'webhook':
-          await this.sendWebhookNotification(recipient, subject, message, data);
+          await this.sendWebhookNotification(recipient, subject, data);
           break;
         default:
           throw new Error(`Unknown notification type: ${type}`);
@@ -235,8 +284,7 @@ export class NotificationJobHandler {
   private static async sendEmailNotification(
     recipient: string,
     subject: string,
-    message: string,
-    _data?: any
+    message: string
   ) {
     // In a real implementation, you would integrate with an email service
     // like SendGrid, AWS SES, or similar
@@ -253,8 +301,7 @@ export class NotificationJobHandler {
   private static async sendSlackNotification(
     recipient: string,
     subject: string,
-    message: string,
-    _data?: any
+    message: string
   ) {
     // In a real implementation, you would use Slack Web API
     logger.info(`Slack notification: ${recipient} - ${subject}`);
@@ -270,12 +317,11 @@ export class NotificationJobHandler {
   private static async sendWebhookNotification(
     url: string,
     event: string,
-    _data: any,
-    _headers?: Record<string, string>
+    data: any
   ) {
     // In a real implementation, you would make HTTP requests to webhook URLs
     logger.info(`Webhook notification: ${url} - ${event}`);
-    logger.info(`Data: ${JSON.stringify(_data, null, 2)}`);
+    logger.info(`Data: ${JSON.stringify(data, null, 2)}`);
 
     // For now, just log the webhook
     // TODO: Implement actual webhook sending

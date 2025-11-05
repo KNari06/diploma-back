@@ -240,6 +240,19 @@ const startServer = async () => {
       logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
     });
 
+    // Initialize WebSocket server
+    try {
+      const { initializeWebSocket } = await import('@/websocket/server');
+      initializeWebSocket(server);
+      logger.info('🌐 WebSocket server initialized');
+    } catch (wsError) {
+      logger.error('Failed to initialize WebSocket server:', wsError);
+      // Continue without WebSocket in development
+      if (env.NODE_ENV !== 'development') {
+        process.exit(1);
+      }
+    }
+
     // Graceful shutdown
     const gracefulShutdown = async (signal: string) => {
       logger.info(`Received ${signal}. Starting graceful shutdown...`);
@@ -262,6 +275,15 @@ const startServer = async () => {
           logger.info('Queue connections closed');
         } catch (error) {
           logger.error('Error during queue shutdown:', error);
+        }
+
+        try {
+          // Close WebSocket server
+          const { shutdownWebSocket } = await import('@/websocket/server');
+          await shutdownWebSocket();
+          logger.info('WebSocket server closed');
+        } catch (error) {
+          logger.error('Error closing WebSocket:', error);
         }
 
         logger.info('Graceful shutdown completed');

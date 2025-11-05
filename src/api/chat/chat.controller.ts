@@ -17,6 +17,8 @@ import { buildChatPrompt } from '@/utils/buildChatPrompt';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 import { ChatRequest } from './chat.types';
+import { webSocketService } from '@/websocket/websocket.service';
+import { ChatTestUpdatePayload, ChatProcessingStepPayload } from '@/websocket/types';
 
 /**
  * Handle chat request from user
@@ -64,6 +66,18 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     // Get projectId from context or user
     const projectId = (typeof context === 'object' && context?.projectId) || userId || 'default';
+
+    // Emit: Enriching context
+    if (chatSessionId) {
+      const stepPayload: ChatProcessingStepPayload = {
+        sessionId: chatSessionId,
+        step: 'enriching_context',
+        message: '🔍 Обогащаю контекст из Knowledge Base и traces...',
+        progress: 10,
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
+    }
 
     // Enrich context with RAG + Traces before parsing intent
     logger.info('Enriching context before intent parsing', {
@@ -123,6 +137,18 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           const plan = await getTestPlan(planId, userId || 'anonymous');
 
           if (plan) {
+            // Emit: Executing test
+            if (chatSessionId) {
+              const stepPayload: ChatProcessingStepPayload = {
+                sessionId: chatSessionId,
+                step: 'executing_test',
+                message: '⚙️ Запускаю тест в браузере...',
+                progress: 70,
+                timestamp: new Date().toISOString(),
+              };
+              webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
+            }
+
             // Execute test with plan commands
             const testRequest = {
               url: plan.url,
@@ -135,6 +161,21 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
             };
 
             const testCreated = await ManualTestService.runTest(testRequest);
+
+            // Emit WebSocket: chat test update
+            if (chatSessionId && testCreated.data?.id) {
+              const chatTestUpdatePayload: ChatTestUpdatePayload = {
+                sessionId: chatSessionId,
+                testId: testCreated.data.id,
+                message: '✅ Тест запущен! Следите за прогрессом в real-time.',
+                status: 'created',
+                links: {
+                  fullReport: `/api/v1/manual-test/${testCreated.data.id}/summary`,
+                },
+                timestamp: new Date().toISOString(),
+              };
+              webSocketService.emitChatTestUpdate(chatSessionId, chatTestUpdatePayload);
+            }
 
             res.json({
               reply: `✅ Test plan подтвержден и запущен!\n\nTest ID: ${testCreated.data?.id}\n\nПроверь статус:\nGET /api/v1/manual-test/${testCreated.data?.id}/status`,
@@ -173,6 +214,18 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       }
     }
 
+    // Emit: Parsing intent
+    if (chatSessionId) {
+      const stepPayload: ChatProcessingStepPayload = {
+        sessionId: chatSessionId,
+        step: 'parsing_intent',
+        message: '🤖 Анализирую ваш запрос с помощью AI...',
+        progress: 20,
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
+    }
+
     // Parse user intent from natural language with enriched context
     const parsedIntent = await parseUserIntent(message, enrichedContext);
 
@@ -184,6 +237,19 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       apiMethod: parsedIntent?.apiMethod,
       apiUrl: parsedIntent?.apiUrl,
     });
+
+    // Emit: Checking autonomous mode
+    if (chatSessionId) {
+      const stepPayload: ChatProcessingStepPayload = {
+        sessionId: chatSessionId,
+        step: 'checking_autonomous',
+        message: '🔎 Проверяю нужен ли автономный режим...',
+        progress: 30,
+        metadata: { intent: parsedIntent?.intent },
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
+    }
 
     // Check if autonomous mode is needed
     const hasTraces = !!(enrichedContext.knownSelectors && Object.keys(enrichedContext.knownSelectors).length > 0);
@@ -210,6 +276,18 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         hasUrl: !!contextUrl,
         intent: parsedIntent?.intent,
       });
+
+      // Emit: Generating questions
+      if (chatSessionId) {
+        const stepPayload: ChatProcessingStepPayload = {
+          sessionId: chatSessionId,
+          step: 'generating_questions',
+          message: '❓ Генерирую уточняющие вопросы...',
+          progress: 40,
+          timestamp: new Date().toISOString(),
+        };
+        webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
+      }
 
       const questionResult = await requestMissingInformation(message, {
         hasUrl: !!contextUrl,
@@ -276,12 +354,25 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         answers: JSON.stringify(answers),
       });
 
+      // Emit: Exploring site
+      if (chatSessionId) {
+        const stepPayload: ChatProcessingStepPayload = {
+          sessionId: chatSessionId,
+          step: 'exploring_site',
+          message: '🌐 Запускаю браузер и исследую сайт...',
+          progress: 50,
+          timestamp: new Date().toISOString(),
+        };
+        webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
+      }
+
       try {
         const explorationResult = await runAutonomousExploration({
           userMessage: message,
           answers,
           userId: userId || 'anonymous',
           projectId,
+          sessionId: chatSessionId,
         });
 
         res.json({
@@ -533,6 +624,19 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
       const finalContext = context
         ? (typeof context === 'string' ? `${context}${kbContext}` : kbContext)
         : kbContext;
+
+      // Emit: Generating response
+      if (chatSessionId) {
+        const stepPayload: ChatProcessingStepPayload = {
+          sessionId: chatSessionId,
+          step: 'generating_response',
+          message: '✍️ Формирую ответ...',
+          progress: 90,
+          timestamp: new Date().toISOString(),
+        };
+        webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
+      }
+
       gptResponse = await getChatCompletion(prompt, finalContext);
     }
 

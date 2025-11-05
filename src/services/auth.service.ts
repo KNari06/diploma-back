@@ -153,32 +153,26 @@ export async function signInWithMagicLink(
  * Get OAuth URL for provider
  * @param provider - OAuth provider (google, github, etc.)
  * @param redirectTo - Redirect URL after OAuth
- * @returns OAuth URL with state for CSRF protection
+ * @returns OAuth URL (Supabase handles state internally)
  */
 export async function getOAuthUrl(
   provider: 'google' | 'github' | 'gitlab' | 'bitbucket',
   redirectTo?: string
-): Promise<{ url: string; state: string }> {
+): Promise<{ url: string }> {
   try {
-    // Generate CSRF state parameter
-    const state = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-
     const { data, error } = await supabase.auth.signInWithOAuth({
       provider,
       options: {
         redirectTo: redirectTo || `${env.FRONTEND_URL}/auth/callback`,
-        queryParams: {
-          state,
-        },
       },
     });
 
     if (error) throw error;
     if (!data.url) throw new Error('No OAuth URL returned');
 
-    logger.info('OAuth URL generated', { provider, state });
+    logger.info('OAuth URL generated', { provider });
 
-    return { url: data.url, state };
+    return { url: data.url };
   } catch (error) {
     logger.error('OAuth URL generation error', error);
     throw error;

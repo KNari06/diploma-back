@@ -4,6 +4,8 @@ import { ValidationError, NotFoundError } from '@/types';
 import { dbAdminService, dbService, supabaseAdmin } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
 import { TestRunRequest, Test, TestResult, BrowserType, ApiResponse, PaginatedResponse } from '@/types';
+import { webSocketService } from '@/websocket/websocket.service';
+import { TestCreatedPayload } from '@/websocket/types';
 
 export class ManualTestService {
   /**
@@ -53,6 +55,16 @@ export class ManualTestService {
       }
 
       logTestEvent('created', test.id, { url: testRequest.url, browsers: testRequest.browsers });
+
+      // Emit WebSocket event for test creation
+      const testCreatedPayload: TestCreatedPayload = {
+        testId: test.id,
+        url: testRequest.url,
+        browsers: testRequest.browsers,
+        userId: testRequest.userId,
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitTestCreated(test.id, testCreatedPayload);
 
       return {
         success: true,

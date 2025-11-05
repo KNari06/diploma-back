@@ -29,8 +29,7 @@ export const errorResponse = (res: Response, message: string, statusCode: number
 export const errorHandler = (
   error: Error,
   req: Request,
-  res: Response,
-  _next: NextFunction
+  res: Response
 ): void => {
   // Log the error
   logger.error({

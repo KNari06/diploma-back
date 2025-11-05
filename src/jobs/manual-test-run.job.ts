@@ -7,6 +7,14 @@ import { QueueManager } from '@/config/queues';
 import { env } from '@/config/env';
 import { executePlaywrightTestWithRetry } from '@/agent';
 import axios from 'axios';
+import { webSocketService } from '@/websocket/websocket.service';
+import {
+  TestStartedPayload,
+  TestBrowserCompletedPayload,
+  TestFailedPayload,
+  ResultReadyPayload,
+  ResultErrorPayload,
+} from '@/websocket/types';
 
 export class ManualTestRunJobHandler {
   /**
@@ -29,6 +37,14 @@ export class ManualTestRunJobHandler {
         status: 'running',
         started_at: new Date().toISOString(),
       });
+
+      // Emit WebSocket: test started
+      const testStartedPayload: TestStartedPayload = {
+        testId,
+        browser,
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitTestStarted(testId, testStartedPayload);
 
       logger.info('[WORKER] Step 3: Executing Playwright test locally', {
         testId,
@@ -61,7 +77,7 @@ export class ManualTestRunJobHandler {
       if (result.success) {
         logger.info('[WORKER] Step 5: Creating test result in database');
         // Create test result in database
-        await dbAdminService.createTestResult({
+        const testResultRecord = await dbAdminService.createTestResult({
           test_id: testId,
           browser,
           status: result.status as any,
@@ -73,6 +89,25 @@ export class ManualTestRunJobHandler {
           performance: result.performance,
           completed_at: new Date().toISOString(),
         });
+
+        // Emit WebSocket: browser completed
+        const browserCompletedPayload: TestBrowserCompletedPayload = {
+          testId,
+          browser,
+          status: 'completed',
+          errorsCount: result.errors?.length || 0,
+          timestamp: new Date().toISOString(),
+        };
+        webSocketService.emitTestBrowserCompleted(testId, browserCompletedPayload);
+
+        // Emit WebSocket: result ready
+        const resultReadyPayload: ResultReadyPayload = {
+          testId,
+          browser,
+          resultId: (testResultRecord as any).id,
+          timestamp: new Date().toISOString(),
+        };
+        webSocketService.emitResultReady(testId, resultReadyPayload);
 
         // Add AI analysis job
         const testResult = await dbAdminService.getTestResultByTestAndBrowser(testId, browser);
@@ -92,6 +127,28 @@ export class ManualTestRunJobHandler {
 
     } catch (error) {
       logger.error(`Test run job failed: ${testId} (${browser})`, error);
+
+      // Emit WebSocket: test failed
+      const testFailedPayload: TestFailedPayload = {
+        testId,
+        browser,
+        error: (error as Error).message,
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitTestFailed(testId, testFailedPayload);
+
+      // Emit WebSocket: result error
+      const resultErrorPayload: ResultErrorPayload = {
+        testId,
+        browser,
+        error: {
+          type: 'execution_error',
+          message: (error as Error).message,
+          stack: (error as Error).stack,
+        },
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitResultError(testId, resultErrorPayload);
 
       // Check if we should retry
       if (shouldRetry(error, retryCount, env.AGENT_MAX_RETRIES)) {

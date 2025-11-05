@@ -98,7 +98,7 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
     logger.info(`🔄 ${workerName} worker ACTIVE (started processing): ${job.id}`);
   });
 
-  worker.on('completed', (job, result) => {
+  worker.on('completed', (job) => {
     logger.info(`✅ ${workerName} worker completed job: ${job.id}`);
   });
 
@@ -165,7 +165,7 @@ process.on('uncaughtException', (error) => {
 });
 
 // Handle unhandled promise rejections
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   logger.error('🚨 Unhandled rejection in worker:', {
     reason: reason instanceof Error ? reason.message : String(reason),
     stack: reason instanceof Error ? reason.stack : undefined,

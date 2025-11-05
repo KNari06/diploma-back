@@ -95,7 +95,7 @@ export async function generateClarifyingQuestions(
     }
 
     // Ask about auth dynamically
-    const needsAuthQuestion = await shouldAskAboutAuth(userMessage, currentContext);
+    const needsAuthQuestion = await shouldAskAboutAuth(userMessage);
     if (needsAuthQuestion) {
       questions.push(BASE_QUESTIONS[2]); // needs_auth
     }
@@ -132,8 +132,7 @@ export async function generateClarifyingQuestions(
  * Determine if we should ask about authentication
  */
 async function shouldAskAboutAuth(
-  userMessage: string,
-  _context: any
+  userMessage: string
 ): Promise<boolean> {
   // Keywords that suggest auth is needed
   const authKeywords = [

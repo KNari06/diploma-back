@@ -11,6 +11,8 @@ import {
 import { generateClarifyingQuestions, parseAnswers } from '@/services/question-generator.service';
 import { formatTestPlanForConfirmation, generateTestPlan } from '@/services/test-plan-generator.service';
 import { logger } from '@/utils/logger';
+import { webSocketService } from '@/websocket/websocket.service';
+import { ChatProcessingStepPayload } from '@/websocket/types';
 
 /**
  * Autonomous testing workflow orchestrator
@@ -88,12 +90,13 @@ export async function runAutonomousExploration(params: {
   answers: Record<string, any>;
   userId: string;
   projectId: string;
+  sessionId?: string;
 }): Promise<{
   exploration: any;
   testPlan: any;
   message: string;
 }> {
-  const { userMessage, answers, userId, projectId } = params;
+  const { userMessage, answers, userId, projectId, sessionId } = params;
 
   try {
     logger.info('[AUTONOMOUS] Step 1: Starting exploration', { userId, projectId });
@@ -174,6 +177,19 @@ export async function runAutonomousExploration(params: {
 
     // Generate test plan from exploration
     logger.info('[AUTONOMOUS] Step 11: Generating test plan');
+
+    // Emit WebSocket: generating plan
+    if (sessionId) {
+      const stepPayload: ChatProcessingStepPayload = {
+        sessionId,
+        step: 'generating_plan',
+        message: '📋 Генерирую план тестирования с помощью AI...',
+        progress: 60,
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitChatProcessingStep(sessionId, stepPayload);
+    }
+
     const testPlan = await generateTestPlan(exploration, {
       message: userMessage,
       scope: parsedAnswers.scope || 'general',
