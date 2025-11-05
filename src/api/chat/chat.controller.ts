@@ -699,3 +699,299 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
     res.status(500).json({ error: 'AI chat failed' });
   }
 };
+
+/**
+ * Get chat history by session ID
+ * GET /chat/history/:sessionId
+ */
+export const getChatHistory = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { sessionId } = req.params;
+    const userId = req.user?.id;
+
+    if (!sessionId) {
+      res.status(400).json({
+        success: false,
+        error: 'Session ID is required',
+      });
+      return;
+    }
+
+    // Get chat session with messages
+    const { data: session, error: sessionError } = await supabaseAdmin
+      .from('chat_sessions')
+      .select(`
+        id,
+        title,
+        created_at,
+        chat_messages (
+          id,
+          role,
+          content,
+          metadata,
+          created_at
+        )
+      `)
+      .eq('id', sessionId)
+      .eq('user_id', userId) // Only user's own sessions
+      .single();
+
+    if (sessionError) {
+      logger.error('Failed to get chat session', sessionError);
+      res.status(404).json({
+        success: false,
+        error: 'Chat session not found',
+      });
+      return;
+    }
+
+    // Sort messages by creation time
+    const messages = session.chat_messages?.sort((a: any, b: any) =>
+      new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+    ) || [];
+
+    logger.info('Chat history retrieved', {
+      sessionId,
+      userId,
+      messageCount: messages.length,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        session: {
+          id: session.id,
+          title: session.title,
+          created_at: session.created_at,
+        },
+        messages,
+      },
+    });
+  } catch (error) {
+    logger.error('Get chat history error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get chat history',
+    });
+  }
+};
+
+/**
+ * Get user's current chat history (single active chat) with pagination
+ * GET /chat/history?limit=50&offset=0
+ */
+export const getCurrentChatHistory = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const { limit = 50, offset = 0 } = req.query;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Authentication required',
+      });
+      return;
+    }
+
+    // Validate pagination parameters
+    const limitNum = Math.min(Math.max(Number(limit), 1), 100); // 1-100 range
+    const offsetNum = Math.max(Number(offset), 0);
+
+    // Get user's most recent (active) chat session
+    const { data: session, error: sessionError } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('id, title, created_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (sessionError) {
+      logger.error('Failed to get current chat session', sessionError);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to get chat history',
+      });
+      return;
+    }
+
+    // If no session exists, return empty history
+    if (!session) {
+      res.json({
+        success: true,
+        data: {
+          session: null,
+          messages: [],
+          pagination: {
+            limit: limitNum,
+            offset: offsetNum,
+            total: 0,
+            has_more: false,
+          },
+        },
+      });
+      return;
+    }
+
+    // Get total message count for pagination
+    const { count: totalMessages } = await supabaseAdmin
+      .from('chat_messages')
+      .select('*', { count: 'exact', head: true })
+      .eq('session_id', session.id);
+
+    // Get messages with pagination - newest first, then reverse for chronological display
+    const { data: messages, error: messagesError } = await supabaseAdmin
+      .from('chat_messages')
+      .select(`
+        id,
+        role,
+        content,
+        metadata,
+        created_at
+      `)
+      .eq('session_id', session.id)
+      .order('created_at', { ascending: false }) // Newest first for pagination
+      .range(offsetNum, offsetNum + limitNum - 1);
+
+    // Reverse to show chronological order (oldest → newest) in UI
+    const chronologicalMessages = messages ? [...messages].reverse() : [];
+
+    if (messagesError) {
+      logger.error('Failed to get chat messages', messagesError);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to get chat messages',
+      });
+      return;
+    }
+
+    const hasMore = (offsetNum + limitNum) < (totalMessages || 0);
+
+    logger.info('Current chat history retrieved', {
+      userId,
+      sessionId: session.id,
+      messageCount: messages?.length || 0,
+      totalMessages,
+      limit: limitNum,
+      offset: offsetNum,
+      hasMore,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        session: {
+          id: session.id,
+          title: session.title,
+          created_at: session.created_at,
+        },
+        messages: chronologicalMessages,
+        pagination: {
+          limit: limitNum,
+          offset: offsetNum,
+          total: totalMessages || 0,
+          has_more: hasMore,
+        },
+      },
+    });
+  } catch (error) {
+    logger.error('Get current chat history error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get chat history',
+    });
+  }
+};
+
+/**
+ * Get user's chat sessions list
+ * GET /chat/sessions
+ */
+export const getChatSessions = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const { limit = 20, offset = 0 } = req.query;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Authentication required',
+      });
+      return;
+    }
+
+    // Get user's chat sessions with message count and last message
+    const { data: sessions, error } = await supabaseAdmin
+      .from('chat_sessions')
+      .select(`
+        id,
+        title,
+        created_at,
+        chat_messages (
+          id,
+          content,
+          role,
+          created_at
+        )
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .range(Number(offset), Number(offset) + Number(limit) - 1);
+
+    if (error) {
+      logger.error('Failed to get chat sessions', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to get chat sessions',
+      });
+      return;
+    }
+
+    // Process sessions to add metadata
+    const processedSessions = sessions?.map((session: any) => {
+      const messages = session.chat_messages || [];
+      const lastMessage = messages.length > 0
+        ? messages.sort((a: any, b: any) =>
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+          )[0]
+        : null;
+
+      return {
+        id: session.id,
+        title: session.title,
+        created_at: session.created_at,
+        message_count: messages.length,
+        last_message: lastMessage ? {
+          content: lastMessage.content.substring(0, 100), // Preview
+          role: lastMessage.role,
+          created_at: lastMessage.created_at,
+        } : null,
+      };
+    }) || [];
+
+    logger.info('Chat sessions retrieved', {
+      userId,
+      sessionCount: processedSessions.length,
+      limit,
+      offset,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        sessions: processedSessions,
+        pagination: {
+          limit: Number(limit),
+          offset: Number(offset),
+          total: processedSessions.length,
+        },
+      },
+    });
+  } catch (error) {
+    logger.error('Get chat sessions error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get chat sessions',
+    });
+  }
+};

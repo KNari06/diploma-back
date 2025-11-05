@@ -2,7 +2,7 @@ import { optionalAuth } from '@/middleware/auth.middleware';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
-import { handleChat } from './chat.controller';
+import { handleChat, getChatHistory, getChatSessions, getCurrentChatHistory } from './chat.controller';
 
 const router = Router();
 
@@ -99,5 +99,243 @@ router.post('/', optionalAuth, asyncHandler(async (req: Request, res: Response) 
     handleValidationError(error);
   }
 }));
+
+/**
+ * @swagger
+ * /api/v1/chat/history:
+ *   get:
+ *     summary: Получить историю текущего чата пользователя с пагинацией
+ *     description: Возвращает историю единственного активного чата пользователя. offset=0 возвращает ПОСЛЕДНИЕ сообщения. Внутри каждой страницы сообщения отсортированы хронологически (старые → новые)
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 50
+ *           minimum: 1
+ *           maximum: 100
+ *         description: Количество сообщений для возврата
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *           minimum: 0
+ *         description: Смещение для пагинации. 0 = последние сообщения, 50 = более старые сообщения
+ *     responses:
+ *       200:
+ *         description: История текущего чата
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     session:
+ *                       type: object
+ *                       nullable: true
+ *                       properties:
+ *                         id:
+ *                           type: string
+ *                           format: uuid
+ *                         title:
+ *                           type: string
+ *                         created_at:
+ *                           type: string
+ *                           format: date-time
+ *                     messages:
+ *                       type: array
+ *                       description: Сообщения в хронологическом порядке внутри страницы (старые → новые). offset=0 дает последние сообщения
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                             format: uuid
+ *                           role:
+ *                             type: string
+ *                             enum: [user, ai]
+ *                           content:
+ *                             type: string
+ *                           metadata:
+ *                             type: object
+ *                           created_at:
+ *                             type: string
+ *                             format: date-time
+ *                     pagination:
+ *                       type: object
+ *                       properties:
+ *                         limit:
+ *                           type: integer
+ *                           example: 50
+ *                         offset:
+ *                           type: integer
+ *                           example: 0
+ *                         total:
+ *                           type: integer
+ *                           example: 150
+ *                         has_more:
+ *                           type: boolean
+ *                           example: true
+ *       401:
+ *         description: Не авторизован
+ */
+router.get('/history', optionalAuth, asyncHandler(getCurrentChatHistory));
+
+/**
+ * @swagger
+ * /api/v1/chat/sessions:
+ *   get:
+ *     summary: Получить список чат-сессий пользователя
+ *     description: Возвращает список всех чат-сессий текущего пользователя с метаданными
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 20
+ *           minimum: 1
+ *           maximum: 100
+ *         description: Количество сессий для возврата
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *           minimum: 0
+ *         description: Смещение для пагинации
+ *     responses:
+ *       200:
+ *         description: Список чат-сессий
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessions:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                             format: uuid
+ *                           title:
+ *                             type: string
+ *                           created_at:
+ *                             type: string
+ *                             format: date-time
+ *                           message_count:
+ *                             type: integer
+ *                           last_message:
+ *                             type: object
+ *                             properties:
+ *                               content:
+ *                                 type: string
+ *                               role:
+ *                                 type: string
+ *                                 enum: [user, ai]
+ *                               created_at:
+ *                                 type: string
+ *                                 format: date-time
+ *                     pagination:
+ *                       type: object
+ *                       properties:
+ *                         limit:
+ *                           type: integer
+ *                         offset:
+ *                           type: integer
+ *                         total:
+ *                           type: integer
+ *       401:
+ *         description: Не авторизован
+ */
+router.get('/sessions', optionalAuth, asyncHandler(getChatSessions));
+
+/**
+ * @swagger
+ * /api/v1/chat/history/{sessionId}:
+ *   get:
+ *     summary: Получить историю чата по ID сессии
+ *     description: Возвращает все сообщения в указанной чат-сессии
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: ID чат-сессии
+ *     responses:
+ *       200:
+ *         description: История чата
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     session:
+ *                       type: object
+ *                       properties:
+ *                         id:
+ *                           type: string
+ *                           format: uuid
+ *                         title:
+ *                           type: string
+ *                         created_at:
+ *                           type: string
+ *                           format: date-time
+ *                     messages:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                             format: uuid
+ *                           role:
+ *                             type: string
+ *                             enum: [user, ai]
+ *                           content:
+ *                             type: string
+ *                           metadata:
+ *                             type: object
+ *                           created_at:
+ *                             type: string
+ *                             format: date-time
+ *       400:
+ *         description: Неверный ID сессии
+ *       401:
+ *         description: Не авторизован
+ *       404:
+ *         description: Сессия не найдена
+ */
+router.get('/history/:sessionId', optionalAuth, asyncHandler(getChatHistory));
 
 export default router;
