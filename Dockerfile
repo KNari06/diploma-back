@@ -6,7 +6,7 @@ COPY package*.json ./
 ENV HUSKY=0
 RUN npm ci
 
-# Копируем исходники и билдим без тестов
+# Копируем исходники и билдим
 COPY . .
 RUN npx tsc -p tsconfig.build.json
 
@@ -20,7 +20,10 @@ RUN npm ci --omit=dev --ignore-scripts
 # Кладём сборку
 COPY --from=builder /app/dist ./dist
 
-# Минимальный tsconfig для tsconfig-paths в рантайме (alias @/* -> dist/*)
+# 👇 КЛЮЧЕВОЕ: кладём и исходники, чтобы swagger-jsdoc мог сканировать src/**/*.ts
+COPY --from=builder /app/src ./src
+
+# tsconfig-paths для алиасов в рантайме ( @/* -> dist/* )
 RUN printf '{\n  "compilerOptions": {\n    "baseUrl": ".",\n    "paths": { "@/*": ["dist/*"] }\n  }\n}\n' > /app/tsconfig.json
 
 ENV NODE_ENV=production
