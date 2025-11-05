@@ -39,24 +39,60 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     // Get or create chat session
     let chatSessionId = sessionId;
-    // Only create session if userId is a valid UUID
     const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 
-    if (isValidUUID && !chatSessionId) {
-      // Create new session if userId provided but no sessionId
-      const { data: newSession, error: sessionError } = await supabaseAdmin
-        .from('chat_sessions')
-        .insert({
-          user_id: userId,
-          title: message.substring(0, 50), // Use first 50 chars as title
-        })
-        .select()
-        .single();
 
-      if (sessionError) {
-        logger.error('Failed to create chat session', sessionError);
-      } else {
-        chatSessionId = newSession.id;
+    if (isValidUUID) {
+      if (chatSessionId) {
+        // Verify session exists and belongs to user
+        const { data: existingSession } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('id')
+          .eq('id', chatSessionId)
+          .eq('user_id', userId)
+          .maybeSingle();
+
+        if (!existingSession) {
+          logger.warn('Session not found or not owned by user, creating new one', {
+            providedSessionId: chatSessionId,
+            userId
+          });
+          chatSessionId = null; // Will create new session below
+        }
+      }
+
+      if (!chatSessionId) {
+        // Check if user has existing session (single chat per user)
+        const { data: existingSession } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('id')
+          .eq('user_id', userId)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (existingSession) {
+          // Use existing session
+          chatSessionId = existingSession.id;
+          logger.info('Using existing chat session', { sessionId: chatSessionId, userId });
+        } else {
+          // Create new session
+          const { data: newSession, error: sessionError } = await supabaseAdmin
+            .from('chat_sessions')
+            .insert({
+              user_id: userId,
+              title: message.substring(0, 50),
+            })
+            .select()
+            .single();
+
+          if (sessionError) {
+            logger.error('Failed to create chat session', sessionError);
+          } else {
+            chatSessionId = newSession.id;
+            logger.info('Created new chat session', { sessionId: chatSessionId, userId });
+          }
+        }
       }
     }
 
@@ -641,6 +677,7 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
     }
 
     // Save user message to database
+
     if (chatSessionId) {
       const { error: userMsgError } = await supabaseAdmin
         .from('chat_messages')
@@ -797,6 +834,12 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
     const limitNum = Math.min(Math.max(Number(limit), 1), 100); // 1-100 range
     const offsetNum = Math.max(Number(offset), 0);
 
+    logger.info('Getting chat history for user', {
+      userId,
+      limit: limitNum,
+      offset: offsetNum,
+    });
+
     // Get user's most recent (active) chat session
     const { data: session, error: sessionError } = await supabaseAdmin
       .from('chat_sessions')
@@ -805,6 +848,14 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
+
+    logger.info('Chat session query result', {
+      userId,
+      sessionFound: !!session,
+      sessionId: session?.id,
+      sessionTitle: session?.title,
+      sessionError: sessionError?.message,
+    });
 
     if (sessionError) {
       logger.error('Failed to get current chat session', sessionError);
@@ -834,10 +885,16 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
     }
 
     // Get total message count for pagination
-    const { count: totalMessages } = await supabaseAdmin
+    const { count: totalMessages, error: countError } = await supabaseAdmin
       .from('chat_messages')
       .select('*', { count: 'exact', head: true })
       .eq('session_id', session.id);
+
+    logger.info('Message count query result', {
+      sessionId: session.id,
+      totalMessages,
+      countError: countError?.message,
+    });
 
     // Get messages with pagination - newest first, then reverse for chronological display
     const { data: messages, error: messagesError } = await supabaseAdmin
@@ -871,10 +928,12 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
       userId,
       sessionId: session.id,
       messageCount: messages?.length || 0,
+      chronologicalMessageCount: chronologicalMessages.length,
       totalMessages,
       limit: limitNum,
       offset: offsetNum,
       hasMore,
+      sessionTitle: session.title,
     });
 
     res.json({
@@ -993,5 +1052,58 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
       success: false,
       error: 'Failed to get chat sessions',
     });
+  }
+};
+
+/**
+ * Debug: Get all chat data for user
+ * GET /chat/debug
+ */
+export const debugChatData = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+
+    if (!userId) {
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    }
+
+    // Get all sessions for user
+    const { data: sessions, error: sessionsError } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('*')
+      .eq('user_id', userId);
+
+    // Get all messages for user's sessions
+    const sessionIds = sessions?.map(s => s.id) || [];
+    const { data: messages, error: messagesError } = sessionIds.length > 0
+      ? await supabaseAdmin
+          .from('chat_messages')
+          .select('*')
+          .in('session_id', sessionIds)
+      : { data: [], error: null };
+
+    logger.info('Debug chat data', {
+      userId,
+      sessionsCount: sessions?.length || 0,
+      messagesCount: messages?.length || 0,
+      sessionIds,
+    });
+
+    res.json({
+      success: true,
+      debug: {
+        userId,
+        sessions: sessions || [],
+        messages: messages || [],
+        errors: {
+          sessions: sessionsError?.message,
+          messages: messagesError?.message,
+        },
+      },
+    });
+  } catch (error) {
+    logger.error('Debug chat data error:', error);
+    res.status(500).json({ error: 'Debug failed' });
   }
 };

@@ -2,7 +2,7 @@ import { optionalAuth } from '@/middleware/auth.middleware';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
-import { handleChat, getChatHistory, getChatSessions, getCurrentChatHistory } from './chat.controller';
+import { handleChat, getChatHistory, getChatSessions, getCurrentChatHistory, debugChatData } from './chat.controller';
 
 const router = Router();
 
@@ -337,5 +337,8 @@ router.get('/sessions', optionalAuth, asyncHandler(getChatSessions));
  *         description: Сессия не найдена
  */
 router.get('/history/:sessionId', optionalAuth, asyncHandler(getChatHistory));
+
+// Debug route - remove in production
+router.get('/debug', optionalAuth, asyncHandler(debugChatData));
 
 export default router;
