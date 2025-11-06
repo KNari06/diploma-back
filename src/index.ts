@@ -59,7 +59,7 @@ app.use(cors({
   origin: isDevelopment ? true : process.env.ALLOWED_ORIGINS?.split(',') || false,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID', 'X-Anonymous-Id'],
 }));
 
 // Rate limiting

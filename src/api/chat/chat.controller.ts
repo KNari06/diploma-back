@@ -1366,14 +1366,19 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
 export const getCurrentChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user?.id;
-    const anonymousId = req.body?.anonymousId || req.query?.anonymousId as string;
+    // Support multiple sources for anonymousId
+    const anonymousId =
+      req.headers['x-anonymous-id'] as string || // From header (frontend)
+      req.query?.anonymousId as string ||        // From query param
+      req.body?.anonymousId;                     // From body
+
     const { limit = 50, offset = 0 } = req.query;
 
     // Allow either authenticated user OR anonymous user with anonymousId
     if (!userId && !anonymousId) {
       res.status(401).json({
         success: false,
-        error: 'Authentication or anonymousId required',
+        error: 'Authentication or anonymousId required. Provide either Authorization header or X-Anonymous-Id header',
       });
       return;
     }
@@ -1405,10 +1410,11 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
       sessionError = result.error;
     } else if (anonymousId) {
       // Anonymous user - get from anonymous_chat_sessions
+      // anonymousId already includes "project_" prefix from frontend
       const result = await supabaseAdmin
         .from('anonymous_chat_sessions')
         .select('id, title, created_at')
-        .eq('anonymous_id', `project_${anonymousId}`)
+        .eq('anonymous_id', anonymousId)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
