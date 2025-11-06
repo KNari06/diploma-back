@@ -28,7 +28,7 @@ jobs:
 
       - name: Deploy to remote server
         run: |
-          ssh -o StrictHostKeyChecking=no root@34.10.193.13 << 'EOF'
+          ssh -o StrictHostKeyChecking=no root@35.238.212.84 << 'EOF'
             set -e
             cd ~/QAI---BackEnd || exit 1
 
