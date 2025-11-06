@@ -1366,12 +1366,14 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
 export const getCurrentChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user?.id;
+    const anonymousId = req.body?.anonymousId || req.query?.anonymousId as string;
     const { limit = 50, offset = 0 } = req.query;
 
-    if (!userId) {
+    // Allow either authenticated user OR anonymous user with anonymousId
+    if (!userId && !anonymousId) {
       res.status(401).json({
         success: false,
-        error: 'Authentication required',
+        error: 'Authentication or anonymousId required',
       });
       return;
     }
@@ -1380,20 +1382,39 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
     const limitNum = Math.min(Math.max(Number(limit), 1), 100); // 1-100 range
     const offsetNum = Math.max(Number(offset), 0);
 
-    logger.info('Getting chat history for user', {
+    logger.info('Getting chat history', {
       userId,
+      anonymousId,
       limit: limitNum,
       offset: offsetNum,
     });
 
     // Get user's most recent (active) chat session
-    const { data: session, error: sessionError } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('id, title, created_at')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    let session, sessionError;
+
+    if (userId) {
+      // Authenticated user - get from chat_sessions
+      const result = await supabaseAdmin
+        .from('chat_sessions')
+        .select('id, title, created_at')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      session = result.data;
+      sessionError = result.error;
+    } else if (anonymousId) {
+      // Anonymous user - get from anonymous_chat_sessions
+      const result = await supabaseAdmin
+        .from('anonymous_chat_sessions')
+        .select('id, title, created_at')
+        .eq('anonymous_id', `project_${anonymousId}`)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      session = result.data;
+      sessionError = result.error;
+    }
 
     logger.info('Chat session query result', {
       userId,
@@ -1431,8 +1452,9 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
     }
 
     // Get total message count for pagination
+    const messageTable = userId ? 'chat_messages' : 'anonymous_chat_messages';
     const { count: totalMessages, error: countError } = await supabaseAdmin
-      .from('chat_messages')
+      .from(messageTable)
       .select('*', { count: 'exact', head: true })
       .eq('session_id', session.id);
 
@@ -1440,11 +1462,12 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
       sessionId: session.id,
       totalMessages,
       countError: countError?.message,
+      table: messageTable,
     });
 
     // Get messages with pagination - newest first, then reverse for chronological display
     const { data: messages, error: messagesError } = await supabaseAdmin
-      .from('chat_messages')
+      .from(messageTable)
       .select(`
         id,
         role,
