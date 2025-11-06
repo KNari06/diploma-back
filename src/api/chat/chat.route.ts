@@ -1,4 +1,5 @@
 import { optionalAuth } from '@/middleware/auth.middleware';
+import { checkAnonymousLimit } from '@/middleware/rate-limiter.middleware';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
@@ -88,17 +89,21 @@ const chatRequestSchema = z.object({
  * POST /api/v1/chat
  * Send message to AI chat
  */
-router.post('/', optionalAuth, asyncHandler(async (req: Request, res: Response) => {
-  try {
-    // Validate request body
-    const validatedData = chatRequestSchema.parse(req.body);
+router.post('/',
+  optionalAuth,           // Check if user is authenticated (optional)
+  checkAnonymousLimit,    // Check rate limit for anonymous users
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      // Validate request body
+      const validatedData = chatRequestSchema.parse(req.body);
 
-    // User ID comes from auth middleware (req.user)
-    await handleChat(req, res);
-  } catch (error) {
-    handleValidationError(error);
-  }
-}));
+      // User ID comes from auth middleware (req.user)
+      await handleChat(req, res);
+    } catch (error) {
+      handleValidationError(error);
+    }
+  })
+);
 
 /**
  * @swagger

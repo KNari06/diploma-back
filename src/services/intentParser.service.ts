@@ -83,7 +83,7 @@ export async function parseUserIntent(
     }
 
     // Normalize common values (optional, helps with consistency)
-    const knownIntents = ['check_element', 'fill_form', 'login_flow', 'assert_ui', 'navigate', 'general_chat'];
+    const knownIntents = ['check_element', 'fill_form', 'login_flow', 'assert_ui', 'navigate', 'api_test', 'api_test_comprehensive', 'general_chat'];
     if (!knownIntents.includes(parsed.intent)) {
       logger.info('Custom intent detected', { intent: parsed.intent });
     }

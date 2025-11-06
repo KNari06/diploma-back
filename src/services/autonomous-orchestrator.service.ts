@@ -36,7 +36,7 @@ export function needsAutonomousMode(context: {
   });
 
   // Skip only for general chat and API testing (explicitly non-UI intents)
-  const skipIntents = ['general_chat', 'api_test'];
+  const skipIntents = ['general_chat', 'api_test', 'api_test_comprehensive'];
   if (skipIntents.includes(context.intent)) {
     logger.info('[AUTONOMOUS] Skipping - intent is general_chat or api_test');
     return false;

@@ -9,6 +9,7 @@ import {
   signUpWithEmail,
   updatePassword,
 } from '@/services/auth.service';
+import { AnonymousLimiterService } from '@/services/anonymous-limiter.service';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 
@@ -18,9 +19,22 @@ import { Request, Response } from 'express';
  */
 export const signup = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password, name } = req.body;
+    const { email, password, name, anonymousId } = req.body;
 
     const result = await signUpWithEmail(email, password, name);
+
+    // Reset anonymous user's rate limit after successful signup
+    if (anonymousId) {
+      try {
+        await AnonymousLimiterService.resetRequestCount(anonymousId);
+        logger.info('[AUTH] Reset anonymous rate limit after signup', {
+          userId: result.user?.id,
+          anonymousId
+        });
+      } catch (resetError) {
+        logger.error('[AUTH] Failed to reset anonymous limit', { resetError, anonymousId });
+      }
+    }
 
     res.status(201).json({
       success: true,
@@ -42,9 +56,22 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
  */
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password } = req.body;
+    const { email, password, anonymousId } = req.body;
 
     const result = await signInWithEmail(email, password);
+
+    // Reset anonymous user's rate limit after successful login
+    if (anonymousId) {
+      try {
+        await AnonymousLimiterService.resetRequestCount(anonymousId);
+        logger.info('[AUTH] Reset anonymous rate limit after login', {
+          userId: result.user.id,
+          anonymousId
+        });
+      } catch (resetError) {
+        logger.error('[AUTH] Failed to reset anonymous limit', { resetError, anonymousId });
+      }
+    }
 
     res.json({
       success: true,

@@ -249,7 +249,8 @@ export interface ChatProcessingStepPayload {
   sessionId: string;
   step: 'parsing_intent' | 'enriching_context' | 'checking_autonomous' |
         'generating_questions' | 'exploring_site' | 'generating_plan' |
-        'executing_test' | 'analyzing_results' | 'generating_response';
+        'executing_test' | 'analyzing_results' | 'generating_response' |
+        'generating_scenarios' | 'executing_tests';
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;

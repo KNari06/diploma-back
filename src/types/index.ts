@@ -373,6 +373,104 @@ export interface JiraProject {
 // Playwright test visualization types
 export * from './playwright.types';
 
+// API Configuration types
+export interface ApiEnvironment {
+  id: string;
+  user_id: string;
+  project_id: string;
+  name: string;
+  base_url: string;
+  description?: string;
+  default_headers: Record<string, string>;
+  auth_type: 'none' | 'bearer' | 'api_key' | 'basic' | 'oauth2';
+  auth_config: Record<string, any>;
+  variables: Record<string, any>;
+  is_active: boolean;
+  is_default: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ApiEndpoint {
+  id: string;
+  environment_id: string;
+  user_id: string;
+  name: string;
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD' | 'OPTIONS';
+  path: string;
+  description?: string;
+  headers: Record<string, string>;
+  query_params: Record<string, any>;
+  path_params: Record<string, any>;
+  body_template?: any;
+  expected_responses: Array<{
+    status: number;
+    description: string;
+    schema?: any;
+  }>;
+  timeout_ms: number;
+  retry_count: number;
+  tags: string[];
+  category?: string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ApiTestConfig {
+  id: string;
+  endpoint_id: string;
+  user_id: string;
+  name: string;
+  description?: string;
+  test_data: any;
+  expected_status: number;
+  expected_response?: any;
+  setup_steps: any[];
+  cleanup_steps: any[];
+  dependencies: string[];
+  validation_rules: any[];
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ApiTestExecution {
+  id: string;
+  user_id: string;
+  environment_id?: string;
+  endpoint_id?: string;
+  test_config_id?: string;
+  execution_type: 'manual' | 'chat' | 'scheduled' | 'ci_cd';
+  request_data: any;
+  response_data: any;
+  status_code: number;
+  duration_ms: number;
+  success: boolean;
+  validation_results: Record<string, any>;
+  error_message?: string;
+  chat_session_id?: string;
+  user_agent: string;
+  executed_at: string;
+}
+
+export interface ApiConfigurationRequest {
+  environment?: Partial<ApiEnvironment>;
+  endpoints?: Partial<ApiEndpoint>[];
+  test_configs?: Partial<ApiTestConfig>[];
+}
+
+export interface ApiTestExecutionRequest {
+  environment_id?: string;
+  endpoint_id?: string;
+  test_config_id?: string;
+  custom_data?: any;
+  execution_context?: {
+    chat_session_id?: string;
+    user_message?: string;
+  };
+}
+
 // Playwright trace upload types
 export type TraceFileStatus = 'uploaded' | 'parsing' | 'parsed' | 'failed';
 
@@ -460,6 +558,7 @@ export type IntentType =
   | 'assert_ui'
   | 'navigate'
   | 'api_test'
+  | 'api_test_comprehensive'
   | 'general_chat'
   | string; // Allow custom intents for flexibility
 
@@ -502,6 +601,7 @@ export interface IntentResult {
   apiBody?: any;
   apiHeaders?: Record<string, string>;
   expectedStatus?: number;
+  isRelativePath?: boolean; // True if apiUrl is a relative path without base URL
   selector?: string; // For UI testing intents
   // Playwright commands generated from intent
   commands?: PlaywrightCommand[];

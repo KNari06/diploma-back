@@ -31,7 +31,8 @@ export function buildIntentPrompt(
 - "login_flow" - авторизация/вход
 - "assert_ui" - проверить UI/дизайн
 - "navigate" - навигация по странице
-- "api_test" - тестирование API/HTTP запросов
+- "api_test" - тестирование API/HTTP запросов (одиночный тест)
+- "api_test_comprehensive" - комплексное тестирование API роута (все сценарии)
 - "general_chat" - обычный чат без тестирования
 
 Доступные типы команд Playwright:
@@ -192,7 +193,41 @@ export function buildIntentPrompt(
   "intent": "api_test",
   "apiMethod": "GET",
   "apiUrl": "/api/users",
-  "expectedStatus": 200
+  "expectedStatus": 200,
+  "isRelativePath": true
+}
+
+Запрос: "Протестируй API /users"
+Ответ:
+{
+  "intent": "api_test_comprehensive",
+  "apiMethod": "GET",
+  "apiUrl": "/users",
+  "isRelativePath": true
+}
+
+Запрос: "Протестируй API /api/v1/users"
+Ответ:
+{
+  "intent": "api_test_comprehensive",
+  "apiMethod": "GET",
+  "apiUrl": "/api/v1/users"
+}
+
+Запрос: "Надо протестировать роут /api/products как QA"
+Ответ:
+{
+  "intent": "api_test_comprehensive",
+  "apiMethod": "GET",
+  "apiUrl": "/api/products"
+}
+
+Запрос: "Проведи полное тестирование POST /api/auth/login"
+Ответ:
+{
+  "intent": "api_test_comprehensive",
+  "apiMethod": "POST",
+  "apiUrl": "/api/auth/login"
 }
 
 Запрос: "${userMessage}"
