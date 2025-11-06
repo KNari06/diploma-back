@@ -1,0 +1,305 @@
+import { Request, Response } from 'express';
+import { WorkspaceService } from '@/services/workspace.service';
+import { WorkspaceCreateRequest } from '@/types';
+import { logger } from '@/utils/logger';
+
+/**
+ * POST /api/v1/workspaces
+ * Create a new workspace
+ */
+export const createWorkspace = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Требуется авторизация',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const body = req.body as any;
+
+    // Use project_name as primary, fallback to name for compatibility
+    const workspaceName = body.project_name || body.name;
+
+    const workspaceData: WorkspaceCreateRequest = {
+      name: workspaceName,
+      platforms: body.platforms,
+      api_testing: body.api_testing,
+      devBaseUrl: body.devBaseUrl,
+      prodBaseUrl: body.prodBaseUrl,
+    };
+
+    // Validate required fields
+    if (!workspaceData.name) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing required field: project_name',
+        message: 'Поле project_name обязательно',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceData.platforms || !Array.isArray(workspaceData.platforms) || workspaceData.platforms.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing or invalid field: platforms',
+        message: 'Поле platforms должно быть непустым массивом',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceData.devBaseUrl) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing required field: devBaseUrl',
+        message: 'Поле devBaseUrl обязательно',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    logger.info('[WORKSPACE_API] Creating workspace', { userId, workspaceData });
+
+    const workspace = await WorkspaceService.createWorkspace(userId, workspaceData);
+
+    res.status(201).json({
+      success: true,
+      data: workspace,
+      message: 'Workspace успешно создан',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_API] Error creating workspace', { error });
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to create workspace',
+      message: 'Не удалось создать workspace',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * GET /api/v1/workspaces
+ * Get all workspaces for the current user
+ */
+export const getWorkspaces = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Требуется авторизация',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    logger.info('[WORKSPACE_API] Getting workspaces', { userId });
+
+    const workspaces = await WorkspaceService.getUserWorkspaces(userId);
+
+    res.json({
+      success: true,
+      data: workspaces,
+      count: workspaces.length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_API] Error getting workspaces', { error });
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to get workspaces',
+      message: 'Не удалось получить workspaces',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * GET /api/v1/workspaces/:id
+ * Get workspace by ID
+ */
+export const getWorkspace = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const workspaceId = req.params.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Требуется авторизация',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing workspace ID',
+        message: 'Не указан ID workspace',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    logger.info('[WORKSPACE_API] Getting workspace', { userId, workspaceId });
+
+    const workspace = await WorkspaceService.getWorkspace(workspaceId, userId);
+
+    if (!workspace) {
+      res.status(404).json({
+        success: false,
+        error: 'Workspace not found',
+        message: 'Workspace не найден',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: workspace,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_API] Error getting workspace', { error });
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to get workspace',
+      message: 'Не удалось получить workspace',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * PUT /api/v1/workspaces/:id
+ * Update workspace
+ */
+export const updateWorkspace = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const workspaceId = req.params.id;
+    const updates = req.body as Partial<WorkspaceCreateRequest>;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Требуется авторизация',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing workspace ID',
+        message: 'Не указан ID workspace',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    logger.info('[WORKSPACE_API] Updating workspace', { userId, workspaceId, updates });
+
+    const workspace = await WorkspaceService.updateWorkspace(workspaceId, userId, updates);
+
+    if (!workspace) {
+      res.status(404).json({
+        success: false,
+        error: 'Workspace not found',
+        message: 'Workspace не найден',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: workspace,
+      message: 'Workspace успешно обновлен',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_API] Error updating workspace', { error });
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to update workspace',
+      message: 'Не удалось обновить workspace',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * DELETE /api/v1/workspaces/:id
+ * Delete workspace
+ */
+export const deleteWorkspace = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const workspaceId = req.params.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Требуется авторизация',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing workspace ID',
+        message: 'Не указан ID workspace',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    logger.info('[WORKSPACE_API] Deleting workspace', { userId, workspaceId });
+
+    const success = await WorkspaceService.deleteWorkspace(workspaceId, userId);
+
+    if (!success) {
+      res.status(404).json({
+        success: false,
+        error: 'Workspace not found',
+        message: 'Workspace не найден',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: 'Workspace успешно удален',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_API] Error deleting workspace', { error });
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to delete workspace',
+      message: 'Не удалось удалить workspace',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};

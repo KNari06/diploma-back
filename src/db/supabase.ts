@@ -212,6 +212,30 @@ export class SupabaseService {
 
   // Project operations
   async createProject(projectData: any) {
+    // Validate workspace_id is provided
+    if (!projectData.workspace_id) {
+      throw new Error('workspace_id is required. Project must belong to a workspace.');
+    }
+
+    // Verify workspace exists and belongs to the user
+    const { data: workspace, error: workspaceError } = await this.client
+      .from('workspaces')
+      .select('id, user_id')
+      .eq('id', projectData.workspace_id)
+      .single();
+
+    if (workspaceError || !workspace) {
+      throw new Error(`Workspace with id ${projectData.workspace_id} not found`);
+    }
+
+    // Verify user_id matches workspace owner (if user_id is provided)
+    if (projectData.user_id && workspace.user_id !== projectData.user_id) {
+      throw new Error('Project user_id must match workspace owner');
+    }
+
+    // Ensure projectData.user_id matches workspace owner
+    projectData.user_id = workspace.user_id;
+
     const { data, error } = await this.client
       .from('projects')
       .insert(projectData)

@@ -414,6 +414,7 @@ export class ManualTestService {
    */
   private static async getOrCreateDefaultProject(): Promise<string> {
     const DEFAULT_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
+    const DEFAULT_WORKSPACE_ID = '00000000-0000-0000-0000-000000000001';
 
     try {
       // Check if default project exists
@@ -427,6 +428,40 @@ export class ManualTestService {
         return DEFAULT_PROJECT_ID;
       }
 
+      // Ensure default workspace exists
+      const { data: existingWorkspace } = await supabaseAdmin
+        .from('workspaces')
+        .select('id')
+        .eq('id', DEFAULT_WORKSPACE_ID)
+        .single();
+
+      let workspaceId = DEFAULT_WORKSPACE_ID;
+
+      if (!existingWorkspace) {
+        // Create default workspace for system/anonymous users
+        const { error: workspaceError } = await supabaseAdmin
+          .from('workspaces')
+          .insert({
+            id: DEFAULT_WORKSPACE_ID,
+            name: 'Default Workspace (Anonymous)',
+            user_id: DEFAULT_PROJECT_ID, // System user ID
+            platforms: ['web(chrome, safari, firefox)'],
+            api_testing: false,
+            dev_base_url: null,
+            prod_base_url: null,
+            settings: {},
+          })
+          .select()
+          .single();
+
+        if (workspaceError) {
+          logger.error('Failed to create default workspace', workspaceError);
+          throw workspaceError;
+        }
+
+        logger.info('Created default workspace for anonymous users', { id: DEFAULT_WORKSPACE_ID });
+      }
+
       // Create default project for anonymous users
       const { error } = await supabaseAdmin
         .from('projects')
@@ -435,6 +470,7 @@ export class ManualTestService {
           name: 'Default Project (Anonymous)',
           description: 'Default project for anonymous test users',
           user_id: DEFAULT_PROJECT_ID, // Self-reference for system project
+          workspace_id: workspaceId,
           settings: {},
         })
         .select()
@@ -445,7 +481,7 @@ export class ManualTestService {
         throw error;
       }
 
-      logger.info('Created default project for anonymous users', { id: DEFAULT_PROJECT_ID });
+      logger.info('Created default project for anonymous users', { id: DEFAULT_PROJECT_ID, workspaceId });
       return DEFAULT_PROJECT_ID;
     } catch (error) {
       logger.error('Error getting/creating default project', error);

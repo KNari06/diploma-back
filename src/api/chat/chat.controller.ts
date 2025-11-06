@@ -37,6 +37,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     const { message, context, sessionId, conversationId, answers, userId: bodyUserId } = req.body as ChatRequest;
     // Use userId from auth middleware, fallback to body or projectId (for testing/dev)
     // Use projectId as userId for anonymous users so all requests from same project share configurations
+    // 'default' is a fallback string when projectId is not provided (not a real UUID)
     const projectId = (typeof context === 'object' ? context?.projectId : undefined) || 'default';
     const userId = req.user?.id || bodyUserId || `project_${projectId}`;
 
@@ -87,13 +88,57 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           chatSessionId = existingSession.id;
           logger.info('Using existing chat session', { sessionId: chatSessionId, userId });
         } else {
+          // Get workspace_id for the chat session
+          let workspaceId: string | null = null;
+
+          // If context has projectId (and it's not the fallback 'default' string), get workspace from project
+          if (projectId && projectId !== 'default') {
+            const isValidProjectUUID = projectId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+            if (isValidProjectUUID) {
+              const { data: project } = await supabaseAdmin
+                .from('projects')
+                .select('workspace_id')
+                .eq('id', projectId)
+                .maybeSingle();
+
+              if (project?.workspace_id) {
+                workspaceId = project.workspace_id;
+              }
+            }
+          }
+
+          // If no workspace from project, get user's default workspace
+          if (!workspaceId) {
+            const { WorkspaceService } = await import('@/services/workspace.service');
+            try {
+              const defaultWorkspace = await WorkspaceService.getOrCreateDefaultWorkspace(userId);
+              workspaceId = defaultWorkspace.id;
+            } catch (workspaceError) {
+              logger.error('Failed to get default workspace for chat session', { workspaceError, userId });
+              // Continue without workspace_id - migration will handle it
+            }
+          }
+
           // Create new session
+          const sessionData: any = {
+            user_id: userId,
+            title: message.substring(0, 50),
+          };
+
+          if (workspaceId) {
+            sessionData.workspace_id = workspaceId;
+          }
+
+          if (projectId && projectId !== 'default') {
+            const isValidProjectUUID = projectId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+            if (isValidProjectUUID) {
+              sessionData.project_id = projectId;
+            }
+          }
+
           const { data: newSession, error: sessionError } = await supabaseAdmin
             .from('chat_sessions')
-            .insert({
-              user_id: userId,
-              title: message.substring(0, 50),
-            })
+            .insert(sessionData)
             .select()
             .single();
 
@@ -101,7 +146,12 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
             logger.error('Failed to create chat session', sessionError);
           } else {
             chatSessionId = newSession.id;
-            logger.info('Created new chat session', { sessionId: chatSessionId, userId });
+            logger.info('Created new chat session', {
+              sessionId: chatSessionId,
+              userId,
+              workspaceId,
+              projectId: sessionData.project_id || null
+            });
           }
         }
       }

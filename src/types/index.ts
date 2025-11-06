@@ -131,11 +131,33 @@ export interface Test {
   results?: TestResult[];
 }
 
+export interface Workspace {
+  id: string;
+  name: string;
+  userId: string;
+  platforms: string[];
+  apiTesting: boolean;
+  devBaseUrl?: string;
+  prodBaseUrl?: string;
+  settings: Record<string, any>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface WorkspaceCreateRequest {
+  name: string; // Will be populated from project_name in API
+  platforms: string[];
+  api_testing?: boolean;
+  devBaseUrl: string;
+  prodBaseUrl?: string;
+}
+
 export interface Project {
   id: string;
   name: string;
   description?: string;
   userId: string;
+  workspaceId: string;
   settings: ProjectSettings;
   createdAt: Date;
   updatedAt: Date;
