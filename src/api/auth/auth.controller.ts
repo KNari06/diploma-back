@@ -1,3 +1,5 @@
+import { AnonymousLimiterService } from '@/services/anonymous-limiter.service';
+import { AnonymousMigrationService } from '@/services/anonymous-migration.service';
 import {
   getCurrentUser,
   getOAuthUrl,
@@ -9,7 +11,6 @@ import {
   signUpWithEmail,
   updatePassword,
 } from '@/services/auth.service';
-import { AnonymousLimiterService } from '@/services/anonymous-limiter.service';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 
@@ -23,16 +24,44 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
 
     const result = await signUpWithEmail(email, password, name);
 
-    // Reset anonymous user's rate limit after successful signup
-    if (anonymousId) {
+    // Migrate anonymous data and reset rate limit after successful signup
+    if (anonymousId && result.user?.id) {
       try {
-        await AnonymousLimiterService.resetRequestCount(anonymousId);
-        logger.info('[AUTH] Reset anonymous rate limit after signup', {
-          userId: result.user?.id,
-          anonymousId
+        // First, migrate all anonymous data to the new authenticated user
+        const migrationResult = await AnonymousMigrationService.migrateToAuthenticatedUser(
+          anonymousId,
+          result.user.id
+        );
+
+        logger.info('[AUTH] Migrated anonymous data after signup', {
+          userId: result.user.id,
+          anonymousId,
+          migrated: migrationResult.migrated
         });
-      } catch (resetError) {
-        logger.error('[AUTH] Failed to reset anonymous limit', { resetError, anonymousId });
+
+        // Then reset rate limit (already done in migration, but just in case)
+        await AnonymousLimiterService.resetRequestCount(anonymousId);
+
+        // Include migration info in response
+        res.status(201).json({
+          success: true,
+          message: 'User registered successfully. Please check your email for verification.',
+          data: {
+            ...result,
+            migration: {
+              success: true,
+              migrated: migrationResult.migrated
+            }
+          },
+        });
+        return;
+      } catch (migrationError: any) {
+        logger.error('[AUTH] Failed to migrate anonymous data', {
+          migrationError,
+          anonymousId,
+          userId: result.user.id
+        });
+        // Don't fail the signup if migration fails, just log it
       }
     }
 
@@ -60,16 +89,44 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     const result = await signInWithEmail(email, password);
 
-    // Reset anonymous user's rate limit after successful login
-    if (anonymousId) {
+    // Migrate anonymous data and reset rate limit after successful login
+    if (anonymousId && result.user?.id) {
       try {
-        await AnonymousLimiterService.resetRequestCount(anonymousId);
-        logger.info('[AUTH] Reset anonymous rate limit after login', {
+        // First, migrate all anonymous data to the authenticated user
+        const migrationResult = await AnonymousMigrationService.migrateToAuthenticatedUser(
+          anonymousId,
+          result.user.id
+        );
+
+        logger.info('[AUTH] Migrated anonymous data after login', {
           userId: result.user.id,
-          anonymousId
+          anonymousId,
+          migrated: migrationResult.migrated
         });
-      } catch (resetError) {
-        logger.error('[AUTH] Failed to reset anonymous limit', { resetError, anonymousId });
+
+        // Then reset rate limit (already done in migration, but just in case)
+        await AnonymousLimiterService.resetRequestCount(anonymousId);
+
+        // Include migration info in response
+        res.json({
+          success: true,
+          message: 'Login successful',
+          data: {
+            ...result,
+            migration: {
+              success: true,
+              migrated: migrationResult.migrated
+            }
+          },
+        });
+        return;
+      } catch (migrationError: any) {
+        logger.error('[AUTH] Failed to migrate anonymous data', {
+          migrationError,
+          anonymousId,
+          userId: result.user.id
+        });
+        // Don't fail the login if migration fails, just log it
       }
     }
 

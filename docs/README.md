@@ -31,6 +31,7 @@
 - [**Стандарты кодирования**](./development/coding-standards.md) - правила написания кода
 - [**Auth Implementation**](./development/auth-implementation.md) - технические детали аутентификации
 - [**Auth Validation**](./development/auth-validation.md) - отчет проверки auth файлов
+- [**Anonymous User Migration**](./development/anonymous-user-migration.md) - миграция анонимных пользователей
 
 ## ⚙️ Setup & Configuration
 
