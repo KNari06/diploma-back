@@ -119,6 +119,19 @@ export class WorkspaceService {
    */
   static async getOrCreateDefaultWorkspace(userId: string): Promise<Workspace> {
     try {
+      // Check if workspaces table exists
+      const { data: tableCheck, error: tableError } = await supabaseAdmin
+        .from('workspaces')
+        .select('id')
+        .limit(1)
+        .maybeSingle();
+
+      // If table doesn't exist, throw a clear error
+      if (tableError && tableError.code === '42P01') {
+        logger.error('[WORKSPACE] Workspaces table does not exist. Please run migration first.', { userId });
+        throw new Error('Workspaces table does not exist. Please apply workspaces.sql migration first.');
+      }
+
       // Try to get existing workspaces
       const workspaces = await this.getUserWorkspaces(userId);
 

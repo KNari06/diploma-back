@@ -113,9 +113,15 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
             try {
               const defaultWorkspace = await WorkspaceService.getOrCreateDefaultWorkspace(userId);
               workspaceId = defaultWorkspace.id;
-            } catch (workspaceError) {
-              logger.error('Failed to get default workspace for chat session', { workspaceError, userId });
-              // Continue without workspace_id - migration will handle it
+            } catch (workspaceError: any) {
+              // If workspaces table doesn't exist, continue without workspace_id
+              if (workspaceError?.message?.includes('does not exist') || workspaceError?.code === '42P01') {
+                logger.warn('Workspaces table not found, creating chat session without workspace_id', { userId });
+                // Continue without workspace_id - migration will handle it later
+              } else {
+                logger.error('Failed to get default workspace for chat session', { workspaceError, userId });
+                // Continue without workspace_id - migration will handle it
+              }
             }
           }
 

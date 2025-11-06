@@ -212,6 +212,28 @@ export class SupabaseService {
 
   // Project operations
   async createProject(projectData: any) {
+    // Check if workspaces table exists (for backward compatibility during migration)
+    const { error: tableCheckError } = await this.client
+      .from('workspaces')
+      .select('id')
+      .limit(1);
+
+    // If workspaces table doesn't exist (error code 42P01 = relation does not exist), use legacy mode
+    if (tableCheckError && (tableCheckError.code === '42P01' || tableCheckError.message?.includes('does not exist'))) {
+      logger.warn('[DB] Workspaces table not found, creating project without workspace_id (legacy mode)');
+      // Remove workspace_id if it was provided but table doesn't exist
+      delete projectData.workspace_id;
+
+      const { data, error } = await this.client
+        .from('projects')
+        .insert(projectData)
+        .select()
+        .single();
+
+      if (error) throw error;
+      return data;
+    }
+
     // Validate workspace_id is provided
     if (!projectData.workspace_id) {
       throw new Error('workspace_id is required. Project must belong to a workspace.');
@@ -228,13 +250,16 @@ export class SupabaseService {
       throw new Error(`Workspace with id ${projectData.workspace_id} not found`);
     }
 
+    // Type assertion for workspace (we know it has user_id from select)
+    const workspaceData = workspace as { id: string; user_id: string };
+
     // Verify user_id matches workspace owner (if user_id is provided)
-    if (projectData.user_id && workspace.user_id !== projectData.user_id) {
+    if (projectData.user_id && workspaceData.user_id !== projectData.user_id) {
       throw new Error('Project user_id must match workspace owner');
     }
 
     // Ensure projectData.user_id matches workspace owner
-    projectData.user_id = workspace.user_id;
+    projectData.user_id = workspaceData.user_id;
 
     const { data, error } = await this.client
       .from('projects')

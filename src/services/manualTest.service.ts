@@ -428,51 +428,70 @@ export class ManualTestService {
         return DEFAULT_PROJECT_ID;
       }
 
-      // Ensure default workspace exists
-      const { data: existingWorkspace } = await supabaseAdmin
+      // Check if workspaces table exists
+      const { error: workspaceTableError } = await supabaseAdmin
         .from('workspaces')
         .select('id')
-        .eq('id', DEFAULT_WORKSPACE_ID)
-        .single();
+        .limit(1);
 
-      let workspaceId = DEFAULT_WORKSPACE_ID;
+      let workspaceId: string | undefined = undefined;
 
-      if (!existingWorkspace) {
-        // Create default workspace for system/anonymous users
-        const { error: workspaceError } = await supabaseAdmin
+      // Only use workspace if table exists
+      if (!workspaceTableError || workspaceTableError.code !== '42P01') {
+        // Ensure default workspace exists
+        const { data: existingWorkspace } = await supabaseAdmin
           .from('workspaces')
-          .insert({
-            id: DEFAULT_WORKSPACE_ID,
-            name: 'Default Workspace (Anonymous)',
-            user_id: DEFAULT_PROJECT_ID, // System user ID
-            platforms: ['web(chrome, safari, firefox)'],
-            api_testing: false,
-            dev_base_url: null,
-            prod_base_url: null,
-            settings: {},
-          })
-          .select()
-          .single();
+          .select('id')
+          .eq('id', DEFAULT_WORKSPACE_ID)
+          .maybeSingle();
 
-        if (workspaceError) {
-          logger.error('Failed to create default workspace', workspaceError);
-          throw workspaceError;
+        workspaceId = DEFAULT_WORKSPACE_ID;
+
+        if (!existingWorkspace) {
+          // Create default workspace for system/anonymous users
+          const { error: workspaceError } = await supabaseAdmin
+            .from('workspaces')
+            .insert({
+              id: DEFAULT_WORKSPACE_ID,
+              name: 'Default Workspace (Anonymous)',
+              user_id: DEFAULT_PROJECT_ID, // System user ID
+              platforms: ['web(chrome, safari, firefox)'],
+              api_testing: false,
+              dev_base_url: null,
+              prod_base_url: null,
+              settings: {},
+            })
+            .select()
+            .single();
+
+          if (workspaceError) {
+            logger.error('Failed to create default workspace', workspaceError);
+            throw workspaceError;
+          }
+
+          logger.info('Created default workspace for anonymous users', { id: DEFAULT_WORKSPACE_ID });
         }
-
-        logger.info('Created default workspace for anonymous users', { id: DEFAULT_WORKSPACE_ID });
+      } else {
+        logger.warn('Workspaces table not found, creating project without workspace_id (legacy mode)');
       }
 
       // Create default project for anonymous users
+      const projectData: any = {
+        id: DEFAULT_PROJECT_ID,
+        name: 'Default Project (Anonymous)',
+        description: 'Default project for anonymous test users',
+        user_id: DEFAULT_PROJECT_ID, // Self-reference for system project
+        settings: {},
+      };
+
+      // Only add workspace_id if table exists
+      if (workspaceId) {
+        projectData.workspace_id = workspaceId;
+      }
+
       const { error } = await supabaseAdmin
         .from('projects')
-        .insert({
-          id: DEFAULT_PROJECT_ID,
-          name: 'Default Project (Anonymous)',
-          description: 'Default project for anonymous test users',
-          user_id: DEFAULT_PROJECT_ID, // Self-reference for system project
-          workspace_id: workspaceId,
-          settings: {},
-        })
+        .insert(projectData)
         .select()
         .single();
 
