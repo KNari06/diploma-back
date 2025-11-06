@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
 import { Workspace, WorkspaceCreateRequest } from '@/types';
+import { logger } from '@/utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 
 /**
