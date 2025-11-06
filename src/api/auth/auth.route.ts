@@ -1,17 +1,18 @@
-import { Router, Request, Response } from 'express';
+import { asyncHandler, handleValidationError } from '@/utils/error-handler';
+import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import {
-  signup,
-  login,
-  sendMagicLink,
   getOAuthUrlHandler,
+  login,
   logout,
-  refresh,
   me,
   passwordResetRequest,
   passwordUpdate,
+  refresh,
+  sendMagicLink,
+  signup,
+  updateProfile,
 } from './auth.controller';
-import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 
 const router = Router();
 
@@ -43,6 +44,10 @@ const passwordResetSchema = z.object({
 
 const passwordUpdateSchema = z.object({
   newPassword: z.string().min(6, 'Password must be at least 6 characters'),
+});
+
+const updateProfileSchema = z.object({
+  name: z.string().min(1, 'Name is required').max(255, 'Name must be less than 255 characters'),
 });
 
 /**
@@ -437,6 +442,130 @@ router.post('/password/update', asyncHandler(async (req: Request, res: Response)
     const validatedData = passwordUpdateSchema.parse(req.body);
     req.body = validatedData;
     await passwordUpdate(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
+
+/**
+ * @swagger
+ * /api/v1/auth/profile:
+ *   put:
+ *     summary: Обновить профиль пользователя
+ *     description: Обновляет имя пользователя в профиле
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - name
+ *             properties:
+ *               name:
+ *                 type: string
+ *                 minLength: 1
+ *                 maxLength: 255
+ *                 example: "John Doe"
+ *                 description: "Новое имя пользователя"
+ *     responses:
+ *       200:
+ *         description: Профиль обновлен успешно
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Profile updated successfully"
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     id:
+ *                       type: string
+ *                       format: uuid
+ *                       example: "c79e2bd7-ad07-4e56-9251-1492dd01e635"
+ *                     email:
+ *                       type: string
+ *                       example: "user@example.com"
+ *                     name:
+ *                       type: string
+ *                       example: "John Doe"
+ *                     role:
+ *                       type: string
+ *                       example: "user"
+ *                     credits:
+ *                       type: integer
+ *                       example: 100
+ *                     subscription:
+ *                       type: object
+ *                       nullable: true
+ *                     createdAt:
+ *                       type: string
+ *                       format: date-time
+ *                       example: "2025-11-06T10:30:00Z"
+ *                     updatedAt:
+ *                       type: string
+ *                       format: date-time
+ *                       example: "2025-11-06T15:45:00Z"
+ *       400:
+ *         description: Невалидные данные
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Invalid name format"
+ *                 code:
+ *                   type: string
+ *                   example: "VALIDATION_ERROR"
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       401:
+ *         description: Не авторизован
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Unauthorized"
+ *       422:
+ *         description: Ошибка валидации
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Name is required"
+ */
+router.put('/profile', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = updateProfileSchema.parse(req.body);
+    req.body = validatedData;
+    await updateProfile(req, res);
   } catch (error) {
     handleValidationError(error);
   }

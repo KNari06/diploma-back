@@ -1,7 +1,7 @@
-import { supabase, supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
-import { AuthUser, AuthTokens } from '@/types';
 import { env } from '@/config/env';
+import { supabase, supabaseAdmin } from '@/db/supabase';
+import { AuthTokens, AuthUser } from '@/types';
+import { logger } from '@/utils/logger';
 
 /**
  * Sign up with email and password
@@ -402,6 +402,102 @@ export async function updatePassword(
     return { success: true };
   } catch (error) {
     logger.error('Password update error', error);
+    throw error;
+  }
+}
+
+/**
+ * Update user profile
+ * @param accessToken - User access token
+ * @param name - New user name
+ * @returns Updated user data
+ */
+export async function updateUserProfile(
+  accessToken: string,
+  name: string
+): Promise<any> {
+  try {
+    // Verify token first
+    const user = await verifyToken(accessToken);
+    if (!user) throw new Error('Invalid token');
+
+    // Update user metadata in Supabase Auth
+    const { data: authData, error: authError } = await supabase.auth.updateUser({
+      data: { name }
+    });
+
+    if (authError) throw authError;
+
+    // Update user data in public.users table
+    const { data: userData, error: dbError } = await supabaseAdmin
+      .from('users')
+      .update({
+        name,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', user.id)
+      .select('*')
+      .maybeSingle();
+
+    if (dbError) {
+      logger.error('Failed to update user in database', { error: dbError, userId: user.id });
+      throw new Error('Failed to update user profile in database');
+    }
+
+    // If user not found in public.users, create them
+    if (!userData) {
+      logger.warn('User not found in public.users, creating entry', { userId: user.id });
+
+      const newUser = {
+        id: user.id,
+        email: user.email,
+        name,
+        role: 'user',
+        credits: 0,
+        subscription: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+
+      const { data: createdUser, error: createError } = await supabaseAdmin
+        .from('users')
+        .insert(newUser)
+        .select('*')
+        .maybeSingle();
+
+      if (createError) {
+        logger.error('Failed to create user in database', { error: createError, userId: user.id });
+        throw new Error('Failed to create user profile in database');
+      }
+
+      logger.info('User profile updated (created)', { userId: user.id, name });
+
+      return {
+        id: user.id,
+        email: user.email,
+        name: createdUser?.name,
+        role: createdUser?.role,
+        credits: createdUser?.credits,
+        subscription: createdUser?.subscription,
+        createdAt: createdUser?.created_at,
+        updatedAt: createdUser?.updated_at,
+      };
+    }
+
+    logger.info('User profile updated', { userId: user.id, name });
+
+    return {
+      id: user.id,
+      email: user.email,
+      name: userData.name,
+      role: userData.role,
+      credits: userData.credits,
+      subscription: userData.subscription,
+      createdAt: userData.created_at,
+      updatedAt: userData.updated_at,
+    };
+  } catch (error) {
+    logger.error('Update user profile error', error);
     throw error;
   }
 }

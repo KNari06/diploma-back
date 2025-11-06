@@ -10,6 +10,7 @@ import {
   signOut,
   signUpWithEmail,
   updatePassword,
+  updateUserProfile,
 } from '@/services/auth.service';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
@@ -346,6 +347,75 @@ export const passwordUpdate = async (req: Request, res: Response): Promise<void>
     res.status(400).json({
       success: false,
       error: error.message || 'Failed to update password',
+    });
+  }
+};
+
+/**
+ * Update user profile
+ * PUT /auth/profile
+ */
+export const updateProfile = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.replace('Bearer ', '') || '';
+    const { name } = req.body;
+
+    if (!token) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        code: 'UNAUTHORIZED',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid name format',
+        code: 'VALIDATION_ERROR',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (name.length > 255) {
+      res.status(422).json({
+        success: false,
+        error: 'Name must be less than 255 characters',
+        code: 'VALIDATION_ERROR',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const updatedUser = await updateUserProfile(token, name.trim());
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: updatedUser,
+    });
+  } catch (error: any) {
+    logger.error('Profile update error', error);
+
+    if (error.message === 'Invalid token') {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        code: 'INVALID_TOKEN',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.status(400).json({
+      success: false,
+      error: error.message || 'Failed to update profile',
+      code: 'UPDATE_ERROR',
+      timestamp: new Date().toISOString(),
     });
   }
 };
