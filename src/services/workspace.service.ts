@@ -2,6 +2,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { Workspace, WorkspaceCreateRequest } from '@/types';
 import { logger } from '@/utils/logger';
 import { v4 as uuidv4 } from 'uuid';
+import { ApiConfigService } from './api-config.service';
 
 /**
  * Service for managing workspaces
@@ -54,6 +55,11 @@ export class WorkspaceService {
         userId,
         name: workspaceData.name,
       });
+
+      // Auto-create API environments from workspace URLs
+      if (workspaceData.api_testing && workspaceData.devBaseUrl) {
+        await this.createApiEnvironmentsFromWorkspace(userId, data.id, workspaceData);
+      }
 
       return this.mapToWorkspace(data);
     } catch (error) {
@@ -222,6 +228,65 @@ export class WorkspaceService {
     } catch (error) {
       logger.error('[WORKSPACE] Exception in deleteWorkspace', { error, workspaceId, userId });
       return false;
+    }
+  }
+
+  /**
+   * Auto-create API environments from workspace URLs
+   */
+  private static async createApiEnvironmentsFromWorkspace(
+    userId: string,
+    workspaceId: string,
+    workspaceData: WorkspaceCreateRequest
+  ): Promise<void> {
+    try {
+      logger.info('[WORKSPACE] Creating API environments from workspace URLs', {
+        workspaceId,
+        userId,
+        devBaseUrl: workspaceData.devBaseUrl,
+        prodBaseUrl: workspaceData.prodBaseUrl,
+      });
+
+      // Create dev environment (required)
+      if (workspaceData.devBaseUrl) {
+        await ApiConfigService.upsertEnvironment(userId, workspaceId, {
+          name: 'dev',
+          base_url: workspaceData.devBaseUrl,
+          description: 'Auto-created from workspace dev_base_url',
+          default_headers: { 'Content-Type': 'application/json' },
+          auth_type: 'none',
+          is_default: true, // Dev is default
+        });
+
+        logger.info('[WORKSPACE] Created dev environment', {
+          workspaceId,
+          baseUrl: workspaceData.devBaseUrl,
+        });
+      }
+
+      // Create prod environment (optional)
+      if (workspaceData.prodBaseUrl) {
+        await ApiConfigService.upsertEnvironment(userId, workspaceId, {
+          name: 'prod',
+          base_url: workspaceData.prodBaseUrl,
+          description: 'Auto-created from workspace prod_base_url',
+          default_headers: { 'Content-Type': 'application/json' },
+          auth_type: 'none',
+          is_default: false, // Prod is not default
+        });
+
+        logger.info('[WORKSPACE] Created prod environment', {
+          workspaceId,
+          baseUrl: workspaceData.prodBaseUrl,
+        });
+      }
+    } catch (error) {
+      logger.error('[WORKSPACE] Failed to create API environments', {
+        error,
+        workspaceId,
+        userId,
+      });
+      // Don't throw - workspace creation should succeed even if environments fail
     }
   }
 
