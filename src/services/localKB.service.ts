@@ -32,13 +32,37 @@ export async function loadGlobalKB(): Promise<LocalKBChunk[]> {
   }
 
   try {
-    const kbPath = path.join(process.cwd(), 'data/global-kb/embeddings.json');
+    // Try multiple possible paths for embeddings.json
+    // 1. Relative to process.cwd() (works in dev and when running from project root)
+    // 2. Relative to __dirname (works when compiled to dist/)
+    // 3. Absolute path from project root
+    const possiblePaths = [
+      path.join(process.cwd(), 'data/global-kb/embeddings.json'),
+      path.join(process.cwd(), '../data/global-kb/embeddings.json'),
+      path.join(__dirname, '../../data/global-kb/embeddings.json'),
+      path.join(__dirname, '../../../data/global-kb/embeddings.json'),
+    ];
 
-    // Check if file exists
-    try {
-      await fs.access(kbPath);
-    } catch {
-      logger.warn('Global KB embeddings.json not found, using empty KB');
+    let kbPath: string | null = null;
+
+    // Find the first existing path
+    for (const testPath of possiblePaths) {
+      try {
+        await fs.access(testPath);
+        kbPath = testPath;
+        logger.debug('Found Global KB embeddings.json', { path: kbPath });
+        break;
+      } catch {
+        // Continue to next path
+      }
+    }
+
+    if (!kbPath) {
+      logger.warn('Global KB embeddings.json not found in any expected location', {
+        searchedPaths: possiblePaths,
+        cwd: process.cwd(),
+        __dirname,
+      });
       globalKBCache = [];
       isInitialized = true;
       return [];
@@ -138,7 +162,36 @@ export async function getLocalKBStats(): Promise<{
     };
   }
 
-  const kbPath = path.join(process.cwd(), 'data/global-kb/embeddings.json');
+  // Use the same path resolution logic as loadGlobalKB
+  const possiblePaths = [
+    path.join(process.cwd(), 'data/global-kb/embeddings.json'),
+    path.join(process.cwd(), '../data/global-kb/embeddings.json'),
+    path.join(__dirname, '../../data/global-kb/embeddings.json'),
+    path.join(__dirname, '../../../data/global-kb/embeddings.json'),
+  ];
+
+  let kbPath: string | null = null;
+
+  for (const testPath of possiblePaths) {
+    try {
+      await fs.access(testPath);
+      kbPath = testPath;
+      break;
+    } catch {
+      // Continue to next path
+    }
+  }
+
+  if (!kbPath) {
+    return {
+      totalChunks: 0,
+      totalFiles: 0,
+      model: 'unknown',
+      version: 'unknown',
+      lastGenerated: 'never',
+    };
+  }
+
   const data = await fs.readFile(kbPath, 'utf-8');
   const kb: LocalKBData = JSON.parse(data);
 

@@ -23,6 +23,9 @@ COPY --from=builder /app/dist ./dist
 # 👇 КЛЮЧЕВОЕ: кладём и исходники, чтобы swagger-jsdoc мог сканировать src/**/*.ts
 COPY --from=builder /app/src ./src
 
+# Копируем данные (Global KB embeddings)
+COPY --from=builder /app/data ./data
+
 # tsconfig-paths для алиасов в рантайме ( @/* -> dist/* )
 RUN printf '{\n  "compilerOptions": {\n    "baseUrl": ".",\n    "paths": { "@/*": ["dist/*"] }\n  }\n}\n' > /app/tsconfig.json
 

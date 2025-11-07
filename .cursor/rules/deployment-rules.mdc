@@ -80,6 +80,20 @@ git status --short
 # - Нет debug кода или console.log
 ```
 
+## Подключение к серверу
+
+### SSH команда для подключения:
+
+```bash
+ssh -i /Users/yerassylospanov/Desktop/QAI-BackEnd/gcp root@35.238.212.84
+```
+
+**Важно:**
+- SSH ключ находится в корне проекта: `./gcp`
+- Полный путь: `/Users/yerassylospanov/Desktop/QAI-BackEnd/gcp`
+- Пользователь: `root`
+- IP сервера: `35.238.212.84`
+
 ## Deployment Process
 
 ### Только после ВСЕХ проверок выше:
