@@ -1,5 +1,5 @@
-import winston from 'winston';
 import { env } from '@/config/env';
+import winston from 'winston';
 
 // Define log levels
 const levels = {
@@ -55,7 +55,7 @@ if (env.NODE_ENV === 'production') {
       ),
     })
   ];
-  
+
   transports.push(...fileTransports);
 }
 
@@ -77,27 +77,70 @@ export const morganStream = {
 
 // Log unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  logger.error('Unhandled Rejection at:', {
+    promise: String(promise),
+    reason: reason instanceof Error ? {
+      message: reason.message,
+      stack: reason.stack,
+      name: reason.name,
+    } : String(reason),
+  });
+
+  // Don't exit - log and continue
+  // Only exit in production for critical errors
+  if (process.env.NODE_ENV === 'production' && reason instanceof Error) {
+    // Check if it's a critical error that should crash the app
+    const criticalErrors = ['ECONNREFUSED', 'ENOTFOUND', 'EADDRINUSE'];
+    const isCritical = criticalErrors.some(code =>
+      reason.message.includes(code) || (reason as any).code === code
+    );
+
+    if (isCritical) {
+      logger.error('Critical unhandled rejection, exiting...');
+      process.exit(1);
+    }
+  }
 });
 
 // Log uncaught exceptions
 process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception:', error);
-  process.exit(1);
+  logger.error('Uncaught Exception:', {
+    message: error.message,
+    stack: error.stack,
+    name: error.name,
+  });
+
+  // Only exit for critical errors in production
+  // In development, log and continue to help debugging
+  if (process.env.NODE_ENV === 'production') {
+    const criticalErrors = ['ECONNREFUSED', 'ENOTFOUND', 'EADDRINUSE', 'EACCES'];
+    const isCritical = criticalErrors.some(code =>
+      error.message.includes(code) || (error as any).code === code
+    );
+
+    if (isCritical) {
+      logger.error('Critical uncaught exception, exiting...');
+      process.exit(1);
+    } else {
+      logger.warn('Non-critical uncaught exception, continuing...');
+    }
+  } else {
+    logger.warn('Uncaught exception in development, continuing...');
+  }
 });
 
 // Helper functions for structured logging
 export const logRequest = (req: any, res: any, next: any) => {
   const start = Date.now();
-  
+
   res.on('finish', () => {
     const duration = Date.now() - start;
     const { method, url, ip } = req;
     const { statusCode } = res;
-    
+
     logger.http(`${method} ${url} ${statusCode} - ${duration}ms - ${ip}`);
   });
-  
+
   next();
 };
 

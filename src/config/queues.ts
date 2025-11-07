@@ -299,13 +299,27 @@ export class QueueManager {
    */
   static async getQueueStats() {
     try {
-      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats] = await Promise.all([
+      // Use Promise.allSettled to handle individual queue failures gracefully
+      const results = await Promise.allSettled([
         testRunQueue.getJobCounts(),
         testResultQueue.getJobCounts(),
         aiAnalysisQueue.getJobCounts(),
         notificationQueue.getJobCounts(),
         webhookQueue.getJobCounts(),
       ]);
+
+      // Extract successful results, use empty object for failed ones
+      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats] = results.map(
+        (result) => result.status === 'fulfilled' ? result.value : {}
+      );
+
+      // Log any failures but don't fail the whole operation
+      results.forEach((result, index) => {
+        if (result.status === 'rejected') {
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook'];
+          logger.warn(`Failed to get stats for ${queueNames[index]} queue`, { error: result.reason });
+        }
+      });
 
       return {
         testRun: testRunStats,
@@ -430,7 +444,8 @@ export const gracefulShutdown = async () => {
   logger.info('Shutting down queues...');
 
   try {
-    await Promise.all([
+    // Use Promise.allSettled to ensure all queues close even if one fails
+    const closeResults = await Promise.allSettled([
       testRunQueue.close(),
       testResultQueue.close(),
       aiAnalysisQueue.close(),
@@ -438,8 +453,22 @@ export const gracefulShutdown = async () => {
       webhookQueue.close(),
     ]);
 
-    await redisConnection.quit();
-    logger.info('Queues shut down successfully');
+    // Log any failures but continue shutdown
+    closeResults.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook'];
+        logger.warn(`Failed to close ${queueNames[index]} queue`, { error: result.reason });
+      }
+    });
+
+    // Try to close Redis connection
+    try {
+      await redisConnection.quit();
+    } catch (redisError) {
+      logger.warn('Failed to close Redis connection', { error: redisError });
+    }
+
+    logger.info('Queues shut down completed');
   } catch (error) {
     logger.error('Error during queue shutdown:', error);
   }

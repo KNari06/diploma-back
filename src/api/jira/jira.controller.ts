@@ -16,11 +16,15 @@ const oauthStates = new Map<string, { userId?: string; expiresAt: number }>();
 
 // Clean up expired states every hour
 setInterval(() => {
-  const now = Date.now();
-  for (const [state, data] of oauthStates.entries()) {
-    if (data.expiresAt < now) {
-      oauthStates.delete(state);
+  try {
+    const now = Date.now();
+    for (const [state, data] of oauthStates.entries()) {
+      if (data.expiresAt < now) {
+        oauthStates.delete(state);
+      }
     }
+  } catch (error) {
+    logger.error('Error cleaning up OAuth states', { error });
   }
 }, 60 * 60 * 1000);
 
@@ -115,11 +119,26 @@ export const handleJiraCallback = async (req: Request, res: Response): Promise<v
     }
 
     // Save token for each accessible resource
-    const savedTokens = await Promise.all(
+    // Use Promise.allSettled to handle individual failures gracefully
+    const saveResults = await Promise.allSettled(
       resources.map((resource) =>
         saveJiraToken(userId, tokenData, resource.id, resource.url)
       )
     );
+
+    const savedTokens = saveResults
+      .filter((result): result is PromiseFulfilledResult<any> => result.status === 'fulfilled')
+      .map(result => result.value);
+
+    // Log failed saves but don't fail the whole operation
+    const failedSaves = saveResults.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failedSaves.length > 0) {
+      logger.warn('Some Jira tokens failed to save', {
+        userId,
+        failedCount: failedSaves.length,
+        totalCount: resources.length,
+      });
+    }
 
     logger.info('Jira OAuth callback completed', {
       userId,

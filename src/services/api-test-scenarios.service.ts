@@ -1,5 +1,5 @@
-import { logger } from '@/utils/logger';
 import { ApiTestRequest, ApiTestResponse } from '@/types';
+import { logger } from '@/utils/logger';
 import { executeApiTest } from './apiTest.service';
 
 /**
@@ -327,11 +327,33 @@ export async function executeApiTestSuite(
           };
         });
 
-        const chunkResults = await Promise.all(chunkPromises);
-        results.push(...chunkResults);
+        // Use Promise.allSettled to handle individual failures gracefully
+        const chunkResults = await Promise.allSettled(chunkPromises);
+        const successfulResults = chunkResults
+          .filter((result): result is PromiseFulfilledResult<any> => result.status === 'fulfilled')
+          .map(result => result.value);
+
+        const failedResults = chunkResults
+          .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+          .map((result, index) => ({
+            scenario: chunk[index],
+            result: {
+              success: false,
+              status: 0,
+              durationMs: 0,
+              responseHeaders: {},
+              responseBody: null,
+              error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+              matchesExpected: false,
+            },
+            passed: false,
+            executedAt: new Date(),
+          }));
+
+        results.push(...successfulResults, ...failedResults);
 
         // Stop on first failure if requested
-        if (options?.stopOnFirstFailure && chunkResults.some(r => !r.passed)) {
+        if (options?.stopOnFirstFailure && failedResults.length > 0) {
           logger.info('Stopping test suite execution due to failure');
           break;
         }

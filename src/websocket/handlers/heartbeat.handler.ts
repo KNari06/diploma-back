@@ -3,14 +3,14 @@
  * Handles ping/pong for connection health checks
  */
 
-import { Socket } from 'socket.io';
 import { logger } from '@/utils/logger';
-import {
-  ClientToServerEvents,
-  ServerToClientEvents,
-  SocketData,
-} from '../types';
+import { Socket } from 'socket.io';
 import { getUserId } from '../middleware';
+import {
+    ClientToServerEvents,
+    ServerToClientEvents,
+    SocketData,
+} from '../types';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 
@@ -21,11 +21,18 @@ export const handleHeartbeat = (socket: TypedSocket): void => {
   const userId = getUserId(socket);
 
   socket.on('ping', () => {
-    socket.emit('pong');
+    try {
+      socket.emit('pong');
 
-    logger.debug('[WebSocket] Heartbeat', {
-      socketId: socket.id,
-      userId: userId || 'anonymous',
-    });
+      logger.debug('[WebSocket] Heartbeat', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in ping handler', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 };

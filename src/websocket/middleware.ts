@@ -45,7 +45,7 @@ export const authenticateSocket = async (
     const user = await AuthService.verifyToken(token);
 
     if (!user) {
-      logger.warn('[WebSocket] Invalid token', {
+      logger.debug('[WebSocket] Invalid token', {
         socketId: socket.id,
       });
       return next(new Error('Authentication failed'));
@@ -67,11 +67,16 @@ export const authenticateSocket = async (
 
     next();
   } catch (error) {
-    logger.error('[WebSocket] Authentication error', {
+    // Log as debug to avoid noise - auth errors are expected
+    logger.debug('[WebSocket] Authentication error', {
       socketId: socket.id,
       error: error instanceof Error ? error.message : String(error),
     });
-    next(new Error('Authentication failed'));
+
+    // Don't crash - just reject the connection gracefully
+    const authError = new Error('Authentication failed');
+    authError.name = 'AuthenticationError';
+    next(authError);
   }
 };
 

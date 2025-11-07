@@ -270,7 +270,11 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
       role: userData?.role || 'user',
     };
   } catch (error) {
-    logger.error('Token verification error', error);
+    // Log error but don't throw - return null to indicate invalid token
+    logger.debug('Token verification error', {
+      error: error instanceof Error ? error.message : String(error),
+      // Don't log stack trace for auth errors to avoid noise
+    });
     return null;
   }
 }

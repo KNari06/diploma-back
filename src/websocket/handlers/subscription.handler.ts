@@ -3,16 +3,16 @@
  * Handles room subscriptions for tests and chats
  */
 
-import { Socket } from 'socket.io';
 import { logger } from '@/utils/logger';
-import {
-  ClientToServerEvents,
-  ServerToClientEvents,
-  SocketData,
-  createRoomName,
-  ErrorPayload,
-} from '../types';
+import { Socket } from 'socket.io';
 import { getUserId } from '../middleware';
+import {
+    ClientToServerEvents,
+    createRoomName,
+    ErrorPayload,
+    ServerToClientEvents,
+    SocketData,
+} from '../types';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 
@@ -61,78 +61,116 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
 
   // Subscribe to test updates
   socket.on('subscribe:test', ({ testId }) => {
-    if (!canSubscribe(socket.id)) {
-      const errorPayload: ErrorPayload = {
-        code: 'SUBSCRIPTION_LIMIT',
-        message: 'Maximum subscription limit reached',
+    try {
+      if (!canSubscribe(socket.id)) {
+        const errorPayload: ErrorPayload = {
+          code: 'SUBSCRIPTION_LIMIT',
+          message: 'Maximum subscription limit reached',
+          timestamp: new Date().toISOString(),
+        };
+        socket.emit('error', errorPayload);
+        return;
+      }
+
+      const room = createRoomName('test', testId);
+      socket.join(room);
+      incrementSubscriptions(socket.id);
+
+      logger.info('[WebSocket] Subscribed to test', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        testId,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in subscribe:test', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      socket.emit('error', {
+        code: 'SUBSCRIPTION_ERROR',
+        message: 'Failed to subscribe to test updates',
         timestamp: new Date().toISOString(),
-      };
-      socket.emit('error', errorPayload);
-      return;
+      });
     }
-
-    const room = createRoomName('test', testId);
-    socket.join(room);
-    incrementSubscriptions(socket.id);
-
-    logger.info('[WebSocket] Subscribed to test', {
-      socketId: socket.id,
-      userId: userId || 'anonymous',
-      testId,
-      room,
-    });
   });
 
   // Unsubscribe from test updates
   socket.on('unsubscribe:test', ({ testId }) => {
-    const room = createRoomName('test', testId);
-    socket.leave(room);
-    decrementSubscriptions(socket.id);
+    try {
+      const room = createRoomName('test', testId);
+      socket.leave(room);
+      decrementSubscriptions(socket.id);
 
-    logger.info('[WebSocket] Unsubscribed from test', {
-      socketId: socket.id,
-      userId: userId || 'anonymous',
-      testId,
-      room,
-    });
+      logger.info('[WebSocket] Unsubscribed from test', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        testId,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in unsubscribe:test', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 
   // Subscribe to chat updates
   socket.on('subscribe:chat', ({ sessionId }) => {
-    if (!canSubscribe(socket.id)) {
-      const errorPayload: ErrorPayload = {
-        code: 'SUBSCRIPTION_LIMIT',
-        message: 'Maximum subscription limit reached',
+    try {
+      if (!canSubscribe(socket.id)) {
+        const errorPayload: ErrorPayload = {
+          code: 'SUBSCRIPTION_LIMIT',
+          message: 'Maximum subscription limit reached',
+          timestamp: new Date().toISOString(),
+        };
+        socket.emit('error', errorPayload);
+        return;
+      }
+
+      const room = createRoomName('chat', sessionId);
+      socket.join(room);
+      incrementSubscriptions(socket.id);
+
+      logger.info('[WebSocket] Subscribed to chat', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        sessionId,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in subscribe:chat', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      socket.emit('error', {
+        code: 'SUBSCRIPTION_ERROR',
+        message: 'Failed to subscribe to chat updates',
         timestamp: new Date().toISOString(),
-      };
-      socket.emit('error', errorPayload);
-      return;
+      });
     }
-
-    const room = createRoomName('chat', sessionId);
-    socket.join(room);
-    incrementSubscriptions(socket.id);
-
-    logger.info('[WebSocket] Subscribed to chat', {
-      socketId: socket.id,
-      userId: userId || 'anonymous',
-      sessionId,
-      room,
-    });
   });
 
   // Unsubscribe from chat updates
   socket.on('unsubscribe:chat', ({ sessionId }) => {
-    const room = createRoomName('chat', sessionId);
-    socket.leave(room);
-    decrementSubscriptions(socket.id);
+    try {
+      const room = createRoomName('chat', sessionId);
+      socket.leave(room);
+      decrementSubscriptions(socket.id);
 
-    logger.info('[WebSocket] Unsubscribed from chat', {
-      socketId: socket.id,
-      userId: userId || 'anonymous',
-      sessionId,
-      room,
-    });
+      logger.info('[WebSocket] Unsubscribed from chat', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        sessionId,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in unsubscribe:chat', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 
   // Cleanup on disconnect

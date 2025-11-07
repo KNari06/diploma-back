@@ -134,7 +134,8 @@ const gracefulShutdown = async (signal: string) => {
   logger.info(`Received ${signal}. Starting graceful worker shutdown...`);
 
   try {
-    await Promise.all([
+    // Use Promise.allSettled to ensure all workers close even if one fails
+    const closeResults = await Promise.allSettled([
       testRunWorker.close(),
       testResultWorker.close(),
       aiAnalysisWorker.close(),
@@ -142,7 +143,15 @@ const gracefulShutdown = async (signal: string) => {
       webhookWorker.close(),
     ]);
 
-    logger.info('All workers closed successfully');
+    // Log any failures but continue shutdown
+    closeResults.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook'];
+        logger.warn(`Failed to close ${workerNames[index]} worker`, { error: result.reason });
+      }
+    });
+
+    logger.info('Worker shutdown completed');
     process.exit(0);
   } catch (error) {
     logger.error('Error during worker shutdown:', error);

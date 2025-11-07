@@ -137,10 +137,23 @@ app.get('/api/docs.json', (req: express.Request, res: express.Response) => {
 // Health check endpoint
 app.get('/health', async (req: express.Request, res: express.Response) => {
   try {
-    const [dbHealth, queueHealth] = await Promise.all([
+    // Use Promise.allSettled to handle individual service failures gracefully
+    const [dbResult, queueResult] = await Promise.allSettled([
       testSupabaseConnection(),
       QueueManager.healthCheck(),
     ]);
+
+    const dbHealth = dbResult.status === 'fulfilled' ? dbResult.value : false;
+    const queueHealth = queueResult.status === 'fulfilled'
+      ? queueResult.value
+      : { status: 'unhealthy', error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason) };
+
+    if (dbResult.status === 'rejected') {
+      logger.warn('Health check: Database check failed', { error: dbResult.reason });
+    }
+    if (queueResult.status === 'rejected') {
+      logger.warn('Health check: Queue check failed', { error: queueResult.reason });
+    }
 
     const health = {
       status: dbHealth && queueHealth.status === 'healthy' ? 'healthy' : 'unhealthy',

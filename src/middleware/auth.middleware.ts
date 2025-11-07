@@ -53,7 +53,11 @@ export const requireAuth = async (
 
     next();
   } catch (error) {
-    logger.error('Auth middleware error', error);
+    // Log error but don't crash - return 401
+    logger.debug('Auth middleware error', {
+      error: error instanceof Error ? error.message : String(error),
+      // Don't log full stack for auth errors
+    });
     res.status(401).json({
       success: false,
       error: 'Unauthorized: Authentication failed',

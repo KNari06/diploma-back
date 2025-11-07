@@ -10,9 +10,9 @@ import { Server as SocketIOServer } from 'socket.io';
 import { handleConnection } from './handlers/connection.handler';
 import { authenticateSocket } from './middleware';
 import {
-  ClientToServerEvents,
-  ServerToClientEvents,
-  SocketData,
+    ClientToServerEvents,
+    ServerToClientEvents,
+    SocketData,
 } from './types';
 
 let io: SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, SocketData> | null = null;
@@ -45,9 +45,28 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
   // Apply authentication middleware
   io.use(authenticateSocket);
 
+  // Handle connection errors (transport-level errors)
+  io.engine.on('connection_error', (error) => {
+    // Log transport errors but don't crash
+    logger.warn('[WebSocket] Connection error', {
+      error: error.message,
+      // Don't log full stack for connection errors
+    });
+  });
+
   // Handle connections
   io.on('connection', (socket) => {
-    handleConnection(socket);
+    try {
+      handleConnection(socket);
+    } catch (error) {
+      logger.error('[WebSocket] Error handling connection', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      // Disconnect the socket if there's an error
+      socket.disconnect(true);
+    }
   });
 
   logger.info('[WebSocket] WebSocket server initialized successfully', {

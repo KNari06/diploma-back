@@ -1,9 +1,9 @@
-import { Page } from 'playwright';
-import { logger } from '@/utils/logger';
 import { browserPool } from '@/agent';
-import { analyzeScreenshotWithVision } from '@/services/vision-analyzer.service';
-import { analyzeDOMStructure, extractInteractiveElements } from '@/services/dom-analyzer.service';
 import { detectLoginPage } from '@/services/ai-helpers.service';
+import { analyzeDOMStructure } from '@/services/dom-analyzer.service';
+import { analyzeScreenshotWithVision } from '@/services/vision-analyzer.service';
+import { logger } from '@/utils/logger';
+import { Page } from 'playwright';
 
 /**
  * Product exploration result
@@ -146,10 +146,26 @@ export async function exploreProduct(options: {
     const domAnalysisPromise = analyzeDOMStructure(page);
 
     // Wait for both analyses
-    const [visualAnalysis, domAnalysis] = await Promise.all([
+    // Use Promise.allSettled to handle individual failures gracefully
+    const [visualResult, domResult] = await Promise.allSettled([
       visualAnalysisPromise,
       domAnalysisPromise,
     ]);
+
+    const visualAnalysis = visualResult.status === 'fulfilled'
+      ? visualResult.value
+      : { error: visualResult.reason instanceof Error ? visualResult.reason.message : String(visualResult.reason) };
+
+    const domAnalysis = domResult.status === 'fulfilled'
+      ? domResult.value
+      : { error: domResult.reason instanceof Error ? domResult.reason.message : String(domResult.reason) };
+
+    if (visualResult.status === 'rejected') {
+      logger.warn('Visual analysis failed', { error: visualResult.reason });
+    }
+    if (domResult.status === 'rejected') {
+      logger.warn('DOM analysis failed', { error: domResult.reason });
+    }
 
     // 8. Generate recommendations
     const recommendations = generateTestRecommendations(
