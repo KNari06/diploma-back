@@ -25,6 +25,9 @@ import swaggerUi from 'swagger-ui-express';
 // Create Express app
 const app = express();
 
+// Trust proxy for correct IP detection (important for IP-based anonymous identification)
+app.set('trust proxy', true);
+
 // Security middleware with Swagger-friendly CSP
 app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
   // Disable strict CSP for Swagger UI
@@ -60,7 +63,7 @@ app.use(cors({
   origin: isDevelopment ? true : process.env.ALLOWED_ORIGINS?.split(',') || false,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID', 'X-Anonymous-Id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID'],
 }));
 
 // Rate limiting

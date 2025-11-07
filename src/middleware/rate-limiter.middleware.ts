@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { AnonymousLimiterService } from '@/services/anonymous-limiter.service';
 import { UserCreditsService } from '@/services/user-credits.service';
 import { logger } from '@/utils/logger';
+import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 
 /**
  * Check if user is authenticated (has valid UUID)
@@ -56,12 +57,11 @@ export const checkAnonymousLimit = async (
       return;
     }
 
-    // For anonymous users, generate anonymousId from projectId
-    const context = req.body?.context;
-    const projectId = (typeof context === 'object' ? context?.projectId : undefined) || 'default';
-    const anonymousId = `project_${projectId}`;
+    // For anonymous users, use IP address as identifier
+    const clientIp = getClientIp(req);
+    const anonymousId = normalizeIpForAnonymousId(clientIp);
 
-    logger.info('[RATE_LIMITER] Checking anonymous limit', { anonymousId });
+    logger.info('[RATE_LIMITER] Checking anonymous limit', { anonymousId, clientIp });
 
     // Check if limit is reached
     const hasReachedLimit = await AnonymousLimiterService.hasReachedLimit(anonymousId);

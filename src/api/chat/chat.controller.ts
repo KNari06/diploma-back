@@ -24,6 +24,7 @@ import { getChatCompletion } from '@/services/openai.service';
 import { UserCreditsService } from '@/services/user-credits.service';
 import { buildChatPrompt } from '@/utils/buildChatPrompt';
 import { logger } from '@/utils/logger';
+import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 import { Request, Response } from 'express';
 import { ChatRequest } from './chat.types';
 import { webSocketService } from '@/websocket/websocket.service';
@@ -35,14 +36,20 @@ import { ChatTestUpdatePayload, ChatProcessingStepPayload } from '@/websocket/ty
 export const handleChat = async (req: Request, res: Response): Promise<void> => {
   try {
     const { message, context, sessionId, conversationId, answers, userId: bodyUserId } = req.body as ChatRequest;
-    // Use userId from auth middleware, fallback to body or projectId (for testing/dev)
-    // Use projectId as userId for anonymous users so all requests from same project share configurations
-    // 'default' is a fallback string when projectId is not provided (not a real UUID)
-    const projectId = (typeof context === 'object' ? context?.projectId : undefined) || 'default';
-    const userId = req.user?.id || bodyUserId || `project_${projectId}`;
+    // Use userId from auth middleware, fallback to body
+    const userId = req.user?.id || bodyUserId;
+
+    // Get anonymous ID from IP address (for non-authenticated users)
+    const clientIp = getClientIp(req);
+    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
+
+    // Extract projectId from context (for workspace/project association, not for anonymous ID)
+    const projectId = typeof context === 'object' ? context.projectId : undefined;
 
     logger.info('Chat request received', {
-      userId,
+      userId: userId || 'anonymous',
+      anonymousId,
+      clientIp,
       messageLength: message.length,
       sessionId,
       hasConversationId: !!conversationId,
@@ -189,7 +196,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     const enrichedContext = await enrichContextForCommands(
       message,
-      projectId,
+      projectId || 'default',
       contextUrl
     );
 
@@ -255,7 +262,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
             const testRequest = {
               url: plan.url,
               browsers: ['chrome' as const],
-              projectId,
+              projectId: projectId || 'default',
               userId,
               options: {},
               commands: plan.commands,
@@ -490,7 +497,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           userMessage: message,
           answers: parsedAnswers,
           userId: userId || 'anonymous',
-          projectId,
+          projectId: projectId || 'default',
         });
 
         res.json({
@@ -527,7 +534,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           userMessage: message,
           answers,
           userId: userId || 'anonymous',
-          projectId,
+          projectId: projectId || 'default',
           sessionId: chatSessionId,
         });
 
@@ -642,7 +649,7 @@ GET /api/v1/manual-test/${testCreated.data?.id}/result`;
         // Smart context analysis for single API test
         const apiContext = await SmartApiContextService.analyzeApiContext(
           parsedIntent,
-          userId,
+          userId || 'anonymous',
           projectId || 'default'
         );
 
@@ -839,7 +846,7 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
 
         const apiContext = await SmartApiContextService.analyzeApiContext(
           parsedIntent,
-          userId,
+          userId || 'anonymous',
           projectId || 'default'
         );
 
@@ -1207,8 +1214,8 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
       }
     }
 
-    // Save anonymous user messages (for non-UUID users)
-    if (!isValidUUID && userId) {
+    // Save anonymous user messages (for non-authenticated users)
+    if (!isValidUUID && anonymousId) {
       try {
         // Get or create anonymous session
         let anonSessionId = sessionId;
@@ -1218,7 +1225,7 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
           const { data: anonSession, error: sessionError } = await supabaseAdmin
             .from('anonymous_chat_sessions')
             .insert({
-              anonymous_id: userId,
+              anonymous_id: anonymousId,
               title: message.substring(0, 50),
             })
             .select()
@@ -1233,7 +1240,7 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
             .from('anonymous_chat_sessions')
             .select('id')
             .eq('id', anonSessionId)
-            .eq('anonymous_id', userId)
+            .eq('anonymous_id', anonymousId)
             .maybeSingle();
 
           if (!existingSession) {
@@ -1241,7 +1248,7 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
             const { data: newSession } = await supabaseAdmin
               .from('anonymous_chat_sessions')
               .insert({
-                anonymous_id: userId,
+                anonymous_id: anonymousId,
                 title: message.substring(0, 50),
               })
               .select()
@@ -1269,12 +1276,12 @@ ${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` :
           });
 
           logger.info('Anonymous chat messages saved', {
-            anonymousId: userId,
+            anonymousId,
             sessionId: anonSessionId
           });
         }
       } catch (anonError) {
-        logger.error('Failed to save anonymous messages', { error: anonError, userId });
+        logger.error('Failed to save anonymous messages', { error: anonError, anonymousId });
       }
     }
 
@@ -1422,19 +1429,17 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
 export const getCurrentChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user?.id;
-    // Support multiple sources for anonymousId
-    const anonymousId =
-      req.headers['x-anonymous-id'] as string || // From header (frontend)
-      req.query?.anonymousId as string ||        // From query param
-      req.body?.anonymousId;                     // From body
+    // Get anonymous ID from IP address (for non-authenticated users)
+    const clientIp = getClientIp(req);
+    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
 
     const { limit = 50, offset = 0 } = req.query;
 
-    // Allow either authenticated user OR anonymous user with anonymousId
+    // Allow either authenticated user OR anonymous user (identified by IP)
     if (!userId && !anonymousId) {
       res.status(401).json({
         success: false,
-        error: 'Authentication or anonymousId required. Provide either Authorization header or X-Anonymous-Id header',
+        error: 'Authentication required',
       });
       return;
     }
@@ -1466,7 +1471,7 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
       sessionError = result.error;
     } else if (anonymousId) {
       // Anonymous user - get from anonymous_chat_sessions
-      // anonymousId already includes "project_" prefix from frontend
+      // anonymousId is IP address
       const result = await supabaseAdmin
         .from('anonymous_chat_sessions')
         .select('id, title, created_at')

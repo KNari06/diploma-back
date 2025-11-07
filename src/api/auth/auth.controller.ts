@@ -13,6 +13,7 @@ import {
   updateUserProfile,
 } from '@/services/auth.service';
 import { logger } from '@/utils/logger';
+import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 import { Request, Response } from 'express';
 
 /**
@@ -21,12 +22,16 @@ import { Request, Response } from 'express';
  */
 export const signup = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password, name, anonymousId } = req.body;
+    const { email, password, name } = req.body;
+
+    // Get anonymous ID from IP address (for migration)
+    const clientIp = getClientIp(req);
+    const anonymousId = normalizeIpForAnonymousId(clientIp);
 
     const result = await signUpWithEmail(email, password, name);
 
     // Migrate anonymous data and reset rate limit after successful signup
-    if (anonymousId && result.user?.id) {
+    if (anonymousId && result.user?.id && anonymousId !== 'unknown') {
       try {
         // First, migrate all anonymous data to the new authenticated user
         const migrationResult = await AnonymousMigrationService.migrateToAuthenticatedUser(
@@ -86,12 +91,16 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
  */
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password, anonymousId } = req.body;
+    const { email, password } = req.body;
+
+    // Get anonymous ID from IP address (for migration)
+    const clientIp = getClientIp(req);
+    const anonymousId = normalizeIpForAnonymousId(clientIp);
 
     const result = await signInWithEmail(email, password);
 
     // Migrate anonymous data and reset rate limit after successful login
-    if (anonymousId && result.user?.id) {
+    if (anonymousId && result.user?.id && anonymousId !== 'unknown') {
       try {
         // First, migrate all anonymous data to the authenticated user
         const migrationResult = await AnonymousMigrationService.migrateToAuthenticatedUser(

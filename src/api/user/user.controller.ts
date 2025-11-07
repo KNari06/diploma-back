@@ -3,6 +3,7 @@ import { AnonymousLimiterService } from '@/services/anonymous-limiter.service';
 import { UserCreditsService } from '@/services/user-credits.service';
 import { PRICING_PLANS } from '@/config/pricing-plans';
 import { logger } from '@/utils/logger';
+import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 
 /**
  * Check if user ID is a valid UUID (authenticated user)
@@ -19,11 +20,11 @@ export const getUserCredits = async (req: Request, res: Response): Promise<void>
   try {
     // Get userId from auth or query params
     const userId = req.user?.id || req.query.userId || req.body?.userId;
-    const context = req.body?.context || req.query?.context;
-    const projectId = (typeof context === 'object' ? context?.projectId : undefined) || 'default';
 
-    // If no userId, use project-based anonymous ID
-    const effectiveUserId = userId || `project_${projectId}`;
+    // If no userId, use IP address as anonymous ID
+    const clientIp = getClientIp(req);
+    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
+    const effectiveUserId = userId || anonymousId || 'unknown';
 
     logger.info('[USER_CREDITS] Getting credits info', {
       userId: effectiveUserId,
@@ -99,18 +100,20 @@ export const getUserCredits = async (req: Request, res: Response): Promise<void>
  */
 export const resetUserCredits = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { anonymousId } = req.body;
+    // Get anonymous ID from IP address
+    const clientIp = getClientIp(req);
+    const anonymousId = normalizeIpForAnonymousId(clientIp);
 
-    if (!anonymousId) {
+    if (!anonymousId || anonymousId === 'unknown') {
       res.status(400).json({
         success: false,
-        error: 'Missing anonymousId',
-        message: 'Не указан anonymousId для сброса',
+        error: 'Unable to determine IP address',
+        message: 'Не удалось определить IP адрес для сброса',
       });
       return;
     }
 
-    logger.info('[USER_CREDITS] Resetting credits', { anonymousId });
+    logger.info('[USER_CREDITS] Resetting credits', { anonymousId, clientIp });
 
     await AnonymousLimiterService.resetRequestCount(anonymousId);
 

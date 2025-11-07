@@ -120,7 +120,7 @@ export class WorkspaceService {
   static async getOrCreateDefaultWorkspace(userId: string): Promise<Workspace> {
     try {
       // Check if workspaces table exists
-      const { data: tableCheck, error: tableError } = await supabaseAdmin
+      const { error: tableError } = await supabaseAdmin
         .from('workspaces')
         .select('id')
         .limit(1)

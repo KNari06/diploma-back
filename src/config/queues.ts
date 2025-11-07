@@ -463,7 +463,7 @@ export const gracefulShutdown = async () => {
 
     // Try to close Redis connection
     try {
-      await redisConnection.quit();
+    await redisConnection.quit();
     } catch (redisError) {
       logger.warn('Failed to close Redis connection', { error: redisError });
     }
