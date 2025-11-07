@@ -30,8 +30,8 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
       name: workspaceName,
       platforms: body.platforms,
       api_testing: body.api_testing,
-      devBaseUrl: body.devBaseUrl,
-      prodBaseUrl: body.prodBaseUrl,
+      devBaseUrl: body.devBaseUrl || body.dev_base_url, // Support both formats
+      prodBaseUrl: body.prodBaseUrl || body.prod_base_url, // Support both formats
     };
 
     // Validate required fields
