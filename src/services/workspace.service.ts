@@ -156,7 +156,7 @@ export class WorkspaceService {
         name: 'Default Workspace',
         platforms: ['web(chrome, safari, firefox)'],
         api_testing: false,
-        devBaseUrl: 'http://localhost:3000',
+        devBaseUrl: 'https://api.qait.dev/',
       });
     } catch (error) {
       logger.error('[WORKSPACE] Exception in getOrCreateDefaultWorkspace', { error, userId });
