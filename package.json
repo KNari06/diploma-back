@@ -5,11 +5,11 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "nodemon --exec ts-node -r tsconfig-paths/register src/index.ts",
-    "build": "tsc -p tsconfig.build.json && npm run copy-config",
+    "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json && npm run copy-config",
     "copy-config": "cp tsconfig.json dist/ 2>/dev/null || true",
-    "start": "node -r tsconfig-paths/register dist/index.js",
+    "start": "node dist/index.js",
     "worker": "nodemon --exec ts-node -r tsconfig-paths/register src/worker/index.ts",
-    "start:worker": "node -r tsconfig-paths/register dist/worker/index.js",
+    "start:worker": "node dist/worker/index.js",
     "build-kb": "ts-node -r tsconfig-paths/register src/scripts/build-global-kb.ts",
     "test": "jest",
     "test:watch": "jest --watch",
@@ -76,6 +76,7 @@
     "nodemon": "^3.0.1",
     "ts-jest": "^29.1.1",
     "ts-node": "^10.9.1",
+    "tsc-alias": "^1.8.16",
     "typescript": "^5.2.2"
   },
   "engines": {
