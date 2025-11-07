@@ -66,21 +66,21 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID'],
 }));
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: env.RATE_LIMIT_WINDOW_MS,
-  max: env.RATE_LIMIT_MAX_REQUESTS,
-  message: {
-    success: false,
-    error: 'Too many requests, please try again later',
-    code: 'RATE_LIMIT_EXCEEDED',
-    timestamp: new Date().toISOString(),
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+// Rate limiting - disable express-rate-limit since we use custom rate limiter
+// const limiter = rateLimit({
+//   windowMs: env.RATE_LIMIT_WINDOW_MS,
+//   max: env.RATE_LIMIT_MAX_REQUESTS,
+//   message: {
+//     success: false,
+//     error: 'Too many requests, please try again later',
+//     code: 'RATE_LIMIT_EXCEEDED',
+//     timestamp: new Date().toISOString(),
+//   },
+//   standardHeaders: true,
+//   legacyHeaders: false,
+// });
 
-app.use(limiter);
+// app.use(limiter); // Disabled - using custom rate limiter in middleware
 
 // Body parsing middleware
 app.use(express.json({ limit: '10mb' }));
