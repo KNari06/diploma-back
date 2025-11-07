@@ -26,10 +26,13 @@ export class WorkspaceService {
         throw new Error('platforms must be a non-empty array');
       }
 
+      // Convert userId to string (handles both UUID and IP addresses)
+      const userIdString = typeof userId === 'string' ? userId : String(userId);
+
       const workspaceRecord = {
         id: uuidv4(),
         name: workspaceData.name,
-        user_id: userId,
+        user_id: userIdString, // Can be UUID or IP address
         platforms: workspaceData.platforms,
         api_testing: workspaceData.api_testing || false,
         dev_base_url: workspaceData.devBaseUrl,
