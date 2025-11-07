@@ -58,6 +58,7 @@ const envSchema = z.object({
 
   // Frontend
   FRONTEND_URL: z.string().url().optional().default('http://localhost:3000'),
+  ALLOWED_ORIGINS: z.string().optional(),
 
   // Integrations
   JIRA_CLIENT_ID: z.string().optional(),
