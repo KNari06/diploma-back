@@ -152,13 +152,23 @@ export async function exploreProduct(options: {
       domAnalysisPromise,
     ]);
 
+    // Create fallback objects with correct structure if analysis failed
     const visualAnalysis = visualResult.status === 'fulfilled'
       ? visualResult.value
-      : { error: visualResult.reason instanceof Error ? visualResult.reason.message : String(visualResult.reason) };
+      : {
+          elements: [],
+          layout: 'unknown',
+          suggestions: [],
+        };
 
     const domAnalysis = domResult.status === 'fulfilled'
       ? domResult.value
-      : { error: domResult.reason instanceof Error ? domResult.reason.message : String(domResult.reason) };
+      : {
+          forms: [],
+          buttons: [],
+          links: [],
+          inputs: [],
+        };
 
     if (visualResult.status === 'rejected') {
       logger.warn('Visual analysis failed', { error: visualResult.reason });
