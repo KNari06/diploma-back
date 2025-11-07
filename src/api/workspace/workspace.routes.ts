@@ -138,8 +138,8 @@ const router = Router();
  *       500:
  *         description: Ошибка сервера
  */
-router.post('/', requireAuth, asyncHandler(createWorkspace));
-router.get('/', requireAuth, asyncHandler(getWorkspaces));
+router.post('/', asyncHandler(createWorkspace)); // Removed requireAuth for anonymous users
+router.get('/', asyncHandler(getWorkspaces));   // Removed requireAuth for anonymous users
 
 /**
  * @swagger

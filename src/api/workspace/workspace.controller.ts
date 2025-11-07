@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { WorkspaceService } from '@/services/workspace.service';
 import { WorkspaceCreateRequest } from '@/types';
 import { logger } from '@/utils/logger';
+import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 
 /**
  * POST /api/v1/workspaces
@@ -9,13 +10,19 @@ import { logger } from '@/utils/logger';
  */
 export const createWorkspace = async (req: Request, res: Response): Promise<void> => {
   try {
+    // Support both authenticated and anonymous users
     const userId = req.user?.id;
 
-    if (!userId) {
-      res.status(401).json({
+    // For anonymous users, use IP address as identifier
+    const clientIp = getClientIp(req);
+    const userIp = userId ? undefined : normalizeIpForAnonymousId(clientIp);
+    const effectiveUserId = userId || userIp || 'unknown';
+
+    if (!effectiveUserId || effectiveUserId === 'unknown') {
+      res.status(400).json({
         success: false,
-        error: 'Unauthorized',
-        message: 'Требуется авторизация',
+        error: 'Unable to identify user',
+        message: 'Не удалось идентифицировать пользователя',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -65,9 +72,13 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    logger.info('[WORKSPACE_API] Creating workspace', { userId, workspaceData });
+    logger.info('[WORKSPACE_API] Creating workspace', {
+      userId: effectiveUserId,
+      isAuthenticated: !!userId,
+      workspaceData
+    });
 
-    const workspace = await WorkspaceService.createWorkspace(userId, workspaceData);
+    const workspace = await WorkspaceService.createWorkspace(effectiveUserId, workspaceData);
 
     res.status(201).json({
       success: true,
@@ -92,21 +103,30 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
  */
 export const getWorkspaces = async (req: Request, res: Response): Promise<void> => {
   try {
+    // Support both authenticated and anonymous users
     const userId = req.user?.id;
 
-    if (!userId) {
-      res.status(401).json({
+    // For anonymous users, use IP address as identifier
+    const clientIp = getClientIp(req);
+    const userIp = userId ? undefined : normalizeIpForAnonymousId(clientIp);
+    const effectiveUserId = userId || userIp || 'unknown';
+
+    if (!effectiveUserId || effectiveUserId === 'unknown') {
+      res.status(400).json({
         success: false,
-        error: 'Unauthorized',
-        message: 'Требуется авторизация',
+        error: 'Unable to identify user',
+        message: 'Не удалось идентифицировать пользователя',
         timestamp: new Date().toISOString(),
       });
       return;
     }
 
-    logger.info('[WORKSPACE_API] Getting workspaces', { userId });
+    logger.info('[WORKSPACE_API] Getting workspaces', {
+      userId: effectiveUserId,
+      isAuthenticated: !!userId
+    });
 
-    const workspaces = await WorkspaceService.getUserWorkspaces(userId);
+    const workspaces = await WorkspaceService.getUserWorkspaces(effectiveUserId);
 
     res.json({
       success: true,
