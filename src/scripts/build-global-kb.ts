@@ -37,9 +37,28 @@ async function buildGlobalKB() {
     process.exit(1);
   }
 
-  // Read all markdown files
-  const files = await fs.readdir(sourceDir);
-  const mdFiles = files.filter((f) => f.endsWith('.md'));
+  // Recursively find all markdown files
+  async function findMarkdownFiles(dir: string, baseDir: string = dir): Promise<string[]> {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const files: string[] = [];
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        // Recursively search subdirectories
+        const subFiles = await findMarkdownFiles(fullPath, baseDir);
+        files.push(...subFiles);
+      } else if (entry.name.endsWith('.md')) {
+        // Store relative path from baseDir
+        const relativePath = path.relative(baseDir, fullPath);
+        files.push(relativePath);
+      }
+    }
+
+    return files;
+  }
+
+  const mdFiles = await findMarkdownFiles(sourceDir);
 
   if (mdFiles.length === 0) {
     console.error('❌ No markdown files found in sources directory');

@@ -573,19 +573,21 @@ export interface TraceStepsResponse {
 }
 
 // Intent Parsing types
-export type IntentType =
-  // NEW: Simplified to 3 main intents
-  | 'platform_test'           // UI testing (replaces check_element, fill_form, login_flow, assert_ui, navigate)
-  | 'api_test'                // API testing (single request)
-  | 'general_chat'            // General conversation
+// FIX #7: Define known intents as a const array for reusability
+export const KNOWN_INTENTS = [
+  'platform_test',           // UI testing (replaces check_element, fill_form, login_flow, assert_ui, navigate)
+  'api_test',                // API testing (single request)
+  'general_chat',            // General conversation
   // LEGACY: Keep for backward compatibility (will be migrated to platform_test)
-  | 'check_element'
-  | 'fill_form'
-  | 'login_flow'
-  | 'assert_ui'
-  | 'navigate'
-  | 'api_test_comprehensive'
-  | string; // Allow custom intents for flexibility
+  'check_element',
+  'fill_form',
+  'login_flow',
+  'assert_ui',
+  'navigate',
+  'api_test_comprehensive',  // Multi-step API test
+] as const;
+
+export type IntentType = typeof KNOWN_INTENTS[number] | string; // Allow custom intents for flexibility
 
 export type ElementType =
   | 'button'
@@ -619,7 +621,7 @@ export interface IntentResult {
   // Legacy fields (for backward compatibility)
   elementType?: ElementType;
   elementLabel?: string;
-  page?: string;
+  page?: string | null; // URL if present, NULL is OK - will ask user
   viewport?: ViewportType;
   action?: ActionType;
   value?: string; // For input actions
@@ -629,11 +631,14 @@ export interface IntentResult {
 
   // API test specific fields
   apiMethod?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | string;
-  apiUrl?: string;
+  apiUrl?: string; // Full URL OR relative path (/api/v1/users)
   apiBody?: any;
   apiHeaders?: Record<string, string>;
   expectedStatus?: number;
   isRelativePath?: boolean; // True if apiUrl is a relative path without base URL
+
+  // Optional fields (all intents)
+  urgency?: 'high' | 'normal' | null; // Detect: "urgent", "ASAP", "critical", "quick"
 
   selector?: string; // For UI testing intents
   // Playwright commands generated from intent

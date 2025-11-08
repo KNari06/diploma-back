@@ -73,7 +73,9 @@ POSSIBLE INTENTS (ONLY 3!):
 
    EXTRACT:
    • apiMethod: "GET" | "POST" | "PUT" | "DELETE" | "PATCH"
-   • apiUrl: full URL or path
+   • apiUrl: ACCEPT BOTH formats:
+     - Full URL: https://api.example.com/users
+     - Relative path: /api/v1/users (validation later)
    • apiBody: request body (if mentions JSON, data)
    • apiHeaders: headers (if mentioned)
 
@@ -95,13 +97,16 @@ RESPONSE FORMAT (STRICT JSON):
   // For platform_test:
   "scope": "full" | "page" | "element" | "flow" | "form" | "auth" | "navigation" | null,
   "target": string | null,
-  "page": string | null,  // URL if present
+  "page": string | null,  // URL if present, NULL is OK - will ask user
 
   // For api_test:
   "apiMethod": "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | null,
-  "apiUrl": string | null,
+  "apiUrl": string | null,  // Full URL OR relative path (/api/v1/users)
   "apiBody": object | null,
   "apiHeaders": object | null,
+
+  // Optional (all intents):
+  "urgency": "high" | "normal" | null,  // Detect: "urgent", "ASAP", "critical", "quick"
 
   // Common:
   "rawText": string  // original user message
@@ -123,6 +128,7 @@ Output:
   "apiUrl": null,
   "apiBody": null,
   "apiHeaders": null,
+  "urgency": null,
   "rawText": "Test the registration form on https://mysite.com/register"
 }
 
@@ -138,10 +144,27 @@ Output:
   "apiUrl": null,
   "apiBody": null,
   "apiHeaders": null,
+  "urgency": null,
   "rawText": "Explore and test the entire platform https://shop.com"
 }
 
-📝 Example 3: API GET test
+📝 Example 3: UI test without URL (will ask user)
+Input: "Check the sign up flow"
+Output:
+{
+  "intent": "platform_test",
+  "scope": "flow",
+  "target": "sign up",
+  "page": null,
+  "apiMethod": null,
+  "apiUrl": null,
+  "apiBody": null,
+  "apiHeaders": null,
+  "urgency": null,
+  "rawText": "Check the sign up flow"
+}
+
+📝 Example 4: API GET test
 Input: "Check that GET request to https://api.example.com/users returns 200"
 Output:
 {
@@ -153,10 +176,43 @@ Output:
   "apiUrl": "https://api.example.com/users",
   "apiBody": null,
   "apiHeaders": null,
+  "urgency": null,
   "rawText": "Check that GET request to https://api.example.com/users returns 200"
 }
 
-📝 Example 4: General chat
+📝 Example 5: API test with relative path
+Input: "Test POST /api/v1/users endpoint"
+Output:
+{
+  "intent": "api_test",
+  "scope": null,
+  "target": null,
+  "page": null,
+  "apiMethod": "POST",
+  "apiUrl": "/api/v1/users",
+  "apiBody": null,
+  "apiHeaders": null,
+  "urgency": null,
+  "rawText": "Test POST /api/v1/users endpoint"
+}
+
+📝 Example 6: Urgent test
+Input: "URGENT: Check if login works on production!"
+Output:
+{
+  "intent": "platform_test",
+  "scope": "auth",
+  "target": "login",
+  "page": null,
+  "apiMethod": null,
+  "apiUrl": null,
+  "apiBody": null,
+  "apiHeaders": null,
+  "urgency": "high",
+  "rawText": "URGENT: Check if login works on production!"
+}
+
+📝 Example 7: General chat
 Input: "What can you do?"
 Output:
 {
@@ -168,6 +224,7 @@ Output:
   "apiUrl": null,
   "apiBody": null,
   "apiHeaders": null,
+  "urgency": null,
   "rawText": "What can you do?"
 }
 
@@ -180,7 +237,10 @@ IMPORTANT RULES:
 3. If just questions/chat → "general_chat"
 4. Always extract scope for platform_test
 5. Always extract apiMethod and apiUrl for api_test
-6. Preserve rawText - original message
+6. page: null is OK - system will ask user for URL
+7. apiUrl can be relative path (/api/v1/users) - system will resolve
+8. Detect urgency from words: "urgent", "ASAP", "critical", "quick", "emergency"
+9. Preserve rawText - original message
 
 ═══════════════════════════════════════════════════════════════════════════════`;
 

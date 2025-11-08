@@ -139,7 +139,9 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     emitProcessingStep(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', 20);
 
-    const parsedIntent = await parseUserIntent(message);
+    // Parse intent with RAG fallback support
+    // Pass workspace_id as projectId for now (can be refined later to actual projectId)
+    const parsedIntent = await parseUserIntent(message, undefined, workspace_id);
     const intent = parsedIntent?.intent || 'general_chat';
 
     logger.info('[CHAT] Intent parsed', {
@@ -147,6 +149,11 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       scope: parsedIntent?.scope,
       target: parsedIntent?.target,
       hasUrl: !!parsedIntent?.page,
+      confidence: parsedIntent?.confidence,
+      usedRAG: parsedIntent?.metadata?.usedRAG,
+      intentChanged: parsedIntent?.metadata?.intentChanged,
+      ragChunksCount: parsedIntent?.metadata?.ragChunksCount,
+      originalIntent: parsedIntent?.metadata?.originalIntent,
     });
 
     // ═══════════════════════════════════════════════════════════════════════
