@@ -1,0 +1,40 @@
+{"text": "Check camera access permission: system dialog should appear after request and show preview", "intent": "device.camera-access"}
+{"text": "Simulate geolocation request: verify user consent and coordinate display on map", "intent": "device.geolocation"}
+{"text": "Enable microphone permission, record audio message through website and play it back", "intent": "device.microphone-record-play"}
+{"text": "Verify that when Bluetooth device connects, successful pairing notification appears", "intent": "device.bluetooth-connect"}
+{"text": "Simulate text paste from clipboard: verify input field accepts copied value", "intent": "device.clipboard-paste"}
+{"text": "Take screenshot via browser API, ensure file appears in device gallery", "intent": "device.screenshot-storage"}
+{"text": "Invoke system share sheet on Android and share link via messenger", "intent": "device.share-sheet-android"}
+{"text": "Test ambient light sensor permission request, display brightness level on UI", "intent": "device.ambient-light-sensor"}
+{"text": "Test form autofill functionality through system password manager (iOS/Android)", "intent": "device.autofill-password-manager"}
+{"text": "Verify app theme switching to dark/light according to OS settings", "intent": "device.os-theme-sync"}
+{"text": "Invoke system Wi-Fi selection menu when attempting to load page in offline mode", "intent": "device.wifi-prompt"}
+{"text": "Test app response to airplane mode activation — notify user about lost connection", "intent": "device.airplane-mode"}
+{"text": "Enable notifications via web API, ensure notifications appear in system notification panel", "intent": "device.web-notification"}
+{"text": "Test haptic feedback (vibration) during mobile swipe gestures", "intent": "device.haptic-swipe"}
+{"text": "Take photo via webcam and add it as user profile avatar", "intent": "device.camera-webcam-avatar"}
+{"text": "Simulate orientation sensor usage: rotate device and verify layout change", "intent": "device.orientation-sensor"}
+{"text": "Test app transition to split-screen mode and interface functionality correctness", "intent": "device.split-screen"}
+{"text": "Refresh page on battery-low system event, show warning", "intent": "device.battery-event"}
+{"text": "Insert image via drag'n'drop from system gallery", "intent": "device.dragdrop-system-gallery"}
+{"text": "Test website response to USB connections (e.g., data upload from flash drive via browser)", "intent": "device.usb-upload"}
+{"text": "Test QR code generation and scanning via mobile device camera", "intent": "device.qr-scan"}
+{"text": "Get contacts list via API, verify display in app address book", "intent": "device.contacts-api"}
+{"text": "Simulate fingerprint/faceID authentication for secure app section access", "intent": "device.biometric-auth"}
+
+{"text": "Test handling of user denial for microphone access (error notification should appear)", "intent": "device.microphone-deny"}
+{"text": "On Android enable split screen and ensure app doesn't break layout", "intent": "device.split-screen-android"}
+{"text": "Simulate geolocation attempt on device without GPS — app should correctly report error", "intent": "device.geolocation-no-gps"}
+{"text": "Test camera failure (e.g., hardware error) and fallback UI display", "intent": "device.camera-error"}
+{"text": "Test browser with connected physical keyboard on tablet: standard hotkeys work in input", "intent": "device.physical-keyboard"}
+{"text": "Invoke NFC scanner on Android for payment, test app response", "intent": "device.nfc-payment"}
+{"text": "Verify that clipboard access attempts require explicit user confirmation", "intent": "device.clipboard-permission"}
+{"text": "Simulate disabled notification permission and ensure app responds correctly", "intent": "device.notifications-denied"}
+{"text": "Use Web Bluetooth API: search nearby devices, handle Bluetooth unavailable error", "intent": "device.bluetooth-api-off"}
+{"text": "Enable battery saver mode, ensure heavy animations are disabled", "intent": "device.battery-saver-disable-animations"}
+{"text": "Test OS calendar integration: create event via web-app and find it in system calendar", "intent": "device.calendar-integration"}
+{"text": "Make avatar editing from camera unavailable when hardware is physically disconnected", "intent": "device.camera-hardware-detached"}
+{"text": "Enable hardware mute and ensure video/audio doesn't play", "intent": "device.hardware-mute-check"}
+{"text": "Test filesystem access denial scenario via browser API on iOS", "intent": "device.filesystem-deny-ios"}
+{"text": "Test instant UI update on SIM card change and automatic number detection", "intent": "device.sim-change-detect"}
+{"text": "Play multimedia file, minimize app (background), ensure playback pauses", "intent": "device.background-media-pause"}

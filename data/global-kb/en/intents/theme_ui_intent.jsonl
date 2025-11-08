@@ -1,0 +1,20 @@
+{"text": "Switch app theme from light to dark and ensure all UI elements adapt", "intent": "ui.theme-switch-dark-light"}
+{"text": "Test high-contrast mode for visually impaired: all buttons and text should be readable", "intent": "ui.high-contrast-accessibility"}
+{"text": "Change font size via profile settings; all buttons and fields should scale correctly", "intent": "ui.font-size-custom"}
+{"text": "Select custom accent color in settings, verify display on all pages", "intent": "ui.accent-color-custom"}
+{"text": "Enable night mode on mobile device and test drag'n'drop and tooltips functionality", "intent": "ui.mobile-night-drag-tooltip"}
+{"text": "Change theme to system default — ensure app responds to system light/dark switching", "intent": "ui.theme-system-auto"}
+{"text": "Test hidden/disabled element functionality: states should be visible in each theme", "intent": "ui.disabled-states-multitheme"}
+{"text": "Test validation error display on all themes (color, contrast, positioning)", "intent": "ui.validation-error-theme"}
+{"text": "Select large UI scale (120%): verify pop-up and overlay element adaptation", "intent": "ui.large-scale-overlay"}
+{"text": "Enable dark mode — ensure images, icons and text do not invert incorrectly", "intent": "ui.dark-mode-icon-text"}
+{"text": "Test last active theme restoration on browser reload", "intent": "ui.theme-persist-after-restart"}
+{"text": "Try changing UI language within custom theme — verify no CSS conflicts", "intent": "ui.theme-language-conflict"}
+{"text": "Perform multiple rapid theme changes: ensure app doesn't lag and switches all styles correctly", "intent": "ui.theme-switch-multi-fast"}
+{"text": "Take page screenshots for each theme, compare important block display (logo, nav)", "intent": "ui.visual-theme-screenshot"}
+{"text": "Verify dark mode navbar receives required opacity value", "intent": "ui.dark-navbar-opacity"}
+{"text": "Enable custom theme with unique font, verify browser support across all browsers", "intent": "ui.custom-font-browser-support"}
+{"text": "Test emoji icon display in different theme modes", "intent": "ui.theme-emoji-support"}
+{"text": "Enable night mode in mobile PWA, verify splash and status bar correctness", "intent": "ui.pwa-night-statusbar"}
+{"text": "Remove custom theme, ensure reset occurs without user data loss", "intent": "ui.theme-remove-reset"}
+{"text": "Test multilingual UI display in different themes (colors, sizes, block overflow)", "intent": "ui.theme-i18n-integration"}

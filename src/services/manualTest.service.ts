@@ -5,6 +5,7 @@ import { dbAdminService, dbService, supabaseAdmin } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
 import { webSocketService } from '@/websocket/websocket.service';
 import { TestCreatedPayload } from '@/websocket/types';
+import { TestCompletionHandlerService } from './test-completion-handler.service';
 
 export class ManualTestService {
   /**
@@ -595,6 +596,9 @@ export class ManualTestService {
       // Add AI analysis job
       await QueueManager.addAIAnalysisJob(testResult.id, resultData.testId);
 
+      // Check if test is complete and notify chat sessions
+      await this.checkAndHandleTestCompletion(resultData.testId);
+
       logTestEvent('result_processed', resultData.testId, {
         browser: resultData.browser,
         status: resultData.status
@@ -610,6 +614,72 @@ export class ManualTestService {
     } catch (error) {
       logger.error(`Failed to process test result: ${resultData.testId}`, error);
       throw error;
+    }
+  }
+
+  /**
+   * Check if test is complete and handle completion notifications
+   * @param testId - The test ID to check
+   */
+  private static async checkAndHandleTestCompletion(testId: string): Promise<void> {
+    try {
+      logger.info('[MANUAL_TEST_SERVICE] Checking test completion', { testId });
+
+      // Get test details
+      const testResponse = await this.getTest(testId);
+      if (!testResponse.success || !testResponse.data) {
+        logger.warn('[MANUAL_TEST_SERVICE] Test not found for completion check', { testId });
+        return;
+      }
+
+      const test = testResponse.data;
+
+      // Get all results for this test
+      const resultsResponse = await this.getTestResults(testId);
+      const results = resultsResponse.data || [];
+
+      // Check if all browsers have completed (either 'completed' or 'failed')
+      const expectedBrowsers = test.browsers || [];
+      const completedBrowsers = results.filter(result =>
+        ['completed', 'failed'].includes(result.status)
+      );
+
+      const isTestComplete = expectedBrowsers.length > 0 &&
+        expectedBrowsers.every(browser =>
+          completedBrowsers.some(result => result.browser === browser)
+        );
+
+      logger.info('[MANUAL_TEST_SERVICE] Test completion check', {
+        testId,
+        expectedBrowsers: expectedBrowsers.length,
+        completedBrowsers: completedBrowsers.length,
+        isComplete: isTestComplete,
+      });
+
+      if (isTestComplete) {
+        // Update test status to completed
+        await dbService.updateTest(testId, {
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+        });
+
+        logger.info('[MANUAL_TEST_SERVICE] Test marked as completed', { testId });
+
+        // Notify all associated chat sessions
+        await TestCompletionHandlerService.handleTestCompletion(testId, 'ui');
+
+        logTestEvent('completed', testId, {
+          totalBrowsers: expectedBrowsers.length,
+          completedBrowsers: completedBrowsers.length,
+        });
+      }
+
+    } catch (error) {
+      logger.error('[MANUAL_TEST_SERVICE] Error checking test completion', {
+        error,
+        testId,
+      });
+      // Don't throw error - this is a background process
     }
   }
 }

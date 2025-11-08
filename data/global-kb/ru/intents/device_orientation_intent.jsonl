@@ -1,0 +1,40 @@
+{"text": "Проверить разрешение доступа к камере: после запроса должно появиться системное окно и превью", "intent": "device.camera-access"}
+{"text": "Имитация запроса геолокации: проверить согласие пользователя и отображение координат на карте", "intent": "device.geolocation"}
+{"text": "Включить разрешение на использование микрофона, записать аудиосообщение через сайт и проиграть его", "intent": "device.microphone-record-play"}
+{"text": "Проверить, что при подключении Bluetooth-устройства появляется уведомление об успешном сопряжении", "intent": "device.bluetooth-connect"}
+{"text": "Имитировать вставку текста из clipboard: проверить, что поле ввода принимает скопированное значение", "intent": "device.clipboard-paste"}
+{"text": "Сделать скриншот через браузерное API, убедиться, что файл появился в галерее устройства", "intent": "device.screenshot-storage"}
+{"text": "Вызвать системную share-sheet на Android и поделиться ссылкой через мессенджер", "intent": "device.share-sheet-android"}
+{"text": "Проверить запрос разрешения на использование сенсора освещенности, отобразить уровень яркости на UI", "intent": "device.ambient-light-sensor"}
+{"text": "Тестировать работу автозаполнения формы через системный менеджер паролей (iOS/Android)", "intent": "device.autofill-password-manager"}
+{"text": "Проверить переключение темы приложения на dark/light согласно настройкам OS", "intent": "device.os-theme-sync"}
+{"text": "Вызвать системное меню выбора Wi-Fi при попытке загрузки страницы в offline-режиме", "intent": "device.wifi-prompt"}
+{"text": "Проверить реакцию приложения на переход в airplane mode — уведомить пользователя о потерянном соединении", "intent": "device.airplane-mode"}
+{"text": "Включить уведомления через веб API, убедиться, что уведомления приходят в системную шторку", "intent": "device.web-notification"}
+{"text": "Проверить работу haptic feedback (вибрации) при свайпе на мобильном", "intent": "device.haptic-swipe"}
+{"text": "Сделать снимок через webcam и добавить его как аватар профиля пользователя", "intent": "device.camera-webcam-avatar"}
+{"text": "Имитация использования датчика ориентации: повернуть устройство и проверить смену layout", "intent": "device.orientation-sensor"}
+{"text": "Проверить передачу приложения в режим split-screen и корректность работы интерфейса", "intent": "device.split-screen"}
+{"text": "Обновить страницу при получении системного события battery-low, показать предупреждение", "intent": "device.battery-event"}
+{"text": "Вставить изображение через drag'n'drop из системной галереи", "intent": "device.dragdrop-system-gallery"}
+{"text": "Тестировать реакцию сайта на USB-подключения (например, загрузка данных с флешки через браузер)", "intent": "device.usb-upload"}
+{"text": "Проверить генерацию QR-кода и его сканирование через камеру мобильного устройства", "intent": "device.qr-scan"}
+{"text": "Получить список контактов через API, проверить отображение в адресной книге приложения", "intent": "device.contacts-api"}
+{"text": "Имитация работы с fingerprint/faceID для входа в защищённый раздел приложения", "intent": "device.biometric-auth"}
+
+{"text": "Проверить обработку отказа пользователя в разрешении доступа к микрофону (должно появиться уведомление об ошибке)", "intent": "device.microphone-deny"}
+{"text": "На Android включить split screen и убедиться, что приложение не ломает layout", "intent": "device.split-screen-android"}
+{"text": "Имитация попытки использовать geolocation на устройстве без GPS — приложение должно корректно сообщить об ошибке", "intent": "device.geolocation-no-gps"}
+{"text": "Тестировать сбой камеры (например, ошибка hardware) и отображение fallback-UI", "intent": "device.camera-error"}
+{"text": "Проверить работу браузера с подключённой physical keyboard на планшете: стандартные hotkey работают в input", "intent": "device.physical-keyboard"}
+{"text": "Вызвать сканер NFC на Android для оплаты, проверить реакцию приложения", "intent": "device.nfc-payment"}
+{"text": "Проверить, что при попытке обращения к clipboard пользователь должен явно подтвердить действие", "intent": "device.clipboard-permission"}
+{"text": "Симулировать отключение разрешения на notifications и убедиться, что приложение корректно реагирует", "intent": "device.notifications-denied"}
+{"text": "Использовать Web Bluetooth API: поиск ближайших устройств, обработка ошибки отсутствия Bluetooth", "intent": "device.bluetooth-api-off"}
+{"text": "Включить энергосберегающий режим (battery saver), убедиться, что heavy animations отключаются", "intent": "device.battery-saver-disable-animations"}
+{"text": "Проверить интеграцию с календарём OS: создать событие через web-app и найти его в системном календаре", "intent": "device.calendar-integration"}
+{"text": "Сделать редактирование аватара с камеры недоступным, если hardware был физически отключён", "intent": "device.camera-hardware-detached"}
+{"text": "Включить аппаратный mute и убедиться, что видео/аудио не проигрывается", "intent": "device.hardware-mute-check"}
+{"text": "Проверить сценарий запрета access к filesystem через browser API на iOS", "intent": "device.filesystem-deny-ios"}
+{"text": "Проверить моментальное обновление UI при смене SIM-карты и автоматическом детекте номера", "intent": "device.sim-change-detect"}
+{"text": "Воспроизвести мультимедийный файл, свернуть приложение (background), убедиться что проигрывание приостанавливается", "intent": "device.background-media-pause"}

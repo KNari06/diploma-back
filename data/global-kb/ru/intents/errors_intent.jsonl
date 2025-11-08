@@ -1,0 +1,24 @@
+{"text": "Загрузить страницу, которая не существует, убедиться, что появляется кастомная 404-страница с переходом на главную", "intent": "errorux.custom-404-redirect-home"}
+{"text": "Проверить отображение страницы ошибки 403 Forbidden при попытке доступа к приватным данным без авторизации", "intent": "errorux.custom-403-unauthorized"}
+{"text": "При сетевом сбое и ошибке 502 Bad Gateway проверить, что пользователь видит понятное сообщение и кнопку для повторной попытки", "intent": "errorux.custom-502-retry-button"}
+{"text": "Симулировать ошибку 500 на сервере, убедиться, что клиент отображает дружественное уведомление без раскрытия stacktrace", "intent": "errorux.custom-500-nofail-sensitive"}
+{"text": "Тестировать появление кастомной страницы ошибки 401 Unauthorized и UX-подсказки для входа", "intent": "errorux.custom-401-login-prompt"}
+{"text": "Провести автоматический редирект со старых недоступных страниц на страницу maintenance (503)", "intent": "errorux.custom-503-maintenance"}
+{"text": "При ошибке загрузки API (например, 504 Gateway Timeout) предоставить fallback меню и кнопку обновления контента", "intent": "errorux.custom-504-fallback-menu"}
+{"text": "Проверить отображение пользовательской ошибки 'Нет соединения' при потере сети (network error)", "intent": "errorux.network-disconnect-custom"}
+{"text": "Генерировать ошибку JavaScript в форме, убедиться, что приложение не перестает работать и появляется UI-уведомление об ошибке", "intent": "errorux.js-error-ui-warning"}
+{"text": "В сценарии Graceful degradation: simulating offline, проверить, что базовые функции работают, а error-banner появляется ненавязчиво", "intent": "errorux.graceful-offline-banner"}
+{"text": "Проверить связь с API при rate-limit (429 Too Many Requests), показать пользователю сообщения о паузе и limit-reset", "intent": "errorux.custom-429-limit-message"}
+{"text": "Симуляция ошибки 400 Bad Request, проверить информативность текста ошибки для пользователя", "intent": "errorux.custom-400-message"}
+{"text": "Проверить отображение страницы с ограниченным доступом для пользователей без прав (403), UX-пояснения и ссылки на помощь", "intent": "errorux.custom-403-help"}
+{"text": "В случае ошибки парсинга данных показать fallback-содержимое и кнопку 'Попробовать позже'", "intent": "errorux.data-parse-fallback"}
+{"text": "При ошибке загрузки стилей убедиться, что интерфейс переключается на базовую разметку, сохраняет доступность", "intent": "errorux.css-load-graceful"}
+{"text": "При превышении времени ожидания загрузки страницы (>10c) отобразить предупреждение с опцией перезагрузки", "intent": "errorux.loading-timeout-ui"}
+{"text": "Проверить корректную работу error boundary в SPA: локализованная ошибка не нарушает другие страницы", "intent": "errorux.spa-error-boundary"}
+{"text": "Тестировать отображение кастомного баннера при баге скрипта (Unhandled Promise Rejection)", "intent": "errorux.unhandled-promise-banner"}
+{"text": "При попытке загрузить файл с неправильным типом (415 Unsupported Media Type), убедиться что выводится поясняющее сообщение", "intent": "errorux.custom-415-media-type"}
+{"text": "Проверить UX graceful degradation при ошибке CDN: fallback картинки, отключение heavy assets", "intent": "errorux.cdn-fallback-graceful"}
+{"text": "Автоматически логировать все ошибки UI и выводить пользовательское предупреждение без лишних технических деталей", "intent": "errorux.ui-error-log-usermsg"}
+{"text": "В edge-кейсе выдавать ошибку переполнения памяти (508), показать пользователю предложение уменьшить объем загрузки", "intent": "errorux.custom-508-memory-suggestion"}
+{"text": "Проверить сценарий, когда custom error class формирует корректное пользовательское сообщение, а не generic error", "intent": "errorux.custom-error-class-user-message"}
+{"text": "Тестировать, что при ошибке браузера (например, page crashed), приложение не оставляет пользователя без объяснений", "intent": "errorux.page-crash-explanation"}

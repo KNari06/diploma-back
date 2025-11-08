@@ -7,6 +7,8 @@ import { Request, Response } from 'express';
 import { ApiTestPlanService } from '@/services/api-test-plan.service';
 import { CredentialsParserService } from '@/services/credentials-parser.service';
 import { ProjectContextService } from '@/services/project-context.service';
+import { TestChatMappingService } from '@/services/test-chat-mapping.service';
+import { TestCompletionHandlerService } from '@/services/test-completion-handler.service';
 import { WorkspaceService } from '@/services/workspace.service';
 
 // Existing services
@@ -15,6 +17,7 @@ import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExpl
 import { extractUrlFromMessage } from '@/services/context-enrichment.service';
 import { getTestPlan, saveTestPlan } from '@/services/exploration-cache.service';
 import { parseUserIntent } from '@/services/intentParser.service';
+import { searchKB } from '@/services/kb.service';
 import { ManualTestService } from '@/services/manualTest.service';
 import { getChatCompletion, getChatCompletionWithMessages } from '@/services/openai.service';
 import { UserCreditsService } from '@/services/user-credits.service';
@@ -611,7 +614,40 @@ async function handleGeneralChat(
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2: BUILD MESSAGES ARRAY FOR OPENAI
+  // STEP 2: SEARCH GLOBAL KB FOR GENERAL CHAT
+  // ═══════════════════════════════════════════════════════════════════════
+
+  let kbContext = '';
+
+  // For general_chat ALWAYS search in Global KB
+  try {
+    logger.info('[GENERAL_CHAT] Searching Global KB for context', { message: message.substring(0, 100) });
+
+    const kbResults = await searchKB(message, undefined, {
+      matchCount: 3,
+      matchThreshold: 0.6, // Slightly higher than for intent parsing
+    });
+
+    if (kbResults.chunks.length > 0) {
+      kbContext = kbResults.chunks
+        .map(chunk => chunk.content)
+        .join('\n\n');
+
+      logger.info('[GENERAL_CHAT] Found KB context', {
+        chunksCount: kbResults.chunks.length,
+        sources: kbResults.sources.global,
+        contextLength: kbContext.length,
+      });
+    } else {
+      logger.info('[GENERAL_CHAT] No relevant KB context found');
+    }
+  } catch (error) {
+    logger.warn('[GENERAL_CHAT] KB search failed', { error });
+    // Continue without KB context
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3: BUILD MESSAGES ARRAY FOR OPENAI
   // ═══════════════════════════════════════════════════════════════════════
 
   const systemPrompt = buildChatSystemPrompt();
@@ -625,7 +661,21 @@ async function handleGeneralChat(
     { role: 'system', content: enhancedSystemPrompt },
   ];
 
-  // Add RAG/KB context if provided
+  // Add Global KB context (ALWAYS for general_chat)
+  if (kbContext) {
+    messages.push({
+      role: 'system',
+      content: `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 RELEVANT KNOWLEDGE FROM KNOWLEDGE BASE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+${kbContext}
+
+Use this knowledge to provide more accurate and helpful responses.`,
+    });
+  }
+
+  // Add additional context if provided (legacy support)
   const contextString = typeof context === 'string' ? context : undefined;
   if (contextString) {
     messages.push({
@@ -644,6 +694,8 @@ async function handleGeneralChat(
     totalMessages: messages.length,
     hasOldSummary: !!oldContextSummary,
     recentHistoryCount: conversationHistory.length,
+    hasKbContext: !!kbContext,
+    kbContextLength: kbContext.length,
   });
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -746,6 +798,30 @@ async function executeApprovedTestPlan(
         expectedStatus: apiDetails.expectedStatus || 200,
       });
 
+      // Generate a unique test ID for API test tracking
+      const apiTestId = `api_${planId}_${Date.now()}`;
+
+      // Save test-chat mapping for API test notifications
+      if (chatSessionId && userId) {
+        await TestChatMappingService.saveTestChatMapping(
+          apiTestId,
+          chatSessionId,
+          userId
+        );
+        logger.info('[API_TEST] Test-chat mapping saved', {
+          testId: apiTestId,
+          chatSessionId,
+          userId,
+        });
+      }
+
+      // Notify completion via TestCompletionHandlerService
+      await TestCompletionHandlerService.handleTestCompletion(
+        apiTestId,
+        'api',
+        apiTestResult
+      );
+
       // Save chat messages
     if (chatSessionId) {
         await saveChatMessages(chatSessionId, [
@@ -753,7 +829,11 @@ async function executeApprovedTestPlan(
           {
             role: 'ai',
             content: `✅ API test executed!\n\n**Result:**\n- Status: ${(apiTestResult as any).response?.status || 'N/A'}\n- Success: ${apiTestResult.success ? 'Yes' : 'No'}\n\n${(apiTestResult as any).message || 'Test completed'}`,
-            metadata: { testResult: apiTestResult },
+            metadata: {
+              testResult: apiTestResult,
+              testId: apiTestId,
+              testType: 'api',
+            },
           },
         ]);
       }
@@ -761,6 +841,7 @@ async function executeApprovedTestPlan(
       res.json({
         reply: `✅ API test executed successfully!\n\n**Status Code:** ${(apiTestResult as any).response?.status || 'N/A'}\n**Success:** ${apiTestResult.success ? 'Yes' : 'No'}\n\n${(apiTestResult as any).message || 'Test completed'}`,
         testResult: apiTestResult,
+        testId: apiTestId,
         timestamp: new Date().toISOString(),
         sessionId: chatSessionId,
       });
@@ -791,6 +872,20 @@ async function executeApprovedTestPlan(
         };
 
         const testCreated = await ManualTestService.runTest(testRequest);
+
+        // Save test-chat mapping for result notifications
+        if (chatSessionId && testCreated.data?.id && userId) {
+          await TestChatMappingService.saveTestChatMapping(
+            testCreated.data.id,
+            chatSessionId,
+            userId
+          );
+          logger.info('[CHAT] Test-chat mapping saved', {
+            testId: testCreated.data.id,
+            chatSessionId,
+            userId,
+          });
+        }
 
         // Emit WebSocket event
         if (chatSessionId && testCreated.data?.id) {

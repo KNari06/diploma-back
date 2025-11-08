@@ -1,0 +1,20 @@
+{"text": "Measure main page load time (Time to First Byte, TTFB) and verify it meets KPI", "intent": "performance.ttfb-mainpage"}
+{"text": "Test content above the fold display speed (First Contentful Paint, FCP) on desktop and mobile", "intent": "performance.fcp-fold-multi-platform"}
+{"text": "Check full page load time (Fully Loaded), show hint if exceeds 3 seconds", "intent": "performance.fully-loaded-time-hint"}
+{"text": "Measure LCP (Largest Contentful Paint) on page with complex images", "intent": "performance.lcp-heavy-images"}
+{"text": "Test interactive element rendering speed (TTI — Time To Interactive)", "intent": "performance.tti-interactive"}
+{"text": "Verify on mobile device first UI interaction takes no more than 2 seconds", "intent": "performance.mobile-tti-threshold"}
+{"text": "Measure search form response speed when filtering large list", "intent": "performance.search-filter-latency"}
+{"text": "Enable slow network (3G simulation), verify quick main UI appearance (critical CSS/assets)", "intent": "performance.slow-network-critical-css"}
+{"text": "Test image lazy loading: ensure images load only when scrolled into view", "intent": "performance.lazyload-images"}
+{"text": "Verify animations don't affect overall FPS on weak devices (animation throttling)", "intent": "performance.animation-fps"}
+{"text": "Measure absence of long JavaScript blocking main thread (Long Tasks threshold)", "intent": "performance.long-js-blocking"}
+{"text": "Test caching: verify repeat page load with cache faster than first open", "intent": "performance.cache-load-compare"}
+{"text": "Test CDN usage: resources load from CDN, latency minimal", "intent": "performance.cdn-resources-latency"}
+{"text": "Simulate multi-threaded media loading, verify UX display of spinners and progress bars", "intent": "performance.parallel-media-load"}
+{"text": "Test script performance during massive DOM operations (1000+ elements)", "intent": "performance.massive-dom-ops"}
+{"text": "Test UI response with large number of simultaneous users (load testing / stress)", "intent": "performance.simulated-concurrent-users"}
+{"text": "Verify theme/section switching happens in under 500ms", "intent": "performance.ui-theme-switch-speed"}
+{"text": "Run Lighthouse audit and ensure Performance Score doesn't drop below 85", "intent": "performance.lighthouse-score"}
+{"text": "Test memory: no memory leaks when navigating between sections", "intent": "performance.memory-leak-nav"}
+{"text": "Verify PWA starts instantly from home screen (instant launch)", "intent": "performance.pwa-instant-launch"}

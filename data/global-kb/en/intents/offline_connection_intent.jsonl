@@ -1,0 +1,20 @@
+{"text": "Disconnect internet after page load, verify app enters offline mode", "intent": "offline.enter-offline-mode"}
+{"text": "Create note in offline mode, then enable internet and ensure record syncs to server", "intent": "offline.sync-after-reconnect"}
+{"text": "When submitting form in offline mode show custom error message, save draft locally", "intent": "offline.form-save-draft"}
+{"text": "Verify special 'No Connection' page display when network is lost", "intent": "offline.no-connection-screen"}
+{"text": "Load app as PWA, disable network, ensure basic functions continue working", "intent": "offline.pwa-works-cache"}
+{"text": "In offline mode open previously loaded page, test history back/forward functionality", "intent": "offline.cached-navigation"}
+{"text": "Add multiple records in offline mode, then enable internet: verify batch synchronization", "intent": "offline.batch-sync"}
+{"text": "Edit profile with network disabled; after restoration — verify no data loss", "intent": "offline.profile-edit-resilience"}
+{"text": "Verify push notifications aren't delivered when device offline, arrive immediately after network restoration", "intent": "offline.push-delay"}
+{"text": "Attempt order payment when offline — should display error and save cart locally", "intent": "offline.payment-fail-local-cart"}
+{"text": "Delete record offline, ensure after network restoration deletion occurs on server", "intent": "offline.delete-sync"}
+{"text": "Exit app offline, re-enter — ensure session saved locally", "intent": "offline.session-local"}
+{"text": "Change settings offline, logout, then login after connection restored and ensure data updated", "intent": "offline.settings-sync-post-login"}
+{"text": "Test opening external link in offline mode — system warning should appear", "intent": "offline.external-link-fail"}
+{"text": "Test app response to prolonged network loss: notify user via banner", "intent": "offline.long-loss-banner"}
+{"text": "Watch video in offline mode: ensure playback available only for pre-downloaded files", "intent": "offline.video-local-only"}
+{"text": "Test auto-session restoration after sudden browser exit in offline mode", "intent": "offline.restore-session"}
+{"text": "Change password in offline mode; after connection restored ensure old password no longer works", "intent": "offline.password-change-sync"}
+{"text": "Place product order in PWA with offline mode: automatic retry sending when network appears", "intent": "offline.retry-order-post-reconnect"}
+{"text": "Enable airplane mode, verify app responds correctly (offline UX, banner, function limitations)", "intent": "offline.airplane-mode-behavior"}

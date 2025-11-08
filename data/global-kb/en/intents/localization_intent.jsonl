@@ -1,0 +1,25 @@
+{"text": "Switch app language to French, verify all labels and messages in UI", "intent": "i18n.switch-french"}
+{"text": "Test display of numbers, dates and time in German locale format", "intent": "i18n.date-time-de"}
+{"text": "Switch interface to Arabic, ensure layout works in RTL mode", "intent": "i18n.rtl-arabic"}
+{"text": "Test correct currency selection: rubles/dollars/euros — price display changes with language switch", "intent": "i18n.currency-switch"}
+{"text": "Send push notification and ensure text arrives in selected profile language", "intent": "i18n.notification-lang"}
+{"text": "Test clip emulation display in Japanese localization (characters, hieroglyphs, emoji display correctly)", "intent": "i18n.japanese-characters"}
+{"text": "In form select 'Kazakh' language, verify correct validation error translation", "intent": "i18n.validation-error-kk"}
+{"text": "Change language during payment, ensure all receipts, tickets, confirmations arrive in correct locale", "intent": "i18n.payment-receipt-localization"}
+{"text": "Compare date display in American and British format (MM/DD/YYYY and DD/MM/YYYY)", "intent": "i18n.date-format-compare"}
+{"text": "Switch between languages on main page, ensure links, maps, filters and meta updated", "intent": "i18n.mainpage-switch"}
+{"text": "In profile settings change interface language from two different devices — verify correct synchronization", "intent": "i18n.sync-multiplatform"}
+{"text": "Test error text appearance with missing translations (fallback to English)", "intent": "i18n.missing-translation-fallback"}
+{"text": "Test display of long words and strings when translating to Finnish (edge case: wrapping, overflow)", "intent": "i18n.long-words-finnish"}
+{"text": "Enter date in different languages in booking form, verify automatic locale detection", "intent": "i18n.booking-date-input-auto-locale"}
+{"text": "Select Turkish language, verify correct number and percentage formatting", "intent": "i18n.number-format-tr"}
+{"text": "Test product search functionality: results, filters and sorting display current language text", "intent": "i18n.search-results-language"}
+{"text": "Change language from English to Chinese on mobile device, verify UI adaptation", "intent": "i18n.mobile-ui-chinese"}
+{"text": "Test cookie policy language version display for ES (Spanish) and PL (Polish) locales", "intent": "i18n.cookie-policy-localization"}
+{"text": "Verify email newsletter to subscribers arrives in their native language", "intent": "i18n.email-newsletter-language"}
+{"text": "Test scenario: languages on different devices in one account display consistently", "intent": "i18n.cross-device-language-sync"}
+{"text": "Test measurement units display (kg, lbs, km, mi) according to user region", "intent": "i18n.measurement-units"}
+{"text": "Enter text with emoji in Japanese, verify correct Unicode symbol display", "intent": "i18n.unicode-emoji-jp"}
+{"text": "Verify help links and FAQ visibility in all supported languages", "intent": "i18n.help-faq-coverage"}
+{"text": "Switch language to Russian and verify correct alphabetical sorting", "intent": "i18n.alphabet-sort-ru"}
+{"text": "Test scenario: part UI in Russian, part in English, verify locale separation in multi-service", "intent": "i18n.partial-localization"}

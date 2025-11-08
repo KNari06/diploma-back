@@ -1,0 +1,50 @@
+{"text": "Ввести XSS-строку <script>alert('XSS')</script> в поле комментария и убедиться, что тег не исполняется", "intent": "security.xss-comment"}
+{"text": "Отправить в форму длинный HTML-текст, проверить, что выводится как текст, а не HTML", "intent": "security.xss-html-escape"}
+{"text": "Проверить, что при подмене CSRF-токена в форме отправки заказа сервер возвращает 403", "intent": "security.csrf-invalid-token"}
+{"text": "Переиспользовать старый csrf-token c другой сессии, убедиться, что запрос заблокирован", "intent": "security.csrf-replay"}
+{"text": "Проверить, что при ajax-запросах на сторонние домены запрещена отправка куки (SameSite policy)", "intent": "security.cors-samesite"}
+{"text": "Проверить cookie с флагами Secure=true, HttpOnly=true и SameSite=Strict на защищённых страницах", "intent": "security.cookie-flags"}
+{"text": "Проверить, что при удалении аккаунта все персональные данные безвозвратно удаляются (GDPR Right to Erasure)", "intent": "privacy.gdpr-erasure"}
+{"text": "На форму обратной связи отправить запрос с fake email, убедиться, что почта не попадает в логи сервера", "intent": "privacy.no-log-email"}
+{"text": "Для неавторизованного пользователя загрузить страницу профиля — персональные данные не должны быть видимы", "intent": "privacy.unauthorized-view"}
+{"text": "Проверить наличие страницы с информацией о cookies и возможности withdraw consent (GDPR)", "intent": "privacy.cookie-policy-withdraw"}
+{"text": "Согласиться на cookies, перезагрузить страницу, проверить что баннер согласия больше не отображается", "intent": "privacy.cookie-consent-persistence"}
+{"text": "Попробовать отправить запрос с неразрешённой геолокацией — убедиться, что персональные координаты не сохраняются", "intent": "privacy.no-geodata"}
+{"text": "Ввести персональные данные в форму, убедиться что в публичном API ответе они не возвращаются", "intent": "privacy.no-leak-api"}
+{"text": "Проверить, что в URL после сброса пароля не остаётся чувствительных токенов", "intent": "security.sensitive-url-cleanup"}
+{"text": "Отправить попытку инъекции через параметр URL (например, sql), убедиться что запрос обработан безопасно", "intent": "security.sql-injection"}
+{"text": "На странице логина проверить ограничение на количество попыток входа (brute force protection)", "intent": "security.bruteforce-limit"}
+{"text": "Включить режим приватного просмотра (incognito), убедиться что нет persist пользовательских данных", "intent": "privacy.incognito-no-persist"}
+{"text": "Проверить маскирование паролей в полях ввода и логах браузера", "intent": "privacy.password-mask"}
+{"text": "Сделать запрос на экспорт всех пользовательских данных в CSV (GDPR Right to Data Portability)", "intent": "privacy.gdpr-export-data"}
+{"text": "Проверить, что при отказе от согласия на marketing cookies прекращается автозагрузка трекеров", "intent": "privacy.optout-marketing-cookies"}
+{"text": "В ответе на API не должно быть полей с персональными пользовательскими данными для сторонних запросов", "intent": "privacy.api-data-minimization"}
+{"text": "Проверить, что в логах сервера не появляются номера телефонов пользователей", "intent": "privacy.log-no-phone"}
+{"text": "Отправить XSS-string в параметр поиска и убедиться, что результат экранирован", "intent": "security.xss-search-params"}
+{"text": "Тестировать попытку загрузить .php-файл вместо картинки на upload endpoint — убедиться что отклонено", "intent": "security.upload-restriction"}
+{"text": "Проверить, что автоматические очистки cookie работают при отключении пользователя от сервиса", "intent": "privacy.cookie-autoclean"}
+
+{"text": "Тестировать сценарий восстановления доступа: убедиться, что reset-токен не можно использовать дважды", "intent": "security.reset-token-onetime"}
+{"text": "Проверить, что при вводе контрольного вопроса нет раскрытия персональных данных в UI или через response", "intent": "privacy.recover-question-no-leak"}
+{"text": "Проверить редирект с http на https при авторизации, убедиться что пароль не отправляется по незащищенному каналу", "intent": "security.https-auth"}
+{"text": "Послать реквест с неверным Content-Type — убедиться, что backend возвращает корректный error", "intent": "security.content-type-validation"}
+{"text": "Проверить работу ограничения области видимости cookie (path/domain) для разных субдоменов", "intent": "security.cookie-scope"}
+{"text": "Проверить невозможность обхода авторизации через прямой запрос на защищенный endpoint", "intent": "security.direct-endpoint-access"}
+{"text": "Проверить наличие в политике конфиденциальности пункта о хранении персональных данных", "intent": "privacy.policy-data-storage"}
+{"text": "Ввести некорректный checksum в URL-параметр, проверить отказ в обработке запроса", "intent": "security.url-param-integrity"}
+{"text": "Удалить пользователя, убедиться что все связанные с ним логи, медиа и комментарии очищены (GDPR)", "intent": "privacy.full-data-wipe"}
+{"text": "Проверить работу периодического удаления устаревших данных согласно сроку хранения (data retention)", "intent": "privacy.data-retention"}
+{"text": "Тестировать невозможность передачи персональных данных в iframe стороннего домена", "intent": "security.iframe-pii-restrict"}
+{"text": "Проверить, что после смены email нельзя войти по старому адресу, а новый требует верификацию", "intent": "security.email-change-verify"}
+{"text": "Имитация массовой рассылки email: проверить, что unsubscribe работает без утечки других адресов", "intent": "privacy.mass-email-unsubscribe"}
+{"text": "Тестировать отсутствие autocomplete на полях с чувствительной информацией (пароли, номер карты)", "intent": "privacy.autocomplete-off"}
+{"text": "Сделать тест на предпросмотр профиля другого пользователя, убедиться в отсутствии приватных данных", "intent": "privacy.profile-preview-no-private"}
+{"text": "Проверить, что доля роли администратора не позволяет экспортировать данные пользователей без consent", "intent": "privacy.admin-data-export-consent"}
+{"text": "Отправить запрос с inject-параметрами в Referer/Origin, проверить безопасность обработки", "intent": "security.referer-origin-safety"}
+{"text": "Проверить корректное отображение нейтрального текста ошибки при попытке перебора recovery-сценариев", "intent": "privacy.non-disclosive-error"}
+{"text": "Тестировать вход по одноразовому секрету (OTP): убедиться что использованный код нельзя повторить", "intent": "security.otp-onetime"}
+{"text": "Проверить генерацию audit log при изменении чувствительных настроек профиля", "intent": "privacy.audit-log-change"}
+{"text": "Отправить запрос на просмотр большого объема данных, убедиться, что API не выдаёт больше, чем разрешено по privacy policy", "intent": "privacy.api-response-limit"}
+{"text": "Проверить защиту от clickjacking: UI не должен отображаться в чужом iframe", "intent": "security.clickjacking"}
+{"text": "Тестировать невозможность изменить HTTP headers через публичный API", "intent": "security.header-modification"}
+{"text": "В режиме инкогнито войти в личный кабинет, убедиться, что сессия не доступна после закрытия вкладки", "intent": "privacy.incognito-session-terminate"}
