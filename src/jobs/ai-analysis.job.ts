@@ -226,7 +226,7 @@ export class AIAnalysisJobHandler {
         },
         headers: {
           'Content-Type': 'application/json',
-          'X-QAI-Event': 'test.completed',
+          'X-QAIT-Event': 'test.completed',
         },
       });
 

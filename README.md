@@ -1,6 +1,6 @@
-# 📘 QAI — Quality Assurance Intelligence
+# 📘 QAIT — Quality Assurance Intelligence Testing
 
-QAI — это AI‑поддерживаемая SaaS‑платформа для автоматизированного тестирования веб‑приложений. Она сочетает в себе Playwright‑агентов для исполнения тестов и GPT‑модели (GPT‑4o / GPT‑5) для анализа DOM, логов и UI, чтобы генерировать баг‑репорты, объяснения и улучшать качество релизов без участия QA‑инженера.
+QAIT — это AI‑поддерживаемая SaaS‑платформа для автоматизированного тестирования веб‑приложений. Она сочетает в себе Playwright‑агентов для исполнения тестов и GPT‑модели (GPT‑4o / GPT‑5) для анализа DOM, логов и UI, чтобы генерировать баг‑репорты, объяснения и улучшать качество релизов без участия QA‑инженера.
 
 ## 🎯 Цель проекта
 
@@ -65,8 +65,8 @@ QAI — это AI‑поддерживаемая SaaS‑платформа дл�
 
 ```bash
 # Клонирование репозитория
-git clone https://github.com/your-username/qai-backend.git
-cd qai-backend
+git clone https://github.com/your-username/qait-backend.git
+cd qait-backend
 
 # Настройка окружения
 cp .env.example .env
@@ -145,10 +145,10 @@ Content-Type: application/json
 
 ```bash
 # Сборка образа
-docker build -t qai-backend .
+docker build -t qait-backend .
 
 # Запуск контейнера
-docker run -p 3000:3000 --env-file .env qai-backend
+docker run -p 3000:3000 --env-file .env qait-backend
 ```
 
 ## 🧪 Тестирование
@@ -187,7 +187,7 @@ npm run test:e2e
 1. **Клонируйте репозиторий**
    ```bash
    git clone <repository-url>
-   cd qai-backend
+   cd qait-backend
    ```
 
 2. **Настройте переменные окружения**
@@ -240,14 +240,14 @@ npm run test:e2e
 **Ospanov Yerassyl**
 AI/Flutter/Backend Developer
 
-- **Проект**: [QAI — https://qai.so](https://qai.so)
+- **Проект**: [QAIT — https://qai.so](https://qai.so)
 - **Поддержка**: Telegram, GPT-4o, Supabase, Docker
 
 ## 📞 Поддержка
 
 Если у вас есть вопросы или предложения, пожалуйста:
 
-- Создайте [Issue](https://github.com/your-username/qai-backend/issues)
+- Создайте [Issue](https://github.com/your-username/qait-backend/issues)
 - Свяжитесь через Telegram
 - Напишите на email: support@qai.so
 

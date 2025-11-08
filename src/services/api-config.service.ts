@@ -449,7 +449,7 @@ export class ApiConfigService {
         success: result.success,
         validation_results: {},
         chat_session_id: request.execution_context?.chat_session_id,
-        user_agent: 'QAI-Backend',
+        user_agent: 'QAIT-Backend',
       });
 
       logger.info('API test executed with configuration', {
@@ -656,7 +656,7 @@ export class ApiConfigService {
       .insert({
         ...execution,
         user_id: userId,
-        user_agent: 'QAI-Backend',
+        user_agent: 'QAIT-Backend',
       })
       .select()
       .single();

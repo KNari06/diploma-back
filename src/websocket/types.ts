@@ -250,7 +250,10 @@ export interface ChatProcessingStepPayload {
   step: 'parsing_intent' | 'enriching_context' | 'checking_autonomous' |
         'generating_questions' | 'exploring_site' | 'generating_plan' |
         'executing_test' | 'analyzing_results' | 'generating_response' |
-        'generating_scenarios' | 'executing_tests';
+        'generating_scenarios' | 'executing_tests' |
+        // NEW: Added for better clarity
+        'preparing_workspace' | 'checking_project' | 'validating_credentials' |
+        'creating_test_plan' | 'waiting_approval';
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;

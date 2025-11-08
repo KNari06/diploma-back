@@ -8,7 +8,7 @@ import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
-import workspaceRoutes from '@/api/workspace/workspace.routes';
+// import workspaceRoutes from '@/api/workspace/workspace.routes'; // DEPRECATED: Workspace auto-created on first chat
 import { env, isDevelopment } from '@/config/env';
 import { QueueManager } from '@/config/queues';
 import { swaggerSpec } from '@/config/swagger';
@@ -92,7 +92,7 @@ app.use(morgan(env.LOG_FORMAT, { stream: morganStream }));
 // Swagger documentation setup (middleware already registered above)
 app.use('/api/docs', swaggerUi.setup(swaggerSpec, {
   customCss: '.swagger-ui .topbar { display: none }',
-  customSiteTitle: 'QAI API Documentation',
+  customSiteTitle: 'QAIT API Documentation',
   swaggerOptions: {
     persistAuthorization: true,
   },
@@ -183,7 +183,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 
 // API routes
 app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
-app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes);
+// app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes); // DEPRECATED
 app.use(`/api/${env.API_VERSION}/manual-test`, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
@@ -198,7 +198,7 @@ app.use(`/api/${env.API_VERSION}/user`, userRoutes);
 app.get('/', (req: express.Request, res: express.Response) => {
   res.json({
     success: true,
-    message: 'QAI Backend API',
+    message: 'QAIT Backend API',
     version: process.env.npm_package_version || '1.0.0',
     environment: env.NODE_ENV,
     timestamp: new Date().toISOString(),
@@ -257,7 +257,7 @@ const startServer = async () => {
 
     // Start HTTP server
     const server = app.listen(env.PORT, () => {
-      logger.info(`🚀 QAI Backend API started on port ${env.PORT}`);
+      logger.info(`🚀 QAIT Backend API started on port ${env.PORT}`);
       logger.info(`📊 Environment: ${env.NODE_ENV}`);
       logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
       logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);

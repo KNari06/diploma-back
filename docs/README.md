@@ -1,6 +1,6 @@
-# 📚 QAI Backend Documentation
+# 📚 QAIT Backend Documentation
 
-Добро пожаловать в документацию QAI Backend! Здесь собрана вся информация о проекте, его архитектуре, API и процессах разработки.
+Добро пожаловать в документацию QAIT Backend! Здесь собрана вся информация о проекте, его архитектуре, API и процессах разработки.
 
 ## 🗂️ Структура документации
 
@@ -87,10 +87,10 @@
 
 ## 🆘 Получение помощи
 
-- **Issues**: [GitHub Issues](https://github.com/your-username/qai-backend/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-username/qai-backend/discussions)
+- **Issues**: [GitHub Issues](https://github.com/your-username/qait-backend/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/your-username/qait-backend/discussions)
 - **Email**: dev@qai.so
-- **Telegram**: @qai_support
+- **Telegram**: @qait_support
 
 ---
 

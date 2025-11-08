@@ -1,6 +1,6 @@
 services:
   backend:
-    container_name: qai-backend
+    container_name: qait-backend
     build:
       context: .
       dockerfile: Dockerfile
@@ -12,7 +12,7 @@ services:
     restart: always
 
   worker:
-    container_name: qai-worker
+    container_name: qait-worker
     build:
       context: .
       dockerfile: Dockerfile

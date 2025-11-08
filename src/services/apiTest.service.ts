@@ -83,7 +83,7 @@ export async function executeApiTest(request: ApiTestRequest): Promise<ApiTestRe
     const method = request.method.toUpperCase();
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      'User-Agent': 'QAI-Backend/1.0',
+      'User-Agent': 'QAIT-Backend/1.0',
       ...request.headers,
     };
 

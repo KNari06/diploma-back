@@ -1,4 +1,4 @@
-# 🤖 QAI Playwright Agent Module
+# 🤖 QAIT Playwright Agent Module
 
 Integrated Playwright agent for browser automation - runs locally within the backend process.
 

@@ -98,7 +98,7 @@ export function generateApiTestScenarios(
       url: fullUrl,
       headers: {
         'Accept': 'application/json',
-        'User-Agent': 'QAI-Test-Agent/1.0',
+        'User-Agent': 'QAIT-Test-Agent/1.0',
         'X-Test-Header': 'test-value',
       },
       expectedStatus: 200,

@@ -574,14 +574,17 @@ export interface TraceStepsResponse {
 
 // Intent Parsing types
 export type IntentType =
+  // NEW: Simplified to 3 main intents
+  | 'platform_test'           // UI testing (replaces check_element, fill_form, login_flow, assert_ui, navigate)
+  | 'api_test'                // API testing (single request)
+  | 'general_chat'            // General conversation
+  // LEGACY: Keep for backward compatibility (will be migrated to platform_test)
   | 'check_element'
   | 'fill_form'
   | 'login_flow'
   | 'assert_ui'
   | 'navigate'
-  | 'api_test'
   | 'api_test_comprehensive'
-  | 'general_chat'
   | string; // Allow custom intents for flexibility
 
 export type ElementType =
@@ -608,6 +611,12 @@ export type ActionType =
 
 export interface IntentResult {
   intent: IntentType;
+
+  // NEW: Scope and target for platform_test
+  scope?: 'full' | 'page' | 'element' | 'flow' | 'form' | 'auth' | 'navigation' | null;
+  target?: string | null; // What exactly to test (e.g., "registration form", "Buy button")
+
+  // Legacy fields (for backward compatibility)
   elementType?: ElementType;
   elementLabel?: string;
   page?: string;
@@ -617,6 +626,7 @@ export interface IntentResult {
   confidence?: number; // 0-1, how confident the parser is
   rawText?: string; // Original user message for reference
   metadata?: Record<string, any>; // Additional flexible data
+
   // API test specific fields
   apiMethod?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | string;
   apiUrl?: string;
@@ -624,6 +634,7 @@ export interface IntentResult {
   apiHeaders?: Record<string, string>;
   expectedStatus?: number;
   isRelativePath?: boolean; // True if apiUrl is a relative path without base URL
+
   selector?: string; // For UI testing intents
   // Playwright commands generated from intent
   commands?: PlaywrightCommand[];

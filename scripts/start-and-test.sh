@@ -31,7 +31,7 @@ if [ ! -d "dist" ]; then
 fi
 
 # Start server
-npm run dev > /tmp/qai-backend.log 2>&1 &
+npm run dev > /tmp/qait-backend.log 2>&1 &
 SERVER_PID=$!
 
 echo "⏳ Waiting for server to start..."
@@ -53,7 +53,7 @@ if ! curl -s "${SERVER_URL}/health" > /dev/null 2>&1; then
   echo "❌ Server failed to start"
   echo ""
   echo "Check logs:"
-  tail -20 /tmp/qai-backend.log
+  tail -20 /tmp/qait-backend.log
   kill $SERVER_PID 2>/dev/null
   exit 1
 fi

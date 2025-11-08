@@ -2,6 +2,7 @@ import { env } from '@/config/env';
 import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
 import { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import { buildChatSystemPrompt } from '@/ai/prompts/index';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
@@ -53,24 +54,8 @@ export async function getChatCompletionWithMessages(
  */
 export async function getChatCompletion(prompt: string, context?: string): Promise<string> {
   try {
-    const systemPrompt = `Ты AI-QA мастер на платформе QAI. Помогай пользователям генерировать тесты, анализировать результаты, тестировать API. Отвечай кратко, по делу и детально.
-
-ВОЗМОЖНОСТИ ПЛАТФОРМЫ:
-- Тестирование UI элементов и веб-страниц
-- Тестирование API через естественный язык
-- Генерация тестовых сценариев
-
-КАК ТЕСТИРОВАТЬ API:
-Пользователь может просто описать что нужно протестировать, например:
-- "Проверь, что GET запрос на https://api.example.com/users возвращает статус 200"
-- "Сделай POST запрос на /api/login с телом {"email":"test@test.com"} и проверь что возвращает 401"
-- "Протестируй GET https://api.myapp.com/data"
-
-Когда пользователь просит протестировать API, объясни ему что он может просто описать запрос естественным языком, и я автоматически выполню его.
-
-Если пользователь спрашивает про возможности или как что-то сделать - объясни кратко и по делу.
-
-ВАЖНО: Всегда отвечай на том же языке, на котором пишет пользователь. Если он пишет на английском - отвечай на английском, если на русском - на русском, на казахском - на казахском.`;
+    // Use centralized prompt (in English, but AI will respond in user's language)
+    const systemPrompt = buildChatSystemPrompt();
 
     const messages: ChatCompletionMessageParam[] = [
       { role: 'system', content: systemPrompt },

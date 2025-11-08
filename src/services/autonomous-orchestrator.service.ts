@@ -21,45 +21,46 @@ import { ChatProcessingStepPayload } from '@/websocket/types';
 
 /**
  * Step 1: Detect if autonomous mode is needed
+ * SIMPLIFIED: Now based purely on intent type
  */
-export function needsAutonomousMode(context: {
-  hasUrl: boolean;
-  hasTraces: boolean;
-  hasDocumentation: boolean;
-  intent: string;
-}): boolean {
-  logger.info('[AUTONOMOUS] Checking if autonomous mode needed', {
-    hasUrl: context.hasUrl,
-    hasTraces: context.hasTraces,
-    hasDocumentation: context.hasDocumentation,
-    intent: context.intent,
-  });
+export function needsAutonomousMode(intent: string): boolean {
+  logger.info('[AUTONOMOUS] Checking if autonomous mode needed', { intent });
 
-  // Skip only for general chat and API testing (explicitly non-UI intents)
-  const skipIntents = ['general_chat', 'api_test', 'api_test_comprehensive'];
-  if (skipIntents.includes(context.intent)) {
-    logger.info('[AUTONOMOUS] Skipping - intent is general_chat or api_test');
-    return false;
-  }
+  // SIMPLIFIED LOGIC:
+  // - platform_test → ALWAYS autonomous (with test plan approval)
+  // - api_test → ALWAYS autonomous (with test plan approval)
+  // - general_chat → NEVER autonomous
 
-  // If we have no URL, definitely need it
-  if (!context.hasUrl) {
-    logger.info('[AUTONOMOUS] Activating - no URL provided');
+  // NEW intents
+  if (intent === 'platform_test') {
+    logger.info('[AUTONOMOUS] Activating - platform_test intent');
     return true;
   }
 
-  // If we have traces or documentation, we have enough context
-  if (context.hasTraces || context.hasDocumentation) {
-    logger.info('[AUTONOMOUS] Skipping - we have traces or documentation');
+  if (intent === 'api_test') {
+    logger.info('[AUTONOMOUS] Activating - api_test intent (will generate test plan)');
+    return true;
+  }
+
+  if (intent === 'general_chat') {
+    logger.info('[AUTONOMOUS] Skipping - general_chat intent');
     return false;
   }
 
-  // For ANY other intent with URL but no context → need autonomous mode
-  // This is universal: custom, ui_test, check_element, login_flow, etc.
-  logger.info('[AUTONOMOUS] Decision: Activating', {
-    reason: `Intent '${context.intent}' needs UI testing but lacks context (no traces/docs)`,
-  });
+  // LEGACY intents (for backward compatibility)
+  const legacyUiIntents = ['check_element', 'fill_form', 'login_flow', 'assert_ui', 'navigate'];
+  if (legacyUiIntents.includes(intent)) {
+    logger.info('[AUTONOMOUS] Activating - legacy UI intent (migrating to platform_test)');
+    return true;
+  }
 
+  if (intent === 'api_test_comprehensive') {
+    logger.info('[AUTONOMOUS] Activating - legacy api_test_comprehensive');
+    return true;
+  }
+
+  // Default: activate autonomous for unknown intents (safe approach)
+  logger.info('[AUTONOMOUS] Activating - unknown intent, defaulting to autonomous', { intent });
   return true;
 }
 

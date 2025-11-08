@@ -426,7 +426,7 @@ export async function updateUserProfile(
     if (!user) throw new Error('Invalid token');
 
     // Update user metadata in Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.updateUser({
+    const { error: authError } = await supabase.auth.updateUser({
       data: { name }
     });
 

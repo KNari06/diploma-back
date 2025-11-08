@@ -183,7 +183,7 @@ process.on('unhandledRejection', (reason) => {
   // process.exit(1);
 });
 
-logger.info('🚀 QAI Worker started');
+logger.info('🚀 QAIT Worker started');
 logger.info(`📊 Concurrency: ${env.QUEUE_CONCURRENCY}`);
 logger.info(`🔧 Environment: ${env.NODE_ENV}`);
 logger.info(`🔌 Redis: ${env.REDIS_HOST}:${env.REDIS_PORT}`);

@@ -83,7 +83,7 @@ export class AnonymousLimiterService {
         return newCount;
       } else {
         // Create new record
-        const { data, error } = await supabaseAdmin
+        const { error } = await supabaseAdmin
           .from('anonymous_usage_limits')
           .insert({
             anonymous_id: anonymousId,

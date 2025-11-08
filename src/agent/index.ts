@@ -1,5 +1,5 @@
 /**
- * QAI Playwright Agent Module
+ * QAIT Playwright Agent Module
  *
  * Self-contained module for browser automation and test execution
  * Runs locally within the backend process (no separate service needed)

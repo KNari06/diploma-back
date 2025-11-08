@@ -221,7 +221,7 @@ export class ManualTestRunJobHandler {
         timeout: env.AGENT_TIMEOUT,
         headers: {
           'Content-Type': 'application/json',
-          'X-QAI-Source': 'backend',
+          'X-QAIT-Source': 'backend',
         },
       });
 

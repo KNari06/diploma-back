@@ -19,12 +19,12 @@ export interface ClarifyingQuestion {
 }
 
 /**
- * Base questions template
+ * Base questions template (English for US market)
  */
 const BASE_QUESTIONS: ClarifyingQuestion[] = [
   {
     id: 'url',
-    question: 'Какой URL вашего продукта нужно протестировать?',
+    question: 'What is the URL of your platform?',
     required: true,
     type: 'url',
     placeholder: 'https://example.com/register',
@@ -34,28 +34,32 @@ const BASE_QUESTIONS: ClarifyingQuestion[] = [
   },
   {
     id: 'scope',
-    question: 'Что именно нужно протестировать?',
+    question: 'What exactly should I test?',
     required: true,
     type: 'scope',
     options: [
-      'Одну страницу (например, форму регистрации)',
-      'Последовательность действий (флоу)',
-      'Конкретный элемент (кнопку, форму)',
+      'Entire platform (comprehensive exploration)',
+      'Specific page (e.g., registration page)',
+      'Specific element (button, form, input)',
+      'User flow (e.g., login → dashboard → action)',
+      'Form functionality',
+      'Authentication process',
+      'Navigation/menu',
     ],
-    placeholder: 'Например: регистрация, логин, оформление заказа',
+    placeholder: 'Example: registration form, checkout process, login flow',
   },
   {
     id: 'needs_auth',
-    question: 'Требуется авторизация для доступа к странице?',
+    question: 'Does the page require authentication?',
     required: false,
     type: 'boolean',
   },
   {
     id: 'credentials',
-    question: 'Введите тестовые credentials для авторизации',
+    question: 'Please provide test credentials (any format)',
     required: false,
     type: 'credentials',
-    placeholder: '{"email": "test@test.com", "password": "testpass"}',
+    placeholder: 'email@example.com / password123  or  {"email": "test@test.com", "password": "pass"}',
   },
 ];
 

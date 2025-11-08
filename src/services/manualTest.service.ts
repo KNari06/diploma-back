@@ -1,9 +1,8 @@
 import { v4 as uuidv4 } from 'uuid';
 import { logger, logTestEvent } from '@/utils/logger';
-import { ValidationError, NotFoundError } from '@/types';
+import { ValidationError, NotFoundError, TestRunRequest, Test, TestResult, BrowserType, ApiResponse, PaginatedResponse } from '@/types';
 import { dbAdminService, dbService, supabaseAdmin } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
-import { TestRunRequest, Test, TestResult, BrowserType, ApiResponse, PaginatedResponse } from '@/types';
 import { webSocketService } from '@/websocket/websocket.service';
 import { TestCreatedPayload } from '@/websocket/types';
 

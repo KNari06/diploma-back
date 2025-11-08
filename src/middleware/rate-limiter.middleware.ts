@@ -80,7 +80,7 @@ export const checkAnonymousLimit = async (
           current: limitInfo.current,
           remaining: 0,
           requiresAuth: true,
-          authMessage: 'Войдите или зарегистрируйтесь, чтобы продолжить использование QAI',
+          authMessage: 'Войдите или зарегистрируйтесь, чтобы продолжить использование QAIT',
         },
         timestamp: new Date().toISOString(),
       });

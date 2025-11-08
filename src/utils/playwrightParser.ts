@@ -19,7 +19,6 @@ export function parsePlaywrightTestSteps(
   const {
     includeStartEnd = true,
     autoLayout = false,
-    groupNesting = true,
     addButtons = true,
   } = options;
 
@@ -440,8 +439,7 @@ function calculateLayout(nodes: GraphNode[], edges: GraphEdge[]): void {
   const startNode = nodes.find(n => n.type === 'start') || nodes[0];
   if (!startNode) return;
 
-  let currentLevel = 0;
-  let queue: Array<{ nodeId: string; level: number; offset: number }> = [
+  const queue: Array<{ nodeId: string; level: number; offset: number }> = [
     { nodeId: startNode.id, level: 0, offset: 0 },
   ];
 

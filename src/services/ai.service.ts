@@ -2,7 +2,7 @@ import OpenAI from 'openai';
 import { env } from '@/config/env';
 import { logger, logAIAnalysis } from '@/utils/logger';
 import { handleAIError } from '@/utils/error-handler';
-import { AISummary, BugReport, TestResult, NetworkLog, TestError } from '@/types';
+import { AISummary, BugReport, TestResult } from '@/types';
 
 export class AIService {
   private openai: OpenAI;
@@ -19,21 +19,21 @@ export class AIService {
   async analyzeTestResults(testResult: TestResult): Promise<AISummary> {
     try {
       const startTime = Date.now();
-      
+
       logger.info(`Starting AI analysis for test ${testResult.testId}`);
 
       // Prepare context for AI analysis
       const context = this.prepareAnalysisContext(testResult);
-      
+
       // Generate AI analysis
       const analysis = await this.generateAnalysis(context);
-      
+
       const duration = Date.now() - startTime;
       logger.info(`AI analysis completed in ${duration}ms for test ${testResult.testId}`);
-      
+
       // Log the analysis
       logAIAnalysis(testResult.testId, analysis);
-      
+
       return analysis;
     } catch (error) {
       logger.error(`AI analysis failed for test ${testResult.testId}:`, error);
@@ -67,15 +67,15 @@ export class AIService {
     if (dom.length <= maxLength) {
       return dom;
     }
-    
+
     // Try to find a good truncation point
     const truncated = dom.substring(0, maxLength);
     const lastTag = truncated.lastIndexOf('>');
-    
+
     if (lastTag > maxLength * 0.8) {
       return truncated.substring(0, lastTag + 1) + '\n... [DOM truncated]';
     }
-    
+
     return truncated + '\n... [DOM truncated]';
   }
 
@@ -108,7 +108,7 @@ export class AIService {
    * Get system prompt for AI analysis
    */
   private getSystemPrompt(): string {
-    return `You are an expert QA engineer with 10+ years of experience in web application testing. 
+    return `You are an expert QA engineer with 10+ years of experience in web application testing.
 Your task is to analyze test results and provide comprehensive bug reports and recommendations.
 
 You will receive:
@@ -184,7 +184,7 @@ If no bugs are found, return an empty bugs array but still provide recommendatio
       }
 
       const parsed = JSON.parse(jsonMatch[0]);
-      
+
       // Validate and transform the response
       const bugs: BugReport[] = (parsed.bugs || []).map((bug: any, index: number) => ({
         id: `bug-${Date.now()}-${index}`,
@@ -211,7 +211,7 @@ If no bugs are found, return an empty bugs array but still provide recommendatio
       };
     } catch (error) {
       logger.error('Failed to parse AI response:', error);
-      
+
       // Return a fallback analysis
       return {
         summary: 'AI analysis failed - manual review required',
@@ -251,7 +251,7 @@ If no bugs are found, return an empty bugs array but still provide recommendatio
         failedTests: testResults.filter(r => r.status === 'failed').length,
         browsers: [...new Set(testResults.map(r => r.browser))],
         totalBugs: testResults.reduce((sum, r) => sum + (r.aiSummary?.bugs?.length || 0), 0),
-        criticalBugs: testResults.reduce((sum, r) => 
+        criticalBugs: testResults.reduce((sum, r) =>
           sum + (r.aiSummary?.bugs?.filter(b => b.severity === 'critical').length || 0), 0),
       };
 
@@ -322,14 +322,14 @@ Generate a professional bug report suitable for development teams.`;
    */
   async healthCheck(): Promise<{ status: string; latency: number }> {
     const startTime = Date.now();
-    
+
     try {
       await this.openai.chat.completions.create({
         model: env.OPENAI_MODEL,
         messages: [{ role: 'user', content: 'Hello' }],
         max_tokens: 1,
       });
-      
+
       const latency = Date.now() - startTime;
       return { status: 'healthy', latency };
     } catch (error) {

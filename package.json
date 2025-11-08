@@ -1,7 +1,7 @@
 {
-  "name": "qai-backend",
+  "name": "qait-backend",
   "version": "1.0.0",
-  "description": "QAI - Quality Assurance Intelligence Backend API",
+  "description": "QAIT - Quality Assurance Intelligence Testing Backend API",
   "main": "dist/index.js",
   "scripts": {
     "dev": "nodemon --exec ts-node -r tsconfig-paths/register src/index.ts",

@@ -1,1622 +1,1322 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { detectUserApproval, parseNaturalAnswers } from '@/services/ai-helpers.service';
-import { executeApiTest } from '@/services/apiTest.service';
-import {
-  generateApiTestScenarios,
-  executeApiTestSuite,
-  formatApiTestResults
-} from '@/services/api-test-scenarios.service';
-import { ApiConfigService } from '@/services/api-config.service';
-import { UrlResolverService } from '@/services/url-resolver.service';
-import { SmartApiContextService } from '@/services/smart-api-context.service';
-import {
-  confirmAndExecuteTestPlan,
-  needsAutonomousMode,
-  rejectPlan,
-  requestMissingInformation,
-  runAutonomousExploration
-} from '@/services/autonomous-orchestrator.service';
-import { enrichContextForCommands, extractUrlFromMessage } from '@/services/context-enrichment.service';
-import { getTestPlan } from '@/services/exploration-cache.service';
+import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
+import { logger } from '@/utils/logger';
+import { Request, Response } from 'express';
+
+// New services
+import { ApiTestPlanService } from '@/services/api-test-plan.service';
+import { CredentialsParserService } from '@/services/credentials-parser.service';
+import { ProjectContextService } from '@/services/project-context.service';
+import { WorkspaceService } from '@/services/workspace.service';
+
+// Existing services
+import { detectUserApproval } from '@/services/ai-helpers.service';
+import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/autonomous-orchestrator.service';
+import { extractUrlFromMessage } from '@/services/context-enrichment.service';
+import { getTestPlan, saveTestPlan } from '@/services/exploration-cache.service';
 import { parseUserIntent } from '@/services/intentParser.service';
 import { ManualTestService } from '@/services/manualTest.service';
-import { getChatCompletion } from '@/services/openai.service';
+import { getChatCompletion, getChatCompletionWithMessages } from '@/services/openai.service';
 import { UserCreditsService } from '@/services/user-credits.service';
-import { buildChatPrompt } from '@/utils/buildChatPrompt';
-import { logger } from '@/utils/logger';
-import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
-import { Request, Response } from 'express';
-import { ChatRequest } from './chat.types';
+import { executeApiTest } from '@/services/apiTest.service';
+
+// Types
+import { ChatProcessingStepPayload, ChatTestUpdatePayload } from '@/websocket/types';
 import { webSocketService } from '@/websocket/websocket.service';
-import { ChatTestUpdatePayload, ChatProcessingStepPayload } from '@/websocket/types';
+import { ChatRequest } from './chat.types';
+
+// Prompts
+import { buildChatSystemPrompt } from '@/ai/prompts';
 
 /**
- * Handle chat request from user
+ * ═══════════════════════════════════════════════════════════════════════════
+ * MAIN CHAT HANDLER
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * NEW SIMPLIFIED ARCHITECTURE:
+ * 1. Workspace check (mandatory)
+ * 2. Parse intent (3 types: platform_test, api_test, general_chat)
+ * 3. Route to appropriate handler
+ * 4. All tests require test plan approval
  */
 export const handleChat = async (req: Request, res: Response): Promise<void> => {
   try {
     const { message, context, sessionId, conversationId, answers, userId: bodyUserId } = req.body as ChatRequest;
-    // Use userId from auth middleware, fallback to body
-    const userId = req.user?.id || bodyUserId;
+    const userId = req.user?.id || bodyUserId || 'anonymous';
 
-    // Get anonymous ID from IP address (for non-authenticated users)
+    // Get anonymous ID from IP
     const clientIp = getClientIp(req);
-    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
+    const anonymousId = userId === 'anonymous' ? normalizeIpForAnonymousId(clientIp) : undefined;
 
-    // Extract projectId from context (for workspace/project association, not for anonymous ID)
-    const projectId = typeof context === 'object' ? context.projectId : undefined;
-
-    logger.info('Chat request received', {
-      userId: userId || 'anonymous',
+    logger.info('[CHAT] Request received', {
+      userId,
       anonymousId,
-      clientIp,
       messageLength: message.length,
-      sessionId,
-      hasConversationId: !!conversationId,
-      hasAnswers: !!answers
+      hasSession: !!sessionId,
+      hasConversation: !!conversationId,
+      hasAnswers: !!answers,
     });
 
-    // Get or create chat session
-    let chatSessionId = sessionId;
-    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 1: WORKSPACE CHECK (MANDATORY!)
+    // ═══════════════════════════════════════════════════════════════════════
 
+    const { workspace_id, is_new: isNewWorkspace } = await WorkspaceService.checkOrCreateWorkspace(userId);
 
-    if (isValidUUID) {
-      if (chatSessionId) {
-        // Verify session exists and belongs to user
-        const { data: existingSession } = await supabaseAdmin
-          .from('chat_sessions')
-          .select('id')
-          .eq('id', chatSessionId)
-          .eq('user_id', userId)
-          .maybeSingle();
-
-        if (!existingSession) {
-          logger.warn('Session not found or not owned by user, creating new one', {
-            providedSessionId: chatSessionId,
-            userId
-          });
-          chatSessionId = undefined; // Will create new session below
-        }
-      }
-
-      if (!chatSessionId) {
-        // Check if user has existing session (single chat per user)
-        const { data: existingSession } = await supabaseAdmin
-          .from('chat_sessions')
-          .select('id')
-          .eq('user_id', userId)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-
-        if (existingSession) {
-          // Use existing session
-          chatSessionId = existingSession.id;
-          logger.info('Using existing chat session', { sessionId: chatSessionId, userId });
-        } else {
-          // Get workspace_id for the chat session
-          let workspaceId: string | null = null;
-
-          // If context has projectId (and it's not the fallback 'default' string), get workspace from project
-          if (projectId && projectId !== 'default') {
-            const isValidProjectUUID = projectId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-            if (isValidProjectUUID) {
-              const { data: project } = await supabaseAdmin
-                .from('projects')
-                .select('workspace_id')
-                .eq('id', projectId)
-                .maybeSingle();
-
-              if (project?.workspace_id) {
-                workspaceId = project.workspace_id;
-              }
-            }
-          }
-
-          // If no workspace from project, get user's default workspace
-          if (!workspaceId) {
-            const { WorkspaceService } = await import('@/services/workspace.service');
-            try {
-              const defaultWorkspace = await WorkspaceService.getOrCreateDefaultWorkspace(userId);
-              workspaceId = defaultWorkspace.id;
-            } catch (workspaceError: any) {
-              // If workspaces table doesn't exist, continue without workspace_id
-              if (workspaceError?.message?.includes('does not exist') || workspaceError?.code === '42P01') {
-                logger.warn('Workspaces table not found, creating chat session without workspace_id', { userId });
-                // Continue without workspace_id - migration will handle it later
-              } else {
-                logger.error('Failed to get default workspace for chat session', { workspaceError, userId });
-                // Continue without workspace_id - migration will handle it
-              }
-            }
-          }
-
-          // Create new session
-          const sessionData: any = {
-            user_id: userId,
-            title: message.substring(0, 50),
-          };
-
-          if (workspaceId) {
-            sessionData.workspace_id = workspaceId;
-          }
-
-          if (projectId && projectId !== 'default') {
-            const isValidProjectUUID = projectId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-            if (isValidProjectUUID) {
-              sessionData.project_id = projectId;
-            }
-          }
-
-          const { data: newSession, error: sessionError } = await supabaseAdmin
-            .from('chat_sessions')
-            .insert(sessionData)
-            .select()
-            .single();
-
-          if (sessionError) {
-            logger.error('Failed to create chat session', sessionError);
-          } else {
-            chatSessionId = newSession.id;
-            logger.info('Created new chat session', {
-              sessionId: chatSessionId,
-              userId,
-              workspaceId,
-              projectId: sessionData.project_id || null
-            });
-          }
-        }
-      }
+    if (isNewWorkspace) {
+      logger.info('[CHAT] Created new workspace', { userId, workspace_id });
     }
 
-    // Extract URL from message for context enrichment
-    const urlFromMessage = extractUrlFromMessage(message);
-    const contextUrl = urlFromMessage || (typeof context === 'object' && context?.currentUrl) || undefined;
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 2: CHAT SESSION MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════
 
-    // projectId is already defined at the top (line 39)
+    let chatSessionId = await getOrCreateChatSession(userId, sessionId, workspace_id);
 
     // Emit: Enriching context
     if (chatSessionId) {
-      const stepPayload: ChatProcessingStepPayload = {
-        sessionId: chatSessionId,
-        step: 'enriching_context',
-        message: '🔍 Обогащаю контекст из Knowledge Base и traces...',
-        progress: 10,
-        timestamp: new Date().toISOString(),
-      };
-      webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
+      emitProcessingStep(chatSessionId, 'enriching_context', '🔍 Analyzing your request...', 10);
     }
 
-    // Enrich context with RAG + Traces before parsing intent
-    logger.info('Enriching context before intent parsing', {
-      hasUrl: !!contextUrl,
-      projectId
-    });
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 3: CHECK FOR PENDING TEST PLAN APPROVAL (MUST BE FIRST!)
+    // ═══════════════════════════════════════════════════════════════════════
 
-    const enrichedContext = await enrichContextForCommands(
-      message,
-      projectId || 'default',
-      contextUrl
-    );
-
-    // === AUTONOMOUS MODE HANDLING ===
-
-    // Check if there's a pending test plan for this conversation
-    let pendingPlan = null;
+    // IMPORTANT: Check test plan approval BEFORE parsing intent!
+    // If user is responding to test plan, we don't want to parse their "yes" as a new intent
     if (conversationId) {
-      pendingPlan = await getTestPlan(conversationId, userId || 'anonymous');
+      const pendingPlan = await getTestPlan(conversationId, userId);
 
       if (pendingPlan && pendingPlan.status === 'pending_confirmation') {
-        logger.info('Found pending plan, detecting user approval', {
-          conversationId,
+        // User is responding to test plan - detect approval/rejection
+        logger.info('[CHAT] Found pending test plan, checking for approval/rejection', {
           planId: pendingPlan.id,
-          message: message.substring(0, 50),
         });
 
-        // AI-powered approval detection - user can write ANYTHING
         const approvalResult = await detectUserApproval(message);
 
-        logger.info('Approval detection result', {
+        logger.info('[CHAT] Test plan response detected', {
+          planId: pendingPlan.id,
           approved: approvalResult.approved,
           confidence: approvalResult.confidence,
-          reasoning: approvalResult.reasoning,
         });
 
-        // Process based on confidence
         if (approvalResult.confidence < 0.5) {
-          // Too unclear - ask for clarification
+          // Unclear response
           res.json({
-            reply: `❓ Не совсем понял ваш ответ.\n\n✅ Подтвердить тест план?\n❌ Отклонить?`,
+            reply: '❓ I didn\'t quite understand. Could you please clarify?\n\n✅ Approve and run the test?\n❌ Cancel?',
             timestamp: new Date().toISOString(),
+            sessionId: chatSessionId,
           });
           return;
         }
 
         if (approvalResult.approved === true) {
-          // APPROVED - execute test plan
-          logger.info('User approved test plan', { planId: pendingPlan.id });
-
-          const planId = pendingPlan.id;
-        // Confirm and execute test plan
-        const result = await confirmAndExecuteTestPlan(planId, userId || 'anonymous');
-
-        if (result.success) {
-          // Get confirmed plan
-          const plan = await getTestPlan(planId, userId || 'anonymous');
-
-          if (plan) {
-            // Emit: Executing test
-            if (chatSessionId) {
-              const stepPayload: ChatProcessingStepPayload = {
-                sessionId: chatSessionId,
-                step: 'executing_test',
-                message: '⚙️ Запускаю тест в браузере...',
-                progress: 70,
-                timestamp: new Date().toISOString(),
-              };
-              webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
-            }
-
-            // Execute test with plan commands
-            const testRequest = {
-              url: plan.url,
-              browsers: ['chrome' as const],
-              projectId: projectId || 'default',
-              userId,
-              options: {},
-              commands: plan.commands,
-              intent: plan.scope,
-            };
-
-            const testCreated = await ManualTestService.runTest(testRequest);
-
-            // Emit WebSocket: chat test update
-            if (chatSessionId && testCreated.data?.id) {
-              const chatTestUpdatePayload: ChatTestUpdatePayload = {
-                sessionId: chatSessionId,
-                testId: testCreated.data.id,
-                message: '✅ Тест запущен! Следите за прогрессом в real-time.',
-                status: 'created',
-                links: {
-                  fullReport: `/api/v1/manual-test/${testCreated.data.id}/summary`,
-                },
-                timestamp: new Date().toISOString(),
-              };
-              webSocketService.emitChatTestUpdate(chatSessionId, chatTestUpdatePayload);
-            }
-
-            res.json({
-              reply: `✅ Test plan подтвержден и запущен!\n\nTest ID: ${testCreated.data?.id}\n\nПроверь статус:\nGET /api/v1/manual-test/${testCreated.data?.id}/status`,
-              timestamp: new Date().toISOString(),
-              testId: testCreated.data?.id,
-            });
-            return;
-          }
-        }
-
-          res.json({
-            reply: result.message,
-            timestamp: new Date().toISOString(),
+          // APPROVED - execute test
+          return await executeApprovedTestPlan(req, res, {
+            planId: pendingPlan.id,
+            userId,
+            chatSessionId,
+            workspace_id,
           });
-          return;
         } else if (approvalResult.approved === false) {
           // REJECTED
-          logger.info('User rejected test plan', { planId: pendingPlan.id });
-
-          const reason = message || 'User rejected';
-          const result = await rejectPlan(pendingPlan.id, userId || 'anonymous', reason);
+          logger.info('[CHAT] Test plan rejected', { planId: pendingPlan.id });
 
           res.json({
-            reply: result.message,
+            reply: '❌ Test plan canceled. Feel free to request a different test or ask any questions!',
             timestamp: new Date().toISOString(),
-          });
-          return;
-        } else {
-          // NULL - very unclear, but confidence is >= 0.5 (shouldn't happen normally)
-          res.json({
-            reply: `❓ Не понял ваш ответ. Пожалуйста, ответьте чётче:\n\n✅ Подтвердить?\n❌ Отклонить?`,
-            timestamp: new Date().toISOString(),
+            sessionId: chatSessionId,
           });
           return;
         }
       }
     }
 
-    // Emit: Parsing intent
-    if (chatSessionId) {
-      const stepPayload: ChatProcessingStepPayload = {
-        sessionId: chatSessionId,
-        step: 'parsing_intent',
-        message: '🤖 Анализирую ваш запрос с помощью AI...',
-        progress: 20,
-        timestamp: new Date().toISOString(),
-      };
-      webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
-    }
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 4: PARSE INTENT (Only if not responding to test plan)
+    // ═══════════════════════════════════════════════════════════════════════
 
-    // Parse user intent from natural language with enriched context
-    const parsedIntent = await parseUserIntent(message, enrichedContext);
+    emitProcessingStep(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', 20);
 
-    logger.info('[CHAT] Parsed intent result', {
-      intent: parsedIntent?.intent,
-      hasCommands: !!parsedIntent?.commands,
-      commandsCount: parsedIntent?.commands?.length || 0,
-      action: parsedIntent?.action,
-      apiMethod: parsedIntent?.apiMethod,
-      apiUrl: parsedIntent?.apiUrl,
+    const parsedIntent = await parseUserIntent(message);
+    const intent = parsedIntent?.intent || 'general_chat';
+
+    logger.info('[CHAT] Intent parsed', {
+      intent,
+      scope: parsedIntent?.scope,
+      target: parsedIntent?.target,
+      hasUrl: !!parsedIntent?.page,
     });
 
-    // Emit: Checking autonomous mode
-    if (chatSessionId) {
-      const stepPayload: ChatProcessingStepPayload = {
-        sessionId: chatSessionId,
-        step: 'checking_autonomous',
-        message: '🔎 Проверяю нужен ли автономный режим...',
-        progress: 30,
-        metadata: { intent: parsedIntent?.intent },
-        timestamp: new Date().toISOString(),
-      };
-      webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
-    }
-
-    // Check if autonomous mode is needed
-    const hasTraces = !!(enrichedContext.knownSelectors && Object.keys(enrichedContext.knownSelectors).length > 0);
-    const hasDocumentation = !!(enrichedContext.documentation && enrichedContext.documentation.length > 0);
-
-    const needsAutonomous = needsAutonomousMode({
-      hasUrl: !!contextUrl,
-      hasTraces,
-      hasDocumentation,
-      intent: parsedIntent?.intent || 'unknown',
-    });
-
-    logger.info('[CHAT] Autonomous mode check', {
-      needsAutonomous,
-      hasUrl: !!contextUrl,
-      hasTraces,
-      hasDocumentation,
-      intent: parsedIntent?.intent,
-    });
-
-    // If autonomous mode needed and no answers provided yet
-    if (needsAutonomous && !answers) {
-      logger.info('Autonomous mode activated - requesting information', {
-        hasUrl: !!contextUrl,
-        intent: parsedIntent?.intent,
-      });
-
-      // Emit: Generating questions
-      if (chatSessionId) {
-        const stepPayload: ChatProcessingStepPayload = {
-          sessionId: chatSessionId,
-          step: 'generating_questions',
-          message: '❓ Генерирую уточняющие вопросы...',
-          progress: 40,
-          timestamp: new Date().toISOString(),
-        };
-        webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
-      }
-
-      const questionResult = await requestMissingInformation(message, {
-        hasUrl: !!contextUrl,
-        hasScope: !!(parsedIntent?.page || parsedIntent?.elementLabel),
-        intent: parsedIntent?.intent,
-      });
-
-      res.json({
-        reply: '🤔 Мне нужна дополнительная информация для создания теста:\n\n' +
-               questionResult.questions.map((q, i) =>
-                 `${i + 1}. ${q.question}${q.required ? ' (обязательно)' : ''}`
-               ).join('\n'),
-        needsMoreInfo: true,
-        questions: questionResult.questions,
-        conversationId: questionResult.conversationId,
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
-    // Handle smart API context conversations
-    if (conversationId && conversationId.startsWith('smart_api_')) {
-      logger.info('[CHAT] Handling smart API context conversation', {
-        conversationId,
-        message: message.substring(0, 100),
-      });
-
-      // For now, provide instructions to user to retry with complete information
-      // In a full implementation, we would parse the structured responses and create configurations
-      res.json({
-        reply: `✅ Информация получена! Теперь повторите ваш запрос на тестирование с полными данными.\n\nНапример: \`Протестируй POST https://api.example.com/users\`\n\nЯ сохраню эту конфигурацию для будущих тестов.`,
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
-    // Handle API URL resolution conversations (legacy)
-    if (conversationId && (conversationId.startsWith('api_url_') || conversationId.includes('api_url'))) {
-      logger.info('[CHAT] Handling API URL resolution conversation', {
-        conversationId,
-        message: message.substring(0, 100),
-      });
-
-      // Parse user response to extract base URL and other info
-      const parseResult = UrlResolverService.parseUserResponse(
-        '', // We'll extract the original path from conversationId if needed
-        message
-      );
-
-      if (parseResult.error) {
-        res.json({
-          reply: `❌ ${parseResult.error}\n\nПример правильного ответа: \`https://api.example.com\` или \`http://localhost:3000\``,
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
-
-      if (parseResult.baseUrl) {
-        // Try to re-parse the original intent with the new base URL
-        // For now, provide instructions to the user
-        res.json({
-          reply: `✅ Отлично! Базовый URL получен: \`${parseResult.baseUrl}\`\n\nТеперь повторите ваш запрос на тестирование, и я использую этот URL. Например:\n\`Протестируй API ${parseResult.baseUrl}/users\``,
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
-
-      res.json({
-        reply: `❌ Не удалось извлечь URL из вашего ответа.\n\nПожалуйста, укажите базовый URL в формате: \`https://api.example.com\``,
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
-    // If we have conversationId but no structured answers, try natural language parsing
-    if (needsAutonomous && conversationId && !answers) {
-      logger.info('Attempting natural language answer parsing', {
-        conversationId,
-        message: message.substring(0, 50),
-      });
-
-      // Get questions from conversation (would need to store in cache/session)
-      // For now, use common questions
-      const commonQuestions = [
-        { id: 'url', question: 'URL', type: 'url' },
-        { id: 'scope', question: 'Scope', type: 'text' },
-        { id: 'needs_auth', question: 'Auth', type: 'boolean' },
-      ];
-
-      const parsedAnswers = await parseNaturalAnswers(message, commonQuestions);
-
-      if (Object.keys(parsedAnswers).length > 0) {
-        logger.info('Natural language answers parsed successfully', {
-          fields: Object.keys(parsedAnswers),
-        });
-
-        const explorationResult = await runAutonomousExploration({
-          userMessage: message,
-          answers: parsedAnswers,
-          userId: userId || 'anonymous',
-          projectId: projectId || 'default',
-        });
-
-        res.json({
-          reply: explorationResult.message,
-          testPlan: explorationResult.testPlan,
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
-    }
-
-    // If we have structured answers, run autonomous exploration
-    if (needsAutonomous && answers && conversationId) {
-      logger.info('Running autonomous exploration with user answers', {
-        conversationId,
-        answerCount: Object.keys(answers).length,
-        answers: JSON.stringify(answers),
-      });
-
-      // Emit: Exploring site
-      if (chatSessionId) {
-        const stepPayload: ChatProcessingStepPayload = {
-          sessionId: chatSessionId,
-          step: 'exploring_site',
-          message: '🌐 Запускаю браузер и исследую сайт...',
-          progress: 50,
-          timestamp: new Date().toISOString(),
-        };
-        webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
-      }
-
-      try {
-        const explorationResult = await runAutonomousExploration({
-          userMessage: message,
-          answers,
-          userId: userId || 'anonymous',
-          projectId: projectId || 'default',
-          sessionId: chatSessionId,
-        });
-
-        res.json({
-          reply: explorationResult.message,
-          testPlan: explorationResult.testPlan,
-          conversationId,
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      } catch (error) {
-        logger.error('Autonomous exploration failed in controller', {
-          error: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-          answers,
-        });
-
-        res.status(500).json({
-          success: false,
-          error: 'Autonomous exploration failed',
-          message: error instanceof Error ? error.message : 'Unknown error',
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
-    }
-
-    let gptResponse: string;
-    let apiTestResult: any = null;
-    let playwrightTestResult: any = null;
-
-    // Check if intent is UI testing (Playwright)
-    const uiTestIntents = ['check_element', 'fill_form', 'login_flow', 'navigate', 'assert_ui'];
-    if (parsedIntent && uiTestIntents.includes(parsedIntent.intent)) {
-      try {
-        // Extract URL from intent or context
-        const testUrl = parsedIntent.page ||
-                       (typeof context === 'object' ? context.url : undefined) ||
-                       parsedIntent.metadata?.url;
-
-        // Extract projectId from context
-        const projectId = typeof context === 'object' ? context.projectId : undefined;
-
-        if (!testUrl) {
-          gptResponse = `❌ Для создания теста нужно указать URL.\n\nПример: "Проверь что кнопка Buy видна на https://example.com"`;
-        } else if (!projectId) {
-          gptResponse = `❌ Для создания теста нужно указать projectId в контексте.`;
-        } else {
-          logger.info('[CHAT] Creating Playwright test from chat', {
-            intent: parsedIntent.intent,
-            action: parsedIntent.action,
-            url: testUrl,
-            projectId,
-            hasCommands: !!parsedIntent.commands,
-            commandsCount: parsedIntent.commands?.length || 0,
-          });
-
-          // Determine browser based on viewport
-          const browsers = parsedIntent.viewport === 'mobile'
-            ? ['mobile-chrome' as const]
-            : ['chrome' as const];
-
-          // Create manual test
-          const testRequest = {
-            url: testUrl,
-            browsers,
-            projectId,
-            userId,
-            options: {
-              mobile: parsedIntent.viewport === 'mobile',
-            },
-            // Pass Playwright commands if available
-            commands: parsedIntent.commands,
-            intent: parsedIntent.intent,
-          };
-
-          const testCreated = await ManualTestService.runTest(testRequest);
-          playwrightTestResult = testCreated.data;
-
-          // Format response
-          const browserText = browsers[0] === 'mobile-chrome' ? 'мобильном браузере' : 'браузере Chrome';
-          gptResponse = `✅ Тест создан и отправлен на выполнение!
-
-📋 Детали:
-- ID теста: ${testCreated.data?.id}
-- URL: ${testUrl}
-- Браузер: ${browserText}
-- Статус: ${testCreated.data?.status}
-- Действие: ${parsedIntent.action || 'проверка'}
-${parsedIntent.elementLabel ? `- Элемент: ${parsedIntent.elementLabel}` : ''}
-
-⏳ Тест выполняется... Проверь статус через:
-GET /api/v1/manual-test/${testCreated.data?.id}/status
-
-Или получи результаты:
-GET /api/v1/manual-test/${testCreated.data?.id}/result`;
-
-          logger.info('Playwright test created from chat', {
-            testId: testCreated.data?.id,
-            url: testUrl,
-            intent: parsedIntent.intent,
-          });
-        }
-      } catch (error) {
-        logger.error('Failed to create Playwright test from chat', error);
-        gptResponse = `❌ Ошибка при создании теста: ${error instanceof Error ? error.message : 'Unknown error'}`;
-      }
-    }
-    // Check if intent is API test
-    else if (parsedIntent?.intent === 'api_test' && parsedIntent.apiMethod && parsedIntent.apiUrl) {
-      try {
-        // Smart context analysis for single API test
-        const apiContext = await SmartApiContextService.analyzeApiContext(
-          parsedIntent,
-          userId || 'anonymous',
-          projectId || 'default'
-        );
-
-        // If we need critical information (base URL), ask for it
-        if (apiContext.missingInfo.baseUrl) {
-          const questions = SmartApiContextService.generateContextQuestions(apiContext, parsedIntent);
-
-          res.json({
-            reply: `🔗 Для тестирования API нужен полный URL. Вы указали только путь: \`${parsedIntent.apiUrl}\`\n\nПожалуйста, укажите базовый URL:`,
-            needsMoreInfo: true,
-            questions,
-            conversationId: `smart_api_single_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-            timestamp: new Date().toISOString(),
-          });
-          return;
-        }
-
-        // Use resolved URL
-        parsedIntent.apiUrl = apiContext.fullUrl || parsedIntent.apiUrl;
-
-        // Add suggested headers if available
-        if (apiContext.suggestedHeaders && Object.keys(apiContext.suggestedHeaders).length > 0) {
-          parsedIntent.apiHeaders = {
-            ...parsedIntent.apiHeaders,
-            ...apiContext.suggestedHeaders,
-          };
-        }
-
-        logger.info('[CHAT] Using smart context for API testing', {
-          originalUrl: parsedIntent.apiUrl,
-          resolvedUrl: apiContext.fullUrl,
-          hasAuth: apiContext.hasAuthentication,
-          confidence: apiContext.confidence,
-        });
-      } catch (contextError) {
-        logger.error('[CHAT] Smart context analysis failed, falling back to basic testing', {
-          error: contextError,
-          apiUrl: parsedIntent.apiUrl
-        });
-        // Continue with basic testing
-      }
-      try {
-        logger.info('[CHAT] Executing API test from chat', {
-          method: parsedIntent.apiMethod,
-          url: parsedIntent.apiUrl,
-          headers: parsedIntent.apiHeaders,
-          body: parsedIntent.apiBody,
-        });
-
-        // Execute API test
-        apiTestResult = await executeApiTest({
-          method: parsedIntent.apiMethod,
-          url: parsedIntent.apiUrl,
-          headers: parsedIntent.apiHeaders,
-          body: parsedIntent.apiBody,
-          expectedStatus: parsedIntent.expectedStatus,
-        });
-
-        logger.info('[CHAT] API test executed successfully', {
-          success: apiTestResult.success,
-          status: apiTestResult.status,
-        });
-
-        // Format API test result for chat response
-        const statusEmoji = apiTestResult.success ? '✅' : '❌';
-        const matchesExpected = parsedIntent.expectedStatus
-          ? (apiTestResult.matchesExpected ? 'Да, как ожидалось' : 'Нет, не соответствует ожиданиям')
-          : undefined;
-
-        gptResponse = `${statusEmoji} Запрос выполнен.
-
-- Метод: ${parsedIntent.apiMethod}
-- URL: ${parsedIntent.apiUrl}
-- Код ответа: ${apiTestResult.status}
-${apiTestResult.statusText ? `- Статус: ${apiTestResult.statusText}` : ''}
-${matchesExpected !== undefined ? `- Успешность: ${matchesExpected}` : ''}
-- Время: ${apiTestResult.durationMs} мс`;
-
-        if (apiTestResult.error) {
-          gptResponse += `\n- Ошибка: ${apiTestResult.error}`;
-        }
-
-        // Add response body preview if available
-        if (apiTestResult.responseBody) {
-          const bodyPreview = typeof apiTestResult.responseBody === 'string'
-            ? apiTestResult.responseBody.substring(0, 200)
-            : JSON.stringify(apiTestResult.responseBody).substring(0, 200);
-          gptResponse += `\n\nТело ответа (первые 200 символов):\n${bodyPreview}...`;
-        }
-
-        logger.info('[CHAT] API test completed from chat', {
-          status: apiTestResult.status,
-          success: apiTestResult.success,
-          durationMs: apiTestResult.durationMs,
-        });
-
-        // Auto-create API configuration for future use
-        logger.info('[CHAT] Checking auto-create conditions', {
-          hasUserId: !!userId,
-          userId,
-          success: apiTestResult.success,
-          hasApiUrl: !!parsedIntent.apiUrl,
-          apiUrl: parsedIntent.apiUrl,
-        });
-
-        if (userId && apiTestResult.success && parsedIntent.apiUrl) {
-          try {
-            logger.info('[CHAT] Auto-creating API configuration', {
-              userId,
-              apiUrl: parsedIntent.apiUrl,
-              method: parsedIntent.apiMethod,
-              projectId: projectId || 'default',
-            });
-
-            const configResult = await ApiConfigService.analyzeAndSuggestConfig(
-              userId,
-              projectId || 'default',
-              parsedIntent.apiUrl,
-              parsedIntent.apiMethod || 'GET',
-              parsedIntent.apiHeaders,
-              parsedIntent.apiBody
-            );
-
-            logger.info('[CHAT] API configuration auto-created successfully', {
-              environmentId: configResult.environment.id,
-              endpointId: configResult.endpoint.id,
-              isNew: configResult.isNew,
-            });
-          } catch (configError: any) {
-            logger.error('[CHAT] Failed to auto-create API configuration', {
-              error: configError,
-              errorMessage: configError?.message,
-              errorStack: configError?.stack,
-              userId,
-              apiUrl: parsedIntent.apiUrl,
-            });
-            // Don't fail the test if config creation fails
-          }
-        }
-
-        // Save API test log to database
-        if (userId && chatSessionId) {
-          try {
-            await supabaseAdmin.from('api_test_logs').insert({
-              user_id: userId,
-              method: parsedIntent.apiMethod,
-              url: parsedIntent.apiUrl,
-              status: apiTestResult.status,
-              success: apiTestResult.success,
-              duration_ms: apiTestResult.durationMs,
-              request: {
-                method: parsedIntent.apiMethod,
-                url: parsedIntent.apiUrl,
-                headers: parsedIntent.apiHeaders,
-                body: parsedIntent.apiBody,
-                expectedStatus: parsedIntent.expectedStatus,
-              },
-              response: {
-                status: apiTestResult.status,
-                statusText: apiTestResult.statusText,
-                headers: apiTestResult.responseHeaders,
-                body: apiTestResult.responseBody,
-                error: apiTestResult.error,
-                matchesExpected: apiTestResult.matchesExpected,
-              },
-            });
-            logger.info('API test log saved to database', { userId, url: parsedIntent.apiUrl });
-          } catch (dbError) {
-            logger.error('Failed to save API test log', dbError);
-          }
-        }
-      } catch (error) {
-        logger.error('[CHAT] API test failed in chat', {
-          error: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-          parsedIntent: {
-            method: parsedIntent.apiMethod,
-            url: parsedIntent.apiUrl,
-          },
-        });
-        gptResponse = `❌ Ошибка при выполнении API-запроса.\n\nОшибка: ${error instanceof Error ? error.message : String(error)}\n\nПроверьте URL и параметры.`;
-      }
-    }
-    // Check if intent is comprehensive API testing
-    else if (parsedIntent?.intent === 'api_test_comprehensive' && parsedIntent.apiUrl) {
-      try {
-        // Smart context analysis
-        logger.info('[CHAT] Starting smart API context analysis', {
-          apiUrl: parsedIntent.apiUrl,
-          method: parsedIntent.apiMethod,
-          userId,
-          projectId,
-        });
-
-        const apiContext = await SmartApiContextService.analyzeApiContext(
-          parsedIntent,
-          userId || 'anonymous',
-          projectId || 'default'
-        );
-
-        logger.info('[CHAT] API context analysis completed', {
-          confidence: apiContext.confidence,
-          strategy: apiContext.testStrategy,
-          missingInfo: Object.keys(apiContext.missingInfo).length,
-          hasConfig: apiContext.hasEndpointConfig,
-        });
-
-        // If we need more information
-        if (Object.keys(apiContext.missingInfo).length > 0 && apiContext.confidence < 0.7) {
-          const questions = SmartApiContextService.generateContextQuestions(apiContext, parsedIntent);
-
-          const missingItems = Object.keys(apiContext.missingInfo);
-          let replyMessage = `🔍 Для качественного тестирования API нужна дополнительная информация:\n\n`;
-
-          if (apiContext.missingInfo.baseUrl) {
-            replyMessage += `📍 **Базовый URL**: Вы указали путь \`${parsedIntent.apiUrl}\`, но нужен полный URL\n`;
-          }
-          if (apiContext.missingInfo.authToken) {
-            replyMessage += `🔐 **Авторизация**: API вероятно требует токен для доступа\n`;
-          }
-          if (apiContext.missingInfo.requestBody) {
-            replyMessage += `📝 **Тело запроса**: Для ${parsedIntent.apiMethod} запроса может потребоваться данные\n`;
-          }
-          if (apiContext.missingInfo.customHeaders) {
-            replyMessage += `📋 **Заголовки**: Могут потребоваться специальные заголовки\n`;
-          }
-
-          replyMessage += `\nПожалуйста, предоставьте недостающую информацию:`;
-
-          res.json({
-            reply: replyMessage,
-            needsMoreInfo: true,
-            questions,
-            conversationId: `smart_api_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-            timestamp: new Date().toISOString(),
-          });
-          return;
-        }
-
-        // We have enough context, proceed with testing
-        parsedIntent.apiUrl = apiContext.fullUrl || parsedIntent.apiUrl;
-
-        // Add suggested headers if available
-        if (apiContext.suggestedHeaders && Object.keys(apiContext.suggestedHeaders).length > 0) {
-          parsedIntent.apiHeaders = {
-            ...parsedIntent.apiHeaders,
-            ...apiContext.suggestedHeaders,
-          };
-        }
-
-      } catch (contextError) {
-        logger.error('[CHAT] Smart context analysis failed for comprehensive testing', {
-          error: contextError,
-          apiUrl: parsedIntent.apiUrl
-        });
-        // Continue with basic testing
-      }
-
-      try {
-        logger.info('[CHAT] Executing comprehensive API test suite from chat', {
-          method: parsedIntent.apiMethod || 'GET',
-          url: parsedIntent.apiUrl,
-        });
-
-        // Emit: Analyzing configuration
-        if (chatSessionId) {
-          const stepPayload: ChatProcessingStepPayload = {
-            sessionId: chatSessionId,
-            step: 'generating_scenarios',
-            message: '🔍 Анализирую API и создаю конфигурацию...',
-            progress: 50,
-            timestamp: new Date().toISOString(),
-          };
-          webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
-        }
-
-        // Analyze and create/find API configuration
-        let configResult;
-        try {
-          configResult = await ApiConfigService.analyzeAndSuggestConfig(
-            userId || 'anonymous',
-            projectId || 'default',
-            parsedIntent.apiUrl,
-            parsedIntent.apiMethod || 'GET'
-          );
-
-          logger.info('[CHAT] API configuration analyzed', {
-            environmentId: configResult.environment.id,
-            endpointId: configResult.endpoint.id,
-            isNew: configResult.isNew,
-            userId,
-          });
-        } catch (configError) {
-          logger.warn('[CHAT] Failed to create API configuration, proceeding with basic testing', {
-            error: configError,
-            url: parsedIntent.apiUrl,
-          });
-          configResult = null;
-        }
-
-        // Emit: Generating test scenarios
-        if (chatSessionId) {
-          const stepPayload: ChatProcessingStepPayload = {
-            sessionId: chatSessionId,
-            step: 'generating_scenarios',
-            message: '🧪 Генерирую сценарии тестирования...',
-            progress: 60,
-            timestamp: new Date().toISOString(),
-          };
-          webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
-        }
-
-        // Generate comprehensive test scenarios
-        const testSuite = generateApiTestScenarios(
-          parsedIntent.apiUrl,
-          parsedIntent.apiMethod || 'GET'
-        );
-
-        // Enhance test suite with stored configuration if available
-        if (configResult) {
-          // Add stored headers to test scenarios
-          const storedHeaders = {
-            ...configResult.environment.default_headers,
-            ...configResult.endpoint.headers,
-          };
-
-          // Apply stored configuration to test scenarios
-          testSuite.scenarios.forEach(scenario => {
-            scenario.request.headers = {
-              ...scenario.request.headers,
-              ...storedHeaders,
-            };
-
-            // Apply timeout from endpoint configuration
-            if (configResult!.endpoint.timeout_ms) {
-              scenario.request.timeout = configResult!.endpoint.timeout_ms;
-            }
-          });
-
-          logger.info('[CHAT] Enhanced test scenarios with stored configuration', {
-            headersCount: Object.keys(storedHeaders).length,
-            timeout: configResult.endpoint.timeout_ms,
-          });
-        }
-
-        logger.info('[CHAT] Generated API test scenarios', {
-          route: testSuite.route,
-          method: testSuite.method,
-          totalScenarios: testSuite.totalScenarios,
-          hasStoredConfig: !!configResult,
-        });
-
-        // Emit: Executing test scenarios
-        if (chatSessionId) {
-          const stepPayload: ChatProcessingStepPayload = {
-            sessionId: chatSessionId,
-            step: 'executing_tests',
-            message: `🚀 Выполняю ${testSuite.totalScenarios} тестовых сценариев...`,
-            progress: 70,
-            timestamp: new Date().toISOString(),
-          };
-          webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
-        }
-
-        // Execute test suite (parallel execution for faster results)
-        const suiteResults = await executeApiTestSuite(testSuite, {
-          parallel: true,
-          maxConcurrency: 3, // Limit concurrent requests
-          stopOnFirstFailure: false, // Continue testing even if some fail
-        });
-
-        logger.info('[CHAT] API test suite completed', {
-          route: suiteResults.suite.route,
-          total: suiteResults.summary.total,
-          passed: suiteResults.summary.passed,
-          failed: suiteResults.summary.failed,
-          successRate: suiteResults.summary.successRate,
-          durationMs: suiteResults.durationMs,
-        });
-
-        // Format results for chat response
-        let formattedResults = formatApiTestResults(suiteResults);
-
-        // Add configuration info to response if created
-        if (configResult && configResult.isNew) {
-          formattedResults += `\n\n🔧 **Конфигурация сохранена:**\n`;
-          formattedResults += `- Окружение: ${configResult.environment.name}\n`;
-          formattedResults += `- Эндпоинт: ${configResult.endpoint.name}\n`;
-          formattedResults += `- Теперь вы можете переиспользовать эту конфигурацию для будущих тестов`;
-        }
-
-        gptResponse = formattedResults;
-
-        // Store comprehensive test results
-        apiTestResult = {
-          success: suiteResults.summary.failed === 0,
-          status: suiteResults.summary.passed > 0 ? 200 : 500,
-          statusText: `${suiteResults.summary.passed}/${suiteResults.summary.total} tests passed`,
-          durationMs: suiteResults.durationMs,
-          responseHeaders: {},
-          responseBody: {
-            suite: suiteResults.suite,
-            summary: suiteResults.summary,
-            results: suiteResults.results.map(r => ({
-              scenario: r.scenario.name,
-              passed: r.passed,
-              status: r.result.status,
-              durationMs: r.result.durationMs,
-              error: r.result.error,
-            })),
-            configuration: configResult ? {
-              environment_id: configResult.environment.id,
-              endpoint_id: configResult.endpoint.id,
-              is_new: configResult.isNew,
-            } : null,
-          },
-          matchesExpected: suiteResults.summary.successRate >= 80, // 80% success rate threshold
-        };
-
-        // Save comprehensive test results to database
-        if (userId && chatSessionId) {
-          try {
-            await supabaseAdmin.from('api_test_logs').insert({
-              user_id: userId,
-              method: parsedIntent.apiMethod || 'GET',
-              url: parsedIntent.apiUrl,
-              status: apiTestResult.status,
-              success: apiTestResult.success,
-              duration_ms: apiTestResult.durationMs,
-              request: {
-                method: parsedIntent.apiMethod || 'GET',
-                url: parsedIntent.apiUrl,
-                comprehensive: true,
-                totalScenarios: suiteResults.summary.total,
-                environment_id: configResult?.environment.id,
-                endpoint_id: configResult?.endpoint.id,
-              },
-              response: {
-                summary: suiteResults.summary,
-                results: suiteResults.results.length,
-                successRate: suiteResults.summary.successRate,
-                configuration_created: configResult?.isNew || false,
-              },
-            });
-            logger.info('Comprehensive API test log saved to database', {
-              userId,
-              url: parsedIntent.apiUrl,
-              scenarios: suiteResults.summary.total,
-              configCreated: configResult?.isNew || false,
-            });
-          } catch (dbError) {
-            logger.error('Failed to save comprehensive API test log', dbError);
-          }
-        }
-
-      } catch (error) {
-        logger.error('[CHAT] Comprehensive API test failed in chat', {
-          error: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-          parsedIntent: {
-            method: parsedIntent.apiMethod || 'GET',
-            url: parsedIntent.apiUrl,
-          },
-        });
-        gptResponse = `❌ Ошибка при выполнении комплексного API-тестирования.\n\nОшибка: ${error instanceof Error ? error.message : String(error)}\n\nПроверьте URL и доступность API.`;
-      }
-    } else {
-      // Regular chat flow with RAG
-      const prompt = buildChatPrompt({
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
+    // ═══════════════════════════════════════════════════════════════════════
+
+    if (intent === 'platform_test') {
+      return await handlePlatformTest(req, res, {
         message,
-        context: context as string | { projectId?: string; [key: string]: any } | undefined
+        parsedIntent,
+        userId,
+        workspace_id,
+        chatSessionId,
+        conversationId,
+        answers,
       });
-
-      // Get KB context if available
-      let kbContext = '';
-      if (userId) {
-        try {
-          const { searchKB } = await import('@/services/kb.service');
-
-          // Get user's current project (if in context)
-          const projectId = typeof context === 'object' ? context?.projectId : undefined;
-
-          // Search KB (global first, then project)
-          const kbResults = await searchKB(message, projectId, {
-            matchThreshold: 0.7,
-            matchCount: 5,
-          });
-
-          if (kbResults.chunks.length > 0) {
-            kbContext = '\n\n--- Knowledge Base Context ---\n';
-            kbContext += kbResults.chunks.map((chunk, idx) => {
-              const source = chunk.source_file || chunk.file_name || 'Unknown';
-              const sourceType = chunk.source_file ? 'Global' : 'Project';
-              return `[${sourceType} - ${source}]:\n${chunk.content}`;
-            }).join('\n\n');
-
-            logger.info('KB context retrieved', {
-              globalSources: kbResults.sources.global.length,
-              projectSources: kbResults.sources.project.length,
-              chunkCount: kbResults.chunks.length,
-            });
-          }
-        } catch (kbError) {
-          logger.warn('Failed to retrieve KB context', kbError);
-          // Continue without KB context
-        }
-      }
-
-      const finalContext = context
-        ? (typeof context === 'string' ? `${context}${kbContext}` : kbContext)
-        : kbContext;
-
-      // Emit: Generating response
-      if (chatSessionId) {
-        const stepPayload: ChatProcessingStepPayload = {
-          sessionId: chatSessionId,
-          step: 'generating_response',
-          message: '✍️ Формирую ответ...',
-          progress: 90,
-          timestamp: new Date().toISOString(),
-        };
-        webSocketService.emitChatProcessingStep(chatSessionId, stepPayload);
-      }
-
-      gptResponse = await getChatCompletion(prompt, finalContext);
     }
 
-    // Save user message to database (for authenticated users with valid UUID sessionId)
-    if (chatSessionId) {
-      const { error: userMsgError } = await supabaseAdmin
-        .from('chat_messages')
-        .insert({
-          session_id: chatSessionId,
-          role: 'user',
-          content: message,
-          metadata: {
-            parsedIntent,
-            context,
-          },
-        });
-
-      if (userMsgError) {
-        logger.error('Failed to save user message', userMsgError);
-      }
-
-      // Save AI response to database
-      const { error: aiMsgError } = await supabaseAdmin
-        .from('chat_messages')
-        .insert({
-          session_id: chatSessionId,
-          role: 'ai',
-          content: gptResponse,
-          metadata: {
-            parsedIntent,
-          },
-        });
-
-      if (aiMsgError) {
-        logger.error('Failed to save AI message', aiMsgError);
-      } else {
-        logger.info('Chat messages saved to database', { sessionId: chatSessionId });
-      }
+    if (intent === 'api_test') {
+      return await handleApiTest(req, res, {
+        message,
+        parsedIntent,
+        userId,
+        workspace_id,
+        chatSessionId,
+        conversationId,
+        answers,
+      });
     }
 
-    // Save anonymous user messages (for non-authenticated users)
-    if (!isValidUUID && anonymousId) {
-      try {
-        // Get or create anonymous session
-        let anonSessionId = sessionId;
-
-        if (!anonSessionId) {
-          // Create new anonymous session
-          const { data: anonSession, error: sessionError } = await supabaseAdmin
-            .from('anonymous_chat_sessions')
-            .insert({
-              anonymous_id: anonymousId,
-              title: message.substring(0, 50),
-            })
-            .select()
-            .single();
-
-          if (!sessionError && anonSession) {
-            anonSessionId = anonSession.id;
-          }
-        } else {
-          // Verify session exists
-          const { data: existingSession } = await supabaseAdmin
-            .from('anonymous_chat_sessions')
-            .select('id')
-            .eq('id', anonSessionId)
-            .eq('anonymous_id', anonymousId)
-            .maybeSingle();
-
-          if (!existingSession) {
-            // Create new session if not found
-            const { data: newSession } = await supabaseAdmin
-              .from('anonymous_chat_sessions')
-              .insert({
-                anonymous_id: anonymousId,
-                title: message.substring(0, 50),
-              })
-              .select()
-              .single();
-
-            anonSessionId = newSession?.id;
-          }
-        }
-
-        if (anonSessionId) {
-          // Save user message
-          await supabaseAdmin.from('anonymous_chat_messages').insert({
-            session_id: anonSessionId,
-            role: 'user',
-            content: message,
-            metadata: { parsedIntent, context },
-          });
-
-          // Save AI response
-          await supabaseAdmin.from('anonymous_chat_messages').insert({
-            session_id: anonSessionId,
-            role: 'ai',
-            content: gptResponse,
-            metadata: { parsedIntent },
-          });
-
-          logger.info('Anonymous chat messages saved', {
-            anonymousId,
-            sessionId: anonSessionId
-          });
-        }
-      } catch (anonError) {
-        logger.error('Failed to save anonymous messages', { error: anonError, anonymousId });
-      }
-    }
-
-    // Add rate limit info for anonymous users
-    const rateLimitInfo = (req as any).rateLimitInfo;
-
-    const response = {
-      reply: gptResponse,
-      timestamp: new Date().toISOString(),
-      parsedIntent,
-      sessionId: chatSessionId,
-      apiTestResult: apiTestResult || undefined,
-      playwrightTest: playwrightTestResult || undefined,
-      rateLimitInfo: rateLimitInfo ? {
-        isAnonymous: rateLimitInfo.isAnonymous,
-        limit: rateLimitInfo.limit,
-        remaining: rateLimitInfo.remaining,
-        message: rateLimitInfo.remaining === 0
-          ? '⚠️ Это ваше последнее сообщение. Авторизуйтесь для продолжения!'
-          : `💡 У вас осталось ${rateLimitInfo.remaining} ${rateLimitInfo.remaining === 1 ? 'сообщение' : 'сообщения'}. Авторизуйтесь для неограниченного доступа.`
-      } : undefined,
-    };
-
-    // Deduct credits for authenticated users
-    if (req.user?.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.user.id)) {
-      try {
-        const deductResult = await UserCreditsService.deductCredits(
-          req.user.id,
-          1,
-          'Chat message',
-          { message, intent: parsedIntent?.intent }
-        );
-
-        if (deductResult.success) {
-          logger.info('[CHAT] Credits deducted', {
-            userId: req.user.id,
-            newBalance: deductResult.newBalance,
-          });
-
-          // Add credit info to response
-          (response as any).creditsDeducted = 1;
-          (response as any).creditsRemaining = deductResult.newBalance;
-        }
-      } catch (creditError) {
-        logger.error('[CHAT] Failed to deduct credits', { error: creditError, userId: req.user.id });
-      }
-    }
-
-    logger.info('Chat response generated', {
+    // general_chat
+    return await handleGeneralChat(req, res, {
+      message,
       userId,
-      replyLength: gptResponse.length,
-      intent: parsedIntent?.intent,
-      sessionId: chatSessionId,
-      isAnonymous: !!rateLimitInfo,
-      remaining: rateLimitInfo?.remaining,
+      chatSessionId,
+      context,
     });
 
-    res.json(response);
   } catch (error) {
-    logger.error('Chat error:', error);
-    res.status(500).json({ error: 'AI chat failed' });
+    logger.error('[CHAT] Error handling chat request', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process chat request',
+      message: error instanceof Error ? error.message : 'Unknown error',
+      timestamp: new Date().toISOString(),
+    });
   }
 };
 
 /**
- * Get chat history by session ID
- * GET /chat/history/:sessionId
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HANDLER: PLATFORM TEST (UI Testing)
+ * ═══════════════════════════════════════════════════════════════════════════
  */
-export const getChatHistory = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { sessionId } = req.params;
-    const userId = req.user?.id;
+async function handlePlatformTest(
+  req: Request,
+  res: Response,
+  params: {
+    message: string;
+    parsedIntent: any;
+    userId: string;
+    workspace_id: string;
+    chatSessionId?: string;
+    conversationId?: string;
+    answers?: Record<string, any>;
+  }
+): Promise<void> {
+  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers } = params;
 
-    if (!sessionId) {
-      res.status(400).json({
-        success: false,
-        error: 'Session ID is required',
-      });
-      return;
-    }
+  logger.info('[PLATFORM_TEST] Starting UI test flow', {
+    scope: parsedIntent?.scope,
+    target: parsedIntent?.target,
+    hasUrl: !!parsedIntent?.page,
+  });
 
-    // Get chat session with messages
-    const { data: session, error: sessionError } = await supabaseAdmin
-      .from('chat_sessions')
-      .select(`
-        id,
-        title,
-        created_at,
-        chat_messages (
-          id,
-          role,
-          content,
-          metadata,
-          created_at
-        )
-      `)
-      .eq('id', sessionId)
-      .eq('user_id', userId) // Only user's own sessions
-      .single();
+  emitProcessingStep(chatSessionId, 'checking_autonomous', '🤖 Preparing autonomous exploration...', 30);
 
-    if (sessionError) {
-      logger.error('Failed to get chat session', sessionError);
-      res.status(404).json({
-        success: false,
-        error: 'Chat session not found',
-      });
-      return;
-    }
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 1: CHECK IF WE HAVE ALL NEEDED INFO
+  // ═══════════════════════════════════════════════════════════════════════
 
-    // Sort messages by creation time
-    const messages = session.chat_messages?.sort((a: any, b: any) =>
-      new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-    ) || [];
+  const extractedUrl = parsedIntent?.page || extractUrlFromMessage(message);
+  const hasUrl = !!extractedUrl;
+  const hasScope = !!parsedIntent?.scope;
 
-    logger.info('Chat history retrieved', {
-      sessionId,
-      userId,
-      messageCount: messages.length,
+  // If missing info, ask questions
+  if (!hasUrl || !hasScope) {
+    logger.info('[PLATFORM_TEST] Missing information', { hasUrl, hasScope });
+
+    const result = await requestMissingInformation(message, {
+      hasUrl,
+      hasScope,
+      intent: 'platform_test',
     });
 
     res.json({
-      success: true,
-      data: {
-        session: {
-          id: session.id,
-          title: session.title,
-          created_at: session.created_at,
-        },
-        messages,
-      },
+      reply: '📝 I need some more information to set up the test:',
+      questions: result.questions,
+      conversationId: result.conversationId,
+      timestamp: new Date().toISOString(),
+      sessionId: chatSessionId,
     });
-  } catch (error) {
-    logger.error('Get chat history error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get chat history',
-    });
+    return;
   }
-};
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2: FIND OR CREATE PROJECT
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const { project_id, is_new: isNewProject } = await ProjectContextService.findOrCreateProject(
+    workspace_id,
+    extractedUrl,
+    userId
+  );
+
+  if (isNewProject) {
+    logger.info('[PLATFORM_TEST] Created new project', { project_id, url: extractedUrl });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3: CHECK FOR SAVED CREDENTIALS
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const savedCredentials = await ProjectContextService.getProjectCredentials(project_id, userId);
+
+  if (savedCredentials) {
+    logger.info('[PLATFORM_TEST] Found saved credentials', { project_id });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 4: IF HAVE ANSWERS, RUN AUTONOMOUS EXPLORATION
+  // ═══════════════════════════════════════════════════════════════════════
+
+  if (answers && conversationId) {
+    logger.info('[PLATFORM_TEST] Running autonomous exploration with answers', {
+      conversationId,
+      answerCount: Object.keys(answers).length,
+    });
+
+    emitProcessingStep(chatSessionId, 'exploring_site', '🌐 Launching browser and exploring...', 50);
+
+    try {
+      // Parse credentials if provided in answers
+      if (answers.credentials) {
+        try {
+          const parsedCreds = CredentialsParserService.parseNaturalCredentials(
+            typeof answers.credentials === 'string' ? answers.credentials : JSON.stringify(answers.credentials)
+          );
+
+          // Save credentials for future use
+          await ProjectContextService.saveProjectCredentials(
+            project_id,
+            userId,
+            parsedCreds,
+            'Auto-saved from chat'
+          );
+
+          logger.info('[PLATFORM_TEST] Parsed and saved credentials', { project_id });
+        } catch (error) {
+          logger.warn('[PLATFORM_TEST] Failed to parse credentials', { error });
+        }
+      }
+
+      const explorationResult = await runAutonomousExploration({
+        userMessage: message,
+        answers,
+        userId,
+        projectId: project_id,
+        sessionId: chatSessionId,
+      });
+
+      // Save chat messages
+      if (chatSessionId) {
+        await saveChatMessages(chatSessionId, [
+          { role: 'user', content: message },
+          {
+            role: 'ai',
+            content: explorationResult.message,
+            metadata: {
+              testPlan: explorationResult.testPlan,
+              exploration: {
+                url: explorationResult.exploration.url,
+                timestamp: explorationResult.exploration.timestamp,
+              },
+            },
+          },
+        ]);
+      }
+
+      res.json({
+        reply: explorationResult.message,
+        testPlan: explorationResult.testPlan,
+        conversationId,
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+      return;
+    } catch (error) {
+      logger.error('[PLATFORM_TEST] Autonomous exploration failed', { error });
+
+      res.status(500).json({
+        success: false,
+        error: 'Failed to explore platform',
+        message: error instanceof Error ? error.message : 'Unknown error',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 5: NO ANSWERS YET - GENERATE QUESTIONS
+  // ═══════════════════════════════════════════════════════════════════════
+
+  logger.info('[PLATFORM_TEST] Generating clarifying questions');
+
+  const result = await requestMissingInformation(message, {
+    hasUrl: true,
+    hasScope: !!parsedIntent?.scope,
+    hasCredentials: !!savedCredentials,
+    intent: 'platform_test',
+  });
+
+  res.json({
+    reply: '📋 Let me gather some details to set up the perfect test:',
+    questions: result.questions,
+    conversationId: result.conversationId,
+    timestamp: new Date().toISOString(),
+    sessionId: chatSessionId,
+  });
+}
 
 /**
- * Get user's current chat history (single active chat) with pagination
- * GET /chat/history?limit=50&offset=0
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HANDLER: API TEST
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+async function handleApiTest(
+  req: Request,
+  res: Response,
+  params: {
+    message: string;
+    parsedIntent: any;
+    userId: string;
+    workspace_id: string;
+    chatSessionId?: string;
+    conversationId?: string;
+    answers?: Record<string, any>;
+  }
+): Promise<void> {
+  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers } = params;
+
+  logger.info('[API_TEST] Starting API test flow', {
+    method: parsedIntent?.apiMethod,
+    url: parsedIntent?.apiUrl,
+  });
+
+  emitProcessingStep(chatSessionId, 'checking_autonomous', '🔍 Analyzing API request...', 30);
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 1: VALIDATE API INFO
+  // ═══════════════════════════════════════════════════════════════════════
+
+  if (!parsedIntent?.apiMethod || !parsedIntent?.apiUrl) {
+    res.json({
+      reply: '❌ I need more details for the API test.\n\nPlease specify:\n• HTTP Method (GET, POST, etc.)\n• API URL\n\nExample: "Test GET request to https://api.example.com/users"',
+      timestamp: new Date().toISOString(),
+      sessionId: chatSessionId,
+    });
+    return;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2: FIND OR CREATE PROJECT
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const { project_id } = await ProjectContextService.findOrCreateProject(
+    workspace_id,
+    parsedIntent.apiUrl,
+    userId
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3: GENERATE API TEST PLAN
+  // ═══════════════════════════════════════════════════════════════════════
+
+  emitProcessingStep(chatSessionId, 'generating_plan', '📋 Creating test plan...', 60);
+
+  const apiTestPlan = await ApiTestPlanService.generateApiTestPlan({
+    method: parsedIntent.apiMethod,
+    url: parsedIntent.apiUrl,
+    body: parsedIntent.apiBody,
+    headers: parsedIntent.apiHeaders,
+    userMessage: message,
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 4: CONVERT API TEST PLAN TO UNIFIED TEST PLAN FORMAT
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // Convert ApiTestPlan to TestPlan for storage and execution
+  const testPlan = convertApiTestPlanToTestPlan(apiTestPlan);
+
+  // Save test plan to database for approval tracking
+  await saveTestPlan(testPlan, userId, project_id);
+
+  logger.info('[API_TEST] Test plan saved', { planId: testPlan.id });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 5: SHOW TEST PLAN TO USER FOR APPROVAL
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const formattedPlan = ApiTestPlanService.formatApiTestPlanForConfirmation(apiTestPlan);
+
+  // Save chat messages
+  if (chatSessionId) {
+    await saveChatMessages(chatSessionId, [
+      { role: 'user', content: message },
+      {
+        role: 'ai',
+        content: formattedPlan,
+        metadata: {
+          testPlan: apiTestPlan,
+          requiresApproval: true,
+        },
+      },
+    ]);
+  }
+
+  res.json({
+    reply: formattedPlan,
+    testPlan: apiTestPlan,
+    conversationId: testPlan.id, // Use this to track approval
+    requiresApproval: true,
+    timestamp: new Date().toISOString(),
+    sessionId: chatSessionId,
+  });
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HANDLER: GENERAL CHAT
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+async function handleGeneralChat(
+  req: Request,
+  res: Response,
+  params: {
+    message: string;
+    userId: string;
+    chatSessionId?: string;
+    context?: any;
+  }
+): Promise<void> {
+  const { message, userId, chatSessionId, context } = params;
+
+  logger.info('[GENERAL_CHAT] Handling general conversation', {
+    hasSession: !!chatSessionId,
+    messageLength: message.length
+  });
+
+  emitProcessingStep(chatSessionId, 'generating_response', '💬 Thinking...', 90);
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 1: BUILD CONTEXT WITH HISTORY
+  // ═══════════════════════════════════════════════════════════════════════
+
+  let conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  let oldContextSummary = '';
+
+  if (chatSessionId) {
+    // Get total message count first
+    const { count: totalMessageCount, error: countError } = await supabaseAdmin
+      .from('chat_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('session_id', chatSessionId);
+
+    if (countError) {
+      logger.error('[GENERAL_CHAT] Failed to count messages', { error: countError });
+    }
+
+    const totalMessages = totalMessageCount || 0;
+
+    logger.info('[GENERAL_CHAT] Message count', {
+      sessionId: chatSessionId,
+      totalMessages
+    });
+
+    // Get recent messages (last 20)
+    const recentMessages = await getRecentChatHistory(chatSessionId, 20);
+
+    logger.info('[GENERAL_CHAT] Retrieved recent history', {
+      messageCount: recentMessages.length
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SMART SUMMARIZATION WITH CACHING
+    // ═══════════════════════════════════════════════════════════════════════
+
+    if (totalMessages > 20) {
+      logger.info('[GENERAL_CHAT] Chat has old messages, checking cache');
+
+      // Try to get cached summary
+      const cachedSummary = await getCachedSummary(chatSessionId);
+
+      if (cachedSummary) {
+        const messagesNeedingSummarization = totalMessages - 20;
+        const alreadySummarized = cachedSummary.summarizedUpTo;
+
+        // Check if cache is still valid (no new old messages since last summary)
+        if (alreadySummarized >= messagesNeedingSummarization) {
+          // Cache is valid!
+          oldContextSummary = cachedSummary.summary;
+          logger.info('[GENERAL_CHAT] Using cached summary', {
+            cachedUpTo: alreadySummarized,
+            currentOldCount: messagesNeedingSummarization,
+            cacheValid: true,
+          });
+        } else {
+          // Cache is outdated, need to re-summarize
+          logger.info('[GENERAL_CHAT] Cache outdated, re-summarizing', {
+            cachedUpTo: alreadySummarized,
+            currentOldCount: messagesNeedingSummarization,
+            newMessages: messagesNeedingSummarization - alreadySummarized,
+          });
+
+          const oldMessages = await getOldMessages(chatSessionId, 20);
+          oldContextSummary = await summarizeOldMessages(oldMessages);
+
+          if (oldContextSummary) {
+            // Save new summary to cache
+            await saveSummaryToCache(chatSessionId, oldContextSummary, messagesNeedingSummarization);
+          }
+        }
+      } else {
+        // No cache, create fresh summary
+        logger.info('[GENERAL_CHAT] No cache found, creating fresh summary');
+
+        const oldMessages = await getOldMessages(chatSessionId, 20);
+        oldContextSummary = await summarizeOldMessages(oldMessages);
+
+        if (oldContextSummary) {
+          const messagesNeedingSummarization = totalMessages - 20;
+          // Save to cache for future use
+          await saveSummaryToCache(chatSessionId, oldContextSummary, messagesNeedingSummarization);
+        }
+      }
+    }
+
+    // Build conversation history with compressed content
+    conversationHistory = recentMessages.map(msg => ({
+      role: msg.role === 'user' ? 'user' : 'assistant',
+      content: compressMessageContent(msg.content),
+    })) as Array<{ role: 'user' | 'assistant'; content: string }>;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2: BUILD MESSAGES ARRAY FOR OPENAI
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const systemPrompt = buildChatSystemPrompt();
+
+  // Enhance system prompt with old context summary
+  const enhancedSystemPrompt = oldContextSummary
+    ? `${systemPrompt}\n\n--- Previous Conversation Context ---\n${oldContextSummary}\n\nNote: The above is a summary of earlier messages. Recent messages follow below.`
+    : systemPrompt;
+
+  const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+    { role: 'system', content: enhancedSystemPrompt },
+  ];
+
+  // Add RAG/KB context if provided
+  const contextString = typeof context === 'string' ? context : undefined;
+  if (contextString) {
+    messages.push({
+      role: 'system',
+      content: `Additional Context: ${contextString}`,
+    });
+  }
+
+  // Add conversation history
+  messages.push(...conversationHistory);
+
+  // Add current message
+  messages.push({ role: 'user', content: message });
+
+  logger.info('[GENERAL_CHAT] Built context for AI', {
+    totalMessages: messages.length,
+    hasOldSummary: !!oldContextSummary,
+    recentHistoryCount: conversationHistory.length,
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3: GET AI RESPONSE
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const gptResponse = await getChatCompletionWithMessages(messages, {
+    temperature: 0.5,
+    max_tokens: 1000,
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 4: SAVE MESSAGES
+  // ═══════════════════════════════════════════════════════════════════════
+
+  if (chatSessionId) {
+    await saveChatMessages(chatSessionId, [
+      { role: 'user', content: message },
+      { role: 'ai', content: gptResponse },
+    ]);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 5: DEDUCT CREDITS & RESPOND
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const response: any = {
+    reply: gptResponse,
+    timestamp: new Date().toISOString(),
+    sessionId: chatSessionId,
+  };
+
+  if (userId && userId !== 'anonymous') {
+    try {
+      const isValidUUID = userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+      if (isValidUUID) {
+        await UserCreditsService.deductCredits(userId, 1, 'Chat message');
+        const credits = await UserCreditsService.getUserCredits(userId);
+        response.creditsDeducted = 1;
+        response.creditsRemaining = credits?.credits_balance || 0;
+      }
+    } catch (error) {
+      logger.warn('[GENERAL_CHAT] Failed to deduct credits', { error, userId });
+    }
+  }
+
+  res.json(response);
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: EXECUTE APPROVED TEST PLAN
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+async function executeApprovedTestPlan(
+  req: Request,
+  res: Response,
+  params: {
+    planId: string;
+    userId: string;
+    chatSessionId?: string;
+    workspace_id: string;
+  }
+): Promise<void> {
+  const { planId, userId, chatSessionId, workspace_id } = params;
+
+  logger.info('[EXECUTE] Test plan approved', { planId, userId });
+
+  try {
+    // Get the test plan
+    const plan = await getTestPlan(planId, userId);
+
+    if (!plan) {
+      res.status(404).json({
+        success: false,
+        error: 'Test plan not found or expired',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Check if it's API test or UI test by looking at metadata or scope
+    const isApiTest = plan.scope === 'api_test' || ((plan as any).metadata && (plan as any).metadata.type === 'api_test');
+
+    if (isApiTest) {
+      // Execute API test
+      emitProcessingStep(chatSessionId, 'executing_test', '🌐 Executing API request...', 70);
+
+      // Confirm plan first
+      await confirmAndExecuteTestPlan(planId, userId);
+
+      // Extract API test details from metadata
+      const apiDetails = (plan as any).metadata || {};
+
+      const apiTestResult = await executeApiTest({
+        method: apiDetails.method || 'GET',
+        url: plan.url,
+        body: apiDetails.body,
+        headers: apiDetails.headers || {},
+        expectedStatus: apiDetails.expectedStatus || 200,
+      });
+
+      // Save chat messages
+    if (chatSessionId) {
+        await saveChatMessages(chatSessionId, [
+          { role: 'user', content: `Approved API test: ${apiDetails.method} ${plan.url}` },
+          {
+            role: 'ai',
+            content: `✅ API test executed!\n\n**Result:**\n- Status: ${(apiTestResult as any).response?.status || 'N/A'}\n- Success: ${apiTestResult.success ? 'Yes' : 'No'}\n\n${(apiTestResult as any).message || 'Test completed'}`,
+            metadata: { testResult: apiTestResult },
+          },
+        ]);
+      }
+
+      res.json({
+        reply: `✅ API test executed successfully!\n\n**Status Code:** ${(apiTestResult as any).response?.status || 'N/A'}\n**Success:** ${apiTestResult.success ? 'Yes' : 'No'}\n\n${(apiTestResult as any).message || 'Test completed'}`,
+        testResult: apiTestResult,
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+    } else {
+      // Execute UI test
+      emitProcessingStep(chatSessionId, 'executing_test', '⚙️ Launching browser tests...', 70);
+
+      // Confirm and execute test plan
+      const result = await confirmAndExecuteTestPlan(planId, userId);
+
+      if (result.success && plan) {
+        // Get project for this test
+        const { project_id } = await ProjectContextService.findOrCreateProject(
+          workspace_id,
+          plan.url,
+          userId
+        );
+
+        // Execute test
+        const testRequest = {
+          url: plan.url,
+          browsers: ['chrome' as const],
+          projectId: project_id,
+          userId,
+          options: {},
+          commands: plan.commands,
+          intent: plan.scope,
+        };
+
+        const testCreated = await ManualTestService.runTest(testRequest);
+
+        // Emit WebSocket event
+        if (chatSessionId && testCreated.data?.id) {
+          const chatTestUpdatePayload: ChatTestUpdatePayload = {
+            sessionId: chatSessionId,
+            testId: testCreated.data.id,
+            message: '✅ Test started! Monitor progress in real-time.',
+            status: 'created',
+            links: {
+              fullReport: `/api/v1/manual-test/${testCreated.data.id}/summary`,
+            },
+            timestamp: new Date().toISOString(),
+          };
+          webSocketService.emitChatTestUpdate(chatSessionId, chatTestUpdatePayload);
+        }
+
+        res.json({
+          reply: `✅ Test plan approved and running!\n\nTest ID: ${testCreated.data?.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data?.id}/status`,
+          testId: testCreated.data?.id,
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+      } else {
+        res.json({
+          reply: result.message || '❌ Failed to execute test plan',
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+      }
+    }
+  } catch (error) {
+    logger.error('[EXECUTE] Error executing test plan', { error, planId });
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to execute test plan',
+      message: error instanceof Error ? error.message : 'Unknown error',
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPERS: CHAT HISTORY & CONTEXT
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * Get recent chat history for context
+ * Returns last N messages in chronological order
+ */
+async function getRecentChatHistory(
+  sessionId: string,
+  limit: number = 20
+): Promise<Array<{ role: 'user' | 'ai'; content: string; created_at: string }>> {
+  try {
+    const { data: messages, error } = await supabaseAdmin
+      .from('chat_messages')
+      .select('role, content, created_at')
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      logger.error('[CHAT_HISTORY] Error fetching history', { error, sessionId });
+      return [];
+    }
+
+    // Reverse to get chronological order (oldest first)
+    return (messages || []).reverse();
+  } catch (error) {
+    logger.error('[CHAT_HISTORY] Failed to fetch history', { error, sessionId });
+    return [];
+  }
+}
+
+/**
+ * Get count of old messages (older than recent history)
+ */
+async function getOldMessagesCount(
+  sessionId: string,
+  recentLimit: number = 20
+): Promise<number> {
+  try {
+    const { count, error } = await supabaseAdmin
+      .from('chat_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('session_id', sessionId);
+
+    if (error) {
+      logger.error('[CHAT_HISTORY] Error counting old messages', { error });
+      return 0;
+    }
+
+    const oldCount = (count || 0) - recentLimit;
+    return oldCount > 0 ? oldCount : 0;
+  } catch (error) {
+    logger.error('[CHAT_HISTORY] Failed to count old messages', { error });
+    return 0;
+  }
+}
+
+/**
+ * Get old messages for summarization
+ */
+async function getOldMessages(
+  sessionId: string,
+  recentLimit: number = 20
+): Promise<Array<{ role: 'user' | 'ai'; content: string }>> {
+  try {
+    const { data: messages, error } = await supabaseAdmin
+      .from('chat_messages')
+      .select('role, content, created_at')
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: true }); // Get all in order
+
+    if (error || !messages) {
+      return [];
+    }
+
+    // Skip the last recentLimit messages
+    const oldMessages = messages.slice(0, -recentLimit);
+    return oldMessages.length > 0 ? oldMessages : [];
+  } catch (error) {
+    logger.error('[CHAT_HISTORY] Failed to fetch old messages', { error });
+    return [];
+  }
+}
+
+/**
+ * Get cached summary from chat_sessions.context
+ */
+async function getCachedSummary(
+  sessionId: string
+): Promise<{ summary: string; summarizedUpTo: number } | null> {
+  try {
+    const { data: session, error } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('context')
+      .eq('id', sessionId)
+      .maybeSingle();
+
+    if (error || !session?.context) {
+      return null;
+    }
+
+    const context = session.context as any;
+
+    if (context.context_summary && context.summarized_up_to_message) {
+      logger.info('[CHAT_CACHE] Found cached summary', {
+        sessionId,
+        summarizedUpTo: context.summarized_up_to_message,
+        summaryLength: context.context_summary.length,
+      });
+
+      return {
+        summary: context.context_summary,
+        summarizedUpTo: context.summarized_up_to_message,
+      };
+    }
+
+    return null;
+  } catch (error) {
+    logger.error('[CHAT_CACHE] Failed to get cached summary', { error, sessionId });
+    return null;
+  }
+}
+
+/**
+ * Save summary to chat_sessions.context
+ * Preserves existing context data and only updates summary fields
+ */
+async function saveSummaryToCache(
+  sessionId: string,
+  summary: string,
+  summarizedUpTo: number
+): Promise<void> {
+  try {
+    // Get current context to preserve existing data
+    const { data: session } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('context')
+      .eq('id', sessionId)
+      .maybeSingle();
+
+    const existingContext = (session?.context as any) || {};
+
+    // Update only summary-related fields
+    const updatedContext = {
+      ...existingContext,
+      context_summary: summary,
+      summarized_up_to_message: summarizedUpTo,
+      last_summary_update: new Date().toISOString(),
+    };
+
+    const { error } = await supabaseAdmin
+      .from('chat_sessions')
+      .update({ context: updatedContext })
+      .eq('id', sessionId);
+
+    if (error) {
+      logger.error('[CHAT_CACHE] Failed to save summary to cache', { error, sessionId });
+    } else {
+      logger.info('[CHAT_CACHE] Summary saved to cache', {
+        sessionId,
+        summarizedUpTo,
+        summaryLength: summary.length,
+      });
+    }
+  } catch (error) {
+    logger.error('[CHAT_CACHE] Failed to save summary to cache', { error, sessionId });
+  }
+}
+
+/**
+ * Summarize old messages using AI
+ */
+async function summarizeOldMessages(
+  oldMessages: Array<{ role: 'user' | 'ai'; content: string }>
+): Promise<string> {
+  if (oldMessages.length === 0) {
+    return '';
+  }
+
+  try {
+    logger.info('[CHAT_SUMMARY] Summarizing old messages', { count: oldMessages.length });
+
+    // Build conversation text
+    const conversationText = oldMessages
+      .map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
+      .join('\n\n');
+
+    // Use gpt-3.5-turbo for fast and cheap summarization
+    const summaryPrompt = `Summarize the following conversation in a concise way, extracting key facts, URLs, decisions, and context. Focus on information that would be useful for continuing the conversation.
+
+Conversation:
+${conversationText}
+
+Provide a brief summary (max 200 words) in the same language as the conversation:`;
+
+    const summary = await getChatCompletionWithMessages(
+      [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant that summarizes conversations concisely.',
+        },
+        {
+          role: 'user',
+          content: summaryPrompt,
+        },
+      ],
+      {
+        model: 'gpt-3.5-turbo',
+        temperature: 0.3,
+        max_tokens: 500,
+      }
+    );
+
+    logger.info('[CHAT_SUMMARY] Summary created', {
+      originalLength: conversationText.length,
+      summaryLength: summary.length
+    });
+
+    return summary;
+  } catch (error) {
+    logger.error('[CHAT_SUMMARY] Failed to summarize', { error });
+    return ''; // Fail gracefully
+  }
+}
+
+/**
+ * Compress long test plans in message content
+ */
+function compressMessageContent(content: string): string {
+  // If content contains a test plan (detected by length and keywords)
+  if (content.length > 1000 && (
+    content.includes('Test Plan') ||
+    content.includes('test plan') ||
+    content.includes('✅') && content.includes('❌')
+  )) {
+    // Extract key info
+    const urlMatch = content.match(/https?:\/\/[^\s)]+/);
+    const url = urlMatch ? urlMatch[0] : 'URL';
+
+    const approvalMatch = content.match(/approved|rejected/i);
+    const status = approvalMatch ? approvalMatch[0] : 'shown';
+
+    return `[Test plan for ${url} - ${status}]`;
+  }
+
+  // If content is very long, truncate
+  if (content.length > 2000) {
+    return content.substring(0, 2000) + '... [truncated]';
+  }
+
+  return content;
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPERS: CHAT SESSION MANAGEMENT
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+async function getOrCreateChatSession(
+  userId: string,
+  providedSessionId: string | undefined,
+  workspaceId: string
+): Promise<string | undefined> {
+  const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+  if (!isValidUUID) {
+    // Anonymous user - no session
+    return undefined;
+  }
+
+  if (providedSessionId) {
+    // Verify session exists
+    const { data: existing } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('id')
+      .eq('id', providedSessionId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (existing) {
+      return existing.id;
+    }
+  }
+
+  // Check for existing session
+  const { data: existing } = await supabaseAdmin
+    .from('chat_sessions')
+    .select('id')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (existing) {
+    return existing.id;
+  }
+
+  // Create new session
+  const { data: newSession } = await supabaseAdmin
+    .from('chat_sessions')
+    .insert({
+      user_id: userId,
+      workspace_id: workspaceId,
+      title: 'New Chat',
+    })
+    .select('id')
+    .single();
+
+  return newSession?.id;
+}
+
+async function saveChatMessages(
+  sessionId: string,
+  messages: Array<{ role: 'user' | 'ai'; content: string; metadata?: any }>
+): Promise<void> {
+  try {
+    const records = messages.map(msg => ({
+      session_id: sessionId,
+      role: msg.role,
+      content: msg.content,
+      metadata: msg.metadata || {},
+    }));
+
+    await supabaseAdmin.from('chat_messages').insert(records);
+  } catch (error) {
+    logger.error('[CHAT] Failed to save messages', { error, sessionId });
+  }
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPERS: TYPE CONVERSIONS
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * Convert ApiTestPlan to unified TestPlan format
+ * This allows API tests to use the same storage and execution flow as UI tests
+ */
+function convertApiTestPlanToTestPlan(apiPlan: any): any {
+  const expiresAt = new Date();
+  expiresAt.setHours(expiresAt.getHours() + 24); // Expire in 24 hours
+
+  return {
+    id: apiPlan.id,
+    status: 'pending_confirmation',
+    url: apiPlan.url,
+    scope: 'api_test', // Special scope for API tests
+    summary: apiPlan.summary,
+    steps: apiPlan.validation_steps.map((step: string, index: number) => ({
+      id: `step_${index + 1}`,
+      action: 'validate',
+      description: step,
+    })),
+    commands: [], // No Playwright commands for API tests
+    estimatedDuration: apiPlan.estimated_duration,
+    whatWillBeTested: apiPlan.what_will_be_tested,
+    whatWillNotBeTested: [], // Not provided in ApiTestPlan
+    risks: apiPlan.potential_issues || [],
+    createdAt: new Date().toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    // Store API-specific data in metadata
+    metadata: {
+      type: 'api_test',
+      method: apiPlan.method,
+      headers: apiPlan.headers,
+      body: apiPlan.body,
+      expectedStatus: apiPlan.expected_status,
+    },
+  };
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPERS: WEBSOCKET EVENTS
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+function emitProcessingStep(
+  sessionId: string | undefined,
+  step: ChatProcessingStepPayload['step'],
+  message: string,
+  progress: number
+): void {
+  if (!sessionId) return;
+
+  const payload: ChatProcessingStepPayload = {
+    sessionId,
+    step,
+    message,
+    progress,
+    timestamp: new Date().toISOString(),
+  };
+
+  webSocketService.emitChatProcessingStep(sessionId, payload);
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HISTORY AND SESSION HANDLERS (Legacy from backup for routes compatibility)
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * Get current chat history (single active session per user)
  */
 export const getCurrentChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user?.id;
-    // Get anonymous ID from IP address (for non-authenticated users)
-    const clientIp = getClientIp(req);
-    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
-
-    const { limit = 50, offset = 0 } = req.query;
-
-    // Allow either authenticated user OR anonymous user (identified by IP)
-    if (!userId && !anonymousId) {
-      res.status(401).json({
-        success: false,
-        error: 'Authentication required',
-      });
+    if (!userId) {
+      res.status(401).json({ error: 'Authentication required' });
       return;
     }
 
-    // Validate pagination parameters
-    const limitNum = Math.min(Math.max(Number(limit), 1), 100); // 1-100 range
-    const offsetNum = Math.max(Number(offset), 0);
+    const limit = Math.min(Number(req.query.limit) || 50, 100);
+    const offset = Number(req.query.offset) || 0;
 
-    logger.info('Getting chat history', {
-      userId,
-      anonymousId,
-      limit: limitNum,
-      offset: offsetNum,
-    });
+    // Get user's session
+    const { data: session } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('id, title, created_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    // Get user's most recent (active) chat session
-    let session, sessionError;
-
-    if (userId) {
-      // Authenticated user - get from chat_sessions
-      const result = await supabaseAdmin
-        .from('chat_sessions')
-        .select('id, title, created_at')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      session = result.data;
-      sessionError = result.error;
-    } else if (anonymousId) {
-      // Anonymous user - get from anonymous_chat_sessions
-      // anonymousId is IP address
-      const result = await supabaseAdmin
-        .from('anonymous_chat_sessions')
-        .select('id, title, created_at')
-        .eq('anonymous_id', anonymousId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      session = result.data;
-      sessionError = result.error;
-    }
-
-    logger.info('Chat session query result', {
-      userId,
-      sessionFound: !!session,
-      sessionId: session?.id,
-      sessionTitle: session?.title,
-      sessionError: sessionError?.message,
-    });
-
-    if (sessionError) {
-      logger.error('Failed to get current chat session', sessionError);
-      res.status(500).json({
-        success: false,
-        error: 'Failed to get chat history',
-      });
-      return;
-    }
-
-    // If no session exists, return empty history
     if (!session) {
       res.json({
         success: true,
         data: {
           session: null,
           messages: [],
-          pagination: {
-            limit: limitNum,
-            offset: offsetNum,
-            total: 0,
-            has_more: false,
-          },
+          pagination: { limit, offset, total: 0, has_more: false },
         },
       });
       return;
     }
 
-    // Get total message count for pagination
-    const messageTable = userId ? 'chat_messages' : 'anonymous_chat_messages';
-    const { count: totalMessages, error: countError } = await supabaseAdmin
-      .from(messageTable)
-      .select('*', { count: 'exact', head: true })
+    // Get total count
+    const { count } = await supabaseAdmin
+      .from('chat_messages')
+      .select('id', { count: 'exact', head: true })
       .eq('session_id', session.id);
 
-    logger.info('Message count query result', {
-      sessionId: session.id,
-      totalMessages,
-      countError: countError?.message,
-      table: messageTable,
-    });
-
-    // Get messages with pagination - newest first, then reverse for chronological display
-    const { data: messages, error: messagesError } = await supabaseAdmin
-      .from(messageTable)
-      .select(`
-        id,
-        role,
-        content,
-        metadata,
-        created_at
-      `)
+    // Get messages (newest first when offset=0)
+    const { data: messages } = await supabaseAdmin
+      .from('chat_messages')
+      .select('id, role, content, metadata, created_at')
       .eq('session_id', session.id)
-      .order('created_at', { ascending: false }) // Newest first for pagination
-      .range(offsetNum, offsetNum + limitNum - 1);
-
-    // Reverse to show chronological order (oldest → newest) in UI
-    const chronologicalMessages = messages ? [...messages].reverse() : [];
-
-    if (messagesError) {
-      logger.error('Failed to get chat messages', messagesError);
-      res.status(500).json({
-        success: false,
-        error: 'Failed to get chat messages',
-      });
-      return;
-    }
-
-    const hasMore = (offsetNum + limitNum) < (totalMessages || 0);
-
-    logger.info('Current chat history retrieved', {
-      userId,
-      sessionId: session.id,
-      messageCount: messages?.length || 0,
-      chronologicalMessageCount: chronologicalMessages.length,
-      totalMessages,
-      limit: limitNum,
-      offset: offsetNum,
-      hasMore,
-      sessionTitle: session.title,
-    });
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
     res.json({
       success: true,
       data: {
-        session: {
-          id: session.id,
-          title: session.title,
-          created_at: session.created_at,
-        },
-        messages: chronologicalMessages,
+        session,
+        messages: messages || [],
         pagination: {
-          limit: limitNum,
-          offset: offsetNum,
-          total: totalMessages || 0,
-          has_more: hasMore,
+          limit,
+          offset,
+          total: count || 0,
+          has_more: (offset + limit) < (count || 0),
         },
       },
     });
   } catch (error) {
-    logger.error('Get current chat history error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get chat history',
-    });
+    logger.error('[CHAT_HISTORY] Error getting current history', { error });
+    res.status(500).json({ error: 'Failed to get chat history' });
   }
 };
 
 /**
- * Get user's chat sessions list
- * GET /chat/sessions
+ * Get all chat sessions for user
  */
 export const getChatSessions = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user?.id;
-    const { limit = 20, offset = 0 } = req.query;
-
     if (!userId) {
-      res.status(401).json({
-        success: false,
-        error: 'Authentication required',
-      });
+      res.status(401).json({ error: 'Authentication required' });
       return;
     }
 
-    // Get user's chat sessions with message count and last message
-    const { data: sessions, error } = await supabaseAdmin
+    const limit = Math.min(Number(req.query.limit) || 20, 100);
+    const offset = Number(req.query.offset) || 0;
+
+    const { data: sessions } = await supabaseAdmin
       .from('chat_sessions')
       .select(`
         id,
@@ -1624,93 +1324,102 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
         created_at,
         chat_messages (
           id,
-          content,
           role,
+          content,
           created_at
         )
       `)
       .eq('user_id', userId)
       .order('created_at', { ascending: false })
-      .range(Number(offset), Number(offset) + Number(limit) - 1);
+      .range(offset, offset + limit - 1);
 
-    if (error) {
-      logger.error('Failed to get chat sessions', error);
-      res.status(500).json({
-        success: false,
-        error: 'Failed to get chat sessions',
-      });
-      return;
-    }
-
-    // Process sessions to add metadata
-    const processedSessions = sessions?.map((session: any) => {
-      const messages = session.chat_messages || [];
-      const lastMessage = messages.length > 0
-        ? messages.sort((a: any, b: any) =>
-            new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-          )[0]
-        : null;
-
-      return {
-        id: session.id,
-        title: session.title,
-        created_at: session.created_at,
-        message_count: messages.length,
-        last_message: lastMessage ? {
-          content: lastMessage.content.substring(0, 100), // Preview
-          role: lastMessage.role,
-          created_at: lastMessage.created_at,
-        } : null,
-      };
-    }) || [];
-
-    logger.info('Chat sessions retrieved', {
-      userId,
-      sessionCount: processedSessions.length,
-      limit,
-      offset,
-    });
+    const processedSessions = (sessions || []).map((session: any) => ({
+      id: session.id,
+      title: session.title,
+      created_at: session.created_at,
+      message_count: session.chat_messages?.length || 0,
+      last_message: session.chat_messages?.[0] || null,
+    }));
 
     res.json({
       success: true,
       data: {
         sessions: processedSessions,
         pagination: {
-          limit: Number(limit),
-          offset: Number(offset),
+          limit,
+          offset,
           total: processedSessions.length,
         },
       },
     });
   } catch (error) {
-    logger.error('Get chat sessions error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get chat sessions',
-    });
+    logger.error('[CHAT_SESSIONS] Error getting sessions', { error });
+    res.status(500).json({ error: 'Failed to get chat sessions' });
   }
 };
 
 /**
- * Debug: Get all chat data for user
- * GET /chat/debug
+ * Get chat history by session ID
  */
-export const debugChatData = async (req: Request, res: Response): Promise<void> => {
+export const getChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user?.id;
+    const { sessionId } = req.params;
 
     if (!userId) {
       res.status(401).json({ error: 'Authentication required' });
       return;
     }
 
-    // Get all sessions for user
+    // Verify session belongs to user
+    const { data: session } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('id, title, created_at')
+      .eq('id', sessionId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    // Get all messages for this session
+    const { data: messages } = await supabaseAdmin
+      .from('chat_messages')
+      .select('id, role, content, metadata, created_at')
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: true });
+
+    res.json({
+      success: true,
+      data: {
+        session,
+        messages: messages || [],
+      },
+    });
+  } catch (error) {
+    logger.error('[CHAT_HISTORY] Error getting history', { error, sessionId: req.params.sessionId });
+    res.status(500).json({ error: 'Failed to get chat history' });
+  }
+};
+
+/**
+ * Debug: Get all chat data for user
+ */
+export const debugChatData = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    }
+
     const { data: sessions, error: sessionsError } = await supabaseAdmin
       .from('chat_sessions')
       .select('*')
       .eq('user_id', userId);
 
-    // Get all messages for user's sessions
     const sessionIds = sessions?.map(s => s.id) || [];
     const { data: messages, error: messagesError } = sessionIds.length > 0
       ? await supabaseAdmin
@@ -1719,17 +1428,10 @@ export const debugChatData = async (req: Request, res: Response): Promise<void> 
           .in('session_id', sessionIds)
       : { data: [], error: null };
 
-    logger.info('Debug chat data', {
-      userId,
-      sessionsCount: sessions?.length || 0,
-      messagesCount: messages?.length || 0,
-      sessionIds,
-    });
-
     res.json({
       success: true,
       debug: {
-        userId,
+      userId,
         sessions: sessions || [],
         messages: messages || [],
         errors: {
@@ -1739,7 +1441,7 @@ export const debugChatData = async (req: Request, res: Response): Promise<void> 
       },
     });
   } catch (error) {
-    logger.error('Debug chat data error:', error);
+    logger.error('[DEBUG] Error getting chat data', { error });
     res.status(500).json({ error: 'Debug failed' });
   }
 };

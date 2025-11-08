@@ -1,8 +1,8 @@
-import { Request, Response } from 'express';
 import { WorkspaceService } from '@/services/workspace.service';
 import { WorkspaceCreateRequest } from '@/types';
-import { logger } from '@/utils/logger';
 import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
+import { logger } from '@/utils/logger';
+import { Request, Response } from 'express';
 
 /**
  * POST /api/v1/workspaces
@@ -78,7 +78,8 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
       workspaceData
     });
 
-    const workspace = await WorkspaceService.createWorkspace(effectiveUserId, workspaceData);
+    const finalWorkspaceName = workspaceData.name || `Workspace ${effectiveUserId.slice(0, 8)}`;
+    const workspace = await WorkspaceService.createWorkspace(effectiveUserId, finalWorkspaceName);
 
     res.status(201).json({
       success: true,
@@ -176,7 +177,7 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
 
     logger.info('[WORKSPACE_API] Getting workspace', { userId, workspaceId });
 
-    const workspace = await WorkspaceService.getWorkspace(workspaceId, userId);
+    const workspace = await WorkspaceService.getWorkspace(workspaceId);
 
     if (!workspace) {
       res.status(404).json({
@@ -236,7 +237,7 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
 
     logger.info('[WORKSPACE_API] Updating workspace', { userId, workspaceId, updates });
 
-    const workspace = await WorkspaceService.updateWorkspace(workspaceId, userId, updates);
+    const workspace = await WorkspaceService.updateWorkspace(workspaceId, updates);
 
     if (!workspace) {
       res.status(404).json({
@@ -296,7 +297,10 @@ export const deleteWorkspace = async (req: Request, res: Response): Promise<void
 
     logger.info('[WORKSPACE_API] Deleting workspace', { userId, workspaceId });
 
-    const success = await WorkspaceService.deleteWorkspace(workspaceId, userId);
+    await WorkspaceService.deleteWorkspace(workspaceId);
+
+    // deleteWorkspace returns void, assume success if no error thrown
+    const success = true;
 
     if (!success) {
       res.status(404).json({
