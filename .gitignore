@@ -222,14 +222,6 @@ ecosystem.config.js
 # GCP
 .gcp
 
-# Environment variables
-.env
-.env.*
-.env.local
-.env.development
-.env.production
-.env.test
-!.env.example
 
 # SSH Keys and credentials
 *.pem
