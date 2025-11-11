@@ -8,7 +8,7 @@ import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
-// import workspaceRoutes from '@/api/workspace/workspace.routes'; // DEPRECATED: Workspace auto-created on first chat
+import workspaceRoutes from '@/api/workspace/workspace.routes';
 import { env, isDevelopment } from '@/config/env';
 import { QueueManager } from '@/config/queues';
 import { swaggerSpec } from '@/config/swagger';
@@ -183,7 +183,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 
 // API routes
 app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
-// app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes); // DEPRECATED
+app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes);
 app.use(`/api/${env.API_VERSION}/manual-test`, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
