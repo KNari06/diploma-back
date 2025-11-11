@@ -9,23 +9,43 @@ import { env } from './env';
 const redisConnection = new IORedis(env.REDIS_URL, {
   maxRetriesPerRequest: 3,
   enableReadyCheck: false,
+  connectTimeout: 10000, // 10 seconds
   retryStrategy: (times) => {
-    if (times > 10) {
-      logger.warn('Redis connection failed after 10 retries');
+    if (times > 3) { // Reduced from 10 to 3
+      logger.warn(`❌ Redis connection failed after ${times} retries. Stopping.`);
       return null; // Stop retrying
     }
-    return Math.min(times * 200, 2000); // Retry with exponential backoff
+    const delay = Math.min(times * 1000, 3000); // Max 3 seconds between retries
+    logger.info(`⏳ Redis retry attempt ${times} in ${delay}ms...`);
+    return delay;
   },
   lazyConnect: true, // Don't connect immediately
+  reconnectOnError: null, // Don't auto-reconnect on specific errors
 });
 
 // Handle Redis connection errors gracefully
-redisConnection.on('error', (error) => {
-  logger.error('Redis connection error:', error);
+redisConnection.on('error', (error: any) => {
+  if (error.code === 'ETIMEDOUT') {
+    logger.warn('⏱️  Redis connection timeout - check if Redis server is accessible');
+  } else if (error.code === 'ECONNREFUSED') {
+    logger.warn('🚫 Redis connection refused - check if Redis is running');
+  } else {
+    logger.error('❌ Redis connection error:', error.message || error);
+  }
 });
 
 redisConnection.on('connect', () => {
+  redisAvailable = true;
   logger.info('✅ Redis connected successfully');
+});
+
+redisConnection.on('close', () => {
+  redisAvailable = false;
+  logger.warn('⚠️  Redis connection closed');
+});
+
+redisConnection.on('reconnecting', (delay: number) => {
+  logger.info(`🔄 Reconnecting to Redis in ${delay}ms...`);
 });
 
 // Connect to Redis (with error handling)
@@ -53,6 +73,14 @@ export const connection = {
   password: env.REDIS_PASSWORD || undefined,
   maxRetriesPerRequest: null, // Required by BullMQ
   enableReadyCheck: false,
+  connectTimeout: 10000, // 10 seconds timeout
+  retryStrategy: (times: number) => {
+    if (times > 3) {
+      logger.error(`❌ BullMQ Redis connection failed after ${times} attempts`);
+      return null; // Stop retrying
+    }
+    return Math.min(times * 1000, 3000);
+  },
 };
 
 // Queue names

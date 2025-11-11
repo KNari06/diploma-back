@@ -74,6 +74,9 @@ const router = Router();
  */
 router.get('/credits', optionalAuth, asyncHandler(getUserCredits));
 
+// Alias for backwards compatibility with frontend
+router.get('/available-credits', optionalAuth, asyncHandler(getUserCredits));
+
 /**
  * @swagger
  * /api/v1/user/credits/reset:
