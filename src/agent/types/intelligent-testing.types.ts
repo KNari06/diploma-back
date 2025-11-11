@@ -77,7 +77,8 @@ export interface DOMAnalysis {
   }>;
   inputs: Array<{
     type: string;
-    name: string;
+    name?: string;
+    required?: boolean;
     placeholder?: string;
     selector: string;
   }>;

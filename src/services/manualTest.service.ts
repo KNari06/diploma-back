@@ -669,7 +669,7 @@ export class ManualTestService {
         logger.info('[MANUAL_TEST_SERVICE] Test marked as completed', { testId });
 
         // Notify all associated chat sessions
-        await TestCompletionHandlerService.handleTestCompletion(testId, 'ui');
+        await TestCompletionHandlerService.handleTestCompletion(testId);
 
         logTestEvent('completed', testId, {
           totalBrowsers: expectedBrowsers.length,

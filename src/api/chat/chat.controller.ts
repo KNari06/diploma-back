@@ -12,6 +12,7 @@ import { TestCompletionHandlerService } from '@/services/test-completion-handler
 import { WorkspaceService } from '@/services/workspace.service';
 
 // Existing services
+import { ChatService } from '@/services/chat.service';
 import { detectUserApproval } from '@/services/ai-helpers.service';
 import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/autonomous-orchestrator.service';
 import { extractUrlFromMessage } from '@/services/context-enrichment.service';
@@ -332,7 +333,7 @@ async function handlePlatformTest(
 
       // Save chat messages
       if (chatSessionId) {
-        await saveChatMessages(chatSessionId, [
+        await ChatService.saveChatMessages(chatSessionId, [
           { role: 'user', content: message },
           {
             role: 'ai',
@@ -475,7 +476,7 @@ async function handleApiTest(
 
   // Save chat messages
   if (chatSessionId) {
-    await saveChatMessages(chatSessionId, [
+    await ChatService.saveChatMessages(chatSessionId, [
       { role: 'user', content: message },
       {
         role: 'ai',
@@ -714,9 +715,9 @@ Use this knowledge to provide more accurate and helpful responses.`,
   // ═══════════════════════════════════════════════════════════════════════
 
         if (chatSessionId) {
-    await saveChatMessages(chatSessionId, [
+    await ChatService.saveChatMessages(chatSessionId, [
       { role: 'user', content: message },
-      { role: 'ai', content: gptResponse },
+      { role: 'ai', content: gptResponse.content },
     ]);
   }
 
@@ -842,11 +843,11 @@ async function executeApprovedTestPlan(
 
       // Save test-chat mapping for API test notifications
       if (chatSessionId && userId) {
-        await TestChatMappingService.saveTestChatMapping(
-          apiTestId,
+        await TestChatMappingService.saveTestChatMapping({
+          testId: apiTestId,
           chatSessionId,
-          userId
-        );
+          userId,
+        });
         logger.info('[API_TEST] Test-chat mapping saved', {
           testId: apiTestId,
           chatSessionId,
@@ -874,15 +875,11 @@ async function executeApprovedTestPlan(
       });
 
       // Notify completion via TestCompletionHandlerService
-      await TestCompletionHandlerService.handleTestCompletion(
-        apiTestId,
-        'api',
-        apiTestResult
-      );
+      await TestCompletionHandlerService.handleTestCompletion(apiTestId);
 
       // Save chat messages
     if (chatSessionId) {
-        await saveChatMessages(chatSessionId, [
+        await ChatService.saveChatMessages(chatSessionId, [
           { role: 'user', content: `Approved API test: ${apiDetails.method} ${plan.url}` },
           {
             role: 'ai',
@@ -968,11 +965,11 @@ async function executeApprovedTestPlan(
 
         // Save test-chat mapping for result notifications
         if (chatSessionId && testCreated.data?.id && userId) {
-          await TestChatMappingService.saveTestChatMapping(
-            testCreated.data.id,
+          await TestChatMappingService.saveTestChatMapping({
+            testId: testCreated.data.id,
             chatSessionId,
-            userId
-          );
+            userId,
+          });
           logger.info('[CHAT] Test-chat mapping saved', {
             testId: testCreated.data.id,
             chatSessionId,
@@ -1248,10 +1245,10 @@ Provide a brief summary (max 200 words) in the same language as the conversation
 
     logger.info('[CHAT_SUMMARY] Summary created', {
       originalLength: conversationText.length,
-      summaryLength: summary.length
+      summaryLength: summary.content.length
     });
 
-    return summary;
+    return summary.content;
   } catch (error) {
     logger.error('[CHAT_SUMMARY] Failed to summarize', { error });
     return ''; // Fail gracefully

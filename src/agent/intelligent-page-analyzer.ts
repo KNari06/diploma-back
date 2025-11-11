@@ -202,10 +202,9 @@ export class IntelligentPageAnalyzer {
         ];
 
         for (const selector of cookieSelectors) {
-          // @ts-expect-error - browser context
+          // @ts-ignore - browser context
           const el = document.querySelector(selector);
           if (el) {
-            // @ts-expect-error - browser context
             const acceptBtn = el.querySelector(
               'button:has-text("Accept"), button:has-text("Agree"), button:has-text("OK"), .accept, .agree'
             );
@@ -225,10 +224,10 @@ export class IntelligentPageAnalyzer {
         ];
 
         for (const selector of newsletterSelectors) {
-          // @ts-expect-error - browser context
+          // @ts-ignore - browser context
           const el = document.querySelector(selector);
           if (el) {
-            // @ts-expect-error - browser context
+            // @ts-ignore - browser context
             const closeBtn = el.querySelector(
               'button:has-text("Close"), button:has-text("Dismiss"), .close, [aria-label*="close"]'
             );
@@ -352,7 +351,7 @@ export class IntelligentPageAnalyzer {
 
     // DOM-based inference
     const hasPasswordField = dom.inputs.some(input => input.type === 'password');
-    const hasEmailField = dom.inputs.some(input => input.type === 'email' || input.name.includes('email'));
+    const hasEmailField = dom.inputs.some(input => input.type === 'email' || (input.name && input.name.includes('email')));
 
     if (hasPasswordField && hasEmailField) {
       return dom.buttons.some(btn => btn.text.toLowerCase().includes('register'))
@@ -404,7 +403,7 @@ export class IntelligentPageAnalyzer {
 
     // Inputs
     dom.inputs.forEach(input => {
-      const priority: 'critical' | 'high' | 'medium' | 'low' = input.name.includes('email') || input.type === 'password'
+      const priority: 'critical' | 'high' | 'medium' | 'low' = (input.name && input.name.includes('email')) || input.type === 'password'
         ? 'critical'
         : 'medium';
 

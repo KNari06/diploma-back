@@ -396,7 +396,7 @@ export class IntelligentTestOrchestrator {
         const urlBefore = this.page.url();
 
         // Execute action using CommandExecutor
-        const executed = await this.commandExecutor.executeCommand({
+        const executionResult = await this.commandExecutor.executeCommand({
           action: action.action as any,
           selector: action.selector,
           value: action.value,
@@ -410,24 +410,31 @@ export class IntelligentTestOrchestrator {
         const urlAfter = this.page.url();
         const urlChanged = urlBefore !== urlAfter;
 
+        // Create preliminary action result
+        const preliminaryResult: ActionResult = {
+          action,
+          success: executionResult.success,
+          error: executionResult.error,
+          urlChanged,
+          urlBefore,
+          urlAfter,
+          timestamp: Date.now(),
+        };
+
         // Validate result
         const validation = await ResultValidator.validateResult(
           action,
-          {
-            action,
-            success: executed,
-            urlChanged,
-            urlBefore,
-            urlAfter,
-            timestamp: Date.now(),
-          },
+          preliminaryResult,
           this.page
         );
 
+        const validationPassed = typeof validation === 'boolean' ? validation : validation.passed;
+        const validationMessage = typeof validation === 'boolean' ? undefined : (validation.message || (!validation.passed ? 'Validation failed' : undefined));
+
         const actionResult: ActionResult = {
           action,
-          success: executed && validation.passed,
-          error: executed ? (validation.passed ? undefined : validation.message) : 'Execution failed',
+          success: executionResult.success && (validationPassed || false),
+          error: executionResult.success ? (validationPassed ? undefined : validationMessage) : (executionResult.error || 'Execution failed'),
           urlChanged,
           urlBefore,
           urlAfter,

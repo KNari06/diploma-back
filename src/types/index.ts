@@ -39,6 +39,11 @@ export interface TestOptions {
   waitForSelector?: string;
   customScripts?: string[];
   headers?: Record<string, string>;
+  credentials?: {
+    email?: string;
+    username?: string;
+    password: string;
+  };
 }
 
 export type BrowserType = 'chrome' | 'firefox' | 'safari' | 'edge' | 'mobile-chrome' | 'mobile-safari';
