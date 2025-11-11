@@ -85,14 +85,15 @@ git status --short
 ### SSH команда для подключения:
 
 ```bash
-ssh -i /Users/yerassylospanov/Desktop/QAI-BackEnd/gcp root@35.238.212.84
+ssh -i /Users/yerassylospanov/Desktop/QAI-BackEnd/gcp root@34.172.156.158
 ```
 
 **Важно:**
+
 - SSH ключ находится в корне проекта: `./gcp`
 - Полный путь: `/Users/yerassylospanov/Desktop/QAI-BackEnd/gcp`
 - Пользователь: `root`
-- IP сервера: `35.238.212.84`
+- IP сервера: `34.172.156.158`
 
 ## Deployment Process
 

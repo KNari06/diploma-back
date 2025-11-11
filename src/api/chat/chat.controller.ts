@@ -728,7 +728,7 @@ Use this knowledge to provide more accurate and helpful responses.`,
   // Credits are only deducted for TESTS (intelligent, standard, api)
 
   const response: any = {
-    reply: gptResponse,
+    reply: gptResponse.content,
             timestamp: new Date().toISOString(),
     sessionId: chatSessionId,
   };

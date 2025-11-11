@@ -11,11 +11,13 @@ ssh -i /Users/yerassylospanov/Desktop/QAI-BackEnd/gcp root@34.172.156.158
 ```
 
 **Детали подключения:**
+
 - **SSH ключ**: `/Users/yerassylospanov/Desktop/QAI-BackEnd/gcp` (в корне проекта)
 - **Пользователь**: `root`
 - **IP адрес**: `34.172.156.158`
 
 **Альтернативный вариант (из корня проекта):**
+
 ```bash
 cd /Users/yerassylospanov/Desktop/QAI-BackEnd
 ssh -i ./gcp root@34.172.156.158
@@ -47,5 +49,6 @@ ssh -i ./gcp root@34.172.156.158
 ## 📝 Дополнительная информация
 
 Для детальных процедур деплоя см.:
+
 - [Deployment Rules](../../.cursor/rules/deployment-rules.mdc) - полные правила и чеклисты
 - [Server Configuration](./server-config.md) - конфигурация сервера (если файл существует)
