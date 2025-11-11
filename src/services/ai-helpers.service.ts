@@ -43,7 +43,7 @@ export async function detectUserApproval(
       max_tokens: 100,
     });
 
-    const parsed = JSON.parse(response);
+    const parsed = JSON.parse(response.content);
 
     logger.info('User approval detected', {
       approved: parsed.approved,
@@ -154,7 +154,7 @@ Response:`;
       model: 'gpt-3.5-turbo', // Cheaper model for simple task
     });
 
-    const detectedPath = response.trim().replace(/['"]/g, '');
+    const detectedPath = response.content.trim().replace(/['"]/g, '');
 
     if (detectedPath === 'null' || !detectedPath) {
       logger.info('AI could not detect login page');
@@ -229,7 +229,7 @@ Return JSON:
       model: 'gpt-3.5-turbo', // Cheaper for simple validation
     });
 
-    const result = JSON.parse(response);
+    const result = JSON.parse(response.content);
 
     logger.info('Selector validated', {
       selector,
@@ -315,7 +315,7 @@ Extracted answers (JSON only):`;
       model: 'gpt-3.5-turbo', // Cheap and fast for simple parsing
     });
 
-    const parsed = JSON.parse(response);
+    const parsed = JSON.parse(response.content);
 
     logger.info('Natural answers parsed', {
       extractedFields: Object.keys(parsed).filter(k => parsed[k] !== null),
@@ -395,7 +395,7 @@ Which option should we click? Return ONLY the number (1-${navOptions.length}) or
       model: 'gpt-3.5-turbo',
     });
 
-    const choice = response.trim();
+    const choice = response.content.trim();
     const index = parseInt(choice) - 1;
 
     if (isNaN(index) || index < 0 || index >= navOptions.length) {

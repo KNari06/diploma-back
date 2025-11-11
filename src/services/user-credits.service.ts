@@ -97,6 +97,7 @@ export class UserCreditsService {
 
   /**
    * Deduct credits from user balance
+   * IMPORTANT: Now supports DECIMAL credits (e.g., 0.5, 1.23, 20.45)
    */
   static async deductCredits(
     userId: string,
@@ -107,23 +108,27 @@ export class UserCreditsService {
     try {
       const credits = await this.getOrCreateUserCredits(userId);
 
-      if (credits.credits_balance < amount) {
+      // Round amount to 2 decimal places to match NUMERIC(10,2) in DB
+      const roundedAmount = Math.round(amount * 100) / 100;
+
+      if (credits.credits_balance < roundedAmount) {
         logger.warn('[USER_CREDITS] Insufficient credits', {
           userId,
-          required: amount,
+          required: roundedAmount,
           available: credits.credits_balance,
         });
         return { success: false, newBalance: credits.credits_balance };
       }
 
-      const newBalance = credits.credits_balance - amount;
+      const newBalance = Math.round((credits.credits_balance - roundedAmount) * 100) / 100;
 
       // Update balance
       const { error: updateError } = await supabaseAdmin
         .from('user_credits')
         .update({
           credits_balance: newBalance,
-          total_used: credits.total_used + amount,
+          total_used: Math.round((credits.total_used + roundedAmount) * 100) / 100,
+          last_credit_usage: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         })
         .eq('user_id', userId);
@@ -133,14 +138,15 @@ export class UserCreditsService {
         return { success: false, newBalance: credits.credits_balance };
       }
 
-      // Record transaction
-      await this.recordTransaction(userId, -amount, newBalance, 'usage', description, metadata);
+      // Record transaction (with token tracking if provided)
+      await this.recordTransaction(userId, -roundedAmount, newBalance, 'usage', description, metadata);
 
       logger.info('[USER_CREDITS] Credits deducted', {
         userId,
-        amount,
+        amount: roundedAmount,
         newBalance,
         description,
+        tokensUsed: metadata.tokens_used || 'N/A',
       });
 
       return { success: true, newBalance };
@@ -152,6 +158,7 @@ export class UserCreditsService {
 
   /**
    * Add credits to user balance (purchase, bonus, refund)
+   * IMPORTANT: Now supports DECIMAL credits with 2 decimal places
    */
   static async addCredits(
     userId: string,
@@ -162,7 +169,10 @@ export class UserCreditsService {
   ): Promise<{ success: boolean; newBalance: number }> {
     try {
       const credits = await this.getOrCreateUserCredits(userId);
-      const newBalance = credits.credits_balance + amount;
+
+      // Round amount to 2 decimal places to match NUMERIC(10,2) in DB
+      const roundedAmount = Math.round(amount * 100) / 100;
+      const newBalance = Math.round((credits.credits_balance + roundedAmount) * 100) / 100;
 
       // Update balance
       const updateData: any = {
@@ -171,7 +181,8 @@ export class UserCreditsService {
       };
 
       if (type === 'purchase') {
-        updateData.total_purchased = credits.total_purchased + amount;
+        updateData.total_purchased = Math.round((credits.total_purchased + roundedAmount) * 100) / 100;
+        updateData.credits_purchased_at = new Date().toISOString();
       }
 
       const { error: updateError } = await supabaseAdmin
@@ -185,11 +196,11 @@ export class UserCreditsService {
       }
 
       // Record transaction
-      await this.recordTransaction(userId, amount, newBalance, type, description, metadata);
+      await this.recordTransaction(userId, roundedAmount, newBalance, type, description, metadata);
 
       logger.info('[USER_CREDITS] Credits added', {
         userId,
-        amount,
+        amount: roundedAmount,
         type,
         newBalance,
         description,
@@ -203,7 +214,7 @@ export class UserCreditsService {
   }
 
   /**
-   * Record credit transaction
+   * Record credit transaction (with token tracking support)
    */
   private static async recordTransaction(
     userId: string,
@@ -214,17 +225,49 @@ export class UserCreditsService {
     metadata: Record<string, any> = {}
   ): Promise<void> {
     try {
-      const { error } = await supabaseAdmin.from('credit_transactions').insert({
+      // Round values to 2 decimal places to match NUMERIC(10,2) in DB
+      const roundedAmount = Math.round(amount * 100) / 100;
+      const roundedBalance = Math.round(balanceAfter * 100) / 100;
+
+      // Prepare transaction data
+      const transactionData: any = {
         user_id: userId,
-        amount,
-        balance_after: balanceAfter,
+        amount: roundedAmount,
+        balance_after: roundedBalance,
         transaction_type: type,
         description,
         metadata,
-      });
+      };
+
+      // Add token tracking fields if present in metadata
+      if (metadata.tokens_used) {
+        transactionData.tokens_used = metadata.tokens_used;
+      }
+
+      if (metadata.cost_usd !== undefined) {
+        transactionData.cost_usd = metadata.cost_usd;
+      }
+
+      if (metadata.credits_calculated !== undefined) {
+        transactionData.credits_calculated = metadata.credits_calculated;
+      }
+
+      if (metadata.test_type) {
+        transactionData.test_type = metadata.test_type;
+      }
+
+      const { error } = await supabaseAdmin.from('credit_transactions').insert(transactionData);
 
       if (error) {
         logger.error('[USER_CREDITS] Error recording transaction', { error, userId });
+      } else {
+        logger.debug('[USER_CREDITS] Transaction recorded', {
+          userId,
+          type,
+          amount: roundedAmount,
+          balanceAfter: roundedBalance,
+          testType: metadata.test_type || 'N/A',
+        });
       }
     } catch (error) {
       logger.error('[USER_CREDITS] Exception in recordTransaction', { error, userId });

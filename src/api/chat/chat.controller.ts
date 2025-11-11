@@ -21,6 +21,8 @@ import { searchKB } from '@/services/kb.service';
 import { ManualTestService } from '@/services/manualTest.service';
 import { getChatCompletion, getChatCompletionWithMessages } from '@/services/openai.service';
 import { UserCreditsService } from '@/services/user-credits.service';
+import { CreditCostTrackerService } from '@/services/credit-cost-tracker.service';
+import { TokenCalculatorService } from '@/services/token-calculator.service';
 import { executeApiTest } from '@/services/apiTest.service';
 
 // Types
@@ -118,7 +120,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           // APPROVED - execute test
           return await executeApprovedTestPlan(req, res, {
             planId: pendingPlan.id,
-            userId,
+              userId,
             chatSessionId,
             workspace_id,
           });
@@ -201,8 +203,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       success: false,
       error: 'Failed to process chat request',
       message: error instanceof Error ? error.message : 'Unknown error',
-      timestamp: new Date().toISOString(),
-    });
+        timestamp: new Date().toISOString(),
+      });
   }
 };
 
@@ -252,15 +254,15 @@ async function handlePlatformTest(
       intent: 'platform_test',
     });
 
-    res.json({
+      res.json({
       reply: '📝 I need some more information to set up the test:',
       questions: result.questions,
       conversationId: result.conversationId,
-      timestamp: new Date().toISOString(),
+        timestamp: new Date().toISOString(),
       sessionId: chatSessionId,
-    });
-    return;
-  }
+      });
+      return;
+    }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 2: FIND OR CREATE PROJECT
@@ -292,8 +294,8 @@ async function handlePlatformTest(
 
   if (answers && conversationId) {
     logger.info('[PLATFORM_TEST] Running autonomous exploration with answers', {
-      conversationId,
-      answerCount: Object.keys(answers).length,
+        conversationId,
+        answerCount: Object.keys(answers).length,
     });
 
     emitProcessingStep(chatSessionId, 'exploring_site', '🌐 Launching browser and exploring...', 50);
@@ -320,13 +322,13 @@ async function handlePlatformTest(
         }
       }
 
-      const explorationResult = await runAutonomousExploration({
-        userMessage: message,
-        answers,
+        const explorationResult = await runAutonomousExploration({
+          userMessage: message,
+          answers,
         userId,
         projectId: project_id,
-        sessionId: chatSessionId,
-      });
+          sessionId: chatSessionId,
+        });
 
       // Save chat messages
       if (chatSessionId) {
@@ -346,26 +348,26 @@ async function handlePlatformTest(
         ]);
       }
 
-      res.json({
-        reply: explorationResult.message,
-        testPlan: explorationResult.testPlan,
-        conversationId,
-        timestamp: new Date().toISOString(),
+        res.json({
+          reply: explorationResult.message,
+          testPlan: explorationResult.testPlan,
+          conversationId,
+          timestamp: new Date().toISOString(),
         sessionId: chatSessionId,
-      });
-      return;
-    } catch (error) {
+        });
+        return;
+      } catch (error) {
       logger.error('[PLATFORM_TEST] Autonomous exploration failed', { error });
 
-      res.status(500).json({
-        success: false,
+        res.status(500).json({
+          success: false,
         error: 'Failed to explore platform',
-        message: error instanceof Error ? error.message : 'Unknown error',
-        timestamp: new Date().toISOString(),
-      });
-      return;
+          message: error instanceof Error ? error.message : 'Unknown error',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
     }
-  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 5: NO ANSWERS YET - GENERATE QUESTIONS
@@ -421,13 +423,13 @@ async function handleApiTest(
   // ═══════════════════════════════════════════════════════════════════════
 
   if (!parsedIntent?.apiMethod || !parsedIntent?.apiUrl) {
-    res.json({
+          res.json({
       reply: '❌ I need more details for the API test.\n\nPlease specify:\n• HTTP Method (GET, POST, etc.)\n• API URL\n\nExample: "Test GET request to https://api.example.com/users"',
-      timestamp: new Date().toISOString(),
+            timestamp: new Date().toISOString(),
       sessionId: chatSessionId,
-    });
-    return;
-  }
+          });
+          return;
+        }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 2: FIND OR CREATE PROJECT
@@ -446,9 +448,9 @@ async function handleApiTest(
   emitProcessingStep(chatSessionId, 'generating_plan', '📋 Creating test plan...', 60);
 
   const apiTestPlan = await ApiTestPlanService.generateApiTestPlan({
-    method: parsedIntent.apiMethod,
-    url: parsedIntent.apiUrl,
-    body: parsedIntent.apiBody,
+          method: parsedIntent.apiMethod,
+          url: parsedIntent.apiUrl,
+          body: parsedIntent.apiBody,
     headers: parsedIntent.apiHeaders,
     userMessage: message,
   });
@@ -711,7 +713,7 @@ Use this knowledge to provide more accurate and helpful responses.`,
   // STEP 4: SAVE MESSAGES
   // ═══════════════════════════════════════════════════════════════════════
 
-  if (chatSessionId) {
+        if (chatSessionId) {
     await saveChatMessages(chatSessionId, [
       { role: 'user', content: message },
       { role: 'ai', content: gptResponse },
@@ -719,26 +721,28 @@ Use this knowledge to provide more accurate and helpful responses.`,
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 5: DEDUCT CREDITS & RESPOND
+  // STEP 5: RESPOND (NO CREDIT DEDUCTION FOR CHAT!)
   // ═══════════════════════════════════════════════════════════════════════
+  // IMPORTANT: Chat messages are FREE
+  // Credits are only deducted for TESTS (intelligent, standard, api)
 
   const response: any = {
     reply: gptResponse,
-    timestamp: new Date().toISOString(),
+            timestamp: new Date().toISOString(),
     sessionId: chatSessionId,
   };
 
+  // Show user's current credit balance (but don't deduct)
   if (userId && userId !== 'anonymous') {
     try {
       const isValidUUID = userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
       if (isValidUUID) {
-        await UserCreditsService.deductCredits(userId, 1, 'Chat message');
         const credits = await UserCreditsService.getUserCredits(userId);
-        response.creditsDeducted = 1;
         response.creditsRemaining = credits?.credits_balance || 0;
+        response.chatIsFree = true; // Indicate that chat is free
       }
     } catch (error) {
-      logger.warn('[GENERAL_CHAT] Failed to deduct credits', { error, userId });
+      logger.warn('[GENERAL_CHAT] Failed to get credits', { error, userId });
     }
   }
 
@@ -772,13 +776,48 @@ async function executeApprovedTestPlan(
       res.status(404).json({
         success: false,
         error: 'Test plan not found or expired',
+            timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Determine test type
+    const isApiTest = plan.scope === 'api_test' || ((plan as any).metadata && (plan as any).metadata.type === 'api_test');
+    const testType = isApiTest ? 'api' : (plan.intelligentMode ? 'intelligent' : 'standard');
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CHECK CREDITS BEFORE RUNNING TEST
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, testType);
+
+    if (!creditCheck.hasEnough) {
+      logger.warn('[EXECUTE] Insufficient credits for test', {
+        userId,
+        testType,
+        required: creditCheck.required,
+        available: creditCheck.available,
+        shortage: creditCheck.shortage,
+      });
+
+      res.status(402).json({
+        success: false,
+        error: 'Insufficient credits',
+        message: `You need ${creditCheck.required} credits to run this test. You have ${creditCheck.available} credits. Please purchase ${creditCheck.shortage} more credits.`,
+        required: creditCheck.required,
+        available: creditCheck.available,
+        shortage: creditCheck.shortage,
         timestamp: new Date().toISOString(),
       });
       return;
     }
 
-    // Check if it's API test or UI test by looking at metadata or scope
-    const isApiTest = plan.scope === 'api_test' || ((plan as any).metadata && (plan as any).metadata.type === 'api_test');
+    logger.info('[EXECUTE] Credit check passed', {
+      userId,
+      testType,
+      required: creditCheck.required,
+      available: creditCheck.available,
+    });
 
     if (isApiTest) {
       // Execute API test
@@ -814,6 +853,25 @@ async function executeApprovedTestPlan(
           userId,
         });
       }
+
+      // ═════════════════════════════════════════════════════════════════════
+      // DEDUCT CREDITS FOR API TEST
+      // ═════════════════════════════════════════════════════════════════════
+
+      await CreditCostTrackerService.deductCreditsForTest({
+        userId,
+        testType: 'api',
+        credits: TokenCalculatorService.getTestCreditCost('api'),
+        costUSD: 0.0011, // Estimated API test cost
+        testId: apiTestId,
+        description: `API test: ${apiDetails.method} ${plan.url}`,
+      });
+
+      logger.info('[API_TEST] Credits deducted', {
+              userId,
+        testId: apiTestId,
+        credits: TokenCalculatorService.getTestCreditCost('api'),
+      });
 
       // Notify completion via TestCompletionHandlerService
       await TestCompletionHandlerService.handleTestCompletion(
@@ -869,9 +927,44 @@ async function executeApprovedTestPlan(
           options: {},
           commands: plan.commands,
           intent: plan.scope,
+          // NEW: Pass intelligent mode if plan has it
+          intelligentMode: plan.intelligentMode,
+          testGoal: plan.intelligentMode ? plan.summary : undefined,
         };
 
+        logger.info('[CHAT] Creating test with configuration', {
+          planId: plan.id,
+          intelligentMode: plan.intelligentMode || false,
+          url: plan.url,
+          scope: plan.scope,
+          commandsCount: plan.commands?.length || 0,
+        });
+
         const testCreated = await ManualTestService.runTest(testRequest);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // DEDUCT CREDITS FOR UI TEST
+        // ═══════════════════════════════════════════════════════════════════
+
+        if (testCreated.data?.id) {
+          const uiTestType = plan.intelligentMode ? 'intelligent' : 'standard';
+
+          await CreditCostTrackerService.deductCreditsForTest({
+            userId,
+            testType: uiTestType,
+            credits: TokenCalculatorService.getTestCreditCost(uiTestType),
+            costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001, // Estimated costs
+            testId: testCreated.data.id,
+            description: `${uiTestType} UI test: ${plan.url}`,
+          });
+
+          logger.info('[UI_TEST] Credits deducted', {
+            userId,
+            testId: testCreated.data.id,
+            testType: uiTestType,
+            credits: TokenCalculatorService.getTestCreditCost(uiTestType),
+          });
+        }
 
         // Save test-chat mapping for result notifications
         if (chatSessionId && testCreated.data?.id && userId) {
@@ -889,21 +982,29 @@ async function executeApprovedTestPlan(
 
         // Emit WebSocket event
         if (chatSessionId && testCreated.data?.id) {
+          const testModeMessage = plan.intelligentMode
+            ? '🤖 Intelligent test started! AI will autonomously explore and adapt to your site.'
+            : '✅ Test started! Monitor progress in real-time.';
+
           const chatTestUpdatePayload: ChatTestUpdatePayload = {
-            sessionId: chatSessionId,
+          sessionId: chatSessionId,
             testId: testCreated.data.id,
-            message: '✅ Test started! Monitor progress in real-time.',
+            message: testModeMessage,
             status: 'created',
             links: {
               fullReport: `/api/v1/manual-test/${testCreated.data.id}/summary`,
             },
-            timestamp: new Date().toISOString(),
-          };
+          timestamp: new Date().toISOString(),
+        };
           webSocketService.emitChatTestUpdate(chatSessionId, chatTestUpdatePayload);
         }
 
+        const testModeInfo = plan.intelligentMode
+          ? `\n\n🤖 **Mode:** Intelligent/Adaptive Testing\n📊 **Estimated:** ${plan.estimatedPages || '5-10 pages'}, ${plan.estimatedCost || '$0.10-0.20'}`
+          : '';
+
         res.json({
-          reply: `✅ Test plan approved and running!\n\nTest ID: ${testCreated.data?.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data?.id}/status`,
+          reply: `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${testCreated.data?.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data?.id}/status`,
           testId: testCreated.data?.id,
           timestamp: new Date().toISOString(),
           sessionId: chatSessionId,
@@ -944,7 +1045,7 @@ async function getRecentChatHistory(
 ): Promise<Array<{ role: 'user' | 'ai'; content: string; created_at: string }>> {
   try {
     const { data: messages, error } = await supabaseAdmin
-      .from('chat_messages')
+        .from('chat_messages')
       .select('role, content, created_at')
       .eq('session_id', sessionId)
       .order('created_at', { ascending: false })
@@ -1239,7 +1340,7 @@ async function getOrCreateChatSession(
       title: 'New Chat',
     })
     .select('id')
-    .single();
+      .single();
 
   return newSession?.id;
 }
@@ -1341,9 +1442,17 @@ function emitProcessingStep(
  */
 export const getCurrentChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
+    // Support both authenticated users and anonymous users (IP-based)
     const userId = req.user?.id;
-    if (!userId) {
-      res.status(401).json({ error: 'Authentication required' });
+    const clientIp = getClientIp(req);
+    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
+    const effectiveUserId = userId || anonymousId;
+
+    if (!effectiveUserId || effectiveUserId === 'unknown') {
+      res.status(400).json({
+        error: 'Unable to identify user',
+        message: 'Please provide authentication or ensure valid IP address'
+      });
       return;
     }
 
@@ -1352,12 +1461,12 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
 
     // Get user's session
     const { data: session } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('id, title, created_at')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+        .from('chat_sessions')
+        .select('id, title, created_at')
+      .eq('user_id', effectiveUserId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
     if (!session) {
       res.json({
@@ -1409,9 +1518,17 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
  */
 export const getChatSessions = async (req: Request, res: Response): Promise<void> => {
   try {
+    // Support both authenticated users and anonymous users (IP-based)
     const userId = req.user?.id;
-    if (!userId) {
-      res.status(401).json({ error: 'Authentication required' });
+    const clientIp = getClientIp(req);
+    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
+    const effectiveUserId = userId || anonymousId;
+
+    if (!effectiveUserId || effectiveUserId === 'unknown') {
+      res.status(400).json({
+        error: 'Unable to identify user',
+        message: 'Please provide authentication or ensure valid IP address'
+      });
       return;
     }
 
@@ -1431,14 +1548,14 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
           created_at
         )
       `)
-      .eq('user_id', userId)
+      .eq('user_id', effectiveUserId)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
     const processedSessions = (sessions || []).map((session: any) => ({
-      id: session.id,
-      title: session.title,
-      created_at: session.created_at,
+        id: session.id,
+        title: session.title,
+        created_at: session.created_at,
       message_count: session.chat_messages?.length || 0,
       last_message: session.chat_messages?.[0] || null,
     }));
@@ -1465,11 +1582,18 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
  */
 export const getChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
+    // Support both authenticated users and anonymous users (IP-based)
     const userId = req.user?.id;
+    const clientIp = getClientIp(req);
+    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
+    const effectiveUserId = userId || anonymousId;
     const { sessionId } = req.params;
 
-    if (!userId) {
-      res.status(401).json({ error: 'Authentication required' });
+    if (!effectiveUserId || effectiveUserId === 'unknown') {
+      res.status(400).json({
+        error: 'Unable to identify user',
+        message: 'Please provide authentication or ensure valid IP address'
+      });
       return;
     }
 
@@ -1478,7 +1602,7 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
       .from('chat_sessions')
       .select('id, title, created_at')
       .eq('id', sessionId)
-      .eq('user_id', userId)
+      .eq('user_id', effectiveUserId)
       .maybeSingle();
 
     if (!session) {
@@ -1533,7 +1657,7 @@ export const debugChatData = async (req: Request, res: Response): Promise<void> 
     res.json({
       success: true,
       debug: {
-      userId,
+        userId,
         sessions: sessions || [],
         messages: messages || [],
         errors: {

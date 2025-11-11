@@ -6,11 +6,25 @@ import { buildChatSystemPrompt } from '@/ai/prompts/index';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface OpenAIResponse {
+  content: string;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    model: string;
+  };
+}
+
 /**
- * Get chat completion with custom messages array
+ * Get chat completion with custom messages array (with token tracking)
  * @param messages - Array of chat messages
  * @param options - Optional configuration
- * @returns AI response
+ * @returns AI response with token usage
  */
 export async function getChatCompletionWithMessages(
   messages: ChatCompletionMessageParam[],
@@ -20,7 +34,7 @@ export async function getChatCompletionWithMessages(
     response_format?: { type: 'json_object' };
     model?: string; // Allow custom model (e.g., gpt-3.5-turbo)
   }
-): Promise<string> {
+): Promise<OpenAIResponse> {
   try {
     const model = options?.model || env.OPENAI_MODEL || 'gpt-4o-mini';
 
@@ -33,26 +47,42 @@ export async function getChatCompletionWithMessages(
     });
 
     const reply = response.choices[0]?.message?.content || '';
+    const usage = response.usage;
 
-    logger.info('Chat completion with messages successful', {
+    logger.info('[OPENAI] Chat completion with messages successful', {
+      model,
       messageCount: messages.length,
       replyLength: reply.length,
+      inputTokens: usage?.prompt_tokens || 0,
+      outputTokens: usage?.completion_tokens || 0,
+      totalTokens: usage?.total_tokens || 0,
     });
 
-    return reply;
+    return {
+      content: reply,
+      usage: {
+        inputTokens: usage?.prompt_tokens || 0,
+        outputTokens: usage?.completion_tokens || 0,
+        totalTokens: usage?.total_tokens || 0,
+        model,
+      },
+    };
   } catch (error) {
-    logger.error('Chat completion with messages error:', error);
+    logger.error('[OPENAI] Chat completion with messages error:', error);
     throw new Error('AI chat failed');
   }
 }
 
 /**
- * Get chat completion from OpenAI
+ * Get chat completion from OpenAI (with token tracking)
  * @param prompt - User message
- * @param context - Optional context for RAG (future feature)
- * @returns AI response
+ * @param context - Optional context for RAG
+ * @returns AI response with token usage
  */
-export async function getChatCompletion(prompt: string, context?: string): Promise<string> {
+export async function getChatCompletion(
+  prompt: string,
+  context?: string
+): Promise<OpenAIResponse> {
   try {
     // Use centralized prompt (in English, but AI will respond in user's language)
     const systemPrompt = buildChatSystemPrompt();
@@ -61,7 +91,7 @@ export async function getChatCompletion(prompt: string, context?: string): Promi
       { role: 'system', content: systemPrompt },
     ];
 
-    // Add context if provided (for future RAG integration)
+    // Add context if provided (for RAG integration)
     if (context) {
       messages.push({
         role: 'system',
@@ -71,20 +101,38 @@ export async function getChatCompletion(prompt: string, context?: string): Promi
 
     messages.push({ role: 'user', content: prompt });
 
+    const model = env.OPENAI_MODEL || 'gpt-4o-mini';
+
     const response = await openai.chat.completions.create({
-      model: env.OPENAI_MODEL || 'gpt-4o-mini',
+      model,
       messages,
       max_tokens: env.OPENAI_MAX_TOKENS || 1000,
       temperature: 0.5, // Softer, more balanced responses
     });
 
     const reply = response.choices[0]?.message?.content || '🤖 Не понял запрос.';
+    const usage = response.usage;
 
-    logger.info('Chat completion successful', { promptLength: prompt.length, replyLength: reply.length });
+    logger.info('[OPENAI] Chat completion successful', {
+      model,
+      promptLength: prompt.length,
+      replyLength: reply.length,
+      inputTokens: usage?.prompt_tokens || 0,
+      outputTokens: usage?.completion_tokens || 0,
+      totalTokens: usage?.total_tokens || 0,
+    });
 
-    return reply;
+    return {
+      content: reply,
+      usage: {
+        inputTokens: usage?.prompt_tokens || 0,
+        outputTokens: usage?.completion_tokens || 0,
+        totalTokens: usage?.total_tokens || 0,
+        model,
+      },
+    };
   } catch (error) {
-    logger.error('Chat completion error:', error);
+    logger.error('[OPENAI] Chat completion error:', error);
     throw new Error('AI chat failed');
   }
 }

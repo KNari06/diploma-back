@@ -9,7 +9,7 @@ import {
   saveTestPlan
 } from '@/services/exploration-cache.service';
 import { generateClarifyingQuestions, parseAnswers } from '@/services/question-generator.service';
-import { formatTestPlanForConfirmation, generateTestPlan } from '@/services/test-plan-generator.service';
+import { formatTestPlanForConfirmation, generateTestPlan, generateIntelligentTestPlan } from '@/services/test-plan-generator.service';
 import { logger } from '@/utils/logger';
 import { webSocketService } from '@/websocket/websocket.service';
 import { ChatProcessingStepPayload } from '@/websocket/types';
@@ -191,12 +191,28 @@ export async function runAutonomousExploration(params: {
       webSocketService.emitChatProcessingStep(sessionId, stepPayload);
     }
 
-    const testPlan = await generateTestPlan(exploration, {
-      message: userMessage,
-      scope: parsedAnswers.scope || 'general',
-      additionalInfo: parsedAnswers.additionalInfo,
+    // Check if this should be intelligent test (for platform_test with scope 'full' or 'flow')
+    const shouldUseIntelligentMode =
+      parsedAnswers.scope === 'full' ||
+      parsedAnswers.scope === 'flow' ||
+      parsedAnswers.scope === 'platform';
+
+    const testPlan = shouldUseIntelligentMode
+      ? await generateIntelligentTestPlan(exploration, {
+          message: userMessage,
+          scope: parsedAnswers.scope || 'general',
+          additionalInfo: parsedAnswers.additionalInfo,
+        })
+      : await generateTestPlan(exploration, {
+          message: userMessage,
+          scope: parsedAnswers.scope || 'general',
+          additionalInfo: parsedAnswers.additionalInfo,
+        });
+
+    logger.info('[AUTONOMOUS] Step 12: Test plan generated', {
+      planId: testPlan.id,
+      intelligentMode: testPlan.intelligentMode || false,
     });
-    logger.info('[AUTONOMOUS] Step 12: Test plan generated', { planId: testPlan.id });
 
     // Save test plan
     await saveTestPlan(testPlan, userId, projectId, explorationId);

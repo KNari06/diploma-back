@@ -24,6 +24,8 @@ export interface TestRunRequest {
   projectId: string;
   userId?: string;
   options?: TestOptions;
+  intelligentMode?: boolean; // NEW: Enable intelligent/adaptive testing
+  testGoal?: string; // NEW: Testing goal for intelligent mode
 }
 
 export interface TestOptions {
@@ -199,6 +201,8 @@ export interface TestJobData {
   retryCount?: number;
   commands?: PlaywrightCommand[]; // Playwright commands to execute
   intent?: string; // Original user intent for context
+  intelligentMode?: boolean; // NEW: Enable intelligent/adaptive testing
+  testGoal?: string; // NEW: Testing goal for intelligent mode
 }
 
 export interface AgentResponse {

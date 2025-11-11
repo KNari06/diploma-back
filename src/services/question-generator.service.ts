@@ -198,7 +198,7 @@ If no additional questions needed, return empty array: []`;
       response_format: { type: 'json_object' },
     });
 
-    const parsed = JSON.parse(response);
+    const parsed = JSON.parse(response.content);
     const questions = Array.isArray(parsed) ? parsed : parsed.questions || [];
 
     logger.info('Generated dynamic questions', {

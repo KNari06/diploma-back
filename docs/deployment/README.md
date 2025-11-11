@@ -7,18 +7,18 @@
 ### SSH команда:
 
 ```bash
-ssh -i /Users/yerassylospanov/Desktop/QAI-BackEnd/gcp root@35.238.212.84
+ssh -i /Users/yerassylospanov/Desktop/QAI-BackEnd/gcp root@34.172.156.158
 ```
 
 **Детали подключения:**
 - **SSH ключ**: `/Users/yerassylospanov/Desktop/QAI-BackEnd/gcp` (в корне проекта)
 - **Пользователь**: `root`
-- **IP адрес**: `35.238.212.84`
+- **IP адрес**: `34.172.156.158`
 
 **Альтернативный вариант (из корня проекта):**
 ```bash
 cd /Users/yerassylospanov/Desktop/QAI-BackEnd
-ssh -i ./gcp root@35.238.212.84
+ssh -i ./gcp root@34.172.156.158
 ```
 
 ## 🔍 Pre-Deployment Checklist

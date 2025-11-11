@@ -27,6 +27,11 @@ export interface TestPlan {
   risks: string[];
   createdAt: string;
   expiresAt: string; // Plan expires after 1 hour
+
+  // Intelligent testing mode
+  intelligentMode?: boolean; // NEW: Flag for intelligent testing
+  estimatedPages?: string; // NEW: Estimated pages for intelligent mode
+  estimatedCost?: string; // NEW: Estimated cost for intelligent mode
 }
 
 /**
@@ -66,7 +71,16 @@ export async function generateTestPlan(
       response_format: { type: 'json_object' },
     });
 
-    const aiPlan = JSON.parse(response);
+    // Extract content from new response format
+    const aiPlan = JSON.parse(response.content);
+
+    // Log token usage for tracking
+    logger.debug('[TEST_PLAN_GENERATOR] AI tokens used', {
+      inputTokens: response.usage.inputTokens,
+      outputTokens: response.usage.outputTokens,
+      totalTokens: response.usage.totalTokens,
+      model: response.usage.model,
+    });
 
     // Generate unique ID
     const planId = `plan_${Date.now()}_${Math.random().toString(36).substring(7)}`;
@@ -202,6 +216,12 @@ Focus on: ${userRequest.scope}`;
  * Returns markdown formatted plan
  */
 export function formatTestPlanForConfirmation(plan: TestPlan): string {
+  // Check if intelligent mode - use special format
+  if (plan.intelligentMode) {
+    return formatIntelligentTestPlan(plan);
+  }
+
+  // Standard test plan format
   let markdown = `# 🧪 Test Plan для подтверждения\n\n`;
   markdown += `**URL:** ${plan.url}\n`;
   markdown += `**Scope:** ${plan.scope}\n`;
@@ -269,4 +289,157 @@ export async function confirmTestPlan(planId: string): Promise<boolean> {
 export async function rejectTestPlan(planId: string, reason?: string): Promise<boolean> {
   logger.info('Test plan rejected', { planId, reason });
   return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTELLIGENT TEST PLAN GENERATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Generate intelligent test plan (surface-level for user approval)
+ * Details will be determined dynamically during execution
+ */
+export async function generateIntelligentTestPlan(
+  explorationResult: ExplorationResult,
+  userRequest: {
+    message: string;
+    scope: string;
+    additionalInfo?: Record<string, any>;
+  }
+): Promise<TestPlan> {
+  try {
+    logger.info('Generating intelligent test plan', {
+      url: explorationResult.url,
+      scope: userRequest.scope,
+    });
+
+    // Generate unique ID
+    const planId = `intelligent_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
+    // Build surface-level plan for approval
+    const testPlan: TestPlan = {
+      id: planId,
+      status: 'pending_confirmation',
+      url: explorationResult.url,
+      scope: userRequest.scope,
+      summary: `Intelligent testing of ${explorationResult.url}. The AI agent will autonomously explore and test the site, adapting to each page dynamically.`,
+      steps: [
+        {
+          id: 'step_1',
+          description: 'Analyze and explore the site',
+          action: 'intelligent_explore',
+          expectedOutcome: 'Understanding of site structure and key pages',
+        },
+        {
+          id: 'step_2',
+          description: 'Execute contextual testing on each page',
+          action: 'intelligent_test',
+          expectedOutcome: 'Comprehensive testing adapted to page context',
+        },
+        {
+          id: 'step_3',
+          description: 'Validate logical dependencies and user flows',
+          action: 'intelligent_validate',
+          expectedOutcome: 'Verification of UX logic and workflows',
+        },
+      ],
+      commands: [], // No static commands - will be generated dynamically
+      estimatedDuration: '1-3 minutes',
+      whatWillBeTested: [
+        'Page navigation and routing',
+        'Interactive elements (buttons, forms, inputs)',
+        'Logical dependencies between elements',
+        'User journey flows',
+        'Visual elements and layouts',
+        'Dynamic content and state changes',
+      ],
+      whatWillNotBeTested: [
+        'Payment processing (requires manual approval)',
+        'Account deletion (safety restriction)',
+        'Email/SMS sending (external systems)',
+        'Third-party integrations',
+      ],
+      risks: [
+        'CAPTCHA may require manual intervention',
+        'Authentication may be needed for protected pages',
+        'Dynamic content may cause unpredictable behavior',
+        'Popups and modals may block automation',
+      ],
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+
+      // Intelligent mode flags
+      intelligentMode: true,
+      estimatedPages: '5-10 pages',
+      estimatedCost: '$0.10-0.20',
+    };
+
+    logger.info('Intelligent test plan generated', {
+      planId,
+      intelligentMode: true,
+    });
+
+    return testPlan;
+  } catch (error) {
+    logger.error('Failed to generate intelligent test plan', { error });
+    throw error;
+  }
+}
+
+/**
+ * Format intelligent test plan for user approval
+ */
+export function formatIntelligentTestPlan(plan: TestPlan): string {
+  return `# 🧠 Intelligent Test Plan for Confirmation
+
+**Plan ID:** \`${plan.id}\`
+**URL:** ${plan.url}
+**Scope:** ${plan.scope}
+**Mode:** 🤖 **Intelligent / Adaptive Testing**
+
+## Summary
+${plan.summary}
+
+## 🔄 How It Works
+
+This intelligent test will:
+1. **Analyze each page dynamically** using GPT-4 Vision + DOM analysis
+2. **Understand page context** and identify critical elements
+3. **Generate actions on-the-fly** based on page type and user goal
+4. **Adapt to changes** in site structure automatically
+5. **Validate results** after each action
+6. **Make smart decisions** about next steps
+
+⚠️ **Important:** Detailed test steps will be determined dynamically during execution based on what the AI agent discovers on each page.
+
+## 📊 Estimates
+
+- **Pages to Analyze:** ${plan.estimatedPages || '5-10 pages'}
+- **Estimated Duration:** ${plan.estimatedDuration}
+- **Estimated Cost:** ${plan.estimatedCost || '$0.10-0.20'}
+
+## ✅ What Will Be Tested
+
+${plan.whatWillBeTested.map(item => `- ${item}`).join('\n')}
+
+## ⚠️ What Will NOT Be Tested
+
+${plan.whatWillNotBeTested.map(item => `- ${item}`).join('\n')}
+
+## 🚨 Potential Risks
+
+${plan.risks.map(risk => `- ${risk}`).join('\n')}
+
+## 🛡️ Safety Features
+
+- Maximum page limit: 10 pages
+- Maximum duration: 5 minutes
+- Automatic detection of dangerous actions (payment, delete, etc.)
+- Real-time progress updates via WebSocket
+
+---
+
+**⏳ Plan expires at:** ${new Date(plan.expiresAt).toLocaleString()}
+
+**Please review and approve this plan to start intelligent testing.**`;
 }

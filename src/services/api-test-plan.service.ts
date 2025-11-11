@@ -61,7 +61,7 @@ export class ApiTestPlanService {
         }
       );
 
-      const testPlan = JSON.parse(response);
+      const testPlan = JSON.parse(response.content);
 
       // Validate and normalize
       const normalized: ApiTestPlan = {

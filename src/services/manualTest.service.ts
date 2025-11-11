@@ -43,6 +43,9 @@ export class ManualTestService {
           // Pass Playwright commands if available
           commands: (testRequest as any).commands,
           intent: (testRequest as any).intent,
+          // NEW: Pass intelligent mode settings
+          intelligentMode: testRequest.intelligentMode,
+          testGoal: testRequest.testGoal,
         });
       }
 

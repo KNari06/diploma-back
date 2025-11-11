@@ -4,6 +4,9 @@ import { devices, Page } from 'playwright';
 import { browserPool } from './browser-pool';
 import { ResultCollector } from './result-collector';
 import { CommandExecutor } from './command-executor';
+import { IntelligentTestOrchestrator } from './intelligent-test-orchestrator';
+import { IntelligentTestConfig } from './types/intelligent-testing.types';
+import { DEFAULT_SAFETY_CONFIG } from './safety-guard';
 
 /**
  * Execute Playwright test
@@ -27,6 +30,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       testId: testData.testId,
       url: testData.url,
       browser: testData.browser,
+      intelligentMode: testData.intelligentMode || false,
     });
 
     // Get browser from pool
@@ -48,6 +52,75 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
     const context = await browser.newContext(contextOptions);
     page = await context.newPage();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // INTELLIGENT MODE: Use IntelligentTestOrchestrator
+    // ═══════════════════════════════════════════════════════════════════════
+    if (testData.intelligentMode) {
+      logger.info('Using Intelligent Testing Mode', {
+        testId: testData.testId,
+        goal: testData.testGoal || testData.intent || 'General testing',
+      });
+
+      // Build intelligent test config
+      const intelligentConfig: IntelligentTestConfig = {
+        mode: 'balanced', // Use balanced mode by default
+        safety: {
+          ...DEFAULT_SAFETY_CONFIG,
+          level: 'normal',
+        },
+        goal: testData.testGoal || testData.intent || 'Test the application',
+        startUrl: testData.url,
+        credentials: testData.options?.credentials,
+        userContext: {
+          projectId: testData.projectId,
+          testId: testData.testId,
+        },
+      };
+
+      // Create orchestrator
+      const orchestrator = new IntelligentTestOrchestrator(
+        intelligentConfig,
+        testData.userId,
+        testData.testId
+      );
+
+      // Execute intelligent test
+      const intelligentResult = await orchestrator.execute(browser, page);
+
+      logger.info('Intelligent test completed', {
+        testId: testData.testId,
+        success: intelligentResult.success,
+        pagesVisited: intelligentResult.pagesVisited,
+        actionsTaken: intelligentResult.actionsTaken,
+        cost: `$${intelligentResult.cost.toFixed(3)}`,
+      });
+
+      // Convert intelligent result to standard format
+      return {
+        success: intelligentResult.success,
+        status: intelligentResult.success ? 'completed' : 'failed',
+        screenshot: intelligentResult.screenshots[0]?.screenshot,
+        dom: '', // DOM will be in page visits
+        logs: [`Intelligent test: ${intelligentResult.summary}`],
+        networkLogs: [],
+        errors: intelligentResult.errors.map(e => ({
+          type: 'other' as const,
+          message: e.message,
+          timestamp: new Date(),
+        })),
+        performance: {
+          pagesVisited: intelligentResult.pagesVisited,
+          actionsTaken: intelligentResult.actionsTaken,
+          duration: intelligentResult.duration,
+          cost: intelligentResult.cost,
+        },
+      };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STANDARD MODE: Execute commands or legacy flow
+    // ═══════════════════════════════════════════════════════════════════════
 
     // Setup result collectors
     collector.setupListeners(page);

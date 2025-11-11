@@ -110,10 +110,8 @@ router.post('/',
  * /api/v1/chat/history:
  *   get:
  *     summary: Получить историю текущего чата пользователя с пагинацией
- *     description: Возвращает историю единственного активного чата пользователя. offset=0 возвращает ПОСЛЕДНИЕ сообщения. Внутри каждой страницы сообщения отсортированы хронологически (старые → новые)
+ *     description: Возвращает историю единственного активного чата пользователя. Поддерживает как авторизованных пользователей (Bearer token), так и анонимных (по IP). offset=0 возвращает ПОСЛЕДНИЕ сообщения. Внутри каждой страницы сообщения отсортированы хронологически (старые → новые)
  *     tags: [Chat]
- *     security:
- *       - bearerAuth: []
  *     parameters:
  *       - in: query
  *         name: limit
@@ -200,10 +198,8 @@ router.get('/history', optionalAuth, asyncHandler(getCurrentChatHistory));
  * /api/v1/chat/sessions:
  *   get:
  *     summary: Получить список чат-сессий пользователя
- *     description: Возвращает список всех чат-сессий текущего пользователя с метаданными
+ *     description: Возвращает список всех чат-сессий текущего пользователя с метаданными. Поддерживает как авторизованных пользователей (Bearer token), так и анонимных (по IP)
  *     tags: [Chat]
- *     security:
- *       - bearerAuth: []
  *     parameters:
  *       - in: query
  *         name: limit
@@ -279,10 +275,8 @@ router.get('/sessions', optionalAuth, asyncHandler(getChatSessions));
  * /api/v1/chat/history/{sessionId}:
  *   get:
  *     summary: Получить историю чата по ID сессии
- *     description: Возвращает все сообщения в указанной чат-сессии
+ *     description: Возвращает все сообщения в указанной чат-сессии. Поддерживает как авторизованных пользователей (Bearer token), так и анонимных (по IP)
  *     tags: [Chat]
- *     security:
- *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: sessionId

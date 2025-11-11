@@ -23,7 +23,7 @@ const options: swaggerJsdoc.Options = {
         description: 'Development server',
       },
       {
-        url: 'http://34.10.193.13:3000',
+        url: 'http://34.172.156.158:3000',
         description: 'Cloud server (GCP)',
       },
       {

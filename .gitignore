@@ -230,3 +230,15 @@ ecosystem.config.js
 .env.production
 .env.test
 !.env.example
+
+# SSH Keys and credentials
+*.pem
+*.key
+*.p12
+*.pfx
+gcp
+gcp-*
+aws-*
+azure-*
+id_rsa*
+id_ed25519*

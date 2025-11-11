@@ -43,7 +43,7 @@ SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
 SUPABASE_BUCKET_NAME=qai-screenshots
 
 # Redis Configuration
-REDIS_URL=redis://localhost:6379
+REDIS_URL=redis://35.202.242.230:6379
 
 # OpenAI Configuration
 OPENAI_API_KEY=your_openai_api_key

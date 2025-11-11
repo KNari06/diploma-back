@@ -19,8 +19,8 @@ const envSchema = z.object({
   SUPABASE_BUCKET_NAME: z.string().default('qai-screenshots'),
 
   // Redis
-  REDIS_URL: z.string().default('redis://localhost:6379'),
-  REDIS_HOST: z.string().default('localhost'),
+  REDIS_URL: z.string().default('redis://35.202.242.230:6379'),
+  REDIS_HOST: z.string().default('35.202.242.230'),
   REDIS_PORT: z.string().transform(Number).default('6379'),
   REDIS_PASSWORD: z.string().optional(),
 

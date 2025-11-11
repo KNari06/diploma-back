@@ -36,7 +36,7 @@ SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
 OPENAI_API_KEY=your_openai_api_key
 
 # Redis (Required)
-REDIS_URL=redis://localhost:6379
+REDIS_URL=redis://35.202.242.230:6379
 
 # Security (Required)
 JWT_SECRET=your_32_character_secret_key_here

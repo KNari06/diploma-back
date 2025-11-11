@@ -35,8 +35,8 @@ PORT=3000
 API_VERSION=v1
 
 # Redis (если используете локальный Redis)
-REDIS_URL=redis://localhost:6379
-REDIS_HOST=localhost
+REDIS_URL=redis://35.202.242.230:6379
+REDIS_HOST=35.202.242.230
 REDIS_PORT=6379
 
 # OpenAI

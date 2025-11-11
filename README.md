@@ -94,7 +94,7 @@ SUPABASE_ANON_KEY=your_supabase_anon_key
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 
 # Redis
-REDIS_URL=redis://localhost:6379
+REDIS_URL=redis://35.202.242.230:6379
 
 # OpenAI
 OPENAI_API_KEY=your_openai_api_key
