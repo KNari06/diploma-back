@@ -22,7 +22,16 @@ const chatRequestSchema = z.object({
  * /api/v1/chat:
  *   post:
  *     summary: Отправить сообщение в AI чат
- *     description: Чат с AI + автоматическое распознавание намерений и выполнение API-тестов
+ *     description: |
+ *       Чат с AI поддерживает:
+ *       - **Intelligent Testing** - автономное тестирование с GPT-4o Vision
+ *       - **API Testing** - тестирование API endpoints
+ *       - **General Chat** - обычный разговор с AI
+ *
+ *       **Чат БЕСПЛАТНЫЙ (0 кредитов)**, кредиты списываются только за тесты:
+ *       - Intelligent тест: 20 кредитов (~50 тестов/месяц за $39)
+ *       - Standard тест: 1 кредит (~1000 тестов/месяц)
+ *       - API тест: 2 кредита (~500 тестов/месяц)
  *     tags: [Chat]
  *     security:
  *       - bearerAuth: []
@@ -40,14 +49,28 @@ const chatRequestSchema = z.object({
  *                 minLength: 1
  *                 maxLength: 5000
  *                 description: Сообщение пользователя
- *                 example: "Проверь, что GET запрос на https://api.example.com/users возвращает статус 200"
+ *                 examples:
+ *                   - "Test my login flow on https://example.com"
+ *                   - "Check GET https://api.example.com/users returns 200"
+ *                   - "How to write better tests?"
  *               context:
- *                 type: string
- *                 description: Дополнительный контекст для RAG (опционально)
+ *                 oneOf:
+ *                   - type: string
+ *                   - type: object
+ *                 description: Дополнительный контекст (projectId, workspaceId)
  *               sessionId:
  *                 type: string
  *                 format: uuid
- *                 description: ID существующей сессии чата (опционально, для продолжения диалога)
+ *                 description: ID существующей сессии чата для продолжения диалога
+ *               conversationId:
+ *                 type: string
+ *                 description: Альтернативный ID для группировки сообщений
+ *               answers:
+ *                 type: object
+ *                 description: Ответы на вопросы AI (credentials, URLs, etc.)
+ *               userId:
+ *                 type: string
+ *                 description: ID пользователя (если не из auth middleware)
  *     responses:
  *       200:
  *         description: Успешный ответ
@@ -58,30 +81,70 @@ const chatRequestSchema = z.object({
  *               properties:
  *                 reply:
  *                   type: string
- *                   example: "✅ Запрос выполнен. Метод: GET, URL: https://api.example.com/users, Код ответа: 200..."
+ *                   description: Ответ AI
  *                 timestamp:
  *                   type: string
  *                   format: date-time
+ *                 sessionId:
+ *                   type: string
+ *                   format: uuid
+ *                   description: ID сессии чата
  *                 parsedIntent:
  *                   type: object
  *                   properties:
  *                     intent:
  *                       type: string
- *                       example: "api_test"
- *                     apiMethod:
+ *                       enum: [platform_test, api_test, general_chat]
+ *                       description: Распознанное намерение
+ *                     scope:
  *                       type: string
- *                       example: "GET"
- *                     apiUrl:
+ *                       enum: [full, page, element, flow, general]
+ *                       description: Область тестирования
+ *                     page:
  *                       type: string
- *                       example: "https://api.example.com/users"
- *                 sessionId:
- *                   type: string
- *                   format: uuid
- *                 apiTestResult:
+ *                       nullable: true
+ *                       description: URL страницы для тестирования
+ *                     target:
+ *                       type: string
+ *                       description: Конкретный элемент или флоу
+ *                     needsAuth:
+ *                       type: boolean
+ *                       description: Требуется ли авторизация
+ *                     intelligentMode:
+ *                       type: boolean
+ *                       description: Использовать ли intelligent testing
+ *                     confidence:
+ *                       type: number
+ *                       description: Уверенность парсинга (0-1)
+ *                 testPlan:
  *                   type: object
- *                   description: Результат API-теста (если был выполнен)
+ *                   description: План тестирования (требует подтверждения)
+ *                   properties:
+ *                     planId:
+ *                       type: string
+ *                     summary:
+ *                       type: string
+ *                     steps:
+ *                       type: array
+ *                       items:
+ *                         type: string
+ *                     estimatedDuration:
+ *                       type: string
+ *                     intelligentMode:
+ *                       type: boolean
+ *                     estimatedCost:
+ *                       type: string
+ *                       description: Стоимость в кредитах
+ *                 creditsRemaining:
+ *                   type: number
+ *                   description: Остаток кредитов после операции
+ *                 chatIsFree:
+ *                   type: boolean
+ *                   description: Указывает что чат бесплатный
  *       400:
  *         description: Ошибка валидации
+ *       402:
+ *         description: Недостаточно кредитов для выполнения теста
  *       500:
  *         description: Ошибка сервера
  */
@@ -93,15 +156,15 @@ router.post('/',
   optionalAuth,           // Check if user is authenticated (optional)
   checkAnonymousLimit,    // Check rate limit for anonymous users
   asyncHandler(async (req: Request, res: Response) => {
-    try {
-      // Validate request body
-      const validatedData = chatRequestSchema.parse(req.body);
+  try {
+    // Validate request body
+    const validatedData = chatRequestSchema.parse(req.body);
 
-      // User ID comes from auth middleware (req.user)
-      await handleChat(req, res);
-    } catch (error) {
-      handleValidationError(error);
-    }
+    // User ID comes from auth middleware (req.user)
+    await handleChat(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
   })
 );
 

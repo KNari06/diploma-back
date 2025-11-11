@@ -13,6 +13,8 @@ const testRunSchema = z.object({
   url: z.string().url('Invalid URL format'),
   browsers: z.array(z.enum(['chrome', 'firefox', 'safari', 'edge', 'mobile-chrome', 'mobile-safari'])).min(1, 'At least one browser is required'),
   projectId: z.string().uuid('Invalid project ID format'),
+  intelligentMode: z.boolean().optional(),
+  testGoal: z.string().optional(),
   options: z.object({
     mobile: z.boolean().optional(),
     viewport: z.object({
@@ -24,6 +26,11 @@ const testRunSchema = z.object({
     waitForSelector: z.string().optional(),
     customScripts: z.array(z.string()).optional(),
     headers: z.record(z.string()).optional(),
+    credentials: z.object({
+      email: z.string().optional(),
+      username: z.string().optional(),
+      password: z.string(),
+    }).optional(),
   }).optional(),
 });
 
@@ -49,10 +56,140 @@ const paginationSchema = z.object({
  * /api/v1/manual-test/run:
  *   post:
  *     summary: Запустить ручной тест
- *     description: Создает и запускает Playwright тест для веб-приложения
+ *     description: |
+ *       Создает и запускает Playwright тест для веб-приложения.
+ *
+ *       **Поддерживает два режима:**
+ *       - **Standard Mode** - выполнение предопределенных команд
+ *       - **Intelligent Mode** - автономное тестирование с GPT-4o Vision
+ *
+ *       **Стоимость:**
+ *       - Standard: 1 кредит
+ *       - Intelligent: 20 кредитов
  *     tags: [Manual Tests]
  *     security:
  *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - url
+ *               - browsers
+ *               - projectId
+ *             properties:
+ *               url:
+ *                 type: string
+ *                 format: uri
+ *                 description: URL страницы для тестирования
+ *                 example: "https://example.com"
+ *               browsers:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                   enum: [chrome, firefox, safari, edge, mobile-chrome, mobile-safari]
+ *                 minItems: 1
+ *                 description: Список браузеров для тестирования
+ *                 example: ["chrome"]
+ *               projectId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: ID проекта
+ *               intelligentMode:
+ *                 type: boolean
+ *                 default: false
+ *                 description: |
+ *                   Включить intelligent testing режим (GPT-4o Vision).
+ *                   Если true - AI автономно исследует и тестирует сайт.
+ *               testGoal:
+ *                 type: string
+ *                 description: |
+ *                   Цель тестирования для intelligent mode.
+ *                   Примеры: "Test login flow", "Check e-commerce cart"
+ *               options:
+ *                 type: object
+ *                 properties:
+ *                   mobile:
+ *                     type: boolean
+ *                     description: Мобильный режим
+ *                   viewport:
+ *                     type: object
+ *                     properties:
+ *                       width:
+ *                         type: number
+ *                       height:
+ *                         type: number
+ *                   timeout:
+ *                     type: number
+ *                     description: Таймаут в миллисекундах
+ *                   retries:
+ *                     type: number
+ *                     description: Количество повторных попыток
+ *                   waitForSelector:
+ *                     type: string
+ *                     description: CSS селектор для ожидания
+ *                   customScripts:
+ *                     type: array
+ *                     items:
+ *                       type: string
+ *                     description: Пользовательские скрипты
+ *                   headers:
+ *                     type: object
+ *                     additionalProperties:
+ *                       type: string
+ *                     description: HTTP заголовки
+ *                   credentials:
+ *                     type: object
+ *                     properties:
+ *                       email:
+ *                         type: string
+ *                       username:
+ *                         type: string
+ *                       password:
+ *                         type: string
+ *                     required:
+ *                       - password
+ *                     description: Учетные данные для авторизации
+ *     responses:
+ *       201:
+ *         description: Тест успешно создан
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     id:
+ *                       type: string
+ *                       format: uuid
+ *                     url:
+ *                       type: string
+ *                     status:
+ *                       type: string
+ *                       enum: [pending, running, completed, failed]
+ *                     browsers:
+ *                       type: array
+ *                       items:
+ *                         type: string
+ *                     intelligentMode:
+ *                       type: boolean
+ *                     created_at:
+ *                       type: string
+ *                       format: date-time
+ *       400:
+ *         description: Ошибка валидации
+ *       401:
+ *         description: Требуется авторизация
+ *       402:
+ *         description: Недостаточно кредитов
+ *       500:
+ *         description: Ошибка сервера
  */
 /**
  * POST /manual-test/run
@@ -72,11 +209,13 @@ router.post('/run', requireAuth, requireCredits(1), asyncHandler(async (req: Req
       projectId: validatedData.projectId,
       userId,
       options: validatedData.options,
+      intelligentMode: validatedData.intelligentMode,
+      testGoal: validatedData.testGoal,
     };
 
     const result = await ManualTestService.runTest(testRequest);
 
-    logger.info(`Test created: ${result.data?.id} for URL: ${validatedData.url}`);
+    logger.info(`Test created: ${result.data?.id} for URL: ${validatedData.url}, intelligentMode: ${validatedData.intelligentMode}`);
 
     res.status(201).json(result);
   } catch (error) {
