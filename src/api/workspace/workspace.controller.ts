@@ -124,10 +124,23 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
 
     logger.info('[WORKSPACE_API] Getting workspaces', {
       userId: effectiveUserId,
-      isAuthenticated: !!userId
+      isAuthenticated: !!userId,
+      clientIp: clientIp,
+      userIp: userIp,
+      requestHeaders: {
+        'user-agent': req.headers['user-agent'],
+        'x-forwarded-for': req.headers['x-forwarded-for'],
+        'x-real-ip': req.headers['x-real-ip']
+      }
     });
 
     const workspaces = await WorkspaceService.getUserWorkspaces(effectiveUserId);
+
+    logger.info('[WORKSPACE_API] Found workspaces', {
+      userId: effectiveUserId,
+      count: workspaces?.length || 0,
+      workspaceIds: workspaces?.map(w => w.id) || []
+    });
 
     res.json({
       success: true,
