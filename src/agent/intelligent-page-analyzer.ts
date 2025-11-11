@@ -15,7 +15,7 @@ import {
   PageType,
 } from './types/intelligent-testing.types';
 import { buildPageAnalysisPrompt, buildLogicAnalysisPrompt } from '@/ai/prompts/intelligent-testing-prompts';
-import { analyzeDOMStructure } from '@/services/dom-analyzer.service';
+import { analyzeDOMStructure } from '@/services/testing/dom-analyzer.service';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 

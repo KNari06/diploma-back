@@ -1,5 +1,5 @@
-import { exploreProduct } from '@/services/autonomous-explorer.service';
-import { retrieveCredentials, storeCredentials } from '@/services/credentials-manager.service';
+import { exploreProduct } from '@/services/testing/autonomous-explorer.service';
+import { retrieveCredentials, storeCredentials } from '@/services/api/credentials-manager.service';
 import {
   confirmTestPlan as confirmPlanInDB,
   getCachedExploration,
@@ -7,9 +7,9 @@ import {
   rejectTestPlan as rejectPlanInDB,
   saveExplorationToCache,
   saveTestPlan
-} from '@/services/exploration-cache.service';
-import { generateClarifyingQuestions, parseAnswers } from '@/services/question-generator.service';
-import { formatTestPlanForConfirmation, generateTestPlan, generateIntelligentTestPlan } from '@/services/test-plan-generator.service';
+} from '@/services/testing/exploration-cache.service';
+import { generateClarifyingQuestions, parseAnswers } from '@/services/utils/question-generator.service';
+import { formatTestPlanForConfirmation, generateTestPlan, generateIntelligentTestPlan } from '@/services/testing/test-plan-generator.service';
 import { logger } from '@/utils/logger';
 import { webSocketService } from '@/websocket/websocket.service';
 import { ChatProcessingStepPayload } from '@/websocket/types';

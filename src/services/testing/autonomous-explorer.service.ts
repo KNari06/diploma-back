@@ -1,7 +1,7 @@
 import { browserPool } from '@/agent';
-import { detectLoginPage } from '@/services/ai-helpers.service';
-import { analyzeDOMStructure } from '@/services/dom-analyzer.service';
-import { analyzeScreenshotWithVision } from '@/services/vision-analyzer.service';
+import { detectLoginPage } from '@/services/ai/ai-helpers.service';
+import { analyzeDOMStructure } from '@/services/testing/dom-analyzer.service';
+import { analyzeScreenshotWithVision } from '@/services/ai/vision-analyzer.service';
 import { logger } from '@/utils/logger';
 import { Page } from 'playwright';
 

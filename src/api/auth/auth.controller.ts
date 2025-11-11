@@ -1,5 +1,5 @@
-import { AnonymousLimiterService } from '@/services/anonymous-limiter.service';
-import { AnonymousMigrationService } from '@/services/anonymous-migration.service';
+import { AnonymousLimiterService } from '@/services/auth/anonymous-limiter.service';
+import { AnonymousMigrationService } from '@/services/auth/anonymous-migration.service';
 import {
   getCurrentUser,
   getOAuthUrl,
@@ -11,7 +11,7 @@ import {
   signUpWithEmail,
   updatePassword,
   updateUserProfile,
-} from '@/services/auth.service';
+} from '@/services/auth/auth.service';
 import { logger } from '@/utils/logger';
 import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 import { Request, Response } from 'express';

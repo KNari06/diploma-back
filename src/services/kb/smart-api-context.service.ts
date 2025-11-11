@@ -1,6 +1,6 @@
 import { logger } from '@/utils/logger';
-import { ApiConfigService } from './api-config.service';
-import { UrlResolverService } from './url-resolver.service';
+import { ApiConfigService } from '../api/api-config.service';
+import { UrlResolverService } from '../utils/url-resolver.service';
 import { ApiEnvironment, ApiEndpoint, IntentResult } from '@/types';
 
 /**

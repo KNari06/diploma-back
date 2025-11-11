@@ -1,5 +1,5 @@
 import { logger } from '@/utils/logger';
-import { ApiConfigService } from './api-config.service';
+import { ApiConfigService } from '../api/api-config.service';
 import { ApiEnvironment } from '@/types';
 
 /**

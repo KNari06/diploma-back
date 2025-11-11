@@ -230,7 +230,7 @@ const startServer = async () => {
   try {
     // Initialize global KB (load into memory)
     try {
-      const { initializeGlobalKB } = await import('@/services/localKB.service');
+      const { initializeGlobalKB } = await import('@/services/kb/localKB.service');
       await initializeGlobalKB();
     } catch (kbError) {
       logger.warn('Failed to initialize global KB, continuing without it', { error: kbError });

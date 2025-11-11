@@ -3,7 +3,7 @@ import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
 import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/intentParserPrompt';
 import { IntentResult, KNOWN_INTENTS } from '@/types';
-import { searchKB, KBSearchResult } from '@/services/kb.service';
+import { searchKB, KBSearchResult } from '@/services/kb/kb.service';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 

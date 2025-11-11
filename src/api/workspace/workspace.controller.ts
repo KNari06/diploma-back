@@ -1,4 +1,4 @@
-import { WorkspaceService } from '@/services/workspace.service';
+import { WorkspaceService } from '@/services/core/workspace.service';
 import { WorkspaceCreateRequest } from '@/types';
 import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 import { logger } from '@/utils/logger';

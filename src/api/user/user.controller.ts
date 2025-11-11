@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
-import { AnonymousLimiterService } from '@/services/anonymous-limiter.service';
-import { UserCreditsService } from '@/services/user-credits.service';
+import { AnonymousLimiterService } from '@/services/auth/anonymous-limiter.service';
+import { UserCreditsService } from '@/services/core/user-credits.service';
 import { PRICING_PLANS } from '@/config/pricing-plans';
 import { logger } from '@/utils/logger';
 import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';

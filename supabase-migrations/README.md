@@ -1,152 +1,176 @@
-# Knowledge Base Migration Guide
+# 🗄️ Supabase Migrations
 
-## 📋 Что делает миграция
+Организованная структура миграций для QAIT Backend.
 
-Создает RAG систему для QAI с двумя базами знаний:
-- **Global KB** - универсальные знания (Playwright, API testing, best practices)
-- **Project KB** - проектные знания (API спеки, кастомные гайды)
+## 📁 Структура
 
-## ✅ Подготовка
+```
+supabase-migrations/
+├── schema/              # Основные схемы БД
+├── features/            # Feature-specific migrations
+├── migrations/          # Data migrations and updates
+├── docs/                # Documentation
+└── archive/             # Старые/устаревшие миграции
+```
 
-### 1. Проверь что основная схема применена
+---
+
+## 📂 Описание папок
+
+### 1️⃣ `schema/` - Основные схемы БД
+
+Полные схемы создания/пересоздания таблиц:
+
+- `recreate-all-tables-with-text-user-id.sql` - Основная схема со всеми таблицами
+
+**Когда использовать:**
+- Новая установка проекта
+- Полное пересоздание БД
+- Major версионные изменения
+
+---
+
+### 2️⃣ `features/` - Функциональные миграции
+
+Миграции для отдельных фич:
+
+- `auth-sync.sql` - Auth синхронизация
+- `jira-oauth.sql` - Jira OAuth интеграция
+- `knowledge-base-safe.sql` - Knowledge Base
+- `playwright-traces.sql` - Playwright trace files
+- `api-configurations.sql` - API конфигурации
+- `workspaces.sql` - Workspace management
+- `default-project.sql` - Default project setup
+- `autonomous-exploration.sql` - Autonomous testing
+- `test-chat-mappings.sql` - Test-chat связи
+- `token-based-credits-system.sql` - Token/credits система
+
+**Когда использовать:**
+- Добавление новой фичи
+- Обновление существующей фичи
+- Feature flags
+
+---
+
+### 3️⃣ `migrations/` - Миграции данных
+
+Миграции для изменения/обновления данных:
+
+- `anonymous-to-auth-migration.sql` - Миграция анонимных → auth
+- `anonymous-chat-limits.sql` - Лимиты для анонимов
+
+**Когда использовать:**
+- Изменение формата данных
+- Массовые обновления
+- Data transformations
+
+---
+
+### 4️⃣ `docs/` - Документация
+
+Документация по миграциям:
+
+- `QUICK_START.md` - Быстрый старт
+- `README_TRACES.md` - Trace файлы документация
+
+**Когда использовать:**
+- Инструкции по применению миграций
+- Troubleshooting guides
+- Examples
+
+---
+
+### 5️⃣ `archive/` - Архив
+
+Устаревшие миграции (для истории):
+
+- Старые версии миграций
+- Deprecated features
+- Legacy schemas
+
+**Когда использовать:**
+- Миграция больше не актуальна
+- Заменена новой версией
+- Только для справки
+
+---
+
+## 🚀 Как использовать
+
+### Новая установка:
+
 ```sql
--- Должны существовать:
-SELECT table_name FROM information_schema.tables
-WHERE table_schema = 'public'
-AND table_name IN ('users', 'projects');
+-- 1. Основная схема
+\i schema/recreate-all-tables-with-text-user-id.sql
+
+-- 2. Фичи (выборочно)
+\i features/auth-sync.sql
+\i features/jira-oauth.sql
+\i features/knowledge-base-safe.sql
 ```
 
-### 2. Проверь vector extension
-```sql
-SELECT * FROM pg_extension WHERE extname = 'vector';
-```
-
-### 3. Проверь что у users есть role column
-```sql
-SELECT column_name, data_type
-FROM information_schema.columns
-WHERE table_name = 'users' AND column_name = 'role';
-```
-
-## 🚀 Применение миграции
-
-### Вариант 1: Через Supabase Dashboard (рекомендуется)
-
-1. Открой Supabase Dashboard
-2. SQL Editor → New Query
-3. Скопируй содержимое `knowledge-base-safe.sql`
-4. Run (F5)
-5. Проверь что все прошло успешно
-
-### Вариант 2: Через Supabase CLI
-
-```bash
-# Из корня проекта
-supabase db push --file supabase-migrations/knowledge-base-safe.sql
-
-# Или напрямую
-psql $DATABASE_URL -f supabase-migrations/knowledge-base-safe.sql
-```
-
-## 🔍 Проверка после применения
+### Обновление существующей БД:
 
 ```sql
--- 1. Таблицы созданы
-SELECT table_name FROM information_schema.tables
-WHERE table_schema = 'public' AND table_name LIKE '%kb_chunks%';
--- Ожидается: global_kb_chunks, project_kb_chunks
-
--- 2. Индексы созданы
-SELECT indexname FROM pg_indexes
-WHERE tablename IN ('global_kb_chunks', 'project_kb_chunks');
--- Должно быть ~8-10 индексов
-
--- 3. RLS включен
-SELECT tablename, rowsecurity FROM pg_tables
-WHERE schemaname = 'public' AND tablename LIKE '%kb_chunks%';
--- Оба должны быть true
-
--- 4. Функции созданы
-SELECT routine_name FROM information_schema.routines
-WHERE routine_schema = 'public' AND routine_name LIKE '%kb%';
--- Ожидается: search_global_kb, search_project_kb, get_kb_stats
-
--- 5. Тест vector
-SELECT '[1,2,3]'::vector(3);
--- Должно вернуть: [1,2,3]
+-- Применить конкретную фичу
+\i features/token-based-credits-system.sql
 ```
 
-## 🔧 Rollback (если что-то пошло не так)
+### Миграция данных:
 
 ```sql
--- ВНИМАНИЕ: Удаляет все данные!
-DROP TABLE IF EXISTS project_kb_chunks CASCADE;
-DROP TABLE IF EXISTS global_kb_chunks CASCADE;
-DROP FUNCTION IF EXISTS search_global_kb CASCADE;
-DROP FUNCTION IF EXISTS search_project_kb CASCADE;
-DROP FUNCTION IF EXISTS get_kb_stats CASCADE;
+-- Мигрировать анонимных юзеров
+\i migrations/anonymous-to-auth-migration.sql
 ```
 
-## 📊 Тест после применения
+---
 
-```bash
-# Запусти сервер
-npm run dev
+## 📋 Правила
 
-# Проверь health endpoint
-curl http://localhost:3000/health
+1. **Именование файлов:**
+   - `kebab-case.sql`
+   - Описательные имена
+   - Версионирование: `v1-feature-name.sql`, `v2-feature-name.sql`
 
-# Проверь KB stats
-curl http://localhost:3000/api/v1/kb/stats \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
+2. **Структура миграции:**
+   ```sql
+   -- =========================================
+   -- Migration: Feature Name
+   -- Created: YYYY-MM-DD
+   -- Description: What this does
+   -- =========================================
+   
+   BEGIN;
+   
+   -- Your SQL here
+   
+   COMMIT;
+   ```
 
-## ⚠️ Важные замечания
+3. **Безопасность:**
+   - Всегда используй `CREATE OR REPLACE` для функций
+   - Используй `IF NOT EXISTS` для таблиц
+   - Используй транзакции `BEGIN/COMMIT`
+   - Проверяй на существование перед DROP
 
-1. **Vector extension** - уже должен быть установлен (из основной схемы)
-2. **HNSW индексы** - могут долго строиться на больших данных (это нормально)
-3. **RLS политики** - используют `auth.uid()`, требуется Supabase Auth
-4. **Admin role** - убедись что у админа `role = 'admin'` в таблице users
+4. **Документация:**
+   - Комментарии на английском
+   - Описание цели миграции
+   - Примеры использования
 
-## 🐛 Troubleshooting
+---
 
-### Ошибка: "extension vector does not exist"
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-```
+## ⚠️ Важно
 
-### Ошибка: "relation users does not exist"
-Сначала примени основную схему: `supabase-schema.sql`
+- **НЕ удаляй** файлы из `schema/` - это основа проекта
+- **НЕ изменяй** примененные миграции - создавай новые
+- **Тестируй локально** перед применением на production
+- **Делай бэкап** перед major миграциями
 
-### Ошибка: "function auth.uid() does not exist"
-Supabase Auth не настроен. Проверь конфигурацию.
+---
 
-### Ошибка при создании HNSW индекса
-```sql
--- Попробуй без HNSW (медленнее, но всегда работает)
-DROP INDEX IF EXISTS idx_global_kb_embedding;
-CREATE INDEX idx_global_kb_embedding ON global_kb_chunks USING ivfflat (embedding vector_cosine_ops);
-```
+## 📞 Помощь
 
-## 📚 Следующие шаги
+Если не уверен какую миграцию применить - спроси в документации или у команды.
 
-1. Создай первого админа:
-```sql
-UPDATE users SET role = 'admin' WHERE email = 'your@email.com';
-```
-
-2. Загрузи глобальные знания:
-```bash
-curl -X POST http://localhost:3000/api/v1/kb/global/upload \
-  -H "Authorization: Bearer ADMIN_TOKEN" \
-  -F "file=@docs/playwright-guide.md" \
-  -F 'tags=["playwright", "testing"]'
-```
-
-3. Тестируй RAG в чате:
-```bash
-curl -X POST http://localhost:3000/api/v1/chat \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Как тестировать API в Playwright?"}'
-```
+**Last updated:** 2025-11-11

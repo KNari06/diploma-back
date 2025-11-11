@@ -9,7 +9,7 @@ import {
   getJiraToken,
   ensureValidToken,
   getJiraProjects,
-} from '@/services/jira.service';
+} from '@/services/api/jira.service';
 
 // In-memory store for OAuth states (in production, use Redis)
 const oauthStates = new Map<string, { userId?: string; expiresAt: number }>();

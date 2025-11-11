@@ -5,7 +5,7 @@
 
 import { Socket } from 'socket.io';
 import { logger } from '@/utils/logger';
-import * as AuthService from '@/services/auth.service';
+import * as AuthService from '@/services/auth/auth.service';
 import { SocketData } from './types';
 
 /**

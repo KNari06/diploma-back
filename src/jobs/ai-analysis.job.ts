@@ -1,7 +1,7 @@
 import { Job } from 'bullmq';
 import { logger, logQueueEvent, logAIAnalysis } from '@/utils/logger';
 import { handleAIError } from '@/utils/error-handler';
-import { aiService } from '@/services/ai.service';
+import { aiService } from '@/services/ai/ai.service';
 import { dbAdminService } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
 import { webSocketService } from '@/websocket/websocket.service';

@@ -4,27 +4,27 @@ import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 
 // New services
-import { ApiTestPlanService } from '@/services/api-test-plan.service';
-import { CredentialsParserService } from '@/services/credentials-parser.service';
-import { ProjectContextService } from '@/services/project-context.service';
-import { TestChatMappingService } from '@/services/test-chat-mapping.service';
-import { TestCompletionHandlerService } from '@/services/test-completion-handler.service';
-import { WorkspaceService } from '@/services/workspace.service';
+import { ApiTestPlanService } from '@/services/testing/api-test-plan.service';
+import { CredentialsParserService } from '@/services/api/credentials-parser.service';
+import { ProjectContextService } from '@/services/utils/project-context.service';
+import { TestChatMappingService } from '@/services/testing/test-chat-mapping.service';
+import { TestCompletionHandlerService } from '@/services/testing/test-completion-handler.service';
+import { WorkspaceService } from '@/services/core/workspace.service';
 
 // Existing services
-import { ChatService } from '@/services/chat.service';
-import { detectUserApproval } from '@/services/ai-helpers.service';
-import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/autonomous-orchestrator.service';
-import { extractUrlFromMessage } from '@/services/context-enrichment.service';
-import { getTestPlan, saveTestPlan } from '@/services/exploration-cache.service';
-import { parseUserIntent } from '@/services/intentParser.service';
-import { searchKB } from '@/services/kb.service';
-import { ManualTestService } from '@/services/manualTest.service';
-import { getChatCompletion, getChatCompletionWithMessages } from '@/services/openai.service';
-import { UserCreditsService } from '@/services/user-credits.service';
-import { CreditCostTrackerService } from '@/services/credit-cost-tracker.service';
-import { TokenCalculatorService } from '@/services/token-calculator.service';
-import { executeApiTest } from '@/services/apiTest.service';
+import { ChatService } from '@/services/utils/chat.service';
+import { detectUserApproval } from '@/services/ai/ai-helpers.service';
+import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/testing/autonomous-orchestrator.service';
+import { extractUrlFromMessage } from '@/services/kb/context-enrichment.service';
+import { getTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
+import { parseUserIntent } from '@/services/ai/intentParser.service';
+import { searchKB } from '@/services/kb/kb.service';
+import { ManualTestService } from '@/services/testing/manualTest.service';
+import { getChatCompletion, getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { UserCreditsService } from '@/services/core/user-credits.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { executeApiTest } from '@/services/testing/apiTest.service';
 
 // Types
 import { ChatProcessingStepPayload, ChatTestUpdatePayload } from '@/websocket/types';

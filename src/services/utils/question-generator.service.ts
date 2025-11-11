@@ -1,5 +1,5 @@
 import { logger } from '@/utils/logger';
-import { getChatCompletionWithMessages } from '@/services/openai.service';
+import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 
 /**
  * Question types for user clarification

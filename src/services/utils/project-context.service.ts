@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/logger';
-import { CredentialsParserService, Credentials } from './credentials-parser.service';
+import { CredentialsParserService, Credentials } from '../api/credentials-parser.service';
 
 /**
  * Project Settings interface

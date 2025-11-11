@@ -1,7 +1,7 @@
 import { logger } from '@/utils/logger';
 import { PlaywrightCommand } from '@/types';
-import { ExplorationResult } from '@/services/autonomous-explorer.service';
-import { getChatCompletionWithMessages } from '@/services/openai.service';
+import { ExplorationResult } from '@/services/testing/autonomous-explorer.service';
+import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 
 /**
  * Test plan with user confirmation

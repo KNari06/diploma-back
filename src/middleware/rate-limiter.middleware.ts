@@ -1,5 +1,5 @@
-import { AnonymousLimiterService } from '@/services/anonymous-limiter.service';
-import { UserCreditsService } from '@/services/user-credits.service';
+import { AnonymousLimiterService } from '@/services/auth/anonymous-limiter.service';
+import { UserCreditsService } from '@/services/core/user-credits.service';
 import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 import { logger } from '@/utils/logger';
 import { NextFunction, Request, Response } from 'express';

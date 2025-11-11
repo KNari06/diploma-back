@@ -1,10 +1,10 @@
 import { logger } from '@/utils/logger';
-import { searchKB } from '@/services/kb.service';
+import { searchKB } from '@/services/kb/kb.service';
 import {
   findTracesByUrl,
   extractSelectorsFromTraces,
   formatTracesForPrompt
-} from '@/services/trace-context.service';
+} from '@/services/utils/trace-context.service';
 import { IntentParserContext } from '@/ai/prompts/intentParserPrompt';
 
 /**

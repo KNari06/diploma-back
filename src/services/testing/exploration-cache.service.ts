@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/logger';
-import { ExplorationResult } from '@/services/autonomous-explorer.service';
-import { TestPlan } from '@/services/test-plan-generator.service';
+import { ExplorationResult } from '@/services/testing/autonomous-explorer.service';
+import { TestPlan } from '@/services/testing/test-plan-generator.service';
 
 /**
  * Save exploration result to cache

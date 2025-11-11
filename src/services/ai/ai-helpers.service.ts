@@ -1,7 +1,7 @@
-import { Page } from 'playwright';
-import { logger } from '@/utils/logger';
-import { getChatCompletionWithMessages } from '@/services/openai.service';
 import { buildApprovalDetectionPrompt } from '@/ai/prompts/index';
+import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { logger } from '@/utils/logger';
+import { Page } from 'playwright';
 
 /**
  * AI-powered helper functions

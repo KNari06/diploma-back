@@ -1,8 +1,8 @@
 import { Request, Response } from 'express';
 import { logger } from '@/utils/logger';
 import { errorResponse, successResponse } from '@/utils/error-handler';
-import * as kbService from '@/services/kb.service';
-import { rebuildGlobalKB, getLocalKBStats } from '@/services/localKB.service';
+import * as kbService from '@/services/kb/kb.service';
+import { rebuildGlobalKB, getLocalKBStats } from '@/services/kb/localKB.service';
 import { supabase } from '@/db/supabase';
 
 /**

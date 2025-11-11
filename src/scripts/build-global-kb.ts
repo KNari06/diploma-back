@@ -7,7 +7,7 @@
  *   ts-node -r tsconfig-paths/register src/scripts/build-global-kb.ts
  */
 
-import { generateEmbeddings } from '@/services/embedding.service';
+import { generateEmbeddings } from '@/services/ai/embedding.service';
 import { chunkMarkdown } from '@/utils/chunking';
 import dotenv from 'dotenv';
 import fs from 'fs/promises';

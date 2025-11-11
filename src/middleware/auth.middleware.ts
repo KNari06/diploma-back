@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { verifyToken } from '@/services/auth.service';
+import { verifyToken } from '@/services/auth/auth.service';
 import { logger } from '@/utils/logger';
 import { AuthUser } from '@/types';
 import { supabaseAdmin } from '@/db/supabase';

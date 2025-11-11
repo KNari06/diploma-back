@@ -1,5 +1,5 @@
 import { optionalAuth, requireAuth, requireCredits } from '@/middleware/auth.middleware';
-import { ManualTestService } from '@/services/manualTest.service';
+import { ManualTestService } from '@/services/testing/manualTest.service';
 import { TestRunRequest } from '@/types';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { logger } from '@/utils/logger';

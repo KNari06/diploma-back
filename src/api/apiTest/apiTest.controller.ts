@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { executeApiTest } from '@/services/apiTest.service';
+import { executeApiTest } from '@/services/testing/apiTest.service';
 import { logger } from '@/utils/logger';
 import { ApiTestRequest } from '@/types';
 

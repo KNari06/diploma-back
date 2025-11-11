@@ -3,7 +3,7 @@ import { chunkMarkdown, chunkText } from '@/utils/chunking';
 import { getFileSizeMB, isValidFileType, parseFile } from '@/utils/fileParser';
 import { logger } from '@/utils/logger';
 import { promises as fs } from 'fs';
-import { generateEmbedding, generateEmbeddings } from './embedding.service';
+import { generateEmbedding, generateEmbeddings } from '../ai/embedding.service';
 import { searchLocalGlobalKB } from './localKB.service';
 
 const MAX_FILE_SIZE_MB = 10; // Maximum file size
