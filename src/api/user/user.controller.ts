@@ -88,7 +88,7 @@ export const getUserCredits = async (req: Request, res: Response): Promise<void>
     res.status(500).json({
       success: false,
       error: 'Failed to get credits information',
-      message: 'Не удалось получить информацию о кредитах',
+      message: 'Failed to get credits information',
       timestamp: new Date().toISOString(),
     });
   }
@@ -108,7 +108,7 @@ export const resetUserCredits = async (req: Request, res: Response): Promise<voi
       res.status(400).json({
         success: false,
         error: 'Unable to determine IP address',
-        message: 'Не удалось определить IP адрес для сброса',
+        message: 'Failed to determine IP address for reset',
       });
       return;
     }
@@ -119,7 +119,7 @@ export const resetUserCredits = async (req: Request, res: Response): Promise<voi
 
     res.json({
       success: true,
-      message: '✅ Лимит успешно сброшен',
+      message: '✅ Limit reset successfully',
       anonymousId,
       timestamp: new Date().toISOString(),
     });
@@ -129,7 +129,7 @@ export const resetUserCredits = async (req: Request, res: Response): Promise<voi
     res.status(500).json({
       success: false,
       error: 'Failed to reset credits',
-      message: 'Не удалось сбросить лимит',
+      message: 'Failed to reset limit',
       timestamp: new Date().toISOString(),
     });
   }
@@ -147,7 +147,7 @@ export const purchaseCredits = async (req: Request, res: Response): Promise<void
       res.status(401).json({
         success: false,
         error: 'Unauthorized',
-        message: 'Требуется авторизация',
+        message: 'Authorization required',
       });
       return;
     }
@@ -158,7 +158,7 @@ export const purchaseCredits = async (req: Request, res: Response): Promise<void
       res.status(400).json({
         success: false,
         error: 'Invalid amount',
-        message: 'Некорректное количество кредитов',
+        message: 'Invalid credit amount',
       });
       return;
     }
@@ -177,14 +177,14 @@ export const purchaseCredits = async (req: Request, res: Response): Promise<void
       res.status(500).json({
         success: false,
         error: 'Purchase failed',
-        message: 'Не удалось купить кредиты',
+        message: 'Failed to purchase credits',
       });
       return;
     }
 
     res.json({
       success: true,
-      message: `✅ Успешно куплено ${amount} кредитов`,
+      message: `✅ Successfully purchased ${amount} credits`,
       credits: {
         balance: result.newBalance,
         purchased: amount,
@@ -197,7 +197,7 @@ export const purchaseCredits = async (req: Request, res: Response): Promise<void
     res.status(500).json({
       success: false,
       error: 'Purchase failed',
-      message: 'Ошибка при покупке кредитов',
+      message: 'Error purchasing credits',
       timestamp: new Date().toISOString(),
     });
   }
@@ -215,7 +215,7 @@ export const getCreditHistory = async (req: Request, res: Response): Promise<voi
       res.status(401).json({
         success: false,
         error: 'Unauthorized',
-        message: 'Требуется авторизация',
+        message: 'Authorization required',
       });
       return;
     }
@@ -238,7 +238,7 @@ export const getCreditHistory = async (req: Request, res: Response): Promise<voi
     res.status(500).json({
       success: false,
       error: 'Failed to get history',
-      message: 'Не удалось получить историю',
+      message: 'Failed to get history',
       timestamp: new Date().toISOString(),
     });
   }
@@ -264,7 +264,7 @@ export const getPricingPlans = async (req: Request, res: Response): Promise<void
     res.status(500).json({
       success: false,
       error: 'Failed to get pricing plans',
-      message: 'Не удалось получить тарифные планы',
+      message: 'Failed to get pricing plans',
       timestamp: new Date().toISOString(),
     });
   }

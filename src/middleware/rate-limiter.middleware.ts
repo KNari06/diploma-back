@@ -1,8 +1,8 @@
-import { Request, Response, NextFunction } from 'express';
 import { AnonymousLimiterService } from '@/services/anonymous-limiter.service';
 import { UserCreditsService } from '@/services/user-credits.service';
-import { logger } from '@/utils/logger';
 import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
+import { logger } from '@/utils/logger';
+import { NextFunction, Request, Response } from 'express';
 
 /**
  * Check if user is authenticated (has valid UUID)
@@ -41,7 +41,7 @@ export const checkAnonymousLimit = async (
         res.status(402).json({
           success: false,
           error: 'Insufficient credits',
-          message: '💳 У вас недостаточно кредитов. Пожалуйста, купите кредиты для продолжения.',
+          message: '💳 You have insufficient credits. Please purchase credits to continue.',
           credits: {
             balance: userCredits?.credits_balance || 0,
             required: 1,
@@ -74,13 +74,13 @@ export const checkAnonymousLimit = async (
       res.status(429).json({
         success: false,
         error: 'Rate limit exceeded',
-        message: '🔒 Вы достигли лимита в 3 сообщения для анонимных пользователей.\n\n✨ Авторизуйтесь для неограниченного доступа к чату!',
+        message: '🔒 You have reached the limit of 3 messages for anonymous users.\n\n✨ Sign in for unlimited chat access!',
         rateLimitInfo: {
           limit: limitInfo.limit,
           current: limitInfo.current,
           remaining: 0,
           requiresAuth: true,
-          authMessage: 'Войдите или зарегистрируйтесь, чтобы продолжить использование QAIT',
+          authMessage: 'Sign in or register to continue using QAIT',
         },
         timestamp: new Date().toISOString(),
       });

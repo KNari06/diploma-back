@@ -22,7 +22,7 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
       res.status(400).json({
         success: false,
         error: 'Unable to identify user',
-        message: 'Не удалось идентифицировать пользователя',
+        message: 'Failed to identify user',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -46,7 +46,7 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
       res.status(400).json({
         success: false,
         error: 'Missing required field: project_name',
-        message: 'Поле project_name обязательно',
+        message: 'Field project_name is required',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -56,7 +56,7 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
       res.status(400).json({
         success: false,
         error: 'Missing or invalid field: platforms',
-        message: 'Поле platforms должно быть непустым массивом',
+        message: 'Field platforms must be a non-empty array',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -66,7 +66,7 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
       res.status(400).json({
         success: false,
         error: 'Missing required field: devBaseUrl',
-        message: 'Поле devBaseUrl обязательно',
+        message: 'Field devBaseUrl is required',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -84,7 +84,7 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
     res.status(201).json({
       success: true,
       data: workspace,
-      message: 'Workspace успешно создан',
+      message: 'Workspace created successfully',
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -92,7 +92,7 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to create workspace',
-      message: 'Не удалось создать workspace',
+      message: 'Failed to create workspace',
       timestamp: new Date().toISOString(),
     });
   }
@@ -116,7 +116,7 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
       res.status(400).json({
         success: false,
         error: 'Unable to identify user',
-        message: 'Не удалось идентифицировать пользователя',
+        message: 'Failed to identify user',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -140,7 +140,7 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to get workspaces',
-      message: 'Не удалось получить workspaces',
+      message: 'Failed to get workspaces',
       timestamp: new Date().toISOString(),
     });
   }
