@@ -2,11 +2,11 @@ import { TestJobData } from '@/types';
 import { logger } from '@/utils/logger';
 import { devices, Page } from 'playwright';
 import { browserPool } from './browser-pool';
-import { ResultCollector } from './result-collector';
 import { CommandExecutor } from './command-executor';
 import { IntelligentTestOrchestrator } from './intelligent-test-orchestrator';
-import { IntelligentTestConfig } from './types/intelligent-testing.types';
+import { ResultCollector } from './result-collector';
 import { DEFAULT_SAFETY_CONFIG } from './safety-guard';
+import { IntelligentTestConfig } from './types/intelligent-testing.types';
 
 /**
  * Execute Playwright test
@@ -95,6 +95,38 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         actionsTaken: intelligentResult.actionsTaken,
         cost: `$${intelligentResult.cost.toFixed(3)}`,
       });
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // SAVE TO SPECIALIZED INTELLIGENT TEST TABLES
+      // ═══════════════════════════════════════════════════════════════════════
+      try {
+        const { IntelligentTestStorageService } = await import('@/services/testing/intelligent-test-storage.service');
+
+        await IntelligentTestStorageService.saveTestSession({
+          testId: testData.testId,
+          userId: testData.userId || 'anonymous',
+          projectId: testData.projectId,
+          result: intelligentResult,
+          config: {
+            goal: intelligentConfig.goal,
+            startUrl: intelligentConfig.startUrl,
+            mode: intelligentConfig.mode,
+            browser: testData.browser || 'chrome',
+            viewport: testData.options?.viewport,
+            credentialsUsed: !!testData.options?.credentials,
+          },
+        });
+
+        logger.info('[PLAYWRIGHT] Intelligent test data saved to specialized tables', {
+          testId: testData.testId,
+        });
+      } catch (storageError) {
+        logger.error('[PLAYWRIGHT] Failed to save intelligent test data', {
+          error: storageError,
+          testId: testData.testId,
+        });
+        // Don't fail the test if storage fails
+      }
 
       // Convert intelligent result to standard format
       return {

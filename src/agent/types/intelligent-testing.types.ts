@@ -149,7 +149,8 @@ export interface PageVisit {
   url: string;
   pageType: PageType;
   timestamp: number;
-  actions: DynamicAction[];
+  actions: DynamicAction[]; // Planned actions
+  actionResults?: ActionResult[]; // Actual execution results
   success: boolean;
 }
 

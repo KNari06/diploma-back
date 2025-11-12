@@ -2,6 +2,7 @@ import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import authRoutes from '@/api/auth/auth.route';
 import chatRoutes from '@/api/chat/chat.route';
+import intelligentTestRoutes from '@/api/intelligentTest/intelligentTest.route';
 import jiraRoutes from '@/api/jira/jira.route';
 import kbRoutes from '@/api/kb/kb.route';
 import manualTestRoutes from '@/api/manualTest/manualTest.route';
@@ -185,6 +186,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
 app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes);
 app.use(`/api/${env.API_VERSION}/manual-test`, manualTestRoutes);
+app.use(`/api/${env.API_VERSION}/intelligent-test`, intelligentTestRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
 app.use(`/api/${env.API_VERSION}/api-config`, apiConfigRoutes);

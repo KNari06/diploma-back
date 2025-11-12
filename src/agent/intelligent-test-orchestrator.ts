@@ -489,7 +489,8 @@ export class IntelligentTestOrchestrator {
       url: context.url,
       pageType: context.pageType,
       timestamp: context.timestamp,
-      actions,
+      actions, // Planned actions
+      actionResults: completedActions, // Actual execution results
       success,
     };
   }
