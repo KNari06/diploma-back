@@ -134,7 +134,26 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
       }
     });
 
-    const workspaces = await WorkspaceService.getUserWorkspaces(effectiveUserId);
+    let workspaces = await WorkspaceService.getUserWorkspaces(effectiveUserId);
+
+    // Auto-create workspace if none found (for both authenticated and anonymous users)
+    if (!workspaces || workspaces.length === 0) {
+      logger.info('[WORKSPACE_API] No workspaces found, creating default workspace', {
+        userId: effectiveUserId,
+        isAuthenticated: !!userId
+      });
+
+      const { workspace_id } = await WorkspaceService.checkOrCreateWorkspace(effectiveUserId);
+
+      // Fetch the newly created workspace
+      workspaces = await WorkspaceService.getUserWorkspaces(effectiveUserId);
+
+      logger.info('[WORKSPACE_API] Created default workspace', {
+        userId: effectiveUserId,
+        workspaceId: workspace_id,
+        count: workspaces?.length || 0
+      });
+    }
 
     logger.info('[WORKSPACE_API] Found workspaces', {
       userId: effectiveUserId,

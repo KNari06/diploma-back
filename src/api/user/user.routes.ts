@@ -166,12 +166,31 @@ router.get('/credits/history', requireAuth, asyncHandler(getCreditHistory));
  * @swagger
  * /api/v1/user/pricing-plans:
  *   get:
- *     summary: Получить список тарифных планов
- *     description: Публичный endpoint - доступен без авторизации. Возвращает все доступные тарифные планы с ценами и описанием.
+ *     summary: Get enhanced pricing plans with multiple credit options
+ *     description: Public endpoint - available without authorization. Returns all available pricing plans with flexible credit options, metadata, and filtering support.
  *     tags: [User]
+ *     parameters:
+ *       - in: query
+ *         name: currency
+ *         schema:
+ *           type: string
+ *           enum: [USD, EUR, KZT]
+ *         description: Filter plans by currency
+ *       - in: query
+ *         name: billing_period
+ *         schema:
+ *           type: string
+ *           enum: [monthly, yearly, custom]
+ *         description: Filter plans by billing period
+ *       - in: query
+ *         name: active_only
+ *         schema:
+ *           type: boolean
+ *           default: true
+ *         description: Show only active plans
  *     responses:
  *       200:
- *         description: Список тарифных планов
+ *         description: Enhanced pricing plans with credit options
  *         content:
  *           application/json:
  *             schema:
@@ -190,9 +209,12 @@ router.get('/credits/history', requireAuth, asyncHandler(getCreditHistory));
  *                         type: string
  *                       description:
  *                         type: string
- *                       credits:
- *                         type: number
- *                       price:
+ *                       type:
+ *                         type: string
+ *                         enum: [free, paid, custom]
+ *                       popular:
+ *                         type: boolean
+ *                       discount:
  *                         type: number
  *                       currency:
  *                         type: string
@@ -200,17 +222,63 @@ router.get('/credits/history', requireAuth, asyncHandler(getCreditHistory));
  *                         type: array
  *                         items:
  *                           type: string
- *                       popular:
+ *                       credit_options:
+ *                         type: array
+ *                         items:
+ *                           type: object
+ *                           properties:
+ *                             credits:
+ *                               type: number
+ *                             price:
+ *                               type: number
+ *                             price_per_credit:
+ *                               type: number
+ *                             is_default:
+ *                               type: boolean
+ *                             billing_period:
+ *                               type: string
+ *                             description:
+ *                               type: string
+ *                             savings:
+ *                               type: number
+ *                       limitations:
+ *                         type: array
+ *                         items:
+ *                           type: string
+ *                       contact_required:
  *                         type: boolean
- *                       discount:
- *                         type: number
- *                 count:
- *                   type: number
+ *                       contact_info:
+ *                         type: object
+ *                         properties:
+ *                           email:
+ *                             type: string
+ *                           phone:
+ *                             type: string
+ *                           calendar_link:
+ *                             type: string
+ *                 metadata:
+ *                   type: object
+ *                   properties:
+ *                     count:
+ *                       type: number
+ *                     currency_options:
+ *                       type: array
+ *                       items:
+ *                         type: string
+ *                     billing_periods:
+ *                       type: array
+ *                       items:
+ *                         type: string
+ *                     last_updated:
+ *                       type: string
+ *                       format: date-time
  *                 timestamp:
  *                   type: string
  *                   format: date-time
+ *       400:
+ *         description: Invalid request parameters
  *       500:
- *         description: Ошибка сервера
+ *         description: Server error
  */
 router.get('/pricing-plans', asyncHandler(getPricingPlans));
 

@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { AnonymousLimiterService } from '@/services/auth/anonymous-limiter.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
-import { PRICING_PLANS } from '@/config/pricing-plans';
+import { PRICING_PLANS, PRICING_METADATA } from '@/config/pricing-plans';
 import { logger } from '@/utils/logger';
 import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 
@@ -247,15 +247,65 @@ export const getCreditHistory = async (req: Request, res: Response): Promise<voi
 /**
  * GET /api/v1/user/pricing-plans
  * Get available pricing plans (public endpoint, no auth required)
+ * Query params: currency, billing_period, active_only
  */
 export const getPricingPlans = async (req: Request, res: Response): Promise<void> => {
   try {
-    logger.info('[PRICING] Getting pricing plans');
+    const { currency, billing_period, active_only = 'true' } = req.query;
 
+    logger.info('[PRICING] Getting pricing plans', {
+      currency,
+      billing_period,
+      active_only,
+    });
+
+    // Validate currency if provided
+    if (currency && !PRICING_METADATA.currency_options.includes(currency as any)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid currency',
+        code: 'INVALID_CURRENCY',
+        message: `Currency must be one of: ${PRICING_METADATA.currency_options.join(', ')}`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate billing_period if provided
+    if (billing_period && !PRICING_METADATA.billing_periods.includes(billing_period as any)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid billing period',
+        code: 'INVALID_BILLING_PERIOD',
+        message: `Billing period must be one of: ${PRICING_METADATA.billing_periods.join(', ')}`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Filter plans based on query parameters
+    let filteredPlans = [...PRICING_PLANS];
+
+    if (currency) {
+      filteredPlans = filteredPlans.filter((plan) => plan.currency === currency);
+    }
+
+    if (billing_period) {
+      filteredPlans = filteredPlans.filter((plan) =>
+        plan.credit_options.some((opt) => opt.billing_period === billing_period)
+      );
+    }
+
+    // Return enhanced structure with metadata
     res.json({
       success: true,
-      plans: PRICING_PLANS,
-      count: PRICING_PLANS.length,
+      plans: filteredPlans,
+      metadata: {
+        count: filteredPlans.length,
+        currency_options: PRICING_METADATA.currency_options,
+        billing_periods: PRICING_METADATA.billing_periods,
+        last_updated: new Date().toISOString(),
+      },
       timestamp: new Date().toISOString(),
     });
 
@@ -264,6 +314,7 @@ export const getPricingPlans = async (req: Request, res: Response): Promise<void
     res.status(500).json({
       success: false,
       error: 'Failed to get pricing plans',
+      code: 'SERVER_ERROR',
       message: 'Failed to get pricing plans',
       timestamp: new Date().toISOString(),
     });

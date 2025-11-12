@@ -1,10 +1,11 @@
-import { v4 as uuidv4 } from 'uuid';
-import { logger, logTestEvent } from '@/utils/logger';
-import { ValidationError, NotFoundError, TestRunRequest, Test, TestResult, BrowserType, ApiResponse, PaginatedResponse } from '@/types';
-import { dbAdminService, dbService, supabaseAdmin } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
-import { webSocketService } from '@/websocket/websocket.service';
+import { dbAdminService, dbService, supabaseAdmin } from '@/db/supabase';
+import { WorkspaceService } from '@/services/core/workspace.service';
+import { ApiResponse, BrowserType, NotFoundError, PaginatedResponse, Test, TestResult, TestRunRequest, ValidationError } from '@/types';
+import { logger, logTestEvent } from '@/utils/logger';
 import { TestCreatedPayload } from '@/websocket/types';
+import { webSocketService } from '@/websocket/websocket.service';
+import { v4 as uuidv4 } from 'uuid';
 import { TestCompletionHandlerService } from './test-completion-handler.service';
 
 export class ManualTestService {
@@ -374,17 +375,29 @@ export class ManualTestService {
    * Create test record
    */
   private static async createTest(testRequest: TestRunRequest): Promise<Test> {
-    // Validate userId is a valid UUID, otherwise use null
+    // Determine effective user ID (authenticated user or anonymous IP)
+    const effectiveUserId = testRequest.userId || 'anonymous-user';
+
+    logger.info('[MANUAL_TEST] Creating test for user', {
+      originalUserId: testRequest.userId,
+      effectiveUserId,
+      isAuthenticated: !!testRequest.userId
+    });
+
+    // Validate userId is a valid UUID for database storage
     const isValidUUID = testRequest.userId && testRequest.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     const validUserId = isValidUUID ? testRequest.userId : null;
 
-    // Validate projectId is a valid UUID, otherwise get/create default project
+    // Validate projectId is a valid UUID, otherwise get/create user project
     const isValidProjectUUID = testRequest.projectId && testRequest.projectId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     let validProjectId = isValidProjectUUID ? testRequest.projectId : null;
 
     if (!validProjectId) {
-      logger.warn('Invalid projectId provided, getting default project', { projectId: testRequest.projectId });
-      validProjectId = await this.getOrCreateDefaultProject();
+      logger.info('[MANUAL_TEST] No valid projectId provided, creating user project', {
+        projectId: testRequest.projectId,
+        effectiveUserId
+      });
+      validProjectId = await this.getOrCreateUserProject(effectiveUserId);
     }
 
     const testData = {
@@ -413,100 +426,75 @@ export class ManualTestService {
   }
 
   /**
-   * Get or create default project for anonymous users
+   * Get or create project for user (both authenticated and anonymous)
+   * Each user gets their own unique project for data isolation
    */
-  private static async getOrCreateDefaultProject(): Promise<string> {
-    const DEFAULT_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
-    const DEFAULT_WORKSPACE_ID = '00000000-0000-0000-0000-000000000001';
-
+  private static async getOrCreateUserProject(userId: string): Promise<string> {
     try {
-      // Check if default project exists
+      logger.info('[MANUAL_TEST] Getting/creating project for user', { userId });
+
+      // First, ensure user has a workspace
+      const { workspace_id } = await WorkspaceService.checkOrCreateWorkspace(userId);
+
+      logger.info('[MANUAL_TEST] Workspace ensured', { userId, workspaceId: workspace_id });
+
+      // Check if user already has a project in this workspace
       const { data: existingProject } = await supabaseAdmin
         .from('projects')
-        .select('id')
-        .eq('id', DEFAULT_PROJECT_ID)
-        .single();
+        .select('id, name')
+        .eq('user_id', userId)
+        .eq('workspace_id', workspace_id)
+        .maybeSingle();
 
       if (existingProject) {
-        return DEFAULT_PROJECT_ID;
+        logger.info('[MANUAL_TEST] Found existing project', {
+          userId,
+          projectId: existingProject.id,
+          projectName: existingProject.name
+        });
+        return existingProject.id;
       }
 
-      // Check if workspaces table exists
-      const { error: workspaceTableError } = await supabaseAdmin
-        .from('workspaces')
-        .select('id')
-        .limit(1);
+      // Create new project for user
+      const isValidUUID = userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+      const projectName = isValidUUID
+        ? 'My Testing Project'
+        : `Testing Project (${userId.substring(0, 8)}...)`;
 
-      let workspaceId: string | undefined = undefined;
-
-      // Only use workspace if table exists
-      if (!workspaceTableError || workspaceTableError.code !== '42P01') {
-        // Ensure default workspace exists
-        const { data: existingWorkspace } = await supabaseAdmin
-          .from('workspaces')
-          .select('id')
-          .eq('id', DEFAULT_WORKSPACE_ID)
-          .maybeSingle();
-
-        workspaceId = DEFAULT_WORKSPACE_ID;
-
-        if (!existingWorkspace) {
-          // Create default workspace for system/anonymous users
-          const { error: workspaceError } = await supabaseAdmin
-            .from('workspaces')
-            .insert({
-              id: DEFAULT_WORKSPACE_ID,
-              name: 'Default Workspace (Anonymous)',
-              user_id: DEFAULT_PROJECT_ID, // System user ID
-              platforms: ['web(chrome, safari, firefox)'],
-              api_testing: false,
-              dev_base_url: null,
-              prod_base_url: null,
-              settings: {},
-            })
-            .select()
-            .single();
-
-          if (workspaceError) {
-            logger.error('Failed to create default workspace', workspaceError);
-            throw workspaceError;
-          }
-
-          logger.info('Created default workspace for anonymous users', { id: DEFAULT_WORKSPACE_ID });
-        }
-      } else {
-        logger.warn('Workspaces table not found, creating project without workspace_id (legacy mode)');
-      }
-
-      // Create default project for anonymous users
-      const projectData: any = {
-        id: DEFAULT_PROJECT_ID,
-        name: 'Default Project (Anonymous)',
-        description: 'Default project for anonymous test users',
-        user_id: DEFAULT_PROJECT_ID, // Self-reference for system project
-        settings: {},
+      const projectData = {
+        name: projectName,
+        description: isValidUUID
+          ? 'Default project for authenticated user'
+          : 'Default project for anonymous user',
+        user_id: userId,
+        workspace_id: workspace_id,
+        settings: {
+          created_from_test: true,
+          created_at: new Date().toISOString(),
+        },
       };
 
-      // Only add workspace_id if table exists
-      if (workspaceId) {
-        projectData.workspace_id = workspaceId;
-      }
-
-      const { error } = await supabaseAdmin
+      const { data: newProject, error } = await supabaseAdmin
         .from('projects')
         .insert(projectData)
-        .select()
+        .select('id, name')
         .single();
 
       if (error) {
-        logger.error('Failed to create default project', error);
+        logger.error('[MANUAL_TEST] Failed to create project', { error, userId });
         throw error;
       }
 
-      logger.info('Created default project for anonymous users', { id: DEFAULT_PROJECT_ID, workspaceId });
-      return DEFAULT_PROJECT_ID;
+      logger.info('[MANUAL_TEST] Created new project', {
+        userId,
+        projectId: newProject.id,
+        projectName: newProject.name,
+        workspaceId: workspace_id
+      });
+
+      return newProject.id;
     } catch (error) {
-      logger.error('Error getting/creating default project', error);
+      logger.error('[MANUAL_TEST] Error getting/creating user project', { error, userId });
       throw error;
     }
   }

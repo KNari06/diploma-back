@@ -4,27 +4,27 @@ import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 
 // New services
-import { ApiTestPlanService } from '@/services/testing/api-test-plan.service';
 import { CredentialsParserService } from '@/services/api/credentials-parser.service';
-import { ProjectContextService } from '@/services/utils/project-context.service';
+import { WorkspaceService } from '@/services/core/workspace.service';
+import { ApiTestPlanService } from '@/services/testing/api-test-plan.service';
 import { TestChatMappingService } from '@/services/testing/test-chat-mapping.service';
 import { TestCompletionHandlerService } from '@/services/testing/test-completion-handler.service';
-import { WorkspaceService } from '@/services/core/workspace.service';
+import { ProjectContextService } from '@/services/utils/project-context.service';
 
 // Existing services
-import { ChatService } from '@/services/utils/chat.service';
 import { detectUserApproval } from '@/services/ai/ai-helpers.service';
-import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/testing/autonomous-orchestrator.service';
-import { extractUrlFromMessage } from '@/services/kb/context-enrichment.service';
-import { getTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
 import { parseUserIntent } from '@/services/ai/intentParser.service';
-import { searchKB } from '@/services/kb/kb.service';
-import { ManualTestService } from '@/services/testing/manualTest.service';
-import { getChatCompletion, getChatCompletionWithMessages } from '@/services/ai/openai.service';
-import { UserCreditsService } from '@/services/core/user-credits.service';
+import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { UserCreditsService } from '@/services/core/user-credits.service';
+import { extractUrlFromMessage } from '@/services/kb/context-enrichment.service';
+import { searchKB } from '@/services/kb/kb.service';
 import { executeApiTest } from '@/services/testing/apiTest.service';
+import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/testing/autonomous-orchestrator.service';
+import { getTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
+import { ManualTestService } from '@/services/testing/manualTest.service';
+import { ChatService } from '@/services/utils/chat.service';
 
 // Types
 import { ChatProcessingStepPayload, ChatTestUpdatePayload } from '@/websocket/types';
@@ -48,15 +48,20 @@ import { buildChatSystemPrompt } from '@/ai/prompts';
 export const handleChat = async (req: Request, res: Response): Promise<void> => {
   try {
     const { message, context, sessionId, conversationId, answers, userId: bodyUserId } = req.body as ChatRequest;
-    const userId = req.user?.id || bodyUserId || 'anonymous';
+    const authUserId = req.user?.id || bodyUserId;
 
-    // Get anonymous ID from IP
+    // Get anonymous ID from IP for non-authenticated users
     const clientIp = getClientIp(req);
-    const anonymousId = userId === 'anonymous' ? normalizeIpForAnonymousId(clientIp) : undefined;
+    const anonymousId = !authUserId ? normalizeIpForAnonymousId(clientIp) : undefined;
+
+    // Use effective user ID (authenticated user ID or anonymous IP-based ID)
+    const userId = authUserId || anonymousId || 'unknown';
 
     logger.info('[CHAT] Request received', {
-      userId,
+      authUserId,
       anonymousId,
+      effectiveUserId: userId,
+      isAuthenticated: !!authUserId,
       messageLength: message.length,
       hasSession: !!sessionId,
       hasConversation: !!conversationId,
@@ -449,9 +454,9 @@ async function handleApiTest(
   emitProcessingStep(chatSessionId, 'generating_plan', '📋 Creating test plan...', 60);
 
   const apiTestPlan = await ApiTestPlanService.generateApiTestPlan({
-          method: parsedIntent.apiMethod,
-          url: parsedIntent.apiUrl,
-          body: parsedIntent.apiBody,
+              method: parsedIntent.apiMethod,
+              url: parsedIntent.apiUrl,
+                body: parsedIntent.apiBody,
     headers: parsedIntent.apiHeaders,
     userMessage: message,
   });
@@ -578,7 +583,7 @@ async function handleGeneralChat(
             currentOldCount: messagesNeedingSummarization,
             cacheValid: true,
           });
-        } else {
+    } else {
           // Cache is outdated, need to re-summarize
           logger.info('[GENERAL_CHAT] Cache outdated, re-summarizing', {
             cachedUpTo: alreadySummarized,
@@ -620,7 +625,7 @@ async function handleGeneralChat(
   // STEP 2: SEARCH GLOBAL KB FOR GENERAL CHAT
   // ═══════════════════════════════════════════════════════════════════════
 
-  let kbContext = '';
+      let kbContext = '';
 
   // For general_chat ALWAYS search in Global KB
   try {
@@ -629,9 +634,9 @@ async function handleGeneralChat(
     const kbResults = await searchKB(message, undefined, {
       matchCount: 3,
       matchThreshold: 0.6, // Slightly higher than for intent parsing
-    });
+          });
 
-    if (kbResults.chunks.length > 0) {
+          if (kbResults.chunks.length > 0) {
       kbContext = kbResults.chunks
         .map(chunk => chunk.content)
         .join('\n\n');
@@ -646,8 +651,8 @@ async function handleGeneralChat(
     }
   } catch (error) {
     logger.warn('[GENERAL_CHAT] KB search failed', { error });
-    // Continue without KB context
-  }
+          // Continue without KB context
+        }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: BUILD MESSAGES ARRAY FOR OPENAI
@@ -714,7 +719,7 @@ Use this knowledge to provide more accurate and helpful responses.`,
   // STEP 4: SAVE MESSAGES
   // ═══════════════════════════════════════════════════════════════════════
 
-        if (chatSessionId) {
+    if (chatSessionId) {
     await ChatService.saveChatMessages(chatSessionId, [
       { role: 'user', content: message },
       { role: 'ai', content: gptResponse.content },
@@ -884,7 +889,7 @@ async function executeApprovedTestPlan(
           {
             role: 'ai',
             content: `✅ API test executed!\n\n**Result:**\n- Status: ${(apiTestResult as any).response?.status || 'N/A'}\n- Success: ${apiTestResult.success ? 'Yes' : 'No'}\n\n${(apiTestResult as any).message || 'Test completed'}`,
-            metadata: {
+          metadata: {
               testResult: apiTestResult,
               testId: apiTestId,
               testType: 'api',
@@ -1331,7 +1336,7 @@ async function getOrCreateChatSession(
   // Create new session
   const { data: newSession } = await supabaseAdmin
     .from('chat_sessions')
-    .insert({
+        .insert({
       user_id: userId,
       workspace_id: workspaceId,
       title: 'New Chat',
@@ -1393,7 +1398,7 @@ function convertApiTestPlanToTestPlan(apiPlan: any): any {
     createdAt: new Date().toISOString(),
     expiresAt: expiresAt.toISOString(),
     // Store API-specific data in metadata
-    metadata: {
+          metadata: {
       type: 'api_test',
       method: apiPlan.method,
       headers: apiPlan.headers,

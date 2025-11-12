@@ -6,10 +6,15 @@ interface MigrationResult {
   anonymous_id: string;
   user_id: string;
   migrated: {
+    workspaces: number;
+    projects: number;
+    tests: number;
     chat_sessions: number;
     chat_messages: number;
     api_environments: number;
     api_endpoints: number;
+    credits: number;
+    transactions: number;
   };
   migrated_at: string;
 }
@@ -17,6 +22,9 @@ interface MigrationResult {
 interface AnonymousDataCheck {
   has_data: boolean;
   counts: {
+    workspaces: number;
+    projects: number;
+    tests: number;
     sessions: number;
     messages: number;
     environments: number;
@@ -66,10 +74,15 @@ export class AnonymousMigrationService {
           anonymous_id: anonymousId,
           user_id: userId,
           migrated: {
+            workspaces: 0,
+            projects: 0,
+            tests: 0,
             chat_sessions: 0,
             chat_messages: 0,
             api_environments: 0,
             api_endpoints: 0,
+            credits: 0,
+            transactions: 0,
           },
           migrated_at: new Date().toISOString(),
         };
