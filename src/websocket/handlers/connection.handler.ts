@@ -26,28 +26,25 @@ export const handleConnection = (socket: TypedSocket): void => {
 
   logger.info('[WebSocket] New connection', {
     socketId: socket.id,
-    userId: userId || 'anonymous',
-    isAuthenticated: isAuthenticated(socket),
+    userId,
   });
 
   // Send authentication confirmation
   const authPayload: AuthenticatedPayload = {
-    userId: userId || 'anonymous',
-    isAnonymous: socketData.isAnonymous,
+    userId,
+    isAnonymous: false,
     timestamp: new Date().toISOString(),
   };
   socket.emit('authenticated', authPayload);
 
-  // Join user room if authenticated
-  if (userId) {
-    const userRoom = `user:${userId}`;
-    socket.join(userRoom);
-    logger.info('[WebSocket] User joined personal room', {
-      socketId: socket.id,
-      userId,
-      room: userRoom,
-    });
-  }
+  // Join user room
+  const userRoom = `user:${userId}`;
+  socket.join(userRoom);
+  logger.info('[WebSocket] User joined personal room', {
+    socketId: socket.id,
+    userId,
+    room: userRoom,
+  });
 
   // Setup event handlers
   handleSubscriptions(socket);
@@ -57,7 +54,7 @@ export const handleConnection = (socket: TypedSocket): void => {
   socket.on('disconnect', (reason) => {
     logger.info('[WebSocket] Client disconnected', {
       socketId: socket.id,
-      userId: userId || 'anonymous',
+      userId,
       reason,
     });
   });
@@ -66,7 +63,7 @@ export const handleConnection = (socket: TypedSocket): void => {
   socket.on('error', (error) => {
     logger.error('[WebSocket] Socket error', {
       socketId: socket.id,
-      userId: userId || 'anonymous',
+      userId,
       error: error.message,
     });
   });

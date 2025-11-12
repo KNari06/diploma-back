@@ -1,5 +1,4 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 
@@ -47,21 +46,11 @@ import { buildChatSystemPrompt } from '@/ai/prompts';
  */
 export const handleChat = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { message, context, sessionId, conversationId, answers, userId: bodyUserId } = req.body as ChatRequest;
-    const authUserId = req.user?.id || bodyUserId;
-
-    // Get anonymous ID from IP for non-authenticated users
-    const clientIp = getClientIp(req);
-    const anonymousId = !authUserId ? normalizeIpForAnonymousId(clientIp) : undefined;
-
-    // Use effective user ID (authenticated user ID or anonymous IP-based ID)
-    const userId = authUserId || anonymousId || 'unknown';
+    const { message, context, sessionId, conversationId, answers } = req.body as ChatRequest;
+    const userId = req.user!.id;
 
     logger.info('[CHAT] Request received', {
-      authUserId,
-      anonymousId,
-      effectiveUserId: userId,
-      isAuthenticated: !!authUserId,
+      userId,
       messageLength: message.length,
       hasSession: !!sessionId,
       hasConversation: !!conversationId,
@@ -1444,19 +1433,7 @@ function emitProcessingStep(
  */
 export const getCurrentChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
-    // Support both authenticated users and anonymous users (IP-based)
-    const userId = req.user?.id;
-    const clientIp = getClientIp(req);
-    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
-    const effectiveUserId = userId || anonymousId;
-
-    if (!effectiveUserId || effectiveUserId === 'unknown') {
-      res.status(400).json({
-        error: 'Unable to identify user',
-        message: 'Please provide authentication or ensure valid IP address'
-      });
-      return;
-    }
+    const userId = req.user!.id;
 
     const limit = Math.min(Number(req.query.limit) || 50, 100);
     const offset = Number(req.query.offset) || 0;
@@ -1465,7 +1442,7 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
     const { data: session } = await supabaseAdmin
         .from('chat_sessions')
         .select('id, title, created_at')
-      .eq('user_id', effectiveUserId)
+      .eq('user_id', userId)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -1520,19 +1497,7 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
  */
 export const getChatSessions = async (req: Request, res: Response): Promise<void> => {
   try {
-    // Support both authenticated users and anonymous users (IP-based)
-    const userId = req.user?.id;
-    const clientIp = getClientIp(req);
-    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
-    const effectiveUserId = userId || anonymousId;
-
-    if (!effectiveUserId || effectiveUserId === 'unknown') {
-      res.status(400).json({
-        error: 'Unable to identify user',
-        message: 'Please provide authentication or ensure valid IP address'
-      });
-      return;
-    }
+    const userId = req.user!.id;
 
     const limit = Math.min(Number(req.query.limit) || 20, 100);
     const offset = Number(req.query.offset) || 0;
@@ -1550,7 +1515,7 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
           created_at
         )
       `)
-      .eq('user_id', effectiveUserId)
+      .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
@@ -1584,27 +1549,15 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
  */
 export const getChatHistory = async (req: Request, res: Response): Promise<void> => {
   try {
-    // Support both authenticated users and anonymous users (IP-based)
-    const userId = req.user?.id;
-    const clientIp = getClientIp(req);
-    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
-    const effectiveUserId = userId || anonymousId;
+    const userId = req.user!.id;
     const { sessionId } = req.params;
-
-    if (!effectiveUserId || effectiveUserId === 'unknown') {
-      res.status(400).json({
-        error: 'Unable to identify user',
-        message: 'Please provide authentication or ensure valid IP address'
-      });
-      return;
-    }
 
     // Verify session belongs to user
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
       .select('id, title, created_at')
       .eq('id', sessionId)
-      .eq('user_id', effectiveUserId)
+      .eq('user_id', userId)
       .maybeSingle();
 
     if (!session) {
@@ -1637,11 +1590,7 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
  */
 export const debugChatData = async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = req.user?.id;
-    if (!userId) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
-    }
+    const userId = req.user!.id;
 
     const { data: sessions, error: sessionsError } = await supabaseAdmin
       .from('chat_sessions')

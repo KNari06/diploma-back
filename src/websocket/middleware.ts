@@ -10,7 +10,7 @@ import { SocketData } from './types';
 
 /**
  * Authenticate WebSocket connection
- * Checks for JWT token in auth.token or query.token
+ * Requires valid JWT token in auth.token or query.token
  */
 export const authenticateSocket = async (
   socket: Socket,
@@ -23,18 +23,10 @@ export const authenticateSocket = async (
       (socket.handshake.query?.token as string);
 
     if (!token) {
-      // Allow anonymous connections
-      logger.info('[WebSocket] Anonymous connection', {
+      logger.debug('[WebSocket] No token provided', {
         socketId: socket.id,
       });
-
-      const socketData: SocketData = {
-        isAnonymous: true,
-        authenticatedAt: new Date().toISOString(),
-      };
-
-      socket.data = socketData;
-      return next();
+      return next(new Error('Authentication required'));
     }
 
     // Verify token
@@ -89,11 +81,11 @@ export const isAuthenticated = (socket: Socket): boolean => {
 };
 
 /**
- * Get userId from socket (returns undefined for anonymous)
+ * Get userId from socket
  */
-export const getUserId = (socket: Socket): string | undefined => {
+export const getUserId = (socket: Socket): string => {
   const socketData = socket.data as SocketData;
-  return socketData.userId;
+  return socketData.userId!;
 };
 
 /**

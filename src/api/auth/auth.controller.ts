@@ -1,5 +1,3 @@
-import { AnonymousLimiterService } from '@/services/auth/anonymous-limiter.service';
-import { AnonymousMigrationService } from '@/services/auth/anonymous-migration.service';
 import {
   getCurrentUser,
   getOAuthUrl,
@@ -13,7 +11,6 @@ import {
   updateUserProfile,
 } from '@/services/auth/auth.service';
 import { logger } from '@/utils/logger';
-import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 import { Request, Response } from 'express';
 
 /**
@@ -24,52 +21,7 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password, name } = req.body;
 
-    // Get anonymous ID from IP address (for migration)
-    const clientIp = getClientIp(req);
-    const anonymousId = normalizeIpForAnonymousId(clientIp);
-
     const result = await signUpWithEmail(email, password, name);
-
-    // Migrate anonymous data and reset rate limit after successful signup
-    if (anonymousId && result.user?.id && anonymousId !== 'unknown') {
-      try {
-        // First, migrate all anonymous data to the new authenticated user
-        const migrationResult = await AnonymousMigrationService.migrateToAuthenticatedUser(
-          anonymousId,
-          result.user.id
-        );
-
-        logger.info('[AUTH] Migrated anonymous data after signup', {
-          userId: result.user.id,
-          anonymousId,
-          migrated: migrationResult.migrated
-        });
-
-        // Then reset rate limit (already done in migration, but just in case)
-        await AnonymousLimiterService.resetRequestCount(anonymousId);
-
-        // Include migration info in response
-        res.status(201).json({
-          success: true,
-          message: 'User registered successfully. Please check your email for verification.',
-          data: {
-            ...result,
-            migration: {
-              success: true,
-              migrated: migrationResult.migrated
-            }
-          },
-        });
-        return;
-      } catch (migrationError: any) {
-        logger.error('[AUTH] Failed to migrate anonymous data', {
-          migrationError,
-          anonymousId,
-          userId: result.user.id
-        });
-        // Don't fail the signup if migration fails, just log it
-      }
-    }
 
     res.status(201).json({
       success: true,
@@ -93,52 +45,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
 
-    // Get anonymous ID from IP address (for migration)
-    const clientIp = getClientIp(req);
-    const anonymousId = normalizeIpForAnonymousId(clientIp);
-
     const result = await signInWithEmail(email, password);
-
-    // Migrate anonymous data and reset rate limit after successful login
-    if (anonymousId && result.user?.id && anonymousId !== 'unknown') {
-      try {
-        // First, migrate all anonymous data to the authenticated user
-        const migrationResult = await AnonymousMigrationService.migrateToAuthenticatedUser(
-          anonymousId,
-          result.user.id
-        );
-
-        logger.info('[AUTH] Migrated anonymous data after login', {
-          userId: result.user.id,
-          anonymousId,
-          migrated: migrationResult.migrated
-        });
-
-        // Then reset rate limit (already done in migration, but just in case)
-        await AnonymousLimiterService.resetRequestCount(anonymousId);
-
-        // Include migration info in response
-        res.json({
-          success: true,
-          message: 'Login successful',
-          data: {
-            ...result,
-            migration: {
-              success: true,
-              migrated: migrationResult.migrated
-            }
-          },
-        });
-        return;
-      } catch (migrationError: any) {
-        logger.error('[AUTH] Failed to migrate anonymous data', {
-          migrationError,
-          anonymousId,
-          userId: result.user.id
-        });
-        // Don't fail the login if migration fails, just log it
-      }
-    }
 
     res.json({
       success: true,

@@ -1,9 +1,7 @@
 import { Request, Response } from 'express';
-import { AnonymousLimiterService } from '@/services/auth/anonymous-limiter.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { PRICING_PLANS, PRICING_METADATA } from '@/config/pricing-plans';
 import { logger } from '@/utils/logger';
-import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 
 /**
  * Check if user ID is a valid UUID (authenticated user)
@@ -18,77 +16,37 @@ function isValidUUID(userId: string): boolean {
  */
 export const getUserCredits = async (req: Request, res: Response): Promise<void> => {
   try {
-    // Get userId from auth or query params
-    const userId = req.user?.id || req.query.userId || req.body?.userId;
+    const userId = req.user!.id;
 
-    // If no userId, use IP address as anonymous ID
-    const clientIp = getClientIp(req);
-    const anonymousId = userId ? undefined : normalizeIpForAnonymousId(clientIp);
-    const effectiveUserId = userId || anonymousId || 'unknown';
+    logger.info('[USER_CREDITS] Getting credits info', { userId });
 
-    logger.info('[USER_CREDITS] Getting credits info', {
-      userId: effectiveUserId,
-      isAuthenticated: !!req.user?.id
-    });
-
-    // Check if user is authenticated
-    if (req.user?.id && isValidUUID(req.user.id)) {
-      // Authenticated user - get credits from database
-      const userCredits = await UserCreditsService.getOrCreateUserCredits(req.user.id);
-
-      res.json({
-        success: true,
-        user: {
-          id: req.user.id,
-          type: 'authenticated',
-        },
-        credits: {
-          plan: userCredits.subscription_plan,
-          status: userCredits.subscription_status,
-          balance: userCredits.credits_balance,
-          totalPurchased: userCredits.total_purchased,
-          totalUsed: userCredits.total_used,
-          expiresAt: userCredits.subscription_expires_at,
-        },
-        message: userCredits.credits_balance === 0
-          ? '💳 Купите кредиты для продолжения работы'
-          : `✅ У вас ${userCredits.credits_balance} кредитов`,
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
-    // Anonymous user - get rate limit info
-    const limitInfo = await AnonymousLimiterService.getLimitInfo(effectiveUserId);
+    // Get credits from database
+    const userCredits = await UserCreditsService.getOrCreateUserCredits(userId);
 
     res.json({
       success: true,
       user: {
-        id: effectiveUserId,
-        type: 'anonymous',
+        id: userId,
+        type: 'authenticated',
       },
       credits: {
-        plan: 'free',
-        limit: limitInfo.limit,
-        used: limitInfo.current,
-        remaining: limitInfo.remaining,
-        resetAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours from now
-        isLimitReached: limitInfo.isLimitReached,
+        plan: userCredits.subscription_plan,
+        status: userCredits.subscription_status,
+        balance: userCredits.credits_balance,
+        totalPurchased: userCredits.total_purchased,
+        totalUsed: userCredits.total_used,
+        expiresAt: userCredits.subscription_expires_at,
       },
-      message: limitInfo.isLimitReached
-        ? '🔒 Вы достигли лимита. Авторизуйтесь для продолжения!'
-        : limitInfo.remaining === 1
-        ? `⚠️ У вас осталось ${limitInfo.remaining} сообщение`
-        : `💡 У вас осталось ${limitInfo.remaining} сообщения`,
+      message: userCredits.credits_balance === 0
+        ? '💳 Купите кредиты для продолжения работы'
+        : `✅ У вас ${userCredits.credits_balance} кредитов`,
       timestamp: new Date().toISOString(),
     });
-
   } catch (error) {
-    logger.error('[USER_CREDITS] Error getting credits info', { error });
+    logger.error('[USER_CREDITS] Error fetching credits', { error });
     res.status(500).json({
       success: false,
-      error: 'Failed to get credits information',
-      message: 'Failed to get credits information',
+      error: 'Failed to fetch credits',
       timestamp: new Date().toISOString(),
     });
   }
@@ -96,40 +54,27 @@ export const getUserCredits = async (req: Request, res: Response): Promise<void>
 
 /**
  * POST /api/v1/user/credits/reset
- * Reset anonymous user's rate limit (admin only or after successful auth)
+ * Reset user credits (admin only)
  */
 export const resetUserCredits = async (req: Request, res: Response): Promise<void> => {
   try {
-    // Get anonymous ID from IP address
-    const clientIp = getClientIp(req);
-    const anonymousId = normalizeIpForAnonymousId(clientIp);
+    const userId = req.user!.id;
 
-    if (!anonymousId || anonymousId === 'unknown') {
-      res.status(400).json({
-        success: false,
-        error: 'Unable to determine IP address',
-        message: 'Failed to determine IP address for reset',
-      });
-      return;
-    }
+    logger.info('[USER_CREDITS] Resetting credits', { userId });
 
-    logger.info('[USER_CREDITS] Resetting credits', { anonymousId, clientIp });
-
-    await AnonymousLimiterService.resetRequestCount(anonymousId);
+    // Admin endpoint - can be used to reset user's credit usage tracking
+    logger.info('[USER_CREDITS] Reset endpoint called - no-op', { userId });
 
     res.json({
       success: true,
-      message: '✅ Limit reset successfully',
-      anonymousId,
+      message: '✅ Credits reset successfully',
       timestamp: new Date().toISOString(),
     });
-
   } catch (error) {
     logger.error('[USER_CREDITS] Error resetting credits', { error });
     res.status(500).json({
       success: false,
       error: 'Failed to reset credits',
-      message: 'Failed to reset limit',
       timestamp: new Date().toISOString(),
     });
   }
@@ -141,16 +86,7 @@ export const resetUserCredits = async (req: Request, res: Response): Promise<voi
  */
 export const purchaseCredits = async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = req.user?.id;
-
-    if (!userId) {
-      res.status(401).json({
-        success: false,
-        error: 'Unauthorized',
-        message: 'Authorization required',
-      });
-      return;
-    }
+    const userId = req.user!.id;
 
     const { amount, paymentId } = req.body;
 

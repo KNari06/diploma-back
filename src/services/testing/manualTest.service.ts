@@ -375,18 +375,9 @@ export class ManualTestService {
    * Create test record
    */
   private static async createTest(testRequest: TestRunRequest): Promise<Test> {
-    // Determine effective user ID (authenticated user or anonymous IP)
-    const effectiveUserId = testRequest.userId || 'anonymous-user';
+    const userId = testRequest.userId!;
 
-    logger.info('[MANUAL_TEST] Creating test for user', {
-      originalUserId: testRequest.userId,
-      effectiveUserId,
-      isAuthenticated: !!testRequest.userId
-    });
-
-    // Validate userId is a valid UUID for database storage
-    const isValidUUID = testRequest.userId && testRequest.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-    const validUserId = isValidUUID ? testRequest.userId : null;
+    logger.info('[MANUAL_TEST] Creating test for user', { userId });
 
     // Validate projectId is a valid UUID, otherwise get/create user project
     const isValidProjectUUID = testRequest.projectId && testRequest.projectId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
@@ -395,16 +386,16 @@ export class ManualTestService {
     if (!validProjectId) {
       logger.info('[MANUAL_TEST] No valid projectId provided, creating user project', {
         projectId: testRequest.projectId,
-        effectiveUserId
+        userId
       });
-      validProjectId = await this.getOrCreateUserProject(effectiveUserId);
+      validProjectId = await this.getOrCreateUserProject(userId);
     }
 
     const testData = {
       id: uuidv4(),
       url: testRequest.url,
       project_id: validProjectId,
-      user_id: validUserId,
+      user_id: userId,
       status: 'pending' as const,
       browsers: testRequest.browsers,
       options: testRequest.options || {},
@@ -413,7 +404,7 @@ export class ManualTestService {
     logger.info('[CREATE_TEST] Attempting to create test in DB', {
       testId: testData.id,
       projectId: validProjectId,
-      userId: validUserId,
+      userId,
     });
 
     const createdTest = await dbAdminService.createTest(testData);
@@ -426,8 +417,7 @@ export class ManualTestService {
   }
 
   /**
-   * Get or create project for user (both authenticated and anonymous)
-   * Each user gets their own unique project for data isolation
+   * Get or create project for user
    */
   private static async getOrCreateUserProject(userId: string): Promise<string> {
     try {
@@ -456,16 +446,9 @@ export class ManualTestService {
       }
 
       // Create new project for user
-      const isValidUUID = userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-      const projectName = isValidUUID
-        ? 'My Testing Project'
-        : `Testing Project (${userId.substring(0, 8)}...)`;
-
       const projectData = {
-        name: projectName,
-        description: isValidUUID
-          ? 'Default project for authenticated user'
-          : 'Default project for anonymous user',
+        name: 'My Testing Project',
+        description: 'Default testing project',
         user_id: userId,
         workspace_id: workspace_id,
         settings: {

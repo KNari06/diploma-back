@@ -149,12 +149,6 @@ export class WorkspaceService {
    * Generate workspace name based on user ID
    */
   private static generateWorkspaceName(userId: string): string {
-    // For anonymous users (IP addresses)
-    if (userId.includes('.')) {
-      return `Workspace ${userId.split('.')[0]}xxx`;
-    }
-
-    // For authenticated users (UUIDs)
     return `Workspace ${userId.slice(0, 8)}`;
   }
 

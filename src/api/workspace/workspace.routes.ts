@@ -1,6 +1,5 @@
 import { Router } from 'express';
-import { optionalAuth } from '@/middleware/auth.middleware';
-import { checkAnonymousLimit } from '@/middleware/rate-limiter.middleware';
+import { requireAuth } from '@/middleware/auth.middleware';
 import { asyncHandler } from '@/utils/error-handler';
 import {
   createWorkspace,
@@ -57,8 +56,7 @@ const router = Router();
  */
 router.post(
   '/',
-  optionalAuth,
-  checkAnonymousLimit,
+  requireAuth,
   asyncHandler(createWorkspace)
 );
 
@@ -75,7 +73,7 @@ router.post(
  */
 router.get(
   '/',
-  optionalAuth,
+  requireAuth,
   asyncHandler(getWorkspaces)
 );
 
@@ -101,7 +99,7 @@ router.get(
  */
 router.get(
   '/:id',
-  optionalAuth,
+  requireAuth,
   asyncHandler(getWorkspace)
 );
 
@@ -133,7 +131,7 @@ router.get(
  */
 router.put(
   '/:id',
-  optionalAuth,
+  requireAuth,
   asyncHandler(updateWorkspace)
 );
 
@@ -159,7 +157,7 @@ router.put(
  */
 router.delete(
   '/:id',
-  optionalAuth,
+  requireAuth,
   asyncHandler(deleteWorkspace)
 );
 

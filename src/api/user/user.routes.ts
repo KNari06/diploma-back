@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { optionalAuth, requireAuth } from '@/middleware/auth.middleware';
+import { requireAuth } from '@/middleware/auth.middleware';
 import { asyncHandler } from '@/utils/error-handler';
 import { getUserCredits, resetUserCredits, purchaseCredits, getCreditHistory, getPricingPlans } from './user.controller';
 
@@ -72,10 +72,10 @@ const router = Router();
  *       500:
  *         description: Ошибка сервера
  */
-router.get('/credits', optionalAuth, asyncHandler(getUserCredits));
+router.get('/credits', requireAuth, asyncHandler(getUserCredits));
 
 // Alias for backwards compatibility with frontend
-router.get('/available-credits', optionalAuth, asyncHandler(getUserCredits));
+router.get('/available-credits', requireAuth, asyncHandler(getUserCredits));
 
 /**
  * @swagger
@@ -104,7 +104,7 @@ router.get('/available-credits', optionalAuth, asyncHandler(getUserCredits));
  *       500:
  *         description: Ошибка сервера
  */
-router.post('/credits/reset', optionalAuth, asyncHandler(resetUserCredits));
+router.post('/credits/reset', requireAuth, asyncHandler(resetUserCredits));
 
 /**
  * @swagger

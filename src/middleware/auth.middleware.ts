@@ -65,34 +65,6 @@ export const requireAuth = async (
   }
 };
 
-/**
- * Middleware for optional authentication
- * Attaches user if token is valid, but doesn't fail if missing
- */
-export const optionalAuth = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
-  try {
-    const authHeader = req.headers.authorization;
-
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.replace('Bearer ', '');
-      const user = await verifyToken(token);
-
-      if (user) {
-        req.user = user;
-        logger.debug('Optional auth: user attached', { userId: user.id });
-      }
-    }
-
-    next();
-  } catch (error) {
-    logger.debug('Optional auth: no valid token, continuing without user');
-    next();
-  }
-};
 
 /**
  * Middleware to require admin role

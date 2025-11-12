@@ -1,6 +1,5 @@
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { WorkspaceCreateRequest } from '@/types';
-import { getClientIp, normalizeIpForAnonymousId } from '@/utils/ip-helper';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 
@@ -10,23 +9,7 @@ import { Request, Response } from 'express';
  */
 export const createWorkspace = async (req: Request, res: Response): Promise<void> => {
   try {
-    // Support both authenticated and anonymous users
-    const userId = req.user?.id;
-
-    // For anonymous users, use IP address as identifier
-    const clientIp = getClientIp(req);
-    const userIp = userId ? undefined : normalizeIpForAnonymousId(clientIp);
-    const effectiveUserId = userId || userIp || 'unknown';
-
-    if (!effectiveUserId || effectiveUserId === 'unknown') {
-      res.status(400).json({
-        success: false,
-        error: 'Unable to identify user',
-        message: 'Failed to identify user',
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
+    const userId = req.user!.id;
 
     const body = req.body as any;
 
@@ -73,13 +56,12 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
     }
 
     logger.info('[WORKSPACE_API] Creating workspace', {
-      userId: effectiveUserId,
-      isAuthenticated: !!userId,
+      userId,
       workspaceData
     });
 
-    const finalWorkspaceName = workspaceData.name || `Workspace ${effectiveUserId.slice(0, 8)}`;
-    const workspace = await WorkspaceService.createWorkspace(effectiveUserId, finalWorkspaceName);
+    const finalWorkspaceName = workspaceData.name || `Workspace ${userId.slice(0, 8)}`;
+    const workspace = await WorkspaceService.createWorkspace(userId, finalWorkspaceName);
 
     res.status(201).json({
       success: true,
@@ -108,11 +90,8 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
     const userId = req.user?.id;
 
     // For anonymous users, use IP address as identifier
-    const clientIp = getClientIp(req);
-    const userIp = userId ? undefined : normalizeIpForAnonymousId(clientIp);
-    const effectiveUserId = userId || userIp || 'unknown';
 
-    if (!effectiveUserId || effectiveUserId === 'unknown') {
+    if (!userId || userId === 'unknown') {
       res.status(400).json({
         success: false,
         error: 'Unable to identify user',
@@ -123,10 +102,7 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
     }
 
     logger.info('[WORKSPACE_API] Getting workspaces', {
-      userId: effectiveUserId,
-      isAuthenticated: !!userId,
-      clientIp: clientIp,
-      userIp: userIp,
+      userId: userId,
       requestHeaders: {
         'user-agent': req.headers['user-agent'],
         'x-forwarded-for': req.headers['x-forwarded-for'],
@@ -134,29 +110,28 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
       }
     });
 
-    let workspaces = await WorkspaceService.getUserWorkspaces(effectiveUserId);
+    let workspaces = await WorkspaceService.getUserWorkspaces(userId);
 
     // Auto-create workspace if none found (for both authenticated and anonymous users)
     if (!workspaces || workspaces.length === 0) {
       logger.info('[WORKSPACE_API] No workspaces found, creating default workspace', {
-        userId: effectiveUserId,
-        isAuthenticated: !!userId
+        userId: userId,
       });
 
-      const { workspace_id } = await WorkspaceService.checkOrCreateWorkspace(effectiveUserId);
+      const { workspace_id } = await WorkspaceService.checkOrCreateWorkspace(userId);
 
       // Fetch the newly created workspace
-      workspaces = await WorkspaceService.getUserWorkspaces(effectiveUserId);
+      workspaces = await WorkspaceService.getUserWorkspaces(userId);
 
       logger.info('[WORKSPACE_API] Created default workspace', {
-        userId: effectiveUserId,
+        userId: userId,
         workspaceId: workspace_id,
         count: workspaces?.length || 0
       });
     }
 
     logger.info('[WORKSPACE_API] Found workspaces', {
-      userId: effectiveUserId,
+      userId: userId,
       count: workspaces?.length || 0,
       workspaceIds: workspaces?.map(w => w.id) || []
     });

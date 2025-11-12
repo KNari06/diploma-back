@@ -1,5 +1,4 @@
-import { optionalAuth } from '@/middleware/auth.middleware';
-import { checkAnonymousLimit } from '@/middleware/rate-limiter.middleware';
+import { requireAuth } from '@/middleware/auth.middleware';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
@@ -153,8 +152,7 @@ const chatRequestSchema = z.object({
  * Send message to AI chat
  */
 router.post('/',
-  optionalAuth,           // Check if user is authenticated (optional)
-  checkAnonymousLimit,    // Check rate limit for anonymous users
+  requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
@@ -254,7 +252,7 @@ router.post('/',
  *       401:
  *         description: Не авторизован
  */
-router.get('/history', optionalAuth, asyncHandler(getCurrentChatHistory));
+router.get('/history', requireAuth, asyncHandler(getCurrentChatHistory));
 
 /**
  * @swagger
@@ -331,7 +329,7 @@ router.get('/history', optionalAuth, asyncHandler(getCurrentChatHistory));
  *       401:
  *         description: Не авторизован
  */
-router.get('/sessions', optionalAuth, asyncHandler(getChatSessions));
+router.get('/sessions', requireAuth, asyncHandler(getChatSessions));
 
 /**
  * @swagger
@@ -398,9 +396,9 @@ router.get('/sessions', optionalAuth, asyncHandler(getChatSessions));
  *       404:
  *         description: Сессия не найдена
  */
-router.get('/history/:sessionId', optionalAuth, asyncHandler(getChatHistory));
+router.get('/history/:sessionId', requireAuth, asyncHandler(getChatHistory));
 
 // Debug route - remove in production
-router.get('/debug', optionalAuth, asyncHandler(debugChatData));
+router.get('/debug', requireAuth, asyncHandler(debugChatData));
 
 export default router;
