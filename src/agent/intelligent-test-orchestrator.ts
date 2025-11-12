@@ -22,6 +22,7 @@ import { SafetyGuard, DEFAULT_SAFETY_CONFIG } from './safety-guard';
 import { StateTracker } from './state-tracker';
 import { ResultValidator } from './result-validator';
 import { CommandExecutor } from './command-executor';
+import { TestProgressEmitter } from './utils/progress-emitter';
 
 // AI cost estimation (updated with accurate pricing Nov 2024)
 // Based on: GPT-4o $0.005 input / $0.015 output per 1K tokens
@@ -43,11 +44,18 @@ export class IntelligentTestOrchestrator {
   private userId?: string;
   private testId?: string;
   private commandExecutor!: CommandExecutor;
+  private progressEmitter?: TestProgressEmitter;
 
   constructor(config: IntelligentTestConfig, userId?: string, testId?: string) {
     this.config = config;
     this.userId = userId;
     this.testId = testId;
+
+    // Initialize progress emitter if testId is provided
+    if (this.testId) {
+      const browser = this.config.browser || 'chrome';
+      this.progressEmitter = new TestProgressEmitter(this.testId, browser);
+    }
   }
 
   /**
@@ -82,6 +90,13 @@ export class IntelligentTestOrchestrator {
       mode: this.config.mode,
     });
 
+    // Emit progress: Analysis phase starting
+    this.progressEmitter?.emit({
+      progress: 30,
+      phase: 'analysis',
+      currentStep: '🤖 AI analyzing page structure...',
+    });
+
     try {
       // Main testing loop
       await this.mainLoop();
@@ -94,6 +109,14 @@ export class IntelligentTestOrchestrator {
         actionsTaken: result.actionsTaken,
         duration: `${Math.round(result.duration / 1000)}s`,
         cost: `$${result.cost.toFixed(3)}`,
+      });
+
+      // Emit progress: Test completed
+      this.progressEmitter?.emit({
+        progress: 100,
+        phase: 'finalization',
+        currentStep: '✅ Test completed successfully!',
+        status: 'completed',
       });
 
       this.emitEvent('test_completed', {
@@ -380,13 +403,37 @@ export class IntelligentTestOrchestrator {
       count: actions.length,
     });
 
+    // Set total actions for progress tracking
+    if (this.progressEmitter) {
+      this.progressEmitter.setTotalActions(actions.length);
+    }
+
     const completedActions: ActionResult[] = [];
     let success = true;
 
-    for (const action of actions) {
+    for (let i = 0; i < actions.length; i++) {
+      const action = actions[i];
       try {
+        // Emit progress: Action execution (60-90%)
+        const progress = 60 + Math.round((i / actions.length) * 30);
+        this.progressEmitter?.emit({
+          progress,
+          phase: 'execution',
+          currentStep: `${this.getActionEmoji(action.action)} ${action.description}...`,
+          action: {
+            type: action.action,
+            description: action.description,
+            target: action.selector,
+          },
+          completedSteps: i,
+        });
+
+        // Log every action execution
         logger.info('[INTELLIGENT_ORCHESTRATOR] Executing action', {
-          action: action.description,
+          testId: this.testId,
+          action: action.action,
+          description: action.description,
+          progress: `${i + 1}/${actions.length}`,
         });
 
         this.emitEvent('action_executing', {
@@ -444,13 +491,23 @@ export class IntelligentTestOrchestrator {
         completedActions.push(actionResult);
         this.state = StateTracker.recordActionResult(this.state, actionResult);
 
+        // Log action result (success/failure)
         if (!actionResult.success) {
           success = false;
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] Action failed', {
+            testId: this.testId,
+            action: action.action,
+            description: action.description,
+            error: actionResult.error,
+            optional: action.optional,
+          });
 
           // If action is not optional, consider stopping
           if (!action.optional) {
-            logger.warn('[INTELLIGENT_ORCHESTRATOR] Critical action failed', {
+            logger.error('[INTELLIGENT_ORCHESTRATOR] Critical action failed', {
+              testId: this.testId,
               action: action.description,
+              error: actionResult.error,
             });
 
             this.emitEvent('action_failed', {
@@ -573,5 +630,22 @@ export class IntelligentTestOrchestrator {
         error,
       });
     }
+  }
+
+  /**
+   * Get emoji for action type
+   */
+  private getActionEmoji(actionType: string): string {
+    const emojiMap: Record<string, string> = {
+      click: '👆',
+      fill: '✍️',
+      select: '📋',
+      wait: '⏱️',
+      scroll: '📜',
+      press: '⌨️',
+      hover: '🖱️',
+      goto: '🌐',
+    };
+    return emojiMap[actionType] || '🔄';
   }
 }

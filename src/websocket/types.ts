@@ -97,10 +97,19 @@ export interface TestProgressPayload {
   testId: string;
   browser: string;
   progress: number; // 0-100
+  phase: string; // 'initialization' | 'analysis' | 'planning' | 'execution' | 'finalization'
   currentStep?: string;
+  action?: {
+    type: string; // 'click' | 'fill' | 'navigate' | etc.
+    description: string;
+    target?: string; // CSS selector
+  };
   totalSteps?: number;
   completedSteps?: number;
+  status?: string; // 'queued' | 'running' | 'completed' | 'failed'
   timestamp: string;
+  elapsedTime?: number; // Milliseconds since test start
+  estimatedRemaining?: number; // Estimated milliseconds remaining
 }
 
 export interface TestStepCompletedPayload {

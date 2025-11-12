@@ -221,6 +221,7 @@ export interface IntelligentTestConfig {
   safety: SafetyConfig;
   goal: string;
   startUrl: string;
+  browser?: string; // Browser type for progress tracking (e.g., 'chrome', 'firefox')
   credentials?: {
     username?: string;
     email?: string;

@@ -7,6 +7,7 @@ import { IntelligentTestOrchestrator } from './intelligent-test-orchestrator';
 import { ResultCollector } from './result-collector';
 import { DEFAULT_SAFETY_CONFIG } from './safety-guard';
 import { IntelligentTestConfig } from './types/intelligent-testing.types';
+import { webSocketService } from '@/websocket/websocket.service';
 
 /**
  * Execute Playwright test
@@ -26,15 +27,39 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   const collector = new ResultCollector();
 
   try {
-    logger.info('Starting Playwright test', {
+    logger.info('[PLAYWRIGHT] Starting test', {
       testId: testData.testId,
       url: testData.url,
       browser: testData.browser,
       intelligentMode: testData.intelligentMode || false,
+      projectId: testData.projectId,
+      userId: testData.userId,
+    });
+
+    // Emit progress: Browser launching (10%)
+    webSocketService.emitTestProgress(testData.testId, {
+      testId: testData.testId,
+      browser: testData.browser,
+      progress: 10,
+      phase: 'initialization',
+      currentStep: '🌐 Launching browser...',
+      status: 'running',
+      timestamp: new Date().toISOString(),
     });
 
     // Get browser from pool
     const browser = await browserPool.getBrowser(testData.browser);
+
+    // Emit progress: Browser ready (15%)
+    webSocketService.emitTestProgress(testData.testId, {
+      testId: testData.testId,
+      browser: testData.browser,
+      progress: 15,
+      phase: 'initialization',
+      currentStep: '✅ Browser ready',
+      status: 'running',
+      timestamp: new Date().toISOString(),
+    });
 
     // Create context with options
     const contextOptions: any = {
@@ -57,9 +82,35 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     // INTELLIGENT MODE: Use IntelligentTestOrchestrator
     // ═══════════════════════════════════════════════════════════════════════
     if (testData.intelligentMode) {
-      logger.info('Using Intelligent Testing Mode', {
+      logger.info('[PLAYWRIGHT] Intelligent mode activated', {
         testId: testData.testId,
         goal: testData.testGoal || testData.intent || 'General testing',
+        mode: 'balanced',
+      });
+
+      // Emit progress: Navigating to page (20%)
+      webSocketService.emitTestProgress(testData.testId, {
+        testId: testData.testId,
+        browser: testData.browser,
+        progress: 20,
+        phase: 'initialization',
+        currentStep: `📄 Navigating to ${testData.url}...`,
+        status: 'running',
+        timestamp: new Date().toISOString(),
+      });
+
+      // Navigate to URL
+      await page.goto(testData.url, { waitUntil: 'networkidle', timeout: 30000 });
+
+      // Emit progress: Page loaded (25%)
+      webSocketService.emitTestProgress(testData.testId, {
+        testId: testData.testId,
+        browser: testData.browser,
+        progress: 25,
+        phase: 'initialization',
+        currentStep: '✅ Page loaded',
+        status: 'running',
+        timestamp: new Date().toISOString(),
       });
 
       // Build intelligent test config
@@ -71,6 +122,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         },
         goal: testData.testGoal || testData.intent || 'Test the application',
         startUrl: testData.url,
+        browser: testData.browser, // Add browser for progress tracking
         credentials: testData.options?.credentials,
         userContext: {
           projectId: testData.projectId,
@@ -88,11 +140,12 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Execute intelligent test
       const intelligentResult = await orchestrator.execute(browser, page);
 
-      logger.info('Intelligent test completed', {
+      logger.info('[PLAYWRIGHT] Intelligent test completed', {
         testId: testData.testId,
         success: intelligentResult.success,
         pagesVisited: intelligentResult.pagesVisited,
         actionsTaken: intelligentResult.actionsTaken,
+        duration: `${Math.round(intelligentResult.duration / 1000)}s`,
         cost: `$${intelligentResult.cost.toFixed(3)}`,
       });
 
@@ -117,13 +170,14 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           },
         });
 
-        logger.info('[PLAYWRIGHT] Intelligent test data saved to specialized tables', {
+        logger.info('[PLAYWRIGHT] Test data saved to database', {
           testId: testData.testId,
+          tables: ['intelligent_test_sessions', 'intelligent_page_visits', 'intelligent_test_actions'],
         });
       } catch (storageError) {
-        logger.error('[PLAYWRIGHT] Failed to save intelligent test data', {
-          error: storageError,
+        logger.error('[PLAYWRIGHT] Failed to save test data', {
           testId: testData.testId,
+          error: storageError instanceof Error ? storageError.message : 'Unknown error',
         });
         // Don't fail the test if storage fails
       }
