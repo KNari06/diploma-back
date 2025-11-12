@@ -102,9 +102,18 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         });
 
         if (approvalResult.confidence < 0.5) {
-          // Unclear response
+          // Unclear response - save to history
+          const clarificationMessage = '❓ I didn\'t quite understand. Could you please clarify?\n\n✅ Approve and run the test?\n❌ Cancel?';
+
+          if (chatSessionId) {
+            await ChatService.saveChatMessages(chatSessionId, [
+              { role: 'user', content: message },
+              { role: 'ai', content: clarificationMessage },
+            ]);
+          }
+
           res.json({
-            reply: '❓ I didn\'t quite understand. Could you please clarify?\n\n✅ Approve and run the test?\n❌ Cancel?',
+            reply: clarificationMessage,
             timestamp: new Date().toISOString(),
             sessionId: chatSessionId,
           });
@@ -120,11 +129,20 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
             workspace_id,
           });
         } else if (approvalResult.approved === false) {
-          // REJECTED
+          // REJECTED - save to history
           logger.info('[CHAT] Test plan rejected', { planId: pendingPlan.id });
 
+          const rejectionMessage = '❌ Test plan canceled. Feel free to request a different test or ask any questions!';
+
+          if (chatSessionId) {
+            await ChatService.saveChatMessages(chatSessionId, [
+              { role: 'user', content: message },
+              { role: 'ai', content: rejectionMessage },
+            ]);
+          }
+
           res.json({
-            reply: '❌ Test plan canceled. Feel free to request a different test or ask any questions!',
+            reply: rejectionMessage,
             timestamp: new Date().toISOString(),
             sessionId: chatSessionId,
           });
@@ -248,6 +266,22 @@ async function handlePlatformTest(
       hasScope,
       intent: 'platform_test',
     });
+
+    // Save chat messages to history
+    if (chatSessionId) {
+      await ChatService.saveChatMessages(chatSessionId, [
+        { role: 'user', content: message },
+        {
+          role: 'ai',
+          content: '📝 I need some more information to set up the test:',
+          metadata: {
+            questions: result.questions,
+            conversationId: result.conversationId,
+            requiresAnswers: true,
+          },
+        },
+      ]);
+    }
 
       res.json({
       reply: '📝 I need some more information to set up the test:',
@@ -377,6 +411,22 @@ async function handlePlatformTest(
     intent: 'platform_test',
   });
 
+  // Save chat messages to history
+  if (chatSessionId) {
+    await ChatService.saveChatMessages(chatSessionId, [
+      { role: 'user', content: message },
+      {
+        role: 'ai',
+        content: '📋 Let me gather some details to set up the perfect test:',
+        metadata: {
+          questions: result.questions,
+          conversationId: result.conversationId,
+          requiresAnswers: true,
+        },
+      },
+    ]);
+  }
+
   res.json({
     reply: '📋 Let me gather some details to set up the perfect test:',
     questions: result.questions,
@@ -418,8 +468,18 @@ async function handleApiTest(
   // ═══════════════════════════════════════════════════════════════════════
 
   if (!parsedIntent?.apiMethod || !parsedIntent?.apiUrl) {
+    const errorMessage = '❌ I need more details for the API test.\n\nPlease specify:\n• HTTP Method (GET, POST, etc.)\n• API URL\n\nExample: "Test GET request to https://api.example.com/users"';
+
+    // Save to history
+    if (chatSessionId) {
+      await ChatService.saveChatMessages(chatSessionId, [
+        { role: 'user', content: message },
+        { role: 'ai', content: errorMessage },
+      ]);
+    }
+
           res.json({
-      reply: '❌ I need more details for the API test.\n\nPlease specify:\n• HTTP Method (GET, POST, etc.)\n• API URL\n\nExample: "Test GET request to https://api.example.com/users"',
+      reply: errorMessage,
             timestamp: new Date().toISOString(),
       sessionId: chatSessionId,
           });
@@ -994,15 +1054,42 @@ async function executeApprovedTestPlan(
           ? `\n\n🤖 **Mode:** Intelligent/Adaptive Testing\n📊 **Estimated:** ${plan.estimatedPages || '5-10 pages'}, ${plan.estimatedCost || '$0.10-0.20'}`
           : '';
 
+        const successMessage = `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${testCreated.data?.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data?.id}/status`;
+
+        // Save to chat history
+        if (chatSessionId) {
+          await ChatService.saveChatMessages(chatSessionId, [
+            { role: 'user', content: 'yes' }, // User approved the test
+            {
+              role: 'ai',
+              content: successMessage,
+              metadata: {
+                testId: testCreated.data?.id,
+                testMode: plan.intelligentMode ? 'intelligent' : 'standard',
+              },
+            },
+          ]);
+        }
+
         res.json({
-          reply: `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${testCreated.data?.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data?.id}/status`,
+          reply: successMessage,
           testId: testCreated.data?.id,
           timestamp: new Date().toISOString(),
           sessionId: chatSessionId,
         });
       } else {
+        const failureMessage = result.message || '❌ Failed to execute test plan';
+
+        // Save to chat history
+        if (chatSessionId) {
+          await ChatService.saveChatMessages(chatSessionId, [
+            { role: 'user', content: 'yes' }, // User approved but execution failed
+            { role: 'ai', content: failureMessage },
+          ]);
+        }
+
         res.json({
-          reply: result.message || '❌ Failed to execute test plan',
+          reply: failureMessage,
           timestamp: new Date().toISOString(),
           sessionId: chatSessionId,
         });

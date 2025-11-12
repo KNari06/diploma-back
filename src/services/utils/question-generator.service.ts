@@ -105,7 +105,8 @@ export async function generateClarifyingQuestions(
     }
 
     // Generate additional dynamic questions using AI
-    const dynamicQuestions = await generateDynamicQuestions(userMessage, currentContext);
+    // IMPORTANT: Pass already asked questions to avoid duplicates
+    const dynamicQuestions = await generateDynamicQuestions(userMessage, currentContext, questions);
     questions.push(...dynamicQuestions);
 
     const conversationId = generateConversationId();
@@ -162,17 +163,24 @@ async function shouldAskAboutAuth(
  */
 async function generateDynamicQuestions(
   userMessage: string,
-  context: any
+  context: any,
+  alreadyAskedQuestions: ClarifyingQuestion[]
 ): Promise<ClarifyingQuestion[]> {
   try {
+    const alreadyAskedList = alreadyAskedQuestions.map(q => `- ${q.question}`).join('\n');
+
     const prompt = `You are a QA assistant. A user wants to test their product but hasn't provided all necessary information.
 
 User request: "${userMessage}"
 Current context: ${JSON.stringify(context)}
 
-Generate 0-3 additional clarifying questions that would help you create better tests. Only ask questions that are truly necessary and not already covered.
+IMPORTANT: These questions are ALREADY being asked (DO NOT duplicate):
+${alreadyAskedList || '(none yet)'}
 
-Examples of good questions:
+Generate 0-2 ADDITIONAL clarifying questions that would help create better tests.
+ONLY ask questions that are NOT already covered above.
+
+Examples of good ADDITIONAL questions:
 - "What should happen after successful registration?" (for registration tests)
 - "Are there any specific validation rules we should test?" (for form tests)
 - "Which browser should we prioritize?" (if multi-browser testing)
@@ -205,7 +213,7 @@ If no additional questions needed, return empty array: []`;
       count: questions.length,
     });
 
-    return questions.slice(0, 3); // Max 3 additional questions
+    return questions.slice(0, 2); // Max 2 additional questions
   } catch (error) {
     logger.error('Failed to generate dynamic questions', error);
     return [];
