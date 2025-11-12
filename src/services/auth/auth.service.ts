@@ -421,16 +421,29 @@ export async function updateUserProfile(
   name: string
 ): Promise<any> {
   try {
-    // Verify token first
-    const user = await verifyToken(accessToken);
-    if (!user) throw new Error('Invalid token');
+    // Verify token first and get user data
+    const { data: authData, error: getUserError } = await supabase.auth.getUser(accessToken);
 
-    // Update user metadata in Supabase Auth
-    const { error: authError } = await supabase.auth.updateUser({
-      data: { name }
-    });
+    if (getUserError || !authData.user) {
+      throw new Error('Invalid token');
+    }
 
-    if (authError) throw authError;
+    const userId = authData.user.id;
+
+    // Update user metadata in Supabase Auth using admin API
+    const { data: updatedAuthData, error: authError } = await supabaseAdmin.auth.admin.updateUserById(
+      userId,
+      {
+        user_metadata: { name }
+      }
+    );
+
+    if (authError) {
+      logger.error('Failed to update user metadata in Auth', { error: authError, userId });
+      throw authError;
+    }
+
+    const userEmail = authData.user.email!;
 
     // Update user data in public.users table
     const { data: userData, error: dbError } = await supabaseAdmin
@@ -439,22 +452,22 @@ export async function updateUserProfile(
         name,
         updated_at: new Date().toISOString(),
       })
-      .eq('id', user.id)
+      .eq('id', userId)
       .select('*')
       .maybeSingle();
 
     if (dbError) {
-      logger.error('Failed to update user in database', { error: dbError, userId: user.id });
+      logger.error('Failed to update user in database', { error: dbError, userId });
       throw new Error('Failed to update user profile in database');
     }
 
     // If user not found in public.users, create them
     if (!userData) {
-      logger.warn('User not found in public.users, creating entry', { userId: user.id });
+      logger.warn('User not found in public.users, creating entry', { userId });
 
       const newUser = {
-        id: user.id,
-        email: user.email,
+        id: userId,
+        email: userEmail,
         name,
         role: 'user',
         credits: 0,
@@ -470,15 +483,15 @@ export async function updateUserProfile(
         .maybeSingle();
 
       if (createError) {
-        logger.error('Failed to create user in database', { error: createError, userId: user.id });
+        logger.error('Failed to create user in database', { error: createError, userId });
         throw new Error('Failed to create user profile in database');
       }
 
-      logger.info('User profile updated (created)', { userId: user.id, name });
+      logger.info('User profile updated (created)', { userId, name });
 
       return {
-        id: user.id,
-        email: user.email,
+        id: userId,
+        email: userEmail,
         name: createdUser?.name,
         role: createdUser?.role,
         credits: createdUser?.credits,
@@ -488,11 +501,11 @@ export async function updateUserProfile(
       };
     }
 
-    logger.info('User profile updated', { userId: user.id, name });
+    logger.info('User profile updated', { userId, name });
 
     return {
-      id: user.id,
-      email: user.email,
+      id: userId,
+      email: userEmail,
       name: userData.name,
       role: userData.role,
       credits: userData.credits,
