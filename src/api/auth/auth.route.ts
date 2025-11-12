@@ -243,7 +243,7 @@ router.post('/magic-link', asyncHandler(async (req: Request, res: Response) => {
  *           enum: [google, github, gitlab, bitbucket]
  *         description: OAuth провайдер
  *       - in: query
- *         name: redirectTo
+ *         name: redirect_uri
  *         schema:
  *           type: string
  *           format: uri

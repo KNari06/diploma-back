@@ -1,3 +1,4 @@
+import { env, isDevelopment } from '@/config/env';
 import {
   getCurrentUser,
   getOAuthUrl,
@@ -91,7 +92,7 @@ export const sendMagicLink = async (req: Request, res: Response): Promise<void> 
 export const getOAuthUrlHandler = async (req: Request, res: Response): Promise<void> => {
   try {
     const { provider } = req.params;
-    const { redirectTo } = req.query;
+    const { redirect_uri } = req.query;
 
     if (!['google', 'github', 'gitlab', 'bitbucket'].includes(provider)) {
       res.status(400).json({
@@ -101,9 +102,16 @@ export const getOAuthUrlHandler = async (req: Request, res: Response): Promise<v
       return;
     }
 
+    let finalRedirect = redirect_uri as string;
+
+    if (!finalRedirect) {
+      const origin = req.headers.origin || (isDevelopment ? 'http://localhost:8080' : env.FRONTEND_URL);
+      finalRedirect = `${origin}/oauth/callback`;
+    }
+
     const result = await getOAuthUrl(
       provider as 'google' | 'github' | 'gitlab' | 'bitbucket',
-      redirectTo as string
+      finalRedirect
     );
 
     res.json({

@@ -152,18 +152,18 @@ export async function signInWithMagicLink(
 /**
  * Get OAuth URL for provider
  * @param provider - OAuth provider (google, github, etc.)
- * @param redirectTo - Redirect URL after OAuth
+ * @param redirectTo - Required redirect URL after OAuth
  * @returns OAuth URL (Supabase handles state internally)
  */
 export async function getOAuthUrl(
   provider: 'google' | 'github' | 'gitlab' | 'bitbucket',
-  redirectTo?: string
+  redirectTo: string
 ): Promise<{ url: string }> {
   try {
     const { data, error } = await supabase.auth.signInWithOAuth({
       provider,
       options: {
-        redirectTo: redirectTo || `${env.FRONTEND_URL}/auth/callback`,
+        redirectTo,
       },
     });
 
