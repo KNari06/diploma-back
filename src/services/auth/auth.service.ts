@@ -186,11 +186,10 @@ export async function getOAuthUrl(
  */
 export async function signOut(): Promise<{ success: boolean }> {
   try {
-    const { error } = await supabase.auth.signOut();
-
-    if (error) throw error;
-
-    logger.info('User signed out');
+    // Note: signOut() works without session - it just clears local storage
+    // But in server context, we don't need to do anything special
+    // The client should handle token removal
+    logger.info('User signed out (server-side)');
 
     return { success: true };
   } catch (error) {
@@ -391,17 +390,24 @@ export async function updatePassword(
   newPassword: string
 ): Promise<{ success: boolean }> {
   try {
-    // Verify token first
-    const user = await verifyToken(accessToken);
-    if (!user) throw new Error('Invalid token');
+    // Get user data from token
+    const { data: authData, error: getUserError } = await supabase.auth.getUser(accessToken);
 
-    const { error } = await supabase.auth.updateUser({
-      password: newPassword,
-    });
+    if (getUserError || !authData.user) {
+      throw new Error('Invalid token');
+    }
+
+    const userId = authData.user.id;
+
+    // Use admin API to update password
+    const { data: updatedUser, error } = await supabaseAdmin.auth.admin.updateUserById(
+      userId,
+      { password: newPassword }
+    );
 
     if (error) throw error;
 
-    logger.info('Password updated', { userId: user.id });
+    logger.info('Password updated', { userId });
 
     return { success: true };
   } catch (error) {
