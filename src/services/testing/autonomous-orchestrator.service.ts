@@ -74,6 +74,7 @@ export async function requestMissingInformation(
     hasScope?: boolean;
     hasCredentials?: boolean;
     intent?: string;
+    userProjects?: Array<{ id: string; name: string; settings?: { main_url?: string } }>;
   }
 ): Promise<{
   needsMoreInfo: boolean;

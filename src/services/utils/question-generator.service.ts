@@ -73,6 +73,7 @@ export async function generateClarifyingQuestions(
     hasCredentials?: boolean;
     hasScope?: boolean;
     intent?: string;
+    userProjects?: Array<{ id: string; name: string; settings?: { main_url?: string } }>;
   }
 ): Promise<{
   needsMoreInfo: boolean;
@@ -83,14 +84,44 @@ export async function generateClarifyingQuestions(
     logger.info('Generating clarifying questions', {
       userMessage: userMessage.substring(0, 50),
       context: currentContext,
+      projectCount: currentContext.userProjects?.length || 0,
     });
 
     // Start with base questions
     const questions: ClarifyingQuestion[] = [];
 
-    // Always need URL if not provided
+    // Check if URL is needed
     if (!currentContext.hasUrl) {
-      questions.push(BASE_QUESTIONS[0]); // url
+      // If user has existing projects, show them as options
+      if (currentContext.userProjects && currentContext.userProjects.length > 0) {
+        const projectOptions = currentContext.userProjects
+          .filter(p => p.settings?.main_url)
+          .map(p => `${p.name} (${p.settings?.main_url})`);
+
+        if (projectOptions.length > 0) {
+          // Show existing projects + option to add new URL
+          questions.push({
+            id: 'url',
+            question: 'Which platform would you like to test?',
+            required: true,
+            type: 'url',
+            options: [
+              ...projectOptions,
+              'Enter a different URL',
+            ],
+            placeholder: 'Select your project or enter new URL',
+            validation: {
+              pattern: '^https?://.+',
+            },
+          });
+        } else {
+          // Projects exist but no URLs saved, ask normally
+          questions.push(BASE_QUESTIONS[0]); // url
+        }
+      } else {
+        // No projects at all, ask normally
+        questions.push(BASE_QUESTIONS[0]); // url
+      }
     }
 
     // Always need scope if not clear

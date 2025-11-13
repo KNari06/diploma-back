@@ -250,14 +250,46 @@ async function handlePlatformTest(
   emitProcessingStep(chatSessionId, 'checking_autonomous', '🤖 Preparing autonomous exploration...', 30);
 
   // ═══════════════════════════════════════════════════════════════════════
+  // STEP 0: LOAD CHAT SESSION CONTEXT (project if exists)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  let sessionProject = null;
+  if (chatSessionId) {
+    const sessionData = await ChatService.getSessionWithProject(chatSessionId);
+    sessionProject = sessionData?.project;
+
+    if (sessionProject?.settings?.main_url) {
+      logger.info('[PLATFORM_TEST] Found project in session', {
+        projectId: sessionProject.id,
+        projectName: sessionProject.name,
+        projectUrl: sessionProject.settings.main_url,
+      });
+    }
+  }
+
+  // Load all user projects for selection
+  const { data: userProjects } = await supabaseAdmin
+    .from('projects')
+    .select('id, name, settings')
+    .eq('user_id', userId)
+    .eq('workspace_id', workspace_id)
+    .order('created_at', { ascending: false })
+    .limit(10);
+
+  logger.info('[PLATFORM_TEST] Loaded user projects', {
+    projectCount: userProjects?.length || 0,
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
   // STEP 1: CHECK IF WE HAVE ALL NEEDED INFO
   // ═══════════════════════════════════════════════════════════════════════
 
-  const extractedUrl = parsedIntent?.page || extractUrlFromMessage(message);
+  // If session has project, use its URL as default
+  const extractedUrl = parsedIntent?.page || extractUrlFromMessage(message) || sessionProject?.settings?.main_url;
   const hasUrl = !!extractedUrl;
   const hasScope = !!parsedIntent?.scope;
 
-  // If missing info, ask questions
+  // If missing info, ask questions (WITH user projects context)
   if (!hasUrl || !hasScope) {
     logger.info('[PLATFORM_TEST] Missing information', { hasUrl, hasScope });
 
@@ -265,6 +297,7 @@ async function handlePlatformTest(
       hasUrl,
       hasScope,
       intent: 'platform_test',
+      userProjects: userProjects || [],
     });
 
     // Save chat messages to history
@@ -305,6 +338,15 @@ async function handlePlatformTest(
 
   if (isNewProject) {
     logger.info('[PLATFORM_TEST] Created new project', { project_id, url: extractedUrl });
+  }
+
+  // Update chat session with project_id (so next time we remember it)
+  if (chatSessionId && project_id) {
+    await ChatService.updateSessionProject(chatSessionId, project_id);
+    logger.info('[PLATFORM_TEST] Updated chat session with project', {
+      chatSessionId,
+      project_id,
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════════

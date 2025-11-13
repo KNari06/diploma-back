@@ -113,4 +113,101 @@ export class ChatService {
       throw error;
     }
   }
+
+  /**
+   * Update project_id in chat session
+   * @param sessionId - Chat session ID
+   * @param projectId - Project ID
+   */
+  static async updateSessionProject(
+    sessionId: string,
+    projectId: string
+  ): Promise<void> {
+    try {
+      const { error } = await supabaseAdmin
+        .from('chat_sessions')
+        .update({ project_id: projectId })
+        .eq('id', sessionId);
+
+      if (error) {
+        logger.error('[CHAT_SERVICE] Failed to update session project', { error, sessionId, projectId });
+        throw error;
+      }
+
+      logger.info('[CHAT_SERVICE] Session project updated', {
+        sessionId,
+        projectId,
+      });
+
+    } catch (error) {
+      logger.error('[CHAT_SERVICE] Error updating session project', { error, sessionId, projectId });
+      // Don't throw - this is not critical
+    }
+  }
+
+  /**
+   * Get chat session with project info
+   * @param sessionId - Chat session ID
+   * @returns Session with project data
+   */
+  static async getSessionWithProject(
+    sessionId: string
+  ): Promise<{
+    id: string;
+    user_id: string;
+    workspace_id: string;
+    project_id?: string;
+    project?: {
+      id: string;
+      name: string;
+      settings?: { main_url?: string };
+    };
+  } | null> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('chat_sessions')
+        .select(`
+          id,
+          user_id,
+          workspace_id,
+          project_id,
+          projects:project_id (
+            id,
+            name,
+            settings
+          )
+        `)
+        .eq('id', sessionId)
+        .single();
+
+      if (error) {
+        logger.error('[CHAT_SERVICE] Failed to get session with project', { error, sessionId });
+        return null;
+      }
+
+      // Transform nested project data
+      const result: any = {
+        id: data.id,
+        user_id: data.user_id,
+        workspace_id: data.workspace_id,
+        project_id: data.project_id,
+      };
+
+      if (data.projects) {
+        result.project = Array.isArray(data.projects) ? data.projects[0] : data.projects;
+      }
+
+      logger.info('[CHAT_SERVICE] Session with project retrieved', {
+        sessionId,
+        hasProject: !!result.project,
+        projectUrl: result.project?.settings?.main_url,
+      });
+
+      return result;
+
+    } catch (error) {
+      logger.error('[CHAT_SERVICE] Error getting session with project', { error, sessionId });
+      return null;
+    }
+  }
 }
