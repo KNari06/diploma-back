@@ -127,8 +127,18 @@ export class RulesCacheService {
 
       return cachedRules;
     } catch (error) {
-      logger.error(`[RULES_CACHE] Failed to load rules for ${language}`, { error });
-      throw error;
+      const errorMessage = error instanceof Error && error.message
+        ? error.message
+        : (error ? String(error) : `Unknown error loading rules for ${language}`);
+
+      logger.error(`[RULES_CACHE] Failed to load rules for ${language}`, {
+        error,
+        errorMessage,
+        errorType: error?.constructor?.name,
+      });
+
+      // Re-throw with proper message
+      throw new Error(errorMessage);
     }
   }
 

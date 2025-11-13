@@ -213,12 +213,18 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
   } catch (error) {
     logger.error('[CHAT] Error handling chat request', { error });
+
+    // Extract error message safely
+    const errorMessage = error instanceof Error && error.message
+      ? error.message
+      : (error ? String(error) : 'An unexpected error occurred');
+
     res.status(500).json({
       success: false,
       error: 'Failed to process chat request',
-      message: error instanceof Error ? error.message : 'Unknown error',
-        timestamp: new Date().toISOString(),
-      });
+      message: errorMessage,
+      timestamp: new Date().toISOString(),
+    });
   }
 };
 
@@ -431,10 +437,14 @@ async function handlePlatformTest(
       } catch (error) {
       logger.error('[PLATFORM_TEST] Autonomous exploration failed', { error });
 
+        const errorMessage = error instanceof Error && error.message
+          ? error.message
+          : (error ? String(error) : 'An unexpected error occurred');
+
         res.status(500).json({
           success: false,
         error: 'Failed to explore platform',
-          message: error instanceof Error ? error.message : 'Unknown error',
+          message: errorMessage,
           timestamp: new Date().toISOString(),
         });
         return;
@@ -499,18 +509,20 @@ async function handleApiTest(
 ): Promise<void> {
   const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers } = params;
 
-  logger.info('[API_TEST] Starting API test flow', {
-    method: parsedIntent?.apiMethod,
-    url: parsedIntent?.apiUrl,
-  });
+  try {
+    logger.info('[API_TEST] Starting API test flow', {
+      method: parsedIntent?.apiMethod,
+      url: parsedIntent?.apiUrl,
+      hasParsedIntent: !!parsedIntent,
+    });
 
-  emitProcessingStep(chatSessionId, 'checking_autonomous', '🔍 Analyzing API request...', 30);
+    emitProcessingStep(chatSessionId, 'checking_autonomous', '🔍 Analyzing API request...', 30);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // STEP 1: VALIDATE API INFO
-  // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 1: VALIDATE API INFO
+    // ═══════════════════════════════════════════════════════════════════════
 
-  if (!parsedIntent?.apiMethod || !parsedIntent?.apiUrl) {
+    if (!parsedIntent?.apiMethod || !parsedIntent?.apiUrl) {
     const errorMessage = '❌ I need more details for the API test.\n\nPlease specify:\n• HTTP Method (GET, POST, etc.)\n• API URL\n\nExample: "Test GET request to https://api.example.com/users"';
 
     // Save to history
@@ -586,14 +598,42 @@ async function handleApiTest(
     ]);
   }
 
-  res.json({
-    reply: formattedPlan,
-    testPlan: apiTestPlan,
-    conversationId: testPlan.id, // Use this to track approval
-    requiresApproval: true,
-    timestamp: new Date().toISOString(),
-    sessionId: chatSessionId,
-  });
+    res.json({
+      reply: formattedPlan,
+      testPlan: apiTestPlan,
+      conversationId: testPlan.id, // Use this to track approval
+      requiresApproval: true,
+      timestamp: new Date().toISOString(),
+      sessionId: chatSessionId,
+    });
+  } catch (error) {
+    logger.error('[API_TEST] Error in API test flow', {
+      error,
+      errorType: error?.constructor?.name,
+      errorMessage: error instanceof Error ? error.message : String(error),
+      parsedIntent,
+    });
+
+    const errorMessage = error instanceof Error && error.message
+      ? error.message
+      : (error ? String(error) : 'Failed to process API test request');
+
+    // Save error to history
+    if (chatSessionId) {
+      await ChatService.saveChatMessages(chatSessionId, [
+        { role: 'user', content: params.message },
+        { role: 'ai', content: `❌ Error: ${errorMessage}` },
+      ]);
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process API test',
+      message: errorMessage,
+      timestamp: new Date().toISOString(),
+      sessionId: chatSessionId,
+    });
+  }
 }
 
 /**
@@ -1234,10 +1274,14 @@ async function executeApprovedTestPlan(
   } catch (error) {
     logger.error('[EXECUTE] Error executing test plan', { error, planId });
 
+    const errorMessage = error instanceof Error && error.message
+      ? error.message
+      : (error ? String(error) : 'An unexpected error occurred');
+
     res.status(500).json({
       success: false,
       error: 'Failed to execute test plan',
-      message: error instanceof Error ? error.message : 'Unknown error',
+      message: errorMessage,
       timestamp: new Date().toISOString(),
     });
   }
