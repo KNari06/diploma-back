@@ -18,7 +18,8 @@ import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.se
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { extractUrlFromMessage } from '@/services/kb/context-enrichment.service';
-import { searchKB } from '@/services/kb/kb.service';
+import { detectLanguage, searchKB } from '@/services/kb/kb.service';
+import { RulesCacheService } from '@/services/kb/rules-cache.service';
 import { executeApiTest } from '@/services/testing/apiTest.service';
 import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/testing/autonomous-orchestrator.service';
 import { getTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
@@ -713,21 +714,35 @@ async function handleGeneralChat(
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2: SEARCH GLOBAL KB FOR GENERAL CHAT
+  // STEP 2: SEARCH GLOBAL KB FOR GENERAL CHAT (ALWAYS!)
   // ═══════════════════════════════════════════════════════════════════════
 
-      let kbContext = '';
+  let kbContext = '';
+  let kbRulesContext = '';
+
+  // Detect user language from message
+  const userLanguage = detectLanguage(message);
+
+  logger.info('[GENERAL_CHAT] Detected user language', {
+    language: userLanguage,
+    message: message.substring(0, 100),
+  });
 
   // For general_chat ALWAYS search in Global KB
   try {
-    logger.info('[GENERAL_CHAT] Searching Global KB for context', { message: message.substring(0, 100) });
+    logger.info('[GENERAL_CHAT] Searching Global KB for context and rules', {
+      message: message.substring(0, 100),
+      language: userLanguage,
+    });
 
+    // Search for general context related to user's message
     const kbResults = await searchKB(message, undefined, {
       matchCount: 3,
       matchThreshold: 0.6, // Slightly higher than for intent parsing
-          });
+      language: userLanguage, // Filter by detected language
+    });
 
-          if (kbResults.chunks.length > 0) {
+    if (kbResults.chunks.length > 0) {
       kbContext = kbResults.chunks
         .map(chunk => chunk.content)
         .join('\n\n');
@@ -740,10 +755,62 @@ async function handleGeneralChat(
     } else {
       logger.info('[GENERAL_CHAT] No relevant KB context found');
     }
+
+    // Try to get rules from cache first (FAST PATH - ~0ms)
+    try {
+      // Fallback to 'en' for neutral language
+      const cacheLanguage = userLanguage === 'neutral' ? 'en' : userLanguage;
+      const cachedRules = RulesCacheService.getRules(cacheLanguage);
+
+      if (cachedRules) {
+        // Rules found in cache! No need for searchKB()
+        kbRulesContext = cachedRules;
+
+        logger.info('[GENERAL_CHAT] Using cached rules (FAST PATH)', {
+          language: userLanguage,
+          cacheLanguage,
+          rulesLength: cachedRules.length,
+          cacheHit: true,
+        });
+      } else {
+        // Fallback to searchKB if cache miss (SLOW PATH - ~200-300ms)
+        logger.warn('[GENERAL_CHAT] Rules cache miss, falling back to searchKB', {
+          language: userLanguage,
+        });
+
+        const kbRulesSearch = await searchKB('AI response guidelines rules', undefined, {
+          matchCount: 2,
+          matchThreshold: 0.5,
+          language: userLanguage,
+        });
+
+        if (kbRulesSearch.chunks.length > 0) {
+          const rulesChunks = kbRulesSearch.chunks.filter(
+            chunk => chunk.source_file?.includes('rules') || chunk.source_file?.includes('general_ai')
+          );
+
+          if (rulesChunks.length > 0) {
+            kbRulesContext = rulesChunks
+              .map(chunk => chunk.content)
+              .join('\n\n');
+
+            logger.info('[GENERAL_CHAT] Found KB rules via searchKB (SLOW PATH)', {
+              rulesChunksCount: rulesChunks.length,
+              sources: kbRulesSearch.sources.global,
+              rulesContextLength: kbRulesContext.length,
+              cacheHit: false,
+            });
+          }
+        }
+      }
+    } catch (rulesError) {
+      logger.warn('[GENERAL_CHAT] Failed to get rules, continuing without them', { error: rulesError });
+      // Continue without rules - not critical
+    }
   } catch (error) {
     logger.warn('[GENERAL_CHAT] KB search failed', { error });
-          // Continue without KB context
-        }
+    // Continue without KB context
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: BUILD MESSAGES ARRAY FOR OPENAI
@@ -759,6 +826,20 @@ async function handleGeneralChat(
   const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
     { role: 'system', content: enhancedSystemPrompt },
   ];
+
+  // Add Global KB RULES FIRST (if available) - IMPORTANT for response guidelines
+  if (kbRulesContext) {
+    messages.push({
+      role: 'system',
+      content: `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 RESPONSE GUIDELINES FROM KNOWLEDGE BASE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+${kbRulesContext}
+
+IMPORTANT: Follow these guidelines when generating responses.`,
+    });
+  }
 
   // Add Global KB context (ALWAYS for general_chat)
   if (kbContext) {
@@ -795,6 +876,8 @@ Use this knowledge to provide more accurate and helpful responses.`,
     recentHistoryCount: conversationHistory.length,
     hasKbContext: !!kbContext,
     kbContextLength: kbContext.length,
+    hasKbRules: !!kbRulesContext,
+    kbRulesLength: kbRulesContext.length,
   });
 
   // ═══════════════════════════════════════════════════════════════════════

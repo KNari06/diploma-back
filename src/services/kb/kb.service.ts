@@ -13,6 +13,7 @@ export interface KBChunk {
   content: string;
   source_file?: string;
   file_name?: string;
+  language?: string; // 'en', 'ru', 'neutral'
   tags?: string[];
   metadata: any;
   similarity?: number;
@@ -186,6 +187,15 @@ export async function uploadProjectKB(
 }
 
 /**
+ * Detect language from user message
+ */
+export function detectLanguage(message: string): 'en' | 'ru' | 'neutral' {
+  // Simple heuristic: if message contains Cyrillic characters → ru
+  const hasCyrillic = /[а-яА-ЯёЁ]/.test(message);
+  return hasCyrillic ? 'ru' : 'en';
+}
+
+/**
  * Search KB using RAG (local global KB first, then project KB from Supabase)
  */
 export async function searchKB(
@@ -194,11 +204,13 @@ export async function searchKB(
   options: {
     matchThreshold?: number;
     matchCount?: number;
+    language?: 'en' | 'ru' | 'neutral'; // Filter by language
   } = {}
 ): Promise<KBSearchResult> {
   try {
     const matchThreshold = options.matchThreshold || 0.7;
     const matchCount = options.matchCount || 5;
+    const language = options.language; // Optional language filter
 
     // Generate query embedding
     const queryEmbedding = await generateEmbedding(query);
@@ -207,12 +219,14 @@ export async function searchKB(
     const localGlobalResults = await searchLocalGlobalKB(queryEmbedding, {
       threshold: matchThreshold,
       limit: matchCount,
+      language, // Pass language filter
     });
 
     const globalChunks: KBChunk[] = localGlobalResults.map((chunk) => ({
       id: chunk.id,
       content: chunk.content,
       source_file: chunk.source_file,
+      language: chunk.language,
       tags: chunk.tags,
       metadata: chunk.metadata,
       similarity: chunk.similarity,

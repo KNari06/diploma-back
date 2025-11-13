@@ -8,6 +8,7 @@ export interface LocalKBChunk {
   content: string;
   embedding: number[];
   source_file: string;
+  language: string; // 'en', 'ru', 'neutral'
   tags?: string[];
   metadata?: any;
   similarity?: number;
@@ -97,10 +98,12 @@ export async function searchLocalGlobalKB(
   options: {
     threshold?: number;
     limit?: number;
+    language?: 'en' | 'ru' | 'neutral'; // Filter by language
   } = {}
 ): Promise<LocalKBChunk[]> {
   const threshold = options.threshold || 0.7;
   const limit = options.limit || 5;
+  const language = options.language;
 
   // Load KB (uses cache if already loaded)
   const chunks = await loadGlobalKB();
@@ -109,8 +112,27 @@ export async function searchLocalGlobalKB(
     return [];
   }
 
+  // Filter by language if specified
+  let filteredChunks = chunks;
+  if (language) {
+    filteredChunks = chunks.filter(
+      (chunk) => chunk.language === language || chunk.language === 'neutral'
+    );
+
+    logger.debug('Filtered KB by language', {
+      language,
+      totalChunks: chunks.length,
+      filteredChunks: filteredChunks.length,
+    });
+  }
+
+  if (filteredChunks.length === 0) {
+    logger.warn('No chunks found for language', { language });
+    return [];
+  }
+
   // Calculate similarity for each chunk
-  const results = chunks.map((chunk) => ({
+  const results = filteredChunks.map((chunk) => ({
     ...chunk,
     similarity: cosineSimilarity(queryEmbedding, chunk.embedding),
   }));
@@ -123,8 +145,10 @@ export async function searchLocalGlobalKB(
 
   logger.debug('Local KB search completed', {
     totalChunks: chunks.length,
+    languageFilteredChunks: filteredChunks.length,
     matchedChunks: filtered.length,
     topSimilarity: filtered[0]?.similarity || 0,
+    language: language || 'all',
   });
 
   return filtered;

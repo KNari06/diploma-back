@@ -5,6 +5,7 @@ import chatRoutes from '@/api/chat/chat.route';
 import intelligentTestRoutes from '@/api/intelligentTest/intelligentTest.route';
 import jiraRoutes from '@/api/jira/jira.route';
 import kbRoutes from '@/api/kb/kb.route';
+import rulesReloadRoutes from '@/api/kb/rules-reload.route';
 import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
@@ -193,6 +194,7 @@ app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
 app.use(`/api/${env.API_VERSION}/api-config`, apiConfigRoutes);
 app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
 app.use(`/api/${env.API_VERSION}/kb`, kbRoutes);
+app.use(`/api/${env.API_VERSION}/kb`, rulesReloadRoutes);
 app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
@@ -238,6 +240,15 @@ const startServer = async () => {
       await initializeGlobalKB();
     } catch (kbError) {
       logger.warn('Failed to initialize global KB, continuing without it', { error: kbError });
+    }
+
+    // Initialize Rules Cache (load AI response rules into memory)
+    try {
+      const { RulesCacheService } = await import('@/services/kb/rules-cache.service');
+      await RulesCacheService.init();
+      logger.info('✓ Rules cache initialized successfully');
+    } catch (rulesCacheError) {
+      logger.warn('Failed to initialize rules cache, continuing without it', { error: rulesCacheError });
     }
 
     // Test database connection

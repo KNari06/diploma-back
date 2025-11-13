@@ -3,7 +3,8 @@ import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
 import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/intentParserPrompt';
 import { IntentResult, KNOWN_INTENTS } from '@/types';
-import { searchKB, KBSearchResult } from '@/services/kb/kb.service';
+import { searchKB, KBSearchResult, detectLanguage } from '@/services/kb/kb.service';
+import { RulesCacheService } from '@/services/kb/rules-cache.service';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
@@ -108,10 +109,106 @@ export async function parseUserIntent(
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // STEP 1: Try standard parsing (fast path)
+    // STEP 1: Always search Global KB for rules and context (IMPORTANT!)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    const intentResult = await parseIntentWithGPT(trimmedMessage, context);
+    let kbRulesContext: IntentParserContext = context || {};
+    let kbRulesUsed = false;
+
+    // Detect user language from message
+    const userLanguage = detectLanguage(trimmedMessage);
+
+    logger.info('[INTENT_PARSER] Detected user language', {
+      language: userLanguage,
+      message: trimmedMessage.substring(0, 50),
+    });
+
+    try {
+      // Try to get rules from cache first (FAST PATH - ~0ms)
+      // Fallback to 'en' for neutral language
+      const cacheLanguage = userLanguage === 'neutral' ? 'en' : userLanguage;
+      const cachedRules = RulesCacheService.getRules(cacheLanguage);
+
+      if (cachedRules) {
+        // Rules found in cache! No need for searchKB()
+        kbRulesContext = {
+          ...context,
+          documentation: [
+            ...(context?.documentation || []),
+            `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 RESPONSE GUIDELINES FROM KNOWLEDGE BASE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+${cachedRules}
+
+IMPORTANT: Follow these guidelines when parsing user intent and generating responses.`,
+          ],
+        };
+        kbRulesUsed = true;
+
+        logger.info('[INTENT_PARSER] Using cached rules (FAST PATH)', {
+          language: userLanguage,
+          cacheLanguage,
+          rulesLength: cachedRules.length,
+          cacheHit: true,
+        });
+      } else {
+        // Fallback to searchKB if cache miss (SLOW PATH - ~200-300ms)
+        logger.warn('[INTENT_PARSER] Rules cache miss, falling back to searchKB', {
+          language: userLanguage,
+        });
+
+        const kbRulesSearch = await withTimeout(
+          searchKB(trimmedMessage, projectId, {
+            matchCount: 3,
+            matchThreshold: 0.5,
+            language: userLanguage,
+          }),
+          RAG_TIMEOUT,
+          'KB rules search timeout'
+        );
+
+        if (kbRulesSearch.chunks.length > 0) {
+          const rulesContext = kbRulesSearch.chunks
+            .filter(chunk => chunk.source_file?.includes('rules') || chunk.source_file?.includes('general'))
+            .map(chunk => chunk.content)
+            .join('\n\n');
+
+          if (rulesContext) {
+            kbRulesContext = {
+              ...context,
+              documentation: [
+                ...(context?.documentation || []),
+                `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 RESPONSE GUIDELINES FROM KNOWLEDGE BASE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+${rulesContext}
+
+IMPORTANT: Follow these guidelines when parsing user intent and generating responses.`,
+              ],
+            };
+            kbRulesUsed = true;
+
+            logger.info('[INTENT_PARSER] Found KB rules via searchKB (SLOW PATH)', {
+              chunksCount: kbRulesSearch.chunks.length,
+              sources: kbRulesSearch.sources.global,
+              rulesContextLength: rulesContext.length,
+              cacheHit: false,
+            });
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn('[INTENT_PARSER] Failed to get rules, continuing without them', { error });
+      // Continue without KB rules - not critical
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // STEP 2: Try standard parsing (with KB rules context if available)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    const intentResult = await parseIntentWithGPT(trimmedMessage, kbRulesContext);
 
     if (!intentResult) {
       logger.warn('[INTENT_PARSER] Initial parse failed');
@@ -119,7 +216,7 @@ export async function parseUserIntent(
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // STEP 2: Calculate confidence - do we need RAG fallback?
+    // STEP 3: Calculate confidence - do we need additional RAG fallback?
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     const confidence = calculateConfidence(intentResult, trimmedMessage);
@@ -127,11 +224,32 @@ export async function parseUserIntent(
     logger.info('[INTENT_PARSER] Initial parse confidence', {
       confidence,
       intent: intentResult.intent,
+      kbRulesUsed,
     });
 
-    // If confidence is high enough, return immediately (fast path)
-    if (confidence >= 0.7) {
-      logger.info('[INTENT_PARSER] High confidence, using standard parse');
+    // If confidence is high enough AND we already used KB rules, return immediately
+    if (confidence >= 0.7 && kbRulesUsed) {
+      logger.info('[INTENT_PARSER] High confidence with KB rules, using standard parse');
+      const finalResult = {
+        ...intentResult,
+        confidence,
+        metadata: {
+          ...intentResult.metadata,
+          usedRAG: true,
+          kbRulesUsed: true,
+        },
+      };
+
+      // Cache the result
+      setCacheEntry(cacheKey, finalResult);
+
+      return finalResult;
+    }
+
+    // If confidence is high but no KB rules were used, still return (fast path)
+    // But mark that KB rules weren't available
+    if (confidence >= 0.7 && !kbRulesUsed) {
+      logger.info('[INTENT_PARSER] High confidence, using standard parse (no KB rules found)');
       const finalResult = {
         ...intentResult,
         confidence,
@@ -144,10 +262,10 @@ export async function parseUserIntent(
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // STEP 3: Low confidence - use RAG fallback
+    // STEP 4: Low confidence - use additional RAG fallback (if needed)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    logger.info('[INTENT_PARSER] Low confidence, using RAG fallback');
+    logger.info('[INTENT_PARSER] Low confidence, using additional RAG fallback');
 
     try {
       // FIX #5: Add timeout for KB search to prevent hanging
@@ -155,6 +273,7 @@ export async function parseUserIntent(
         searchKB(trimmedMessage, projectId, {
           matchCount: 5,
           matchThreshold: 0.5, // Lower threshold for better recall
+          language: userLanguage, // Use detected language for additional context
         }),
         RAG_TIMEOUT,
         'KB search timeout'
