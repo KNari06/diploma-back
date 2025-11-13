@@ -21,8 +21,9 @@ export async function detectUserApproval(
   reasoning?: string;
 }> {
   try {
-    logger.info('Detecting user approval with AI', {
-      message: userMessage.substring(0, 50),
+    logger.info('🔍 [APPROVAL_DETECT] Starting detection', {
+      message: userMessage,
+      length: userMessage.length,
     });
 
     // Use centralized prompt
@@ -43,9 +44,13 @@ export async function detectUserApproval(
       max_tokens: 100,
     });
 
+    logger.info('🔍 [APPROVAL_DETECT] AI response received', {
+      rawContent: response.content,
+    });
+
     const parsed = JSON.parse(response.content);
 
-    logger.info('User approval detected', {
+    logger.info('✅ [APPROVAL_DETECT] User approval detected by AI', {
       approved: parsed.approved,
       confidence: parsed.confidence,
       reasoning: parsed.reasoning,
@@ -57,25 +62,34 @@ export async function detectUserApproval(
       reasoning: parsed.reasoning,
     };
   } catch (error) {
-    logger.error('Failed to detect user approval', { error });
+    logger.error('❌ [APPROVAL_DETECT] AI detection failed, using fallback', { error });
 
     // Fallback: simple keyword matching
     const message = userMessage.toLowerCase().trim();
 
-    const approvalKeywords = ['да', 'давай', 'ок', 'согласен', 'го', 'хорошо', 'go', 'yes', 'ok', 'sure', 'запускай', '+', 'подтверждаю', 'accept'];
+    const approvalKeywords = ['да', 'давай', 'ок', 'согласен', 'го', 'хорошо', 'go', 'yes', 'ok', 'sure', 'запускай', 'начинай', 'начни', '+', 'подтверждаю', 'accept', 'approved', 'тестинг', 'тест'];
     const rejectionKeywords = ['нет', 'не надо', 'отмена', 'стоп', 'no', 'cancel', 'reject', 'stop', '-', 'отклоняю'];
 
     // Check approval
     if (approvalKeywords.some(k => message.includes(k))) {
-      return { approved: true, confidence: 0.6, reasoning: 'Keyword matching (fallback)' };
+      logger.info('✅ [APPROVAL_DETECT] Keyword match found (approval)', {
+        message,
+        matchedKeyword: approvalKeywords.find(k => message.includes(k)),
+      });
+      return { approved: true, confidence: 0.8, reasoning: 'Keyword matching (fallback)' };
     }
 
     // Check rejection
     if (rejectionKeywords.some(k => message.includes(k))) {
-      return { approved: false, confidence: 0.6, reasoning: 'Keyword matching (fallback)' };
+      logger.info('❌ [APPROVAL_DETECT] Keyword match found (rejection)', {
+        message,
+        matchedKeyword: rejectionKeywords.find(k => message.includes(k)),
+      });
+      return { approved: false, confidence: 0.8, reasoning: 'Keyword matching (fallback)' };
     }
 
     // Unclear
+    logger.warn('⚠️ [APPROVAL_DETECT] No clear intent detected', { message });
     return { approved: null, confidence: 0.1, reasoning: 'No clear intent (fallback)' };
   }
 }

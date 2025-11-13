@@ -72,9 +72,17 @@ export async function executeApiTest(
 ): Promise<ApiTestResponse> {
   const startTime = Date.now();
 
+  logger.info('🟢 [executeApiTest] FUNCTION CALLED', {
+    method: request.method,
+    url: request.url,
+    hasChatSession: !!chatSessionId,
+    timeout: request.timeout,
+  });
+
   // Helper to emit WebSocket progress
   const emitProgress = (step: ChatProcessingStepPayload['step'], message: string, progress: number) => {
     if (chatSessionId) {
+      logger.info('📡 [executeApiTest] Emitting WebSocket progress', { step, message, progress });
       webSocketService.emitChatProcessingStep(chatSessionId, {
         sessionId: chatSessionId,
         step,
@@ -82,10 +90,13 @@ export async function executeApiTest(
         progress,
         timestamp: new Date().toISOString(),
       });
+    } else {
+      logger.warn('⚠️ [executeApiTest] No chatSessionId, skipping WebSocket emit');
     }
   };
 
   try {
+    logger.info('🔵 [executeApiTest] Step 1: Validating request...');
     // Validate timeout
     const timeout = Math.min(
       request.timeout || DEFAULT_TIMEOUT,
@@ -119,7 +130,7 @@ export async function executeApiTest(
         : JSON.stringify(request.body);
     }
 
-    logger.info('Executing API test', {
+    logger.info('🔵 [executeApiTest] Step 2: Request validated, preparing fetch', {
       method,
       url: request.url,
       timeout,
@@ -127,10 +138,16 @@ export async function executeApiTest(
     });
 
     // Emit: Sending request
+    logger.info('🔵 [executeApiTest] Step 3: Emitting progress and starting fetch...');
     emitProgress('executing_test', `📡 Sending ${method} request...`, 72);
 
     // Execute request
+    logger.info('🔵 [executeApiTest] Step 4: Calling fetch()...', { url: request.url });
     const response = await fetch(request.url, fetchOptions);
+    logger.info('🔵 [executeApiTest] Step 5: Fetch completed!', {
+      status: response.status,
+      statusText: response.statusText,
+    });
     const durationMs = Date.now() - startTime;
 
     // Emit: Processing response

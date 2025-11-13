@@ -22,7 +22,7 @@ import { detectLanguage, searchKB } from '@/services/kb/kb.service';
 import { RulesCacheService } from '@/services/kb/rules-cache.service';
 import { executeApiTest } from '@/services/testing/apiTest.service';
 import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/testing/autonomous-orchestrator.service';
-import { getTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
+import { getTestPlan, getLatestPendingTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
 import { ManualTestService } from '@/services/testing/manualTest.service';
 import { ChatService } from '@/services/utils/chat.service';
 
@@ -85,13 +85,28 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     // IMPORTANT: Check test plan approval BEFORE parsing intent!
     // If user is responding to test plan, we don't want to parse their "yes" as a new intent
-    if (conversationId) {
-      const pendingPlan = await getTestPlan(conversationId, userId);
 
-      if (pendingPlan && pendingPlan.status === 'pending_confirmation') {
+    // Try to find pending plan by conversationId first, fallback to latest pending plan
+    let pendingPlan = null;
+
+    if (conversationId) {
+      logger.info('[CHAT] Looking for pending plan by conversationId', { conversationId });
+      pendingPlan = await getTestPlan(conversationId, userId);
+    }
+
+    // FALLBACK: If no conversationId provided, check if user has any recent pending plan
+    if (!pendingPlan) {
+      logger.info('[CHAT] No conversationId or plan not found, checking for latest pending plan', { userId });
+      pendingPlan = await getLatestPendingTestPlan(userId);
+    }
+
+    if (pendingPlan && pendingPlan.status === 'pending_confirmation') {
         // User is responding to test plan - detect approval/rejection
-        logger.info('[CHAT] Found pending test plan, checking for approval/rejection', {
+        logger.info('🔍 [CHAT] Found pending test plan, checking for approval/rejection', {
           planId: pendingPlan.id,
+          scope: pendingPlan.scope,
+          createdAt: pendingPlan.createdAt,
+          userMessage: message,
         });
 
         const approvalResult = await detectUserApproval(message);
@@ -123,6 +138,12 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
         if (approvalResult.approved === true) {
           // APPROVED - execute test
+          logger.info('🟢 [APPROVAL] Test approved, executing now...', {
+            planId: pendingPlan.id,
+            userId,
+            chatSessionId,
+            scope: pendingPlan.scope,
+          });
           return await executeApprovedTestPlan(req, res, {
             planId: pendingPlan.id,
               userId,
@@ -149,7 +170,11 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           });
           return;
         }
-      }
+    } else {
+      logger.info('[CHAT] No pending test plan found', {
+        userId,
+        conversationId: conversationId || 'none'
+      });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -986,7 +1011,12 @@ async function executeApprovedTestPlan(
 ): Promise<void> {
   const { planId, userId, chatSessionId, workspace_id } = params;
 
-  logger.info('[EXECUTE] Test plan approved', { planId, userId });
+  logger.info('🚀 [EXECUTE] ==> FUNCTION CALLED - Test plan approved', {
+    planId,
+    userId,
+    chatSessionId,
+    timestamp: new Date().toISOString()
+  });
 
   try {
     // Get the test plan
@@ -1041,13 +1071,29 @@ async function executeApprovedTestPlan(
 
     if (isApiTest) {
       // Execute API test
+      logger.info('🔵 [API_TEST] Starting API test execution', {
+        planId,
+        url: plan.url,
+        method: (plan as any).metadata?.method,
+        chatSessionId,
+      });
+
       emitProcessingStep(chatSessionId, 'executing_test', '🌐 Executing API request...', 70);
 
       // Confirm plan first
+      logger.info('🔵 [API_TEST] Step 1: Confirming plan...');
       await confirmAndExecuteTestPlan(planId, userId);
+      logger.info('🔵 [API_TEST] Step 2: Plan confirmed, extracting details...');
 
       // Extract API test details from metadata
       const apiDetails = (plan as any).metadata || {};
+
+      logger.info('🔵 [API_TEST] Step 3: Calling executeApiTest', {
+        method: apiDetails.method || 'GET',
+        url: plan.url,
+        hasBody: !!apiDetails.body,
+        hasHeaders: !!apiDetails.headers,
+      });
 
       const apiTestResult = await executeApiTest(
         {

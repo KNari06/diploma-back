@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
 import { ExplorationResult } from '@/services/testing/autonomous-explorer.service';
 import { TestPlan } from '@/services/testing/test-plan-generator.service';
+import { logger } from '@/utils/logger';
 
 /**
  * Save exploration result to cache
@@ -154,6 +154,66 @@ export async function saveTestPlan(
   } catch (error) {
     logger.error('Error saving test plan', { error });
     throw error;
+  }
+}
+
+/**
+ * Get latest pending test plan for user (fallback when conversationId not provided)
+ */
+export async function getLatestPendingTestPlan(
+  userId: string
+): Promise<TestPlan | null> {
+  try {
+    // Check if userId is valid UUID
+    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+    let query = supabaseAdmin
+      .from('test_plans')
+      .select('*')
+      .eq('status', 'pending_confirmation')
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    // Only filter by user_id if it's a valid UUID
+    if (isValidUUID) {
+      query = query.eq('user_id', userId);
+    } else {
+      // For invalid UUIDs, look for plans with NULL user_id (anonymous)
+      query = query.is('user_id', null);
+    }
+
+    const { data, error } = await query.maybeSingle();
+
+    if (error || !data) {
+      logger.info('[PENDING_PLAN] No pending test plan found', { userId, isValidUUID });
+      return null;
+    }
+
+    logger.info('[PENDING_PLAN] Found latest pending test plan', {
+      planId: data.id,
+      userId,
+      createdAt: data.created_at,
+    });
+
+    return {
+      id: data.id,
+      status: data.status,
+      url: data.url,
+      scope: data.scope,
+      summary: data.summary,
+      steps: data.steps,
+      commands: data.commands,
+      estimatedDuration: data.estimated_duration,
+      whatWillBeTested: data.what_will_be_tested,
+      whatWillNotBeTested: data.what_will_not_be_tested,
+      risks: data.risks,
+      createdAt: data.created_at,
+      expiresAt: data.expires_at,
+    };
+  } catch (error) {
+    logger.error('Error getting latest pending test plan', { error });
+    return null;
   }
 }
 
