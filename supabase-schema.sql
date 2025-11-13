@@ -17,6 +17,7 @@ CREATE TYPE credit_transaction_type AS ENUM ('purchase', 'usage', 'refund', 'bon
 CREATE TYPE bug_severity AS ENUM ('low', 'medium', 'high', 'critical');
 CREATE TYPE bug_category AS ENUM ('visual', 'functional', 'performance', 'accessibility', 'security');
 CREATE TYPE chat_role AS ENUM ('user', 'ai');
+CREATE TYPE feedback_type AS ENUM ('like', 'dislike');
 
 -- Users table
 CREATE TABLE users (
@@ -114,6 +115,18 @@ CREATE TABLE chat_messages (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Message feedback table (for RLHF and AI improvement)
+CREATE TABLE message_feedback (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    message_id UUID NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id UUID NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    feedback_type feedback_type NOT NULL,
+    intent_type TEXT,
+    context JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- API test logs table
 CREATE TABLE api_test_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -156,6 +169,13 @@ CREATE INDEX idx_chat_sessions_project_id ON chat_sessions(project_id);
 CREATE INDEX idx_chat_sessions_created_at ON chat_sessions(created_at DESC);
 CREATE INDEX idx_chat_messages_session_id ON chat_messages(session_id);
 CREATE INDEX idx_chat_messages_created_at ON chat_messages(created_at DESC);
+CREATE INDEX idx_message_feedback_message_id ON message_feedback(message_id);
+CREATE INDEX idx_message_feedback_user_id ON message_feedback(user_id);
+CREATE INDEX idx_message_feedback_session_id ON message_feedback(session_id);
+CREATE INDEX idx_message_feedback_feedback_type ON message_feedback(feedback_type);
+CREATE INDEX idx_message_feedback_intent_type ON message_feedback(intent_type);
+CREATE INDEX idx_message_feedback_created_at ON message_feedback(created_at DESC);
+CREATE UNIQUE INDEX idx_message_feedback_unique ON message_feedback(message_id, user_id);
 CREATE INDEX idx_api_test_logs_user_id ON api_test_logs(user_id);
 CREATE INDEX idx_api_test_logs_created_at ON api_test_logs(created_at DESC);
 CREATE INDEX idx_api_test_logs_url ON api_test_logs(url);
@@ -172,6 +192,7 @@ ALTER TABLE test_results ENABLE ROW LEVEL SECURITY;
 ALTER TABLE credit_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE chat_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE chat_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE message_feedback ENABLE ROW LEVEL SECURITY;
 ALTER TABLE api_test_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_embeddings ENABLE ROW LEVEL SECURITY;
 
@@ -308,6 +329,19 @@ CREATE POLICY "Users can delete messages from own sessions" ON chat_messages
         )
     );
 
+-- Message feedback policies
+CREATE POLICY "Users can view own feedback" ON message_feedback
+    FOR SELECT USING (user_id = auth.uid());
+
+CREATE POLICY "Users can create own feedback" ON message_feedback
+    FOR INSERT WITH CHECK (user_id = auth.uid());
+
+CREATE POLICY "Users can update own feedback" ON message_feedback
+    FOR UPDATE USING (user_id = auth.uid());
+
+CREATE POLICY "Users can delete own feedback" ON message_feedback
+    FOR DELETE USING (user_id = auth.uid());
+
 -- API test logs policies
 CREATE POLICY "Users can view own API test logs" ON api_test_logs
     FOR SELECT USING (auth.uid() = user_id);
@@ -354,6 +388,21 @@ CREATE POLICY "Users can delete embeddings from own projects" ON ai_embeddings
             AND projects.user_id = auth.uid()
         )
     );
+
+-- Views for analytics and reporting
+CREATE OR REPLACE VIEW feedback_analytics AS
+SELECT
+    intent_type,
+    feedback_type,
+    COUNT(*) as count,
+    DATE_TRUNC('day', created_at) as date
+FROM message_feedback
+WHERE intent_type IS NOT NULL
+GROUP BY intent_type, feedback_type, DATE_TRUNC('day', created_at)
+ORDER BY date DESC, intent_type, feedback_type;
+
+-- Grant access to analytics view
+GRANT SELECT ON feedback_analytics TO authenticated;
 
 -- Functions for automatic timestamp updates
 CREATE OR REPLACE FUNCTION update_updated_at_column()

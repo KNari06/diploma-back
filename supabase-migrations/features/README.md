@@ -119,6 +119,21 @@ Feature-specific database migrations for QAIT Backend.
 
 ---
 
+### 8️⃣ AI Improvement & Feedback
+
+#### `message-feedback.sql`
+- User feedback (like/dislike) on AI messages
+- Feedback analytics view
+- RLHF data collection
+- Intent-based statistics
+
+**Apply when:**
+- Want to collect user feedback on AI responses
+- Need RLHF (Reinforcement Learning from Human Feedback) data
+- Building AI improvement pipeline
+
+---
+
 ## 🚀 How to Apply
 
 ### Single Feature:
@@ -152,6 +167,9 @@ Feature-specific database migrations for QAIT Backend.
 
 -- 5. Credits system
 \i features/token-based-credits-system.sql
+
+-- 6. AI improvement
+\i features/message-feedback.sql
 ```
 
 ---
@@ -186,4 +204,4 @@ autonomous-exploration.sql
 
 ---
 
-**Last updated:** 2025-11-11
+**Last updated:** 2024-11-13

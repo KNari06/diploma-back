@@ -708,3 +708,103 @@ export interface PlaywrightTestPlan {
   viewport?: ViewportType;
   expectedOutcome: string;  // What should happen if test passes
 }
+
+// Message Feedback types
+export type FeedbackType = 'like' | 'dislike';
+
+export interface MessageFeedback {
+  id: string;
+  message_id: string;
+  user_id: string;
+  session_id: string;
+  feedback_type: FeedbackType;
+  intent_type?: string;
+  context?: FeedbackContext;
+  created_at: string;
+}
+
+export interface FeedbackContext {
+  prompt_tokens?: number;
+  response_tokens?: number;
+  response_time_ms?: number;
+  model?: string;
+  temperature?: number;
+  user_agent?: string;
+  [key: string]: any;
+}
+
+export interface CreateFeedbackRequest {
+  message_id: string;
+  feedback_type: FeedbackType;
+  intent_type?: string;
+  context?: FeedbackContext;
+}
+
+export interface FeedbackAnalytics {
+  intent_type: string;
+  feedback_type: FeedbackType;
+  count: number;
+  date: string;
+}
+
+export interface FeedbackStatistics {
+  total_feedback: number;
+  likes: number;
+  dislikes: number;
+  satisfaction_rate: number;
+  by_intent: Array<{
+    intent_type: string;
+    likes: number;
+    dislikes: number;
+    satisfaction_rate: number;
+    total: number;
+  }>;
+  recent_feedback: MessageFeedback[];
+}
+
+export interface FeedbackInsights {
+  summary: {
+    overall_satisfaction: number;
+    total_responses: number;
+    feedback_rate: number; // % of messages with feedback
+    trend: 'improving' | 'declining' | 'stable';
+  };
+  problem_areas: Array<{
+    intent_type: string;
+    issue: string;
+    severity: 'high' | 'medium' | 'low';
+    affected_messages: number;
+    satisfaction_rate: number;
+  }>;
+  top_performers: Array<{
+    intent_type: string;
+    satisfaction_rate: number;
+    total_feedback: number;
+    why_successful: string;
+  }>;
+  recommendations: Array<{
+    priority: 'high' | 'medium' | 'low';
+    area: string;
+    action: string;
+    expected_improvement: string;
+  }>;
+  time_series: Array<{
+    date: string;
+    likes: number;
+    dislikes: number;
+    satisfaction_rate: number;
+  }>;
+}
+
+export interface FeedbackComparison {
+  current_period: FeedbackStatistics;
+  previous_period: FeedbackStatistics;
+  changes: {
+    satisfaction_rate_change: number; // percentage points
+    likes_change: number;
+    dislikes_change: number;
+    total_feedback_change: number;
+  };
+  improved_intents: string[];
+  declined_intents: string[];
+}
