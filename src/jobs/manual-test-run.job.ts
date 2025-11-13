@@ -21,12 +21,14 @@ export class ManualTestRunJobHandler {
    * Process test run job
    */
   static async process(job: Job<TestJobData>) {
-    const { testId, url, browser, options, projectId, userId, retryCount = 0, commands, intent } = job.data;
+    const { testId, url, browser, options, projectId, userId, retryCount = 0, commands, intent, intelligentMode, testGoal } = job.data;
 
     logger.info(`[WORKER] Step 1: Processing test run job: ${testId} (${browser})`, {
       hasCommands: !!commands,
       commandsCount: commands?.length,
       intent,
+      intelligentMode,
+      testGoal: testGoal ? `"${testGoal.substring(0, 50)}..."` : undefined,
     });
     logQueueEvent('processing', job.id!, { testId, browser });
 
@@ -51,6 +53,7 @@ export class ManualTestRunJobHandler {
         browser,
         url,
         hasCommands: !!commands,
+        intelligentMode,
       });
 
       // Execute test using local Playwright agent (integrated)
@@ -64,6 +67,8 @@ export class ManualTestRunJobHandler {
           userId,
           commands,
           intent,
+          intelligentMode,
+          testGoal,
         },
         env.AGENT_MAX_RETRIES || 2
       );

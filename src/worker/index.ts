@@ -95,7 +95,14 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
   });
 
   worker.on('active', (job) => {
-    logger.info(`🔄 ${workerName} worker ACTIVE (started processing): ${job.id}`);
+    logger.info(`🟡 [WORKER_DEBUG] ${workerName} Job picked from queue: ${job.id}`, {
+      testId: job.data?.testId,
+      intelligentMode: job.data?.intelligentMode,
+    });
+    logger.info(`🔄 ${workerName} worker ACTIVE (started processing): ${job.id}`, {
+      testId: job.data?.testId,
+      intelligentMode: job.data?.intelligentMode,
+    });
   });
 
   worker.on('completed', (job) => {

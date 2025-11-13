@@ -958,16 +958,22 @@ async function executeApprovedTestPlan(
       // Execute UI test
       emitProcessingStep(chatSessionId, 'executing_test', '⚙️ Launching browser tests...', 70);
 
+      logger.info('🔵 [EXECUTE_FLOW] Step 1: Starting UI test execution', { planId, userId });
+
       // Confirm and execute test plan
+      logger.info('🔵 [EXECUTE_FLOW] Step 2: Confirming test plan');
       const result = await confirmAndExecuteTestPlan(planId, userId);
+      logger.info('🔵 [EXECUTE_FLOW] Step 3: Test plan confirmed', { success: result.success });
 
       if (result.success && plan) {
         // Get project for this test
+        logger.info('🔵 [EXECUTE_FLOW] Step 4: Finding/creating project');
         const { project_id } = await ProjectContextService.findOrCreateProject(
           workspace_id,
           plan.url,
           userId
         );
+        logger.info('🔵 [EXECUTE_FLOW] Step 5: Project ready', { project_id });
 
         // Execute test
         const testRequest = {
@@ -983,7 +989,7 @@ async function executeApprovedTestPlan(
           testGoal: plan.intelligentMode ? plan.summary : undefined,
         };
 
-        logger.info('[CHAT] Creating test with configuration', {
+        logger.info('🔵 [EXECUTE_FLOW] Step 6: Calling ManualTestService.runTest', {
           planId: plan.id,
           intelligentMode: plan.intelligentMode || false,
           url: plan.url,
@@ -992,6 +998,11 @@ async function executeApprovedTestPlan(
         });
 
         const testCreated = await ManualTestService.runTest(testRequest);
+
+        logger.info('🔵 [EXECUTE_FLOW] Step 7: Test created', {
+          testId: testCreated.data?.id,
+          success: testCreated.success
+        });
 
         // ═══════════════════════════════════════════════════════════════════
         // DEDUCT CREDITS FOR UI TEST

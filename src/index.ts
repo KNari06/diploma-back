@@ -6,6 +6,7 @@ import intelligentTestRoutes from '@/api/intelligentTest/intelligentTest.route';
 import jiraRoutes from '@/api/jira/jira.route';
 import kbRoutes from '@/api/kb/kb.route';
 import manualTestRoutes from '@/api/manualTest/manualTest.route';
+import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
@@ -195,6 +196,7 @@ app.use(`/api/${env.API_VERSION}/kb`, kbRoutes);
 app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
+app.use(`/api/${env.API_VERSION}/queue`, queueStatusRoutes); // Queue monitoring
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {

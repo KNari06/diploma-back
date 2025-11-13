@@ -14,27 +14,39 @@ export class ManualTestService {
    */
   static async runTest(testRequest: TestRunRequest): Promise<ApiResponse<Test>> {
     try {
-      logger.info(`Creating new test for URL: ${testRequest.url}`);
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 1: runTest called', {
+        url: testRequest.url,
+        intelligentMode: testRequest.intelligentMode,
+        testGoal: testRequest.testGoal ? `"${testRequest.testGoal.substring(0, 50)}..."` : undefined,
+      });
 
       // Validate test request
       this.validateTestRequest(testRequest);
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 2: Validation passed');
 
       // Check user credits if userId provided AND is valid UUID
       if (testRequest.userId) {
         const isValidUserUUID = testRequest.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
         if (isValidUserUUID) {
           await this.checkUserCredits(testRequest.userId, testRequest.browsers);
+          logger.info('🟢 [MANUAL_TEST_FLOW] Step 3: Credit check passed');
         } else {
-          logger.info('Skipping credit check for anonymous user', { userId: testRequest.userId });
+          logger.info('🟢 [MANUAL_TEST_FLOW] Step 3: Skipping credit check (anonymous)');
         }
       }
 
       // Create test record
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 4: Creating test record in DB');
       const test = await this.createTest(testRequest);
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 5: Test record created', { testId: test.id });
 
       // Add jobs to queue for each browser
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 6: Adding jobs to queue');
+
       for (const browser of testRequest.browsers) {
-        await QueueManager.addTestRunJob({
+        logger.info('🟢 [MANUAL_TEST_FLOW] Step 7: Adding job to queue', { browser, testId: test.id });
+
+        const job = await QueueManager.addTestRunJob({
           testId: test.id,
           url: testRequest.url,
           browser,
@@ -44,13 +56,25 @@ export class ManualTestService {
           // Pass Playwright commands if available
           commands: (testRequest as any).commands,
           intent: (testRequest as any).intent,
-          // NEW: Pass intelligent mode settings
+          // Pass intelligent mode settings
           intelligentMode: testRequest.intelligentMode,
           testGoal: testRequest.testGoal,
         });
+
+        logger.info('🟢 [MANUAL_TEST_FLOW] Step 8: Job added to queue successfully', {
+          browser,
+          jobId: job?.id
+        });
+
+        // Monitor the job after adding
+        if (job?.id) {
+          const { QueueMonitor } = await import('@/utils/queue-monitor');
+          QueueMonitor.monitorAfterJobAdd(job.id, test.id);
+        }
       }
 
       // Deduct credits if userId provided AND is valid UUID
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 9: Deducting credits');
       if (testRequest.userId) {
         const isValidUserUUID = testRequest.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
         if (isValidUserUUID) {
@@ -61,6 +85,7 @@ export class ManualTestService {
       logTestEvent('created', test.id, { url: testRequest.url, browsers: testRequest.browsers });
 
       // Emit WebSocket event for test creation
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 10: Emitting WebSocket event');
       const testCreatedPayload: TestCreatedPayload = {
         testId: test.id,
         url: testRequest.url,
@@ -69,6 +94,11 @@ export class ManualTestService {
         timestamp: new Date().toISOString(),
       };
       webSocketService.emitTestCreated(test.id, testCreatedPayload);
+
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 11: DONE! Returning test', {
+        testId: test.id,
+        success: true
+      });
 
       return {
         success: true,

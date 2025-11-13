@@ -217,11 +217,14 @@ export class QueueManager {
    */
   static async addTestRunJob(jobData: TestJobData, priority: number = 0) {
     try {
-      if (!redisAvailable && env.NODE_ENV === 'development') {
-        logger.warn('Redis unavailable, job queued in memory (will be lost on restart)');
-        // Fallback: return mock job ID for development
-        return { id: `mock-${Date.now()}` } as any;
-      }
+      logger.info('🔴 [QUEUE_DEBUG] Attempting to add job to queue', {
+        testId: jobData.testId,
+        browser: jobData.browser,
+        intelligentMode: jobData.intelligentMode,
+        redisAvailable,
+        redisHost: connection.host,
+        redisPort: connection.port,
+      });
 
       const job = await testRunQueue.add('test-run', jobData, {
         priority,
@@ -229,14 +232,20 @@ export class QueueManager {
         jobId: `${jobData.testId}-${jobData.browser}`,
       });
 
+      logger.info('🟢 [QUEUE_DEBUG] Job added successfully to Redis', {
+        jobId: job.id,
+        testId: jobData.testId,
+        queue: QUEUE_NAMES.TEST_RUN,
+      });
+
       logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.TEST_RUN, testId: jobData.testId });
       return job;
     } catch (error) {
-      if (env.NODE_ENV === 'development') {
-        logger.warn('Queue unavailable in development, continuing without queue');
-        return { id: `mock-${Date.now()}` } as any;
-      }
-      logger.error('Failed to add test run job:', error);
+      logger.error('❌ [QUEUE_DEBUG] Failed to add test run job', {
+        error: error instanceof Error ? error.message : String(error),
+        testId: jobData.testId,
+        browser: jobData.browser,
+      });
       throw handleQueueError(error);
     }
   }
