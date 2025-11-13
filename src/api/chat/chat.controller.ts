@@ -7,7 +7,6 @@ import { CredentialsParserService } from '@/services/api/credentials-parser.serv
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { ApiTestPlanService } from '@/services/testing/api-test-plan.service';
 import { TestChatMappingService } from '@/services/testing/test-chat-mapping.service';
-import { TestCompletionHandlerService } from '@/services/testing/test-completion-handler.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
 
 // Existing services
@@ -22,7 +21,7 @@ import { detectLanguage, searchKB } from '@/services/kb/kb.service';
 import { RulesCacheService } from '@/services/kb/rules-cache.service';
 import { executeApiTest } from '@/services/testing/apiTest.service';
 import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/testing/autonomous-orchestrator.service';
-import { getTestPlan, getLatestPendingTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
+import { getLatestPendingTestPlan, getTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
 import { ManualTestService } from '@/services/testing/manualTest.service';
 import { ChatService } from '@/services/utils/chat.service';
 
@@ -89,15 +88,49 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // Try to find pending plan by conversationId first, fallback to latest pending plan
     let pendingPlan = null;
 
+    logger.info('🔍🔍🔍 [PENDING_PLAN_SEARCH] Starting search', {
+      conversationId: conversationId || 'NONE',
+      userId,
+      message: message.substring(0, 50),
+      sessionId,
+    });
+
     if (conversationId) {
-      logger.info('[CHAT] Looking for pending plan by conversationId', { conversationId });
+      logger.info('🔍 [PENDING_PLAN_SEARCH] Step 1: Searching by conversationId', { conversationId });
       pendingPlan = await getTestPlan(conversationId, userId);
+
+      if (pendingPlan) {
+        logger.info('✅ [PENDING_PLAN_SEARCH] Found plan by conversationId!', {
+          planId: pendingPlan.id,
+          status: pendingPlan.status,
+          scope: pendingPlan.scope,
+        });
+      } else {
+        logger.warn('❌ [PENDING_PLAN_SEARCH] NOT found by conversationId', { conversationId });
+      }
+    } else {
+      logger.warn('⚠️ [PENDING_PLAN_SEARCH] No conversationId provided from frontend!');
     }
 
     // FALLBACK: If no conversationId provided, check if user has any recent pending plan
     if (!pendingPlan) {
-      logger.info('[CHAT] No conversationId or plan not found, checking for latest pending plan', { userId });
+      logger.info('🔍 [PENDING_PLAN_SEARCH] Step 2: FALLBACK - Searching latest pending plan', { userId });
       pendingPlan = await getLatestPendingTestPlan(userId);
+
+      if (pendingPlan) {
+        logger.info('✅ [PENDING_PLAN_SEARCH] Found plan via FALLBACK!', {
+          planId: pendingPlan.id,
+          status: pendingPlan.status,
+          scope: pendingPlan.scope,
+          createdAt: pendingPlan.createdAt,
+        });
+      } else {
+        logger.error('❌❌❌ [PENDING_PLAN_SEARCH] NO PENDING PLAN FOUND AT ALL!', {
+          userId,
+          triedConversationId: conversationId || 'none',
+          triedFallback: true,
+        });
+      }
     }
 
     if (pendingPlan && pendingPlan.status === 'pending_confirmation') {
@@ -535,36 +568,92 @@ async function handleApiTest(
   const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers } = params;
 
   try {
+    // Merge answers into parsedIntent if provided
+    if (answers) {
+      if (answers.apiMethod) parsedIntent.apiMethod = answers.apiMethod;
+      if (answers.apiUrl) parsedIntent.apiUrl = answers.apiUrl;
+      if (answers.apiBody) parsedIntent.apiBody = answers.apiBody;
+      if (answers.apiHeaders) parsedIntent.apiHeaders = answers.apiHeaders;
+
+      logger.info('[API_TEST] Merged answers into parsedIntent', {
+        answersProvided: Object.keys(answers),
+        method: parsedIntent.apiMethod,
+        url: parsedIntent.apiUrl,
+      });
+    }
+
     logger.info('[API_TEST] Starting API test flow', {
       method: parsedIntent?.apiMethod,
       url: parsedIntent?.apiUrl,
       hasParsedIntent: !!parsedIntent,
+      hasAnswers: !!answers,
     });
 
     emitProcessingStep(chatSessionId, 'checking_autonomous', '🔍 Analyzing API request...', 30);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 1: VALIDATE API INFO
+    // STEP 1: VALIDATE API INFO - ASK FOR MISSING DETAILS
     // ═══════════════════════════════════════════════════════════════════════
 
-    if (!parsedIntent?.apiMethod || !parsedIntent?.apiUrl) {
-    const errorMessage = '❌ I need more details for the API test.\n\nPlease specify:\n• HTTP Method (GET, POST, etc.)\n• API URL\n\nExample: "Test GET request to https://api.example.com/users"';
+    const hasMethod = !!parsedIntent?.apiMethod;
+    const hasUrl = !!parsedIntent?.apiUrl;
 
-    // Save to history
-    if (chatSessionId) {
-      await ChatService.saveChatMessages(chatSessionId, [
-        { role: 'user', content: message },
-        { role: 'ai', content: errorMessage },
-      ]);
+    // If missing method OR URL, ask clarifying questions
+    if (!hasMethod || !hasUrl) {
+      logger.info('[API_TEST] Missing API details, asking for clarification', {
+        hasMethod,
+        hasUrl,
+        message: message.substring(0, 50),
+      });
+
+      const questions = [];
+
+      if (!hasUrl) {
+        questions.push({
+          id: 'apiUrl',
+          question: '🌐 What is the API endpoint URL?',
+          type: 'text',
+          required: true,
+          placeholder: 'https://api.example.com/v1/users',
+        });
+      }
+
+      if (!hasMethod) {
+        questions.push({
+          id: 'apiMethod',
+          question: '📡 Which HTTP method should I use?',
+          type: 'select',
+          required: true,
+          options: [
+            { value: 'GET', label: 'GET - Retrieve data' },
+            { value: 'POST', label: 'POST - Create/Submit data' },
+            { value: 'PUT', label: 'PUT - Update/Replace data' },
+            { value: 'PATCH', label: 'PATCH - Partial update' },
+            { value: 'DELETE', label: 'DELETE - Remove data' },
+          ],
+        });
+      }
+
+      const clarificationMessage = `📋 I need a few more details to set up the API test:\n\n${questions.map(q => `• ${q.question}`).join('\n')}`;
+
+      // Save to history
+      if (chatSessionId) {
+        await ChatService.saveChatMessages(chatSessionId, [
+          { role: 'user', content: message },
+          { role: 'ai', content: clarificationMessage },
+        ]);
+      }
+
+      res.json({
+        reply: clarificationMessage,
+        questions,
+        conversationId: `api_clarify_${Date.now()}`,
+        needsMoreInfo: true,
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+      return;
     }
-
-          res.json({
-      reply: errorMessage,
-            timestamp: new Date().toISOString(),
-      sessionId: chatSessionId,
-          });
-          return;
-        }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 2: FIND OR CREATE PROJECT
@@ -1156,13 +1245,42 @@ async function executeApprovedTestPlan(
       // API tests don't exist in 'tests' table (that's for UI tests only)
       // We already sent all progress via WebSocket in executeApiTest()
 
+      // Format response body for display
+      let responseBodyDisplay = '';
+      if (apiTestResult.responseBody) {
+        if (typeof apiTestResult.responseBody === 'object') {
+          responseBodyDisplay = '\n\n**Response Body:**\n```json\n' + JSON.stringify(apiTestResult.responseBody, null, 2) + '\n```';
+        } else if (typeof apiTestResult.responseBody === 'string' && apiTestResult.responseBody.length > 0) {
+          // Try to parse if it's JSON string
+          try {
+            const parsed = JSON.parse(apiTestResult.responseBody);
+            responseBodyDisplay = '\n\n**Response Body:**\n```json\n' + JSON.stringify(parsed, null, 2) + '\n```';
+          } catch {
+            // Not JSON, show as text (truncate if too long)
+            const truncated = apiTestResult.responseBody.length > 500
+              ? apiTestResult.responseBody.substring(0, 500) + '...'
+              : apiTestResult.responseBody;
+            responseBodyDisplay = '\n\n**Response Body:**\n```\n' + truncated + '\n```';
+          }
+        }
+      }
+
+      const successMessage = `✅ API test executed successfully!
+
+**URL:** ${plan.url}
+**Method:** ${apiDetails.method}
+**Status Code:** ${apiTestResult.status}
+**Success:** ${apiTestResult.success ? 'Yes' : 'No'}
+**Duration:** ${apiTestResult.durationMs}ms${responseBodyDisplay}`;
+
       // Save chat messages
     if (chatSessionId) {
+        logger.info('[API_TEST] Saving chat messages...');
         await ChatService.saveChatMessages(chatSessionId, [
           { role: 'user', content: `Approved API test: ${apiDetails.method} ${plan.url}` },
           {
             role: 'ai',
-            content: `✅ API test executed!\n\n**Result:**\n- Status: ${(apiTestResult as any).response?.status || 'N/A'}\n- Success: ${apiTestResult.success ? 'Yes' : 'No'}\n\n${(apiTestResult as any).message || 'Test completed'}`,
+            content: successMessage,
           metadata: {
               testResult: apiTestResult,
               testId: apiTestId,
@@ -1170,15 +1288,24 @@ async function executeApprovedTestPlan(
             },
           },
         ]);
+        logger.info('[API_TEST] Chat messages saved');
       }
 
+      logger.info('🎯🎯🎯 [API_TEST] About to send HTTP response with results', {
+        testId: apiTestId,
+        status: apiTestResult.status,
+        success: apiTestResult.success,
+      });
+
       res.json({
-        reply: `✅ API test executed successfully!\n\n**Status Code:** ${(apiTestResult as any).response?.status || 'N/A'}\n**Success:** ${apiTestResult.success ? 'Yes' : 'No'}\n\n${(apiTestResult as any).message || 'Test completed'}`,
+        reply: successMessage,
         testResult: apiTestResult,
         testId: apiTestId,
         timestamp: new Date().toISOString(),
         sessionId: chatSessionId,
       });
+
+      logger.info('✅✅✅ [API_TEST] HTTP response sent successfully!');
     } else {
       // Execute UI test
       emitProcessingStep(chatSessionId, 'executing_test', '⚙️ Launching browser tests...', 70);
@@ -1332,11 +1459,28 @@ async function executeApprovedTestPlan(
       }
     }
   } catch (error) {
-    logger.error('[EXECUTE] Error executing test plan', { error, planId });
+    logger.error('❌❌❌ [EXECUTE] CRITICAL ERROR executing test plan', {
+      error,
+      planId,
+      errorMessage: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
 
     const errorMessage = error instanceof Error && error.message
       ? error.message
       : (error ? String(error) : 'An unexpected error occurred');
+
+    // Save error to chat history
+    if (chatSessionId) {
+      try {
+        await ChatService.saveChatMessages(chatSessionId, [
+          { role: 'user', content: 'Approved test execution' },
+          { role: 'ai', content: `❌ Error executing test: ${errorMessage}` },
+        ]);
+      } catch (saveError) {
+        logger.error('[EXECUTE] Failed to save error message to chat', { saveError });
+      }
+    }
 
     res.status(500).json({
       success: false,

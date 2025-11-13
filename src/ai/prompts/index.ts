@@ -68,16 +68,21 @@ POSSIBLE INTENTS (ONLY 3!):
    INDICATORS:
    • Mentions: "API", "endpoint", "HTTP", "request"
    • HTTP methods: GET, POST, PUT, DELETE, PATCH
-   • Words: "test API", "check endpoint", "make request"
+   • Words: "test API", "check endpoint", "make request", "потести апи"
    • URL looks like API (contains /api/, /v1/, etc.)
+   • Informal requests: "давай потести", "проверь вот это"
 
    EXTRACT:
    • apiMethod: "GET" | "POST" | "PUT" | "DELETE" | "PATCH"
-   • apiUrl: ACCEPT BOTH formats:
+     - If NOT explicitly mentioned → null (system will ask user)
+   • apiUrl: EXTRACT ANY URL FROM MESSAGE, including:
      - Full URL: https://api.example.com/users
-     - Relative path: /api/v1/users (validation later)
+     - Relative path: /api/v1/users
+     - URL after words: "вот это", "this", "endpoint", "API"
    • apiBody: request body (if mentions JSON, data)
    • apiHeaders: headers (if mentioned)
+
+   ⚠️ IMPORTANT: ALWAYS extract URL if present, even with informal wording!
 
 3️⃣ "general_chat" - General conversation (NO testing)
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -180,6 +185,22 @@ Output:
   "rawText": "Check that GET request to https://api.example.com/users returns 200"
 }
 
+📝 Example 4b: Informal API test (Russian)
+Input: "оке, давай потести АПИ вот это https://api.hrgpt.kz/api/v1/credit-packs/list"
+Output:
+{
+  "intent": "api_test",
+  "scope": null,
+  "target": null,
+  "page": null,
+  "apiMethod": null,
+  "apiUrl": "https://api.hrgpt.kz/api/v1/credit-packs/list",
+  "apiBody": null,
+  "apiHeaders": null,
+  "urgency": null,
+  "rawText": "оке, давай потести АПИ вот это https://api.hrgpt.kz/api/v1/credit-packs/list"
+}
+
 📝 Example 5: API test with relative path
 Input: "Test POST /api/v1/users endpoint"
 Output:
@@ -236,11 +257,13 @@ IMPORTANT RULES:
 2. If API/HTTP/endpoint → "api_test"
 3. If just questions/chat → "general_chat"
 4. Always extract scope for platform_test
-5. Always extract apiMethod and apiUrl for api_test
-6. page: null is OK - system will ask user for URL
-7. apiUrl can be relative path (/api/v1/users) - system will resolve
-8. Detect urgency from words: "urgent", "ASAP", "critical", "quick", "emergency"
-9. Preserve rawText - original message
+5. For api_test: ALWAYS extract apiUrl if URL present (even informal: "вот это", "this")
+6. For api_test: apiMethod can be null if not specified (system will ask user to clarify)
+7. page: null is OK for platform_test - system will ask user for URL
+8. apiUrl can be relative path (/api/v1/users) - system will resolve
+9. Detect urgency from words: "urgent", "ASAP", "critical", "quick", "emergency"
+10. Preserve rawText - original message
+11. Extract URL even from informal requests: "потести АПИ вот это URL"
 
 ═══════════════════════════════════════════════════════════════════════════════`;
 
