@@ -1,5 +1,7 @@
 import { logger } from '@/utils/logger';
 import { ApiTestRequest, ApiTestResponse } from '@/types';
+import { webSocketService } from '@/websocket/websocket.service';
+import { ChatProcessingStepPayload } from '@/websocket/types';
 
 const DEFAULT_TIMEOUT = 10000; // 10 seconds
 const MAX_TIMEOUT = 30000; // 30 seconds max
@@ -61,10 +63,27 @@ function sanitizeHeaders(headers: Record<string, string> = {}): Record<string, s
 /**
  * Execute API test request
  * @param request - API test request parameters
+ * @param chatSessionId - Optional chat session ID for WebSocket progress updates
  * @returns API test response
  */
-export async function executeApiTest(request: ApiTestRequest): Promise<ApiTestResponse> {
+export async function executeApiTest(
+  request: ApiTestRequest,
+  chatSessionId?: string
+): Promise<ApiTestResponse> {
   const startTime = Date.now();
+
+  // Helper to emit WebSocket progress
+  const emitProgress = (step: ChatProcessingStepPayload['step'], message: string, progress: number) => {
+    if (chatSessionId) {
+      webSocketService.emitChatProcessingStep(chatSessionId, {
+        sessionId: chatSessionId,
+        step,
+        message,
+        progress,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  };
 
   try {
     // Validate timeout
@@ -107,9 +126,15 @@ export async function executeApiTest(request: ApiTestRequest): Promise<ApiTestRe
       hasBody: !!request.body,
     });
 
+    // Emit: Sending request
+    emitProgress('executing_test', `📡 Sending ${method} request...`, 72);
+
     // Execute request
     const response = await fetch(request.url, fetchOptions);
     const durationMs = Date.now() - startTime;
+
+    // Emit: Processing response
+    emitProgress('executing_test', `📥 Processing response (${response.status})...`, 80);
 
     // Read response body (with size limit)
     let responseBody: any;
@@ -164,6 +189,9 @@ export async function executeApiTest(request: ApiTestRequest): Promise<ApiTestRe
       matchesExpected,
     });
 
+    // Emit: Completed
+    emitProgress('executing_test', `✅ API test completed (${durationMs}ms)`, 90);
+
     return result;
   } catch (error: any) {
     const durationMs = Date.now() - startTime;
@@ -172,6 +200,7 @@ export async function executeApiTest(request: ApiTestRequest): Promise<ApiTestRe
     const timeout = Math.min(request.timeout || DEFAULT_TIMEOUT, MAX_TIMEOUT);
     if (error.name === 'AbortError' || error.name === 'TimeoutError') {
       logger.warn('API test timeout', { url: request.url, timeout });
+      emitProgress('executing_test', `⏱️ Request timeout after ${timeout}ms`, 90);
       return {
         success: false,
         status: 0,
@@ -185,6 +214,7 @@ export async function executeApiTest(request: ApiTestRequest): Promise<ApiTestRe
 
     // Handle other errors
     logger.error('API test failed', { error, url: request.url });
+    emitProgress('executing_test', `❌ API test failed: ${error.message}`, 90);
     return {
       success: false,
       status: 0,

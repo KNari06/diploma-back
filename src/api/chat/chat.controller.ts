@@ -1049,13 +1049,16 @@ async function executeApprovedTestPlan(
       // Extract API test details from metadata
       const apiDetails = (plan as any).metadata || {};
 
-      const apiTestResult = await executeApiTest({
-        method: apiDetails.method || 'GET',
-        url: plan.url,
-        body: apiDetails.body,
-        headers: apiDetails.headers || {},
-        expectedStatus: apiDetails.expectedStatus || 200,
-      });
+      const apiTestResult = await executeApiTest(
+        {
+          method: apiDetails.method || 'GET',
+          url: plan.url,
+          body: apiDetails.body,
+          headers: apiDetails.headers || {},
+          expectedStatus: apiDetails.expectedStatus || 200,
+        },
+        chatSessionId // Pass chatSessionId for WebSocket progress updates
+      );
 
       // Generate a unique test ID for API test tracking
       const apiTestId = `api_${planId}_${Date.now()}`;
@@ -1091,6 +1094,16 @@ async function executeApprovedTestPlan(
               userId,
         testId: apiTestId,
         credits: TokenCalculatorService.getTestCreditCost('api'),
+      });
+
+      // Emit final completion WebSocket message
+      emitProcessingStep(chatSessionId, 'analyzing_results', '🎉 API test completed!', 100);
+
+      logger.info('[API_TEST] Test completed successfully', {
+        testId: apiTestId,
+        status: (apiTestResult as any).response?.status || (apiTestResult as any).status,
+        success: apiTestResult.success,
+        durationMs: (apiTestResult as any).durationMs,
       });
 
       // Notify completion via TestCompletionHandlerService
