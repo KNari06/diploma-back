@@ -1152,8 +1152,9 @@ async function executeApprovedTestPlan(
         durationMs: (apiTestResult as any).durationMs,
       });
 
-      // Notify completion via TestCompletionHandlerService
-      await TestCompletionHandlerService.handleTestCompletion(apiTestId);
+      // NOTE: Don't call TestCompletionHandlerService for API tests
+      // API tests don't exist in 'tests' table (that's for UI tests only)
+      // We already sent all progress via WebSocket in executeApiTest()
 
       // Save chat messages
     if (chatSessionId) {
