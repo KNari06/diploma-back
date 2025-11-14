@@ -407,6 +407,56 @@ async function parseIntentWithGPT(
     // JSON mode supported by: gpt-4-turbo, gpt-4o, gpt-4o-mini, o1, o3
     const supportsJsonMode = model.includes('gpt-4') || model.includes('gpt-3.5') || model.includes('o1') || model.includes('o3');
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // SMART HISTORY PARSING: Extract URL from recent messages for short approval messages
+    // ═══════════════════════════════════════════════════════════════════════
+
+    let extractedUrlFromHistory: string | null = null;
+    let extractedMethodFromHistory: string | null = null;
+
+    // If user message is short (likely approval), search for URL in recent history
+    const isShortMessage = message.trim().length < 20;
+    const approvalWords = ['yes', 'go', 'test', 'execute', 'run', 'start', 'давай', 'да'];
+    const looksLikeApproval = approvalWords.some(word => message.toLowerCase().includes(word));
+
+    if ((isShortMessage || looksLikeApproval) && context?.chatHistory && context.chatHistory.length > 0) {
+      logger.info('[INTENT_PARSER] Short/approval message detected, searching for URL in history', {
+        message,
+        historyLength: context.chatHistory.length,
+      });
+
+      // Search last 5 messages for URLs
+      const recentHistory = context.chatHistory.slice(-5);
+      const urlRegex = /https?:\/\/[^\s]+/gi;
+      const methodRegex = /\b(GET|POST|PUT|DELETE|PATCH)\b/gi;
+
+      for (let i = recentHistory.length - 1; i >= 0; i--) {
+        const msg = recentHistory[i];
+        const urlMatch = msg.content?.match(urlRegex);
+        const methodMatch = msg.content?.match(methodRegex);
+
+        if (urlMatch && urlMatch[0]) {
+          extractedUrlFromHistory = urlMatch[0];
+          extractedMethodFromHistory = methodMatch?.[0] || null;
+
+          logger.info('[INTENT_PARSER] Found URL in chat history!', {
+            url: extractedUrlFromHistory,
+            method: extractedMethodFromHistory,
+            messageIndex: i,
+            fromMessage: msg.content?.substring(0, 100),
+          });
+          break;
+        }
+      }
+
+      if (!extractedUrlFromHistory) {
+        logger.warn('[INTENT_PARSER] No URL found in recent history despite approval-like message', {
+          message,
+          recentHistoryPreview: recentHistory.map(m => m.content?.substring(0, 50)),
+        });
+      }
+    }
+
     // Build messages array with chat history if available
     const messages: any[] = [
       {
@@ -419,6 +469,15 @@ CRITICAL INSTRUCTIONS:
 3. If chat history contains API URL and user says "yes"/"go" → extract that URL and use intent "api_test"
 4. If chat history contains website URL and user says "yes"/"go" → use intent "platform_test"
 5. Parse user's current message BUT remember context from previous messages
+
+${extractedUrlFromHistory ? `
+⚠️ IMPORTANT: URL FOUND IN HISTORY!
+URL: ${extractedUrlFromHistory}
+Method: ${extractedMethodFromHistory || 'Not specified'}
+User current message: "${message}"
+
+If user message is approval-like ("yes", "go", "test it"), extract this URL and use intent "api_test"!
+` : ''}
 
 Example:
 Previous: User: "test GET https://api.example.com/users"
@@ -460,16 +519,38 @@ Always return valid JSON matching the expected format.`,
       return null;
     }
 
+    // Log raw GPT response for debugging
+    logger.info('[INTENT_PARSER] GPT raw response', {
+      messagePreview: message.substring(0, 100),
+      responseLength: text.length,
+      responsePreview: text.substring(0, 200),
+    });
+
     // Try to parse JSON (handle cases where response format is not enforced)
     let parsed: IntentResult;
     try {
       parsed = JSON.parse(text);
+      logger.info('[INTENT_PARSER] JSON parsed successfully', {
+        intent: parsed.intent,
+        hasUrl: !!(parsed as any).page || !!(parsed as any).apiUrl,
+      });
     } catch (parseError) {
+      logger.warn('[INTENT_PARSER] Initial JSON parse failed, trying markdown extraction', {
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+        textPreview: text.substring(0, 200),
+      });
+
       // Try to extract JSON from markdown code blocks if present
       const jsonMatch = text.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
       if (jsonMatch) {
         parsed = JSON.parse(jsonMatch[1]);
+        logger.info('[INTENT_PARSER] JSON extracted from markdown', {
+          intent: parsed.intent,
+        });
       } else {
+        logger.error('[INTENT_PARSER] Failed to extract JSON from response', {
+          textPreview: text.substring(0, 300),
+        });
         throw parseError;
       }
     }
@@ -497,7 +578,11 @@ Always return valid JSON matching the expected format.`,
     // Log as warn instead of error - this is expected for ambiguous/incomplete messages
     logger.warn('Intent parsing with GPT failed (will fallback to general_chat)', {
       error: error instanceof Error ? error.message : String(error),
-      messagePreview: message.substring(0, 50),
+      errorStack: error instanceof Error ? error.stack : undefined,
+      messagePreview: message.substring(0, 100),
+      hasContext: !!context,
+      hasChatHistory: !!(context?.chatHistory && context.chatHistory.length > 0),
+      chatHistoryLength: context?.chatHistory?.length || 0,
     });
     return null;
   }
