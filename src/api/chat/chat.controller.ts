@@ -1195,9 +1195,7 @@ async function executeApprovedTestPlan(
         chatSessionId,
       });
 
-      emitProcessingStep(chatSessionId, 'executing_test', '🌐 Executing API request...', 70);
-
-      // Confirm plan first
+      // Confirm plan first (no WebSocket emit here - executeApiTest will handle progress)
       logger.info('🔵 [API_TEST] Step 1: Confirming plan...');
       await confirmAndExecuteTestPlan(planId, userId);
       logger.info('🔵 [API_TEST] Step 2: Plan confirmed, extracting details...');
@@ -1259,8 +1257,8 @@ async function executeApprovedTestPlan(
         credits: TokenCalculatorService.getTestCreditCost('api'),
       });
 
-      // Emit final completion WebSocket message
-      emitProcessingStep(chatSessionId, 'analyzing_results', '🎉 API test completed!', 100);
+      // NOTE: WebSocket final progress already sent by executeApiTest()
+      // No need to emit here - avoid duplicate events
 
       logger.info('[API_TEST] Test completed successfully', {
         testId: apiTestId,
