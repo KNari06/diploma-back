@@ -24,6 +24,7 @@ export interface IntentParserContext {
   knownSelectors?: Record<string, string>;
   tracesContext?: string;
   projectInfo?: string;
+  chatHistory?: Array<{ role: string; content: string }>; // Chat history for context
 }
 
 /**

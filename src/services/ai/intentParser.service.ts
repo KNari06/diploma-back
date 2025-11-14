@@ -1,10 +1,10 @@
+import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/intentParserPrompt';
 import { env } from '@/config/env';
+import { detectLanguage, searchKB } from '@/services/kb/kb.service';
+import { RulesCacheService } from '@/services/kb/rules-cache.service';
+import { IntentResult, KNOWN_INTENTS } from '@/types';
 import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
-import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/intentParserPrompt';
-import { IntentResult, KNOWN_INTENTS } from '@/types';
-import { searchKB, KBSearchResult, detectLanguage } from '@/services/kb/kb.service';
-import { RulesCacheService } from '@/services/kb/rules-cache.service';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
@@ -407,15 +407,29 @@ async function parseIntentWithGPT(
     // JSON mode supported by: gpt-4-turbo, gpt-4o, gpt-4o-mini, o1, o3
     const supportsJsonMode = model.includes('gpt-4') || model.includes('gpt-3.5') || model.includes('o1') || model.includes('o3');
 
+    // Build messages array with chat history if available
+    const messages: any[] = [
+      {
+        role: 'system',
+        content: 'Ты помощник для парсинга намерений пользователя. Всегда возвращай только валидный JSON без дополнительного текста.',
+      },
+    ];
+
+    // Add chat history for context (helps AI remember previous conversation)
+    // Use all provided history (controller already limits to 20 messages)
+    if (context?.chatHistory && context.chatHistory.length > 0) {
+      messages.push(...context.chatHistory);
+      logger.info('[INTENT_PARSER] Using chat history for context', {
+        historyLength: context.chatHistory.length,
+      });
+    }
+
+    // Add current message
+    messages.push({ role: 'user', content: prompt });
+
     const requestParams: any = {
       model,
-      messages: [
-        {
-          role: 'system',
-          content: 'Ты помощник для парсинга намерений пользователя. Всегда возвращай только валидный JSON без дополнительного текста.',
-        },
-        { role: 'user', content: prompt },
-      ],
+      messages,
       temperature: 0.1, // Low temperature for consistent parsing
     };
 

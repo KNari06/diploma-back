@@ -74,6 +74,9 @@ cp .env.example .env
 # Установка зависимостей
 npm install
 
+# ⚠️ ВАЖНО: Установка Playwright браузеров (ОДИН РАЗ)
+npx playwright install chromium --with-deps
+
 # Запуск в режиме разработки
 npm run dev
 ```
