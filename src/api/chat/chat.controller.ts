@@ -1074,6 +1074,12 @@ Use this knowledge to provide more accurate and helpful responses.`,
       { role: 'user', content: message },
       { role: 'ai', content: gptResponse.content },
     ]);
+
+    // Auto-generate title for new chats (after first user message)
+    // This runs in background, doesn't block response
+    ChatService.autoGenerateTitle(chatSessionId).catch(error => {
+      logger.warn('[GENERAL_CHAT] Failed to auto-generate title', { error, chatSessionId });
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1786,10 +1792,19 @@ function compressMessageContent(content: string): string {
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+/**
+ * Get or create chat session with multi-chat support
+ * @param userId - User ID
+ * @param providedSessionId - Existing session ID (optional)
+ * @param workspaceId - Workspace ID
+ * @param createNew - Force create new session (for multi-chat support)
+ * @returns Chat session ID or undefined for anonymous
+ */
 async function getOrCreateChatSession(
   userId: string,
   providedSessionId: string | undefined,
-  workspaceId: string
+  workspaceId: string,
+  createNew: boolean = false
 ): Promise<string | undefined> {
   const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 
@@ -1798,8 +1813,8 @@ async function getOrCreateChatSession(
     return undefined;
   }
 
+  // If providedSessionId exists, verify and use it
   if (providedSessionId) {
-    // Verify session exists
     const { data: existing } = await supabaseAdmin
       .from('chat_sessions')
       .select('id')
@@ -1808,35 +1823,39 @@ async function getOrCreateChatSession(
       .maybeSingle();
 
     if (existing) {
+      logger.info('[CHAT_SESSION] Using provided session', { sessionId: existing.id, userId });
       return existing.id;
+    } else {
+      logger.warn('[CHAT_SESSION] Provided session not found, will create new', {
+        providedSessionId,
+        userId,
+      });
     }
   }
 
-  // Check for existing session
+  // If createNew = true, always create new session (multi-chat support)
+  if (createNew) {
+    logger.info('[CHAT_SESSION] Creating new chat session (multi-chat)', { userId, workspaceId });
+    return await ChatService.createChatSession(userId, workspaceId);
+  }
+
+  // Otherwise, find latest session (backward compatibility)
   const { data: existing } = await supabaseAdmin
     .from('chat_sessions')
     .select('id')
     .eq('user_id', userId)
-    .order('created_at', { ascending: false })
+    .order('updated_at', { ascending: false }) // Sort by updated_at for recent activity
     .limit(1)
     .maybeSingle();
 
   if (existing) {
+    logger.info('[CHAT_SESSION] Using existing session', { sessionId: existing.id, userId });
     return existing.id;
   }
 
-  // Create new session
-  const { data: newSession } = await supabaseAdmin
-    .from('chat_sessions')
-        .insert({
-      user_id: userId,
-      workspace_id: workspaceId,
-      title: 'New Chat',
-    })
-    .select('id')
-      .single();
-
-  return newSession?.id;
+  // Create new session if none exists
+  logger.info('[CHAT_SESSION] No existing session, creating new', { userId, workspaceId });
+  return await ChatService.createChatSession(userId, workspaceId);
 }
 
 async function saveChatMessages(

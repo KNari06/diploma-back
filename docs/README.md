@@ -23,6 +23,7 @@
 - [**API Reference**](./api/README.md) - полная документация API
 - [**Примеры использования**](./api/examples.md) - практические примеры
 - [**Аутентификация**](./api/authentication.md) - работа с токенами и ключами
+- [**Multi-Chat Sessions**](./api/multi-chat-sessions.md) - ✨ NEW! Мультичат как в ChatGPT
 - [**Playwright API**](./api/playwright.md) - загрузка trace файлов
 - [**Feedback API**](./api/feedback-api-examples.md) - система like/dislike для улучшения AI
 - [**Feedback Analytics**](./api/feedback-analytics-guide.md) - аналитика и insights для мониторинга качества AI

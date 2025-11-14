@@ -63,7 +63,7 @@ CREATE POLICY "Users can view own chat embeddings"
     FOR SELECT
     USING (
         session_id IN (
-            SELECT id FROM chat_sessions WHERE user_id = auth.uid()
+            SELECT id FROM chat_sessions WHERE user_id = auth.uid()::text
         )
     );
 
@@ -71,8 +71,8 @@ CREATE POLICY "Users can view own chat embeddings"
 CREATE POLICY "Service role full access to chat embeddings"
     ON chat_message_embeddings
     FOR ALL
-    USING (auth.jwt() ->> 'role' = 'service_role')
-    WITH CHECK (auth.jwt() ->> 'role' = 'service_role');
+    USING (auth.role() = 'service_role')
+    WITH CHECK (auth.role() = 'service_role');
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- HELPER FUNCTION: Semantic search in chat history

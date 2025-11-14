@@ -3,6 +3,13 @@ import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import { handleChat, getChatHistory, getChatSessions, getCurrentChatHistory, debugChatData } from './chat.controller';
+import {
+  createNewChatSession,
+  listUserChatSessions,
+  getChatSessionById,
+  updateChatSessionTitle,
+  deleteChatSession,
+} from './chat-sessions.controller';
 
 const router = Router();
 
@@ -258,15 +265,20 @@ router.get('/history', requireAuth, asyncHandler(getCurrentChatHistory));
  * @swagger
  * /api/v1/chat/sessions:
  *   get:
- *     summary: Получить список чат-сессий пользователя
- *     description: Возвращает список всех чат-сессий текущего пользователя с метаданными. Поддерживает как авторизованных пользователей (Bearer token), так и анонимных (по IP)
- *     tags: [Chat]
+ *     summary: Получить список всех чат-сессий пользователя (с multi-chat support)
+ *     description: |
+ *       Возвращает список всех чат-сессий с метаданными, отсортированный по последней активности (updated_at).
+ *
+ *       **NEW:** Теперь сортировка по updated_at вместо created_at для показа активных чатов вверху.
+ *     tags: [Chat Sessions]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: query
  *         name: limit
  *         schema:
  *           type: integer
- *           default: 20
+ *           default: 50
  *           minimum: 1
  *           maximum: 100
  *         description: Количество сессий для возврата
@@ -304,6 +316,9 @@ router.get('/history', requireAuth, asyncHandler(getCurrentChatHistory));
  *                           created_at:
  *                             type: string
  *                             format: date-time
+ *                           updated_at:
+ *                             type: string
+ *                             format: date-time
  *                           message_count:
  *                             type: integer
  *                           last_message:
@@ -326,18 +341,25 @@ router.get('/history', requireAuth, asyncHandler(getCurrentChatHistory));
  *                           type: integer
  *                         total:
  *                           type: integer
+ *                         has_more:
+ *                           type: boolean
  *       401:
  *         description: Не авторизован
  */
-router.get('/sessions', requireAuth, asyncHandler(getChatSessions));
+router.get('/sessions', requireAuth, asyncHandler(listUserChatSessions)); // Updated to use new multi-chat endpoint
 
 /**
  * @swagger
  * /api/v1/chat/history/{sessionId}:
  *   get:
- *     summary: Получить историю чата по ID сессии
- *     description: Возвращает все сообщения в указанной чат-сессии. Поддерживает как авторизованных пользователей (Bearer token), так и анонимных (по IP)
+ *     summary: Получить историю чата по ID сессии (legacy endpoint)
+ *     description: |
+ *       Возвращает все сообщения в указанной чат-сессии.
+ *
+ *       **DEPRECATED:** Используйте `/api/v1/chat/sessions/{sessionId}` вместо этого.
+ *       Этот endpoint сохранен для backward compatibility.
  *     tags: [Chat]
+ *     deprecated: true
  *     parameters:
  *       - in: path
  *         name: sessionId
@@ -396,9 +418,229 @@ router.get('/sessions', requireAuth, asyncHandler(getChatSessions));
  *       404:
  *         description: Сессия не найдена
  */
-router.get('/history/:sessionId', requireAuth, asyncHandler(getChatHistory));
+router.get('/history/:sessionId', requireAuth, asyncHandler(getChatHistory)); // Legacy - kept for backward compatibility
 
 // Debug route - remove in production
 router.get('/debug', requireAuth, asyncHandler(debugChatData));
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * MULTI-CHAT SESSIONS MANAGEMENT
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * @swagger
+ * /api/v1/chat/sessions/new:
+ *   post:
+ *     summary: Создать новую чат-сессию (multi-chat support)
+ *     description: Создает новую изолированную чат-сессию для пользователя. Позволяет вести несколько независимых диалогов как в ChatGPT
+ *     tags: [Chat Sessions]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       201:
+ *         description: Новая чат-сессия создана
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessionId:
+ *                       type: string
+ *                       format: uuid
+ *                       description: ID новой чат-сессии
+ *                     title:
+ *                       type: string
+ *                       example: "New Chat"
+ *                     created_at:
+ *                       type: string
+ *                       format: date-time
+ *                 message:
+ *                   type: string
+ *                   example: "New chat session created"
+ *       401:
+ *         description: Не авторизован
+ *       500:
+ *         description: Ошибка сервера
+ */
+router.post('/sessions/new', requireAuth, asyncHandler(createNewChatSession));
+
+
+/**
+ * @swagger
+ * /api/v1/chat/sessions/{sessionId}:
+ *   get:
+ *     summary: Получить чат-сессию со всеми сообщениями
+ *     description: Возвращает детали чат-сессии включая все сообщения
+ *     tags: [Chat Sessions]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: ID чат-сессии
+ *     responses:
+ *       200:
+ *         description: Чат-сессия с сообщениями
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     session:
+ *                       type: object
+ *                       properties:
+ *                         id:
+ *                           type: string
+ *                           format: uuid
+ *                         title:
+ *                           type: string
+ *                         created_at:
+ *                           type: string
+ *                           format: date-time
+ *                         updated_at:
+ *                           type: string
+ *                           format: date-time
+ *                     messages:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                             format: uuid
+ *                           role:
+ *                             type: string
+ *                             enum: [user, ai]
+ *                           content:
+ *                             type: string
+ *                           metadata:
+ *                             type: object
+ *                           created_at:
+ *                             type: string
+ *                             format: date-time
+ *       404:
+ *         description: Чат-сессия не найдена
+ *       401:
+ *         description: Не авторизован
+ */
+router.get('/sessions/:sessionId', requireAuth, asyncHandler(getChatSessionById));
+
+/**
+ * @swagger
+ * /api/v1/chat/sessions/{sessionId}:
+ *   patch:
+ *     summary: Обновить название чат-сессии
+ *     description: Изменяет название (title) чат-сессии
+ *     tags: [Chat Sessions]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: ID чат-сессии
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - title
+ *             properties:
+ *               title:
+ *                 type: string
+ *                 minLength: 1
+ *                 maxLength: 200
+ *                 description: Новое название чат-сессии
+ *                 example: "API Testing Discussion"
+ *     responses:
+ *       200:
+ *         description: Название обновлено
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessionId:
+ *                       type: string
+ *                       format: uuid
+ *                     title:
+ *                       type: string
+ *                 message:
+ *                   type: string
+ *       400:
+ *         description: Неверные данные
+ *       404:
+ *         description: Чат-сессия не найдена
+ *       401:
+ *         description: Не авторизован
+ */
+router.patch('/sessions/:sessionId', requireAuth, asyncHandler(updateChatSessionTitle));
+
+/**
+ * @swagger
+ * /api/v1/chat/sessions/{sessionId}:
+ *   delete:
+ *     summary: Удалить чат-сессию и все сообщения
+ *     description: Безвозвратно удаляет чат-сессию и все связанные сообщения (CASCADE)
+ *     tags: [Chat Sessions]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: ID чат-сессии для удаления
+ *     responses:
+ *       200:
+ *         description: Чат-сессия удалена
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Chat session deleted"
+ *       404:
+ *         description: Чат-сессия не найдена
+ *       401:
+ *         description: Не авторизован
+ */
+router.delete('/sessions/:sessionId', requireAuth, asyncHandler(deleteChatSession));
 
 export default router;
