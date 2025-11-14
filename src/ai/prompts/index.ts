@@ -316,22 +316,9 @@ IMPORTANT RULES:
 
   // Add context if available
   if (context) {
-    // Add chat history FIRST (most important for context continuity)
-    if (context.chatHistory && context.chatHistory.length > 0) {
-      prompt += `\n\n💬 RECENT CHAT HISTORY (last ${Math.min(context.chatHistory.length, 5)} messages):\n`;
-      prompt += `Use this to remember URLs, endpoints, or test details from previous conversation!\n\n`;
-
-      // Show last 5 messages for context (reverse to show oldest first)
-      const recentHistory = context.chatHistory.slice(-5);
-      recentHistory.forEach((msg, idx) => {
-        const role = msg.role === 'user' ? 'User' : 'AI';
-        const preview = msg.content.length > 150 ? msg.content.substring(0, 150) + '...' : msg.content;
-        prompt += `${idx + 1}. ${role}: ${preview}\n`;
-      });
-
-      prompt += `\n⚠️ IMPORTANT: If user says "execute the test" or "test it" WITHOUT providing URL,\n`;
-      prompt += `check chat history above! If URL was mentioned before, extract it and use intent "api_test"!\n`;
-    }
+    // NOTE: chatHistory is NOT added to prompt - it's added directly to messages array
+    // in intentParser.service.ts (lines 420-425) for better GPT context handling
+    // This prevents duplication and maintains cleaner conversation flow
 
     if (context.documentation && context.documentation.length > 0) {
       prompt += `\n\n📚 AVAILABLE DOCUMENTATION:\n${context.documentation.slice(0, 3).join('\n')}`;
