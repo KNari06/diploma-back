@@ -414,12 +414,14 @@ async function parseIntentWithGPT(
     let extractedUrlFromHistory: string | null = null;
     let extractedMethodFromHistory: string | null = null;
 
-    // If user message is short (likely approval), search for URL in recent history
+    // If user message looks like approval/action request, search for URL in recent history
     const isShortMessage = message.trim().length < 20;
-    const approvalWords = ['yes', 'go', 'test', 'execute', 'run', 'start', 'давай', 'да'];
+    const approvalWords = ['yes', 'go', 'test', 'execute', 'run', 'start', 'давай', 'да', 'launch', 'check'];
     const looksLikeApproval = approvalWords.some(word => message.toLowerCase().includes(word));
 
-    if ((isShortMessage || looksLikeApproval) && context?.chatHistory && context.chatHistory.length > 0) {
+    // Only activate smart history if message looks like approval/action request
+    // Don't activate for generic greetings like "hi", "hello", etc.
+    if (looksLikeApproval && context?.chatHistory && context.chatHistory.length > 0) {
       logger.info('[INTENT_PARSER] Short/approval message detected, searching for URL in history', {
         message,
         historyLength: context.chatHistory.length,
