@@ -1246,6 +1246,14 @@ async function executeApprovedTestPlan(
       // We already sent all progress via WebSocket in executeApiTest()
 
       // Format response body for display
+      logger.info('🔍 [API_TEST] Response body debug', {
+        hasResponseBody: !!apiTestResult.responseBody,
+        responseBodyType: typeof apiTestResult.responseBody,
+        responseBodyLength: apiTestResult.responseBody ? JSON.stringify(apiTestResult.responseBody).length : 0,
+        responseBodyPreview: apiTestResult.responseBody ? JSON.stringify(apiTestResult.responseBody).substring(0, 100) : 'null',
+        fullResult: JSON.stringify(apiTestResult).substring(0, 500),
+      });
+
       let responseBodyDisplay = '';
       if (apiTestResult.responseBody) {
         if (typeof apiTestResult.responseBody === 'object') {
@@ -1263,6 +1271,8 @@ async function executeApprovedTestPlan(
             responseBodyDisplay = '\n\n**Response Body:**\n```\n' + truncated + '\n```';
           }
         }
+      } else {
+        logger.warn('⚠️ [API_TEST] responseBody is empty or null!');
       }
 
       const successMessage = `✅ API test executed successfully!
