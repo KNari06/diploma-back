@@ -334,6 +334,20 @@ DEBUG=bullmq:* npm run worker
 - `GET /health` - System health check
 - `GET /` - API information
 
+## 📖 Implementation Documentation
+
+### Features & Fixes
+
+- [**Chat Vector Context**](./chat-vector-context.md) - Векторный контекст для чата
+- [**WebSocket Progress Implementation**](./websocket-progress-implementation-plan.md) - Реализация WebSocket прогресса
+- [**AI Capabilities Fix**](./AI_CAPABILITIES_FIX.md) - Исправление "забывания" возможностей AI
+- [**API Test WebSocket Fix**](./API_TEST_WEBSOCKET_FIX.md) - Исправление WebSocket для API тестов
+- [**Multi-Chat Implementation**](./MULTI_CHAT_IMPLEMENTATION.md) - Реализация мультичата
+- [**API Test Debug Guide**](./API_TEST_DEBUG_GUIDE.md) - Руководство по отладке API тестов
+- [**Analytics Implementation**](./ANALYTICS_IMPLEMENTATION_COMPLETE.md) - Реализация аналитики
+- [**Analytics Review**](./ANALYTICS_REVIEW.md) - Обзор аналитики
+- [**Feedback Feature Summary**](./FEEDBACK_FEATURE_SUMMARY.md) - Сводка по фиче feedback
+
 ## 🤝 Contributing
 
 1. Fork the repository

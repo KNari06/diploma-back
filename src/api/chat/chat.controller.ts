@@ -1221,6 +1221,74 @@ async function executeApprovedTestPlan(
         chatSessionId // Pass chatSessionId for WebSocket progress updates
       );
 
+      // ═════════════════════════════════════════════════════════════════════
+      // ✨ NEW: INTELLIGENT API FUZZING
+      // ═════════════════════════════════════════════════════════════════════
+      let fuzzingReport = null;
+
+      // Only run fuzzing if happy path test was successful
+      if (apiTestResult.success && chatSessionId) {
+        try {
+          const { IntelligentApiFuzzerService } = await import('@/services/testing/intelligent-api-fuzzer.service');
+          const { ApiFuzzingExecutorService } = await import('@/services/testing/api-fuzzing-executor.service');
+
+          logger.info('[API_FUZZING] Starting intelligent fuzzing', {
+            method: apiDetails.method,
+            url: plan.url,
+          });
+
+          // WebSocket: Generating scenarios
+          emitProcessingStep(chatSessionId, 'analyzing_results', '🔍 Generating security test scenarios...', 70);
+
+          const fuzzingScenarios = await IntelligentApiFuzzerService.generateFuzzingScenarios(
+            {
+              method: apiDetails.method || 'GET',
+              url: plan.url,
+              body: apiDetails.body,
+              headers: apiDetails.headers || {},
+              expectedStatus: apiDetails.expectedStatus || 200,
+            },
+            apiTestResult
+          );
+
+          logger.info('[API_FUZZING] Scenarios generated', { count: fuzzingScenarios.length });
+
+          // WebSocket: Executing fuzzing tests
+          emitProcessingStep(
+            chatSessionId,
+            'analyzing_results',
+            `🎯 Testing ${fuzzingScenarios.length} security scenarios...`,
+            75
+          );
+
+          fuzzingReport = await ApiFuzzingExecutorService.executeFuzzingScenarios(
+            fuzzingScenarios,
+            apiTestResult
+          );
+
+          logger.info('[API_FUZZING] Fuzzing completed', {
+            totalTests: fuzzingReport.summary.totalTests,
+            passed: fuzzingReport.summary.passed,
+            failed: fuzzingReport.summary.failed,
+            issuesFound: fuzzingReport.issues.length,
+            securityScore: fuzzingReport.securityScore,
+          });
+
+          // WebSocket: Analysis complete
+          emitProcessingStep(
+            chatSessionId,
+            'analyzing_results',
+            `✅ Security analysis complete! Found ${fuzzingReport.issues.length} issue(s)`,
+            100
+          );
+        } catch (fuzzingError) {
+          logger.error('[API_FUZZING] Fuzzing failed, continuing without it', {
+            error: fuzzingError
+          });
+          // Continue without fuzzing if it fails
+        }
+      }
+
       // Generate a unique test ID for API test tracking
       const apiTestId = `api_${planId}_${Date.now()}`;
 
@@ -1301,13 +1369,39 @@ async function executeApprovedTestPlan(
         logger.warn('⚠️ [API_TEST] responseBody is empty or null!');
       }
 
-      const successMessage = `✅ API test executed successfully!
+      // ═════════════════════════════════════════════════════════════════════
+      // FORMAT COMPREHENSIVE RESPONSE (with fuzzing if available)
+      // ═════════════════════════════════════════════════════════════════════
+
+      let finalMessage = '';
+
+      if (fuzzingReport) {
+        // Import formatter
+        const { ApiFuzzingFormatterService } = await import('@/services/testing/api-fuzzing-formatter.service');
+
+        // Format comprehensive report
+        finalMessage = ApiFuzzingFormatterService.formatComprehensiveReport(fuzzingReport);
+
+        // Add happy path result at the top
+        finalMessage = `✅ **API Test Results**\n\n` +
+          `**Happy Path Test:** PASSED ✅\n` +
+          `• URL: ${plan.url}\n` +
+          `• Method: ${apiDetails.method}\n` +
+          `• Status: ${apiTestResult.status}\n` +
+          `• Duration: ${apiTestResult.durationMs}ms\n` +
+          responseBodyDisplay + '\n\n' +
+          '─────────────────────────────────────────────\n\n' +
+          finalMessage;
+      } else {
+        // Fallback to simple message if fuzzing didn't run
+        finalMessage = `✅ API test executed successfully!
 
 **URL:** ${plan.url}
 **Method:** ${apiDetails.method}
 **Status Code:** ${apiTestResult.status}
 **Success:** ${apiTestResult.success ? 'Yes' : 'No'}
 **Duration:** ${apiTestResult.durationMs}ms${responseBodyDisplay}`;
+      }
 
       // Save chat messages
     if (chatSessionId) {
@@ -1316,11 +1410,18 @@ async function executeApprovedTestPlan(
           { role: 'user', content: `Approved API test: ${apiDetails.method} ${plan.url}` },
           {
             role: 'ai',
-            content: successMessage,
+            content: finalMessage,
           metadata: {
               testResult: apiTestResult,
               testId: apiTestId,
               testType: 'api',
+              fuzzingReport: fuzzingReport ? {
+                totalTests: fuzzingReport.summary.totalTests,
+                passed: fuzzingReport.summary.passed,
+                failed: fuzzingReport.summary.failed,
+                issuesFound: fuzzingReport.issues.length,
+                securityScore: fuzzingReport.securityScore,
+              } : null,
             },
           },
         ]);
@@ -1331,11 +1432,14 @@ async function executeApprovedTestPlan(
         testId: apiTestId,
         status: apiTestResult.status,
         success: apiTestResult.success,
+        hasFuzzing: !!fuzzingReport,
+        issuesFound: fuzzingReport?.issues.length || 0,
       });
 
       res.json({
-        reply: successMessage,
+        reply: finalMessage,
         testResult: apiTestResult,
+        fuzzingReport: fuzzingReport || undefined,
         testId: apiTestId,
         timestamp: new Date().toISOString(),
         sessionId: chatSessionId,

@@ -480,7 +480,11 @@ async function parseIntentWithGPT(
 
     return parsed;
   } catch (error) {
-    logger.error('Intent parsing with GPT failed', { error, message });
+    // Log as warn instead of error - this is expected for ambiguous/incomplete messages
+    logger.warn('Intent parsing with GPT failed (will fallback to general_chat)', {
+      error: error instanceof Error ? error.message : String(error),
+      messagePreview: message.substring(0, 50),
+    });
     return null;
   }
 }

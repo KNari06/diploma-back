@@ -27,6 +27,8 @@
 - [**Playwright API**](./api/playwright.md) - загрузка trace файлов
 - [**Feedback API**](./api/feedback-api-examples.md) - система like/dislike для улучшения AI
 - [**Feedback Analytics**](./api/feedback-analytics-guide.md) - аналитика и insights для мониторинга качества AI
+- [**Intelligent API Fuzzing**](./api/INTELLIGENT_API_FUZZING_IMPLEMENTATION.md) - автоматическое security testing API
+- [**Enhanced Fuzzing Details**](./api/ENHANCED_FUZZING_DETAILS.md) - детальная информация о failed tests
 
 ### 💻 Разработка
 
@@ -45,6 +47,8 @@
 ### 🚀 Деплой
 
 - [**Процедуры деплоя**](./deployment/README.md) - как деплоить проект и подключение к серверу
+- [**Pre-Deployment Check Summary**](./deployment/PRE_DEPLOYMENT_CHECK_SUMMARY.md) - краткая сводка проверок перед деплоем
+- [**Multi-Chat Deployment Checklist**](./deployment/DEPLOYMENT_CHECKLIST_MULTI_CHAT.md) - чеклист для деплоя мультичата
 - [**Конфигурация сервера**](./deployment/server-config.md) - настройка окружения (если файл существует)
 - [**Мониторинг**](./deployment/monitoring.md) - отслеживание состояния (если файл существует)
 

@@ -85,6 +85,11 @@ POSSIBLE INTENTS (ONLY 3!):
 
    ⚠️ IMPORTANT: ALWAYS extract URL if present, even with informal wording!
 
+   ⚠️ AMBIGUOUS CASE: If message says "test API" but NO URL provided:
+   • Use "general_chat" instead (system will ask user for details)
+   • Examples: "давай потестируй мне один api" → general_chat
+   • Examples: "test some api" → general_chat
+
 3️⃣ "general_chat" - General conversation (NO testing)
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    INDICATORS:
@@ -92,6 +97,7 @@ POSSIBLE INTENTS (ONLY 3!):
    • No URL present
    • No mention of testing/checking
    • General conversation
+   • Ambiguous test requests WITHOUT URL/details ("test api" without URL)
 
 ═══════════════════════════════════════════════════════════════════════════════
 RESPONSE FORMAT (STRICT JSON):
@@ -250,21 +256,38 @@ Output:
   "rawText": "What can you do?"
 }
 
+📝 Example 8: Ambiguous API test (NO URL) → general_chat
+Input: "давай, потестируй мне один api"
+Output:
+{
+  "intent": "general_chat",
+  "scope": null,
+  "target": null,
+  "page": null,
+  "apiMethod": null,
+  "apiUrl": null,
+  "apiBody": null,
+  "apiHeaders": null,
+  "urgency": null,
+  "rawText": "давай, потестируй мне один api"
+}
+
 ═══════════════════════════════════════════════════════════════════════════════
 IMPORTANT RULES:
 ═══════════════════════════════════════════════════════════════════════════════
 
 1. If URL + testing words → "platform_test"
-2. If API/HTTP/endpoint → "api_test"
-3. If just questions/chat → "general_chat"
-4. Always extract scope for platform_test
-5. For api_test: ALWAYS extract apiUrl if URL present (even informal: "вот это", "this")
-6. For api_test: apiMethod can be null if not specified (system will ask user to clarify)
-7. page: null is OK for platform_test - system will ask user for URL
-8. apiUrl can be relative path (/api/v1/users) - system will resolve
-9. Detect urgency from words: "urgent", "ASAP", "critical", "quick", "emergency"
-10. Preserve rawText - original message
-11. Extract URL even from informal requests: "потести АПИ вот это URL"
+2. If API/HTTP/endpoint WITH URL → "api_test"
+3. If API mentioned but NO URL → "general_chat" (system will ask for details)
+4. If just questions/chat → "general_chat"
+5. Always extract scope for platform_test
+6. For api_test: ALWAYS extract apiUrl if URL present (even informal: "вот это", "this")
+7. For api_test: apiMethod can be null if not specified (system will ask user to clarify)
+8. page: null is OK for platform_test - system will ask user for URL
+9. apiUrl can be relative path (/api/v1/users) - system will resolve
+10. Detect urgency from words: "urgent", "ASAP", "critical", "quick", "emergency"
+11. Preserve rawText - original message
+12. Extract URL even from informal requests: "потести АПИ вот это URL"
 
 ═══════════════════════════════════════════════════════════════════════════════`;
 
@@ -445,9 +468,16 @@ export function buildChatSystemPrompt(): string {
 
 YOUR CAPABILITIES:
 • Autonomous testing of web platforms (UI testing)
-• API endpoint testing
+• API endpoint testing (YOU CAN EXECUTE REAL HTTP REQUESTS!)
 • Test plan generation and execution
 • Bug analysis and reporting
+
+⚠️ CRITICAL: You are NOT a regular ChatGPT!
+• You have REAL access to execute tests
+• You CAN make HTTP requests to APIs
+• You CAN test websites with Playwright
+• NEVER say "I cannot execute" or "I don't have access"
+• When user approves test plan → Platform executes it FOR YOU automatically
 
 HOW PLATFORM WORKS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -461,13 +491,20 @@ HOW PLATFORM WORKS:
 2. API TESTING:
    User requests API test → You analyze the endpoint
    → Generate test plan with validations → User approves
-   → Execute HTTP request → Validate response
-   → Report results
+   → **YOU EXECUTE HTTP REQUEST** (platform does this for you automatically)
+   → Validate response → Report results
+
+   ⚠️ IMPORTANT: When user says "yes", "go", "approve" after seeing test plan:
+   → YOU ALREADY HAVE ALL DATA (URL, method, headers from test plan)
+   → PLATFORM EXECUTES THE REQUEST FOR YOU
+   → You will receive the actual HTTP response with results
+   → NEVER say "I cannot execute" - the platform CAN and WILL execute it!
 
 3. TEST PLANS:
    IMPORTANT: Always show test plan to user BEFORE execution
    → User must approve the plan
-   → This ensures they understand what will be tested
+   → Once approved, platform EXECUTES the test automatically
+   → You receive REAL results and report them to user
 
 COMMUNICATION STYLE:
 • Be concise, clear, and professional
@@ -480,6 +517,32 @@ If they write in English - respond in English.
 If they write in Russian - respond in Russian.
 If they write in Spanish - respond in Spanish.
 This is critical for user experience.
+
+EXAMPLES OF CORRECT BEHAVIOR:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ CORRECT (API test with URL):
+User: "Test GET https://api.example.com/users"
+You: "I'll create a test plan for GET https://api.example.com/users
+[Show detailed test plan]
+Do you approve?"
+
+User: "yes" or "go" or "давай"
+You: [Wait for platform to execute] → Receive results → Report them
+"✅ Test completed! Status: 200 OK
+Response: {...}"
+
+❌ INCORRECT (Never say this!):
+User: "yes" or "go"
+You: "I cannot execute tests directly, here's Python code..."
+→ WRONG! Platform executes it for you!
+
+✅ CORRECT (API test WITHOUT URL):
+User: "давай потестируй мне один api"
+You: "Какой API endpoint вы хотите протестировать? Пожалуйста, укажите:
+• URL (например: https://api.example.com/users)
+• HTTP метод (GET, POST, etc.)
+• Headers или Body если нужны"
 
 Be helpful, thorough, and reliable.`;
 }
@@ -576,6 +639,148 @@ RETURN ONLY JSON:`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 7. API FUZZING PROMPTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Generate fuzzing scenarios for API endpoint
+ * Used to create negative test cases and security tests
+ */
+export function buildApiFuzzingPrompt(params: {
+  method: string;
+  url: string;
+  headers?: Record<string, string>;
+  body?: any;
+  happyPathResult: {
+    status: number;
+    durationMs: number;
+    responseBody: any;
+  };
+}): string {
+  return `You are a security testing expert. Generate comprehensive fuzzing scenarios for this API endpoint.
+
+═══════════════════════════════════════════════════════════════════════════════
+API ENDPOINT DETAILS:
+═══════════════════════════════════════════════════════════════════════════════
+
+Method: ${params.method}
+URL: ${params.url}
+${params.headers ? `Headers: ${JSON.stringify(params.headers, null, 2)}` : 'Headers: None'}
+${params.body ? `Body: ${JSON.stringify(params.body, null, 2)}` : 'Body: None'}
+
+Happy Path Result:
+• Status: ${params.happyPathResult.status}
+• Duration: ${params.happyPathResult.durationMs}ms
+• Response: ${JSON.stringify(params.happyPathResult.responseBody).substring(0, 200)}...
+
+═══════════════════════════════════════════════════════════════════════════════
+TASK:
+═══════════════════════════════════════════════════════════════════════════════
+
+Generate 10-15 negative test scenarios to try to break this API. Think like a penetration tester.
+
+CATEGORIES TO COVER:
+
+1️⃣ **AUTHENTICATION TESTS** (type: "authentication"):
+   • Remove Authorization header completely
+   • Use invalid token format
+   • Use expired token pattern
+   • Use token from different API
+   Expected: 401 Unauthorized
+
+2️⃣ **AUTHORIZATION TESTS** (type: "authorization"):
+   • Try to access another user's resources (if endpoint has user ID)
+   • Try to access admin-only endpoints
+   • Try to modify resources you shouldn't have access to
+   Expected: 403 Forbidden
+
+3️⃣ **METHOD VALIDATION** (type: "method_validation"):
+   • Use wrong HTTP method (POST on GET endpoint, DELETE on POST, etc.)
+   • Use OPTIONS, TRACE, HEAD methods
+   Expected: 405 Method Not Allowed
+
+4️⃣ **PAYLOAD VALIDATION** (type: "payload_validation"):
+   • Send malformed JSON (missing quotes, extra commas)
+   • Send empty body where required
+   • Send huge payload (> 10MB)
+   • Send wrong data types (string instead of number)
+   • Send negative numbers where positive expected
+   • Send extremely long strings (> 10K chars)
+   Expected: 400 Bad Request or 413 Payload Too Large
+
+5️⃣ **SECURITY TESTS** (type: "security"):
+   • SQL Injection: Add ' OR '1'='1 to parameters
+   • XSS: Add <script>alert(1)</script> to string fields
+   • Path Traversal: Add ../../etc/passwd to paths
+   • Command Injection: Add ; ls -la to parameters
+   • NoSQL Injection: Add {"$gt":""} to parameters
+   Expected: Sanitized/escaped, should NOT execute
+
+6️⃣ **RATE LIMITING** (type: "rate_limiting"):
+   • Send 100 identical requests rapidly
+   • Send requests from same IP in burst
+   Expected: 429 Too Many Requests (if rate limit exists)
+
+7️⃣ **PERFORMANCE** (type: "performance"):
+   • Send 10 concurrent requests
+   • Send request with very short timeout (1ms)
+   Expected: Reasonable performance, no timeouts
+
+═══════════════════════════════════════════════════════════════════════════════
+RESPONSE FORMAT (JSON):
+═══════════════════════════════════════════════════════════════════════════════
+
+{
+  "scenarios": [
+    {
+      "id": "auth_no_token",
+      "type": "authentication",
+      "description": "Request without Authorization header",
+      "request": {
+        "method": "GET",
+        "url": "https://api.example.com/users",
+        "headers": {},  // No auth header
+        "body": null
+      },
+      "expectedStatus": 401,
+      "expectedBehavior": "Should return 401 Unauthorized",
+      "riskIfFails": "Unauthenticated users can access protected resources",
+      "severity": "critical"
+    },
+    {
+      "id": "security_sql_injection",
+      "type": "security",
+      "description": "SQL injection in query parameter",
+      "request": {
+        "method": "GET",
+        "url": "https://api.example.com/users?id=1' OR '1'='1",
+        "headers": {...},
+        "body": null
+      },
+      "expectedStatus": 400,
+      "expectedBehavior": "Should sanitize input and return 400 or safe result",
+      "riskIfFails": "Database can be compromised via SQL injection",
+      "severity": "critical"
+    }
+    // ... 10-15 total scenarios
+  ]
+}
+
+IMPORTANT RULES:
+1. Generate 10-15 diverse scenarios covering ALL categories
+2. Each scenario MUST have unique id
+3. Be creative but realistic - think like a real attacker
+4. Include both common and advanced attack vectors
+5. Set appropriate severity: "critical", "high", "medium", "low"
+6. Make descriptions clear and actionable
+7. expectedStatus should be the SECURE behavior (401, 403, 400, etc.)
+8. If endpoint has parameters, try to manipulate them
+9. If endpoint uses POST/PUT, try to send malicious payloads
+
+RETURN ONLY VALID JSON.`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // HELPER: Build context string for prompts
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -621,6 +826,9 @@ export const Prompts = {
   // User interaction
   buildApprovalDetectionPrompt,
   buildQuestionGenerationPrompt,
+
+  // API Fuzzing
+  buildApiFuzzingPrompt,
 
   // Utilities
   buildContextString,

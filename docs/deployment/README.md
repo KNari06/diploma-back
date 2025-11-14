@@ -52,3 +52,8 @@ ssh -i ./gcp root@34.172.156.158
 
 - [Deployment Rules](../../.cursor/rules/deployment-rules.mdc) - полные правила и чеклисты
 - [Server Configuration](./server-config.md) - конфигурация сервера (если файл существует)
+
+## 📋 Deployment Checklists
+
+- [**Pre-Deployment Check Summary**](./PRE_DEPLOYMENT_CHECK_SUMMARY.md) - Краткая сводка проверок перед деплоем
+- [**Multi-Chat Deployment Checklist**](./DEPLOYMENT_CHECKLIST_MULTI_CHAT.md) - Чеклист для деплоя мультичата

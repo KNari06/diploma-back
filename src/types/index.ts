@@ -359,6 +359,63 @@ export interface ApiTestResponse {
   matchesExpected?: boolean; // true if status matches expectedStatus
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// API FUZZING TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type FuzzingScenarioType =
+  | 'authentication'
+  | 'authorization'
+  | 'method_validation'
+  | 'payload_validation'
+  | 'security'
+  | 'rate_limiting'
+  | 'performance';
+
+export type IssueSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+
+export interface FuzzingScenario {
+  id: string;
+  type: FuzzingScenarioType;
+  description: string;
+  request: ApiTestRequest;
+  expectedStatus: number;
+  expectedBehavior: string;
+  riskIfFails: string;
+}
+
+export interface FuzzingScenarioResult {
+  scenario: FuzzingScenario;
+  result: ApiTestResponse;
+  passed: boolean;
+  issue?: SecurityIssue;
+}
+
+export interface SecurityIssue {
+  severity: IssueSeverity;
+  type: FuzzingScenarioType;
+  title: string;
+  description: string;
+  evidence: string;
+  risk: string;
+  recommendation: string;
+  cwe?: string; // Common Weakness Enumeration ID
+}
+
+export interface FuzzingReport {
+  happyPathResult: ApiTestResponse;
+  scenarios: FuzzingScenarioResult[];
+  summary: {
+    totalTests: number;
+    passed: number;
+    failed: number;
+    duration: number;
+  };
+  issues: SecurityIssue[];
+  securityScore: number; // 0-10
+  recommendations: string[];
+}
+
 // Jira OAuth types
 export interface JiraTokenResponse {
   access_token: string;

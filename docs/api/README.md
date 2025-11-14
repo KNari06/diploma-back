@@ -9,6 +9,7 @@
 - [**Примеры использования**](./examples.md)
 - [**Endpoints**](#endpoints)
 - [**Коды ошибок**](#коды-ошибок)
+- [**API Fuzzing**](#api-fuzzing)
 
 ## 🔍 Обзор API
 
@@ -104,6 +105,21 @@ https://api.qai.so/api/v1
 Список всех trace для теста
 
 [📖 Подробная документация Playwright API](./playwright.md)
+
+## 🔒 API Fuzzing
+
+### Intelligent API Fuzzing
+
+QAI Backend автоматически выполняет security testing для API endpoints:
+
+- [**Intelligent API Fuzzing Implementation**](./INTELLIGENT_API_FUZZING_IMPLEMENTATION.md) - Полная документация по реализации
+- [**Enhanced Fuzzing Details**](./ENHANCED_FUZZING_DETAILS.md) - Детальная информация о failed tests
+
+**Возможности:**
+- Автоматическая генерация security test scenarios через GPT
+- Параллельное выполнение negative tests (authentication, authorization, SQL injection, XSS, rate limiting)
+- Comprehensive security reports с CWE references
+- Полная детализация request/response для каждого failed test
 
 ## 📊 Коды ошибок
 
