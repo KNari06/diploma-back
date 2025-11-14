@@ -96,6 +96,8 @@ export class SupabaseService {
       .select()
       .maybeSingle(); // Use maybeSingle() to avoid errors
 
+
+
     if (error) {
       logger.error('[DB] Failed to create test', {
         error,
