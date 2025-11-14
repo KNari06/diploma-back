@@ -272,6 +272,27 @@ Output:
   "rawText": "давай, потестируй мне один api"
 }
 
+📝 Example 9: Execute test WITH chat history (extract URL from history)
+Chat History:
+1. User: "test GET https://api.repetino.kz/student/me/lessons"
+2. AI: "I'll create a test plan... [shows plan] Do you approve?"
+
+Current Input: "yes, execute it now"
+Output:
+{
+  "intent": "api_test",
+  "scope": null,
+  "target": null,
+  "page": null,
+  "apiMethod": "GET",
+  "apiUrl": "https://api.repetino.kz/student/me/lessons",
+  "apiBody": null,
+  "apiHeaders": null,
+  "urgency": null,
+  "rawText": "yes, execute it now"
+}
+Note: URL extracted from chat history, intent recognized as approval to execute API test!
+
 ═══════════════════════════════════════════════════════════════════════════════
 IMPORTANT RULES:
 ═══════════════════════════════════════════════════════════════════════════════
@@ -288,11 +309,30 @@ IMPORTANT RULES:
 10. Detect urgency from words: "urgent", "ASAP", "critical", "quick", "emergency"
 11. Preserve rawText - original message
 12. Extract URL even from informal requests: "потести АПИ вот это URL"
+13. ⚠️ NEW: Check CHAT HISTORY! If user says "execute test" without URL, look in chat history for previous URL mention
+14. ⚠️ NEW: If URL found in chat history + user wants to execute → use "api_test" intent and extract that URL!
 
 ═══════════════════════════════════════════════════════════════════════════════`;
 
   // Add context if available
   if (context) {
+    // Add chat history FIRST (most important for context continuity)
+    if (context.chatHistory && context.chatHistory.length > 0) {
+      prompt += `\n\n💬 RECENT CHAT HISTORY (last ${Math.min(context.chatHistory.length, 5)} messages):\n`;
+      prompt += `Use this to remember URLs, endpoints, or test details from previous conversation!\n\n`;
+
+      // Show last 5 messages for context (reverse to show oldest first)
+      const recentHistory = context.chatHistory.slice(-5);
+      recentHistory.forEach((msg, idx) => {
+        const role = msg.role === 'user' ? 'User' : 'AI';
+        const preview = msg.content.length > 150 ? msg.content.substring(0, 150) + '...' : msg.content;
+        prompt += `${idx + 1}. ${role}: ${preview}\n`;
+      });
+
+      prompt += `\n⚠️ IMPORTANT: If user says "execute the test" or "test it" WITHOUT providing URL,\n`;
+      prompt += `check chat history above! If URL was mentioned before, extract it and use intent "api_test"!\n`;
+    }
+
     if (context.documentation && context.documentation.length > 0) {
       prompt += `\n\n📚 AVAILABLE DOCUMENTATION:\n${context.documentation.slice(0, 3).join('\n')}`;
     }
@@ -543,6 +583,18 @@ You: "Какой API endpoint вы хотите протестировать? П
 • URL (например: https://api.example.com/users)
 • HTTP метод (GET, POST, etc.)
 • Headers или Body если нужны"
+
+❌ CRITICAL ERROR (NEVER DO THIS!):
+User: "execute the test now" or "let me perform the test" WITHOUT URL
+You: "I will execute the test... Executing the request... Please hold on"
+→ WRONG! You are HALLUCINATING! You DON'T HAVE the URL to test!
+→ CORRECT: Ask "Which API endpoint do you want to test? Please provide the URL."
+
+⚠️ IMPORTANT RULE:
+• If user asks to execute/perform/run a test BUT you don't see URL in their message
+• AND you don't remember URL from chat history
+• DON'T pretend to execute! ASK for the URL!
+• NEVER say "Executing the request..." without actual test plan approval!
 
 Be helpful, thorough, and reliable.`;
 }

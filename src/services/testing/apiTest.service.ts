@@ -96,8 +96,8 @@ export async function executeApiTest(
   };
 
   try {
-    // Emit: Starting API test
-    emitProgress('executing_test', '🚀 Starting API test...', 50);
+    // Emit: Validating request
+    emitProgress('executing_test', '🔍 Validating request...', 40);
 
     logger.info('🔵 [executeApiTest] Step 1: Validating request...');
 
@@ -114,7 +114,7 @@ export async function executeApiTest(
     }
 
     // Emit: Preparing request
-    emitProgress('executing_test', `🔧 Preparing ${request.method.toUpperCase()} request...`, 60);
+    emitProgress('executing_test', `📦 Building ${request.method.toUpperCase()} request...`, 50);
 
     // Prepare request options
     const method = request.method.toUpperCase();
@@ -146,7 +146,7 @@ export async function executeApiTest(
 
     // Emit: Sending request
     logger.info('🔵 [executeApiTest] Step 3: Emitting progress and starting fetch...');
-    emitProgress('executing_test', `📡 Sending ${method} request to ${new URL(request.url).hostname}...`, 70);
+    emitProgress('executing_test', `📡 Sending ${method} request to ${new URL(request.url).hostname}...`, 60);
 
     // Execute request
     logger.info('🔵 [executeApiTest] Step 4: Calling fetch()...', { url: request.url });
@@ -158,7 +158,7 @@ export async function executeApiTest(
     const durationMs = Date.now() - startTime;
 
     // Emit: Response received
-    emitProgress('executing_test', `📥 Response received: ${response.status} ${response.statusText}`, 80);
+    emitProgress('executing_test', `📥 Response received: ${response.status} ${response.statusText}`, 65);
 
     // Read response body (with size limit)
     let responseBody: any;

@@ -1195,10 +1195,17 @@ async function executeApprovedTestPlan(
         chatSessionId,
       });
 
-      // Confirm plan first (no WebSocket emit here - executeApiTest will handle progress)
+      // ═══ EMIT: Test starting ═══
+      emitProcessingStep(chatSessionId, 'executing_test', '🚀 Starting API test execution...', 10);
+
+      // Confirm plan first
       logger.info('🔵 [API_TEST] Step 1: Confirming plan...');
+      emitProcessingStep(chatSessionId, 'executing_test', '📋 Confirming test plan...', 20);
+
       await confirmAndExecuteTestPlan(planId, userId);
       logger.info('🔵 [API_TEST] Step 2: Plan confirmed, extracting details...');
+
+      emitProcessingStep(chatSessionId, 'executing_test', '🔧 Preparing API request...', 30);
 
       // Extract API test details from metadata
       const apiDetails = (plan as any).metadata || {};
