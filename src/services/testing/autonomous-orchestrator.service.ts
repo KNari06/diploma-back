@@ -1,18 +1,18 @@
-import { exploreProduct } from '@/services/testing/autonomous-explorer.service';
 import { retrieveCredentials, storeCredentials } from '@/services/api/credentials-manager.service';
+import { exploreProduct } from '@/services/testing/autonomous-explorer.service';
 import {
-  confirmTestPlan as confirmPlanInDB,
-  getCachedExploration,
-  getTestPlan,
-  rejectTestPlan as rejectPlanInDB,
-  saveExplorationToCache,
-  saveTestPlan
+    confirmTestPlan as confirmPlanInDB,
+    getCachedExploration,
+    getTestPlan,
+    rejectTestPlan as rejectPlanInDB,
+    saveExplorationToCache,
+    saveTestPlan
 } from '@/services/testing/exploration-cache.service';
+import { formatTestPlanForConfirmation, generateIntelligentTestPlan, generateTestPlan } from '@/services/testing/test-plan-generator.service';
 import { generateClarifyingQuestions, parseAnswers } from '@/services/utils/question-generator.service';
-import { formatTestPlanForConfirmation, generateTestPlan, generateIntelligentTestPlan } from '@/services/testing/test-plan-generator.service';
 import { logger } from '@/utils/logger';
-import { webSocketService } from '@/websocket/websocket.service';
 import { ChatProcessingStepPayload } from '@/websocket/types';
+import { webSocketService } from '@/websocket/websocket.service';
 
 /**
  * Autonomous testing workflow orchestrator
@@ -241,21 +241,39 @@ export async function runAutonomousExploration(params: {
 }
 
 /**
- * Step 4: Confirm and execute test plan
+ * Step 4: Confirm test plan (prepare for execution)
+ * FIX: Renamed from confirmAndExecuteTestPlan - function only confirms, doesn't execute
  */
-export async function confirmAndExecuteTestPlan(
+export async function confirmTestPlan(
   planId: string,
   userId: string
 ): Promise<{
   success: boolean;
-  testId?: string;
   message: string;
 }> {
   try {
+    // FIX #5: Validate input parameters
+    if (!isValidUUID(planId)) {
+      logger.warn('[CONFIRM_PLAN] Invalid planId format', { planId });
+      return {
+        success: false,
+        message: 'Invalid plan ID format',
+      };
+    }
+
+    if (!isValidUUID(userId)) {
+      logger.warn('[CONFIRM_PLAN] Invalid userId format', { userId });
+      return {
+        success: false,
+        message: 'Invalid user ID format',
+      };
+    }
+
     // Get plan
     const plan = await getTestPlan(planId, userId);
 
     if (!plan) {
+      logger.info('[CONFIRM_PLAN] Plan not found', { planId, userId });
       return {
         success: false,
         message: 'Test plan not found or expired',
@@ -263,37 +281,67 @@ export async function confirmAndExecuteTestPlan(
     }
 
     if (plan.status !== 'pending_confirmation') {
+      logger.warn('[CONFIRM_PLAN] Plan not in pending status', {
+        planId,
+        currentStatus: plan.status
+      });
       return {
         success: false,
         message: `Test plan already ${plan.status}`,
       };
     }
 
-    // Confirm in database
+    // FIX #4: Atomic confirmation in database (prevents race conditions)
     const confirmed = await confirmPlanInDB(planId, userId);
 
     if (!confirmed.success) {
+      logger.error('[CONFIRM_PLAN] Failed to confirm in database', {
+        planId,
+        userId,
+        error: 'Plan may already be confirmed or not found'
+      });
+
+      // FIX #3: Return detailed error message
       return {
         success: false,
-        message: 'Failed to confirm test plan',
+        message: 'Failed to confirm test plan - it may already be confirmed or not found',
       };
     }
 
-    logger.info('Test plan confirmed, ready for execution', { planId });
+    logger.info('[CONFIRM_PLAN] Test plan confirmed successfully', {
+      planId,
+      userId,
+      confirmedAt: new Date().toISOString()
+    });
 
-    // Return commands for execution
-    // (Chat controller will create manual test with these commands)
+    // FIX #6: Updated comment to reflect actual behavior
+    // Plan is now confirmed and ready for execution by chat controller
     return {
       success: true,
-      message: `✅ Test plan confirmed! Starting execution...\n\nTest ID will be generated.`,
+      message: `✅ Test plan confirmed! Ready for execution.`,
     };
   } catch (error) {
-    logger.error('Error confirming test plan', { error });
+    logger.error('[CONFIRM_PLAN] Critical error confirming test plan', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      planId,
+      userId
+    });
+
     return {
       success: false,
-      message: 'Error confirming test plan',
+      message: error instanceof Error ? error.message : 'Error confirming test plan',
     };
   }
+}
+
+/**
+ * UUID validation helper (centralized)
+ */
+function isValidUUID(uuid: string): boolean {
+  if (!uuid || typeof uuid !== 'string') return false;
+  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return UUID_REGEX.test(uuid);
 }
 
 /**

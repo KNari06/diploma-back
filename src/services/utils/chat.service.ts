@@ -47,13 +47,15 @@ export class ChatService {
    * Get recent chat messages for a session
    * @param sessionId - Chat session ID
    * @param limit - Number of messages to retrieve
-   * @returns Array of chat messages
+   * @returns Array of chat messages in chronological order (oldest first)
    */
   static async getRecentMessages(
     sessionId: string,
     limit: number = 20
-  ): Promise<Array<{ role: string; content: string; created_at: string; metadata?: any }>> {
+  ): Promise<Array<{ role: 'user' | 'ai'; content: string; created_at: string; metadata?: any }>> {
     try {
+      logger.debug('[CHAT_SERVICE] Fetching recent messages', { sessionId, limit });
+
       const { data, error } = await supabaseAdmin
         .from('chat_messages')
         .select('role, content, created_at, metadata')
@@ -63,10 +65,19 @@ export class ChatService {
 
       if (error) {
         logger.error('[CHAT_SERVICE] Failed to get recent messages', { error, sessionId });
-        throw error;
+        return []; // Don't throw, return empty array for graceful degradation
       }
 
-      return (data || []).reverse(); // Reverse to get chronological order
+      const messages = (data || []).reverse(); // Reverse to get chronological order
+
+      logger.debug('[CHAT_SERVICE] Retrieved messages', {
+        sessionId,
+        count: messages.length,
+        firstMessage: messages[0]?.created_at,
+        lastMessage: messages[messages.length - 1]?.created_at
+      });
+
+      return messages;
 
     } catch (error) {
       logger.error('[CHAT_SERVICE] Error getting recent messages', { error, sessionId });

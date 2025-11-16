@@ -1,7 +1,8 @@
-import { logger } from '@/utils/logger';
-import { PlaywrightCommand } from '@/types';
-import { ExplorationResult } from '@/services/testing/autonomous-explorer.service';
+import { buildTestPlanPrompt } from '@/ai/prompts/index';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { ExplorationResult } from '@/services/testing/autonomous-explorer.service';
+import { PlaywrightCommand } from '@/types';
+import { logger } from '@/utils/logger';
 
 /**
  * Test plan with user confirmation
@@ -115,156 +116,111 @@ export async function generateTestPlan(
   }
 }
 
-/**
- * Build prompt for test plan generation
- */
-function buildTestPlanPrompt(
-  exploration: ExplorationResult,
-  userRequest: { message: string; scope: string; additionalInfo?: any }
-): string {
-  return `Generate a comprehensive test plan based on the following exploration data.
-
-USER REQUEST:
-"${userRequest.message}"
-
-SCOPE:
-${userRequest.scope}
-
-PAGE INFORMATION:
-- URL: ${exploration.url}
-- Title: ${exploration.pageInfo.title}
-
-VISUAL ANALYSIS (from GPT-4o Vision):
-${JSON.stringify(exploration.visualAnalysis, null, 2)}
-
-DOM ANALYSIS:
-- Forms: ${exploration.domAnalysis.forms.length}
-${exploration.domAnalysis.forms.map((f, i) => `  Form ${i + 1}: ${f.fields.length} fields (${f.fields.map(field => field.name || field.type).join(', ')})`).join('\n')}
-
-- Buttons: ${exploration.domAnalysis.buttons.length}
-${exploration.domAnalysis.buttons.map(b => `  - ${b.text || b.type} (${b.selector})`).join('\n')}
-
-- Inputs: ${exploration.domAnalysis.inputs.length}
-${exploration.domAnalysis.inputs.map(i => `  - ${i.type} ${i.name || ''} ${i.required ? '(required)' : ''}`).join('\n')}
-
-RECOMMENDATIONS:
-${exploration.recommendations.map(r => `- ${r}`).join('\n')}
-
----
-
-Generate a test plan in this EXACT JSON format:
-
-{
-  "summary": "Brief summary of what this test plan will do (2-3 sentences)",
-
-  "steps": [
-    {
-      "id": "step_1",
-      "description": "Human-readable step description",
-      "action": "goto|fill|click|assertVisible|etc",
-      "selector": "CSS selector if applicable",
-      "value": "Value to input if applicable",
-      "expectedOutcome": "What should happen after this step"
-    }
-  ],
-
-  "commands": [
-    {
-      "action": "goto",
-      "url": "${exploration.url}",
-      "description": "Navigate to page"
-    },
-    {
-      "action": "fill",
-      "selector": "actual_selector_from_dom_analysis",
-      "value": "test@example.com",
-      "description": "Fill email field"
-    }
-  ],
-
-  "estimatedDuration": "~30 seconds",
-
-  "whatWillBeTested": [
-    "Specific functionality 1",
-    "Specific functionality 2"
-  ],
-
-  "whatWillNotBeTested": [
-    "Out of scope functionality 1",
-    "Out of scope functionality 2"
-  ],
-
-  "risks": [
-    "Potential issue or limitation of this test"
-  ]
-}
-
-IMPORTANT:
-- Use REAL selectors from DOM analysis
-- Create 5-10 specific test steps
-- Generate matching Playwright commands
-- Be specific about expected outcomes
-- Estimate realistic duration
-- List what WILL and WILL NOT be tested
-- Identify potential risks or limitations
-
-Focus on: ${userRequest.scope}`;
-}
 
 /**
  * Format test plan for user confirmation
  * Returns markdown formatted plan
  */
 export function formatTestPlanForConfirmation(plan: TestPlan): string {
-  // Check if intelligent mode - use special format
-  if (plan.intelligentMode) {
-    return formatIntelligentTestPlan(plan);
-  }
+  // ✅ UNIFIED: Support both AI-generated and standard test plans
+  const isAiGenerated = plan.intelligentMode;
 
-  // Standard test plan format
-  let markdown = `# 🧪 Test Plan для подтверждения\n\n`;
+  // Header with appropriate mode indication
+  let markdown = isAiGenerated
+    ? `# 🧠 AI Test Plan for Confirmation\n\n`
+    : `# 🧪 Test Plan для подтверждения\n\n`;
+
+  // Basic info
+  markdown += `**Plan ID:** \`${plan.id}\`\n`;
   markdown += `**URL:** ${plan.url}\n`;
   markdown += `**Scope:** ${plan.scope}\n`;
-  markdown += `**Estimated duration:** ${plan.estimatedDuration}\n\n`;
 
+  if (isAiGenerated) {
+    markdown += `**Mode:** 🤖 **AI-Generated Testing**\n`;
+  }
+
+  markdown += `**Estimated Duration:** ${plan.estimatedDuration}\n\n`;
+
+  // Summary
   markdown += `## 📋 Summary\n\n${plan.summary}\n\n`;
 
-  markdown += `## ✅ Что будет протестировано:\n\n`;
+  // AI-specific estimates (if available)
+  if (isAiGenerated && (plan.estimatedPages || plan.estimatedCost)) {
+    markdown += `## 📊 AI Estimates\n\n`;
+    if (plan.estimatedPages) {
+      markdown += `- **Pages to Test:** ${plan.estimatedPages}\n`;
+    }
+    if (plan.estimatedCost) {
+      markdown += `- **Estimated Cost:** ${plan.estimatedCost}\n`;
+    }
+    markdown += '\n';
+  }
+
+  // AI explanation (for AI-generated plans)
+  if (isAiGenerated) {
+    markdown += `## 🤖 How AI Testing Works\n\n`;
+    markdown += `This AI-generated test plan will:\n`;
+    markdown += `1. **Execute pre-analyzed test steps** tailored to your specific site\n`;
+    markdown += `2. **Adapt to page context** based on URL analysis and user intent\n`;
+    markdown += `3. **Follow intelligent test scenarios** created by GPT-4o\n`;
+    markdown += `4. **Provide detailed results** with actionable insights\n\n`;
+  }
+
+  // What will be tested
+  markdown += `## ✅ What Will Be Tested\n\n`;
   for (const item of plan.whatWillBeTested) {
     markdown += `- ${item}\n`;
   }
 
+  // What will NOT be tested
   if (plan.whatWillNotBeTested.length > 0) {
-    markdown += `\n## ❌ Что НЕ будет протестировано:\n\n`;
+    markdown += `\n## ❌ What Will NOT Be Tested\n\n`;
     for (const item of plan.whatWillNotBeTested) {
       markdown += `- ${item}\n`;
     }
   }
 
-  markdown += `\n## 🔍 Test Steps:\n\n`;
-  for (let i = 0; i < plan.steps.length; i++) {
-    const step = plan.steps[i];
-    markdown += `**${i + 1}. ${step.description}**\n`;
-    markdown += `   - Action: \`${step.action}\`\n`;
-    if (step.selector) {
-      markdown += `   - Selector: \`${step.selector}\`\n`;
+  // Test Steps (show for non-AI or if steps are meaningful)
+  if (!isAiGenerated || (plan.steps && plan.steps.length > 0 && plan.steps.some(s => s.action !== 'intelligent_explore'))) {
+    markdown += `\n## 🔍 Test Steps\n\n`;
+    for (let i = 0; i < plan.steps.length; i++) {
+      const step = plan.steps[i];
+      markdown += `**${i + 1}. ${step.description}**\n`;
+      markdown += `   - Action: \`${step.action}\`\n`;
+      if (step.selector) {
+        markdown += `   - Selector: \`${step.selector}\`\n`;
+      }
+      if (step.value) {
+        markdown += `   - Value: \`${step.value}\`\n`;
+      }
+      markdown += `   - Expected: ${step.expectedOutcome}\n\n`;
     }
-    if (step.value) {
-      markdown += `   - Value: \`${step.value}\`\n`;
-    }
-    markdown += `   - Expected: ${step.expectedOutcome}\n\n`;
+  } else if (isAiGenerated) {
+    markdown += `\n## 🔍 Test Execution\n\n`;
+    markdown += `⚠️ **Note:** Detailed test steps are AI-generated and will be executed automatically based on the analysis above.\n\n`;
   }
 
+  // Risks
   if (plan.risks.length > 0) {
-    markdown += `## ⚠️ Potential Risks:\n\n`;
+    markdown += `## 🚨 Potential Risks\n\n`;
     for (const risk of plan.risks) {
       markdown += `- ${risk}\n`;
     }
+    markdown += '\n';
   }
 
-  markdown += `\n---\n\n`;
-  markdown += `**Plan ID:** \`${plan.id}\`\n`;
-  markdown += `**Expires:** ${new Date(plan.expiresAt).toLocaleString()}\n\n`;
+  // Safety features (for AI plans)
+  if (isAiGenerated) {
+    markdown += `## 🛡️ Safety Features\n\n`;
+    markdown += `- Real-time progress updates via WebSocket\n`;
+    markdown += `- Automatic detection of dangerous actions (payment, delete, etc.)\n`;
+    markdown += `- Intelligent timeout and error handling\n`;
+    markdown += `- Safe execution with rollback capabilities\n\n`;
+  }
+
+  // Footer
+  markdown += `---\n\n`;
+  markdown += `**⏳ Plan expires at:** ${new Date(plan.expiresAt).toLocaleString()}\n\n`;
   markdown += `💬 **Подтвердить тест план?**\n\n`;
   markdown += `Напишите свой ответ (любыми словами):\n`;
   markdown += `- ✅ Да / Давай / Ок / Go / Запускай → Выполнить тест\n`;
@@ -274,22 +230,6 @@ export function formatTestPlanForConfirmation(plan: TestPlan): string {
   return markdown;
 }
 
-/**
- * Confirm test plan
- */
-export async function confirmTestPlan(planId: string): Promise<boolean> {
-  // Implementation will be in cache/storage service
-  logger.info('Test plan confirmed', { planId });
-  return true;
-}
-
-/**
- * Reject test plan
- */
-export async function rejectTestPlan(planId: string, reason?: string): Promise<boolean> {
-  logger.info('Test plan rejected', { planId, reason });
-  return true;
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INTELLIGENT TEST PLAN GENERATION
@@ -384,62 +324,4 @@ export async function generateIntelligentTestPlan(
     logger.error('Failed to generate intelligent test plan', { error });
     throw error;
   }
-}
-
-/**
- * Format intelligent test plan for user approval
- */
-export function formatIntelligentTestPlan(plan: TestPlan): string {
-  return `# 🧠 Intelligent Test Plan for Confirmation
-
-**Plan ID:** \`${plan.id}\`
-**URL:** ${plan.url}
-**Scope:** ${plan.scope}
-**Mode:** 🤖 **Intelligent / Adaptive Testing**
-
-## Summary
-${plan.summary}
-
-## 🔄 How It Works
-
-This intelligent test will:
-1. **Analyze each page dynamically** using GPT-4 Vision + DOM analysis
-2. **Understand page context** and identify critical elements
-3. **Generate actions on-the-fly** based on page type and user goal
-4. **Adapt to changes** in site structure automatically
-5. **Validate results** after each action
-6. **Make smart decisions** about next steps
-
-⚠️ **Important:** Detailed test steps will be determined dynamically during execution based on what the AI agent discovers on each page.
-
-## 📊 Estimates
-
-- **Pages to Analyze:** ${plan.estimatedPages || '5-10 pages'}
-- **Estimated Duration:** ${plan.estimatedDuration}
-- **Estimated Cost:** ${plan.estimatedCost || '$0.10-0.20'}
-
-## ✅ What Will Be Tested
-
-${plan.whatWillBeTested.map(item => `- ${item}`).join('\n')}
-
-## ⚠️ What Will NOT Be Tested
-
-${plan.whatWillNotBeTested.map(item => `- ${item}`).join('\n')}
-
-## 🚨 Potential Risks
-
-${plan.risks.map(risk => `- ${risk}`).join('\n')}
-
-## 🛡️ Safety Features
-
-- Maximum page limit: 10 pages
-- Maximum duration: 5 minutes
-- Automatic detection of dangerous actions (payment, delete, etc.)
-- Real-time progress updates via WebSocket
-
----
-
-**⏳ Plan expires at:** ${new Date(plan.expiresAt).toLocaleString()}
-
-**Please review and approve this plan to start intelligent testing.**`;
 }

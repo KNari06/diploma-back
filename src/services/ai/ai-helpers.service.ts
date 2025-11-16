@@ -67,8 +67,8 @@ export async function detectUserApproval(
     // Fallback: simple keyword matching
     const message = userMessage.toLowerCase().trim();
 
-    const approvalKeywords = ['да', 'давай', 'ок', 'согласен', 'го', 'хорошо', 'go', 'yes', 'ok', 'sure', 'запускай', 'начинай', 'начни', '+', 'подтверждаю', 'accept', 'approved', 'тестинг', 'тест'];
-    const rejectionKeywords = ['нет', 'не надо', 'отмена', 'стоп', 'no', 'cancel', 'reject', 'stop', '-', 'отклоняю'];
+    const approvalKeywords = ['да', 'yes', 'ok', 'ок', 'го', 'давай', 'запускай', 'погнали', 'валим', 'sure', 'run', 'execute', 'start', 'согласен', 'одобряю', 'approve', 'confirm', 'good', 'fine', 'хорошо', 'делай', 'начинай', 'тестируй', '+', '✅', '👍'];
+    const rejectionKeywords = ['нет', 'no', 'не надо', "don't", 'stop', 'cancel', 'отмена', 'потом', 'later', 'not now', 'maybe', 'подожди', 'отклоняю', 'reject', 'пас', 'skip', 'нет спасибо', '-', '❌', '👎'];
 
     // Check approval
     if (approvalKeywords.some(k => message.includes(k))) {
@@ -431,5 +431,165 @@ Which option should we click? Return ONLY the number (1-${navOptions.length}) or
   } catch (error) {
     logger.error('Smart navigation failed', { error });
     return { success: false };
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// URL EXTRACTION WITH GPT (GLOBAL UTILITY)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * Cache for URL extraction results
+ */
+interface UrlExtractionCache {
+  result: {
+    url: string | null;
+    method: string | null;
+    confidence: number;
+  };
+  timestamp: number;
+}
+
+const urlExtractionCache = new Map<string, UrlExtractionCache>();
+const URL_EXTRACTION_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Extract URL and HTTP method from chat messages using GPT-3.5-turbo
+ * This is a GLOBAL utility that can be used anywhere in the codebase
+ *
+ * @param messages - Array of chat messages (only user messages recommended)
+ * @param currentMessage - Current user message (for context)
+ * @returns Extracted URL, method, and confidence score
+ */
+export async function extractUrlWithGPT(
+  messages: Array<{ role: string; content: string }>,
+  currentMessage?: string
+): Promise<{
+  url: string | null;
+  method: string | null;
+  confidence: number;
+  reasoning?: string;
+}> {
+  try {
+    // Build cache key from messages content
+    const cacheKey = messages.map(m => m.content).join('|') + (currentMessage || '');
+    const cached = urlExtractionCache.get(cacheKey);
+
+    if (cached && Date.now() - cached.timestamp < URL_EXTRACTION_CACHE_TTL) {
+      logger.info('🎯 [URL_EXTRACT] Using cached result', {
+        url: cached.result.url,
+        method: cached.result.method,
+      });
+      return cached.result;
+    }
+
+    logger.info('🔍 [URL_EXTRACT] Starting URL extraction with GPT', {
+      messagesCount: messages.length,
+      hasCurrentMessage: !!currentMessage,
+    });
+
+    // Build context from messages
+    const messagesContext = messages
+      .map((msg, idx) => `[${idx + 1}] ${msg.role}: "${msg.content}"`)
+      .join('\n');
+
+    const prompt = `Extract API URL and HTTP method from these chat messages.
+
+CHAT HISTORY:
+${messagesContext}
+
+${currentMessage ? `CURRENT MESSAGE: "${currentMessage}"` : ''}
+
+RULES:
+1. Extract the MOST RECENT API URL mentioned by user
+2. If user corrected/changed URL → use the LATEST one
+3. Extract HTTP method (GET, POST, PUT, DELETE, PATCH) if mentioned
+4. Clean URL: remove punctuation (commas, periods, brackets)
+5. Ignore URLs from AI responses - ONLY user messages
+6. If multiple URLs → prioritize the one user wants to test NOW
+
+EXAMPLES:
+
+Example 1:
+[1] user: "test GET https://api.example.com/users"
+[2] ai: "Creating plan..."
+[3] user: "yes"
+→ { "url": "https://api.example.com/users", "method": "GET", "confidence": 0.95 }
+
+Example 2:
+[1] user: "Check https://api.com/old"
+[2] user: "wait, test https://api.com/new instead"
+→ { "url": "https://api.com/new", "method": null, "confidence": 0.9 }
+
+Example 3:
+[1] user: "test this endpoint: https://api.example.com/users,"
+→ { "url": "https://api.example.com/users", "method": null, "confidence": 0.85 }
+
+Example 4:
+[1] user: "what can you do?"
+[2] user: "tell me more"
+→ { "url": null, "method": null, "confidence": 0.0 }
+
+RETURN ONLY VALID JSON:
+{
+  "url": string | null,
+  "method": "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | null,
+  "confidence": 0.0-1.0,
+  "reasoning": "why this URL/method was selected"
+}`;
+
+    const response = await getChatCompletionWithMessages([
+      {
+        role: 'system',
+        content: 'You are a URL extraction expert. Extract API URLs and HTTP methods from chat messages. Return ONLY valid JSON.',
+      },
+      {
+        role: 'user',
+        content: prompt,
+      },
+    ], {
+      model: 'gpt-3.5-turbo',
+      temperature: 0.1, // Very low for consistent extraction
+      max_tokens: 200,
+    });
+
+    // Parse response
+    let parsed: any;
+    try {
+      parsed = JSON.parse(response.content.trim());
+    } catch (parseError) {
+      logger.error('[URL_EXTRACT] Failed to parse GPT response', {
+        response: response.content.substring(0, 200),
+      });
+      return { url: null, method: null, confidence: 0.0 };
+    }
+
+    const result = {
+      url: parsed.url || null,
+      method: parsed.method || null,
+      confidence: parsed.confidence || 0.0,
+      reasoning: parsed.reasoning,
+    };
+
+    // Cache the result
+    urlExtractionCache.set(cacheKey, {
+      result,
+      timestamp: Date.now(),
+    });
+
+    logger.info('✅ [URL_EXTRACT] Extraction complete', {
+      url: result.url,
+      method: result.method,
+      confidence: result.confidence,
+      reasoning: result.reasoning,
+    });
+
+    return result;
+
+  } catch (error) {
+    logger.error('[URL_EXTRACT] URL extraction failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { url: null, method: null, confidence: 0.0 };
   }
 }

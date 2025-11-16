@@ -5,7 +5,7 @@ import {
   extractSelectorsFromTraces,
   formatTracesForPrompt
 } from '@/services/utils/trace-context.service';
-import { IntentParserContext } from '@/ai/prompts/intentParserPrompt';
+import { IntentParserContext } from '@/ai/prompts/index';
 
 /**
  * Enrich context for command generation

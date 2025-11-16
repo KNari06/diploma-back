@@ -3,6 +3,19 @@ import { ExplorationResult } from '@/services/testing/autonomous-explorer.servic
 import { TestPlan } from '@/services/testing/test-plan-generator.service';
 import { logger } from '@/utils/logger';
 
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Validate UUID format (consistent with other services)
+ */
+function isValidUUID(str: string): boolean {
+  if (!str || typeof str !== 'string') return false;
+  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return UUID_REGEX.test(str);
+}
+
 /**
  * Save exploration result to cache
  */
@@ -12,7 +25,7 @@ export async function saveExplorationToCache(
   projectId: string
 ): Promise<{ id: string; success: boolean }> {
   try {
-    // If userId is not a valid UUID, use null (anonymous user)
+    // FIX: Only valid UUIDs allowed (no anonymous users)
     const validUserId = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
       ? userId
       : null;
@@ -101,6 +114,7 @@ export async function getCachedExploration(
 
 /**
  * Save test plan awaiting confirmation
+ * FIXED: Added validation, new fields support, and centralized UUID validation
  */
 export async function saveTestPlan(
   testPlan: TestPlan,
@@ -109,11 +123,61 @@ export async function saveTestPlan(
   explorationId?: string
 ): Promise<{ success: boolean }> {
   try {
-    // If userId is not a valid UUID, use null (anonymous user)
-    const validUserId = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
-      ? userId
-      : null;
+    // FIX #1: Input validation
+    if (!testPlan) {
+      throw new Error('TestPlan is required');
+    }
 
+    if (!testPlan.id || typeof testPlan.id !== 'string' || testPlan.id.trim().length === 0) {
+      throw new Error('TestPlan ID is required');
+    }
+
+    if (!testPlan.url || typeof testPlan.url !== 'string' || testPlan.url.trim().length === 0) {
+      throw new Error('TestPlan URL is required');
+    }
+
+    if (!testPlan.scope || typeof testPlan.scope !== 'string' || testPlan.scope.trim().length === 0) {
+      throw new Error('TestPlan scope is required');
+    }
+
+    if (!Array.isArray(testPlan.steps) || testPlan.steps.length === 0) {
+      throw new Error('TestPlan must have at least one step');
+    }
+
+    // FIX #2: Centralized UUID validation (consistent with other services)
+    const validUserId = isValidUUID(userId) ? userId : null;
+
+    if (!validUserId) {
+      logger.warn('[SAVE_TEST_PLAN] Invalid userId provided, saving without user association', {
+        userId: userId?.substring(0, 8) + '...',
+        testPlanId: testPlan.id,
+      });
+    }
+
+    // FIX #3: Validate projectId
+    if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+      throw new Error('ProjectId is required');
+    }
+
+    // FIX #4: Validate explorationId if provided
+    if (explorationId && !isValidUUID(explorationId)) {
+      logger.warn('[SAVE_TEST_PLAN] Invalid explorationId provided, ignoring', {
+        explorationId: explorationId.substring(0, 8) + '...',
+        testPlanId: testPlan.id,
+      });
+      explorationId = undefined;
+    }
+
+    logger.info('[SAVE_TEST_PLAN] Saving test plan', {
+      planId: testPlan.id,
+      userId: validUserId?.substring(0, 8) + '...',
+      projectId: projectId.substring(0, 8) + '...',
+      stepsCount: testPlan.steps.length,
+      commandsCount: testPlan.commands?.length || 0,
+      intelligentMode: testPlan.intelligentMode,
+    });
+
+    // FIX #5: Include all TestPlan fields (including new AI-generated fields)
     const { error } = await supabaseAdmin
       .from('test_plans')
       .insert({
@@ -124,35 +188,50 @@ export async function saveTestPlan(
         scope: testPlan.scope,
         summary: testPlan.summary,
         steps: testPlan.steps,
-        commands: testPlan.commands,
+        commands: testPlan.commands || [],
         estimated_duration: testPlan.estimatedDuration,
-        what_will_be_tested: testPlan.whatWillBeTested,
-        what_will_not_be_tested: testPlan.whatWillNotBeTested,
-        risks: testPlan.risks,
+        what_will_be_tested: testPlan.whatWillBeTested || [],
+        what_will_not_be_tested: testPlan.whatWillNotBeTested || [],
+        risks: testPlan.risks || [],
         status: 'pending_confirmation',
         exploration_id: explorationId,
         expires_at: testPlan.expiresAt,
+        // NEW: AI-generated fields support
+        intelligent_mode: testPlan.intelligentMode || false,
+        estimated_pages: testPlan.estimatedPages,
+        estimated_cost: testPlan.estimatedCost,
       });
 
     if (error) {
-      logger.error('Failed to save test plan', {
-        error,
-        errorMessage: error.message,
+      logger.error('[SAVE_TEST_PLAN] Database insert failed', {
+        error: error.message,
+        errorCode: error.code,
         errorDetails: error.details,
+        errorHint: error.hint,
         testPlanId: testPlan.id,
-        userId: validUserId,
+        userId: validUserId?.substring(0, 8) + '...',
+        projectId: projectId.substring(0, 8) + '...',
       });
-      throw error;
+      throw new Error(`Failed to save test plan: ${error.message}`);
     }
 
-    logger.info('Test plan saved', {
+    logger.info('[SAVE_TEST_PLAN] Test plan saved successfully', {
       planId: testPlan.id,
       stepsCount: testPlan.steps.length,
+      commandsCount: testPlan.commands?.length || 0,
+      intelligentMode: testPlan.intelligentMode,
+      estimatedDuration: testPlan.estimatedDuration,
     });
 
     return { success: true };
+
   } catch (error) {
-    logger.error('Error saving test plan', { error });
+    logger.error('[SAVE_TEST_PLAN] Error saving test plan', {
+      error: error instanceof Error ? error.message : String(error),
+      testPlanId: testPlan?.id,
+      userId: userId?.substring(0, 8) + '...',
+      projectId: projectId?.substring(0, 8) + '...',
+    });
     throw error;
   }
 }
@@ -164,29 +243,28 @@ export async function getLatestPendingTestPlan(
   userId: string
 ): Promise<TestPlan | null> {
   try {
-    // Check if userId is valid UUID
-    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    // FIX: Remove anonymous logic - only valid UUIDs allowed
+    if (!isValidUUID(userId)) {
+      logger.warn('[GET_LATEST_PENDING] Invalid userId, cannot fetch plan', {
+        userId,
+        reason: 'userId must be a valid UUID',
+      });
+      return null;
+    }
 
-    let query = supabaseAdmin
+    const query = supabaseAdmin
       .from('test_plans')
       .select('*')
       .eq('status', 'pending_confirmation')
+      .eq('user_id', userId) // Always filter by valid userId
       .gt('expires_at', new Date().toISOString())
       .order('created_at', { ascending: false })
       .limit(1);
 
-    // Only filter by user_id if it's a valid UUID
-    if (isValidUUID) {
-      query = query.eq('user_id', userId);
-    } else {
-      // For invalid UUIDs, look for plans with NULL user_id (anonymous)
-      query = query.is('user_id', null);
-    }
-
     const { data, error } = await query.maybeSingle();
 
     if (error || !data) {
-      logger.info('[PENDING_PLAN] No pending test plan found', { userId, isValidUUID });
+      logger.info('[PENDING_PLAN] No pending test plan found', { userId });
       return null;
     }
 
@@ -219,55 +297,105 @@ export async function getLatestPendingTestPlan(
 
 /**
  * Get test plan by ID
+ * FIX: Improved validation, error handling, and field coverage
  */
 export async function getTestPlan(
   planId: string,
   userId: string
 ): Promise<TestPlan | null> {
   try {
-    // Check if userId is valid UUID
-    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-
-    let query = supabaseAdmin
-      .from('test_plans')
-      .select('*')
-      .eq('id', planId);
-
-    // Only filter by user_id if it's a valid UUID
-    if (isValidUUID) {
-      query = query.eq('user_id', userId);
-    } else {
-      // For invalid UUIDs, look for plans with NULL user_id (anonymous)
-      query = query.is('user_id', null);
-    }
-
-    const { data, error } = await query.single();
-
-    if (error || !data) {
-      logger.warn('Test plan not found', { planId, userId, isValidUUID });
+    // FIX #3: Validate planId is a valid UUID
+    if (!isValidUUID(planId)) {
+      logger.warn('[GET_TEST_PLAN] Invalid planId format', {
+        planId,
+        userId,
+      });
       return null;
     }
 
+    // FIX #1: Use centralized UUID validation
+    const isValidUserId = isValidUUID(userId);
+
+    // FIX #4: If userId is invalid, return null (no anonymous plans support)
+    if (!isValidUserId) {
+      logger.warn('[GET_TEST_PLAN] Invalid userId, cannot fetch plan', {
+        planId,
+        userId,
+        reason: 'userId must be a valid UUID',
+      });
+      return null;
+    }
+
+    // Query with proper filters
+    const { data, error } = await supabaseAdmin
+      .from('test_plans')
+      .select('*')
+      .eq('id', planId)
+      .eq('user_id', userId)
+      .single();
+
+    // FIX #2: Better error handling
+    if (error) {
+      // PGRST116 = Record not found (expected)
+      if (error.code === 'PGRST116') {
+        logger.info('[GET_TEST_PLAN] Test plan not found', {
+          planId,
+          userId,
+          errorCode: error.code,
+        });
+        return null;
+      }
+
+      // Unexpected error (network, permission, etc.)
+      logger.error('[GET_TEST_PLAN] Unexpected error fetching test plan', {
+        error,
+        planId,
+        userId,
+        errorCode: error.code,
+        errorMessage: error.message,
+      });
+      return null;
+    }
+
+    if (!data) {
+      logger.info('[GET_TEST_PLAN] Test plan not found (no data)', {
+        planId,
+        userId,
+      });
+      return null;
+    }
+
+    // FIX #5: Return complete TestPlan with all fields
     return {
       id: data.id,
       status: data.status,
       url: data.url,
       scope: data.scope,
       summary: data.summary,
-      steps: data.steps,
-      commands: data.commands,
+      steps: data.steps || [],
+      commands: data.commands || [],
       estimatedDuration: data.estimated_duration,
-      whatWillBeTested: data.what_will_be_tested,
-      whatWillNotBeTested: data.what_will_not_be_tested,
-      risks: data.risks,
+      whatWillBeTested: data.what_will_be_tested || [],
+      whatWillNotBeTested: data.what_will_not_be_tested || [],
+      risks: data.risks || [],
       createdAt: data.created_at,
       expiresAt: data.expires_at,
+      // FIX #5: Add missing optional fields
+      intelligentMode: data.intelligent_mode || false,
+      estimatedPages: data.estimated_pages,
+      estimatedCost: data.estimated_cost,
     };
   } catch (error) {
-    logger.error('Error getting test plan', { error });
+    logger.error('[GET_TEST_PLAN] Critical error getting test plan', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      planId,
+      userId,
+    });
     return null;
   }
 }
+
 
 /**
  * Confirm test plan
@@ -277,30 +405,30 @@ export async function confirmTestPlan(
   userId: string
 ): Promise<{ success: boolean; plan?: TestPlan }> {
   try {
-    // Check if userId is valid UUID
-    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    // FIX: Remove anonymous logic - validate both IDs
+    if (!isValidUUID(planId) || !isValidUUID(userId)) {
+      logger.warn('[CONFIRM_TEST_PLAN] Invalid UUID format', {
+        planId,
+        userId,
+        reason: 'Both planId and userId must be valid UUIDs',
+      });
+      return { success: false };
+    }
 
-    let query = supabaseAdmin
+    const query = supabaseAdmin
       .from('test_plans')
       .update({
         status: 'confirmed',
         confirmed_at: new Date().toISOString(),
       })
       .eq('id', planId)
+      .eq('user_id', userId) // Always filter by valid userId
       .eq('status', 'pending_confirmation'); // Only confirm if still pending
-
-    // Only filter by user_id if it's a valid UUID
-    if (isValidUUID) {
-      query = query.eq('user_id', userId);
-    } else {
-      // For invalid UUIDs, match NULL user_id (anonymous)
-      query = query.is('user_id', null);
-    }
 
     const { data, error } = await query.select().single();
 
     if (error || !data) {
-      logger.warn('Failed to confirm test plan', { planId, userId, isValidUUID, error });
+      logger.warn('Failed to confirm test plan', { planId, userId, error });
       return { success: false };
     }
 
@@ -339,10 +467,17 @@ export async function rejectTestPlan(
   reason?: string
 ): Promise<{ success: boolean }> {
   try {
-    // Check if userId is valid UUID
-    const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    // FIX: Remove anonymous logic - validate both IDs
+    if (!isValidUUID(planId) || !isValidUUID(userId)) {
+      logger.warn('[REJECT_TEST_PLAN] Invalid UUID format', {
+        planId,
+        userId,
+        reason: 'Both planId and userId must be valid UUIDs',
+      });
+      return { success: false };
+    }
 
-    let query = supabaseAdmin
+    const query = supabaseAdmin
       .from('test_plans')
       .update({
         status: 'rejected',
@@ -350,15 +485,8 @@ export async function rejectTestPlan(
         rejection_reason: reason,
       })
       .eq('id', planId)
+      .eq('user_id', userId) // Always filter by valid userId
       .eq('status', 'pending_confirmation');
-
-    // Only filter by user_id if it's a valid UUID
-    if (isValidUUID) {
-      query = query.eq('user_id', userId);
-    } else {
-      // For invalid UUIDs, match NULL user_id (anonymous)
-      query = query.is('user_id', null);
-    }
 
     const { error } = await query;
 

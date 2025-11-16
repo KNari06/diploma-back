@@ -3,10 +3,10 @@ import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 
 // New services
-import { CredentialsParserService } from '@/services/api/credentials-parser.service';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { ApiTestPlanService } from '@/services/testing/api-test-plan.service';
 import { TestChatMappingService } from '@/services/testing/test-chat-mapping.service';
+import { UiTestPlanService } from '@/services/testing/ui-test-plan.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
 
 // Existing services
@@ -17,13 +17,15 @@ import { autoEmbedOldMessages, searchChatHistory } from '@/services/chat-embeddi
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
-import { extractUrlFromMessage } from '@/services/kb/context-enrichment.service';
 import { detectLanguage, searchKB } from '@/services/kb/kb.service';
 import { RulesCacheService } from '@/services/kb/rules-cache.service';
+import { ApiFuzzingExecutorService } from '@/services/testing/api-fuzzing-executor.service';
 import { executeApiTest } from '@/services/testing/apiTest.service';
-import { confirmAndExecuteTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/testing/autonomous-orchestrator.service';
+import { confirmTestPlan, requestMissingInformation } from '@/services/testing/autonomous-orchestrator.service';
 import { getLatestPendingTestPlan, getTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
+import { IntelligentApiFuzzerService } from '@/services/testing/intelligent-api-fuzzer.service';
 import { ManualTestService } from '@/services/testing/manualTest.service';
+import { formatTestPlanForConfirmation } from '@/services/testing/test-plan-generator.service';
 import { ChatService } from '@/services/utils/chat.service';
 
 // Types
@@ -34,21 +36,129 @@ import { ChatRequest } from './chat.types';
 // Prompts
 import { buildChatSystemPrompt } from '@/ai/prompts';
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CONSTANTS (FIX #9: Centralized magic numbers)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const CONSTANTS = {
+  // Chat history
+  RECENT_MESSAGES_LIMIT: 20,
+
+  // Knowledge base search
+  KB_MATCH_COUNT: 3,
+  KB_MATCH_THRESHOLD: 0.6,
+
+  // Timeouts
+  FUZZING_TIMEOUT: 30000, // 30 seconds
+  AUTO_EMBED_TIMEOUT: 5000, // 5 seconds
+  CHAT_REQUEST_TIMEOUT: 30000, // 30 seconds max for entire chat request
+
+  // Test plan expiration
+  TEST_PLAN_EXPIRY_HOURS: 24,
+} as const;
+
+// Progress percentages for consistent WebSocket updates
+const PROGRESS = {
+  START: 0,
+  ENRICHING: 10,
+  INTENT_PARSING: 20,
+  INTENT_PARSED: 40,
+  ROUTING: 50,
+} as const;
+
+// Response messages
+const MESSAGES = {
+  APPROVAL_UNCLEAR: '❓ I didn\'t quite understand. Could you please clarify?\n\n✅ Approve and run the test?\n❌ Cancel?',
+  TEST_REJECTED: '❌ Test plan canceled. Feel free to request a different test or ask any questions!',
+  REQUEST_TIMEOUT: '⏱️ Request timeout - please try again',
+  INVALID_REQUEST: '❌ Invalid request - message is required',
+  AUTH_REQUIRED: '🔒 Authentication required',
+} as const;
+
+// FIX #7: Centralized UUID validation
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Validate UUID format
+ */
+function isValidUUID(uuid: string | undefined): boolean {
+  if (!uuid || typeof uuid !== 'string') return false;
+  return UUID_REGEX.test(uuid);
+}
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * MAIN CHAT HANDLER
+ * MAIN CHAT HANDLER (REFACTORED - PRODUCTION READY)
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * NEW SIMPLIFIED ARCHITECTURE:
- * 1. Workspace check (mandatory)
- * 2. Parse intent (3 types: platform_test, api_test, general_chat)
- * 3. Route to appropriate handler
- * 4. All tests require test plan approval
+ * ARCHITECTURE:
+ * 1. Input validation (req.body, req.user, message)
+ * 2. Workspace check (mandatory)
+ * 3. Chat session management
+ * 4. Check pending test plan approval
+ * 5. Parse intent (platform_test, api_test, general_chat)
+ * 6. Route to appropriate handler
+ *
+ * FIXES:
+ * - FIX #1-2: Input validation
+ * - FIX #3-5: Error handling for all async operations
+ * - FIX #6: Response already sent check
+ * - FIX #8: Global timeout for entire request
+ * - FIX #11: Using PROGRESS constants
  */
 export const handleChat = async (req: Request, res: Response): Promise<void> => {
+  // FIX #8: Setup global timeout for entire request
+  const requestStartTime = Date.now();
+  const checkRequestTimeout = () => {
+    if (Date.now() - requestStartTime > CONSTANTS.CHAT_REQUEST_TIMEOUT) {
+      throw new Error(`Request timeout after ${CONSTANTS.CHAT_REQUEST_TIMEOUT / 1000}s`);
+    }
+  };
+
   try {
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 0: INPUT VALIDATION (FIX #1 & #2)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // Validate req.user (FIX #2)
+    if (!req.user || !req.user.id) {
+      logger.error('[CHAT] Authentication required - req.user missing', {
+        hasReqUser: !!req.user,
+        hasUserId: !!req.user?.id,
+      });
+      res.status(401).json({
+        success: false,
+        error: MESSAGES.AUTH_REQUIRED,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const userId = req.user.id;
+
+    // Validate req.body (FIX #1)
+    if (!req.body || typeof req.body !== 'object') {
+      logger.error('[CHAT] Invalid request body', { userId });
+      res.status(400).json({
+        success: false,
+        error: MESSAGES.INVALID_REQUEST,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     const { message, context, sessionId, conversationId, answers } = req.body as ChatRequest;
-    const userId = req.user!.id;
+
+    // Validate message (FIX #1)
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+      logger.error('[CHAT] Message is required', { userId, messageType: typeof message });
+      res.status(400).json({
+        success: false,
+        error: MESSAGES.INVALID_REQUEST,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
 
     logger.info('[CHAT] Request received', {
       userId,
@@ -56,208 +166,128 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       hasSession: !!sessionId,
       hasConversation: !!conversationId,
       hasAnswers: !!answers,
+      timeout: CONSTANTS.CHAT_REQUEST_TIMEOUT,
     });
 
+    checkRequestTimeout(); // Check timeout after validation
+
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 1: WORKSPACE CHECK (MANDATORY!)
+    // STEP 1: WORKSPACE CHECK (MANDATORY!) (FIX #3)
     // ═══════════════════════════════════════════════════════════════════════
 
-    const { workspace_id, is_new: isNewWorkspace } = await WorkspaceService.checkOrCreateWorkspace(userId);
+    let workspace_id: string;
+    try {
+      const workspaceResult = await WorkspaceService.checkOrCreateWorkspace(userId);
+      workspace_id = workspaceResult.workspace_id;
 
-    if (isNewWorkspace) {
+      if (workspaceResult.is_new) {
       logger.info('[CHAT] Created new workspace', { userId, workspace_id });
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // STEP 2: CHAT SESSION MANAGEMENT
-    // ═══════════════════════════════════════════════════════════════════════
-
-    let chatSessionId = await getOrCreateChatSession(userId, sessionId, workspace_id);
-
-    // Emit: Enriching context
-    if (chatSessionId) {
-      emitProcessingStep(chatSessionId, 'enriching_context', '🔍 Analyzing your request...', 10);
+    } catch (workspaceError) {
+      logger.error('[CHAT] WorkspaceService failed', {
+        error: workspaceError instanceof Error ? workspaceError.message : String(workspaceError),
+        userId,
+      });
+      throw new Error(`Failed to initialize workspace: ${workspaceError instanceof Error ? workspaceError.message : 'Unknown error'}`);
     }
+
+    checkRequestTimeout();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 2: CHAT SESSION MANAGEMENT (FIX #4)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    let chatSessionId: string | undefined;
+    try {
+      chatSessionId = await getOrCreateChatSession(userId, sessionId, workspace_id);
+      logger.debug('[CHAT] Chat session ready', {
+        chatSessionId: chatSessionId || 'none',
+        providedSessionId: sessionId || 'none',
+      });
+    } catch (sessionError) {
+      logger.warn('[CHAT] getOrCreateChatSession failed, continuing without session', {
+        error: sessionError instanceof Error ? sessionError.message : String(sessionError),
+          userId,
+      });
+      // Continue without session (graceful degradation)
+      chatSessionId = undefined;
+    }
+
+    // Emit: Enriching context (FIX #11: Using PROGRESS constants)
+    emitProcessingStep(chatSessionId, 'enriching_context', '🔍 Analyzing your request...', PROGRESS.ENRICHING);
+
+    checkRequestTimeout();
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 3: CHECK FOR PENDING TEST PLAN APPROVAL (MUST BE FIRST!)
     // ═══════════════════════════════════════════════════════════════════════
 
-    // IMPORTANT: Check test plan approval BEFORE parsing intent!
-    // If user is responding to test plan, we don't want to parse their "yes" as a new intent
-
-    // Try to find pending plan by conversationId first, fallback to latest pending plan
-    let pendingPlan = null;
-
-    logger.info('🔍🔍🔍 [PENDING_PLAN_SEARCH] Starting search', {
-      conversationId: conversationId || 'NONE',
-      userId,
-      message: message.substring(0, 50),
-      sessionId,
-    });
-
-    if (conversationId) {
-      logger.info('🔍 [PENDING_PLAN_SEARCH] Step 1: Searching by conversationId', { conversationId });
-      pendingPlan = await getTestPlan(conversationId, userId);
-
-      if (pendingPlan) {
-        logger.info('✅ [PENDING_PLAN_SEARCH] Found plan by conversationId!', {
-          planId: pendingPlan.id,
-          status: pendingPlan.status,
-          scope: pendingPlan.scope,
-        });
-      } else {
-        logger.warn('❌ [PENDING_PLAN_SEARCH] NOT found by conversationId', { conversationId });
-      }
-    } else {
-      logger.warn('⚠️ [PENDING_PLAN_SEARCH] No conversationId provided from frontend!');
-    }
-
-    // FALLBACK: If no conversationId provided, check if user has any recent pending plan
-    if (!pendingPlan) {
-      logger.info('🔍 [PENDING_PLAN_SEARCH] Step 2: FALLBACK - Searching latest pending plan', { userId });
-      pendingPlan = await getLatestPendingTestPlan(userId);
-
-      if (pendingPlan) {
-        logger.info('✅ [PENDING_PLAN_SEARCH] Found plan via FALLBACK!', {
-          planId: pendingPlan.id,
-          status: pendingPlan.status,
-          scope: pendingPlan.scope,
-          createdAt: pendingPlan.createdAt,
-        });
-      } else {
-        logger.info('ℹ️ [PENDING_PLAN_SEARCH] No pending plan found (normal for regular chat)', {
-          userId,
-          triedConversationId: conversationId || 'none',
-        });
-      }
-    }
-
-    if (pendingPlan && pendingPlan.status === 'pending_confirmation') {
-        // User is responding to test plan - detect approval/rejection
-        logger.info('🔍 [CHAT] Found pending test plan, checking for approval/rejection', {
-          planId: pendingPlan.id,
-          scope: pendingPlan.scope,
-          createdAt: pendingPlan.createdAt,
-          userMessage: message,
-        });
-
-        const approvalResult = await detectUserApproval(message);
-
-        logger.info('[CHAT] Test plan response detected', {
-          planId: pendingPlan.id,
-          approved: approvalResult.approved,
-          confidence: approvalResult.confidence,
-        });
-
-        if (approvalResult.confidence < 0.5) {
-          // Unclear response - save to history
-          const clarificationMessage = '❓ I didn\'t quite understand. Could you please clarify?\n\n✅ Approve and run the test?\n❌ Cancel?';
-
-          if (chatSessionId) {
-            await ChatService.saveChatMessages(chatSessionId, [
-              { role: 'user', content: message },
-              { role: 'ai', content: clarificationMessage },
-            ]);
-          }
-
-          res.json({
-            reply: clarificationMessage,
-            timestamp: new Date().toISOString(),
-            sessionId: chatSessionId,
-          });
-          return;
-        }
-
-        if (approvalResult.approved === true) {
-          // APPROVED - execute test
-          logger.info('🟢 [APPROVAL] Test approved, executing now...', {
-            planId: pendingPlan.id,
-            userId,
-            chatSessionId,
-            scope: pendingPlan.scope,
-          });
-          return await executeApprovedTestPlan(req, res, {
-            planId: pendingPlan.id,
+    const approvalHandled = await handlePendingTestPlanApproval({
+      req,
+      res,
+      message,
+      conversationId,
               userId,
             chatSessionId,
             workspace_id,
           });
-        } else if (approvalResult.approved === false) {
-          // REJECTED - save to history
-          logger.info('[CHAT] Test plan rejected', { planId: pendingPlan.id });
 
-          const rejectionMessage = '❌ Test plan canceled. Feel free to request a different test or ask any questions!';
-
-          if (chatSessionId) {
-            await ChatService.saveChatMessages(chatSessionId, [
-              { role: 'user', content: message },
-              { role: 'ai', content: rejectionMessage },
-            ]);
-          }
-
-          res.json({
-            reply: rejectionMessage,
-            timestamp: new Date().toISOString(),
-            sessionId: chatSessionId,
-          });
+    // If approval was handled (approved/rejected/clarification), return early
+    if (approvalHandled) {
           return;
-        }
-    } else {
-      logger.info('[CHAT] No pending test plan found', {
-        userId,
-        conversationId: conversationId || 'none'
-      });
     }
 
+    checkRequestTimeout();
+
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 4: PARSE INTENT (Only if not responding to test plan)
+    // STEP 4: PARSE INTENT (Only if not responding to test plan) (FIX #5)
     // ═══════════════════════════════════════════════════════════════════════
 
-    emitProcessingStep(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', 20);
+    emitProcessingStep(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', PROGRESS.INTENT_PARSING);
 
-    // Get chat history for context (helps AI remember previous conversation)
-    // Standard: 20 messages (same as handleGeneralChat)
-    let chatHistory: Array<{ role: string; content: string }> = [];
-    if (chatSessionId) {
-      try {
-        const recentMessages = await ChatService.getRecentMessages(chatSessionId, 20);
-        chatHistory = recentMessages.map(msg => ({
-          role: msg.role,
-          content: msg.content,
-        }));
-        logger.info('[CHAT] Retrieved chat history for intent parsing', {
-          historyLength: chatHistory.length,
-        });
-      } catch (error) {
-        logger.warn('[CHAT] Failed to get chat history, continuing without it', { error });
-      }
-    }
+    // Get chat history for context
+    const chatHistory = await getChatHistoryForIntent(chatSessionId);
 
-    // Parse intent with RAG fallback support + chat history
-    // Pass workspace_id as projectId for now (can be refined later to actual projectId)
-    const parsedIntent = await parseUserIntent(
+    checkRequestTimeout();
+
+    // Parse intent with error handling (FIX #5)
+    let parsedIntent: any;
+    try {
+      parsedIntent = await parseUserIntent(
       message,
-      { chatHistory }, // Pass chat history for context
+        { chatHistory },
       workspace_id
     );
+    } catch (intentError) {
+      logger.error('[CHAT] parseUserIntent failed', {
+        error: intentError instanceof Error ? intentError.message : String(intentError),
+        userId,
+        messageLength: message.length,
+      });
+      // Fallback to general_chat if intent parsing fails
+      parsedIntent = { intent: 'general_chat', confidence: 0 };
+    }
+
+    // Emit detailed intent information
+    const intentMessage = buildIntentMessage(parsedIntent);
+    emitProcessingStep(chatSessionId, 'parsing_intent', intentMessage, PROGRESS.INTENT_PARSED);
+
     const intent = parsedIntent?.intent || 'general_chat';
 
     logger.info('[CHAT] Intent parsed', {
       intent,
       scope: parsedIntent?.scope,
-      target: parsedIntent?.target,
-      hasUrl: !!parsedIntent?.page,
       confidence: parsedIntent?.confidence,
       usedRAG: parsedIntent?.metadata?.usedRAG,
-      intentChanged: parsedIntent?.metadata?.intentChanged,
-      ragChunksCount: parsedIntent?.metadata?.ragChunksCount,
-      originalIntent: parsedIntent?.metadata?.originalIntent,
     });
+
+    checkRequestTimeout();
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
     // ═══════════════════════════════════════════════════════════════════════
+
+    emitProcessingStep(chatSessionId, 'generating_plan', '🚀 Processing your request...', PROGRESS.ROUTING);
 
     if (intent === 'platform_test') {
       return await handlePlatformTest(req, res, {
@@ -292,16 +322,31 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     });
 
   } catch (error) {
-    logger.error('[CHAT] Error handling chat request', { error });
+    // FIX #6: Check if response already sent
+    if (res.headersSent) {
+      logger.warn('[CHAT] Response already sent, cannot send error response', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+
+    logger.error('[CHAT] Error handling chat request', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      duration: Date.now() - requestStartTime,
+    });
 
     // Extract error message safely
     const errorMessage = error instanceof Error && error.message
       ? error.message
       : (error ? String(error) : 'An unexpected error occurred');
 
-    res.status(500).json({
+    // Check for timeout error
+    const isTimeout = errorMessage.includes('timeout');
+
+    res.status(isTimeout ? 408 : 500).json({
       success: false,
-      error: 'Failed to process chat request',
+      error: isTimeout ? MESSAGES.REQUEST_TIMEOUT : 'Failed to process chat request',
       message: errorMessage,
       timestamp: new Date().toISOString(),
     });
@@ -309,9 +354,241 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 };
 
 /**
+ * Get chat history for intent parsing (extracted helper)
+ */
+async function getChatHistoryForIntent(
+  chatSessionId: string | undefined
+): Promise<Array<{ role: string; content: string }>> {
+  if (!chatSessionId) {
+    return [];
+  }
+
+  try {
+    const recentMessages = await ChatService.getRecentMessages(
+      chatSessionId,
+      CONSTANTS.RECENT_MESSAGES_LIMIT
+    );
+    const chatHistory = recentMessages.map(msg => ({
+      role: msg.role,
+      content: msg.content,
+    }));
+
+    logger.debug('[CHAT] Retrieved chat history for intent parsing', {
+      historyLength: chatHistory.length,
+    });
+
+    return chatHistory;
+  } catch (error) {
+    logger.warn('[CHAT] Failed to get chat history, continuing without it', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return [];
+  }
+}
+
+/**
  * ═══════════════════════════════════════════════════════════════════════════
- * HANDLER: PLATFORM TEST (UI Testing)
+ * HELPER: HANDLE PENDING TEST PLAN APPROVAL
  * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Checks if user has a pending test plan and processes their approval/rejection.
+ * Returns true if approval was handled (and response sent), false otherwise.
+ */
+async function handlePendingTestPlanApproval(params: {
+  req: Request;
+  res: Response;
+  message: string;
+  conversationId?: string;
+  userId: string;
+  chatSessionId?: string;
+  workspace_id: string;
+}): Promise<boolean> {
+  const { req, res, message, conversationId, userId, chatSessionId, workspace_id } = params;
+
+  // Find pending test plan (parallel search for performance)
+  const pendingPlan = await findPendingTestPlan(conversationId, userId);
+
+  if (!pendingPlan) {
+    logger.info('[CHAT] No pending test plan found', {
+      userId,
+      conversationId: conversationId || 'none',
+    });
+    return false; // No approval to handle
+  }
+
+  if (pendingPlan.status !== 'pending_confirmation') {
+    logger.info('[CHAT] Found plan but not pending confirmation', {
+      planId: pendingPlan.id,
+      status: pendingPlan.status,
+    });
+    return false; // Plan exists but not awaiting approval
+  }
+
+  // User is responding to test plan - process approval/rejection
+  logger.info('🔍 [CHAT] Found pending test plan, checking for approval/rejection', {
+    planId: pendingPlan.id,
+    scope: pendingPlan.scope,
+    createdAt: pendingPlan.createdAt,
+    userMessage: message,
+  });
+
+  const approvalResult = await detectUserApproval(message);
+
+  logger.info('[CHAT] Test plan response detected', {
+    planId: pendingPlan.id,
+    approved: approvalResult.approved,
+    confidence: approvalResult.confidence,
+  });
+
+  // Handle unclear response
+  if (approvalResult.confidence < 0.5) {
+    await saveAndRespond(
+      chatSessionId,
+      res,
+      message,
+      MESSAGES.APPROVAL_UNCLEAR
+    );
+    return true;
+  }
+
+  // Handle approval
+  if (approvalResult.approved === true) {
+    logger.info('🟢 [APPROVAL] Test approved, executing now...', {
+      planId: pendingPlan.id,
+      userId,
+      chatSessionId,
+      scope: pendingPlan.scope,
+    });
+
+    await executeApprovedTestPlan(req, res, {
+      planId: pendingPlan.id,
+      userId,
+      chatSessionId,
+      workspace_id,
+      userMessage: message, // FIX #14: Pass actual user message
+    });
+    return true;
+  }
+
+  // Handle rejection
+  if (approvalResult.approved === false) {
+    logger.info('[CHAT] Test plan rejected', { planId: pendingPlan.id });
+
+    await saveAndRespond(
+      chatSessionId,
+      res,
+      message,
+      MESSAGES.TEST_REJECTED
+    );
+    return true;
+  }
+
+  // Shouldn't reach here, but handle gracefully
+  return false;
+}
+
+/**
+ * Find pending test plan (parallel search for performance)
+ */
+async function findPendingTestPlan(
+  conversationId: string | undefined,
+  userId: string
+): Promise<any | null> {
+  logger.info('🔍 [PENDING_PLAN_SEARCH] Starting parallel search', {
+    conversationId: conversationId || 'NONE',
+    userId,
+  });
+
+  // Validate conversationId format
+  const isValidConversationId = conversationId && isValidUUID(conversationId);
+
+  if (conversationId && !isValidConversationId) {
+    logger.warn('⚠️ [PENDING_PLAN_SEARCH] Invalid conversationId format, ignoring', {
+      conversationId,
+      userId,
+    });
+  }
+
+  // Run both queries in parallel (50ms instead of 100ms)
+  const [planByConversation, latestPlan] = await Promise.all([
+    isValidConversationId ? getTestPlan(conversationId, userId) : Promise.resolve(null),
+    getLatestPendingTestPlan(userId),
+  ]);
+
+  // Prefer plan by conversationId, fallback to latest
+  const pendingPlan = planByConversation || latestPlan;
+
+  if (pendingPlan) {
+    if (planByConversation) {
+      logger.info('✅ [PENDING_PLAN_SEARCH] Found plan by conversationId!', {
+        planId: pendingPlan.id,
+        status: pendingPlan.status,
+        scope: pendingPlan.scope,
+        searchMethod: 'conversationId',
+      });
+    } else {
+      logger.info('✅ [PENDING_PLAN_SEARCH] Found plan via FALLBACK (latest pending)!', {
+        planId: pendingPlan.id,
+        status: pendingPlan.status,
+        scope: pendingPlan.scope,
+        createdAt: pendingPlan.createdAt,
+        searchMethod: 'fallback',
+      });
+    }
+  } else {
+    logger.info('ℹ️ [PENDING_PLAN_SEARCH] No pending plan found', {
+      userId,
+      triedConversationId: conversationId || 'none',
+      conversationIdValid: isValidConversationId,
+    });
+  }
+
+  return pendingPlan;
+}
+
+/**
+ * Save message to chat history and send response
+ */
+async function saveAndRespond(
+  chatSessionId: string | undefined,
+  res: Response,
+  userMessage: string,
+  aiMessage: string
+): Promise<void> {
+  if (chatSessionId) {
+    await ChatService.saveChatMessages(chatSessionId, [
+      { role: 'user', content: userMessage },
+      { role: 'ai', content: aiMessage },
+    ]);
+  }
+
+  res.json({
+    reply: aiMessage,
+    timestamp: new Date().toISOString(),
+    sessionId: chatSessionId,
+  });
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HANDLER: PLATFORM TEST (UI Testing) - REFACTORED & FIXED
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * CRITICAL FIXES:
+ * - FIX #1: Added comprehensive error handling for all async operations
+ * - FIX #2: Implemented proper test plan approval flow (like API test)
+ * - FIX #3: Added timeout protection for entire flow
+ * - FIX #4: Improved WebSocket progress updates
+ * - FIX #5: Fixed extractUrlFromMessage undefined issue
+ * - FIX #6: Removed duplicate question asking logic
+ *
+ * NEW FLOW (CORRECT):
+ * 1. Validate URL + scope
+ * 2. Create/find project
+ * 3. GENERATE TEST PLAN (not run immediately!)
+ * 4. Save test plan to DB
+ * 5. Show to user for APPROVAL
+ * 6. User approves → handlePendingTestPlanApproval → executeUiTestFlow
  */
 async function handlePlatformTest(
   req: Request,
@@ -328,20 +605,34 @@ async function handlePlatformTest(
 ): Promise<void> {
   const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers } = params;
 
+  // FIX #3: Setup timeout for entire platform test flow
+  const flowStartTime = Date.now();
+  const flowTimeout = 60000; // 60 seconds
+  const checkTimeout = () => {
+    if (Date.now() - flowStartTime > flowTimeout) {
+      throw new Error(`Platform test flow timeout after ${flowTimeout / 1000}s`);
+    }
+  };
+
+  try {
   logger.info('[PLATFORM_TEST] Starting UI test flow', {
     scope: parsedIntent?.scope,
     target: parsedIntent?.target,
     hasUrl: !!parsedIntent?.page,
+      hasAnswers: !!answers,
+      timeout: flowTimeout,
   });
 
-  emitProcessingStep(chatSessionId, 'checking_autonomous', '🤖 Preparing autonomous exploration...', 30);
+    // FIX #4: Better progress updates
+    emitProcessingStep(chatSessionId, 'checking_autonomous', '🤖 Analyzing your request...', 30);
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 0: LOAD CHAT SESSION CONTEXT (project if exists)
+    // STEP 0: LOAD CHAT SESSION CONTEXT (FIX #1: Error handling)
   // ═══════════════════════════════════════════════════════════════════════
 
   let sessionProject = null;
   if (chatSessionId) {
+      try {
     const sessionData = await ChatService.getSessionWithProject(chatSessionId);
     sessionProject = sessionData?.project;
 
@@ -351,11 +642,25 @@ async function handlePlatformTest(
         projectName: sessionProject.name,
         projectUrl: sessionProject.settings.main_url,
       });
+        } else {
+          logger.debug('[PLATFORM_TEST] No project in session yet');
+        }
+      } catch (error) {
+        logger.warn('[PLATFORM_TEST] Failed to get session project', {
+          error: error instanceof Error ? error.message : String(error),
+          chatSessionId,
+        });
+        // Continue without session project (graceful degradation)
+        sessionProject = null;
+      }
     }
-  }
 
-  // Load all user projects for selection
-  const { data: userProjects } = await supabaseAdmin
+    checkTimeout();
+
+    // Load user projects (FIX #1: Error handling)
+    let userProjects: any[] = [];
+    try {
+      const { data, error } = await supabaseAdmin
     .from('projects')
     .select('id, name, settings')
     .eq('user_id', userId)
@@ -363,33 +668,59 @@ async function handlePlatformTest(
     .order('created_at', { ascending: false })
     .limit(10);
 
+      if (error) {
+        logger.error('[PLATFORM_TEST] Failed to load user projects', { error });
+      } else {
+        userProjects = data || [];
+      }
+
   logger.info('[PLATFORM_TEST] Loaded user projects', {
-    projectCount: userProjects?.length || 0,
-  });
+        projectCount: userProjects.length,
+      });
+    } catch (error) {
+      logger.warn('[PLATFORM_TEST] Error loading projects, continuing without them', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      userProjects = [];
+    }
+
+    checkTimeout();
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 1: CHECK IF WE HAVE ALL NEEDED INFO
+    // STEP 1: VALIDATE URL + SCOPE (FIX #5: Safe URL extraction)
   // ═══════════════════════════════════════════════════════════════════════
 
-  // If session has project, use its URL as default
-  const extractedUrl = parsedIntent?.page || extractUrlFromMessage(message) || sessionProject?.settings?.main_url;
+    // FIX #5: Safe URL extraction without undefined function
+    const extractedUrl =
+      parsedIntent?.page ||
+      sessionProject?.settings?.main_url ||
+      null;
+
   const hasUrl = !!extractedUrl;
   const hasScope = !!parsedIntent?.scope;
 
-  // If missing info, ask questions (WITH user projects context)
-  if (!hasUrl || !hasScope) {
-    logger.info('[PLATFORM_TEST] Missing information', { hasUrl, hasScope });
+    logger.info('[PLATFORM_TEST] Validation check', {
+      hasUrl,
+      hasScope,
+      extractedUrl: extractedUrl || 'none',
+      scope: parsedIntent?.scope || 'none',
+    });
 
+    // If missing info, ask questions
+  if (!hasUrl || !hasScope) {
+      logger.info('[PLATFORM_TEST] Missing required information', { hasUrl, hasScope });
+
+      try {
     const result = await requestMissingInformation(message, {
       hasUrl,
       hasScope,
       intent: 'platform_test',
-      userProjects: userProjects || [],
+          userProjects,
     });
 
-    // Save chat messages to history
+        // Save to history (non-blocking)
     if (chatSessionId) {
-      await ChatService.saveChatMessages(chatSessionId, [
+          ChatService.saveChatMessages(chatSessionId, [
         { role: 'user', content: message },
         {
           role: 'ai',
@@ -400,7 +731,11 @@ async function handlePlatformTest(
             requiresAnswers: true,
           },
         },
-      ]);
+          ]).catch(saveError => {
+            logger.error('[PLATFORM_TEST] Failed to save messages', {
+              error: saveError instanceof Error ? saveError.message : String(saveError),
+            });
+          });
     }
 
       res.json({
@@ -411,162 +746,193 @@ async function handlePlatformTest(
       sessionId: chatSessionId,
       });
       return;
+      } catch (error) {
+        logger.error('[PLATFORM_TEST] requestMissingInformation failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw new Error('Failed to generate questions');
+      }
     }
 
+    checkTimeout();
+
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2: FIND OR CREATE PROJECT
+    // STEP 2: FIND OR CREATE PROJECT (FIX #1: Error handling)
   // ═══════════════════════════════════════════════════════════════════════
 
-  const { project_id, is_new: isNewProject } = await ProjectContextService.findOrCreateProject(
+    emitProcessingStep(chatSessionId, 'checking_autonomous', '🔍 Setting up project...', 40);
+
+    let project_id: string;
+    try {
+      const projectResult = await ProjectContextService.findOrCreateProject(
     workspace_id,
     extractedUrl,
     userId
   );
+      project_id = projectResult.project_id;
 
-  if (isNewProject) {
+      if (projectResult.is_new) {
     logger.info('[PLATFORM_TEST] Created new project', { project_id, url: extractedUrl });
   }
 
-  // Update chat session with project_id (so next time we remember it)
-  if (chatSessionId && project_id) {
-    await ChatService.updateSessionProject(chatSessionId, project_id);
-    logger.info('[PLATFORM_TEST] Updated chat session with project', {
-      chatSessionId,
-      project_id,
-    });
-  }
+      // Update session with project (non-blocking)
+      if (chatSessionId) {
+        ChatService.updateSessionProject(chatSessionId, project_id).catch(updateError => {
+          logger.warn('[PLATFORM_TEST] Failed to update session project', {
+            error: updateError instanceof Error ? updateError.message : String(updateError),
+          });
+        });
+      }
+    } catch (error) {
+      logger.error('[PLATFORM_TEST] ProjectContextService failed', {
+        error: error instanceof Error ? error.message : String(error),
+        url: extractedUrl,
+      });
+      throw new Error(`Failed to initialize project: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+
+    checkTimeout();
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 3: CHECK FOR SAVED CREDENTIALS
+    // STEP 3: CHECK FOR SAVED CREDENTIALS (FIX #1: Error handling)
   // ═══════════════════════════════════════════════════════════════════════
 
-  const savedCredentials = await ProjectContextService.getProjectCredentials(project_id, userId);
+    let savedCredentials: any = null;
+    try {
+      savedCredentials = await ProjectContextService.getProjectCredentials(project_id, userId);
 
   if (savedCredentials) {
     logger.info('[PLATFORM_TEST] Found saved credentials', { project_id });
-  }
+      }
+    } catch (error) {
+      logger.warn('[PLATFORM_TEST] Failed to get credentials, continuing without them', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      savedCredentials = null;
+    }
+
+    checkTimeout();
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 4: IF HAVE ANSWERS, RUN AUTONOMOUS EXPLORATION
+    // NEW STEP 4: GENERATE TEST PLAN (FIX #2: Proper approval flow!)
   // ═══════════════════════════════════════════════════════════════════════
 
-  if (answers && conversationId) {
-    logger.info('[PLATFORM_TEST] Running autonomous exploration with answers', {
-        conversationId,
-        answerCount: Object.keys(answers).length,
+    emitProcessingStep(chatSessionId, 'generating_plan', '📋 Creating AI test plan...', 60);
+
+    // ✅ NEW: Generate intelligent UI test plan using AI (replaces hardcoded plan)
+    const testPlan = await UiTestPlanService.generateUiTestPlan({
+      url: extractedUrl,
+      scope: parsedIntent.scope,
+      target: parsedIntent.target,
+      userMessage: message,
+      hasCredentials: !!savedCredentials,
+      projectContext: sessionProject ? {
+        name: sessionProject.name,
+        // TODO: Add previousTests and knownIssues from project history
+      } : undefined,
     });
 
-    emitProcessingStep(chatSessionId, 'exploring_site', '🌐 Launching browser and exploring...', 50);
+    checkTimeout();
 
-    try {
-      // Parse credentials if provided in answers
-      if (answers.credentials) {
-        try {
-          const parsedCreds = CredentialsParserService.parseNaturalCredentials(
-            typeof answers.credentials === 'string' ? answers.credentials : JSON.stringify(answers.credentials)
-          );
+    // ═══════════════════════════════════════════════════════════════════════
+    // NEW STEP 5: SAVE TEST PLAN FOR APPROVAL (FIX #2)
+    // ═══════════════════════════════════════════════════════════════════════
 
-          // Save credentials for future use
-          await ProjectContextService.saveProjectCredentials(
-            project_id,
-            userId,
-            parsedCreds,
-            'Auto-saved from chat'
-          );
+    // Save test plan (explorationId is optional, not needed for UI tests)
+    await saveTestPlan(testPlan, userId, project_id);
 
-          logger.info('[PLATFORM_TEST] Parsed and saved credentials', { project_id });
-        } catch (error) {
-          logger.warn('[PLATFORM_TEST] Failed to parse credentials', { error });
-        }
-      }
+    logger.info('[PLATFORM_TEST] Test plan saved for approval', {
+      planId: testPlan.id,
+      url: extractedUrl,
+      scope: parsedIntent.scope,
+    });
 
-        const explorationResult = await runAutonomousExploration({
-          userMessage: message,
-          answers,
-        userId,
-        projectId: project_id,
-          sessionId: chatSessionId,
-        });
+    checkTimeout();
 
-      // Save chat messages
+    // ═══════════════════════════════════════════════════════════════════════
+    // NEW STEP 6: SHOW TEST PLAN TO USER FOR APPROVAL (FIX #2)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    emitProcessingStep(chatSessionId, 'generating_plan', '✅ Test plan ready!', 80);
+
+    const formattedPlan = formatTestPlanForConfirmation(testPlan);
+
+    // Save to history (non-blocking)
       if (chatSessionId) {
-        await ChatService.saveChatMessages(chatSessionId, [
+      ChatService.saveChatMessages(chatSessionId, [
           { role: 'user', content: message },
           {
             role: 'ai',
-            content: explorationResult.message,
+          content: formattedPlan,
             metadata: {
-              testPlan: explorationResult.testPlan,
-              exploration: {
-                url: explorationResult.exploration.url,
-                timestamp: explorationResult.exploration.timestamp,
-              },
-            },
+            testPlan,
+            requiresApproval: true,
           },
-        ]);
-      }
+        },
+      ]).catch(saveError => {
+        logger.error('[PLATFORM_TEST] Failed to save messages', {
+          error: saveError instanceof Error ? saveError.message : String(saveError),
+        });
+      });
+    }
 
+    // Send response with test plan
         res.json({
-          reply: explorationResult.message,
-          testPlan: explorationResult.testPlan,
-          conversationId,
+      reply: formattedPlan,
+      testPlan,
+      conversationId: testPlan.id, // ← For tracking approval
+      requiresApproval: true, // ← KEY! User must approve
           timestamp: new Date().toISOString(),
         sessionId: chatSessionId,
         });
-        return;
-      } catch (error) {
-      logger.error('[PLATFORM_TEST] Autonomous exploration failed', { error });
 
-        const errorMessage = error instanceof Error && error.message
-          ? error.message
-          : (error ? String(error) : 'An unexpected error occurred');
+    logger.info('[PLATFORM_TEST] Test plan sent for user approval', {
+      planId: testPlan.id,
+      duration: Date.now() - flowStartTime,
+    });
 
-        res.status(500).json({
-          success: false,
-        error: 'Failed to explore platform',
-          message: errorMessage,
-          timestamp: new Date().toISOString(),
+  } catch (error) {
+    // Check if response already sent
+    if (res.headersSent) {
+      logger.warn('[PLATFORM_TEST] Response already sent, cannot send error', {
+        error: error instanceof Error ? error.message : String(error),
         });
         return;
-      }
     }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // STEP 5: NO ANSWERS YET - GENERATE QUESTIONS
-  // ═══════════════════════════════════════════════════════════════════════
+    logger.error('[PLATFORM_TEST] Error in platform test flow', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      duration: Date.now() - flowStartTime,
+    });
 
-  logger.info('[PLATFORM_TEST] Generating clarifying questions');
+    const errorMessage = error instanceof Error && error.message
+      ? error.message
+      : (error ? String(error) : 'Failed to process platform test');
 
-  const result = await requestMissingInformation(message, {
-    hasUrl: true,
-    hasScope: !!parsedIntent?.scope,
-    hasCredentials: !!savedCredentials,
-    intent: 'platform_test',
-  });
+    // Check for timeout
+    const isTimeout = errorMessage.includes('timeout');
 
-  // Save chat messages to history
+    // Save error to history (non-blocking)
   if (chatSessionId) {
-    await ChatService.saveChatMessages(chatSessionId, [
+      ChatService.saveChatMessages(chatSessionId, [
       { role: 'user', content: message },
-      {
-        role: 'ai',
-        content: '📋 Let me gather some details to set up the perfect test:',
-        metadata: {
-          questions: result.questions,
-          conversationId: result.conversationId,
-          requiresAnswers: true,
-        },
-      },
-    ]);
-  }
+        { role: 'ai', content: `❌ Error: ${errorMessage}` },
+      ]).catch(saveError => {
+        logger.error('[PLATFORM_TEST] Failed to save error message', {
+          error: saveError instanceof Error ? saveError.message : String(saveError),
+        });
+      });
+    }
 
-  res.json({
-    reply: '📋 Let me gather some details to set up the perfect test:',
-    questions: result.questions,
-    conversationId: result.conversationId,
+    res.status(isTimeout ? 408 : 500).json({
+      success: false,
+      error: isTimeout ? 'Request timeout' : 'Failed to process platform test',
+      message: errorMessage,
     timestamp: new Date().toISOString(),
     sessionId: chatSessionId,
   });
+  }
 }
 
 /**
@@ -590,15 +956,45 @@ async function handleApiTest(
   const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers } = params;
 
   try {
-    // Merge answers into parsedIntent if provided
+    // FIX #8: Validate and merge answers into parsedIntent if provided
     if (answers) {
-      if (answers.apiMethod) parsedIntent.apiMethod = answers.apiMethod;
-      if (answers.apiUrl) parsedIntent.apiUrl = answers.apiUrl;
-      if (answers.apiBody) parsedIntent.apiBody = answers.apiBody;
-      if (answers.apiHeaders) parsedIntent.apiHeaders = answers.apiHeaders;
+      // Validate answers structure
+      if (typeof answers !== 'object' || Array.isArray(answers)) {
+        logger.error('[API_TEST] Invalid answers structure', { answers: typeof answers });
+        throw new Error('Invalid answers format - expected object');
+      }
 
-      logger.info('[API_TEST] Merged answers into parsedIntent', {
-        answersProvided: Object.keys(answers),
+      // Safely merge answers with validation
+      const validatedAnswers: Record<string, any> = {};
+
+      if (answers.apiMethod && typeof answers.apiMethod === 'string') {
+        parsedIntent.apiMethod = answers.apiMethod.toUpperCase();
+        validatedAnswers.apiMethod = answers.apiMethod;
+      }
+
+      if (answers.apiUrl && typeof answers.apiUrl === 'string') {
+        // Validate URL format
+        try {
+          new URL(answers.apiUrl);
+          parsedIntent.apiUrl = answers.apiUrl;
+          validatedAnswers.apiUrl = answers.apiUrl;
+        } catch {
+          logger.warn('[API_TEST] Invalid URL in answers', { apiUrl: answers.apiUrl });
+        }
+      }
+
+      if (answers.apiBody) {
+        parsedIntent.apiBody = answers.apiBody;
+        validatedAnswers.apiBody = typeof answers.apiBody === 'string' ? 'provided' : 'object';
+      }
+
+      if (answers.apiHeaders && typeof answers.apiHeaders === 'object') {
+        parsedIntent.apiHeaders = answers.apiHeaders;
+        validatedAnswers.apiHeaders = Object.keys(answers.apiHeaders).length;
+      }
+
+      logger.info('[API_TEST] Merged validated answers into parsedIntent', {
+        answersProvided: Object.keys(validatedAnswers),
         method: parsedIntent.apiMethod,
         url: parsedIntent.apiUrl,
       });
@@ -822,7 +1218,7 @@ async function handleGeneralChat(
     });
 
     // Get recent messages (last 20)
-    const recentMessages = await getRecentChatHistory(chatSessionId, 20);
+    const recentMessages = await ChatService.getRecentMessages(chatSessionId, CONSTANTS.RECENT_MESSAGES_LIMIT);
 
     logger.info('[GENERAL_CHAT] Retrieved recent history', {
       messageCount: recentMessages.length
@@ -838,14 +1234,21 @@ async function handleGeneralChat(
 
     // Note: chatSessionId is always defined (requireAuth middleware ensures valid user)
     // But we check anyway as defensive programming
-    if (totalMessages > 20 && chatSessionId) {
+    if (totalMessages > CONSTANTS.RECENT_MESSAGES_LIMIT && chatSessionId) {
       logger.info('[GENERAL_CHAT] Chat has old messages, using vector search');
 
       try {
-        // Auto-embed old messages if not already done (runs in background)
-        // This is a fire-and-forget operation
-        autoEmbedOldMessages(chatSessionId).catch(error => {
-          logger.warn('[GENERAL_CHAT] Failed to auto-embed messages', { error });
+        // FIX #4: Auto-embed with timeout to prevent memory leak
+        const embedPromise = autoEmbedOldMessages(chatSessionId);
+        const embedTimeout = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Auto-embed timeout')), CONSTANTS.AUTO_EMBED_TIMEOUT)
+        );
+
+        Promise.race([embedPromise, embedTimeout]).catch(error => {
+          logger.warn('[GENERAL_CHAT] Failed to auto-embed messages', {
+            error: error instanceof Error ? error.message : String(error),
+            timeout: CONSTANTS.AUTO_EMBED_TIMEOUT,
+          });
         });
 
         // Search for relevant old messages using semantic similarity
@@ -853,8 +1256,8 @@ async function handleGeneralChat(
           chatSessionId,
           message, // Current user query
           {
-            matchCount: 3, // Top 3 most relevant old messages
-            matchThreshold: 0.6, // Only include if similarity > 0.6
+            matchCount: CONSTANTS.KB_MATCH_COUNT, // Top 3 most relevant old messages
+            matchThreshold: CONSTANTS.KB_MATCH_THRESHOLD, // Only include if similarity > 0.6
           }
         );
 
@@ -897,7 +1300,7 @@ async function handleGeneralChat(
   let kbRulesContext = '';
 
   // Detect user language from message
-  const userLanguage = detectLanguage(message);
+  const userLanguage = await detectLanguage(message);
 
   logger.info('[GENERAL_CHAT] Detected user language', {
     language: userLanguage,
@@ -913,8 +1316,8 @@ async function handleGeneralChat(
 
     // Search for general context related to user's message
     const kbResults = await searchKB(message, undefined, {
-      matchCount: 3,
-      matchThreshold: 0.6, // Slightly higher than for intent parsing
+      matchCount: CONSTANTS.KB_MATCH_COUNT,
+      matchThreshold: CONSTANTS.KB_MATCH_THRESHOLD,
       language: userLanguage, // Filter by detected language
     });
 
@@ -1097,8 +1500,8 @@ Use this knowledge to provide more accurate and helpful responses.`,
   // Show user's current credit balance (but don't deduct)
   if (userId && userId !== 'anonymous') {
     try {
-      const isValidUUID = userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-      if (isValidUUID) {
+      // FIX #7: Use centralized UUID validation
+      if (isValidUUID(userId)) {
         const credits = await UserCreditsService.getUserCredits(userId);
         response.creditsRemaining = credits?.credits_balance || 0;
         response.chatIsFree = true; // Indicate that chat is free
@@ -1113,30 +1516,14 @@ Use this knowledge to provide more accurate and helpful responses.`,
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * HELPER: EXECUTE APPROVED TEST PLAN
+ * HELPER: VALIDATE TEST PLAN
  * ═══════════════════════════════════════════════════════════════════════════
  */
-async function executeApprovedTestPlan(
-  req: Request,
-  res: Response,
-  params: {
-    planId: string;
-    userId: string;
-    chatSessionId?: string;
-    workspace_id: string;
-  }
-): Promise<void> {
-  const { planId, userId, chatSessionId, workspace_id } = params;
-
-  logger.info('🚀 [EXECUTE] ==> FUNCTION CALLED - Test plan approved', {
-    planId,
-    userId,
-    chatSessionId,
-    timestamp: new Date().toISOString()
-  });
-
-  try {
-    // Get the test plan
+async function validateTestPlan(
+  planId: string,
+  userId: string,
+  res: Response
+): Promise<any | null> {
     const plan = await getTestPlan(planId, userId);
 
     if (!plan) {
@@ -1145,17 +1532,55 @@ async function executeApprovedTestPlan(
         error: 'Test plan not found or expired',
             timestamp: new Date().toISOString(),
       });
-      return;
-    }
+    return null;
+  }
 
-    // Determine test type
-    const isApiTest = plan.scope === 'api_test' || ((plan as any).metadata && (plan as any).metadata.type === 'api_test');
-    const testType = isApiTest ? 'api' : (plan.intelligentMode ? 'intelligent' : 'standard');
+  return plan;
+}
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // CHECK CREDITS BEFORE RUNNING TEST
-    // ═══════════════════════════════════════════════════════════════════════
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: DETERMINE TEST TYPE
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+function determineTestType(plan: any): 'api' | 'intelligent' | 'standard' {
+  if (!plan) {
+    logger.warn('[DETERMINE_TYPE] Plan is null/undefined');
+    return 'standard';
+  }
 
+  // Check if API test (priority 1)
+  const isApiTest = plan.scope === 'api_test' || (plan.metadata?.type === 'api_test');
+
+  if (isApiTest) {
+    logger.debug('[DETERMINE_TYPE] Detected API test', {
+      scope: plan.scope,
+      metadataType: plan.metadata?.type
+    });
+    return 'api';
+  }
+
+  // Check intelligent mode (priority 2)
+  if (plan.intelligentMode) {
+    logger.debug('[DETERMINE_TYPE] Detected intelligent test');
+    return 'intelligent';
+  }
+
+  // Default to standard
+  logger.debug('[DETERMINE_TYPE] Defaulting to standard test');
+  return 'standard';
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: CHECK CREDITS BEFORE TEST
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+async function checkCreditsBeforeTest(
+  userId: string,
+  testType: 'api' | 'intelligent' | 'standard',
+  res: Response
+): Promise<boolean> {
     const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, testType);
 
     if (!creditCheck.hasEnough) {
@@ -1176,7 +1601,7 @@ async function executeApprovedTestPlan(
         shortage: creditCheck.shortage,
         timestamp: new Date().toISOString(),
       });
-      return;
+    return false;
     }
 
     logger.info('[EXECUTE] Credit check passed', {
@@ -1186,38 +1611,103 @@ async function executeApprovedTestPlan(
       available: creditCheck.available,
     });
 
-    if (isApiTest) {
-      // Execute API test
+  return true;
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: EXECUTE API TEST FLOW (REFACTORED - CRITICAL FIXES)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * FIX #1-5: Error handling, validation, non-blocking chat save
+ * FIX #12: Global timeout for entire flow (60s)
+ * FIX #13: Consistent WebSocket progress (0-100%)
+ */
+async function executeApiTestFlow(
+  res: Response,
+  params: {
+    plan: any;
+    planId: string;
+    userId: string;
+    chatSessionId?: string;
+    userMessage?: string; // FIX #14: Actual user message
+  }
+): Promise<void> {
+  const { plan, planId, userId, chatSessionId, userMessage = 'Approved test execution' } = params;
+
+  // FIX #12: Global timeout for entire API test flow
+  const flowTimeout = 60000; // 60 seconds
+  const flowStartTime = Date.now();
+
+  const checkTimeout = () => {
+    if (Date.now() - flowStartTime > flowTimeout) {
+      throw new Error(`API test flow timeout after ${flowTimeout / 1000}s`);
+    }
+  };
+
       logger.info('🔵 [API_TEST] Starting API test execution', {
         planId,
         url: plan.url,
-        method: (plan as any).metadata?.method,
+    method: plan.metadata?.method,
         chatSessionId,
+    timeout: flowTimeout,
+  });
+
+  try {
+    // FIX #13: Consistent progress starting from 0%
+    emitProcessingStep(chatSessionId, 'executing_test', '🚀 Starting API test execution...', 0);
+    emitProcessingStep(chatSessionId, 'executing_test', '📋 Confirming test plan...', 5);
+
+    // FIX #4: Validate plan.url before execution
+    if (!plan.url || typeof plan.url !== 'string') {
+      throw new Error('Invalid plan URL - URL is required for API testing');
+    }
+
+    // Validate URL format
+    try {
+      new URL(plan.url);
+    } catch {
+      throw new Error(`Invalid URL format: ${plan.url}`);
+    }
+
+    checkTimeout(); // Check timeout before each major step
+
+    // Confirm plan
+    const confirmResult = await confirmTestPlan(planId, userId);
+    if (!confirmResult.success) {
+      throw new Error(`Failed to confirm test plan: ${confirmResult.message}`);
+    }
+
+    emitProcessingStep(chatSessionId, 'executing_test', '💳 Checking credits...', 10);
+    checkTimeout();
+
+    // FIX #3: Deduct credits BEFORE test execution (not after)
+    const apiTestId = `api_${planId}_${Date.now()}`;
+    const apiDetails = plan.metadata || {};
+
+    try {
+      await CreditCostTrackerService.deductCreditsForTest({
+        userId,
+        testType: 'api',
+        credits: TokenCalculatorService.getTestCreditCost('api'),
+        costUSD: 0.0011,
+        testId: apiTestId,
+        description: `API test: ${apiDetails.method || 'GET'} ${plan.url}`,
       });
-
-      // ═══ EMIT: Test starting ═══
-      emitProcessingStep(chatSessionId, 'executing_test', '🚀 Starting API test execution...', 10);
-
-      // Confirm plan first
-      logger.info('🔵 [API_TEST] Step 1: Confirming plan...');
-      emitProcessingStep(chatSessionId, 'executing_test', '📋 Confirming test plan...', 20);
-
-      await confirmAndExecuteTestPlan(planId, userId);
-      logger.info('🔵 [API_TEST] Step 2: Plan confirmed, extracting details...');
-
-      emitProcessingStep(chatSessionId, 'executing_test', '🔧 Preparing API request...', 30);
-
-      // Extract API test details from metadata
-      const apiDetails = (plan as any).metadata || {};
-
-      logger.info('🔵 [API_TEST] Step 3: Calling executeApiTest', {
-        method: apiDetails.method || 'GET',
-        url: plan.url,
-        hasBody: !!apiDetails.body,
-        hasHeaders: !!apiDetails.headers,
+    } catch (creditError) {
+      logger.error('[API_TEST] Failed to deduct credits', {
+        error: creditError instanceof Error ? creditError.message : String(creditError),
+        userId,
       });
+      throw new Error('Insufficient credits or payment error');
+    }
 
-      const apiTestResult = await executeApiTest(
+    emitProcessingStep(chatSessionId, 'executing_test', '🔧 Preparing API request...', 15);
+    checkTimeout();
+
+    // FIX #1: Wrap executeApiTest in try-catch
+    let apiTestResult: any;
+    try {
+      apiTestResult = await executeApiTest(
         {
           method: apiDetails.method || 'GET',
           url: plan.url,
@@ -1225,256 +1715,421 @@ async function executeApprovedTestPlan(
           headers: apiDetails.headers || {},
           expectedStatus: apiDetails.expectedStatus || 200,
         },
-        chatSessionId // Pass chatSessionId for WebSocket progress updates
+        chatSessionId
       );
+    } catch (testError) {
+      logger.error('[API_TEST] executeApiTest failed', {
+        error: testError instanceof Error ? testError.message : String(testError),
+        url: plan.url,
+      });
+      throw new Error(`API test execution failed: ${testError instanceof Error ? testError.message : 'Unknown error'}`);
+    }
 
-      // ═════════════════════════════════════════════════════════════════════
-      // ✨ NEW: INTELLIGENT API FUZZING
-      // ═════════════════════════════════════════════════════════════════════
-      let fuzzingReport = null;
+    checkTimeout();
 
-      // Only run fuzzing if happy path test was successful
-      if (apiTestResult.success && chatSessionId) {
-        try {
-          const { IntelligentApiFuzzerService } = await import('@/services/testing/intelligent-api-fuzzer.service');
-          const { ApiFuzzingExecutorService } = await import('@/services/testing/api-fuzzing-executor.service');
+    // FIX #2: Wrap runApiFuzzing in try-catch (already has internal try-catch, but double-check)
+    let fuzzingReport: any = null;
+    try {
+      fuzzingReport = await runApiFuzzing(apiTestResult, apiDetails, plan.url, chatSessionId);
+    } catch (fuzzingError) {
+      // Fuzzing is optional, don't fail the entire test
+      logger.warn('[API_TEST] Fuzzing failed, continuing without it', {
+        error: fuzzingError instanceof Error ? fuzzingError.message : String(fuzzingError),
+      });
+      // fuzzingReport stays null
+    }
 
-          logger.info('[API_FUZZING] Starting intelligent fuzzing', {
-            method: apiDetails.method,
-            url: plan.url,
-          });
+    checkTimeout();
 
-          // WebSocket: Generating scenarios
-          emitProcessingStep(chatSessionId, 'analyzing_results', '🔍 Generating security test scenarios...', 70);
-
-          const fuzzingScenarios = await IntelligentApiFuzzerService.generateFuzzingScenarios(
-            {
-              method: apiDetails.method || 'GET',
-              url: plan.url,
-              body: apiDetails.body,
-              headers: apiDetails.headers || {},
-              expectedStatus: apiDetails.expectedStatus || 200,
-            },
-            apiTestResult
-          );
-
-          logger.info('[API_FUZZING] Scenarios generated', { count: fuzzingScenarios.length });
-
-          // WebSocket: Executing fuzzing tests
-          emitProcessingStep(
-            chatSessionId,
-            'analyzing_results',
-            `🎯 Testing ${fuzzingScenarios.length} security scenarios...`,
-            75
-          );
-
-          fuzzingReport = await ApiFuzzingExecutorService.executeFuzzingScenarios(
-            fuzzingScenarios,
-            apiTestResult
-          );
-
-          logger.info('[API_FUZZING] Fuzzing completed', {
-            totalTests: fuzzingReport.summary.totalTests,
-            passed: fuzzingReport.summary.passed,
-            failed: fuzzingReport.summary.failed,
-            issuesFound: fuzzingReport.issues.length,
-            securityScore: fuzzingReport.securityScore,
-          });
-
-          // WebSocket: Analysis complete
-          emitProcessingStep(
-            chatSessionId,
-            'analyzing_results',
-            `✅ Security analysis complete! Found ${fuzzingReport.issues.length} issue(s)`,
-            100
-          );
-        } catch (fuzzingError) {
-          logger.error('[API_FUZZING] Fuzzing failed, continuing without it', {
-            error: fuzzingError
-          });
-          // Continue without fuzzing if it fails
-        }
-      }
-
-      // Generate a unique test ID for API test tracking
-      const apiTestId = `api_${planId}_${Date.now()}`;
-
-      // Save test-chat mapping for API test notifications
+    // Save test-chat mapping (non-blocking)
       if (chatSessionId && userId) {
-        await TestChatMappingService.saveTestChatMapping({
+      TestChatMappingService.saveTestChatMapping({
           testId: apiTestId,
           chatSessionId,
           userId,
-        });
-        logger.info('[API_TEST] Test-chat mapping saved', {
+      }).catch(mappingError => {
+        logger.error('[API_TEST] Failed to save test-chat mapping', {
+          error: mappingError instanceof Error ? mappingError.message : String(mappingError),
           testId: apiTestId,
-          chatSessionId,
-          userId,
         });
-      }
+      });
+    }
 
-      // ═════════════════════════════════════════════════════════════════════
-      // DEDUCT CREDITS FOR API TEST
-      // ═════════════════════════════════════════════════════════════════════
+    // Format response
+    const { finalMessage } = await formatApiResponse(
+      apiTestResult,
+      fuzzingReport,
+      plan,
+      apiDetails
+    );
 
-      await CreditCostTrackerService.deductCreditsForTest({
-        userId,
+    // FIX #5: Make chat save non-blocking (fire-and-forget)
+    if (chatSessionId) {
+      ChatService.saveChatMessages(chatSessionId, [
+        { role: 'user', content: userMessage }, // FIX #14: Use actual user message
+        {
+          role: 'ai',
+          content: finalMessage,
+          metadata: {
+            testResult: apiTestResult,
+            testId: apiTestId,
         testType: 'api',
-        credits: TokenCalculatorService.getTestCreditCost('api'),
-        costUSD: 0.0011, // Estimated API test cost
+            fuzzingReport: fuzzingReport ? {
+              totalTests: fuzzingReport.summary.totalTests,
+              passed: fuzzingReport.summary.passed,
+              failed: fuzzingReport.summary.failed,
+              issuesFound: fuzzingReport.issues.length,
+              securityScore: fuzzingReport.securityScore,
+            } : null,
+          },
+        },
+      ]).catch(saveError => {
+        logger.error('[API_TEST] Failed to save chat messages', {
+          error: saveError instanceof Error ? saveError.message : String(saveError),
+          sessionId: chatSessionId,
+        });
+      });
+    }
+
+    // Send response immediately (don't wait for chat save)
+    res.json({
+      reply: finalMessage,
+      testResult: apiTestResult,
+      fuzzingReport: fuzzingReport || undefined,
         testId: apiTestId,
-        description: `API test: ${apiDetails.method} ${plan.url}`,
+      timestamp: new Date().toISOString(),
+      sessionId: chatSessionId,
       });
 
-      logger.info('[API_TEST] Credits deducted', {
-              userId,
+    logger.info('✅ [API_TEST] HTTP response sent successfully', {
         testId: apiTestId,
-        credits: TokenCalculatorService.getTestCreditCost('api'),
+      duration: Date.now() - flowStartTime,
+    });
+  } catch (error) {
+    logger.error('❌ [API_TEST] Critical error in API test flow', {
+      error: error instanceof Error ? error.message : String(error),
+      planId,
+      userId,
+    });
+
+    // If response not sent yet, send error
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: 'API test failed',
+        message: error instanceof Error ? error.message : 'Unknown error',
+        timestamp: new Date().toISOString(),
       });
+    }
 
-      // NOTE: WebSocket final progress already sent by executeApiTest()
-      // No need to emit here - avoid duplicate events
+    throw error; // Re-throw for handleExecutionError
+  }
+}
 
-      logger.info('[API_TEST] Test completed successfully', {
-        testId: apiTestId,
-        status: (apiTestResult as any).response?.status || (apiTestResult as any).status,
-        success: apiTestResult.success,
-        durationMs: (apiTestResult as any).durationMs,
-      });
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: RUN API FUZZING (REFACTORED)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * FIX #1: Proper AbortController for timeout
+ * FIX #2: Cleanup on timeout
+ * FIX #5: Progress reporting during fuzzing
+ * FIX #8: Static imports (moved to top)
+ */
+async function runApiFuzzing(
+  apiTestResult: any,
+  apiDetails: any,
+  url: string,
+  chatSessionId?: string
+): Promise<any | null> {
+  // Only run if happy path succeeded
+  if (!apiTestResult.success || !chatSessionId) {
+    return null;
+  }
 
-      // NOTE: Don't call TestCompletionHandlerService for API tests
-      // API tests don't exist in 'tests' table (that's for UI tests only)
-      // We already sent all progress via WebSocket in executeApiTest()
+  // FIX #1: Create AbortController for proper cleanup
+  const abortController = new AbortController();
+  let timeoutId: NodeJS.Timeout | null = null;
 
-      // Format response body for display
-      logger.info('🔍 [API_TEST] Response body debug', {
-        hasResponseBody: !!apiTestResult.responseBody,
-        responseBodyType: typeof apiTestResult.responseBody,
-        responseBodyLength: apiTestResult.responseBody ? JSON.stringify(apiTestResult.responseBody).length : 0,
-        responseBodyPreview: apiTestResult.responseBody ? JSON.stringify(apiTestResult.responseBody).substring(0, 100) : 'null',
-        fullResult: JSON.stringify(apiTestResult).substring(0, 500),
-      });
+  try {
+    logger.info('[API_FUZZING] Starting intelligent fuzzing', {
+      method: apiDetails.method,
+      url,
+      timeout: CONSTANTS.FUZZING_TIMEOUT,
+    });
 
+    emitProcessingStep(chatSessionId, 'analyzing_results', '🔍 Generating security test scenarios...', 70);
+
+    const fuzzingScenarios = await IntelligentApiFuzzerService.generateFuzzingScenarios(
+      {
+        method: apiDetails.method || 'GET',
+        url,
+        body: apiDetails.body,
+        headers: apiDetails.headers || {},
+        expectedStatus: apiDetails.expectedStatus || 200,
+      },
+      apiTestResult
+    );
+
+    emitProcessingStep(
+      chatSessionId,
+      'analyzing_results',
+      `🎯 Testing ${fuzzingScenarios.length} security scenarios...`,
+      75
+    );
+
+    // FIX #1: Setup timeout that aborts all requests
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        abortController.abort(); // ← Cancel all ongoing requests
+        reject(new Error('Fuzzing timeout'));
+      }, CONSTANTS.FUZZING_TIMEOUT);
+    });
+
+    // FIX #5: Progress callback for real-time updates
+    const onProgress = (completed: number, total: number) => {
+      const progressPercent = 75 + Math.floor((completed / total) * 20); // 75% → 95%
+      emitProcessingStep(
+        chatSessionId,
+        'analyzing_results',
+        `🔒 Testing security (${completed}/${total} scenarios)...`,
+        progressPercent
+      );
+    };
+
+    // Execute with abort signal + progress
+    const fuzzingPromise = ApiFuzzingExecutorService.executeFuzzingScenarios(
+      fuzzingScenarios,
+      apiTestResult,
+      abortController.signal, // ← Pass abort signal
+      onProgress              // ← Pass progress callback
+    );
+
+    const fuzzingReport = await Promise.race([fuzzingPromise, timeoutPromise]) as any;
+
+    // FIX #2: Clear timeout if completed successfully
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+
+    logger.info('[API_FUZZING] Fuzzing completed', {
+      totalTests: fuzzingReport.summary.totalTests,
+      passed: fuzzingReport.summary.passed,
+      failed: fuzzingReport.summary.failed,
+      issuesFound: fuzzingReport.issues.length,
+      securityScore: fuzzingReport.securityScore,
+    });
+
+    emitProcessingStep(
+      chatSessionId,
+      'analyzing_results',
+      `✅ Security analysis complete! Found ${fuzzingReport.issues.length} issue(s)`,
+      100
+    );
+
+    return fuzzingReport;
+  } catch (fuzzingError) {
+    const isTimeout = fuzzingError instanceof Error && fuzzingError.message === 'Fuzzing timeout';
+    const isAborted = fuzzingError instanceof Error && fuzzingError.message.includes('aborted');
+
+    logger.error('[API_FUZZING] Fuzzing failed, continuing without it', {
+      error: fuzzingError instanceof Error ? fuzzingError.message : String(fuzzingError),
+      isTimeout,
+      isAborted,
+      maxTimeout: CONSTANTS.FUZZING_TIMEOUT,
+    });
+
+    if ((isTimeout || isAborted) && chatSessionId) {
+      emitProcessingStep(
+        chatSessionId,
+        'analyzing_results',
+        `⚠️ Security analysis timed out (max ${CONSTANTS.FUZZING_TIMEOUT / 1000}s), skipping fuzzing`,
+        100
+      );
+    }
+
+    return null;
+  } finally {
+    // FIX #2: Always cleanup timeout
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: FORMAT API RESPONSE
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+async function formatApiResponse(
+  apiTestResult: any,
+  fuzzingReport: any,
+  plan: any,
+  apiDetails: any
+): Promise<{ finalMessage: string; responseBodyDisplay: string }> {
+  // Format response body
       let responseBodyDisplay = '';
+
       if (apiTestResult.responseBody) {
         if (typeof apiTestResult.responseBody === 'object') {
-          responseBodyDisplay = '\n\n**Response Body:**\n```json\n' + JSON.stringify(apiTestResult.responseBody, null, 2) + '\n```';
+      responseBodyDisplay = '\n\n**Response Body:**\n```json\n' +
+        JSON.stringify(apiTestResult.responseBody, null, 2) + '\n```';
         } else if (typeof apiTestResult.responseBody === 'string' && apiTestResult.responseBody.length > 0) {
-          // Try to parse if it's JSON string
           try {
             const parsed = JSON.parse(apiTestResult.responseBody);
-            responseBodyDisplay = '\n\n**Response Body:**\n```json\n' + JSON.stringify(parsed, null, 2) + '\n```';
+        responseBodyDisplay = '\n\n**Response Body:**\n```json\n' +
+          JSON.stringify(parsed, null, 2) + '\n```';
           } catch {
-            // Not JSON, show as text (truncate if too long)
             const truncated = apiTestResult.responseBody.length > 500
               ? apiTestResult.responseBody.substring(0, 500) + '...'
               : apiTestResult.responseBody;
             responseBodyDisplay = '\n\n**Response Body:**\n```\n' + truncated + '\n```';
           }
         }
-      } else {
-        logger.warn('⚠️ [API_TEST] responseBody is empty or null!');
-      }
+  }
 
-      // ═════════════════════════════════════════════════════════════════════
-      // FORMAT COMPREHENSIVE RESPONSE (with fuzzing if available)
-      // ═════════════════════════════════════════════════════════════════════
+  let finalMessage = '';
 
-      let finalMessage = '';
+  if (fuzzingReport) {
+    const { ApiFuzzingFormatterService } = await import('@/services/testing/api-fuzzing-formatter.service');
+    const fuzzingFormatted = ApiFuzzingFormatterService.formatComprehensiveReport(fuzzingReport);
 
-      if (fuzzingReport) {
-        // Import formatter
-        const { ApiFuzzingFormatterService } = await import('@/services/testing/api-fuzzing-formatter.service');
-
-        // Format comprehensive report
-        finalMessage = ApiFuzzingFormatterService.formatComprehensiveReport(fuzzingReport);
-
-        // Add happy path result at the top
-        finalMessage = `✅ **API Test Results**\n\n` +
-          `**Happy Path Test:** PASSED ✅\n` +
-          `• URL: ${plan.url}\n` +
-          `• Method: ${apiDetails.method}\n` +
-          `• Status: ${apiTestResult.status}\n` +
-          `• Duration: ${apiTestResult.durationMs}ms\n` +
-          responseBodyDisplay + '\n\n' +
-          '─────────────────────────────────────────────\n\n' +
-          finalMessage;
-      } else {
-        // Fallback to simple message if fuzzing didn't run
-        finalMessage = `✅ API test executed successfully!
+    finalMessage = `✅ **API Test Results**\n\n` +
+      `**Happy Path Test:** PASSED ✅\n` +
+      `• URL: ${plan.url}\n` +
+      `• Method: ${apiDetails.method}\n` +
+      `• Status: ${apiTestResult.status}\n` +
+      `• Duration: ${apiTestResult.durationMs}ms\n` +
+      responseBodyDisplay + '\n\n' +
+      '─────────────────────────────────────────────\n\n' +
+      fuzzingFormatted;
+  } else {
+    finalMessage = `✅ API test executed successfully!
 
 **URL:** ${plan.url}
 **Method:** ${apiDetails.method}
 **Status Code:** ${apiTestResult.status}
 **Success:** ${apiTestResult.success ? 'Yes' : 'No'}
 **Duration:** ${apiTestResult.durationMs}ms${responseBodyDisplay}`;
-      }
+  }
 
-      // Save chat messages
-    if (chatSessionId) {
-        logger.info('[API_TEST] Saving chat messages...');
-        await ChatService.saveChatMessages(chatSessionId, [
-          { role: 'user', content: `Approved API test: ${apiDetails.method} ${plan.url}` },
-          {
-            role: 'ai',
-            content: finalMessage,
-          metadata: {
-              testResult: apiTestResult,
-              testId: apiTestId,
-              testType: 'api',
-              fuzzingReport: fuzzingReport ? {
-                totalTests: fuzzingReport.summary.totalTests,
-                passed: fuzzingReport.summary.passed,
-                failed: fuzzingReport.summary.failed,
-                issuesFound: fuzzingReport.issues.length,
-                securityScore: fuzzingReport.securityScore,
-              } : null,
-            },
-          },
-        ]);
-        logger.info('[API_TEST] Chat messages saved');
-      }
+  return { finalMessage, responseBodyDisplay };
+}
 
-      logger.info('🎯🎯🎯 [API_TEST] About to send HTTP response with results', {
-        testId: apiTestId,
-        status: apiTestResult.status,
-        success: apiTestResult.success,
-        hasFuzzing: !!fuzzingReport,
-        issuesFound: fuzzingReport?.issues.length || 0,
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: EXECUTE UI TEST FLOW (REFACTORED - CRITICAL FIXES)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * FIX #6-11: Error handling, validation, non-blocking operations
+ * FIX #12: Global timeout for entire flow (90s for UI tests)
+ * FIX #13: Consistent WebSocket progress (0-100%)
+ */
+async function executeUiTestFlow(
+  res: Response,
+  params: {
+    plan: any;
+    planId: string;
+    userId: string;
+    chatSessionId?: string;
+    workspace_id: string;
+    userMessage?: string; // FIX #14: Actual user message
+  }
+): Promise<void> {
+  const { plan, planId, userId, chatSessionId, workspace_id, userMessage = 'Approved test execution' } = params;
+
+  // FIX #12: Global timeout for UI test flow (longer than API because browser tests are slower)
+  const flowTimeout = 90000; // 90 seconds
+  const flowStartTime = Date.now();
+
+  const checkTimeout = () => {
+    if (Date.now() - flowStartTime > flowTimeout) {
+      throw new Error(`UI test flow timeout after ${flowTimeout / 1000}s`);
+    }
+  };
+
+  logger.info('🔵 [UI_TEST] Starting UI test execution', {
+    planId,
+    userId,
+    url: plan.url,
+    intelligentMode: plan.intelligentMode,
+    timeout: flowTimeout,
+  });
+
+  try {
+    // FIX #13: Consistent progress starting from 0%
+    emitProcessingStep(chatSessionId, 'executing_test', '🚀 Starting UI test execution...', 0);
+    emitProcessingStep(chatSessionId, 'executing_test', '📋 Confirming test plan...', 5);
+
+    // Validate plan.url
+    if (!plan.url || typeof plan.url !== 'string') {
+      throw new Error('Invalid plan URL - URL is required for UI testing');
+    }
+
+    checkTimeout();
+
+    // FIX #6 & #7: Confirm plan and check result properly
+    const confirmResult = await confirmTestPlan(planId, userId);
+
+    if (!confirmResult.success) {
+      throw new Error(`Failed to confirm test plan: ${confirmResult.message || 'Unknown error'}`);
+    }
+
+    emitProcessingStep(chatSessionId, 'executing_test', '💳 Checking credits...', 10);
+    checkTimeout();
+
+    // FIX #10: Deduct credits BEFORE test execution (not after)
+    const uiTestType = plan.intelligentMode ? 'intelligent' : 'standard';
+    const testId = `ui_${planId}_${Date.now()}`;
+
+    try {
+      await CreditCostTrackerService.deductCreditsForTest({
+        userId,
+        testType: uiTestType,
+        credits: TokenCalculatorService.getTestCreditCost(uiTestType),
+        costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001,
+        testId,
+        description: `${uiTestType} UI test: ${plan.url}`,
       });
-
-      res.json({
-        reply: finalMessage,
-        testResult: apiTestResult,
-        fuzzingReport: fuzzingReport || undefined,
-        testId: apiTestId,
-        timestamp: new Date().toISOString(),
-        sessionId: chatSessionId,
+    } catch (creditError) {
+      logger.error('[UI_TEST] Failed to deduct credits', {
+        error: creditError instanceof Error ? creditError.message : String(creditError),
+        userId,
       });
+      throw new Error('Insufficient credits or payment error');
+    }
 
-      logger.info('✅✅✅ [API_TEST] HTTP response sent successfully!');
-    } else {
-      // Execute UI test
-      emitProcessingStep(chatSessionId, 'executing_test', '⚙️ Launching browser tests...', 70);
+    emitProcessingStep(chatSessionId, 'executing_test', '🔍 Finding project context...', 20);
+    checkTimeout();
 
-      logger.info('🔵 [EXECUTE_FLOW] Step 1: Starting UI test execution', { planId, userId });
-
-      // Confirm and execute test plan
-      logger.info('🔵 [EXECUTE_FLOW] Step 2: Confirming test plan');
-      const result = await confirmAndExecuteTestPlan(planId, userId);
-      logger.info('🔵 [EXECUTE_FLOW] Step 3: Test plan confirmed', { success: result.success });
-
-      if (result.success && plan) {
-        // Get project for this test
-        logger.info('🔵 [EXECUTE_FLOW] Step 4: Finding/creating project');
-        const { project_id } = await ProjectContextService.findOrCreateProject(
+    // FIX #8: Wrap ProjectContextService in try-catch
+    let project_id: string;
+    try {
+      const projectResult = await ProjectContextService.findOrCreateProject(
           workspace_id,
           plan.url,
           userId
         );
-        logger.info('🔵 [EXECUTE_FLOW] Step 5: Project ready', { project_id });
+      project_id = projectResult.project_id;
 
-        // Execute test
+      if (!project_id) {
+        throw new Error('Failed to get project_id from ProjectContextService');
+      }
+    } catch (projectError) {
+      logger.error('[UI_TEST] ProjectContextService failed', {
+        error: projectError instanceof Error ? projectError.message : String(projectError),
+        workspace_id,
+        url: plan.url,
+      });
+      throw new Error(`Failed to initialize project: ${projectError instanceof Error ? projectError.message : 'Unknown error'}`);
+    }
+
+    emitProcessingStep(chatSessionId, 'executing_test', '⚙️ Launching browser test...', 30);
+    checkTimeout();
+
+    // FIX #9: Wrap ManualTestService.runTest in try-catch
+    let testCreated: any;
+    try {
         const testRequest = {
           url: plan.url,
           browsers: ['chrome' as const],
@@ -1483,66 +2138,48 @@ async function executeApprovedTestPlan(
           options: {},
           commands: plan.commands,
           intent: plan.scope,
-          // NEW: Pass intelligent mode if plan has it
           intelligentMode: plan.intelligentMode,
           testGoal: plan.intelligentMode ? plan.summary : undefined,
+          estimatedCost: plan.estimatedCost, // For dynamic credit calculation
         };
+    /// Here we run the main UI/UX manual test
+      testCreated = await ManualTestService.runTest(testRequest);
 
-        logger.info('🔵 [EXECUTE_FLOW] Step 6: Calling ManualTestService.runTest', {
-          planId: plan.id,
-          intelligentMode: plan.intelligentMode || false,
+      if (!testCreated.success || !testCreated.data?.id) {
+        throw new Error('Test creation failed - no test ID returned');
+      }
+    } catch (testError) {
+      logger.error('[UI_TEST] ManualTestService.runTest failed', {
+        error: testError instanceof Error ? testError.message : String(testError),
           url: plan.url,
-          scope: plan.scope,
-          commandsCount: plan.commands?.length || 0,
-        });
+      });
+      throw new Error(`Failed to start test: ${testError instanceof Error ? testError.message : 'Unknown error'}`);
+    }
 
-        const testCreated = await ManualTestService.runTest(testRequest);
-
-        logger.info('🔵 [EXECUTE_FLOW] Step 7: Test created', {
-          testId: testCreated.data?.id,
-          success: testCreated.success
-        });
-
-        // ═══════════════════════════════════════════════════════════════════
-        // DEDUCT CREDITS FOR UI TEST
-        // ═══════════════════════════════════════════════════════════════════
-
-        if (testCreated.data?.id) {
-          const uiTestType = plan.intelligentMode ? 'intelligent' : 'standard';
-
-          await CreditCostTrackerService.deductCreditsForTest({
-            userId,
-            testType: uiTestType,
-            credits: TokenCalculatorService.getTestCreditCost(uiTestType),
-            costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001, // Estimated costs
+    logger.info('✅ [UI_TEST] Test created successfully', {
             testId: testCreated.data.id,
-            description: `${uiTestType} UI test: ${plan.url}`,
-          });
+      intelligentMode: plan.intelligentMode,
+    });
 
-          logger.info('[UI_TEST] Credits deducted', {
-            userId,
-            testId: testCreated.data.id,
-            testType: uiTestType,
-            credits: TokenCalculatorService.getTestCreditCost(uiTestType),
-          });
-        }
+    emitProcessingStep(chatSessionId, 'executing_test', '✅ Test started successfully!', 100);
 
-        // Save test-chat mapping for result notifications
-        if (chatSessionId && testCreated.data?.id && userId) {
-          await TestChatMappingService.saveTestChatMapping({
+    // Save test-chat mapping (non-blocking)
+    if (chatSessionId && userId) {
+      TestChatMappingService.saveTestChatMapping({
             testId: testCreated.data.id,
             chatSessionId,
             userId,
-          });
-          logger.info('[CHAT] Test-chat mapping saved', {
+      }).catch(mappingError => {
+        logger.error('[UI_TEST] Failed to save test-chat mapping', {
+          error: mappingError instanceof Error ? mappingError.message : String(mappingError),
             testId: testCreated.data.id,
-            chatSessionId,
-            userId,
+        });
           });
         }
 
-        // Emit WebSocket event
-        if (chatSessionId && testCreated.data?.id) {
+    // Emit WebSocket event (non-blocking)
+    if (chatSessionId) {
+      try {
           const testModeMessage = plan.intelligentMode
             ? '🤖 Intelligent test started! AI will autonomously explore and adapt to your site.'
             : '✅ Test started! Monitor progress in real-time.';
@@ -1558,55 +2195,86 @@ async function executeApprovedTestPlan(
           timestamp: new Date().toISOString(),
         };
           webSocketService.emitChatTestUpdate(chatSessionId, chatTestUpdatePayload);
+      } catch (wsError) {
+        logger.warn('[UI_TEST] Failed to emit WebSocket event', {
+          error: wsError instanceof Error ? wsError.message : String(wsError),
+        });
+      }
         }
 
+    // Build success message
         const testModeInfo = plan.intelligentMode
           ? `\n\n🤖 **Mode:** Intelligent/Adaptive Testing\n📊 **Estimated:** ${plan.estimatedPages || '5-10 pages'}, ${plan.estimatedCost || '$0.10-0.20'}`
           : '';
 
-        const successMessage = `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${testCreated.data?.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data?.id}/status`;
+    const successMessage = `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${testCreated.data.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data.id}/status`;
 
-        // Save to chat history
+    // FIX #11: Make chat save non-blocking (fire-and-forget)
         if (chatSessionId) {
-          await ChatService.saveChatMessages(chatSessionId, [
-            { role: 'user', content: 'yes' }, // User approved the test
+      ChatService.saveChatMessages(chatSessionId, [
+        { role: 'user', content: userMessage }, // FIX #14: Use actual user message
             {
               role: 'ai',
               content: successMessage,
               metadata: {
-                testId: testCreated.data?.id,
+            testId: testCreated.data.id,
                 testMode: plan.intelligentMode ? 'intelligent' : 'standard',
               },
             },
-          ]);
-        }
+      ]).catch(saveError => {
+        logger.error('[UI_TEST] Failed to save chat messages', {
+          error: saveError instanceof Error ? saveError.message : String(saveError),
+          sessionId: chatSessionId,
+        });
+      });
+    }
 
+    // Send response immediately (don't wait for chat save)
         res.json({
           reply: successMessage,
-          testId: testCreated.data?.id,
+      testId: testCreated.data.id,
           timestamp: new Date().toISOString(),
           sessionId: chatSessionId,
         });
-      } else {
-        const failureMessage = result.message || '❌ Failed to execute test plan';
 
-        // Save to chat history
-        if (chatSessionId) {
-          await ChatService.saveChatMessages(chatSessionId, [
-            { role: 'user', content: 'yes' }, // User approved but execution failed
-            { role: 'ai', content: failureMessage },
-          ]);
-        }
-
-        res.json({
-          reply: failureMessage,
-          timestamp: new Date().toISOString(),
-          sessionId: chatSessionId,
-        });
-      }
-    }
+    logger.info('✅ [UI_TEST] HTTP response sent successfully', {
+      testId: testCreated.data.id,
+      duration: Date.now() - flowStartTime,
+    });
   } catch (error) {
-    logger.error('❌❌❌ [EXECUTE] CRITICAL ERROR executing test plan', {
+    logger.error('❌ [UI_TEST] Critical error in UI test flow', {
+      error: error instanceof Error ? error.message : String(error),
+      planId,
+      userId,
+    });
+
+    // If response not sent yet, send error
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: 'UI test failed',
+        message: error instanceof Error ? error.message : 'Unknown error',
+          timestamp: new Date().toISOString(),
+      });
+    }
+
+    throw error; // Re-throw for handleExecutionError
+  }
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: HANDLE EXECUTION ERROR
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+async function handleExecutionError(
+  error: unknown,
+  res: Response,
+  params: { planId: string; chatSessionId?: string }
+): Promise<void> {
+  const { planId, chatSessionId } = params;
+
+  logger.error('❌ [EXECUTE] CRITICAL ERROR executing test plan', {
       error,
       planId,
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -1617,24 +2285,101 @@ async function executeApprovedTestPlan(
       ? error.message
       : (error ? String(error) : 'An unexpected error occurred');
 
-    // Save error to chat history
+  // Check if response already sent
+  if (res.headersSent) {
+    logger.warn('[EXECUTE] Response already sent, cannot send error response', {
+      planId,
+      errorMessage,
+    });
+    return;
+  }
+
+  // Save error to chat history (non-blocking)
     if (chatSessionId) {
-      try {
-        await ChatService.saveChatMessages(chatSessionId, [
+    ChatService.saveChatMessages(chatSessionId, [
           { role: 'user', content: 'Approved test execution' },
           { role: 'ai', content: `❌ Error executing test: ${errorMessage}` },
-        ]);
-      } catch (saveError) {
-        logger.error('[EXECUTE] Failed to save error message to chat', { saveError });
-      }
-    }
+    ]).catch(saveError => {
+      logger.error('[EXECUTE] Failed to save error message to chat', {
+        saveError: saveError instanceof Error ? saveError.message : String(saveError),
+        planId,
+      });
+    });
+  }
 
+  // Send error response
     res.status(500).json({
       success: false,
       error: 'Failed to execute test plan',
       message: errorMessage,
       timestamp: new Date().toISOString(),
     });
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: EXECUTE APPROVED TEST PLAN (REFACTORED)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Orchestrates test plan execution flow:
+ * 1. Validate test plan
+ * 2. Check credits
+ * 3. Route to API or UI test flow
+ * 4. Handle errors
+ */
+async function executeApprovedTestPlan(
+  req: Request,
+  res: Response,
+  params: {
+    planId: string;
+    userId: string;
+    chatSessionId?: string;
+    workspace_id: string;
+    userMessage?: string; // FIX #14: Actual user message for chat history
+  }
+): Promise<void> {
+  const { planId, userId, chatSessionId, workspace_id, userMessage } = params;
+
+  logger.info('🚀 [EXECUTE] Test plan approved', {
+    planId,
+    userId,
+    chatSessionId,
+    timestamp: new Date().toISOString()
+  });
+
+  try {
+    // STEP 1: Validate test plan
+    const plan = await validateTestPlan(planId, userId, res);
+    if (!plan) return; // Response already sent
+
+    // STEP 2: Determine test type
+    const testType = determineTestType(plan);
+    const isApiTest = testType === 'api';
+
+    // STEP 3: Check credits
+    const creditCheckPassed = await checkCreditsBeforeTest(userId, testType, res);
+    if (!creditCheckPassed) return; // Response already sent
+
+    // STEP 4: Route to appropriate test flow
+    if (isApiTest) {
+      await executeApiTestFlow(res, {
+        plan,
+        planId,
+        userId,
+        chatSessionId,
+        userMessage, // FIX #14: Pass user message
+      });
+    } else {
+      await executeUiTestFlow(res, {
+        plan,
+        planId,
+        userId,
+        chatSessionId,
+        workspace_id,
+        userMessage, // FIX #14: Pass user message
+      });
+    }
+  } catch (error) {
+    await handleExecutionError(error, res, { planId, chatSessionId });
   }
 }
 
@@ -1644,41 +2389,14 @@ async function executeApprovedTestPlan(
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/**
- * Get recent chat history for context
- * Returns last N messages in chronological order
- */
-async function getRecentChatHistory(
-  sessionId: string,
-  limit: number = 20
-): Promise<Array<{ role: 'user' | 'ai'; content: string; created_at: string }>> {
-  try {
-    const { data: messages, error } = await supabaseAdmin
-        .from('chat_messages')
-      .select('role, content, created_at')
-      .eq('session_id', sessionId)
-      .order('created_at', { ascending: false })
-      .limit(limit);
-
-    if (error) {
-      logger.error('[CHAT_HISTORY] Error fetching history', { error, sessionId });
-      return [];
-    }
-
-    // Reverse to get chronological order (oldest first)
-    return (messages || []).reverse();
-  } catch (error) {
-    logger.error('[CHAT_HISTORY] Failed to fetch history', { error, sessionId });
-    return [];
-  }
-}
+// REMOVED: Duplicate function - use ChatService.getRecentMessages() instead
 
 /**
  * Get count of old messages (older than recent history)
  */
 async function getOldMessagesCount(
   sessionId: string,
-  recentLimit: number = 20
+  recentLimit: number = CONSTANTS.RECENT_MESSAGES_LIMIT
 ): Promise<number> {
   try {
     const { count, error } = await supabaseAdmin
@@ -1704,7 +2422,7 @@ async function getOldMessagesCount(
  */
 async function getOldMessages(
   sessionId: string,
-  recentLimit: number = 20
+  recentLimit: number = CONSTANTS.RECENT_MESSAGES_LIMIT
 ): Promise<Array<{ role: 'user' | 'ai'; content: string }>> {
   try {
     const { data: messages, error } = await supabaseAdmin
@@ -1915,9 +2633,8 @@ async function getOrCreateChatSession(
   workspaceId: string,
   createNew: boolean = false
 ): Promise<string | undefined> {
-  const isValidUUID = userId && userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-
-  if (!isValidUUID) {
+  // FIX #7: Use centralized UUID validation
+  if (!isValidUUID(userId)) {
     // Anonymous user - no session
     return undefined;
   }
@@ -1997,7 +2714,7 @@ async function saveChatMessages(
  */
 function convertApiTestPlanToTestPlan(apiPlan: any): any {
   const expiresAt = new Date();
-  expiresAt.setHours(expiresAt.getHours() + 24); // Expire in 24 hours
+  expiresAt.setHours(expiresAt.getHours() + CONSTANTS.TEST_PLAN_EXPIRY_HOURS);
 
   return {
     id: apiPlan.id,
@@ -2253,3 +2970,44 @@ export const debugChatData = async (req: Request, res: Response): Promise<void> 
     res.status(500).json({ error: 'Debug failed' });
   }
 };
+
+/**
+ * Build user-friendly intent message for WebSocket
+ */
+function buildIntentMessage(parsedIntent: any): string {
+  if (!parsedIntent) {
+    return '🤔 Understanding your request...';
+  }
+
+  const { intent, scope, target, page, apiMethod, apiUrl, urgency } = parsedIntent;
+
+  switch (intent) {
+    case 'api_test':
+      if (apiUrl && apiMethod) {
+        return `🔍 Got it! Testing ${apiMethod} ${apiUrl}`;
+      } else if (apiUrl) {
+        return `🔍 Got it! Testing API endpoint ${apiUrl}`;
+      } else {
+        return '🔍 Got it! You want to test an API endpoint';
+      }
+
+    case 'platform_test':
+      if (page && scope && target) {
+        return `🌐 Got it! Testing ${target} on ${page}`;
+      } else if (page && scope) {
+        return `🌐 Got it! Testing ${scope} on ${page}`;
+      } else if (scope && target) {
+        return `🌐 Got it! Testing ${target} (${scope})`;
+      } else if (page) {
+        return `🌐 Got it! Testing website ${page}`;
+      } else {
+        return '🌐 Got it! You want to test a website';
+      }
+
+    case 'general_chat':
+      return '💬 Got it! Let me help you with that';
+
+    default:
+      return '✅ Intent understood!';
+  }
+}

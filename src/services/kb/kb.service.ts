@@ -1,4 +1,5 @@
 import { supabase } from '@/db/supabase';
+import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { chunkMarkdown, chunkText } from '@/utils/chunking';
 import { getFileSizeMB, isValidFileType, parseFile } from '@/utils/fileParser';
 import { logger } from '@/utils/logger';
@@ -187,12 +188,86 @@ export async function uploadProjectKB(
 }
 
 /**
- * Detect language from user message
+ * Detect language from user message using AI
+ * Falls back to simple heuristic if AI fails
  */
-export function detectLanguage(message: string): 'en' | 'ru' | 'neutral' {
+export async function detectLanguage(message: string): Promise<'en' | 'ru' | 'neutral'> {
+  // Quick fallback for very short messages
+  if (!message || message.trim().length < 3) {
+    return 'neutral';
+  }
+
+  try {
+    // Use AI for accurate language detection
+    const result = await detectLanguageWithAI(message);
+    return result;
+  } catch (error) {
+    logger.warn('[KB_SERVICE] AI language detection failed, using fallback', {
+      error: error instanceof Error ? error.message : String(error),
+      message: message.substring(0, 50)
+    });
+
+    // Fallback to simple heuristic
+    return detectLanguageFallback(message);
+  }
+}
+
+/**
+ * AI-powered language detection using GPT-3.5-turbo
+ */
+async function detectLanguageWithAI(message: string): Promise<'en' | 'ru' | 'neutral'> {
+  const prompt = `Detect the language of this message. Return ONLY the language code.
+
+MESSAGE: "${message}"
+
+RULES:
+- If Russian text (Cyrillic) → return "ru"
+- If English text (Latin) → return "en"
+- If mixed languages → return primary language
+- If unclear/symbols/numbers only → return "neutral"
+
+RETURN ONLY: ru, en, or neutral`;
+
+  const response = await getChatCompletionWithMessages([
+    {
+      role: 'system',
+      content: 'You are a language detection expert. Return only the language code: ru, en, or neutral.',
+    },
+    {
+      role: 'user',
+      content: prompt,
+    },
+  ], {
+    model: 'gpt-3.5-turbo',
+    temperature: 0.1, // Very low for consistent results
+    max_tokens: 10, // Just need 1-2 tokens
+  });
+
+  const detected = response.content.trim().toLowerCase();
+
+  // Validate response
+  if (detected === 'ru' || detected === 'en' || detected === 'neutral') {
+    return detected;
+  }
+
+  // If AI returned something unexpected, use fallback
+  logger.warn('[KB_SERVICE] AI returned unexpected language', { detected, message: message.substring(0, 50) });
+  return detectLanguageFallback(message);
+}
+
+/**
+ * Simple fallback language detection
+ */
+function detectLanguageFallback(message: string): 'en' | 'ru' | 'neutral' {
   // Simple heuristic: if message contains Cyrillic characters → ru
   const hasCyrillic = /[а-яА-ЯёЁ]/.test(message);
-  return hasCyrillic ? 'ru' : 'en';
+  const hasLatin = /[a-zA-Z]/.test(message);
+
+  if (hasCyrillic && !hasLatin) return 'ru';
+  if (hasLatin && !hasCyrillic) return 'en';
+  if (hasCyrillic && hasLatin) return 'ru'; // Mixed → prefer Russian
+
+  return 'neutral'; // Numbers, symbols, etc.
 }
 
 /**

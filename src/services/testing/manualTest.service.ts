@@ -24,16 +24,12 @@ export class ManualTestService {
       this.validateTestRequest(testRequest);
       logger.info('🟢 [MANUAL_TEST_FLOW] Step 2: Validation passed');
 
-      // Check user credits if userId provided AND is valid UUID
-      if (testRequest.userId) {
-        const isValidUserUUID = testRequest.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-        if (isValidUserUUID) {
-          await this.checkUserCredits(testRequest.userId, testRequest.browsers);
-          logger.info('🟢 [MANUAL_TEST_FLOW] Step 3: Credit check passed');
-        } else {
-          logger.info('🟢 [MANUAL_TEST_FLOW] Step 3: Skipping credit check (anonymous)');
-        }
+      // Check user credits (userId is required)
+      if (!testRequest.userId) {
+        throw new ValidationError('User ID is required - anonymous users are not supported');
       }
+      await this.checkUserCredits(testRequest.userId, testRequest.browsers, testRequest.intelligentMode, testRequest.estimatedCost);
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 3: Credit check passed');
 
       // Create test record
       logger.info('🟢 [MANUAL_TEST_FLOW] Step 4: Creating test record in DB');
@@ -73,14 +69,9 @@ export class ManualTestService {
         }
       }
 
-      // Deduct credits if userId provided AND is valid UUID
+      // Deduct credits
       logger.info('🟢 [MANUAL_TEST_FLOW] Step 9: Deducting credits');
-      if (testRequest.userId) {
-        const isValidUserUUID = testRequest.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-        if (isValidUserUUID) {
-          await this.deductCredits(testRequest.userId, testRequest.browsers);
-        }
-      }
+      await this.deductCredits(testRequest.userId, testRequest.browsers, testRequest.intelligentMode, testRequest.estimatedCost);
 
       logTestEvent('created', test.id, { url: testRequest.url, browsers: testRequest.browsers });
 
@@ -116,7 +107,7 @@ export class ManualTestService {
   /**
    * Get test by ID with results
    */
-  static   async getTest(testId: string, userId?: string): Promise<ApiResponse<Test>> {
+  static  async getTest(testId: string, userId?: string): Promise<ApiResponse<Test>> {
     try {
       const test = await dbService.getTest(testId) as any;
 
@@ -233,7 +224,7 @@ export class ManualTestService {
   /**
    * Cancel a running test
    */
-  static   async cancelTest(testId: string, userId?: string): Promise<ApiResponse<Test>> {
+  static async cancelTest(testId: string, userId?: string): Promise<ApiResponse<Test>> {
     try {
       const test = await dbService.getTest(testId) as any;
       if (!test) {
@@ -274,15 +265,21 @@ export class ManualTestService {
 
   /**
    * Retry a failed test
+   * - For intelligent mode: Retry with same plan (Variant A) on first attempt
+   * - If retryCount >= 2: Switch to Variant B (regenerate plan) - handled by user
    */
-  static   async retryTest(testId: string, userId?: string): Promise<ApiResponse<Test>> {
+  static async retryTest(testId: string, userId?: string): Promise<ApiResponse<Test>> {
     try {
       const test = await dbService.getTest(testId) as any;
       if (!test) {
         throw new NotFoundError('Test', testId);
       }
 
-      if (userId && test.user_id && test.user_id !== userId) {
+      if (!userId) {
+        throw new ValidationError('User ID is required');
+      }
+
+      if (test.user_id !== userId) {
         throw new ValidationError('Access denied to this test');
       }
 
@@ -290,10 +287,19 @@ export class ManualTestService {
         throw new ValidationError('Can only retry failed tests');
       }
 
-      // Check user credits if userId provided
-      if (userId) {
-        await this.checkUserCredits(userId, test.browsers);
-      }
+      logger.info('[RETRY_TEST] Retrying test', {
+        testId,
+        intelligentMode: test.intelligent_mode,
+        userId: userId.substring(0, 8) + '...',
+      });
+
+      // Check user credits (with intelligent mode consideration)
+      await this.checkUserCredits(
+        userId,
+        test.browsers,
+        test.intelligent_mode,
+        test.options?.estimatedCost // May be stored in options from original test
+      );
 
       // Reset test status
       const updatedTest = await dbService.updateTest(testId, {
@@ -303,6 +309,7 @@ export class ManualTestService {
       }) as any;
 
       // Add jobs to queue for each browser
+      // IMPORTANT: Restore full AI context (commands, testGoal, etc.)
       for (const browser of test.browsers) {
         await QueueManager.addTestRunJob({
           testId: test.id,
@@ -311,20 +318,35 @@ export class ManualTestService {
           options: test.options,
           projectId: test.project_id,
           userId: test.user_id,
+          // Restore AI context from DB
+          commands: test.commands || [], // Playwright commands
+          intent: test.test_goal || undefined, // Use test_goal as intent
+          intelligentMode: test.intelligent_mode || false,
+          testGoal: test.test_goal || undefined,
+          retryCount: 1, // Variant A: Retry with same plan (first retry)
         });
       }
 
-      // Deduct credits if userId provided
-      if (userId) {
-        await this.deductCredits(userId, test.browsers);
-      }
+      // Deduct credits
+      await this.deductCredits(
+        userId,
+        test.browsers,
+        test.intelligent_mode,
+        test.options?.estimatedCost
+      );
 
-      logTestEvent('retried', testId, { userId, browsers: test.browsers });
+      logTestEvent('retried', testId, {
+        userId,
+        browsers: test.browsers,
+        intelligentMode: test.intelligent_mode,
+      });
 
       return {
         success: true,
         data: updatedTest,
-        message: 'Test retry initiated successfully',
+        message: test.intelligent_mode
+          ? 'Intelligent test retry initiated (using same plan)'
+          : 'Test retry initiated successfully',
         timestamp: new Date(),
       };
 
@@ -407,7 +429,10 @@ export class ManualTestService {
   private static async createTest(testRequest: TestRunRequest): Promise<Test> {
     const userId = testRequest.userId!;
 
-    logger.info('[MANUAL_TEST] Creating test for user', { userId });
+    logger.info('[MANUAL_TEST] Creating test for user', {
+      userId,
+      intelligentMode: testRequest.intelligentMode || false,
+    });
 
     // Validate projectId is a valid UUID, otherwise get/create user project
     const isValidProjectUUID = testRequest.projectId && testRequest.projectId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
@@ -429,18 +454,25 @@ export class ManualTestService {
       status: 'pending' as const,
       browsers: testRequest.browsers,
       options: testRequest.options || {},
+      // Intelligent testing fields
+      intelligent_mode: testRequest.intelligentMode || false,
+      test_goal: testRequest.testGoal || null,
+      commands: testRequest.commands || [],
     };
 
     logger.info('[CREATE_TEST] Attempting to create test in DB', {
       testId: testData.id,
       projectId: validProjectId,
       userId,
+      intelligentMode: testData.intelligent_mode,
+      hasCommands: (testData.commands as any[]).length > 0,
     });
 
     const createdTest = await dbAdminService.createTest(testData);
 
     logger.info('[CREATE_TEST] Test created successfully in DB', {
       testId: (createdTest as any).id,
+      intelligentMode: testData.intelligent_mode,
     });
 
     return createdTest;
@@ -515,14 +547,27 @@ export class ManualTestService {
   /**
    * Check user credits
    */
-  private static async checkUserCredits(userId: string, browsers: BrowserType[]): Promise<void> {
+  private static async checkUserCredits(
+    userId: string,
+    browsers: BrowserType[],
+    intelligentMode?: boolean,
+    estimatedCost?: string
+  ): Promise<void> {
     const user = await dbService.getUser(userId) as any;
     if (!user) {
       throw new NotFoundError('User', userId);
     }
 
     // Calculate required credits
-    const requiredCredits = this.calculateRequiredCredits(browsers);
+    const requiredCredits = this.calculateRequiredCredits(browsers, intelligentMode, estimatedCost);
+
+    logger.info('[CREDIT_CHECK] Credits calculation', {
+      userId: userId.substring(0, 8) + '...',
+      intelligentMode,
+      estimatedCost,
+      requiredCredits,
+      availableCredits: user.credits,
+    });
 
     if (user.credits < requiredCredits) {
       throw new ValidationError(`Insufficient credits. Required: ${requiredCredits}, Available: ${user.credits}`);
@@ -532,8 +577,19 @@ export class ManualTestService {
   /**
    * Deduct user credits
    */
-  private static async deductCredits(userId: string, browsers: BrowserType[]): Promise<void> {
-    const requiredCredits = this.calculateRequiredCredits(browsers);
+  private static async deductCredits(
+    userId: string,
+    browsers: BrowserType[],
+    intelligentMode?: boolean,
+    estimatedCost?: string
+  ): Promise<void> {
+    const requiredCredits = this.calculateRequiredCredits(browsers, intelligentMode, estimatedCost);
+
+    logger.info('[CREDIT_DEDUCT] Deducting credits', {
+      userId: userId.substring(0, 8) + '...',
+      requiredCredits,
+      intelligentMode,
+    });
 
     // Deduct credits using Supabase function
     const { data, error } = await dbService.supabaseAdmin
@@ -552,8 +608,15 @@ export class ManualTestService {
 
   /**
    * Calculate required credits for browsers
+   * Formula:
+   * - Standard test: 1 credit per browser (2 for mobile browsers)
+   * - Intelligent test: base + AI cost (parsed from estimatedCost or 2x base)
    */
-  private static calculateRequiredCredits(browsers: BrowserType[]): number {
+  private static calculateRequiredCredits(
+    browsers: BrowserType[],
+    intelligentMode?: boolean,
+    estimatedCost?: string
+  ): number {
     const creditCosts: Record<BrowserType, number> = {
       'chrome': 1,
       'firefox': 1,
@@ -563,7 +626,47 @@ export class ManualTestService {
       'mobile-safari': 2,
     };
 
-    return browsers.reduce((total, browser) => total + (creditCosts[browser] || 1), 0);
+    // 1. Calculate base browser cost
+    const baseBrowserCost = browsers.reduce(
+      (total, browser) => total + (creditCosts[browser] || 1),
+      0
+    );
+
+    // 2. If NOT intelligent mode - return base cost
+    if (!intelligentMode) {
+      return baseBrowserCost;
+    }
+
+    // 3. For intelligent mode - parse estimatedCost or use 2x multiplier
+    if (estimatedCost) {
+      // Parse "$0.10-0.20" or "$0.15" format
+      const match = estimatedCost.match(/\$([0-9.]+)(?:-\$?([0-9.]+))?/);
+      if (match) {
+        // Take upper bound if range, otherwise single value
+        const maxCost = match[2] ? parseFloat(match[2]) : parseFloat(match[1]);
+
+        // Convert $ to credits (1 credit = $0.01)
+        const aiCredits = Math.ceil(maxCost * 100);
+
+        logger.debug('[CREDIT_CALC] Intelligent mode cost calculated', {
+          estimatedCost,
+          parsedMaxCost: maxCost,
+          aiCredits,
+          baseBrowserCost,
+          total: baseBrowserCost + aiCredits,
+        });
+
+        return baseBrowserCost + aiCredits;
+      }
+    }
+
+    // 4. Fallback: If no estimatedCost - use 2x multiplier
+    logger.debug('[CREDIT_CALC] Using fallback 2x multiplier for intelligent mode', {
+      baseBrowserCost,
+      total: baseBrowserCost * 2,
+    });
+
+    return baseBrowserCost * 2;
   }
 
   /**

@@ -24,8 +24,12 @@ export interface TestRunRequest {
   projectId: string;
   userId?: string;
   options?: TestOptions;
-  intelligentMode?: boolean; // NEW: Enable intelligent/adaptive testing
-  testGoal?: string; // NEW: Testing goal for intelligent mode
+  // Intelligent testing fields
+  intelligentMode?: boolean; // Enable AI-driven intelligent/adaptive testing
+  testGoal?: string; // High-level testing goal for intelligent mode
+  estimatedCost?: string; // Estimated cost from test plan (e.g., "$0.10-0.20")
+  commands?: PlaywrightCommand[]; // Playwright commands to execute
+  intent?: string; // Original user intent for context
 }
 
 export interface TestOptions {

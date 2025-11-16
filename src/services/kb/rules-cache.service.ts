@@ -11,7 +11,7 @@
  */
 
 import { logger } from '@/utils/logger';
-import { searchKB, KBChunk } from './kb.service';
+import { KBChunk, searchKB } from './kb.service';
 
 interface CachedRules {
   content: string;
@@ -144,18 +144,29 @@ export class RulesCacheService {
 
   /**
    * Get cached rules for a language
-   * Returns null if not cached
+   * Returns null if not cached or not initialized
    */
   static getRules(language: 'en' | 'ru'): string | null {
+    // Check if cache is initialized
+    if (!this.isInitialized) {
+      logger.warn(`[RULES_CACHE] Cache not initialized yet, language: ${language}`);
+      return null;
+    }
+
     const cached = this.cache.get(language);
 
     if (!cached) {
-      logger.debug(`[RULES_CACHE] Cache miss for language: ${language}`);
+      logger.debug(`[RULES_CACHE] Cache miss for language: ${language}`, {
+        availableLanguages: Array.from(this.cache.keys()),
+        cacheSize: this.cache.size,
+        isInitialized: this.isInitialized,
+      });
       return null;
     }
 
     logger.debug(`[RULES_CACHE] Cache hit for language: ${language}`, {
-      chunksCount: cached.chunks.length,
+      chunksCount: cached.chunks?.length || 0,
+      contentLength: cached.content?.length || 0,
       age: `${Math.floor((Date.now() - cached.loadedAt) / 1000)}s`,
     });
 

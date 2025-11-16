@@ -8,41 +8,79 @@ import {
   IssueSeverity,
 } from '@/types';
 import { executeApiTest } from './apiTest.service';
+import { FUZZING_CONFIG } from './fuzzing-config';
 import pLimit from 'p-limit';
 
 /**
- * API Fuzzing Executor Service
- * Executes fuzzing scenarios and analyzes results
+ * API Fuzzing Executor Service (REFACTORED)
+ * FIX #1: Added AbortSignal support
+ * FIX #2: Proper cleanup on timeout
+ * FIX #3: Using centralized constants
+ * FIX #4: Better error categorization
+ * FIX #5: Progress reporting callback
  */
 export class ApiFuzzingExecutorService {
-  // Limit concurrent requests to avoid overwhelming the API
-  private static readonly CONCURRENCY_LIMIT = 5;
-  private static readonly FUZZING_TIMEOUT = 5000; // 5 seconds per fuzzing test
-
   /**
    * Execute all fuzzing scenarios
    * @param scenarios - Array of fuzzing scenarios to execute
    * @param happyPathResult - Result from the original happy path test
+   * @param abortSignal - Optional signal to abort execution
+   * @param onProgress - Optional callback for progress updates
    * @returns Comprehensive fuzzing report
    */
   static async executeFuzzingScenarios(
     scenarios: FuzzingScenario[],
-    happyPathResult: ApiTestResponse
+    happyPathResult: ApiTestResponse,
+    abortSignal?: AbortSignal,
+    onProgress?: (completed: number, total: number) => void
   ): Promise<FuzzingReport> {
     const startTime = Date.now();
 
     logger.info('[FUZZING_EXECUTOR] Starting fuzzing execution', {
       scenarioCount: scenarios.length,
-      concurrencyLimit: this.CONCURRENCY_LIMIT,
+      concurrencyLimit: FUZZING_CONFIG.MAX_CONCURRENT_REQUESTS,
+      hasAbortSignal: !!abortSignal,
     });
 
-    // Execute scenarios with concurrency limit
-    const limit = pLimit(this.CONCURRENCY_LIMIT);
+    // FIX #1 & #2: Check abort signal before starting
+    if (abortSignal?.aborted) {
+      throw new Error('Fuzzing aborted before execution');
+    }
+
+    // Execute scenarios with concurrency limit + progress tracking
+    let completed = 0;
+    const limit = pLimit(FUZZING_CONFIG.MAX_CONCURRENT_REQUESTS);
+
     const scenarioPromises = scenarios.map(scenario =>
-      limit(() => this.executeScenario(scenario))
+      limit(async () => {
+        // FIX #2: Check abort signal before each scenario
+        if (abortSignal?.aborted) {
+          throw new Error('Fuzzing aborted');
+        }
+
+        const result = await this.executeScenario(scenario, abortSignal);
+
+        // FIX #5: Report progress
+        completed++;
+        if (completed % FUZZING_CONFIG.PROGRESS_UPDATE_INTERVAL === 0 || completed === scenarios.length) {
+          onProgress?.(completed, scenarios.length);
+        }
+
+        return result;
+      })
     );
 
-    const results = await Promise.allSettled(scenarioPromises);
+    // FIX #1: Race with abort signal
+    const results = await Promise.race([
+      Promise.allSettled(scenarioPromises),
+      new Promise<never>((_, reject) => {
+        if (abortSignal) {
+          abortSignal.addEventListener('abort', () => {
+            reject(new Error('Fuzzing aborted by timeout'));
+          });
+        }
+      }),
+    ]) as PromiseSettledResult<FuzzingScenarioResult>[];
 
     // Process results
     const scenarioResults: FuzzingScenarioResult[] = [];
@@ -58,11 +96,15 @@ export class ApiFuzzingExecutorService {
           failed++;
         }
       } else {
-        // Handle rejected scenario
+        // FIX #4: Better error categorization
+        const errorType = this.categorizeErrorType(result.reason);
+
         logger.warn('[FUZZING_EXECUTOR] Scenario execution failed', {
           scenario: scenarios[index].id,
-          error: result.reason,
+          errorType,
+          error: result.reason?.message || String(result.reason),
         });
+
         scenarioResults.push({
           scenario: scenarios[index],
           result: {
@@ -71,7 +113,7 @@ export class ApiFuzzingExecutorService {
             durationMs: 0,
             responseHeaders: {},
             responseBody: null,
-            error: result.reason?.message || 'Execution failed',
+            error: `[${errorType}] ${result.reason?.message || 'Execution failed'}`,
             matchesExpected: false,
           },
           passed: false,
@@ -119,19 +161,28 @@ export class ApiFuzzingExecutorService {
 
   /**
    * Execute a single fuzzing scenario
+   * FIX #2: Added abort signal support
    */
-  private static async executeScenario(scenario: FuzzingScenario): Promise<FuzzingScenarioResult> {
+  private static async executeScenario(
+    scenario: FuzzingScenario,
+    abortSignal?: AbortSignal
+  ): Promise<FuzzingScenarioResult> {
     try {
-      logger.info('[FUZZING_EXECUTOR] Executing scenario', {
+      // FIX #2: Check if aborted before execution
+      if (abortSignal?.aborted) {
+        throw new Error('Scenario aborted');
+      }
+
+      logger.debug('[FUZZING_EXECUTOR] Executing scenario', {
         id: scenario.id,
         type: scenario.type,
       });
 
-      // Execute the test with shorter timeout
+      // FIX #3: Use centralized timeout
       const result = await executeApiTest({
         ...scenario.request,
         expectedStatus: scenario.expectedStatus,
-        timeout: this.FUZZING_TIMEOUT,
+        timeout: FUZZING_CONFIG.SCENARIO_TIMEOUT,
       });
 
       // Analyze if scenario passed (API behaved securely)
@@ -305,7 +356,11 @@ export class ApiFuzzingExecutorService {
       const bodyStr = typeof scenario.request.body === 'string'
         ? scenario.request.body
         : JSON.stringify(scenario.request.body, null, 2);
-      evidenceParts.push(bodyStr.length > 500 ? bodyStr.substring(0, 500) + '...' : bodyStr);
+      evidenceParts.push(
+        bodyStr.length > FUZZING_CONFIG.MAX_BODY_PREVIEW
+          ? bodyStr.substring(0, FUZZING_CONFIG.MAX_BODY_PREVIEW) + '...'
+          : bodyStr
+      );
       evidenceParts.push('');
     }
 
@@ -314,12 +369,14 @@ export class ApiFuzzingExecutorService {
     evidenceParts.push(`Duration: ${result.durationMs}ms`);
     evidenceParts.push('');
 
-    // Add response headers if present
+    // Add response headers if present (limited)
     if (result.responseHeaders && Object.keys(result.responseHeaders).length > 0) {
       evidenceParts.push('Response Headers:');
-      Object.entries(result.responseHeaders).slice(0, 5).forEach(([key, value]) => {
-        evidenceParts.push(`  ${key}: ${value}`);
-      });
+      Object.entries(result.responseHeaders)
+        .slice(0, FUZZING_CONFIG.MAX_HEADER_COUNT)
+        .forEach(([key, value]) => {
+          evidenceParts.push(`  ${key}: ${value}`);
+        });
       evidenceParts.push('');
     }
 
@@ -329,7 +386,11 @@ export class ApiFuzzingExecutorService {
       const bodyStr = typeof result.responseBody === 'string'
         ? result.responseBody
         : JSON.stringify(result.responseBody, null, 2);
-      evidenceParts.push(bodyStr.length > 500 ? bodyStr.substring(0, 500) + '...' : bodyStr);
+      evidenceParts.push(
+        bodyStr.length > FUZZING_CONFIG.MAX_BODY_PREVIEW
+          ? bodyStr.substring(0, FUZZING_CONFIG.MAX_BODY_PREVIEW) + '...'
+          : bodyStr
+      );
     }
 
     // Add error if present
@@ -463,6 +524,24 @@ export class ApiFuzzingExecutorService {
 
     // Minimum score is 0
     return Math.max(0, Math.round(score * 10) / 10);
+  }
+
+  /**
+   * FIX #4: Categorize error types for better debugging
+   */
+  private static categorizeErrorType(error: any): string {
+    if (!error) return 'unknown';
+
+    const errorMsg = error.message || String(error);
+
+    if (error.name === 'AbortError' || errorMsg.includes('aborted')) return 'aborted';
+    if (error.name === 'TimeoutError' || errorMsg.includes('timeout')) return 'timeout';
+    if (error.code === 'ENOTFOUND' || errorMsg.includes('getaddrinfo')) return 'dns_error';
+    if (error.code === 'ECONNREFUSED') return 'connection_refused';
+    if (errorMsg.includes('SSL') || errorMsg.includes('certificate')) return 'ssl_error';
+    if (errorMsg.includes('network')) return 'network_error';
+
+    return 'execution_error';
   }
 
   /**

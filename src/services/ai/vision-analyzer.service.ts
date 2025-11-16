@@ -1,6 +1,7 @@
 import { OpenAI } from 'openai';
 import { env } from '@/config/env';
 import { logger } from '@/utils/logger';
+import { buildVisionPrompt } from '@/ai/prompts/index';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
@@ -92,7 +93,10 @@ export async function analyzeScreenshotWithVision(
 /**
  * Build prompt for vision analysis based on scope
  */
-function buildVisionPrompt(scope: string, url: string): string {
+// Moved to src/ai/prompts/index.ts
+
+// Legacy function for backward compatibility
+function buildVisionPromptLegacy(scope: string, url: string): string {
   let basePrompt = `Analyze this screenshot of a web page (URL: ${url}).
 
 Your task: Identify all interactive elements and provide testing recommendations.
