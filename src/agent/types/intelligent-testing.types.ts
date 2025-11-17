@@ -110,9 +110,33 @@ export interface PageContext {
 
 /**
  * Action generated dynamically based on context
+ * NOTE: This type is used for intelligent testing (AI-driven test generation)
+ * It supports a subset of PlaywrightActionType actions that are safe for automated testing
  */
 export interface DynamicAction {
-  action: 'goto' | 'click' | 'fill' | 'select' | 'wait' | 'scroll' | 'press' | 'hover';
+  action:
+    // Navigation
+    | 'goto'            // Navigate to URL
+    // Interactions (core set for intelligent testing)
+    | 'click'           // Click element
+    | 'fill'            // Fill input field
+    | 'type'            // Type text (with events)
+    | 'select'          // Select from dropdown (maps to selectOption in executor)
+    | 'check'           // Check checkbox
+    | 'uncheck'         // Uncheck checkbox
+    | 'hover'           // Hover over element
+    | 'press'           // Press keyboard key
+    // Wait & Scroll
+    | 'wait'            // Wait for timeout
+    | 'waitForSelector' // Wait for element to appear
+    | 'scroll'          // Scroll page/element
+    // Assertions (for validation)
+    | 'assertVisible'   // Assert element is visible
+    | 'assertText'      // Assert element contains text
+    | 'assertValue'     // Assert input has value
+    | 'assertUrl'       // Assert current URL matches
+    // Screenshots (for analysis)
+    | 'screenshot';     // Take screenshot for AI analysis
   selector?: string;
   value?: string;
   url?: string;

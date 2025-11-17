@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { logger } from '@/utils/logger';
-import { IntelligentTestStorageService } from '@/services/testing/intelligent-test-storage.service';
+import { IntelligentTestStorageService } from '@/services/testing/results/intelligent-test-storage.service';
 
 /**
  * Get intelligent test session with full details for visualization

@@ -1,6 +1,6 @@
-import { Request, Response, NextFunction } from 'express';
+import { NotFoundError, QAIError, RateLimitError, ValidationError } from '@/types';
+import { NextFunction, Request, Response } from 'express';
 import { logger } from './logger';
-import { QAIError, ValidationError, NotFoundError, RateLimitError } from '@/types';
 
 /**
  * Send success response
@@ -101,7 +101,7 @@ export const errorHandler = (
   }
 
   // Handle Redis errors
-  if (error.message.includes('Redis')) {
+  if (error.message && typeof error.message === 'string' && error.message.includes('Redis')) {
     res.status(503).json({
       success: false,
       error: 'Queue service unavailable',
@@ -112,7 +112,7 @@ export const errorHandler = (
   }
 
   // Handle OpenAI errors
-  if (error.message.includes('OpenAI')) {
+  if (error.message && typeof error.message === 'string' && error.message.includes('OpenAI')) {
     res.status(503).json({
       success: false,
       error: 'AI service unavailable',
@@ -123,7 +123,7 @@ export const errorHandler = (
   }
 
   // Handle agent communication errors
-  if (error.message.includes('Agent')) {
+  if (error.message && typeof error.message === 'string' && error.message.includes('Agent')) {
     res.status(503).json({
       success: false,
       error: 'Test agent unavailable',
@@ -166,19 +166,23 @@ export const asyncHandler = (fn: Function) => {
 
 // Validation error handler
 export const handleValidationError = (error: any) => {
-  if (error.isJoi) {
+  if (!error || typeof error !== 'object') {
+    throw error;
+  }
+
+  if (error.isJoi && Array.isArray(error.details)) {
     const details = error.details.map((detail: any) => ({
-      field: detail.path.join('.'),
-      message: detail.message,
+      field: Array.isArray(detail.path) ? detail.path.join('.') : String(detail.path || 'unknown'),
+      message: detail.message || 'Validation error',
     }));
 
     throw new ValidationError('Validation failed', details);
   }
 
-  if (error.name === 'ZodError') {
+  if (error.name === 'ZodError' && Array.isArray(error.errors)) {
     const details = error.errors.map((err: any) => ({
-      field: err.path.join('.'),
-      message: err.message,
+      field: Array.isArray(err.path) ? err.path.join('.') : String(err.path || 'unknown'),
+      message: err.message || 'Validation error',
     }));
 
     throw new ValidationError('Validation failed', details);
@@ -206,12 +210,18 @@ export const handleDatabaseError = (error: any) => {
 
 // Queue error handler
 export const handleQueueError = (error: any) => {
-  if (error.message.includes('Connection is closed')) {
-    throw new QAIError('Queue service unavailable', 'QUEUE_UNAVAILABLE', 503);
+  if (!error || typeof error !== 'object') {
+    throw error;
   }
 
-  if (error.message.includes('Job not found')) {
-    throw new NotFoundError('Job', 'unknown');
+  if (error.message && typeof error.message === 'string') {
+    if (error.message.includes('Connection is closed')) {
+      throw new QAIError('Queue service unavailable', 'QUEUE_UNAVAILABLE', 503);
+    }
+
+    if (error.message.includes('Job not found')) {
+      throw new NotFoundError('Job', 'unknown');
+    }
   }
 
   throw error;
@@ -257,11 +267,15 @@ export const handleAgentError = (error: any) => {
 
 // Health check error handler
 export const handleHealthCheckError = (service: string, error: any) => {
-  logger.warn(`Health check failed for ${service}:`, error.message);
+  const errorMessage = error && typeof error === 'object' && error.message
+    ? String(error.message)
+    : (error ? String(error) : 'Unknown error');
+
+  logger.warn(`Health check failed for ${service}:`, errorMessage);
   return {
-    service,
+    service: service || 'unknown',
     status: 'unhealthy',
-    error: error.message,
+    error: errorMessage,
     timestamp: new Date().toISOString(),
   };
 };

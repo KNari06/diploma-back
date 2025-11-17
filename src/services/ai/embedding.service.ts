@@ -2,12 +2,22 @@ import { env } from '@/config/env';
 import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
 
-const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+// Validate API key on module load
+if (!env.OPENAI_API_KEY) {
+  throw new Error('OPENAI_API_KEY is not configured');
+}
+
+const openai = new OpenAI({
+  apiKey: env.OPENAI_API_KEY,
+  timeout: 30000, // 30 seconds
+});
 
 // Using text-embedding-3-small (1536 dimensions, fast, HNSW-compatible)
 // Note: text-embedding-3-large (3072 dims) exceeds HNSW limit (2000 dims)
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 const EMBEDDING_DIMENSIONS = 1536;
+const MAX_TEXT_LENGTH = 8000; // OpenAI limit is ~8191 tokens, be safe
+const MAX_BATCH_SIZE = 100; // Limit batch size for safety
 
 /**
  * Generate embedding vector for text using OpenAI
@@ -15,13 +25,37 @@ const EMBEDDING_DIMENSIONS = 1536;
  * @returns Vector embedding (1536 dimensions)
  */
 export async function generateEmbedding(text: string): Promise<number[]> {
-  try {
-    if (!text || text.trim().length === 0) {
-      throw new Error('Text is empty');
-    }
+  // Validate input
+  if (!text || typeof text !== 'string') {
+    logger.error('[EMBEDDING] Invalid text input', { type: typeof text });
+    throw new Error('Text must be a non-empty string');
+  }
 
+  const trimmedText = text.trim();
+  if (trimmedText.length === 0) {
+    logger.error('[EMBEDDING] Empty text provided');
+    throw new Error('Text is empty');
+  }
+
+  // Check text length
+  if (trimmedText.length > MAX_TEXT_LENGTH) {
+    logger.warn('[EMBEDDING] Text too long, truncating', {
+      originalLength: trimmedText.length,
+      maxLength: MAX_TEXT_LENGTH,
+    });
+  }
+
+  try {
     // OpenAI recommends replacing newlines with spaces for better embeddings
-    const cleanedText = text.replace(/\n/g, ' ').trim();
+    const cleanedText = trimmedText
+      .substring(0, MAX_TEXT_LENGTH)
+      .replace(/\n/g, ' ')
+      .trim();
+
+    logger.info('[EMBEDDING] Generating embedding', {
+      textLength: cleanedText.length,
+      model: EMBEDDING_MODEL,
+    });
 
     const response = await openai.embeddings.create({
       model: EMBEDDING_MODEL,
@@ -31,15 +65,23 @@ export async function generateEmbedding(text: string): Promise<number[]> {
 
     const embedding = response.data[0].embedding;
 
-    logger.info('Embedding generated', {
-      textLength: text.length,
+    // Validate embedding
+    if (!embedding || !Array.isArray(embedding) || embedding.length !== EMBEDDING_DIMENSIONS) {
+      throw new Error(`Invalid embedding dimensions: expected ${EMBEDDING_DIMENSIONS}, got ${embedding?.length}`);
+    }
+
+    logger.info('[EMBEDDING] Embedding generated successfully', {
+      textLength: cleanedText.length,
       dimensions: embedding.length,
     });
 
     return embedding;
   } catch (error) {
-    logger.error('Embedding generation failed', { error, textLength: text?.length });
-    throw new Error('Failed to generate embedding');
+    logger.error('[EMBEDDING] Generation failed', {
+      error,
+      textLength: trimmedText?.length,
+    });
+    throw new Error(`Failed to generate embedding: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 }
 
@@ -49,13 +91,50 @@ export async function generateEmbedding(text: string): Promise<number[]> {
  * @returns Array of vector embeddings
  */
 export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
+  // Validate input
+  if (!texts || !Array.isArray(texts)) {
+    logger.error('[EMBEDDING] Invalid texts input', { type: typeof texts });
+    throw new Error('Texts must be an array');
+  }
+
+  if (texts.length === 0) {
+    logger.warn('[EMBEDDING] Empty texts array provided');
+    return [];
+  }
+
+  // Check batch size
+  if (texts.length > MAX_BATCH_SIZE) {
+    logger.warn('[EMBEDDING] Batch size exceeds limit', {
+      provided: texts.length,
+      max: MAX_BATCH_SIZE,
+    });
+    throw new Error(`Batch size exceeds limit of ${MAX_BATCH_SIZE}`);
+  }
+
   try {
-    if (!texts || texts.length === 0) {
-      throw new Error('No texts provided');
+    // Clean and validate texts
+    const cleanedTexts = texts.map((text, index) => {
+      if (!text || typeof text !== 'string') {
+        logger.warn('[EMBEDDING] Invalid text in batch', { index, type: typeof text });
+        return ''; // Empty string as fallback
+      }
+
+      return text
+        .trim()
+        .substring(0, MAX_TEXT_LENGTH)
+        .replace(/\n/g, ' ')
+        .trim();
+    }).filter(text => text.length > 0); // Remove empty strings
+
+    if (cleanedTexts.length === 0) {
+      logger.error('[EMBEDDING] No valid texts after cleaning');
+      throw new Error('No valid texts to embed');
     }
 
-    // Clean texts
-    const cleanedTexts = texts.map((text) => text.replace(/\n/g, ' ').trim());
+    logger.info('[EMBEDDING] Generating batch embeddings', {
+      count: cleanedTexts.length,
+      model: EMBEDDING_MODEL,
+    });
 
     const response = await openai.embeddings.create({
       model: EMBEDDING_MODEL,
@@ -65,15 +144,30 @@ export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
 
     const embeddings = response.data.map((item) => item.embedding);
 
-    logger.info('Batch embeddings generated', {
-      count: texts.length,
+    // Validate embeddings
+    if (embeddings.length !== cleanedTexts.length) {
+      throw new Error(`Expected ${cleanedTexts.length} embeddings, got ${embeddings.length}`);
+    }
+
+    // Validate each embedding dimension
+    for (let i = 0; i < embeddings.length; i++) {
+      if (!embeddings[i] || embeddings[i].length !== EMBEDDING_DIMENSIONS) {
+        throw new Error(`Invalid embedding at index ${i}: expected ${EMBEDDING_DIMENSIONS} dimensions, got ${embeddings[i]?.length}`);
+      }
+    }
+
+    logger.info('[EMBEDDING] Batch embeddings generated successfully', {
+      count: embeddings.length,
       dimensions: embeddings[0]?.length,
     });
 
     return embeddings;
   } catch (error) {
-    logger.error('Batch embedding generation failed', { error, count: texts?.length });
-    throw new Error('Failed to generate batch embeddings');
+    logger.error('[EMBEDDING] Batch generation failed', {
+      error,
+      count: texts?.length,
+    });
+    throw new Error(`Failed to generate batch embeddings: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 }
 
@@ -81,22 +175,66 @@ export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
  * Calculate cosine similarity between two embeddings
  * @param embedding1 - First embedding
  * @param embedding2 - Second embedding
- * @returns Similarity score (0-1)
+ * @returns Similarity score (0-1, or -1 to 1 technically, but OpenAI embeddings are normalized)
  */
 export function cosineSimilarity(embedding1: number[], embedding2: number[]): number {
+  // Validate inputs
+  if (!embedding1 || !Array.isArray(embedding1) || !embedding2 || !Array.isArray(embedding2)) {
+    logger.error('[EMBEDDING] Invalid embeddings for similarity calculation', {
+      hasEmbedding1: !!embedding1,
+      hasEmbedding2: !!embedding2,
+      isArray1: Array.isArray(embedding1),
+      isArray2: Array.isArray(embedding2),
+    });
+    throw new Error('Both embeddings must be valid arrays');
+  }
+
   if (embedding1.length !== embedding2.length) {
-    throw new Error('Embeddings must have the same dimensions');
+    logger.error('[EMBEDDING] Embedding dimension mismatch', {
+      length1: embedding1.length,
+      length2: embedding2.length,
+    });
+    throw new Error(`Embeddings must have the same dimensions: ${embedding1.length} vs ${embedding2.length}`);
   }
 
-  let dotProduct = 0;
-  let norm1 = 0;
-  let norm2 = 0;
-
-  for (let i = 0; i < embedding1.length; i++) {
-    dotProduct += embedding1[i] * embedding2[i];
-    norm1 += embedding1[i] * embedding1[i];
-    norm2 += embedding2[i] * embedding2[i];
+  if (embedding1.length === 0) {
+    logger.error('[EMBEDDING] Empty embeddings provided');
+    throw new Error('Embeddings cannot be empty');
   }
 
-  return dotProduct / (Math.sqrt(norm1) * Math.sqrt(norm2));
+  try {
+    let dotProduct = 0;
+    let norm1 = 0;
+    let norm2 = 0;
+
+    for (let i = 0; i < embedding1.length; i++) {
+      // Validate numbers
+      if (typeof embedding1[i] !== 'number' || typeof embedding2[i] !== 'number') {
+        throw new Error(`Invalid number at index ${i}: ${embedding1[i]}, ${embedding2[i]}`);
+      }
+
+      dotProduct += embedding1[i] * embedding2[i];
+      norm1 += embedding1[i] * embedding1[i];
+      norm2 += embedding2[i] * embedding2[i];
+    }
+
+    const denominator = Math.sqrt(norm1) * Math.sqrt(norm2);
+
+    // Handle edge case: zero vectors
+    if (denominator === 0) {
+      logger.warn('[EMBEDDING] Zero vector detected in similarity calculation');
+      return 0;
+    }
+
+    const similarity = dotProduct / denominator;
+
+    // Clamp to [-1, 1] due to floating point errors
+    return Math.max(-1, Math.min(1, similarity));
+  } catch (error) {
+    logger.error('[EMBEDDING] Cosine similarity calculation failed', {
+      error,
+      length: embedding1.length,
+    });
+    throw new Error(`Failed to calculate cosine similarity: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
 }

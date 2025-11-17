@@ -306,5 +306,14 @@ export interface RoomIdentifier {
 
 // Helper to create room names
 export const createRoomName = (type: RoomType, id: string): string => {
-  return `${type}:${id}`;
+  // Validate inputs
+  if (!type || !['test', 'chat', 'user'].includes(type)) {
+    throw new Error(`Invalid room type: ${type}. Must be 'test', 'chat', or 'user'`);
+  }
+
+  if (!id || typeof id !== 'string' || id.trim().length === 0) {
+    throw new Error('Room id must be a non-empty string');
+  }
+
+  return `${type}:${id.trim()}`;
 };

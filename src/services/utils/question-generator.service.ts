@@ -101,11 +101,27 @@ export async function generateClarifyingQuestions(
   questions: ClarifyingQuestion[];
   conversationId: string;
 }> {
+  // Validate inputs
+  if (!userMessage || typeof userMessage !== 'string' || userMessage.trim().length === 0) {
+    logger.warn('[QUESTION_GEN] Invalid userMessage', { userMessage: typeof userMessage });
+    return {
+      needsMoreInfo: true,
+      questions: [BASE_QUESTIONS[0], BASE_QUESTIONS[1]],
+      conversationId: generateConversationId(),
+    };
+  }
+
+  if (!currentContext || typeof currentContext !== 'object') {
+    logger.warn('[QUESTION_GEN] Invalid currentContext', { currentContext: typeof currentContext });
+    currentContext = {};
+  }
+
   try {
     logger.info('[QUESTION_GEN] Generating clarifying questions', {
       userMessage: userMessage.substring(0, MAX_USER_MESSAGE_LOG_LENGTH),
-      context: currentContext,
-      projectCount: currentContext.userProjects?.length || 0,
+      hasUrl: currentContext.hasUrl,
+      hasScope: currentContext.hasScope,
+      projectCount: Array.isArray(currentContext.userProjects) ? currentContext.userProjects.length : 0,
     });
 
     // Start with base questions
@@ -116,7 +132,10 @@ export async function generateClarifyingQuestions(
     // ═══════════════════════════════════════════════════════════════════════
 
     if (!currentContext.hasUrl) {
-      const projectsWithUrls = currentContext.userProjects?.filter(p => p.settings?.main_url) || [];
+      const validProjects = Array.isArray(currentContext.userProjects) ? currentContext.userProjects : [];
+      const projectsWithUrls = validProjects.filter(
+        (p) => p && typeof p === 'object' && p.settings && p.settings.main_url && typeof p.settings.main_url === 'string'
+      );
 
       if (projectsWithUrls.length > 0) {
         // Show existing projects as options
@@ -126,7 +145,7 @@ export async function generateClarifyingQuestions(
           required: true,
           type: 'url',
           options: [
-            ...projectsWithUrls.map(p => `${p.name} (${p.settings!.main_url})`),
+            ...projectsWithUrls.map((p) => `${p.name || 'Unnamed'} (${p.settings?.main_url || ''})`),
             'Enter a different URL',
           ],
           placeholder: 'Select your project or enter new URL',
@@ -210,6 +229,14 @@ export async function generateClarifyingQuestions(
  * Accuracy: 97-99% (vs 70-80% pure regex, 95-98% pure GPT)
  */
 async function shouldAskAboutAuth(userMessage: string): Promise<boolean> {
+  // Validate input
+  if (!userMessage || typeof userMessage !== 'string' || userMessage.trim().length === 0) {
+    logger.debug('[AUTH_CHECK] Invalid userMessage, defaulting to false', {
+      userMessage: typeof userMessage,
+    });
+    return false;
+  }
+
   const messageLC = userMessage.toLowerCase();
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -303,9 +330,22 @@ Guidelines:
       model: 'gpt-3.5-turbo',
     });
 
-    const parsed = JSON.parse(response.content);
+    if (!response || !response.content || typeof response.content !== 'string') {
+      throw new Error('Empty or invalid response from GPT');
+    }
 
-    // Validate GPT response
+    let parsed: any;
+    try {
+      parsed = JSON.parse(response.content);
+    } catch (parseError) {
+      throw new Error(`Failed to parse GPT response: ${parseError instanceof Error ? parseError.message : String(parseError)}`);
+    }
+
+    // Validate GPT response structure
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('Invalid GPT response: expected object');
+    }
+
     if (typeof parsed.requiresAuth !== 'boolean') {
       throw new Error('Invalid GPT response: requiresAuth must be boolean');
     }
@@ -359,19 +399,46 @@ async function generateDynamicQuestions(
   context: any,
   alreadyAskedQuestions: ClarifyingQuestion[]
 ): Promise<ClarifyingQuestion[]> {
+  // Validate inputs
+  if (!userMessage || typeof userMessage !== 'string' || userMessage.trim().length === 0) {
+    logger.warn('[QUESTION_GEN] Invalid userMessage in generateDynamicQuestions');
+    return [];
+  }
+
+  if (!Array.isArray(alreadyAskedQuestions)) {
+    logger.warn('[QUESTION_GEN] Invalid alreadyAskedQuestions in generateDynamicQuestions');
+    alreadyAskedQuestions = [];
+  }
+
   try {
     const prompt = buildDynamicQuestionPrompt(userMessage, context, alreadyAskedQuestions);
 
-    const response = await getChatCompletionWithMessages([
-      { role: 'system', content: 'You are a helpful QA assistant that generates clarifying questions.' },
-      { role: 'user', content: prompt },
-    ], {
-      temperature: 0.3,
-      response_format: { type: 'json_object' },
-    });
+    const response = await getChatCompletionWithMessages(
+      [
+        { role: 'system', content: 'You are a helpful QA assistant that generates clarifying questions.' },
+        { role: 'user', content: prompt },
+      ],
+      {
+        temperature: 0.3,
+        response_format: { type: 'json_object' },
+      }
+    );
+
+    if (!response || !response.content || typeof response.content !== 'string') {
+      logger.warn('[QUESTION_GEN] Empty or invalid response from GPT');
+      return [];
+    }
 
     // FIX #2: Safe parsing with validation
-    const parsed = JSON.parse(response.content);
+    let parsed: any;
+    try {
+      parsed = JSON.parse(response.content);
+    } catch (parseError) {
+      logger.error('[QUESTION_GEN] Failed to parse GPT response', {
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+      });
+      return [];
+    }
     let questions: any[] = [];
 
     if (Array.isArray(parsed)) {
@@ -423,9 +490,23 @@ export function validateAnswers(
   valid: boolean;
   errors: Record<string, string>;
 } {
+  // Validate inputs
+  if (!questions || !Array.isArray(questions) || questions.length === 0) {
+    return { valid: true, errors: {} }; // No questions = no validation needed
+  }
+
+  if (!answers || typeof answers !== 'object') {
+    return { valid: false, errors: {} }; // Invalid answers
+  }
+
   const errors: Record<string, string> = {};
 
   for (const question of questions) {
+    // Validate question structure
+    if (!question || typeof question !== 'object' || !question.id || !question.type) {
+      continue; // Skip invalid questions
+    }
+
     const answer = answers[question.id];
 
     // Check required
@@ -536,15 +617,21 @@ export function parseAnswers(
   };
   additionalInfo?: Record<string, any>;
 } {
+  // Validate input
+  if (!answers || typeof answers !== 'object') {
+    logger.warn('[PARSE_ANSWERS] Invalid answers input', { answers: typeof answers });
+    return {};
+  }
+
   const parsed: any = {};
 
   // Parse URL
-  if (answers.url && typeof answers.url === 'string') {
+  if (answers.url && typeof answers.url === 'string' && answers.url.trim().length > 0) {
     parsed.url = answers.url.trim();
   }
 
   // Parse scope
-  if (answers.scope && typeof answers.scope === 'string') {
+  if (answers.scope && typeof answers.scope === 'string' && answers.scope.trim().length > 0) {
     parsed.scope = answers.scope.trim();
   }
 

@@ -21,9 +21,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   networkLogs: any[];
   errors: any[];
   performance?: any;
+  // ✅ NEW: Video & Trace support
+  videoUrl?: string;
+  videoPath?: string;
+  traceUrl?: string;
+  tracePath?: string;
   error?: string;
 }> {
   let page: Page | null = null;
+  let context: any = null;
+  let videoPath: string | undefined;
+  let tracePath: string | undefined;
   const collector = new ResultCollector();
 
   try {
@@ -61,10 +69,25 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       timestamp: new Date().toISOString(),
     });
 
+    // ✅ FIX: Prepare video & trace directories
+    const fs = await import('fs/promises');
+    const path = await import('path');
+
+    const videosDir = path.join(process.cwd(), 'test-results', 'videos');
+    const tracesDir = path.join(process.cwd(), 'test-results', 'traces');
+
+    await fs.mkdir(videosDir, { recursive: true });
+    await fs.mkdir(tracesDir, { recursive: true });
+
     // Create context with options
     const contextOptions: any = {
       viewport: testData.options?.viewport || { width: 1920, height: 1080 },
       userAgent: testData.options?.headers?.['User-Agent'] || undefined,
+      // ✅ NEW: Enable video recording
+      recordVideo: {
+        dir: videosDir,
+        size: { width: 1920, height: 1080 }
+      },
     };
 
     // Mobile emulation
@@ -73,10 +96,32 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         ? devices['iPhone 12']
         : devices['Pixel 5'];
       Object.assign(contextOptions, device);
+      // Update video size for mobile
+      contextOptions.recordVideo.size = contextOptions.viewport;
     }
 
-    const context = await browser.newContext(contextOptions);
+    context = await browser.newContext(contextOptions);
+
+    // ✅ NEW: Start tracing
+    tracePath = path.join(tracesDir, `trace-${testData.testId}-${Date.now()}.zip`);
+    await context.tracing.start({
+      screenshots: true,
+      snapshots: true,
+      sources: true,
+    });
+
+    logger.info('[PLAYWRIGHT] Video & Trace recording started', {
+      testId: testData.testId,
+      videoDir: videosDir,
+      tracePath,
+    });
+
     page = await context.newPage();
+
+    // ✅ FIX: Ensure page is not null
+    if (!page) {
+      throw new Error('Failed to create page');
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // INTELLIGENT MODE: Use IntelligentTestOrchestrator
@@ -153,7 +198,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // SAVE TO SPECIALIZED INTELLIGENT TEST TABLES
       // ═══════════════════════════════════════════════════════════════════════
       try {
-        const { IntelligentTestStorageService } = await import('@/services/testing/intelligent-test-storage.service');
+        const { IntelligentTestStorageService } = await import('@/services/testing/results/intelligent-test-storage.service');
 
         await IntelligentTestStorageService.saveTestSession({
           testId: testData.testId,
@@ -286,9 +331,43 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     // Collect results
     const results = await collector.collect(page, true);
 
-    // Close page and context
+    // ✅ NEW: Stop tracing before closing
+    await context.tracing.stop({ path: tracePath });
+    logger.info('[PLAYWRIGHT] Trace saved', { tracePath });
+
+    // ✅ NEW: Get video path before closing page
+    const video = page.video();
     await page.close();
+
+    if (video) {
+      videoPath = await video.path();
+      logger.info('[PLAYWRIGHT] Video saved', { videoPath });
+    }
+
     await context.close();
+
+    // ✅ NEW: Upload video & trace to Supabase Storage
+    let videoUrl: string | undefined;
+    let traceUrl: string | undefined;
+
+    try {
+      const { uploadVideoToStorage, uploadTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+
+      if (videoPath) {
+        videoUrl = await uploadVideoToStorage(videoPath, testData.testId, testData.userId || 'anonymous');
+        logger.info('[PLAYWRIGHT] Video uploaded to storage', { videoUrl });
+      }
+
+      if (tracePath) {
+        traceUrl = await uploadTraceToStorage(tracePath, testData.testId, testData.userId || 'anonymous');
+        logger.info('[PLAYWRIGHT] Trace uploaded to storage', { traceUrl });
+      }
+    } catch (uploadError) {
+      logger.error('[PLAYWRIGHT] Failed to upload artifacts', {
+        error: uploadError instanceof Error ? uploadError.message : String(uploadError),
+      });
+      // Don't fail the test if upload fails
+    }
 
     logger.info('Playwright test completed successfully', {
       testId: testData.testId,
@@ -296,6 +375,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       logsCount: results.logs.length,
       networkLogsCount: results.networkLogs.length,
       errorsCount: results.errors.length,
+      hasVideo: !!videoUrl,
+      hasTrace: !!traceUrl,
     });
 
     return {
@@ -307,6 +388,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       networkLogs: results.networkLogs,
       errors: results.errors,
       performance: results.performance,
+      // ✅ NEW: Return video & trace paths/URLs
+      videoUrl,
+      videoPath,
+      traceUrl,
+      tracePath,
     };
   } catch (error) {
     logger.error('Playwright test failed', {

@@ -7,6 +7,7 @@ import {
   PlaywrightStepType,
   TestGraph
 } from '../types/playwright.types';
+import { logger } from './logger';
 
 /**
  * Parses Playwright test steps into a graph structure for visualization
@@ -16,6 +17,48 @@ export function parsePlaywrightTestSteps(
   testSteps: PlaywrightStep[],
   options: ParserOptions = {}
 ): TestGraph {
+  // Validate input
+  if (!testSteps || !Array.isArray(testSteps)) {
+    logger.warn('[PLAYWRIGHT_PARSER] Invalid testSteps: expected array', { testSteps });
+    return {
+      nodes: [],
+      edges: [],
+      metadata: {
+        totalSteps: 0,
+        conditionalBranches: 0,
+        loops: 0,
+        assertions: 0,
+      },
+    };
+  }
+
+  // Filter out invalid steps
+  const validSteps = testSteps.filter((step, idx) => {
+    if (!step || typeof step !== 'object') {
+      logger.warn('[PLAYWRIGHT_PARSER] Invalid step at index', { index: idx, step });
+      return false;
+    }
+    if (!step.type || typeof step.type !== 'string') {
+      logger.warn('[PLAYWRIGHT_PARSER] Step missing type at index', { index: idx, step });
+      return false;
+    }
+    return true;
+  });
+
+  if (validSteps.length === 0) {
+    logger.warn('[PLAYWRIGHT_PARSER] No valid steps to parse');
+    return {
+      nodes: [],
+      edges: [],
+      metadata: {
+        totalSteps: 0,
+        conditionalBranches: 0,
+        loops: 0,
+        assertions: 0,
+      },
+    };
+  }
+
   const {
     includeStartEnd = true,
     autoLayout = false,
@@ -62,7 +105,14 @@ export function parsePlaywrightTestSteps(
     group?: string,
     parentId?: string
   ): { nodeId: string; lastNodeId: string } {
-    const nodeId = step.id || generateNodeId();
+    // Validate step
+    if (!step || typeof step !== 'object') {
+      logger.warn('[PLAYWRIGHT_PARSER] Invalid step in processStep', { step });
+      const fallbackId = generateNodeId();
+      return { nodeId: fallbackId, lastNodeId: fallbackId };
+    }
+
+    const nodeId = (step.id && typeof step.id === 'string') ? step.id : generateNodeId();
     const nodeType = getNodeType(step.type);
 
     metadata.totalSteps++;
@@ -73,12 +123,12 @@ export function parsePlaywrightTestSteps(
       id: nodeId,
       type: nodeType,
       stepType: step.type,
-      label: step.label,
-      selector: step.selector,
-      value: step.value,
-      group,
+      label: (step.label && typeof step.label === 'string') ? step.label : step.type || 'Unknown',
+      selector: (step.selector && typeof step.selector === 'string') ? step.selector : undefined,
+      value: step.value !== undefined ? step.value : undefined,
+      group: (group && typeof group === 'string') ? group : undefined,
       meta: {
-        ...step.meta,
+        ...(step.meta && typeof step.meta === 'object' ? step.meta : {}),
         icon: getStepIcon(step.type),
         color: getStepColor(step.type),
         buttons: addButtons ? getNodeButtons(step.type) : [],
@@ -305,7 +355,7 @@ export function parsePlaywrightTestSteps(
   }
 
   // Process all steps
-  const processedNodeIds = processStepList(testSteps, currentNodeId || '', undefined);
+  const processedNodeIds = processStepList(validSteps, currentNodeId || '', undefined);
 
   // Add end node if needed
   if (includeStartEnd && processedNodeIds.length > 0) {
@@ -485,19 +535,46 @@ export function exportGraph(graph: TestGraph, format: 'json' | 'mermaid' = 'json
  * Export to Mermaid diagram syntax
  */
 function exportToMermaid(graph: TestGraph): string {
-  let mermaid = 'graph TD\n';
-
-  // Add nodes
-  for (const node of graph.nodes) {
-    const shape = getNodeShape(node.type);
-    mermaid += `  ${node.id}${shape[0]}${node.label}${shape[1]}\n`;
+  // Validate input
+  if (!graph || !graph.nodes || !Array.isArray(graph.nodes)) {
+    logger.warn('[PLAYWRIGHT_PARSER] Invalid graph for Mermaid export');
+    return 'graph TD\n';
   }
 
-  // Add edges
+  let mermaid = 'graph TD\n';
+
+  // Add nodes with safe label escaping
+  for (const node of graph.nodes) {
+    if (!node || !node.id) continue;
+
+    const shape = getNodeShape(node.type || 'action');
+    // Escape special Mermaid characters in labels
+    const safeLabel = (node.label || node.id || 'Node')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;')
+      .replace(/\n/g, ' ')
+      .replace(/[{}[\]()]/g, '');
+
+    mermaid += `  ${node.id}${shape[0]}"${safeLabel}"${shape[1]}\n`;
+  }
+
+  // Add edges with validation
+  if (!graph.edges || !Array.isArray(graph.edges)) {
+    logger.warn('[PLAYWRIGHT_PARSER] Invalid edges array for Mermaid export');
+    return mermaid;
+  }
+
   for (const edge of graph.edges) {
+    if (!edge || !edge.source || !edge.target) continue;
+
     const arrow = edge.type === 'branch' ? '-.->|' : '-->';
-    const label = edge.label ? `${arrow}|${edge.label}|` : arrow;
-    mermaid += `  ${edge.source} ${label} ${edge.target}\n`;
+    if (edge.label && typeof edge.label === 'string') {
+      // Escape label for Mermaid
+      const safeLabel = edge.label.replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+      mermaid += `  ${edge.source} ${arrow}|"${safeLabel}"| ${edge.target}\n`;
+    } else {
+      mermaid += `  ${edge.source} ${arrow} ${edge.target}\n`;
+    }
   }
 
   return mermaid;

@@ -1,6 +1,6 @@
 import { buildTestPlanPrompt } from '@/ai/prompts/index';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
-import { ExplorationResult } from '@/services/testing/autonomous-explorer.service';
+import { ExplorationResult } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/logger';
 

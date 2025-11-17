@@ -71,14 +71,34 @@ class WebSocketService {
   ): void {
     if (!this.isReady()) return;
 
-    const room = createRoomName('user', userId);
-    (getIO().to(room) as any).emit(event, data);
+    // Validate inputs
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid userId in emitToUser', { userId, event });
+      return;
+    }
 
-    logger.debug('[WebSocketService] Emitted to user', {
-      userId,
-      event,
-      room,
-    });
+    if (!event || typeof event !== 'string' || event.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid event in emitToUser', { userId, event });
+      return;
+    }
+
+    try {
+      const room = createRoomName('user', userId.trim());
+      getIO().to(room).emit(event.trim(), data);
+
+      logger.debug('[WebSocketService] Emitted to user', {
+        userId,
+        event,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocketService] Error emitting to user', {
+        userId,
+        event,
+        error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+      });
+    }
   }
 
   /**
@@ -91,14 +111,34 @@ class WebSocketService {
   ): void {
     if (!this.isReady()) return;
 
-    const room = createRoomName('test', testId);
-    (getIO().to(room) as any).emit(event, data);
+    // Validate inputs
+    if (!testId || typeof testId !== 'string' || testId.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid testId in emitToTest', { testId, event });
+      return;
+    }
 
-    logger.debug('[WebSocketService] Emitted to test', {
-      testId,
-      event,
-      room,
-    });
+    if (!event || typeof event !== 'string' || event.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid event in emitToTest', { testId, event });
+      return;
+    }
+
+    try {
+      const room = createRoomName('test', testId.trim());
+      getIO().to(room).emit(event.trim(), data);
+
+      logger.debug('[WebSocketService] Emitted to test', {
+        testId,
+        event,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocketService] Error emitting to test', {
+        testId,
+        event,
+        error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+      });
+    }
   }
 
   /**
@@ -111,14 +151,34 @@ class WebSocketService {
   ): void {
     if (!this.isReady()) return;
 
-    const room = createRoomName('chat', sessionId);
-    (getIO().to(room) as any).emit(event, data);
+    // Validate inputs
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid sessionId in emitToChat', { sessionId, event });
+      return;
+    }
 
-    logger.debug('[WebSocketService] Emitted to chat', {
-      sessionId,
-      event,
-      room,
-    });
+    if (!event || typeof event !== 'string' || event.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid event in emitToChat', { sessionId, event });
+      return;
+    }
+
+    try {
+      const room = createRoomName('chat', sessionId.trim());
+      getIO().to(room).emit(event.trim(), data);
+
+      logger.debug('[WebSocketService] Emitted to chat', {
+        sessionId,
+        event,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocketService] Error emitting to chat', {
+        sessionId,
+        event,
+        error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+      });
+    }
   }
 
   /**
@@ -132,15 +192,41 @@ class WebSocketService {
   ): void {
     if (!this.isReady()) return;
 
-    const room = createRoomName(roomType, roomId);
-    (getIO().to(room) as any).emit(event, data);
+    // Validate inputs
+    if (!roomType || !['test', 'chat', 'user'].includes(roomType)) {
+      logger.warn('[WebSocketService] Invalid roomType in emitToRoom', { roomType, roomId, event });
+      return;
+    }
 
-    logger.debug('[WebSocketService] Emitted to room', {
-      roomType,
-      roomId,
-      event,
-      room,
-    });
+    if (!roomId || typeof roomId !== 'string' || roomId.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid roomId in emitToRoom', { roomType, roomId, event });
+      return;
+    }
+
+    if (!event || typeof event !== 'string' || event.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid event in emitToRoom', { roomType, roomId, event });
+      return;
+    }
+
+    try {
+      const room = createRoomName(roomType, roomId.trim());
+      getIO().to(room).emit(event.trim(), data);
+
+      logger.debug('[WebSocketService] Emitted to room', {
+        roomType,
+        roomId,
+        event,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocketService] Error emitting to room', {
+        roomType,
+        roomId,
+        event,
+        error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+      });
+    }
   }
 
   /**
@@ -152,11 +238,25 @@ class WebSocketService {
   ): void {
     if (!this.isReady()) return;
 
-    (getIO() as any).emit(event, data);
+    // Validate inputs
+    if (!event || typeof event !== 'string' || event.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid event in broadcast', { event });
+      return;
+    }
 
-    logger.debug('[WebSocketService] Broadcasted to all', {
-      event,
-    });
+    try {
+      getIO().emit(event.trim(), data);
+
+      logger.debug('[WebSocketService] Broadcasted to all', {
+        event,
+      });
+    } catch (error) {
+      logger.error('[WebSocketService] Error broadcasting', {
+        event,
+        error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+      });
+    }
   }
 
   // ============================================================================
@@ -274,8 +374,15 @@ class WebSocketService {
   public async getConnectedCount(): Promise<number> {
     if (!this.isReady()) return 0;
 
-    const sockets = await getIO().fetchSockets();
-    return sockets.length;
+    try {
+      const sockets = await getIO().fetchSockets();
+      return sockets.length;
+    } catch (error) {
+      logger.error('[WebSocketService] Error getting connected count', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 0;
+    }
   }
 
   /**
@@ -284,9 +391,23 @@ class WebSocketService {
   public async getTestSubscribers(testId: string): Promise<number> {
     if (!this.isReady()) return 0;
 
-    const room = createRoomName('test', testId);
-    const sockets = await getIO().in(room).fetchSockets();
-    return sockets.length;
+    // Validate input
+    if (!testId || typeof testId !== 'string' || testId.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid testId in getTestSubscribers', { testId });
+      return 0;
+    }
+
+    try {
+      const room = createRoomName('test', testId.trim());
+      const sockets = await getIO().in(room).fetchSockets();
+      return sockets.length;
+    } catch (error) {
+      logger.error('[WebSocketService] Error getting test subscribers', {
+        testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 0;
+    }
   }
 }
 

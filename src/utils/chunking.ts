@@ -35,6 +35,16 @@ function normalizeText(text: string): string {
  * Count tokens in text using tiktoken
  */
 export function countTokens(text: string): number {
+  // Validate input
+  if (!text || typeof text !== 'string') {
+    return 0;
+  }
+
+  // Handle empty string
+  if (text.trim().length === 0) {
+    return 0;
+  }
+
   try {
     const encoder = getEncoder();
     const tokens = encoder.encode(text);
@@ -43,7 +53,7 @@ export function countTokens(text: string): number {
   } catch (error) {
     logger.error('Token counting failed', { error });
     // Fallback: rough estimate (1 token ≈ 4 characters)
-    return Math.ceil(text.length / 4);
+    return Math.max(0, Math.ceil(text.length / 4));
   }
 }
 
@@ -76,12 +86,37 @@ export function chunkText(
     overlap?: number;
   } = {}
 ): TextChunk[] {
-  const chunkSize = options.chunkSize || CHUNK_SIZE;
-  const overlap = options.overlap || CHUNK_OVERLAP;
+  // Validate input
+  if (!text || typeof text !== 'string') {
+    logger.warn('Chunking empty or invalid text', { fileName: options.fileName });
+    return [];
+  }
+
+  // Validate and clamp chunk size
+  let chunkSize = options.chunkSize || CHUNK_SIZE;
+  if (!Number.isFinite(chunkSize) || chunkSize <= 0) {
+    logger.warn('Invalid chunkSize, using default', { chunkSize: options.chunkSize, default: CHUNK_SIZE });
+    chunkSize = CHUNK_SIZE;
+  }
+  chunkSize = Math.max(1, Math.min(chunkSize, 10000)); // Clamp between 1 and 10000
+
+  // Validate and clamp overlap
+  let overlap = options.overlap || CHUNK_OVERLAP;
+  if (!Number.isFinite(overlap) || overlap < 0) {
+    logger.warn('Invalid overlap, using default', { overlap: options.overlap, default: CHUNK_OVERLAP });
+    overlap = CHUNK_OVERLAP;
+  }
+  overlap = Math.max(0, Math.min(overlap, chunkSize - 1)); // Overlap must be less than chunk size
 
   try {
     // Normalize text before processing
     const normalizedText = normalizeText(text);
+
+    // Handle empty normalized text
+    if (!normalizedText || normalizedText.trim().length === 0) {
+      logger.warn('Normalized text is empty', { fileName: options.fileName });
+      return [];
+    }
 
     const encoder = getEncoder();
     const tokens = encoder.encode(normalizedText);
@@ -96,15 +131,31 @@ export function chunkText(
       // tiktoken's decode returns string (not Uint8Array)
       const chunkText = String(encoder.decode(chunkTokens));
 
+      // Skip empty chunks
+      const trimmedChunk = chunkText.trim();
+      if (trimmedChunk.length === 0) {
+        logger.debug('Skipping empty chunk', { chunkIndex: chunks.length, fileName: options.fileName });
+        continue;
+      }
+
+      // Calculate actual character positions in original normalized text
+      // We need to decode tokens to get the actual text position
+      const chunkStartChar = normalizedText.length > 0
+        ? Math.min(startIdx > 0 ? encoder.decode(tokens.slice(0, startIdx)).length : 0, normalizedText.length)
+        : 0;
+      const chunkEndChar = normalizedText.length > 0
+        ? Math.min(encoder.decode(chunkTokens).length + chunkStartChar, normalizedText.length)
+        : normalizedText.length;
+
       chunks.push({
-        content: chunkText.trim(),
+        content: trimmedChunk,
         chunkIndex: chunks.length,
         totalChunks: 0, // Will be set after all chunks are created
         tokenCount: chunkTokens.length,
         metadata: {
           sectionTitle: options.sectionTitle,
-          startChar: startIdx,
-          endChar: endIdx,
+          startChar: chunkStartChar,
+          endChar: chunkEndChar,
         },
       });
 
@@ -181,8 +232,26 @@ export function extractMarkdownStructure(content: string): { title: string; sect
  * Chunk markdown with structure preservation
  */
 export function chunkMarkdown(content: string, fileName: string): TextChunk[] {
+  // Validate input
+  if (!content || typeof content !== 'string') {
+    logger.warn('Chunking empty or invalid markdown content', { fileName });
+    return [];
+  }
+
+  if (!fileName || typeof fileName !== 'string') {
+    logger.warn('Invalid fileName in chunkMarkdown', { fileName });
+    fileName = 'unknown.md';
+  }
+
   // Normalize content first (especially important for .docx/.pdf conversions)
   const normalizedContent = normalizeText(content);
+
+  // Handle empty normalized content
+  if (!normalizedContent || normalizedContent.trim().length === 0) {
+    logger.warn('Normalized markdown content is empty', { fileName });
+    return [];
+  }
+
   const { title, sections } = extractMarkdownStructure(normalizedContent);
 
   if (sections.length === 0) {

@@ -1,15 +1,27 @@
-import OpenAI from 'openai';
 import { env } from '@/config/env';
-import { logger, logAIAnalysis } from '@/utils/logger';
-import { handleAIError } from '@/utils/error-handler';
 import { AISummary, BugReport, TestResult } from '@/types';
+import { handleAIError } from '@/utils/error-handler';
+import { logAIAnalysis, logger } from '@/utils/logger';
+import OpenAI from 'openai';
+
+// Constants
+const AI_TIMEOUT = 30000; // 30 seconds
+const MAX_DOM_LENGTH = 10000;
+const MAX_TOKENS_ANALYSIS = env.OPENAI_MAX_TOKENS || 2000;
+const ANALYSIS_TEMPERATURE = 0.3; // Lower for consistency
+const SUMMARY_TEMPERATURE = 0.5;
 
 export class AIService {
   private openai: OpenAI;
 
   constructor() {
+    if (!env.OPENAI_API_KEY) {
+      throw new Error('OPENAI_API_KEY is not configured');
+    }
+
     this.openai = new OpenAI({
       apiKey: env.OPENAI_API_KEY,
+      timeout: AI_TIMEOUT,
     });
   }
 
@@ -17,10 +29,23 @@ export class AIService {
    * Analyze test results and generate AI summary
    */
   async analyzeTestResults(testResult: TestResult): Promise<AISummary> {
+    // Validate input
+    if (!testResult) {
+      throw new Error('TestResult is required');
+    }
+
+    if (!testResult.testId) {
+      throw new Error('TestResult.testId is required');
+    }
+
     try {
       const startTime = Date.now();
 
-      logger.info(`Starting AI analysis for test ${testResult.testId}`);
+      logger.info('[AI_SERVICE] Starting AI analysis', {
+        testId: testResult.testId,
+        browser: testResult.browser,
+        status: testResult.status,
+      });
 
       // Prepare context for AI analysis
       const context = this.prepareAnalysisContext(testResult);
@@ -29,14 +54,22 @@ export class AIService {
       const analysis = await this.generateAnalysis(context);
 
       const duration = Date.now() - startTime;
-      logger.info(`AI analysis completed in ${duration}ms for test ${testResult.testId}`);
+      logger.info('[AI_SERVICE] Analysis completed', {
+        testId: testResult.testId,
+        duration,
+        bugsFound: analysis.bugs.length,
+        severity: analysis.severity,
+      });
 
       // Log the analysis
       logAIAnalysis(testResult.testId, analysis);
 
       return analysis;
     } catch (error) {
-      logger.error(`AI analysis failed for test ${testResult.testId}:`, error);
+      logger.error('[AI_SERVICE] Analysis failed', {
+        testId: testResult.testId,
+        error,
+      });
       throw handleAIError(error);
     }
   }
@@ -45,16 +78,22 @@ export class AIService {
    * Prepare context for AI analysis
    */
   private prepareAnalysisContext(testResult: TestResult): string {
+    // Note: URL should be passed from the job handler when fetching from DB
+    // The job handler includes tests.url via JOIN query
     const context = {
-      url: testResult.testId, // This should be the actual URL from the test
+      testId: testResult.testId,
+      // URL is not directly in TestResult - must be provided by caller from tests table
+      // This is handled in ai-analysis.job.ts via JOIN: tests(url)
       browser: testResult.browser,
       status: testResult.status,
-      errors: testResult.errors,
-      logs: testResult.logs,
-      networkLogs: testResult.networkLogs,
-      performance: testResult.performance,
+      errors: testResult.errors || [],
+      logs: testResult.logs || [],
+      networkLogs: testResult.networkLogs || [],
+      performance: testResult.performance || null,
       dom: testResult.dom ? this.truncateDOM(testResult.dom) : null,
       screenshot: testResult.screenshot ? 'Screenshot available' : 'No screenshot',
+      videoUrl: testResult.videoUrl || null,
+      traceUrl: testResult.traceUrl || null,
     };
 
     return JSON.stringify(context, null, 2);
@@ -63,17 +102,22 @@ export class AIService {
   /**
    * Truncate DOM to avoid token limits
    */
-  private truncateDOM(dom: string, maxLength: number = 10000): string {
+  private truncateDOM(dom: string, maxLength: number = MAX_DOM_LENGTH): string {
+    if (!dom || typeof dom !== 'string') {
+      return '';
+    }
+
     if (dom.length <= maxLength) {
       return dom;
     }
 
-    // Try to find a good truncation point
+    // Try to find a good truncation point at a tag boundary
     const truncated = dom.substring(0, maxLength);
     const lastTag = truncated.lastIndexOf('>');
 
+    // If we found a tag close to the end (within 20%), truncate there
     if (lastTag > maxLength * 0.8) {
-      return truncated.substring(0, lastTag + 1) + '\n... [DOM truncated]';
+      return truncated.substring(0, lastTag + 1) + '\n... [DOM truncated - showing first ' + lastTag + ' chars]';
     }
 
     return truncated + '\n... [DOM truncated]';
@@ -86,20 +130,31 @@ export class AIService {
     const systemPrompt = this.getSystemPrompt();
     const userPrompt = this.getUserPrompt(context);
 
+    logger.info('[AI_SERVICE] Calling OpenAI for analysis', {
+      model: env.OPENAI_MODEL,
+      maxTokens: MAX_TOKENS_ANALYSIS,
+      temperature: ANALYSIS_TEMPERATURE,
+    });
+
     const response = await this.openai.chat.completions.create({
       model: env.OPENAI_MODEL,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      max_tokens: env.OPENAI_MAX_TOKENS,
-      temperature: 0.3, // Lower temperature for more consistent analysis
+      max_tokens: MAX_TOKENS_ANALYSIS,
+      temperature: ANALYSIS_TEMPERATURE,
     });
 
     const content = response.choices[0]?.message?.content;
     if (!content) {
       throw new Error('No response from AI service');
     }
+
+    logger.info('[AI_SERVICE] Received AI response', {
+      contentLength: content.length,
+      tokensUsed: response.usage?.total_tokens,
+    });
 
     return this.parseAIResponse(content);
   }
@@ -180,10 +235,22 @@ If no bugs are found, return an empty bugs array but still provide recommendatio
       // Try to extract JSON from the response
       const jsonMatch = content.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
+        logger.error('[AI_SERVICE] No JSON found in AI response', {
+          contentPreview: content.substring(0, 200),
+        });
         throw new Error('No JSON found in AI response');
       }
 
-      const parsed = JSON.parse(jsonMatch[0]);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(jsonMatch[0]);
+      } catch (parseError) {
+        logger.error('[AI_SERVICE] Failed to parse JSON from AI response', {
+          jsonPreview: jsonMatch[0].substring(0, 200),
+          parseError,
+        });
+        throw new Error('Invalid JSON in AI response');
+      }
 
       // Validate and transform the response
       const bugs: BugReport[] = (parsed.bugs || []).map((bug: any, index: number) => ({
@@ -210,7 +277,7 @@ If no bugs are found, return an empty bugs array but still provide recommendatio
         generatedAt: new Date(),
       };
     } catch (error) {
-      logger.error('Failed to parse AI response:', error);
+      logger.error('[AI_SERVICE] Failed to parse AI response', { error });
 
       // Return a fallback analysis
       return {
@@ -244,6 +311,16 @@ If no bugs are found, return an empty bugs array but still provide recommendatio
    * Generate test execution summary
    */
   async generateTestSummary(testResults: TestResult[]): Promise<string> {
+    // Validate input
+    if (!testResults || !Array.isArray(testResults)) {
+      logger.error('[AI_SERVICE] Invalid test results for summary');
+      return 'Summary generation failed - invalid input';
+    }
+
+    if (testResults.length === 0) {
+      return 'No test results available';
+    }
+
     try {
       const summary = {
         totalTests: testResults.length,
@@ -254,6 +331,8 @@ If no bugs are found, return an empty bugs array but still provide recommendatio
         criticalBugs: testResults.reduce((sum, r) =>
           sum + (r.aiSummary?.bugs?.filter(b => b.severity === 'critical').length || 0), 0),
       };
+
+      logger.info('[AI_SERVICE] Generating test summary', { summary });
 
       const prompt = `Generate a concise test execution summary for the following results:
 ${JSON.stringify(summary, null, 2)}
@@ -266,12 +345,12 @@ Provide a brief, professional summary suitable for stakeholders.`;
           { role: 'user', content: prompt },
         ],
         max_tokens: 500,
-        temperature: 0.5,
+        temperature: SUMMARY_TEMPERATURE,
       });
 
       return response.choices[0]?.message?.content || 'Summary generation failed';
     } catch (error) {
-      logger.error('Failed to generate test summary:', error);
+      logger.error('[AI_SERVICE] Failed to generate test summary', { error });
       return 'Summary generation failed';
     }
   }
@@ -283,7 +362,19 @@ Provide a brief, professional summary suitable for stakeholders.`;
     bug: BugReport,
     context: { url: string; browser: string; logs: string[] }
   ): Promise<string> {
+    // Validate inputs
+    if (!bug || !context) {
+      logger.error('[AI_SERVICE] Invalid parameters for bug report');
+      return 'Bug report generation failed - invalid input';
+    }
+
     try {
+      logger.info('[AI_SERVICE] Generating bug report', {
+        bugId: bug.id,
+        severity: bug.severity,
+        category: bug.category,
+      });
+
       const prompt = `Generate a detailed bug report for the following issue:
 
 Bug: ${bug.title}
@@ -312,7 +403,7 @@ Generate a professional bug report suitable for development teams.`;
 
       return response.choices[0]?.message?.content || 'Bug report generation failed';
     } catch (error) {
-      logger.error('Failed to generate bug report:', error);
+      logger.error('[AI_SERVICE] Failed to generate bug report', { error, bugId: bug?.id });
       return 'Bug report generation failed';
     }
   }
@@ -321,6 +412,7 @@ Generate a professional bug report suitable for development teams.`;
    * Health check for AI service
    */
   async healthCheck(): Promise<{ status: string; latency: number }> {
+    logger.info('[AI_SERVICE] Running health check');
     const startTime = Date.now();
 
     try {

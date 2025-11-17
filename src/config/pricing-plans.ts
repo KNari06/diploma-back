@@ -242,6 +242,104 @@ export const PRICING_METADATA: PricingMetadata = {
 };
 
 /**
+ * Validate and calculate price_per_credit if not accurate
+ * @param credits - Number of credits
+ * @param price - Price in currency
+ * @returns Calculated price per credit
+ */
+function calculatePricePerCredit(credits: number, price: number): number {
+  if (credits <= 0 || price < 0) {
+    return 0;
+  }
+  // Round to 4 decimal places for precision
+  return Math.round((price / credits) * 10000) / 10000;
+}
+
+/**
+ * Calculate savings relative to base price per credit
+ * @param basePricePerCredit - Base price per credit (from default option)
+ * @param currentPricePerCredit - Current price per credit
+ * @param credits - Number of credits
+ * @returns Savings in currency units
+ */
+function calculateSavings(basePricePerCredit: number, currentPricePerCredit: number, credits: number): number {
+  if (basePricePerCredit <= 0 || credits <= 0) {
+    return 0;
+  }
+  const savingsPerCredit = basePricePerCredit - currentPricePerCredit;
+  const totalSavings = savingsPerCredit * credits;
+  // Round to nearest dollar
+  return Math.round(totalSavings);
+}
+
+/**
+ * Validate pricing plans for consistency
+ */
+export function validatePricingPlans(): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+
+  for (const plan of PRICING_PLANS) {
+    // Find default option
+    const defaultOption = plan.credit_options.find(opt => opt.is_default);
+    if (!defaultOption) {
+      errors.push(`Plan ${plan.id} has no default credit option`);
+      continue;
+    }
+
+    // Skip validation for enterprise (unlimited)
+    if (defaultOption.credits === -1 && defaultOption.price === -1) {
+      continue;
+    }
+
+    const basePricePerCredit = defaultOption.price_per_credit;
+
+    for (const option of plan.credit_options) {
+      // Skip unlimited options
+      if (option.credits === -1 && option.price === -1) {
+        continue;
+      }
+
+      // Validate price_per_credit calculation
+      const calculatedPricePerCredit = calculatePricePerCredit(option.credits, option.price);
+      const expectedPricePerCredit = Math.round(calculatedPricePerCredit * 1000) / 1000; // Round to 3 decimals
+      const actualPricePerCredit = Math.round(option.price_per_credit * 1000) / 1000;
+
+      // Allow 0.001 difference for rounding
+      if (Math.abs(expectedPricePerCredit - actualPricePerCredit) > 0.001) {
+        errors.push(
+          `Plan ${plan.id}, option ${option.credits} credits: price_per_credit mismatch. ` +
+          `Expected: ${expectedPricePerCredit}, Actual: ${actualPricePerCredit}`
+        );
+      }
+
+      // Validate savings calculation (only for non-default options)
+      if (!option.is_default && basePricePerCredit > 0) {
+        const calculatedSavings = calculateSavings(
+          basePricePerCredit,
+          option.price_per_credit,
+          option.credits
+        );
+        const expectedSavings = calculatedSavings;
+        const actualSavings = option.savings || 0;
+
+        // Allow $1 difference for rounding
+        if (Math.abs(expectedSavings - actualSavings) > 1) {
+          errors.push(
+            `Plan ${plan.id}, option ${option.credits} credits: savings mismatch. ` +
+            `Expected: $${expectedSavings}, Actual: $${actualSavings}`
+          );
+        }
+      }
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
+}
+
+/**
  * Get plan by ID
  */
 export function getPlanById(planId: string): PricingPlan | undefined {

@@ -10,9 +10,9 @@ import { Server as SocketIOServer } from 'socket.io';
 import { handleConnection } from './handlers/connection.handler';
 import { authenticateSocket } from './middleware';
 import {
-    ClientToServerEvents,
-    ServerToClientEvents,
-    SocketData,
+  ClientToServerEvents,
+  ServerToClientEvents,
+  SocketData,
 } from './types';
 
 let io: SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, SocketData> | null = null;
@@ -23,12 +23,30 @@ let io: SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, Socke
 export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
   logger.info('[WebSocket] Initializing WebSocket server...');
 
+  // Parse CORS origins
+  let corsOrigin: boolean | string[] = false;
+  if (isDevelopment) {
+    corsOrigin = true;
+  } else if (process.env.ALLOWED_ORIGINS) {
+    try {
+      const origins = process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean);
+      if (origins.length > 0) {
+        corsOrigin = origins;
+      }
+    } catch (error) {
+      logger.warn('[WebSocket] Failed to parse ALLOWED_ORIGINS, disabling CORS', {
+        error: error instanceof Error ? error.message : String(error),
+        ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
+      });
+    }
+  }
+
   // Create Socket.IO server with typed events
   io = new SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, SocketData>(
     httpServer,
     {
       cors: {
-        origin: isDevelopment ? true : process.env.ALLOWED_ORIGINS?.split(',') || false,
+        origin: corsOrigin,
         credentials: true,
         methods: ['GET', 'POST'],
       },
@@ -99,16 +117,44 @@ export const isWebSocketInitialized = (): boolean => {
  */
 export const shutdownWebSocket = async (): Promise<void> => {
   if (!io) {
+    logger.debug('[WebSocket] WebSocket server already closed or not initialized');
     return;
   }
 
   logger.info('[WebSocket] Shutting down WebSocket server...');
 
-  return new Promise((resolve) => {
-    io!.close(() => {
-      logger.info('[WebSocket] WebSocket server closed');
-      io = null;
+  // Save reference to avoid null check issues in callback
+  const serverInstance = io;
+
+  return new Promise((resolve, reject) => {
+    // Double-check server instance exists
+    if (!serverInstance) {
+      logger.debug('[WebSocket] Server instance is null, resolving immediately');
       resolve();
-    });
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      logger.warn('[WebSocket] WebSocket shutdown timeout, forcing close');
+      io = null;
+      reject(new Error('WebSocket shutdown timeout'));
+    }, 10000); // 10 second timeout
+
+    try {
+      serverInstance.close(() => {
+        clearTimeout(timeout);
+        logger.info('[WebSocket] WebSocket server closed');
+        io = null;
+        resolve();
+      });
+    } catch (error) {
+      clearTimeout(timeout);
+      logger.error('[WebSocket] Error during shutdown', {
+        error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+      });
+      io = null;
+      reject(error);
+    }
   });
 };

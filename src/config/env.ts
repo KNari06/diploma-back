@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { z } from 'zod';
 
@@ -81,9 +82,8 @@ if (!parseResult.success) {
 
 // Generate secrets for development if not provided
 let parsedEnv = parseResult.data;
-const crypto = require('crypto');
 
-if (process.env.NODE_ENV === 'development') {
+if (parsedEnv.NODE_ENV === 'development') {
   if (!parsedEnv.JWT_SECRET) {
     parsedEnv.JWT_SECRET = crypto.randomBytes(32).toString('hex');
     console.log('⚠️  JWT_SECRET not provided, generated random secret for development');

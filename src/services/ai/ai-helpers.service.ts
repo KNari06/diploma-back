@@ -20,14 +20,26 @@ export async function detectUserApproval(
   confidence: number; // 0.0-1.0
   reasoning?: string;
 }> {
+  // Validate input
+  if (!userMessage || typeof userMessage !== 'string') {
+    logger.warn('[APPROVAL_DETECT] Invalid input message', { userMessage });
+    return { approved: null, confidence: 0.0, reasoning: 'Invalid input' };
+  }
+
+  const trimmedMessage = userMessage.trim();
+  if (trimmedMessage.length === 0) {
+    logger.warn('[APPROVAL_DETECT] Empty message');
+    return { approved: null, confidence: 0.0, reasoning: 'Empty message' };
+  }
+
   try {
     logger.info('🔍 [APPROVAL_DETECT] Starting detection', {
-      message: userMessage,
-      length: userMessage.length,
+      message: trimmedMessage,
+      length: trimmedMessage.length,
     });
 
     // Use centralized prompt
-    const prompt = buildApprovalDetectionPrompt(userMessage);
+    const prompt = buildApprovalDetectionPrompt(trimmedMessage);
 
     const response = await getChatCompletionWithMessages([
       {
@@ -45,10 +57,25 @@ export async function detectUserApproval(
     });
 
     logger.info('🔍 [APPROVAL_DETECT] AI response received', {
-      rawContent: response.content,
+      rawContent: response.content?.substring(0, 100),
     });
 
-    const parsed = JSON.parse(response.content);
+    // Safe JSON parsing
+    let parsed: any;
+    try {
+      parsed = JSON.parse(response.content);
+    } catch (parseError) {
+      logger.error('[APPROVAL_DETECT] Failed to parse AI response', {
+        response: response.content?.substring(0, 200),
+        parseError,
+      });
+      throw new Error('Invalid JSON response from AI');
+    }
+
+    // Validate parsed response structure
+    if (typeof parsed !== 'object' || parsed === null) {
+      throw new Error('AI response is not a valid object');
+    }
 
     logger.info('✅ [APPROVAL_DETECT] User approval detected by AI', {
       approved: parsed.approved,
@@ -65,7 +92,7 @@ export async function detectUserApproval(
     logger.error('❌ [APPROVAL_DETECT] AI detection failed, using fallback', { error });
 
     // Fallback: simple keyword matching
-    const message = userMessage.toLowerCase().trim();
+    const message = trimmedMessage.toLowerCase();
 
     const approvalKeywords = ['да', 'yes', 'ok', 'ок', 'го', 'давай', 'запускай', 'погнали', 'валим', 'sure', 'run', 'execute', 'start', 'согласен', 'одобряю', 'approve', 'confirm', 'good', 'fine', 'хорошо', 'делай', 'начинай', 'тестируй', '+', '✅', '👍'];
     const rejectionKeywords = ['нет', 'no', 'не надо', "don't", 'stop', 'cancel', 'отмена', 'потом', 'later', 'not now', 'maybe', 'подожди', 'отклоняю', 'reject', 'пас', 'skip', 'нет спасибо', '-', '❌', '👎'];
@@ -102,8 +129,14 @@ export async function detectLoginPage(
   baseUrl: string,
   page: Page
 ): Promise<string | null> {
+  // Validate inputs
+  if (!baseUrl || !page) {
+    logger.error('[LOGIN_DETECT] Invalid parameters', { hasBaseUrl: !!baseUrl, hasPage: !!page });
+    return null;
+  }
+
   try {
-    logger.info('Detecting login page with AI', { baseUrl });
+    logger.info('[LOGIN_DETECT] Starting login page detection', { baseUrl });
 
     // First try hardcoded paths (fast + free)
     const commonPaths = ['/login', '/signin', '/auth/login', '/account/login', '/log-in', '/sign-in'];
@@ -203,8 +236,14 @@ export async function validateSelector(
   suggestion?: string;
   reasoning?: string;
 }> {
+  // Validate inputs
+  if (!selector || !elementPurpose) {
+    logger.warn('[SELECTOR_VALIDATE] Missing required parameters', { selector, elementPurpose });
+    return { isValid: false, confidence: 0.0, reasoning: 'Missing required parameters' };
+  }
+
   try {
-    logger.info('Validating selector with AI', { selector, elementPurpose });
+    logger.info('[SELECTOR_VALIDATE] Starting validation', { selector, elementPurpose });
 
     const prompt = `You are a Playwright selector expert.
 

@@ -7,11 +7,11 @@ import { logger } from '@/utils/logger';
 import { Socket } from 'socket.io';
 import { getUserId } from '../middleware';
 import {
-    ClientToServerEvents,
-    createRoomName,
-    ErrorPayload,
-    ServerToClientEvents,
-    SocketData,
+  ClientToServerEvents,
+  createRoomName,
+  ErrorPayload,
+  ServerToClientEvents,
+  SocketData,
 } from '../types';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
@@ -57,11 +57,42 @@ const cleanupSubscriptions = (socketId: string): void => {
  * Handle subscription events
  */
 export const handleSubscriptions = (socket: TypedSocket): void => {
-  const userId = getUserId(socket);
+  // Get userId safely (may fail if socket is not authenticated)
+  let userId: string | undefined;
+  try {
+    userId = getUserId(socket);
+  } catch {
+    userId = undefined;
+  }
 
   // Subscribe to test updates
   socket.on('subscribe:test', ({ testId }) => {
     try {
+      // Validate input
+      if (!testId || typeof testId !== 'string' || testId.trim().length === 0) {
+        logger.warn('[WebSocket] Invalid testId in subscribe:test', {
+          socketId: socket.id,
+          userId: userId || 'anonymous',
+          testId,
+        });
+        socket.emit('error', {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid testId provided',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Check if socket is still connected
+      if (!socket.connected) {
+        logger.debug('[WebSocket] Socket disconnected, ignoring subscribe:test', {
+          socketId: socket.id,
+          userId: userId || 'anonymous',
+          testId,
+        });
+        return;
+      }
+
       if (!canSubscribe(socket.id)) {
         const errorPayload: ErrorPayload = {
           code: 'SUBSCRIPTION_LIMIT',
@@ -72,7 +103,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         return;
       }
 
-      const room = createRoomName('test', testId);
+      const room = createRoomName('test', testId.trim());
       socket.join(room);
       incrementSubscriptions(socket.id);
 
@@ -85,7 +116,9 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
     } catch (error) {
       logger.error('[WebSocket] Error in subscribe:test', {
         socketId: socket.id,
+        userId: userId || 'anonymous',
         error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
       });
       socket.emit('error', {
         code: 'SUBSCRIPTION_ERROR',
@@ -98,7 +131,17 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
   // Unsubscribe from test updates
   socket.on('unsubscribe:test', ({ testId }) => {
     try {
-      const room = createRoomName('test', testId);
+      // Validate input
+      if (!testId || typeof testId !== 'string' || testId.trim().length === 0) {
+        logger.warn('[WebSocket] Invalid testId in unsubscribe:test', {
+          socketId: socket.id,
+          userId: userId || 'anonymous',
+          testId,
+        });
+        return;
+      }
+
+      const room = createRoomName('test', testId.trim());
       socket.leave(room);
       decrementSubscriptions(socket.id);
 
@@ -111,7 +154,9 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
     } catch (error) {
       logger.error('[WebSocket] Error in unsubscribe:test', {
         socketId: socket.id,
+        userId: userId || 'anonymous',
         error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
       });
     }
   });
@@ -119,6 +164,31 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
   // Subscribe to chat updates
   socket.on('subscribe:chat', ({ sessionId }) => {
     try {
+      // Validate input
+      if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+        logger.warn('[WebSocket] Invalid sessionId in subscribe:chat', {
+          socketId: socket.id,
+          userId: userId || 'anonymous',
+          sessionId,
+        });
+        socket.emit('error', {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid sessionId provided',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Check if socket is still connected
+      if (!socket.connected) {
+        logger.debug('[WebSocket] Socket disconnected, ignoring subscribe:chat', {
+          socketId: socket.id,
+          userId: userId || 'anonymous',
+          sessionId,
+        });
+        return;
+      }
+
       if (!canSubscribe(socket.id)) {
         const errorPayload: ErrorPayload = {
           code: 'SUBSCRIPTION_LIMIT',
@@ -129,7 +199,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         return;
       }
 
-      const room = createRoomName('chat', sessionId);
+      const room = createRoomName('chat', sessionId.trim());
       socket.join(room);
       incrementSubscriptions(socket.id);
 
@@ -142,7 +212,9 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
     } catch (error) {
       logger.error('[WebSocket] Error in subscribe:chat', {
         socketId: socket.id,
+        userId: userId || 'anonymous',
         error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
       });
       socket.emit('error', {
         code: 'SUBSCRIPTION_ERROR',
@@ -155,7 +227,17 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
   // Unsubscribe from chat updates
   socket.on('unsubscribe:chat', ({ sessionId }) => {
     try {
-      const room = createRoomName('chat', sessionId);
+      // Validate input
+      if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+        logger.warn('[WebSocket] Invalid sessionId in unsubscribe:chat', {
+          socketId: socket.id,
+          userId: userId || 'anonymous',
+          sessionId,
+        });
+        return;
+      }
+
+      const room = createRoomName('chat', sessionId.trim());
       socket.leave(room);
       decrementSubscriptions(socket.id);
 
@@ -168,13 +250,22 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
     } catch (error) {
       logger.error('[WebSocket] Error in unsubscribe:chat', {
         socketId: socket.id,
+        userId: userId || 'anonymous',
         error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
       });
     }
   });
 
   // Cleanup on disconnect
   socket.on('disconnect', () => {
-    cleanupSubscriptions(socket.id);
+    try {
+      cleanupSubscriptions(socket.id);
+    } catch (error) {
+      logger.error('[WebSocket] Error cleaning up subscriptions on disconnect', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 };

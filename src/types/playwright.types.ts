@@ -1,59 +1,70 @@
 // Playwright test visualization types
+//
+// NOTE: This type is used for TEST VISUALIZATION (graph generation, UI display)
+// It includes control flow types (if, loop, etc.) that are NOT executable actions
+//
+// For executable commands, see PlaywrightActionType in index.ts
+// PlaywrightActionType is a subset of PlaywrightStepType (without control flow)
 
-// All possible step types
+// All possible step types for visualization
 export type PlaywrightStepType =
   // Navigation
-  | 'goto'
-  | 'goBack'
-  | 'goForward'
-  | 'reload'
+  | 'goto'              // Navigate to URL
+  | 'goBack'            // Navigate back in history
+  | 'goForward'         // Navigate forward in history
+  | 'reload'            // Reload current page
   // Interactions
-  | 'click'
-  | 'dblclick'
-  | 'fill'
-  | 'type'
-  | 'hover'
-  | 'check'
-  | 'uncheck'
-  | 'selectOption'
-  | 'press'
-  | 'focus'
-  | 'blur'
-  // Drag & Drop / Touch
-  | 'dragAndDrop'
-  | 'swipe'
-  | 'tap'
+  | 'click'             // Click element
+  | 'dblclick'          // Double-click element
+  | 'fill'              // Fill input field (fast)
+  | 'type'              // Type text (with events)
+  | 'hover'             // Hover over element
+  | 'check'             // Check checkbox
+  | 'uncheck'           // Uncheck checkbox
+  | 'select'            // Select from dropdown (alias, maps to selectOption)
+  | 'selectOption'      // Select option from dropdown/select element
+  | 'press'             // Press keyboard key
+  | 'focus'             // Focus element
+  | 'blur'              // Blur element
+  // Drag & Drop / Touch (Mobile)
+  | 'dragAndDrop'       // Drag and drop element
+  | 'swipe'             // Swipe gesture (mobile)
+  | 'tap'               // Tap gesture (mobile)
   // Wait & Scroll
-  | 'waitForSelector'
-  | 'waitForTimeout'
-  | 'waitForLoadState'
-  | 'waitForNavigation'
-  | 'scroll'
-  | 'scrollIntoView'
+  | 'wait'              // Wait for timeout (ms)
+  | 'waitForSelector'   // Wait for element to appear
+  | 'waitForTimeout'    // Wait for specific timeout (alias for wait)
+  | 'waitForLoadState'  // Wait for page load state
+  | 'waitForNavigation' // Wait for page navigation
+  | 'scroll'            // Scroll page/element
+  | 'scrollIntoView'    // Scroll element into view
   // File operations
-  | 'upload'
-  | 'download'
-  | 'screenshot'
+  | 'upload'            // Upload file
+  | 'download'          // Download file (read-only)
+  | 'screenshot'        // Take screenshot
   // Assertions
-  | 'assert'
-  | 'expect'
-  | 'assertVisible'
-  | 'assertHidden'
-  | 'assertEnabled'
-  | 'assertDisabled'
-  | 'assertText'
-  | 'assertValue'
-  | 'assertCount'
-  // Control flow
-  | 'if'
-  | 'else'
-  | 'loop'
-  | 'while'
-  | 'forEach'
-  // Custom
-  | 'custom'
-  | 'script'
-  | 'evaluate';
+  | 'assert'            // Generic assertion (visualization only)
+  | 'expect'            // Generic expectation (visualization only)
+  | 'assertVisible'     // Assert element is visible
+  | 'assertHidden'      // Assert element is hidden
+  | 'assertEnabled'     // Assert element is enabled
+  | 'assertDisabled'    // Assert element is disabled
+  | 'assertText'        // Assert element contains text
+  | 'assertValue'       // Assert input has value
+  | 'assertUrl'         // Assert current URL matches
+  | 'assertCount'       // Assert number of elements
+  // Data extraction & evaluation
+  | 'extract'           // Extract data from element
+  | 'evaluate'          // Execute JS in browser context
+  | 'script'            // Execute custom script (alias for evaluate)
+  // Control flow (VISUALIZATION ONLY - not executable)
+  | 'if'                // Conditional branch (if statement)
+  | 'else'              // Else branch (not a standalone action)
+  | 'loop'              // Loop block
+  | 'while'             // While loop
+  | 'forEach'           // ForEach loop
+  // Custom/Unknown (for visualization of unsupported actions)
+  | 'custom'            // Custom/unknown action
 
 // Base step interface
 export interface PlaywrightStep {

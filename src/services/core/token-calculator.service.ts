@@ -68,7 +68,10 @@ export class TokenCalculatorService {
    * @returns Credits to charge (rounded up)
    */
   static tokensToCredits(tokens: number): number {
-    if (tokens <= 0) return 0;
+    // Validate input
+    if (!Number.isFinite(tokens) || tokens <= 0) {
+      return 0;
+    }
 
     const credits = tokens / TOKENS_PER_CREDIT;
 
@@ -82,6 +85,11 @@ export class TokenCalculatorService {
    * @returns Equivalent tokens
    */
   static creditsToTokens(credits: number): number {
+    // Validate input
+    if (!Number.isFinite(credits) || credits < 0) {
+      return 0;
+    }
+
     return credits * TOKENS_PER_CREDIT;
   }
 
@@ -97,6 +105,19 @@ export class TokenCalculatorService {
     outputTokens: number,
     model: 'gpt-4o' | 'gpt-4o-mini'
   ): number {
+    // Validate inputs
+    if (!Number.isFinite(inputTokens) || inputTokens < 0) {
+      inputTokens = 0;
+    }
+    if (!Number.isFinite(outputTokens) || outputTokens < 0) {
+      outputTokens = 0;
+    }
+
+    if (!MODEL_PRICING[model]) {
+      logger.warn('[TOKEN_CALCULATOR] Unknown model, using gpt-4o-mini', { model });
+      model = 'gpt-4o-mini';
+    }
+
     const pricing = MODEL_PRICING[model];
 
     const inputCost = (inputTokens / 1000) * pricing.input;
@@ -111,6 +132,11 @@ export class TokenCalculatorService {
    * @returns Credits to charge
    */
   static calculateCreditsFromCost(costUSD: number): number {
+    // Validate input
+    if (!Number.isFinite(costUSD) || costUSD <= 0) {
+      return 0;
+    }
+
     // Convert cost to tokens first (using average $0.008 per 1K tokens)
     const averageCostPerToken = 0.008 / 1000;
     const equivalentTokens = costUSD / averageCostPerToken;
@@ -142,10 +168,16 @@ export class TokenCalculatorService {
 
   /**
    * Estimate credits for an intelligent test
-   * @param estimatedPages - Estimated pages to visit
+   * @param estimatedPages - Estimated pages to visit (default: 5, min: 1)
    * @returns Estimated credits
    */
   static estimateIntelligentTestCredits(estimatedPages: number = 5): number {
+    // Validate and clamp estimatedPages
+    if (!Number.isFinite(estimatedPages) || estimatedPages < 1) {
+      estimatedPages = 5; // Default to 5 pages
+    }
+    estimatedPages = Math.max(1, Math.floor(estimatedPages)); // Ensure integer >= 1
+
     // Average: 1,400 tokens per page (700 screenshot + 300 DOM + 200 prompt + 200 response)
     const tokensPerPage = 1400;
     const totalTokens = estimatedPages * tokensPerPage;
@@ -165,6 +197,11 @@ export class TokenCalculatorService {
    * @returns Formatted string
    */
   static formatCredits(credits: number): string {
+    // Validate input
+    if (!Number.isFinite(credits)) {
+      return '0';
+    }
+
     return credits.toLocaleString('en-US');
   }
 
@@ -198,6 +235,11 @@ export class TokenCalculatorService {
     standard: number;
     api: number;
   } {
+    // Validate input
+    if (!Number.isFinite(credits) || credits < 0) {
+      credits = 0;
+    }
+
     return {
       intelligent: Math.floor(credits / TEST_CREDITS.INTELLIGENT),
       standard: Math.floor(credits / TEST_CREDITS.STANDARD),
@@ -215,6 +257,11 @@ export class TokenCalculatorService {
     availableCredits: number,
     testType: 'intelligent' | 'standard' | 'api' | 'chat'
   ): boolean {
+    // Validate input
+    if (!Number.isFinite(availableCredits) || availableCredits < 0) {
+      availableCredits = 0;
+    }
+
     const requiredCredits = this.getTestCreditCost(testType);
     return availableCredits >= requiredCredits;
   }

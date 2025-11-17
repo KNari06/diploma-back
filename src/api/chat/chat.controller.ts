@@ -4,10 +4,23 @@ import { Request, Response } from 'express';
 
 // New services
 import { WorkspaceService } from '@/services/core/workspace.service';
-import { ApiTestPlanService } from '@/services/testing/api-test-plan.service';
-import { TestChatMappingService } from '@/services/testing/test-chat-mapping.service';
-import { UiTestPlanService } from '@/services/testing/ui-test-plan.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
+
+// Testing services - API
+import { ApiTestPlanService } from '@/services/testing/api/api-test-plan.service';
+import { executeApiTest } from '@/services/testing/api/apiTest.service';
+import { ApiFuzzingExecutorService } from '@/services/testing/api/fuzzing/api-fuzzing-executor.service';
+import { IntelligentApiFuzzerService } from '@/services/testing/api/fuzzing/intelligent-api-fuzzer.service';
+
+// Testing services - UI
+import { confirmTestPlan, requestMissingInformation, runAutonomousExploration } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
+import { ManualTestService } from '@/services/testing/ui/manualTest.service';
+
+// Testing services - Plans
+import { getLatestPendingTestPlan, getTestPlan, saveTestPlan } from '@/services/testing/plans/exploration-cache.service';
+
+// Testing services - Shared
+import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 
 // Existing services
 import { detectUserApproval } from '@/services/ai/ai-helpers.service';
@@ -19,13 +32,6 @@ import { TokenCalculatorService } from '@/services/core/token-calculator.service
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { detectLanguage, searchKB } from '@/services/kb/kb.service';
 import { RulesCacheService } from '@/services/kb/rules-cache.service';
-import { ApiFuzzingExecutorService } from '@/services/testing/api-fuzzing-executor.service';
-import { executeApiTest } from '@/services/testing/apiTest.service';
-import { confirmTestPlan, requestMissingInformation } from '@/services/testing/autonomous-orchestrator.service';
-import { getLatestPendingTestPlan, getTestPlan, saveTestPlan } from '@/services/testing/exploration-cache.service';
-import { IntelligentApiFuzzerService } from '@/services/testing/intelligent-api-fuzzer.service';
-import { ManualTestService } from '@/services/testing/manualTest.service';
-import { formatTestPlanForConfirmation } from '@/services/testing/test-plan-generator.service';
 import { ChatService } from '@/services/utils/chat.service';
 
 // Types
@@ -687,23 +693,60 @@ async function handlePlatformTest(
     checkTimeout();
 
   // ═══════════════════════════════════════════════════════════════════════
-    // STEP 1: VALIDATE URL + SCOPE (FIX #5: Safe URL extraction)
+    // STEP 1: PROCESS ANSWERS (if user provided them)
   // ═══════════════════════════════════════════════════════════════════════
 
-    // FIX #5: Safe URL extraction without undefined function
+  let parsedAnswers: any = null;
+
+  // ✅ FIX: Parse user answers if they were provided
+  if (answers && typeof answers === 'object' && !Array.isArray(answers)) {
+    logger.info('[PLATFORM_TEST] Processing user answers', {
+      answerKeys: Object.keys(answers),
+      hasCredentials: !!answers.credentials,
+      hasUrl: !!answers.url,
+    });
+
+    try {
+      // Import parseAnswers from question-generator
+      const { parseAnswers } = await import('@/services/utils/question-generator.service');
+      parsedAnswers = parseAnswers(answers);
+
+      logger.info('[PLATFORM_TEST] Parsed answers successfully', {
+        hasUrl: !!parsedAnswers.url,
+        hasScope: !!parsedAnswers.scope,
+        needsAuth: parsedAnswers.needsAuth,
+        hasCredentials: !!parsedAnswers.credentials,
+      });
+    } catch (parseError) {
+      logger.error('[PLATFORM_TEST] Failed to parse answers', {
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+        answers: JSON.stringify(answers).substring(0, 100),
+      });
+      // Continue without parsed answers (will re-ask if needed)
+      parsedAnswers = null;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+    // STEP 2: VALIDATE URL + SCOPE (FIX #5: Safe URL extraction)
+  // ═══════════════════════════════════════════════════════════════════════
+
+    // FIX #5: Safe URL extraction with priority: answers > parsedIntent > session
     const extractedUrl =
+      parsedAnswers?.url ||
       parsedIntent?.page ||
       sessionProject?.settings?.main_url ||
       null;
 
   const hasUrl = !!extractedUrl;
-  const hasScope = !!parsedIntent?.scope;
+  const hasScope = !!(parsedAnswers?.scope || parsedIntent?.scope);
 
     logger.info('[PLATFORM_TEST] Validation check', {
       hasUrl,
       hasScope,
       extractedUrl: extractedUrl || 'none',
-      scope: parsedIntent?.scope || 'none',
+      scope: parsedAnswers?.scope || parsedIntent?.scope || 'none',
+      fromAnswers: !!parsedAnswers,
     });
 
     // If missing info, ask questions
@@ -794,68 +837,152 @@ async function handlePlatformTest(
     checkTimeout();
 
   // ═══════════════════════════════════════════════════════════════════════
-    // STEP 3: CHECK FOR SAVED CREDENTIALS (FIX #1: Error handling)
+    // STEP 3: HANDLE CREDENTIALS (from answers OR saved in DB)
   // ═══════════════════════════════════════════════════════════════════════
 
-    let savedCredentials: any = null;
-    try {
-      savedCredentials = await ProjectContextService.getProjectCredentials(project_id, userId);
+  let finalCredentials: any = null;
 
-  if (savedCredentials) {
-    logger.info('[PLATFORM_TEST] Found saved credentials', { project_id });
+  // Priority 1: Credentials from user answers (fresh input)
+  if (parsedAnswers?.credentials) {
+    logger.info('[PLATFORM_TEST] Using credentials from user answers');
+    finalCredentials = parsedAnswers.credentials;
+  }
+  // Priority 2: Saved credentials from DB
+  else {
+    try {
+      const savedCredentials = await ProjectContextService.getProjectCredentials(project_id, userId);
+
+      if (savedCredentials) {
+        logger.info('[PLATFORM_TEST] Found saved credentials in DB', { project_id });
+        finalCredentials = savedCredentials;
       }
     } catch (error) {
-      logger.warn('[PLATFORM_TEST] Failed to get credentials, continuing without them', {
+      logger.warn('[PLATFORM_TEST] Failed to get saved credentials', {
         error: error instanceof Error ? error.message : String(error),
       });
-      savedCredentials = null;
+      finalCredentials = null;
+    }
+  }
+
+  // Determine if authentication is needed
+  const needsAuth = parsedAnswers?.needsAuth ?? !!finalCredentials;
+
+    checkTimeout();
+
+  // ═══════════════════════════════════════════════════════════════════════
+    // ✅ NEW STEP 4: RUN AUTONOMOUS EXPLORATION + GENERATE REAL TEST PLAN
+    // Replaces UiTestPlanService with real browser-based exploration
+  // ═══════════════════════════════════════════════════════════════════════
+
+    emitProcessingStep(chatSessionId, 'generating_plan', '🔍 Analyzing page with real browser...', 50);
+
+    // Determine scope: from answers > from parsedIntent
+    const finalScope = parsedAnswers?.scope || parsedIntent.scope;
+
+    logger.info('[PLATFORM_TEST] Starting autonomous exploration', {
+      url: extractedUrl,
+      scope: finalScope,
+      hasCredentials: !!finalCredentials,
+      needsAuth,
+      fromAnswers: !!parsedAnswers,
+    });
+
+    // ✅ Run autonomous exploration: Launch browser → Analyze real page → Generate accurate plan
+    let exploration, testPlan, formattedPlan;
+
+    try {
+      const result = await runAutonomousExploration({
+        userMessage: message,
+        answers: {
+          url: extractedUrl,
+          scope: finalScope,
+          target: parsedIntent.target,
+          credentials: finalCredentials,
+          needsAuth,
+          additionalInfo: {
+            projectName: sessionProject?.name,
+            ...(parsedAnswers?.additionalInfo || {}),
+          },
+        },
+        userId,
+        projectId: project_id,
+        sessionId: chatSessionId,
+      });
+
+      exploration = result.exploration;
+      testPlan = result.testPlan;
+      formattedPlan = result.message;
+
+    } catch (explorationError) {
+      const errorMsg = explorationError instanceof Error ? explorationError.message : String(explorationError);
+
+      // ✅ FIX: Check if error is about missing credentials
+      if (errorMsg.includes('Authentication required') || errorMsg.includes('credentials')) {
+        logger.info('[PLATFORM_TEST] Auth required, asking for credentials', {
+          url: extractedUrl,
+          originalError: errorMsg,
+        });
+
+        // Re-ask with credentials question
+        try {
+          const result = await requestMissingInformation(message, {
+            hasUrl: true,
+            hasScope: true,
+            hasCredentials: false, // ← Force credentials question
+            intent: 'platform_test',
+            userProjects,
+          });
+
+          // Save to history
+          if (chatSessionId) {
+            ChatService.saveChatMessages(chatSessionId, [
+              { role: 'user', content: message },
+              {
+                role: 'ai',
+                content: '🔐 This site requires authentication. Please provide your credentials:',
+                metadata: {
+                  questions: result.questions,
+                  conversationId: result.conversationId,
+                  requiresAnswers: true,
+                },
+              },
+            ]).catch(saveError => {
+              logger.error('[PLATFORM_TEST] Failed to save credential request', {
+                error: saveError instanceof Error ? saveError.message : String(saveError),
+              });
+            });
+          }
+
+          res.json({
+            reply: '🔐 This site requires authentication. Please provide your credentials:',
+            questions: result.questions,
+            conversationId: result.conversationId,
+            timestamp: new Date().toISOString(),
+            sessionId: chatSessionId,
+          });
+          return;
+
+        } catch (reqError) {
+          logger.error('[PLATFORM_TEST] Failed to request credentials', {
+            error: reqError instanceof Error ? reqError.message : String(reqError),
+          });
+          // Fall through to generic error handler
+        }
+      }
+
+      // Re-throw if not a credentials error
+      throw explorationError;
     }
 
-    checkTimeout();
-
-  // ═══════════════════════════════════════════════════════════════════════
-    // NEW STEP 4: GENERATE TEST PLAN (FIX #2: Proper approval flow!)
-  // ═══════════════════════════════════════════════════════════════════════
-
-    emitProcessingStep(chatSessionId, 'generating_plan', '📋 Creating AI test plan...', 60);
-
-    // ✅ NEW: Generate intelligent UI test plan using AI (replaces hardcoded plan)
-    const testPlan = await UiTestPlanService.generateUiTestPlan({
-      url: extractedUrl,
-      scope: parsedIntent.scope,
-      target: parsedIntent.target,
-      userMessage: message,
-      hasCredentials: !!savedCredentials,
-      projectContext: sessionProject ? {
-        name: sessionProject.name,
-        // TODO: Add previousTests and knownIssues from project history
-      } : undefined,
-    });
-
-    checkTimeout();
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // NEW STEP 5: SAVE TEST PLAN FOR APPROVAL (FIX #2)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    // Save test plan (explorationId is optional, not needed for UI tests)
-    await saveTestPlan(testPlan, userId, project_id);
-
-    logger.info('[PLATFORM_TEST] Test plan saved for approval', {
+    logger.info('[PLATFORM_TEST] Autonomous exploration completed', {
       planId: testPlan.id,
-      url: extractedUrl,
-      scope: parsedIntent.scope,
+      explorationId: exploration.timestamp,
+      stepsCount: testPlan.steps.length,
+      commandsCount: testPlan.commands.length,
+      intelligentMode: testPlan.intelligentMode || false,
     });
 
     checkTimeout();
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // NEW STEP 6: SHOW TEST PLAN TO USER FOR APPROVAL (FIX #2)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    emitProcessingStep(chatSessionId, 'generating_plan', '✅ Test plan ready!', 80);
-
-    const formattedPlan = formatTestPlanForConfirmation(testPlan);
 
     // Save to history (non-blocking)
       if (chatSessionId) {
@@ -1992,7 +2119,7 @@ async function formatApiResponse(
   let finalMessage = '';
 
   if (fuzzingReport) {
-    const { ApiFuzzingFormatterService } = await import('@/services/testing/api-fuzzing-formatter.service');
+    const { ApiFuzzingFormatterService } = await import('@/services/testing/api/fuzzing/api-fuzzing-formatter.service');
     const fuzzingFormatted = ApiFuzzingFormatterService.formatComprehensiveReport(fuzzingReport);
 
     finalMessage = `✅ **API Test Results**\n\n` +
@@ -2391,199 +2518,10 @@ async function executeApprovedTestPlan(
 
 // REMOVED: Duplicate function - use ChatService.getRecentMessages() instead
 
-/**
- * Get count of old messages (older than recent history)
- */
-async function getOldMessagesCount(
-  sessionId: string,
-  recentLimit: number = CONSTANTS.RECENT_MESSAGES_LIMIT
-): Promise<number> {
-  try {
-    const { count, error } = await supabaseAdmin
-      .from('chat_messages')
-      .select('id', { count: 'exact', head: true })
-      .eq('session_id', sessionId);
 
-    if (error) {
-      logger.error('[CHAT_HISTORY] Error counting old messages', { error });
-      return 0;
-    }
 
-    const oldCount = (count || 0) - recentLimit;
-    return oldCount > 0 ? oldCount : 0;
-  } catch (error) {
-    logger.error('[CHAT_HISTORY] Failed to count old messages', { error });
-    return 0;
-  }
-}
 
-/**
- * Get old messages for summarization
- */
-async function getOldMessages(
-  sessionId: string,
-  recentLimit: number = CONSTANTS.RECENT_MESSAGES_LIMIT
-): Promise<Array<{ role: 'user' | 'ai'; content: string }>> {
-  try {
-    const { data: messages, error } = await supabaseAdmin
-      .from('chat_messages')
-      .select('role, content, created_at')
-      .eq('session_id', sessionId)
-      .order('created_at', { ascending: true }); // Get all in order
 
-    if (error || !messages) {
-      return [];
-    }
-
-    // Skip the last recentLimit messages
-    const oldMessages = messages.slice(0, -recentLimit);
-    return oldMessages.length > 0 ? oldMessages : [];
-  } catch (error) {
-    logger.error('[CHAT_HISTORY] Failed to fetch old messages', { error });
-    return [];
-  }
-}
-
-/**
- * Get cached summary from chat_sessions.context
- */
-async function getCachedSummary(
-  sessionId: string
-): Promise<{ summary: string; summarizedUpTo: number } | null> {
-  try {
-    const { data: session, error } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('context')
-      .eq('id', sessionId)
-      .maybeSingle();
-
-    if (error || !session?.context) {
-      return null;
-    }
-
-    const context = session.context as any;
-
-    if (context.context_summary && context.summarized_up_to_message) {
-      logger.info('[CHAT_CACHE] Found cached summary', {
-        sessionId,
-        summarizedUpTo: context.summarized_up_to_message,
-        summaryLength: context.context_summary.length,
-      });
-
-      return {
-        summary: context.context_summary,
-        summarizedUpTo: context.summarized_up_to_message,
-      };
-    }
-
-    return null;
-  } catch (error) {
-    logger.error('[CHAT_CACHE] Failed to get cached summary', { error, sessionId });
-    return null;
-  }
-}
-
-/**
- * Save summary to chat_sessions.context
- * Preserves existing context data and only updates summary fields
- */
-async function saveSummaryToCache(
-  sessionId: string,
-  summary: string,
-  summarizedUpTo: number
-): Promise<void> {
-  try {
-    // Get current context to preserve existing data
-    const { data: session } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('context')
-      .eq('id', sessionId)
-      .maybeSingle();
-
-    const existingContext = (session?.context as any) || {};
-
-    // Update only summary-related fields
-    const updatedContext = {
-      ...existingContext,
-      context_summary: summary,
-      summarized_up_to_message: summarizedUpTo,
-      last_summary_update: new Date().toISOString(),
-    };
-
-    const { error } = await supabaseAdmin
-      .from('chat_sessions')
-      .update({ context: updatedContext })
-      .eq('id', sessionId);
-
-    if (error) {
-      logger.error('[CHAT_CACHE] Failed to save summary to cache', { error, sessionId });
-    } else {
-      logger.info('[CHAT_CACHE] Summary saved to cache', {
-        sessionId,
-        summarizedUpTo,
-        summaryLength: summary.length,
-      });
-    }
-  } catch (error) {
-    logger.error('[CHAT_CACHE] Failed to save summary to cache', { error, sessionId });
-  }
-}
-
-/**
- * Summarize old messages using AI
- */
-async function summarizeOldMessages(
-  oldMessages: Array<{ role: 'user' | 'ai'; content: string }>
-): Promise<string> {
-  if (oldMessages.length === 0) {
-    return '';
-  }
-
-  try {
-    logger.info('[CHAT_SUMMARY] Summarizing old messages', { count: oldMessages.length });
-
-    // Build conversation text
-    const conversationText = oldMessages
-      .map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
-      .join('\n\n');
-
-    // Use gpt-3.5-turbo for fast and cheap summarization
-    const summaryPrompt = `Summarize the following conversation in a concise way, extracting key facts, URLs, decisions, and context. Focus on information that would be useful for continuing the conversation.
-
-Conversation:
-${conversationText}
-
-Provide a brief summary (max 200 words) in the same language as the conversation:`;
-
-    const summary = await getChatCompletionWithMessages(
-      [
-        {
-          role: 'system',
-          content: 'You are a helpful assistant that summarizes conversations concisely.',
-        },
-        {
-          role: 'user',
-          content: summaryPrompt,
-        },
-      ],
-      {
-        model: 'gpt-3.5-turbo',
-        temperature: 0.3,
-        max_tokens: 500,
-      }
-    );
-
-    logger.info('[CHAT_SUMMARY] Summary created', {
-      originalLength: conversationText.length,
-      summaryLength: summary.content.length
-    });
-
-    return summary.content;
-  } catch (error) {
-    logger.error('[CHAT_SUMMARY] Failed to summarize', { error });
-    return ''; // Fail gracefully
-  }
-}
 
 /**
  * Compress long test plans in message content
@@ -2684,23 +2622,6 @@ async function getOrCreateChatSession(
   return await ChatService.createChatSession(userId, workspaceId);
 }
 
-async function saveChatMessages(
-  sessionId: string,
-  messages: Array<{ role: 'user' | 'ai'; content: string; metadata?: any }>
-): Promise<void> {
-  try {
-    const records = messages.map(msg => ({
-      session_id: sessionId,
-      role: msg.role,
-      content: msg.content,
-      metadata: msg.metadata || {},
-    }));
-
-    await supabaseAdmin.from('chat_messages').insert(records);
-  } catch (error) {
-    logger.error('[CHAT] Failed to save messages', { error, sessionId });
-  }
-}
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════

@@ -432,7 +432,7 @@ export class ApiConfigService {
       };
 
       // Execute the request (using existing executeApiTest)
-      const { executeApiTest } = await import('../testing/apiTest.service');
+      const { executeApiTest } = await import('../testing/api/apiTest.service');
       const result = await executeApiTest(requestData);
 
       // Store execution record

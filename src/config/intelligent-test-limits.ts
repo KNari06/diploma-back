@@ -60,12 +60,27 @@ export function formatExecutionTime(ms: number): string {
 
 /**
  * Check if intelligent test should pause for continuation
+ * @param pagesVisited - Number of pages visited in current run
+ * @param executionTimeMs - Total execution time in milliseconds
+ * @param currentRun - Current run number (1-indexed)
+ * @returns Object with shouldPause flag and optional reason
  */
 export function shouldRequestContinuation(
   pagesVisited: number,
   executionTimeMs: number,
   currentRun: number
 ): { shouldPause: boolean; reason?: string } {
+  // Validate inputs
+  if (pagesVisited < 0) {
+    throw new Error('pagesVisited must be non-negative');
+  }
+  if (executionTimeMs < 0) {
+    throw new Error('executionTimeMs must be non-negative');
+  }
+  if (currentRun < 1) {
+    throw new Error('currentRun must be at least 1');
+  }
+
   // Hard limit: Max continuation runs reached
   if (currentRun >= INTELLIGENT_TEST_LIMITS.MAX_CONTINUATION_RUNS) {
     return {
@@ -91,4 +106,22 @@ export function shouldRequestContinuation(
   }
 
   return { shouldPause: false };
+}
+
+/**
+ * Check if total pages visited exceeds the absolute maximum
+ * @param totalPagesVisited - Total pages visited across all runs
+ * @returns True if absolute limit is reached
+ */
+export function hasReachedTotalPageLimit(totalPagesVisited: number): boolean {
+  return totalPagesVisited >= INTELLIGENT_TEST_LIMITS.MAX_TOTAL_PAGES;
+}
+
+/**
+ * Get remaining pages before hitting the limit
+ * @param totalPagesVisited - Total pages visited across all runs
+ * @returns Number of remaining pages
+ */
+export function getRemainingPages(totalPagesVisited: number): number {
+  return Math.max(0, INTELLIGENT_TEST_LIMITS.MAX_TOTAL_PAGES - totalPagesVisited);
 }

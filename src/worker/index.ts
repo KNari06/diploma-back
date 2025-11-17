@@ -5,10 +5,27 @@ import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manu
 import { logger } from '@/utils/logger';
 import { Worker } from 'bullmq';
 
+// Validate worker configuration
+const validateWorkerConfig = (): void => {
+  if (!connection || typeof connection !== 'object') {
+    throw new Error('Invalid Redis connection configuration');
+  }
+
+  if (!Number.isFinite(env.QUEUE_CONCURRENCY) || env.QUEUE_CONCURRENCY < 1 || env.QUEUE_CONCURRENCY > 100) {
+    logger.warn('[WORKER] Invalid QUEUE_CONCURRENCY, using default: 5', {
+      provided: env.QUEUE_CONCURRENCY,
+      default: 5,
+    });
+    env.QUEUE_CONCURRENCY = 5;
+  }
+};
+
+validateWorkerConfig();
+
 // Worker configuration
 const workerOptions = {
   connection,
-  concurrency: env.QUEUE_CONCURRENCY,
+  concurrency: Math.max(1, Math.min(100, Math.floor(env.QUEUE_CONCURRENCY))), // Clamp between 1-100
   removeOnComplete: { count: 100 },
   removeOnFail: { count: 50 },
   lockDuration: 300000, // 5 minutes - для долгих Playwright тестов
@@ -22,27 +39,31 @@ logger.info(`Creating TestRun worker for queue: ${QUEUE_NAMES.TEST_RUN}`);
 const testRunWorker = new Worker(
   QUEUE_NAMES.TEST_RUN,
   async (job) => {
-    // This should execute when job is picked up
-    logger.info(`🎯 [CRITICAL] TestRun worker picked up job: ${job.id}`);
+    // Validate job
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[TEST_RUN_WORKER] Processing job: ${job.id}`, {
+      testId: job.data?.testId,
+      browser: job.data?.browser,
+      intelligentMode: job.data?.intelligentMode,
+    });
 
     try {
-      logger.info(`[WRAPPER] Received job: ${job.id}`, {
-        jobData: JSON.stringify(job.data).substring(0, 200),
-      });
-      logger.info(`Processing manual test run job: ${job.id}`);
-
-      // Check if handler exists
+      // Validate handler exists
       if (!ManualTestRunJobHandler || typeof ManualTestRunJobHandler.process !== 'function') {
-        throw new Error('ManualTestRunJobHandler.process is not a function!');
+        throw new Error('ManualTestRunJobHandler.process is not a function');
       }
 
       const result = await ManualTestRunJobHandler.process(job);
-      logger.info(`[WRAPPER] Job completed successfully: ${job.id}`);
+      logger.info(`[TEST_RUN_WORKER] Job completed successfully: ${job.id}`);
       return result;
     } catch (error) {
-      logger.error(`[WRAPPER] Job handler threw error: ${job.id}`, {
+      logger.error(`[TEST_RUN_WORKER] Job failed: ${job.id}`, {
         error: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack : undefined,
+        jobData: job.data ? JSON.stringify(job.data).substring(0, 200) : 'N/A',
       });
       throw error;
     }
@@ -55,7 +76,16 @@ logger.info(`TestRun worker created successfully`);
 const testResultWorker = new Worker(
   QUEUE_NAMES.TEST_RESULT,
   async (job) => {
-    logger.info(`Processing manual test result job: ${job.id}`);
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[TEST_RESULT_WORKER] Processing job: ${job.id}`);
+
+    if (!ManualTestResultJobHandler || typeof ManualTestResultJobHandler.process !== 'function') {
+      throw new Error('ManualTestResultJobHandler.process is not a function');
+    }
+
     return await ManualTestResultJobHandler.process(job);
   },
   workerOptions
@@ -64,7 +94,19 @@ const testResultWorker = new Worker(
 const aiAnalysisWorker = new Worker(
   QUEUE_NAMES.AI_ANALYSIS,
   async (job) => {
-    logger.info(`Processing AI analysis job: ${job.id}`);
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[AI_ANALYSIS_WORKER] Processing job: ${job.id}`, {
+      testId: job.data?.testId,
+      resultId: job.data?.resultId,
+    });
+
+    if (!AIAnalysisJobHandler || typeof AIAnalysisJobHandler.process !== 'function') {
+      throw new Error('AIAnalysisJobHandler.process is not a function');
+    }
+
     return await AIAnalysisJobHandler.process(job);
   },
   workerOptions
@@ -73,7 +115,16 @@ const aiAnalysisWorker = new Worker(
 const notificationWorker = new Worker(
   QUEUE_NAMES.NOTIFICATION,
   async (job) => {
-    logger.info(`Processing notification job: ${job.id}`);
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[NOTIFICATION_WORKER] Processing job: ${job.id}`);
+
+    if (!NotificationJobHandler || typeof NotificationJobHandler.process !== 'function') {
+      throw new Error('NotificationJobHandler.process is not a function');
+    }
+
     return await NotificationJobHandler.process(job);
   },
   workerOptions
@@ -82,7 +133,19 @@ const notificationWorker = new Worker(
 const webhookWorker = new Worker(
   QUEUE_NAMES.WEBHOOK,
   async (job) => {
-    logger.info(`Processing webhook job: ${job.id}`);
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[WEBHOOK_WORKER] Processing job: ${job.id}`, {
+      url: job.data?.url,
+      event: job.data?.event,
+    });
+
+    if (!WebhookJobHandler || typeof WebhookJobHandler.process !== 'function') {
+      throw new Error('WebhookJobHandler.process is not a function');
+    }
+
     return await WebhookJobHandler.process(job);
   },
   workerOptions
@@ -95,11 +158,12 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
   });
 
   worker.on('active', (job) => {
-    logger.info(`🟡 [WORKER_DEBUG] ${workerName} Job picked from queue: ${job.id}`, {
-      testId: job.data?.testId,
-      intelligentMode: job.data?.intelligentMode,
-    });
-    logger.info(`🔄 ${workerName} worker ACTIVE (started processing): ${job.id}`, {
+    if (!job || !job.id) {
+      logger.warn(`[${workerName}] Received invalid job in 'active' event`);
+      return;
+    }
+
+    logger.info(`🔄 [${workerName}] Job started: ${job.id}`, {
       testId: job.data?.testId,
       intelligentMode: job.data?.intelligentMode,
     });
@@ -110,10 +174,19 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
   });
 
   worker.on('failed', (job, err) => {
-    logger.error(`❌ ${workerName} worker FAILED job: ${job?.id}`, {
+    if (!job) {
+      logger.error(`❌ [${workerName}] Job failed but job is null/undefined`, {
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      });
+      return;
+    }
+
+    logger.error(`❌ [${workerName}] Job failed: ${job.id}`, {
       error: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
-      jobData: job?.data ? JSON.stringify(job.data).substring(0, 200) : 'N/A',
+      attemptsMade: job.attemptsMade,
+      jobData: job.data ? JSON.stringify(job.data).substring(0, 200) : 'N/A',
     });
   });
 
@@ -137,8 +210,23 @@ setupWorkerEvents(notificationWorker, 'Notification');
 setupWorkerEvents(webhookWorker, 'Webhook');
 
 // Graceful shutdown
+let isShuttingDown = false;
+
 const gracefulShutdown = async (signal: string) => {
-  logger.info(`Received ${signal}. Starting graceful worker shutdown...`);
+  // Prevent multiple shutdown attempts
+  if (isShuttingDown) {
+    logger.warn(`[WORKER] Shutdown already in progress, ignoring ${signal}`);
+    return;
+  }
+
+  isShuttingDown = true;
+  logger.info(`[WORKER] Received ${signal}. Starting graceful shutdown...`);
+
+  const SHUTDOWN_TIMEOUT = 30000; // 30 seconds
+  const shutdownTimeout = setTimeout(() => {
+    logger.error('[WORKER] Shutdown timeout exceeded, forcing exit');
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT);
 
   try {
     // Use Promise.allSettled to ensure all workers close even if one fails
@@ -154,14 +242,21 @@ const gracefulShutdown = async (signal: string) => {
     closeResults.forEach((result, index) => {
       if (result.status === 'rejected') {
         const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook'];
-        logger.warn(`Failed to close ${workerNames[index]} worker`, { error: result.reason });
+        logger.warn(`[WORKER] Failed to close ${workerNames[index]} worker`, {
+          error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        });
       }
     });
 
-    logger.info('Worker shutdown completed');
+    clearTimeout(shutdownTimeout);
+    logger.info('[WORKER] Worker shutdown completed');
     process.exit(0);
   } catch (error) {
-    logger.error('Error during worker shutdown:', error);
+    clearTimeout(shutdownTimeout);
+    logger.error('[WORKER] Error during worker shutdown:', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     process.exit(1);
   }
 };
@@ -172,22 +267,24 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
-  logger.error('🚨 Uncaught exception in worker:', {
-    error: error instanceof Error ? error.message : String(error),
-    stack: error instanceof Error ? error.stack : undefined,
+  logger.error('[WORKER] 🚨 Uncaught exception:', {
+    error: error.message,
+    stack: error.stack,
+    name: error.name,
   });
-  // Don't exit immediately - let it retry
-  // process.exit(1);
+  // Don't exit immediately - let workers continue and retry
+  // Graceful shutdown will handle cleanup on SIGTERM/SIGINT
 });
 
 // Handle unhandled promise rejections
-process.on('unhandledRejection', (reason) => {
-  logger.error('🚨 Unhandled rejection in worker:', {
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('[WORKER] 🚨 Unhandled rejection:', {
     reason: reason instanceof Error ? reason.message : String(reason),
     stack: reason instanceof Error ? reason.stack : undefined,
+    promise: promise,
   });
-  // Don't exit immediately - let it retry
-  // process.exit(1);
+  // Don't exit immediately - let workers continue and retry
+  // Graceful shutdown will handle cleanup on SIGTERM/SIGINT
 });
 
 logger.info('🚀 QAIT Worker started');
@@ -200,16 +297,28 @@ logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`
 (async () => {
   try {
     const Redis = await import('ioredis');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const testRedis = new Redis.default(connection as any);
-    await testRedis.ping();
-    logger.info('✅ Redis connection test PASSED');
+
+    // Test with timeout
+    const pingPromise = testRedis.ping();
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Redis ping timeout')), 5000)
+    );
+
+    await Promise.race([pingPromise, timeoutPromise]);
+    logger.info('[WORKER] ✅ Redis connection test PASSED');
     await testRedis.quit();
   } catch (error) {
-    logger.error('❌ Redis connection test FAILED', error);
+    logger.error('[WORKER] ❌ Redis connection test FAILED', {
+      error: error instanceof Error ? error.message : String(error),
+      errorType: error instanceof Error ? error.constructor.name : typeof error,
+    });
+    // Don't exit - workers will fail gracefully if Redis is unavailable
   }
 })();
 
 export {
-  aiAnalysisWorker,
-  notificationWorker, testResultWorker, testRunWorker, webhookWorker
+    aiAnalysisWorker,
+    notificationWorker, testResultWorker, testRunWorker, webhookWorker
 };

@@ -146,10 +146,10 @@ export class WorkspaceService {
   }
 
   /**
-   * Generate workspace name based on user ID
+   * Generate workspace name - default to "Untitled"
    */
   private static generateWorkspaceName(userId: string): string {
-    return `Workspace ${userId.slice(0, 8)}`;
+    return 'Untitled';
   }
 
   /**

@@ -2,6 +2,37 @@ import { WorkspaceService } from '@/services/core/workspace.service';
 import { WorkspaceCreateRequest } from '@/types';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
+import { supabaseAdmin } from '@/db/supabase';
+
+// UUID validation regex
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Check if user owns workspace
+ */
+async function verifyWorkspaceOwnership(workspaceId: string, userId: string): Promise<boolean> {
+  try {
+    // Validate UUIDs
+    if (!UUID_REGEX.test(workspaceId) || !UUID_REGEX.test(userId)) {
+      return false;
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('workspaces')
+      .select('user_id')
+      .eq('id', workspaceId)
+      .maybeSingle();
+
+    if (error || !data) {
+      return false;
+    }
+
+    return data.user_id === userId;
+  } catch (error) {
+    logger.error('[WORKSPACE_API] Error verifying ownership', { error, workspaceId, userId });
+    return false;
+  }
+}
 
 /**
  * POST /api/v1/workspaces
@@ -9,7 +40,27 @@ import { Request, Response } from 'express';
  */
 export const createWorkspace = async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = req.user!.id;
+    const userId = req.user?.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authorization required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate userId format (UUID)
+    if (!UUID_REGEX.test(userId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid user ID format',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
 
     const body = req.body as any;
 
@@ -25,11 +76,22 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
     };
 
     // Validate required fields
-    if (!workspaceData.name) {
+    if (!workspaceData.name || typeof workspaceData.name !== 'string' || workspaceData.name.trim().length === 0) {
       res.status(400).json({
         success: false,
         error: 'Missing required field: project_name',
-        message: 'Field project_name is required',
+        message: 'Field project_name is required and must be a non-empty string',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate name length
+    if (workspaceData.name.length > 255) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid field: project_name',
+        message: 'Field project_name is too long (max 255 characters)',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -45,6 +107,19 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
       return;
     }
 
+    // Validate platforms array
+    const validPlatforms = ['web', 'mobile', 'api'];
+    const invalidPlatforms = workspaceData.platforms.filter(p => !validPlatforms.includes(p));
+    if (invalidPlatforms.length > 0) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid field: platforms',
+        message: `Invalid platforms: ${invalidPlatforms.join(', ')}. Must be one of: ${validPlatforms.join(', ')}`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     if (!workspaceData.devBaseUrl) {
       res.status(400).json({
         success: false,
@@ -55,13 +130,44 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
       return;
     }
 
+    // Validate URL format
+    try {
+      new URL(workspaceData.devBaseUrl);
+    } catch {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid field: devBaseUrl',
+        message: 'Field devBaseUrl must be a valid URL',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate prodBaseUrl if provided
+    if (workspaceData.prodBaseUrl) {
+      try {
+        new URL(workspaceData.prodBaseUrl);
+      } catch {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: prodBaseUrl',
+          message: 'Field prodBaseUrl must be a valid URL',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+
     logger.info('[WORKSPACE_API] Creating workspace', {
       userId,
       workspaceData
     });
 
-    const finalWorkspaceName = workspaceData.name || `Workspace ${userId.slice(0, 8)}`;
-    const workspace = await WorkspaceService.createWorkspace(userId, finalWorkspaceName);
+    const finalWorkspaceName = workspaceData.name.trim() || 'Untitled';
+    const workspaceId = await WorkspaceService.createWorkspace(userId, finalWorkspaceName);
+
+    // Fetch created workspace for response
+    const workspace = await WorkspaceService.getWorkspace(workspaceId);
 
     res.status(201).json({
       success: true,
@@ -71,6 +177,12 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
     });
   } catch (error) {
     logger.error('[WORKSPACE_API] Error creating workspace', { error });
+
+    if (res.headersSent) {
+      logger.warn('[WORKSPACE_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to create workspace',
@@ -96,6 +208,16 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
         success: false,
         error: 'Unable to identify user',
         message: 'Failed to identify user',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate userId format (UUID)
+    if (!UUID_REGEX.test(userId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid user ID format',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -144,6 +266,12 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
     });
   } catch (error) {
     logger.error('[WORKSPACE_API] Error getting workspaces', { error });
+
+    if (res.headersSent) {
+      logger.warn('[WORKSPACE_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to get workspaces',
@@ -172,11 +300,31 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
+    // Validate userId format (UUID)
+    if (!UUID_REGEX.test(userId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid user ID format',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     if (!workspaceId) {
       res.status(400).json({
         success: false,
         error: 'Missing workspace ID',
         message: 'Не указан ID workspace',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate workspaceId format (UUID)
+    if (!UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID format',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -196,6 +344,18 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
+    // Verify workspace ownership
+    const isOwner = await verifyWorkspaceOwnership(workspaceId, userId);
+    if (!isOwner) {
+      res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        message: 'Access denied to this workspace',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     res.json({
       success: true,
       data: workspace,
@@ -203,6 +363,12 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
     });
   } catch (error) {
     logger.error('[WORKSPACE_API] Error getting workspace', { error });
+
+    if (res.headersSent) {
+      logger.warn('[WORKSPACE_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to get workspace',
@@ -232,6 +398,16 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
       return;
     }
 
+    // Validate userId format (UUID)
+    if (!UUID_REGEX.test(userId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid user ID format',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     if (!workspaceId) {
       res.status(400).json({
         success: false,
@@ -240,6 +416,103 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
         timestamp: new Date().toISOString(),
       });
       return;
+    }
+
+    // Validate workspaceId format (UUID)
+    if (!UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID format',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Verify workspace ownership
+    const isOwner = await verifyWorkspaceOwnership(workspaceId, userId);
+    if (!isOwner) {
+      res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        message: 'Access denied to this workspace',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate updates
+    if (updates.name !== undefined) {
+      if (typeof updates.name !== 'string' || updates.name.trim().length === 0) {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: name',
+          message: 'Field name must be a non-empty string',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      if (updates.name.length > 255) {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: name',
+          message: 'Field name is too long (max 255 characters)',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+
+    if (updates.platforms !== undefined) {
+      if (!Array.isArray(updates.platforms) || updates.platforms.length === 0) {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: platforms',
+          message: 'Field platforms must be a non-empty array',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const validPlatforms = ['web', 'mobile', 'api'];
+      const invalidPlatforms = updates.platforms.filter((p: any) => !validPlatforms.includes(p));
+      if (invalidPlatforms.length > 0) {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: platforms',
+          message: `Invalid platforms: ${invalidPlatforms.join(', ')}. Must be one of: ${validPlatforms.join(', ')}`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+
+    if (updates.devBaseUrl !== undefined) {
+      try {
+        new URL(updates.devBaseUrl);
+      } catch {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: devBaseUrl',
+          message: 'Field devBaseUrl must be a valid URL',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+
+    if (updates.prodBaseUrl !== undefined) {
+      try {
+        new URL(updates.prodBaseUrl);
+      } catch {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: prodBaseUrl',
+          message: 'Field prodBaseUrl must be a valid URL',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
     }
 
     logger.info('[WORKSPACE_API] Updating workspace', { userId, workspaceId, updates });
@@ -264,6 +537,12 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
     });
   } catch (error) {
     logger.error('[WORKSPACE_API] Error updating workspace', { error });
+
+    if (res.headersSent) {
+      logger.warn('[WORKSPACE_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to update workspace',
@@ -292,6 +571,16 @@ export const deleteWorkspace = async (req: Request, res: Response): Promise<void
       return;
     }
 
+    // Validate userId format (UUID)
+    if (!UUID_REGEX.test(userId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid user ID format',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     if (!workspaceId) {
       res.status(400).json({
         success: false,
@@ -302,22 +591,31 @@ export const deleteWorkspace = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    logger.info('[WORKSPACE_API] Deleting workspace', { userId, workspaceId });
-
-    await WorkspaceService.deleteWorkspace(workspaceId);
-
-    // deleteWorkspace returns void, assume success if no error thrown
-    const success = true;
-
-    if (!success) {
-      res.status(404).json({
+    // Validate workspaceId format (UUID)
+    if (!UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
         success: false,
-        error: 'Workspace not found',
-        message: 'Workspace не найден',
+        error: 'Invalid workspace ID format',
         timestamp: new Date().toISOString(),
       });
       return;
     }
+
+    // Verify workspace ownership before deletion
+    const isOwner = await verifyWorkspaceOwnership(workspaceId, userId);
+    if (!isOwner) {
+      res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        message: 'Access denied to this workspace',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    logger.info('[WORKSPACE_API] Deleting workspace', { userId, workspaceId });
+
+    await WorkspaceService.deleteWorkspace(workspaceId);
 
     res.json({
       success: true,
@@ -326,6 +624,12 @@ export const deleteWorkspace = async (req: Request, res: Response): Promise<void
     });
   } catch (error) {
     logger.error('[WORKSPACE_API] Error deleting workspace', { error });
+
+    if (res.headersSent) {
+      logger.warn('[WORKSPACE_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to delete workspace',

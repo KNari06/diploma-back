@@ -6,7 +6,6 @@ import { dbAdminService } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
 import { env } from '@/config/env';
 import { executePlaywrightTestWithRetry } from '@/agent';
-import axios from 'axios';
 import { webSocketService } from '@/websocket/websocket.service';
 import {
   TestStartedPayload,
@@ -16,6 +15,10 @@ import {
   ResultErrorPayload,
 } from '@/websocket/types';
 
+// Constants
+const MAX_RETRIES = env.AGENT_MAX_RETRIES || 2;
+const DEFAULT_ADMIN_EMAIL = 'admin@qai.so';
+
 export class ManualTestRunJobHandler {
   /**
    * Process test run job
@@ -23,33 +26,30 @@ export class ManualTestRunJobHandler {
   static async process(job: Job<TestJobData>) {
     const { testId, url, browser, options, projectId, userId, retryCount = 0, commands, intent, intelligentMode, testGoal } = job.data;
 
-    logger.info(`[WORKER] Step 1: Processing test run job: ${testId} (${browser})`, {
+    // Validate required parameters
+    if (!testId || !url || !browser) {
+      throw new Error('Missing required parameters: testId, url, or browser');
+    }
+
+    logger.info(`[TEST-RUN] Processing job for test: ${testId} (${browser})`, {
       hasCommands: !!commands,
       commandsCount: commands?.length,
       intent,
       intelligentMode,
       testGoal: testGoal ? `"${testGoal.substring(0, 50)}..."` : undefined,
+      retryAttempt: retryCount,
     });
     logQueueEvent('processing', job.id!, { testId, browser });
 
     try {
       // Update test status to running
-      logger.info('[WORKER] Step 2: Updating test status to running');
-      await dbAdminService.updateTest(testId, {
-        status: 'running',
-        started_at: new Date().toISOString(),
-      });
+      logger.info(`[TEST-RUN] Updating test status to running: ${testId}`);
+      await this.updateTestStatus(testId, 'running', new Date().toISOString());
 
       // Emit WebSocket: test started
-      const testStartedPayload: TestStartedPayload = {
-        testId,
-        browser,
-        timestamp: new Date().toISOString(),
-      };
-      webSocketService.emitTestStarted(testId, testStartedPayload);
+      this.emitTestStarted(testId, browser);
 
-      logger.info('[WORKER] Step 3: Executing Playwright test locally', {
-        testId,
+      logger.info(`[TEST-RUN] Executing Playwright test: ${testId}`, {
         browser,
         url,
         hasCommands: !!commands,
@@ -70,106 +70,40 @@ export class ManualTestRunJobHandler {
           intelligentMode,
           testGoal,
         },
-        env.AGENT_MAX_RETRIES || 2
+        MAX_RETRIES
       );
 
       // Process result
-      logger.info('[WORKER] Step 4: Test execution completed', {
+      logger.info(`[TEST-RUN] Test execution completed: ${testId}`, {
         success: result.success,
         status: result.status,
       });
 
       if (result.success) {
-        logger.info('[WORKER] Step 5: Creating test result in database');
-        // Create test result in database
-        const testResultRecord = await dbAdminService.createTestResult({
-          test_id: testId,
-          browser,
-          status: result.status as any,
-          screenshot: result.screenshot,
-          dom: result.dom,
-          logs: result.logs,
-          network_logs: result.networkLogs,
-          errors: result.errors,
-          performance: result.performance,
-          completed_at: new Date().toISOString(),
-        });
-
-        // Emit WebSocket: browser completed
-        const browserCompletedPayload: TestBrowserCompletedPayload = {
-          testId,
-          browser,
-          status: 'completed',
-          errorsCount: result.errors?.length || 0,
-          timestamp: new Date().toISOString(),
-        };
-        webSocketService.emitTestBrowserCompleted(testId, browserCompletedPayload);
-
-        // Emit WebSocket: result ready
-        const resultReadyPayload: ResultReadyPayload = {
-          testId,
-          browser,
-          resultId: (testResultRecord as any).id,
-          timestamp: new Date().toISOString(),
-        };
-        webSocketService.emitResultReady(testId, resultReadyPayload);
-
-        // Add AI analysis job
-        const testResult = await dbAdminService.getTestResultByTestAndBrowser(testId, browser);
-        if (testResult) {
-          await QueueManager.addAIAnalysisJob(testResult.id, testId);
-        }
-
-        logger.info('Test completed successfully', {
-          testId,
-          browser,
-          logsCount: result.logs.length,
-          errorsCount: result.errors.length,
-        });
+        await this.handleSuccessfulTest(testId, browser, result);
       } else {
         throw new Error(result.error || 'Test execution failed');
       }
 
     } catch (error) {
-      logger.error(`Test run job failed: ${testId} (${browser})`, error);
+      logger.error(`[TEST-RUN] Job failed for test ${testId} (${browser}):`, error);
 
-      // Emit WebSocket: test failed
-      const testFailedPayload: TestFailedPayload = {
-        testId,
-        browser,
-        error: (error as Error).message,
-        timestamp: new Date().toISOString(),
-      };
-      webSocketService.emitTestFailed(testId, testFailedPayload);
-
-      // Emit WebSocket: result error
-      const resultErrorPayload: ResultErrorPayload = {
-        testId,
-        browser,
-        error: {
-          type: 'execution_error',
-          message: (error as Error).message,
-          stack: (error as Error).stack,
-        },
-        timestamp: new Date().toISOString(),
-      };
-      webSocketService.emitResultError(testId, resultErrorPayload);
+      // Emit WebSocket events for failure
+      this.emitTestFailed(testId, browser, error as Error);
+      this.emitResultError(testId, browser, error as Error);
 
       // Check if we should retry
-      if (shouldRetry(error, retryCount, env.AGENT_MAX_RETRIES)) {
+      if (shouldRetry(error, retryCount, MAX_RETRIES)) {
         const delay = calculateRetryDelay(retryCount);
-        logger.info(`Retrying test run job in ${delay}ms: ${testId} (${browser})`);
+        logger.info(`[TEST-RUN] Retrying test in ${delay}ms: ${testId} (${browser}) - Attempt ${retryCount + 1}/${MAX_RETRIES}`);
 
         // Update retry count and delay
         await job.updateData({ ...job.data, retryCount: retryCount + 1 });
-        throw new Error(`Retry ${retryCount + 1}/${env.AGENT_MAX_RETRIES}: ${(error as Error).message}`);
+        throw new Error(`Retry ${retryCount + 1}/${MAX_RETRIES}: ${(error as Error).message}`);
       }
 
-      // Mark test as failed
-      await dbAdminService.updateTest(testId, {
-        status: 'failed',
-        completed_at: new Date().toISOString(),
-      });
+      // Mark test as failed (final failure)
+      await this.updateTestStatus(testId, 'failed', undefined, new Date().toISOString());
 
       // Send failure notification
       await this.sendFailureNotification(testId, error);
@@ -179,64 +113,114 @@ export class ManualTestRunJobHandler {
   }
 
   /**
-   * Find available test agent
+   * Update test status in database
    */
-  private static async findAvailableAgent(): Promise<string | null> {
-    try {
-      // In a real implementation, you would query a service registry
-      // or maintain a list of available agents
-      const agents = [
-        `${env.AGENT_BASE_URL}/agent1`,
-        `${env.AGENT_BASE_URL}/agent2`,
-        `${env.AGENT_BASE_URL}/agent3`,
-      ];
+  private static async updateTestStatus(
+    testId: string,
+    status: 'running' | 'completed' | 'failed',
+    startedAt?: string,
+    completedAt?: string
+  ) {
+    const updateData: any = { status };
+    if (startedAt) updateData.started_at = startedAt;
+    if (completedAt) updateData.completed_at = completedAt;
 
-      // Check each agent for availability
-      for (const agentUrl of agents) {
-        try {
-          const response = await axios.get(`${agentUrl}/health`, {
-            timeout: 5000,
-          });
-
-          if (response.status === 200 && response.data.status === 'healthy') {
-            return agentUrl;
-          }
-        } catch (error) {
-          logger.warn(`Agent ${agentUrl} is not available:`, (error as Error).message);
-          continue;
-        }
-      }
-
-      return null;
-    } catch (error) {
-      logger.error('Failed to find available agent:', error);
-      return null;
-    }
+    await dbAdminService.updateTest(testId, updateData);
   }
 
   /**
-   * Send test to agent
+   * Emit test started WebSocket event
    */
-  private static async sendTestToAgent(
-    agentUrl: string,
-    testData: TestJobData
-  ): Promise<AgentResponse> {
-    try {
-      const response = await axios.post(`${agentUrl}/test/run`, testData, {
-        timeout: env.AGENT_TIMEOUT,
-        headers: {
-          'Content-Type': 'application/json',
-          'X-QAIT-Source': 'backend',
-        },
-      });
+  private static emitTestStarted(testId: string, browser: string) {
+    const payload: TestStartedPayload = {
+      testId,
+      browser,
+      timestamp: new Date().toISOString(),
+    };
+    webSocketService.emitTestStarted(testId, payload);
+  }
 
-      return response.data;
-    } catch (error) {
-      if (axios.isAxiosError(error)) {
-        throw new Error(`Agent communication failed: ${error.message}`);
-      }
-      throw error;
+  /**
+   * Emit test failed WebSocket event
+   */
+  private static emitTestFailed(testId: string, browser: string, error: Error) {
+    const payload: TestFailedPayload = {
+      testId,
+      browser,
+      error: error.message,
+      timestamp: new Date().toISOString(),
+    };
+    webSocketService.emitTestFailed(testId, payload);
+  }
+
+  /**
+   * Emit result error WebSocket event
+   */
+  private static emitResultError(testId: string, browser: string, error: Error) {
+    const payload: ResultErrorPayload = {
+      testId,
+      browser,
+      error: {
+        type: 'execution_error',
+        message: error.message,
+        stack: error.stack,
+      },
+      timestamp: new Date().toISOString(),
+    };
+    webSocketService.emitResultError(testId, payload);
+  }
+
+  /**
+   * Handle successful test completion
+   */
+  private static async handleSuccessfulTest(testId: string, browser: string, result: any) {
+    logger.info(`[TEST-RUN] Creating test result in database: ${testId}`);
+
+    // Create test result in database
+    const testResultRecord = await dbAdminService.createTestResult({
+      test_id: testId,
+      browser,
+      status: result.status as any,
+      screenshot: result.screenshot,
+      dom: result.dom,
+      logs: result.logs || [],
+      network_logs: result.networkLogs || [],
+      errors: result.errors || [],
+      performance: result.performance,
+      completed_at: new Date().toISOString(),
+    });
+
+    // Emit WebSocket: browser completed
+    const browserCompletedPayload: TestBrowserCompletedPayload = {
+      testId,
+      browser,
+      status: 'completed',
+      errorsCount: result.errors?.length || 0,
+      timestamp: new Date().toISOString(),
+    };
+    webSocketService.emitTestBrowserCompleted(testId, browserCompletedPayload);
+
+    // Emit WebSocket: result ready
+    const resultReadyPayload: ResultReadyPayload = {
+      testId,
+      browser,
+      resultId: (testResultRecord as any).id,
+      timestamp: new Date().toISOString(),
+    };
+    webSocketService.emitResultReady(testId, resultReadyPayload);
+
+    // Add AI analysis job
+    const testResult = await dbAdminService.getTestResultByTestAndBrowser(testId, browser);
+    if (testResult) {
+      await QueueManager.addAIAnalysisJob(testResult.id, testId);
+      logger.info(`[TEST-RUN] AI analysis job queued for test result: ${testResult.id}`);
     }
+
+    logger.info(`[TEST-RUN] Test completed successfully: ${testId}`, {
+      browser,
+      logsCount: result.logs?.length || 0,
+      errorsCount: result.errors?.length || 0,
+    });
   }
 
   /**
@@ -246,18 +230,24 @@ export class ManualTestRunJobHandler {
     try {
       // Get test details
       const test = await dbAdminService.getTest(testId) as any;
-      if (!test) return;
+      if (!test) {
+        logger.warn(`[TEST-RUN] Test not found for failure notification: ${testId}`);
+        return;
+      }
+
+      const errorMessage = (error as Error).message || 'Unknown error occurred';
+      logger.info(`[TEST-RUN] Sending failure notification for test: ${testId}`);
 
       // Send notification
       await QueueManager.addNotificationJob({
         type: 'email',
-        recipient: test.user_id || 'admin@qai.so',
+        recipient: test.user_id || DEFAULT_ADMIN_EMAIL,
         subject: `Test Failed: ${testId}`,
-        message: `Test ${testId} failed with error: ${(error as Error).message}`,
-        data: { testId, error: (error as Error).message },
+        message: `Test ${testId} failed with error: ${errorMessage}`,
+        data: { testId, error: errorMessage },
       });
     } catch (notificationError) {
-      logger.error('Failed to send failure notification:', notificationError);
+      logger.error(`[TEST-RUN] Failed to send failure notification for test ${testId}:`, notificationError);
     }
   }
 }
@@ -301,8 +291,8 @@ export class ManualTestResultJobHandler {
       // Add AI analysis job
       await QueueManager.addAIAnalysisJob((savedResult as any).id, testId);
 
-      // Update test status
-      await this.updateTestStatus(testId);
+      // Update overall test status
+      await this.updateOverallTestStatus(testId);
 
       logger.info(`Test result processed successfully: ${testId} (${browser})`);
 
@@ -322,28 +312,28 @@ export class ManualTestResultJobHandler {
         completed_at: new Date().toISOString(),
       });
 
-      // Update test status
-      await this.updateTestStatus(testId);
+      // Update overall test status
+      await this.updateOverallTestStatus(testId);
 
       throw error;
     }
   }
 
   /**
-   * Update test status based on results
+   * Update overall test status based on all results
    */
-  private static async updateTestStatus(testId: string) {
+  private static async updateOverallTestStatus(testId: string) {
     try {
       // Get all results for this test
       const results = await dbAdminService.getTestResults(testId) as any[];
 
       if (results.length === 0) {
+        logger.debug(`[TEST-RESULT] No results found for test: ${testId}`);
         return;
       }
 
       // Determine overall test status
       const hasFailed = results.some((r: any) => r.status === 'failed');
-      // const hasRunning = results.some((r: any) => r.status === 'running' || r.status === 'pending');
       const allCompleted = results.every((r: any) => r.status === 'completed' || r.status === 'failed');
 
       let status: 'running' | 'completed' | 'failed' = 'running';
@@ -351,6 +341,8 @@ export class ManualTestResultJobHandler {
       if (allCompleted) {
         status = hasFailed ? 'failed' : 'completed';
       }
+
+      logger.info(`[TEST-RESULT] Updating overall test status: ${testId} -> ${status}`);
 
       // Update test status
       await dbAdminService.updateTest(testId, {
@@ -364,7 +356,7 @@ export class ManualTestResultJobHandler {
       }
 
     } catch (error) {
-      logger.error(`Failed to update test status: ${testId}`, error);
+      logger.error(`[TEST-RESULT] Failed to update test status for ${testId}:`, error);
     }
   }
 
@@ -378,20 +370,25 @@ export class ManualTestResultJobHandler {
   ) {
     try {
       const test = await dbAdminService.getTest(testId) as any;
-      if (!test) return;
+      if (!test) {
+        logger.warn(`[TEST-RESULT] Test not found for completion notification: ${testId}`);
+        return;
+      }
 
       const successCount = results.filter((r: any) => r.status === 'completed').length;
       const totalCount = results.length;
 
+      logger.info(`[TEST-RESULT] Sending completion notification: ${testId} (${successCount}/${totalCount} successful)`);
+
       await QueueManager.addNotificationJob({
         type: 'email',
-        recipient: test.user_id || 'admin@qai.so',
+        recipient: test.user_id || DEFAULT_ADMIN_EMAIL,
         subject: `Test ${status}: ${testId}`,
         message: `Test ${testId} ${status}. ${successCount}/${totalCount} browsers completed successfully.`,
         data: { testId, status, results: results.length },
       });
     } catch (error) {
-      logger.error('Failed to send completion notification:', error);
+      logger.error(`[TEST-RESULT] Failed to send completion notification for test ${testId}:`, error);
     }
   }
 }

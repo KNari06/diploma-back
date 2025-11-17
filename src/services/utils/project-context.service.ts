@@ -250,10 +250,11 @@ export class ProjectContextService {
 
       if (error) {
         logger.error('[PROJECT] Error searching projects by URL', {
-          error,
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
           baseUrl,
           workspaceId,
-          userId
+          userId,
         });
         return null;
       }
@@ -297,7 +298,11 @@ export class ProjectContextService {
         .maybeSingle();
 
       if (error) {
-        logger.error('[PROJECT] Error getting settings', { error, projectId });
+        logger.error('[PROJECT] Error getting settings', {
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
+          projectId,
+        });
         return null;
       }
 
@@ -356,7 +361,11 @@ export class ProjectContextService {
         .eq('id', projectId);
 
       if (error) {
-        logger.error('[PROJECT] Error updating settings', { error, projectId });
+        logger.error('[PROJECT] Error updating settings', {
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
+          projectId,
+        });
         return false;
       }
 

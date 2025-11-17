@@ -70,9 +70,57 @@ export async function loadGlobalKB(): Promise<LocalKBChunk[]> {
     }
 
     const data = await fs.readFile(kbPath, 'utf-8');
-    const kb: LocalKBData = JSON.parse(data);
 
-    globalKBCache = kb.chunks;
+    // Validate JSON
+    let kb: LocalKBData;
+    try {
+      kb = JSON.parse(data);
+    } catch (parseError) {
+      logger.error('[LOCAL_KB] Failed to parse embeddings.json', {
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+        path: kbPath,
+      });
+      globalKBCache = [];
+      isInitialized = true;
+      return [];
+    }
+
+    // Validate KB structure
+    if (!kb || typeof kb !== 'object') {
+      logger.error('[LOCAL_KB] Invalid KB data structure', { path: kbPath });
+      globalKBCache = [];
+      isInitialized = true;
+      return [];
+    }
+
+    if (!kb.chunks || !Array.isArray(kb.chunks)) {
+      logger.error('[LOCAL_KB] Invalid chunks array', { path: kbPath });
+      globalKBCache = [];
+      isInitialized = true;
+      return [];
+    }
+
+    // Validate chunks have required fields
+    const validChunks = kb.chunks.filter(
+      (chunk) =>
+        chunk &&
+        typeof chunk === 'object' &&
+        chunk.id &&
+        chunk.content &&
+        chunk.embedding &&
+        Array.isArray(chunk.embedding) &&
+        chunk.embedding.length === 1536
+    );
+
+    if (validChunks.length < kb.chunks.length) {
+      logger.warn('[LOCAL_KB] Filtered out invalid chunks', {
+        total: kb.chunks.length,
+        valid: validChunks.length,
+        invalid: kb.chunks.length - validChunks.length,
+      });
+    }
+
+    globalKBCache = validChunks;
     isInitialized = true;
 
     logger.info('Global KB loaded from local storage', {
@@ -92,6 +140,9 @@ export async function loadGlobalKB(): Promise<LocalKBChunk[]> {
 
 /**
  * Search local global KB using vector similarity
+ * @param queryEmbedding - Query embedding vector (1536 dimensions)
+ * @param options - Search options (threshold, limit, language filter)
+ * @returns Array of matching chunks with similarity scores
  */
 export async function searchLocalGlobalKB(
   queryEmbedding: number[],
@@ -101,14 +152,34 @@ export async function searchLocalGlobalKB(
     language?: 'en' | 'ru' | 'neutral'; // Filter by language
   } = {}
 ): Promise<LocalKBChunk[]> {
-  const threshold = options.threshold || 0.7;
-  const limit = options.limit || 5;
-  const language = options.language;
+  // Validate queryEmbedding
+  if (!queryEmbedding || !Array.isArray(queryEmbedding) || queryEmbedding.length !== 1536) {
+    logger.warn('[LOCAL_KB] Invalid queryEmbedding', {
+      isValid: !!queryEmbedding,
+      isArray: Array.isArray(queryEmbedding),
+      length: queryEmbedding?.length,
+    });
+    return [];
+  }
+
+  // Validate queryEmbedding contains only finite numbers
+  const hasInvalidValues = queryEmbedding.some((val) => !Number.isFinite(val));
+  if (hasInvalidValues) {
+    logger.warn('[LOCAL_KB] Query embedding contains invalid values');
+    return [];
+  }
+
+  // Validate and clamp options
+  const threshold = Math.max(0, Math.min(1, options.threshold || 0.7));
+  const limit = Math.max(1, Math.min(100, Math.floor(options.limit || 5)));
+  const language = options.language && ['en', 'ru', 'neutral'].includes(options.language)
+    ? options.language
+    : undefined;
 
   // Load KB (uses cache if already loaded)
   const chunks = await loadGlobalKB();
 
-  if (chunks.length === 0) {
+  if (!chunks || chunks.length === 0) {
     return [];
   }
 
@@ -132,10 +203,42 @@ export async function searchLocalGlobalKB(
   }
 
   // Calculate similarity for each chunk
-  const results = filteredChunks.map((chunk) => ({
-    ...chunk,
-    similarity: cosineSimilarity(queryEmbedding, chunk.embedding),
-  }));
+  const results = filteredChunks
+    .filter((chunk) => {
+      // Validate chunk has valid embedding
+      if (!chunk || !chunk.embedding || !Array.isArray(chunk.embedding)) {
+        return false;
+      }
+      // Validate embedding dimensions match query
+      if (chunk.embedding.length !== queryEmbedding.length) {
+        logger.warn('[LOCAL_KB] Chunk embedding dimension mismatch', {
+          chunkId: chunk.id,
+          expected: queryEmbedding.length,
+          actual: chunk.embedding.length,
+        });
+        return false;
+      }
+      // Validate embedding contains only finite numbers
+      return chunk.embedding.every((val) => Number.isFinite(val));
+    })
+    .map((chunk) => {
+      try {
+        const similarity = cosineSimilarity(queryEmbedding, chunk.embedding);
+        return {
+          ...chunk,
+          similarity: Number.isFinite(similarity) ? similarity : 0,
+        };
+      } catch (error) {
+        logger.warn('[LOCAL_KB] Failed to calculate similarity', {
+          chunkId: chunk.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return {
+          ...chunk,
+          similarity: 0,
+        };
+      }
+    });
 
   // Filter by threshold and sort by similarity
   const filtered = results

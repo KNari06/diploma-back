@@ -1,6 +1,6 @@
+import { ApiEnvironment } from '@/types';
 import { logger } from '@/utils/logger';
 import { ApiConfigService } from '../api/api-config.service';
-import { ApiEnvironment } from '@/types';
 
 /**
  * Service for resolving relative API paths to full URLs
@@ -21,9 +21,37 @@ export class UrlResolverService {
     source: 'default_env' | 'suggested_env' | 'user_input_required';
     suggestions?: string[];
   }> {
+    // Validate inputs
+    if (!relativePath || typeof relativePath !== 'string' || relativePath.trim().length === 0) {
+      logger.warn('[URL_RESOLVER] Invalid relativePath', { relativePath: typeof relativePath });
+      return {
+        fullUrl: relativePath || '',
+        source: 'user_input_required',
+        suggestions: this.generateBaseUrlSuggestions('/api/'),
+      };
+    }
+
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      logger.warn('[URL_RESOLVER] Invalid userId', { userId: typeof userId });
+      return {
+        fullUrl: relativePath,
+        source: 'user_input_required',
+        suggestions: this.generateBaseUrlSuggestions(relativePath),
+      };
+    }
+
+    if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+      logger.warn('[URL_RESOLVER] Invalid projectId', { projectId: typeof projectId });
+      return {
+        fullUrl: relativePath,
+        source: 'user_input_required',
+        suggestions: this.generateBaseUrlSuggestions(relativePath),
+      };
+    }
+
     try {
       // Clean the relative path
-      const cleanPath = relativePath.startsWith('/') ? relativePath : `/${relativePath}`;
+      const cleanPath = relativePath.trim().startsWith('/') ? relativePath.trim() : `/${relativePath.trim()}`;
 
       logger.info('[URL_RESOLVER] Resolving relative path', {
         relativePath: cleanPath,
@@ -95,8 +123,8 @@ export class UrlResolverService {
 
     } catch (error) {
       logger.error('[URL_RESOLVER] Error resolving relative path', {
-        error,
-        relativePath,
+        error: error instanceof Error ? error.message : String(error),
+        relativePath: relativePath.substring(0, 100),
         userId,
         projectId,
       });
@@ -116,8 +144,15 @@ export class UrlResolverService {
   static generateBaseUrlSuggestions(path: string): string[] {
     const suggestions: string[] = [];
 
+    // Validate input
+    if (!path || typeof path !== 'string') {
+      return ['https://api.example.com', 'http://localhost:3000'];
+    }
+
+    const normalizedPath = path.trim();
+
     // Common patterns based on path structure
-    if (path.startsWith('/api/v')) {
+    if (normalizedPath.startsWith('/api/v')) {
       // Versioned API
       suggestions.push(
         'https://api.example.com',
@@ -125,7 +160,7 @@ export class UrlResolverService {
         'http://localhost:3000',
         'http://localhost:8000'
       );
-    } else if (path.startsWith('/api/')) {
+    } else if (normalizedPath.startsWith('/api/')) {
       // Standard API
       suggestions.push(
         'https://api.example.com',
@@ -150,9 +185,14 @@ export class UrlResolverService {
    * Check if a URL is relative (doesn't have protocol and host)
    */
   static isRelativeUrl(url: string): boolean {
+    // Validate input
+    if (!url || typeof url !== 'string' || url.trim().length === 0) {
+      return true; // Empty string is considered relative
+    }
+
     try {
       // If we can create a URL object, it's absolute
-      new URL(url);
+      new URL(url.trim());
       return false;
     } catch {
       // If URL constructor fails, it's likely relative
@@ -164,10 +204,25 @@ export class UrlResolverService {
    * Extract base URL from full URL
    */
   static extractBaseUrl(fullUrl: string): string {
+    // Validate input
+    if (!fullUrl || typeof fullUrl !== 'string' || fullUrl.trim().length === 0) {
+      logger.debug('[URL_RESOLVER] Invalid fullUrl in extractBaseUrl', { fullUrl: typeof fullUrl });
+      return '';
+    }
+
     try {
-      const url = new URL(fullUrl);
-      return `${url.protocol}//${url.host}`;
+      const url = new URL(fullUrl.trim());
+      const baseUrl = `${url.protocol}//${url.host}`;
+
+      // Validate extracted base URL
+      if (baseUrl.length === 0 || !url.host) {
+        logger.warn('[URL_RESOLVER] Extracted empty base URL', { fullUrl: fullUrl.substring(0, 100) });
+        return '';
+      }
+
+      return baseUrl;
     } catch {
+      logger.debug('[URL_RESOLVER] Failed to extract base URL', { fullUrl: fullUrl.substring(0, 100) });
       return '';
     }
   }
@@ -176,12 +231,19 @@ export class UrlResolverService {
    * Extract path from full URL
    */
   static extractPath(fullUrl: string): string {
+    // Validate input
+    if (!fullUrl || typeof fullUrl !== 'string') {
+      return '/';
+    }
+
+    const normalized = fullUrl.trim();
+
     try {
-      const url = new URL(fullUrl);
-      return url.pathname;
+      const url = new URL(normalized);
+      return url.pathname || '/';
     } catch {
       // If it's not a valid URL, assume it's already a path
-      return fullUrl.startsWith('/') ? fullUrl : `/${fullUrl}`;
+      return normalized.startsWith('/') ? normalized : `/${normalized}`;
     }
   }
 
@@ -189,9 +251,18 @@ export class UrlResolverService {
    * Generate environment name from base URL
    */
   static generateEnvironmentName(baseUrl: string): string {
+    // Validate input
+    if (!baseUrl || typeof baseUrl !== 'string' || baseUrl.trim().length === 0) {
+      return 'Default';
+    }
+
     try {
-      const url = new URL(baseUrl);
+      const url = new URL(baseUrl.trim());
       const hostname = url.hostname;
+
+      if (!hostname || hostname.length === 0) {
+        return 'Default';
+      }
 
       // Extract meaningful name from hostname
       if (hostname.includes('localhost')) {
@@ -270,14 +341,48 @@ export class UrlResolverService {
     headers?: Record<string, string>;
     error?: string;
   } {
+    // Validate inputs
+    if (!relativePath || typeof relativePath !== 'string') {
+      return {
+        error: 'Invalid relative path',
+      };
+    }
+
+    if (!userResponse || typeof userResponse !== 'string' || userResponse.trim().length === 0) {
+      return {
+        error: 'Empty user response',
+      };
+    }
+
     try {
       // Try to extract URL from user response
-      const urlMatch = userResponse.match(/(https?:\/\/[^\s]+)/i);
+      const urlMatch = userResponse.match(/(https?:\/\/[^\s<>"']+)/i);
 
-      if (urlMatch) {
-        const baseUrl = urlMatch[1].replace(/\/$/, ''); // Remove trailing slash
-        const cleanPath = relativePath.startsWith('/') ? relativePath : `/${relativePath}`;
-        const fullUrl = `${baseUrl}${cleanPath}`;
+      if (urlMatch && urlMatch[1]) {
+        // Validate extracted URL
+        let baseUrl: string;
+        try {
+          const extracted = urlMatch[1].replace(/\/$/, ''); // Remove trailing slash
+          new URL(extracted); // Validate URL format
+          baseUrl = extracted;
+        } catch {
+          return {
+            error: 'Invalid URL format in user response',
+          };
+        }
+
+        const cleanPath = relativePath.trim().startsWith('/') ? relativePath.trim() : `/${relativePath.trim()}`;
+
+        // Validate full URL can be constructed
+        let fullUrl: string;
+        try {
+          fullUrl = `${baseUrl}${cleanPath}`;
+          new URL(fullUrl); // Validate full URL format
+        } catch {
+          return {
+            error: 'Cannot construct valid full URL',
+          };
+        }
 
         // Try to extract token/headers from response
         const headers: Record<string, string> = {};
@@ -317,26 +422,44 @@ export class UrlResolverService {
   static smartCompleteUrl(partialUrl: string): string[] {
     const suggestions: string[] = [];
 
+    // Validate input
+    if (!partialUrl || typeof partialUrl !== 'string' || partialUrl.trim().length === 0) {
+      return suggestions;
+    }
+
+    const normalized = partialUrl.trim();
+
     // If it looks like a domain without protocol
-    if (partialUrl.match(/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/) && !partialUrl.startsWith('http')) {
-      suggestions.push(`https://${partialUrl}`, `http://${partialUrl}`);
+    if (normalized.match(/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/) && !normalized.startsWith('http')) {
+      suggestions.push(`https://${normalized}`, `http://${normalized}`);
     }
 
     // If it looks like localhost
-    if (partialUrl.includes('localhost') && !partialUrl.startsWith('http')) {
-      suggestions.push(`http://${partialUrl}`, `https://${partialUrl}`);
+    if (normalized.includes('localhost') && !normalized.startsWith('http')) {
+      suggestions.push(`http://${normalized}`, `https://${normalized}`);
     }
 
     // If it's just a port number
-    if (partialUrl.match(/^:\d+/)) {
-      suggestions.push(`http://localhost${partialUrl}`, `https://localhost${partialUrl}`);
+    if (normalized.match(/^:\d+$/)) {
+      suggestions.push(`http://localhost${normalized}`, `https://localhost${normalized}`);
     }
 
     // If it's just a number (port)
-    if (partialUrl.match(/^\d+$/)) {
-      suggestions.push(`http://localhost:${partialUrl}`, `https://localhost:${partialUrl}`);
+    if (normalized.match(/^\d+$/)) {
+      const port = parseInt(normalized, 10);
+      if (port > 0 && port <= 65535) {
+        suggestions.push(`http://localhost:${normalized}`, `https://localhost:${normalized}`);
+      }
     }
 
-    return suggestions;
+    // Validate suggestions (filter out invalid URLs)
+    return suggestions.filter((url) => {
+      try {
+        new URL(url);
+        return true;
+      } catch {
+        return false;
+      }
+    });
   }
 }

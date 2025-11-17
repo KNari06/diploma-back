@@ -3,9 +3,9 @@
  * Validates JWT tokens and extracts user information
  */
 
-import { Socket } from 'socket.io';
-import { logger } from '@/utils/logger';
 import * as AuthService from '@/services/auth/auth.service';
+import { logger } from '@/utils/logger';
+import { Socket } from 'socket.io';
 import { SocketData } from './types';
 
 /**
@@ -18,13 +18,16 @@ export const authenticateSocket = async (
 ): Promise<void> => {
   try {
     // Get token from auth handshake or query params
-    const token =
-      (socket.handshake.auth?.token as string) ||
-      (socket.handshake.query?.token as string);
+    const authToken = socket.handshake.auth?.token as string | undefined;
+    const queryToken = socket.handshake.query?.token as string | undefined;
+    const token = authToken || queryToken;
 
-    if (!token) {
+    // Validate token exists and is a string
+    if (!token || typeof token !== 'string' || token.trim().length === 0) {
       logger.debug('[WebSocket] No token provided', {
         socketId: socket.id,
+        hasAuthToken: !!authToken,
+        hasQueryToken: !!queryToken,
       });
       return next(new Error('Authentication required'));
     }
@@ -32,15 +35,25 @@ export const authenticateSocket = async (
     // Verify token
     logger.info('[WebSocket] Authenticating connection', {
       socketId: socket.id,
+      tokenLength: token.length,
     });
 
-    const user = await AuthService.verifyToken(token);
+    const user = await AuthService.verifyToken(token.trim());
 
     if (!user) {
       logger.debug('[WebSocket] Invalid token', {
         socketId: socket.id,
       });
       return next(new Error('Authentication failed'));
+    }
+
+    // Validate user has required fields
+    if (!user.id || typeof user.id !== 'string') {
+      logger.warn('[WebSocket] User missing required id field', {
+        socketId: socket.id,
+        user,
+      });
+      return next(new Error('Authentication failed: invalid user data'));
     }
 
     // Store user info in socket data
@@ -63,6 +76,7 @@ export const authenticateSocket = async (
     logger.debug('[WebSocket] Authentication error', {
       socketId: socket.id,
       error: error instanceof Error ? error.message : String(error),
+      errorType: error instanceof Error ? error.constructor.name : typeof error,
     });
 
     // Don't crash - just reject the connection gracefully
@@ -76,16 +90,30 @@ export const authenticateSocket = async (
  * Check if socket is authenticated (not anonymous)
  */
 export const isAuthenticated = (socket: Socket): boolean => {
+  if (!socket || !socket.data) {
+    return false;
+  }
+
   const socketData = socket.data as SocketData;
-  return !socketData.isAnonymous && !!socketData.userId;
+  return !socketData.isAnonymous && !!socketData.userId && typeof socketData.userId === 'string';
 };
 
 /**
  * Get userId from socket
+ * @throws Error if socket is not authenticated or userId is missing
  */
 export const getUserId = (socket: Socket): string => {
+  if (!socket || !socket.data) {
+    throw new Error('Socket data not available');
+  }
+
   const socketData = socket.data as SocketData;
-  return socketData.userId!;
+
+  if (!socketData.userId || typeof socketData.userId !== 'string') {
+    throw new Error('Socket is not authenticated or userId is missing');
+  }
+
+  return socketData.userId;
 };
 
 /**

@@ -64,6 +64,11 @@ export interface TestResult {
   errors: TestError[];
   performance?: PerformanceMetrics;
   aiSummary?: AISummary;
+  // ✅ NEW: Video & Trace support
+  videoUrl?: string; // Supabase Storage URL
+  videoPath?: string; // Local path (temp)
+  traceUrl?: string; // Supabase Storage URL
+  tracePath?: string; // Local path (temp)
   createdAt: Date;
   completedAt?: Date;
 }
@@ -716,28 +721,76 @@ export interface IntentResult {
 }
 
 // Playwright Command types
+//
+// NOTE: This type defines ALL possible Playwright actions for type safety
+// Some actions may not be implemented in command-executor.ts yet (marked below)
+//
+// IMPLEMENTED in command-executor.ts:
+// - goto, click, fill, type, select (→ selectOption), check, uncheck, hover, press
+// - wait (→ waitForTimeout), waitForSelector, waitForNavigation (→ waitForLoadState)
+// - scroll, screenshot
+// - assertVisible, assertText, assertValue, assertUrl, assertCount
+// - extract, evaluate
+//
+// NOT YET IMPLEMENTED (types ready for future implementation):
+// - goBack, goForward, reload (navigation)
+// - dblclick, focus, blur (interactions)
+// - dragAndDrop, swipe, tap (touch/mobile)
+// - waitForTimeout, waitForLoadState, scrollIntoView (aliases/missing)
+// - upload, download (file operations)
+// - assertHidden, assertEnabled, assertDisabled (assertions)
+// - selectOption (use 'select' which maps to it)
+//
+// Types are defined to prevent runtime errors and support future features
 export type PlaywrightActionType =
-  | 'goto'          // Navigate to URL
-  | 'click'         // Click element
-  | 'fill'          // Fill input field
-  | 'type'          // Type text (slower, with events)
-  | 'select'        // Select from dropdown
-  | 'check'         // Check checkbox
-  | 'uncheck'       // Uncheck checkbox
-  | 'hover'         // Hover over element
-  | 'wait'          // Wait for condition
-  | 'waitForSelector' // Wait for element
+  // Navigation
+  | 'goto'              // Navigate to URL
+  | 'goBack'            // Navigate back in history
+  | 'goForward'         // Navigate forward in history
+  | 'reload'            // Reload current page
+  // Interactions
+  | 'click'             // Click element
+  | 'dblclick'          // Double-click element
+  | 'fill'              // Fill input field (fast, no events)
+  | 'type'              // Type text (slower, with keyboard events)
+  | 'select'            // Select from dropdown (maps to selectOption)
+  | 'selectOption'      // Select option from dropdown/select element
+  | 'check'             // Check checkbox
+  | 'uncheck'           // Uncheck checkbox
+  | 'hover'             // Hover over element
+  | 'press'             // Press keyboard key
+  | 'focus'             // Focus element
+  | 'blur'              // Blur element
+  // Touch/Mobile
+  | 'dragAndDrop'       // Drag and drop element
+  | 'swipe'             // Swipe gesture (mobile)
+  | 'tap'               // Tap gesture (mobile)
+  // Wait & Scroll
+  | 'wait'              // Wait for timeout (ms)
+  | 'waitForSelector'   // Wait for element to appear
+  | 'waitForTimeout'    // Wait for specific timeout (alias for wait)
+  | 'waitForLoadState'  // Wait for page load state
   | 'waitForNavigation' // Wait for page navigation
-  | 'screenshot'    // Take screenshot
-  | 'scroll'        // Scroll page/element
-  | 'press'         // Press keyboard key
-  | 'assertVisible' // Assert element is visible
-  | 'assertText'    // Assert element contains text
-  | 'assertValue'   // Assert input has value
-  | 'assertUrl'     // Assert current URL
-  | 'assertCount'   // Assert number of elements
-  | 'extract'       // Extract data from element
-  | 'evaluate'      // Execute JS in browser
+  | 'scroll'            // Scroll page/element
+  | 'scrollIntoView'    // Scroll element into view
+  // File operations
+  | 'upload'            // Upload file
+  | 'download'          // Download file (read-only)
+  | 'screenshot'        // Take screenshot
+  // Assertions
+  | 'assertVisible'     // Assert element is visible
+  | 'assertHidden'      // Assert element is hidden
+  | 'assertEnabled'     // Assert element is enabled
+  | 'assertDisabled'    // Assert element is disabled
+  | 'assertText'        // Assert element contains text
+  | 'assertValue'       // Assert input has value
+  | 'assertUrl'         // Assert current URL matches
+  | 'assertCount'       // Assert number of elements
+  // Data extraction & evaluation
+  | 'extract'           // Extract data from element
+  | 'evaluate'          // Execute JS in browser context
+  | 'script'            // Execute custom script (alias for evaluate)
+  // Fallback for custom/unknown actions
   | string;
 
 export interface PlaywrightCommand {
@@ -753,7 +806,7 @@ export interface PlaywrightCommand {
   assertion?: {             // For assert actions
     type: 'visible' | 'hidden' | 'text' | 'value' | 'count' | 'url' | 'enabled' | 'disabled';
     expected: string | number | boolean;
-    operator?: '=' | '!=' | '>' | '<' | 'contains' | 'startsWith' | 'endsWith';
+    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'contains' | 'startsWith' | 'endsWith' | 'matches' | 'regex';
   };
   extract?: {               // For extract action
     name: string;           // Variable name to store extracted value
@@ -768,6 +821,88 @@ export interface PlaywrightTestPlan {
   commands: PlaywrightCommand[];
   viewport?: ViewportType;
   expectedOutcome: string;  // What should happen if test passes
+}
+
+// ============================================================================
+// FINAL REPORT & JIRA INTEGRATION TYPES
+// ============================================================================
+
+export interface FinalTestReport {
+  testId: string;
+  testUrl: string;
+  status: TestStatus;
+  executedAt: string;
+  duration: number; // milliseconds
+
+  // Generated Playwright code
+  generatedCode: {
+    language: 'typescript' | 'javascript' | 'python';
+    framework: 'playwright' | 'puppeteer';
+    code: string;
+    steps: string[];
+    commands: PlaywrightCommand[];
+  };
+
+  // Test artifacts
+  artifacts: {
+    video?: string; // URL
+    trace?: string; // URL
+    screenshots: string[]; // URLs or base64
+    dom?: string;
+    logs: string[];
+    networkLogs: NetworkLog[];
+  };
+
+  // AI Analysis
+  analysis: {
+    bugs: Array<{
+      severity: 'critical' | 'high' | 'medium' | 'low';
+      type: string;
+      message: string;
+      selector?: string;
+      recommendation: string;
+    }>;
+    severity: 'critical' | 'high' | 'medium' | 'low' | 'none';
+    recommendations: string[];
+    confidence: number; // 0-1
+  };
+
+  // Summary stats
+  summary: {
+    totalSteps: number;
+    passedSteps: number;
+    failedSteps: number;
+    bugsFound: number;
+    criticalBugs: number;
+  };
+}
+
+export interface JiraIssueRequest {
+  userId: string;
+  projectKey: string;
+  testReport: FinalTestReport;
+  issueType?: 'Bug' | 'Task' | 'Story';
+  priority?: 'Highest' | 'High' | 'Medium' | 'Low' | 'Lowest';
+}
+
+export interface JiraIssue {
+  id: string;
+  key: string; // e.g., "PROJ-123"
+  self: string; // URL
+  fields: {
+    summary: string;
+    description: any;
+    status: { name: string };
+    priority: { name: string };
+    created: string;
+    updated: string;
+  };
+}
+
+export interface JiraAttachment {
+  filename: string;
+  buffer: Buffer;
+  mimeType: string;
 }
 
 // Message Feedback types

@@ -33,7 +33,7 @@ router.use(requireAuth);
 
 /**
  * @swagger
- * /api/kb/global/upload:
+ * /api/v1/kb/global/upload:
  *   post:
  *     summary: Upload file to global KB (admin only)
  *     tags: [Knowledge Base]
@@ -62,7 +62,7 @@ router.post('/global/upload', upload.single('file'), kbController.uploadGlobalKB
 
 /**
  * @swagger
- * /api/kb/upload:
+ * /api/v1/kb/upload:
  *   post:
  *     summary: Upload file to project KB
  *     tags: [Knowledge Base]
@@ -89,7 +89,7 @@ router.post('/upload', upload.single('file'), kbController.uploadProjectKB);
 
 /**
  * @swagger
- * /api/kb/query:
+ * /api/v1/kb/query:
  *   post:
  *     summary: Query knowledge base (RAG search)
  *     tags: [Knowledge Base]
@@ -121,7 +121,7 @@ router.post('/query', kbController.queryKB);
 
 /**
  * @swagger
- * /api/kb/project-files:
+ * /api/v1/kb/project-files:
  *   get:
  *     summary: Get project KB files
  *     tags: [Knowledge Base]
@@ -142,7 +142,7 @@ router.get('/project-files', kbController.getProjectFiles);
 
 /**
  * @swagger
- * /api/kb/project-files:
+ * /api/v1/kb/project-files:
  *   delete:
  *     summary: Delete project KB file
  *     tags: [Knowledge Base]
@@ -168,7 +168,7 @@ router.delete('/project-files', kbController.deleteProjectFile);
 
 /**
  * @swagger
- * /api/kb/stats:
+ * /api/v1/kb/stats:
  *   get:
  *     summary: Get KB statistics (local global KB + project KB)
  *     tags: [Knowledge Base]
@@ -188,7 +188,7 @@ router.get('/stats', kbController.getKBStats);
 
 /**
  * @swagger
- * /api/kb/rebuild:
+ * /api/v1/kb/rebuild:
  *   post:
  *     summary: Rebuild global KB from source files (admin only)
  *     description: Regenerates embeddings.json from markdown files in data/global-kb/sources/ and reloads into memory

@@ -5,6 +5,17 @@ import { Queue, QueueEvents } from 'bullmq';
 import IORedis from 'ioredis';
 import { env } from './env';
 
+// Helper to check if Redis is available
+let redisAvailable = false;
+
+// Validate required Redis configuration
+if (!env.REDIS_HOST || !env.REDIS_PORT) {
+  logger.error('❌ Missing required Redis configuration: REDIS_HOST and REDIS_PORT must be set');
+  if (env.NODE_ENV === 'production') {
+    throw new Error('Redis configuration is required in production');
+  }
+}
+
 // Redis connection configuration
 const redisConnection = new IORedis(env.REDIS_URL, {
   maxRetriesPerRequest: 3,
@@ -50,10 +61,6 @@ redisConnection.on('reconnecting', (delay: number) => {
 
 // Connect to Redis (with error handling)
 redisConnection.connect()
-  .then(() => {
-    redisAvailable = true;
-    logger.info('✅ Redis connected successfully');
-  })
   .catch((error) => {
     redisAvailable = false;
     logger.warn('Failed to connect to Redis:', error.message);
@@ -91,9 +98,6 @@ export const QUEUE_NAMES = {
   NOTIFICATION: 'notification',
   WEBHOOK: 'webhook',
 } as const;
-
-// Helper to check if Redis is available
-let redisAvailable = false;
 
 // Test run queue - for executing tests
 export const testRunQueue = new Queue<TestJobData>(QUEUE_NAMES.TEST_RUN, {
@@ -217,6 +221,16 @@ export class QueueManager {
    */
   static async addTestRunJob(jobData: TestJobData, priority: number = 0) {
     try {
+      // Check Redis availability before adding job
+      if (!redisAvailable) {
+        const error = new Error('Redis is not available. Cannot add job to queue.');
+        logger.error('❌ [QUEUE] Redis unavailable', {
+          testId: jobData.testId,
+          browser: jobData.browser,
+        });
+        throw error;
+      }
+
       logger.info('🔴 [QUEUE_DEBUG] Attempting to add job to queue', {
         testId: jobData.testId,
         browser: jobData.browser,
@@ -476,38 +490,69 @@ export class QueueManager {
   }
 }
 
-// Graceful shutdown
+// Graceful shutdown with timeout
 export const gracefulShutdown = async () => {
   logger.info('Shutting down queues...');
 
-  try {
-    // Use Promise.allSettled to ensure all queues close even if one fails
-    const closeResults = await Promise.allSettled([
-      testRunQueue.close(),
-      testResultQueue.close(),
-      aiAnalysisQueue.close(),
-      notificationQueue.close(),
-      webhookQueue.close(),
-    ]);
+  const SHUTDOWN_TIMEOUT = 30000; // 30 seconds
 
-    // Log any failures but continue shutdown
-    closeResults.forEach((result, index) => {
-      if (result.status === 'rejected') {
-        const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook'];
-        logger.warn(`Failed to close ${queueNames[index]} queue`, { error: result.reason });
-      }
+  try {
+    // Create a timeout promise
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Shutdown timeout after 30s')), SHUTDOWN_TIMEOUT);
     });
 
-    // Try to close Redis connection
-    try {
-    await redisConnection.quit();
-    } catch (redisError) {
-      logger.warn('Failed to close Redis connection', { error: redisError });
-    }
+    // Shutdown logic
+    const shutdownLogic = async () => {
+      // Close all Queues
+      const closeQueueResults = await Promise.allSettled([
+        testRunQueue.close(),
+        testResultQueue.close(),
+        aiAnalysisQueue.close(),
+        notificationQueue.close(),
+        webhookQueue.close(),
+      ]);
 
-    logger.info('Queues shut down completed');
+      closeQueueResults.forEach((result, index) => {
+        if (result.status === 'rejected') {
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook'];
+          logger.warn(`Failed to close ${queueNames[index]} queue`, { error: result.reason });
+        }
+      });
+
+      // Close all QueueEvents to prevent memory leaks
+      const closeQueueEventsResults = await Promise.allSettled([
+        testRunQueueEvents.close(),
+        testResultQueueEvents.close(),
+        aiAnalysisQueueEvents.close(),
+      ]);
+
+      closeQueueEventsResults.forEach((result, index) => {
+        if (result.status === 'rejected') {
+          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents'];
+          logger.warn(`Failed to close ${eventNames[index]}`, { error: result.reason });
+        }
+      });
+
+      // Close Redis connection
+      try {
+        await redisConnection.quit();
+        logger.info('✅ Redis connection closed');
+      } catch (redisError) {
+        logger.warn('Failed to close Redis connection', { error: redisError });
+      }
+    };
+
+    // Race between shutdown logic and timeout
+    await Promise.race([shutdownLogic(), timeoutPromise]);
+
+    logger.info('✅ Queues shut down completed');
   } catch (error) {
-    logger.error('Error during queue shutdown:', error);
+    if (error instanceof Error && error.message.includes('timeout')) {
+      logger.error('❌ Queue shutdown timed out - forcing exit');
+    } else {
+      logger.error('❌ Error during queue shutdown:', error);
+    }
   }
 };
 

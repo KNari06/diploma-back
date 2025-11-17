@@ -7,7 +7,7 @@ import {
   SecurityIssue,
   IssueSeverity,
 } from '@/types';
-import { executeApiTest } from './apiTest.service';
+import { executeApiTest } from '../apiTest.service';
 import { FUZZING_CONFIG } from './fuzzing-config';
 import pLimit from 'p-limit';
 

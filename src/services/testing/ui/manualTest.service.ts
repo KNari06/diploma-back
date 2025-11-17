@@ -6,7 +6,7 @@ import { logger, logTestEvent } from '@/utils/logger';
 import { TestCreatedPayload } from '@/websocket/types';
 import { webSocketService } from '@/websocket/websocket.service';
 import { v4 as uuidv4 } from 'uuid';
-import { TestCompletionHandlerService } from './test-completion-handler.service';
+import { TestCompletionHandlerService } from '@/services/testing/results/test-completion-handler.service';
 
 export class ManualTestService {
   /**
@@ -702,6 +702,19 @@ export class ManualTestService {
 
       // Add AI analysis job
       await QueueManager.addAIAnalysisJob(testResult.id, resultData.testId);
+
+      // TODO: Auto-generate final report after AI analysis completes
+      // After aiAnalysisQueue finishes, call:
+      // await TestReportGeneratorService.generateFinalReport({
+      //   testId: resultData.testId,
+      //   testResult: testResult,
+      //   testPlan: await getTestPlan(...),
+      //   aiAnalysis: await getAIAnalysis(...),
+      // });
+      // Options:
+      // 1. Add to AI analysis worker (recommended - after AI analysis)
+      // 2. Add here (immediate - without AI analysis)
+      // 3. User-triggered only (manual via API)
 
       // Check if test is complete and notify chat sessions
       await this.checkAndHandleTestCompletion(resultData.testId);

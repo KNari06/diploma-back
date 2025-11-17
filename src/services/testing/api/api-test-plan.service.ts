@@ -1,5 +1,5 @@
 import { logger } from '@/utils/logger';
-import { getChatCompletionWithMessages } from '../ai/openai.service';
+import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { buildApiTestPlanPrompt } from '@/ai/prompts/index';
 
 /**

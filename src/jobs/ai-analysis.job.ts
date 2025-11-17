@@ -11,14 +11,34 @@ import {
   AIBugFoundPayload,
 } from '@/websocket/types';
 
+// Types for better type safety
+interface BugSeverity {
+  severity: 'critical' | 'high' | 'medium' | 'low';
+}
+
+interface ProcessedBug extends BugSeverity {
+  message: string;
+  location?: string;
+}
+
+interface AIAnalysisJobData {
+  testResultId: string;
+  testId: string;
+}
+
 export class AIAnalysisJobHandler {
   /**
    * Process AI analysis job
    */
-  static async process(job: Job<{ testResultId: string; testId: string }>) {
+  static async process(job: Job<AIAnalysisJobData>) {
     const { testResultId, testId } = job.data;
 
-    logger.info(`Processing AI analysis: ${testResultId}`);
+    // Validate input parameters
+    if (!testResultId || !testId) {
+      throw new Error('Missing required parameters: testResultId or testId');
+    }
+
+    logger.info(`[AI-ANALYSIS] Processing analysis for test result: ${testResultId}`);
     logQueueEvent('processing', job.id!, { testResultId, testId });
 
     try {
@@ -49,15 +69,13 @@ export class AIAnalysisJobHandler {
 
       // Emit WebSocket: AI bugs found (one by one)
       if (aiSummary.bugs && aiSummary.bugs.length > 0) {
-        for (const bug of aiSummary.bugs) {
+        const processedBugs = this.processBugsForWebSocket(aiSummary.bugs);
+
+        for (const bug of processedBugs) {
           const bugFoundPayload: AIBugFoundPayload = {
             testId,
             resultId: testResultId,
-            bug: {
-              severity: bug.severity as 'critical' | 'high' | 'medium' | 'low',
-              message: (bug as any).message || bug.description,
-              location: (bug as any).location || (bug as any).selector,
-            },
+            bug,
             timestamp: new Date().toISOString(),
           };
           webSocketService.emitAIBugFound(testId, bugFoundPayload);
@@ -65,18 +83,15 @@ export class AIAnalysisJobHandler {
       }
 
       // Emit WebSocket: AI analysis completed
+      const processedBugs = this.processBugsForWebSocket(aiSummary.bugs || []);
       const analysisCompletedPayload: AIAnalysisCompletedPayload = {
         testId,
         resultId: testResultId,
         summary: {
           summary: aiSummary.summary,
-          bugs: aiSummary.bugs.map((bug: any) => ({
-            severity: bug.severity as 'critical' | 'high' | 'medium' | 'low',
-            message: bug.message || bug.description,
-            location: bug.location || bug.selector,
-          })),
-          recommendations: aiSummary.recommendations,
-          confidence: aiSummary.confidence,
+          bugs: processedBugs,
+          recommendations: aiSummary.recommendations || [],
+          confidence: aiSummary.confidence || 0,
         },
         timestamp: new Date().toISOString(),
       };
@@ -88,11 +103,11 @@ export class AIAnalysisJobHandler {
       // Send webhook notifications
       await this.sendWebhookNotifications(testId, aiSummary);
 
-      logger.info(`AI analysis completed: ${testResultId}`);
+      logger.info(`[AI-ANALYSIS] Analysis completed successfully: ${testResultId}`);
       logAIAnalysis(testId, aiSummary);
 
     } catch (error) {
-      logger.error(`AI analysis failed: ${testResultId}`, error);
+      logger.error(`[AI-ANALYSIS] Analysis failed for ${testResultId}:`, error);
 
       // Mark analysis as failed in database
       await dbAdminService.updateTestResult(testResultId, {
@@ -108,6 +123,28 @@ export class AIAnalysisJobHandler {
 
       throw handleAIError(error);
     }
+  }
+
+  /**
+   * Process bugs for WebSocket emission with proper type safety
+   */
+  private static processBugsForWebSocket(bugs: any[]): ProcessedBug[] {
+    if (!Array.isArray(bugs)) {
+      logger.warn('[AI-ANALYSIS] Invalid bugs format, expected array');
+      return [];
+    }
+
+    return bugs.map((bug) => {
+      // Validate and normalize severity
+      const validSeverities: Array<'critical' | 'high' | 'medium' | 'low'> = ['critical', 'high', 'medium', 'low'];
+      const severity = validSeverities.includes(bug.severity) ? bug.severity : 'medium';
+
+      return {
+        severity,
+        message: bug.message || bug.description || 'Unknown issue detected',
+        location: bug.location || bug.selector || undefined,
+      };
+    });
   }
 
   /**
@@ -129,10 +166,19 @@ export class AIAnalysisJobHandler {
         .eq('id', testResultId)
         .single();
 
-      if (error) throw error;
+      if (error) {
+        logger.error(`[AI-ANALYSIS] Database error fetching test result ${testResultId}:`, error);
+        throw error;
+      }
+
+      if (!data) {
+        logger.warn(`[AI-ANALYSIS] Test result not found: ${testResultId}`);
+        return null;
+      }
+
       return data;
     } catch (error) {
-      logger.error(`Failed to get test result: ${testResultId}`, error);
+      logger.error(`[AI-ANALYSIS] Failed to get test result ${testResultId}:`, error);
       return null;
     }
   }
@@ -166,19 +212,30 @@ export class AIAnalysisJobHandler {
       const criticalBugs = aiSummary.bugs?.filter((bug: any) => bug.severity === 'critical') || [];
 
       if (criticalBugs.length === 0) {
+        logger.debug(`[AI-ANALYSIS] No critical issues found for test: ${testId}`);
         return;
       }
 
+      logger.info(`[AI-ANALYSIS] Found ${criticalBugs.length} critical issues for test: ${testId}`);
+
       // Get test details
       const test = await dbAdminService.getTest(testId) as any;
-      if (!test) return;
+      if (!test) {
+        logger.warn(`[AI-ANALYSIS] Test not found when handling critical issues: ${testId}`);
+        return;
+      }
+
+      // Prepare critical issues summary
+      const issuesSummary = criticalBugs
+        .map((bug: any) => `- ${bug.message || bug.description || 'Unknown issue'}`)
+        .join('\n');
 
       // Send critical issue notification
       await QueueManager.addNotificationJob({
         type: 'email',
         recipient: test.user_id || 'admin@qai.so',
         subject: `🚨 Critical Issues Found: ${testId}`,
-        message: `Critical issues detected in test ${testId}:\n\n${criticalBugs.map((bug: any) => `- ${bug.title}: ${bug.description}`).join('\n')}`,
+        message: `Critical issues detected in test ${testId}:\n\n${issuesSummary}`,
         data: { testId, criticalBugs, aiSummary },
       });
 
@@ -192,7 +249,7 @@ export class AIAnalysisJobHandler {
       });
 
     } catch (error) {
-      logger.error('Failed to handle critical issues:', error);
+      logger.error(`[AI-ANALYSIS] Failed to handle critical issues for test ${testId}:`, error);
     }
   }
 
@@ -203,15 +260,20 @@ export class AIAnalysisJobHandler {
     try {
       // Get test details
       const test = await dbAdminService.getTest(testId) as any;
-      if (!test) return;
+      if (!test) {
+        logger.warn(`[AI-ANALYSIS] Test not found for webhook notification: ${testId}`);
+        return;
+      }
 
       // Get project settings for webhook configuration
       const project = await dbAdminService.getProject(test.project_id) as any;
       if (!project?.settings?.integrations?.webhook) {
+        logger.debug(`[AI-ANALYSIS] No webhook configured for project: ${test.project_id}`);
         return;
       }
 
       const webhookUrl = project.settings.integrations.webhook;
+      logger.info(`[AI-ANALYSIS] Sending webhook notification for test: ${testId}`);
 
       // Send webhook notification
       await QueueManager.addWebhookJob({
@@ -231,7 +293,7 @@ export class AIAnalysisJobHandler {
       });
 
     } catch (error) {
-      logger.error('Failed to send webhook notifications:', error);
+      logger.error(`[AI-ANALYSIS] Failed to send webhook notifications for test ${testId}:`, error);
     }
   }
 }

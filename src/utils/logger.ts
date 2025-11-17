@@ -172,14 +172,30 @@ export const logQueueEvent = (event: string, jobId: string, data?: any) => {
 };
 
 export const logAIAnalysis = (testId: string, analysis: any) => {
+  // Validate inputs
+  if (!testId || typeof testId !== 'string') {
+    logger.warn('Invalid testId in logAIAnalysis', { testId });
+    testId = 'unknown';
+  }
+
+  if (!analysis || typeof analysis !== 'object') {
+    logger.warn('Invalid analysis object in logAIAnalysis', { testId });
+    return;
+  }
+
+  // Safely extract summary
+  const summary = analysis.summary && typeof analysis.summary === 'string'
+    ? (analysis.summary.length > 100 ? analysis.summary.substring(0, 100) + '...' : analysis.summary)
+    : 'No summary available';
+
   logger.info({
     event: 'ai.analysis',
     testId,
     analysis: {
-      summary: analysis.summary?.substring(0, 100) + '...',
-      bugsCount: analysis.bugs?.length || 0,
-      severity: analysis.severity,
-      confidence: analysis.confidence,
+      summary,
+      bugsCount: Array.isArray(analysis.bugs) ? analysis.bugs.length : 0,
+      severity: analysis.severity || 'unknown',
+      confidence: typeof analysis.confidence === 'number' ? analysis.confidence : 0,
     },
     timestamp: new Date().toISOString(),
   });

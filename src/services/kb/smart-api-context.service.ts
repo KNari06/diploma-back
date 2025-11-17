@@ -1,7 +1,7 @@
+import { ApiEndpoint, ApiEnvironment, IntentResult } from '@/types';
 import { logger } from '@/utils/logger';
 import { ApiConfigService } from '../api/api-config.service';
 import { UrlResolverService } from '../utils/url-resolver.service';
-import { ApiEnvironment, ApiEndpoint, IntentResult } from '@/types';
 
 /**
  * Context analysis result for API testing
@@ -50,10 +50,26 @@ export class SmartApiContextService {
     userId: string,
     projectId: string
   ): Promise<ApiTestContext> {
+    // Validate inputs
+    if (!intent || typeof intent !== 'object') {
+      logger.error('[SMART_CONTEXT] Invalid intent in analyzeApiContext', { intent: typeof intent });
+      return this.getMinimalContext();
+    }
+
+    if (!userId || typeof userId !== 'string') {
+      logger.error('[SMART_CONTEXT] Invalid userId in analyzeApiContext', { userId: typeof userId });
+      return this.getMinimalContext();
+    }
+
+    if (!projectId || typeof projectId !== 'string') {
+      logger.error('[SMART_CONTEXT] Invalid projectId in analyzeApiContext', { projectId: typeof projectId });
+      return this.getMinimalContext();
+    }
+
     try {
       logger.info('[SMART_CONTEXT] Analyzing API context', {
         intent: intent.intent,
-        apiUrl: intent.apiUrl,
+        apiUrl: intent.apiUrl ? intent.apiUrl.substring(0, 100) : undefined,
         apiMethod: intent.apiMethod,
         userId,
         projectId,
@@ -71,8 +87,21 @@ export class SmartApiContextService {
         confidence: 0,
       };
 
+      // Validate apiUrl exists
+      if (!intent.apiUrl || typeof intent.apiUrl !== 'string' || intent.apiUrl.trim().length === 0) {
+        logger.warn('[SMART_CONTEXT] Missing apiUrl in intent', { intent: intent.intent });
+        context.missingInfo.baseUrl = true;
+        context.confidence = 0.1;
+        return context;
+      }
+
       // 1. Analyze URL completeness
-      const urlAnalysis = await this.analyzeUrl(intent.apiUrl!, userId, projectId, intent.apiMethod || 'GET');
+      const urlAnalysis = await this.analyzeUrl(
+        intent.apiUrl,
+        userId,
+        projectId,
+        intent.apiMethod || 'GET'
+      );
       context.hasBaseUrl = urlAnalysis.hasBaseUrl;
       context.environment = urlAnalysis.environment;
       context.fullUrl = urlAnalysis.fullUrl;
@@ -136,18 +165,25 @@ export class SmartApiContextService {
       logger.error('[SMART_CONTEXT] Error analyzing API context', { error, intent, userId, projectId });
 
       // Return minimal context on error
-      return {
-        hasBaseUrl: false,
-        hasAuthentication: false,
-        hasHeaders: false,
-        hasEndpointConfig: false,
-        hasTestHistory: false,
-        missingInfo: { baseUrl: true },
-        testStrategy: 'basic',
-        recommendedScenarios: ['Happy Path'],
-        confidence: 0.1,
-      };
+      return this.getMinimalContext();
     }
+  }
+
+  /**
+   * Get minimal context for error cases
+   */
+  private static getMinimalContext(): ApiTestContext {
+    return {
+      hasBaseUrl: false,
+      hasAuthentication: false,
+      hasHeaders: false,
+      hasEndpointConfig: false,
+      hasTestHistory: false,
+      missingInfo: { baseUrl: true },
+      testStrategy: 'basic',
+      recommendedScenarios: ['Happy Path'],
+      confidence: 0.1,
+    };
   }
 
   /**
@@ -163,12 +199,32 @@ export class SmartApiContextService {
     fullUrl?: string;
     environment?: ApiEnvironment;
   }> {
+    // Validate inputs
+    if (!apiUrl || typeof apiUrl !== 'string' || apiUrl.trim().length === 0) {
+      return { hasBaseUrl: false };
+    }
+
+    if (!userId || typeof userId !== 'string') {
+      return { hasBaseUrl: false };
+    }
+
+    if (!projectId || typeof projectId !== 'string') {
+      return { hasBaseUrl: false };
+    }
+
     // Check if URL is complete
     if (!UrlResolverService.isRelativeUrl(apiUrl)) {
-      return {
-        hasBaseUrl: true,
-        fullUrl: apiUrl,
-      };
+      // Validate URL format
+      try {
+        new URL(apiUrl);
+        return {
+          hasBaseUrl: true,
+          fullUrl: apiUrl,
+        };
+      } catch {
+        logger.warn('[SMART_CONTEXT] Invalid URL format', { apiUrl: apiUrl.substring(0, 100) });
+        return { hasBaseUrl: false };
+      }
     }
 
     // Try to resolve relative URL
@@ -480,6 +536,47 @@ export class SmartApiContextService {
     endpoint?: ApiEndpoint;
     error?: string;
   }> {
+    // Validate inputs
+    if (!context || typeof context !== 'object') {
+      return {
+        success: false,
+        updatedContext: this.getMinimalContext(),
+        error: 'Invalid context',
+      };
+    }
+
+    if (!responses || typeof responses !== 'object') {
+      return {
+        success: false,
+        updatedContext: context,
+        error: 'Invalid responses',
+      };
+    }
+
+    if (!userId || typeof userId !== 'string') {
+      return {
+        success: false,
+        updatedContext: context,
+        error: 'Invalid userId',
+      };
+    }
+
+    if (!projectId || typeof projectId !== 'string') {
+      return {
+        success: false,
+        updatedContext: context,
+        error: 'Invalid projectId',
+      };
+    }
+
+    if (!intent || typeof intent !== 'object') {
+      return {
+        success: false,
+        updatedContext: context,
+        error: 'Invalid intent',
+      };
+    }
+
     try {
       let environment = context.environment;
       let endpoint = context.endpoint;

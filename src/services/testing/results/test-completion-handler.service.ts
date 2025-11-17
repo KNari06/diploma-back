@@ -1,8 +1,8 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { TestResultsFormatterService } from '@/services/testing/results/test-results-formatter.service';
+import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
+import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/logger';
-import { TestChatMappingService } from './test-chat-mapping.service';
-import { TestResultsFormatterService } from './test-results-formatter.service';
-import { ChatService } from '../utils/chat.service';
 
 /**
  * Service to handle test completion and notify chat sessions
@@ -23,23 +23,26 @@ export class TestCompletionHandlerService {
         return;
       }
 
-      // Get test data
+      // ✅ FIX #8: Get test data with proper field selection
       const { data: test, error: testError } = await supabaseAdmin
         .from('tests')
-        .select('*')
+        .select('id, url, status, browsers, created_at, completed_at') // ✅ Select only needed fields
         .eq('id', testId)
         .single();
 
       if (testError || !test) {
-        logger.error('[TEST_COMPLETION] Failed to get test', { error: testError, testId });
+        logger.error('[TEST_COMPLETION] Failed to get test', {
+          error: testError?.message,
+          testId
+        });
         return;
       }
 
-      // Get test results
+      // ✅ FIX #9: Get test results with proper field selection
       const { data: results, error: resultsError } = await supabaseAdmin
         .from('test_results')
-        .select('*')
-        .eq('test_id', testId);
+        .select('id, test_id, browser, status, errors, created_at, completed_at') // ✅ Select only needed fields
+        .eq('test_id', testId); // ✅ Correct field name: test_id (not testId)
 
       if (resultsError) {
         logger.error('[TEST_COMPLETION] Failed to get results', { error: resultsError, testId });

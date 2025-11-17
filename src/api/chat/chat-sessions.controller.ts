@@ -1,7 +1,8 @@
-import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
-import { ChatService } from '@/services/utils/chat.service';
+import { supabaseAdmin } from '@/db/supabase';
 import { WorkspaceService } from '@/services/core/workspace.service';
+import { ChatService } from '@/services/utils/chat.service';
+import { logger } from '@/utils/logger';
+import { Request, Response } from 'express';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -15,6 +16,9 @@ import { WorkspaceService } from '@/services/core/workspace.service';
  * - Delete chat session
  * ═══════════════════════════════════════════════════════════════════════════
  */
+
+// UUID validation regex
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * POST /api/v1/chat/sessions/new
@@ -49,6 +53,12 @@ export const createNewChatSession = async (req: Request, res: Response): Promise
     });
   } catch (error) {
     logger.error('[CHAT_SESSIONS] Error creating new chat session', { error });
+
+    if (res.headersSent) {
+      logger.warn('[CHAT_SESSIONS] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: 'Failed to create new chat session',
@@ -95,6 +105,12 @@ export const listUserChatSessions = async (req: Request, res: Response): Promise
     });
   } catch (error) {
     logger.error('[CHAT_SESSIONS] Error listing chat sessions', { error });
+
+    if (res.headersSent) {
+      logger.warn('[CHAT_SESSIONS] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: 'Failed to list chat sessions',
@@ -114,10 +130,19 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
 
     logger.info('[CHAT_SESSIONS] Getting chat session', { userId, sessionId });
 
+    // Validate sessionId format (UUID)
+    if (!UUID_REGEX.test(sessionId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid session ID format',
+      });
+      return;
+    }
+
     // Get session with messages (using existing getChatHistory logic)
     // This endpoint already exists in chat.controller.ts
     // We'll reuse that logic here for consistency
-    const { data: session, error: sessionError } = await require('@/db/supabase').supabaseAdmin
+    const { data: session, error: sessionError } = await supabaseAdmin
       .from('chat_sessions')
       .select('id, title, created_at, updated_at')
       .eq('id', sessionId)
@@ -134,7 +159,7 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
     }
 
     // Get messages
-    const { data: messages, error: messagesError } = await require('@/db/supabase').supabaseAdmin
+    const { data: messages, error: messagesError } = await supabaseAdmin
       .from('chat_messages')
       .select('id, role, content, metadata, created_at')
       .eq('session_id', sessionId)
@@ -159,6 +184,12 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
     });
   } catch (error) {
     logger.error('[CHAT_SESSIONS] Error getting chat session', { error });
+
+    if (res.headersSent) {
+      logger.warn('[CHAT_SESSIONS] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: 'Failed to get chat session',
@@ -176,6 +207,15 @@ export const updateChatSessionTitle = async (req: Request, res: Response): Promi
     const userId = req.user!.id;
     const { sessionId } = req.params;
     const { title } = req.body;
+
+    // Validate sessionId format (UUID)
+    if (!UUID_REGEX.test(sessionId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid session ID format',
+      });
+      return;
+    }
 
     if (!title || typeof title !== 'string') {
       res.status(400).json({
@@ -217,6 +257,12 @@ export const updateChatSessionTitle = async (req: Request, res: Response): Promi
     });
   } catch (error) {
     logger.error('[CHAT_SESSIONS] Error updating chat session title', { error });
+
+    if (res.headersSent) {
+      logger.warn('[CHAT_SESSIONS] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: 'Failed to update chat session title',
@@ -233,6 +279,15 @@ export const deleteChatSession = async (req: Request, res: Response): Promise<vo
   try {
     const userId = req.user!.id;
     const { sessionId } = req.params;
+
+    // Validate sessionId format (UUID)
+    if (!UUID_REGEX.test(sessionId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid session ID format',
+      });
+      return;
+    }
 
     logger.info('[CHAT_SESSIONS] Deleting chat session', { userId, sessionId });
 
@@ -257,6 +312,12 @@ export const deleteChatSession = async (req: Request, res: Response): Promise<vo
     });
   } catch (error) {
     logger.error('[CHAT_SESSIONS] Error deleting chat session', { error });
+
+    if (res.headersSent) {
+      logger.warn('[CHAT_SESSIONS] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       error: 'Failed to delete chat session',

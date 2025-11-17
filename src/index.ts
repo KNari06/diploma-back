@@ -10,6 +10,7 @@ import rulesReloadRoutes from '@/api/kb/rules-reload.route';
 import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
+import reportsRoutes from '@/api/reports/reports.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
@@ -21,7 +22,6 @@ import { errorHandler, notFoundHandler } from '@/utils/error-handler';
 import { logger, morganStream } from '@/utils/logger';
 import cors from 'cors';
 import express from 'express';
-import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import swaggerUi from 'swagger-ui-express';
@@ -63,8 +63,30 @@ app.use('/api/docs', (req: express.Request, res: express.Response, next: express
 }, swaggerUi.serve);
 
 // CORS configuration
+const getCorsOrigins = (): boolean | string[] => {
+  if (isDevelopment) {
+    return true;
+  }
+
+  const allowedOrigins = process.env.ALLOWED_ORIGINS;
+  if (!allowedOrigins || typeof allowedOrigins !== 'string') {
+    return false;
+  }
+
+  try {
+    const origins = allowedOrigins.split(',').map(origin => origin.trim()).filter(Boolean);
+    return origins.length > 0 ? origins : false;
+  } catch (error) {
+    logger.warn('Failed to parse ALLOWED_ORIGINS, disabling CORS', {
+      error: error instanceof Error ? error.message : String(error),
+      ALLOWED_ORIGINS: allowedOrigins, // Use local variable instead of undefined
+    });
+    return false;
+  }
+};
+
 app.use(cors({
-  origin: isDevelopment ? true : process.env.ALLOWED_ORIGINS?.split(',') || false,
+  origin: getCorsOrigins(),
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID'],
@@ -144,39 +166,60 @@ app.get('/api/docs.json', (req: express.Request, res: express.Response) => {
 // Health check endpoint
 app.get('/health', async (req: express.Request, res: express.Response) => {
   try {
-    // Use Promise.allSettled to handle individual service failures gracefully
-    const [dbResult, queueResult] = await Promise.allSettled([
-      testSupabaseConnection(),
-      QueueManager.healthCheck(),
+    // Use Promise.allSettled with timeout to handle individual service failures gracefully
+    const healthCheckPromise = Promise.allSettled([
+      Promise.race([
+        testSupabaseConnection(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Database check timeout')), 5000)),
+      ]),
+      Promise.race([
+        QueueManager.healthCheck(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Queue check timeout')), 5000)),
+      ]),
     ]);
 
+    const [dbResult, queueResult] = await healthCheckPromise;
+
+    // Safely extract results
     const dbHealth = dbResult.status === 'fulfilled' ? dbResult.value : false;
     const queueHealth = queueResult.status === 'fulfilled'
       ? queueResult.value
-      : { status: 'unhealthy', error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason) };
+      : {
+          status: 'unhealthy' as const,
+          error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason),
+        };
 
+    // Log failures
     if (dbResult.status === 'rejected') {
-      logger.warn('Health check: Database check failed', { error: dbResult.reason });
+      logger.warn('[HEALTH] Database check failed', {
+        error: dbResult.reason instanceof Error ? dbResult.reason.message : String(dbResult.reason),
+      });
     }
     if (queueResult.status === 'rejected') {
-      logger.warn('Health check: Queue check failed', { error: queueResult.reason });
+      logger.warn('[HEALTH] Queue check failed', {
+        error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason),
+      });
     }
 
+    const isHealthy = dbHealth && queueHealth.status === 'healthy';
     const health = {
-      status: dbHealth && queueHealth.status === 'healthy' ? 'healthy' : 'unhealthy',
+      status: isHealthy ? 'healthy' : 'unhealthy',
       timestamp: new Date().toISOString(),
       services: {
         database: dbHealth ? 'healthy' : 'unhealthy',
-        queue: queueHealth.status,
+        queue: queueHealth.status || 'unhealthy',
       },
       version: process.env.npm_package_version || '1.0.0',
       environment: env.NODE_ENV,
     };
 
-    const statusCode = health.status === 'healthy' ? 200 : 503;
+    const statusCode = isHealthy ? 200 : 503;
     res.status(statusCode).json(health);
   } catch (error) {
-    logger.error('Health check failed:', error);
+    logger.error('[HEALTH] Health check failed:', {
+      error: error instanceof Error ? error.message : String(error),
+      errorType: error instanceof Error ? error.constructor.name : typeof error,
+    });
     res.status(503).json({
       status: 'unhealthy',
       timestamp: new Date().toISOString(),
@@ -198,6 +241,7 @@ app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
 app.use(`/api/${env.API_VERSION}/kb`, kbRoutes);
 app.use(`/api/${env.API_VERSION}/kb`, rulesReloadRoutes);
 app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
+app.use(`/api/${env.API_VERSION}/reports`, reportsRoutes); // ✅ NEW: Test reports & Jira integration
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
 app.use(`/api/${env.API_VERSION}/queue`, queueStatusRoutes); // Queue monitoring
@@ -235,13 +279,25 @@ app.use(errorHandler);
 
 // Start server
 const startServer = async () => {
+  let server: ReturnType<typeof app.listen> | null = null;
+  let isShuttingDown = false;
+
   try {
+    // Validate PORT
+    if (!env.PORT || !Number.isFinite(env.PORT) || env.PORT < 1 || env.PORT > 65535) {
+      logger.error(`Invalid PORT: ${env.PORT}. Must be between 1 and 65535`);
+      process.exit(1);
+    }
+
     // Initialize global KB (load into memory)
     try {
       const { initializeGlobalKB } = await import('@/services/kb/localKB.service');
       await initializeGlobalKB();
+      logger.info('✓ Global KB initialized successfully');
     } catch (kbError) {
-      logger.warn('Failed to initialize global KB, continuing without it', { error: kbError });
+      logger.warn('[SERVER] Failed to initialize global KB, continuing without it', {
+        error: kbError instanceof Error ? kbError.message : String(kbError),
+      });
     }
 
     // Initialize Rules Cache (load AI response rules into memory)
@@ -250,43 +306,102 @@ const startServer = async () => {
       await RulesCacheService.init();
       logger.info('✓ Rules cache initialized successfully');
     } catch (rulesCacheError) {
-      logger.warn('Failed to initialize rules cache, continuing without it', { error: rulesCacheError });
+      logger.warn('[SERVER] Failed to initialize rules cache, continuing without it', {
+        error: rulesCacheError instanceof Error ? rulesCacheError.message : String(rulesCacheError),
+      });
     }
 
-    // Test database connection
-    const dbConnected = await testSupabaseConnection();
-    if (!dbConnected) {
-      logger.error('Failed to connect to database. Exiting...');
+    // Test database connection with timeout
+    try {
+      const dbCheckPromise = testSupabaseConnection();
+      const dbTimeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Database connection timeout')), 10000)
+      );
+
+      const dbConnected = await Promise.race([dbCheckPromise, dbTimeoutPromise]);
+      if (!dbConnected) {
+        logger.error('[SERVER] Failed to connect to database. Exiting...');
+        process.exit(1);
+      }
+      logger.info('✓ Database connection verified');
+    } catch (dbError) {
+      logger.error('[SERVER] Database connection failed', {
+        error: dbError instanceof Error ? dbError.message : String(dbError),
+      });
       process.exit(1);
     }
 
     // Test queue connection (non-blocking in development)
-    const queueHealth = await QueueManager.healthCheck();
-    if (queueHealth.status !== 'healthy') {
-      if (env.NODE_ENV === 'development') {
-        logger.warn('⚠️  Queue service is unavailable. Running in limited mode.');
-        logger.warn('💡 To enable full functionality, start Redis: redis-server');
+    try {
+      const queueCheckPromise = QueueManager.healthCheck();
+      const queueTimeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Queue connection timeout')), 5000)
+      );
+
+      const queueHealth = await Promise.race([queueCheckPromise, queueTimeoutPromise]);
+      if (queueHealth.status !== 'healthy') {
+        if (env.NODE_ENV === 'development') {
+          logger.warn('[SERVER] ⚠️  Queue service is unavailable. Running in limited mode.');
+          logger.warn('[SERVER] 💡 To enable full functionality, start Redis: redis-server');
+        } else {
+          logger.error('[SERVER] Queue service is unhealthy. Exiting...');
+          process.exit(1);
+        }
       } else {
-        logger.error('Queue service is unhealthy. Exiting...');
+        logger.info('✓ Queue connection verified');
+      }
+    } catch (queueError) {
+      if (env.NODE_ENV === 'development') {
+        logger.warn('[SERVER] Queue health check failed, continuing in development mode', {
+          error: queueError instanceof Error ? queueError.message : String(queueError),
+        });
+      } else {
+        logger.error('[SERVER] Queue health check failed', {
+          error: queueError instanceof Error ? queueError.message : String(queueError),
+        });
         process.exit(1);
       }
     }
 
     // Start HTTP server
-    const server = app.listen(env.PORT, () => {
-      logger.info(`🚀 QAIT Backend API started on port ${env.PORT}`);
-      logger.info(`📊 Environment: ${env.NODE_ENV}`);
-      logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
-      logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
-    });
+    try {
+      server = app.listen(env.PORT, () => {
+        logger.info(`🚀 QAIT Backend API started on port ${env.PORT}`);
+        logger.info(`📊 Environment: ${env.NODE_ENV}`);
+        logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
+        logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
+      });
+
+      // Handle server errors
+      server.on('error', (error: NodeJS.ErrnoException) => {
+        if (error.code === 'EADDRINUSE') {
+          logger.error(`[SERVER] Port ${env.PORT} is already in use`);
+        } else {
+          logger.error('[SERVER] HTTP server error:', {
+            error: error.message,
+            code: error.code,
+          });
+        }
+        process.exit(1);
+      });
+    } catch (serverError) {
+      logger.error('[SERVER] Failed to start HTTP server:', {
+        error: serverError instanceof Error ? serverError.message : String(serverError),
+      });
+      process.exit(1);
+    }
 
     // Initialize WebSocket server
     try {
       const { initializeWebSocket } = await import('@/websocket/server');
-      initializeWebSocket(server);
-      logger.info('🌐 WebSocket server initialized');
+      if (server) {
+        initializeWebSocket(server);
+        logger.info('🌐 WebSocket server initialized');
+      }
     } catch (wsError) {
-      logger.error('Failed to initialize WebSocket server:', wsError);
+      logger.error('[SERVER] Failed to initialize WebSocket server:', {
+        error: wsError instanceof Error ? wsError.message : String(wsError),
+      });
       // Continue without WebSocket in development
       if (env.NODE_ENV !== 'development') {
         process.exit(1);
@@ -295,48 +410,120 @@ const startServer = async () => {
 
     // Graceful shutdown
     const gracefulShutdown = async (signal: string) => {
-      logger.info(`Received ${signal}. Starting graceful shutdown...`);
+      // Prevent multiple shutdown attempts
+      if (isShuttingDown) {
+        logger.warn(`[SERVER] Shutdown already in progress, ignoring ${signal}`);
+        return;
+      }
 
-      server.close(async () => {
-        logger.info('HTTP server closed');
+      isShuttingDown = true;
+      logger.info(`[SERVER] Received ${signal}. Starting graceful shutdown...`);
 
-        try {
-          // Close browser pool
-          const { browserPool } = await import('@/agent');
-          await browserPool.closeAll();
-          logger.info('Browser pool closed');
-        } catch (error) {
-          logger.error('Error closing browsers:', error);
+      const SHUTDOWN_TIMEOUT = 30000; // 30 seconds
+      const shutdownTimeout = setTimeout(() => {
+        logger.error('[SERVER] Shutdown timeout exceeded, forcing exit');
+        process.exit(1);
+      }, SHUTDOWN_TIMEOUT);
+
+      try {
+        // Stop accepting new connections
+        if (server) {
+          server.close(async () => {
+            logger.info('[SERVER] HTTP server closed');
+
+            // Close services in parallel with error handling
+            const cleanupResults = await Promise.allSettled([
+              // Close browser pool
+              (async () => {
+                try {
+                  const { browserPool } = await import('@/agent');
+                  await browserPool.closeAll();
+                  logger.info('[SERVER] Browser pool closed');
+                } catch (error) {
+                  logger.error('[SERVER] Error closing browsers:', {
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              })(),
+              // Close queue connections
+              (async () => {
+                try {
+                  const queuesModule = await import('@/config/queues');
+                  await queuesModule.gracefulShutdown();
+                  logger.info('[SERVER] Queue connections closed');
+                } catch (error) {
+                  logger.error('[SERVER] Error during queue shutdown:', {
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              })(),
+              // Close WebSocket server
+              (async () => {
+                try {
+                  const { shutdownWebSocket } = await import('@/websocket/server');
+                  await shutdownWebSocket();
+                  logger.info('[SERVER] WebSocket server closed');
+                } catch (error) {
+                  logger.error('[SERVER] Error closing WebSocket:', {
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              })(),
+            ]);
+
+            // Log any failures
+            cleanupResults.forEach((result, index) => {
+              if (result.status === 'rejected') {
+                const serviceNames = ['browser pool', 'queues', 'websocket'];
+                logger.warn(`[SERVER] Failed to close ${serviceNames[index]}`, {
+                  error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+                });
+              }
+            });
+
+            clearTimeout(shutdownTimeout);
+            logger.info('[SERVER] Graceful shutdown completed');
+            process.exit(0);
+          });
+        } else {
+          clearTimeout(shutdownTimeout);
+          logger.warn('[SERVER] Server was not initialized, exiting');
+          process.exit(0);
         }
-
-        try {
-          // Close queue connections
-          await import('@/config/queues').then(module => module.gracefulShutdown());
-          logger.info('Queue connections closed');
-        } catch (error) {
-          logger.error('Error during queue shutdown:', error);
-        }
-
-        try {
-          // Close WebSocket server
-          const { shutdownWebSocket } = await import('@/websocket/server');
-          await shutdownWebSocket();
-          logger.info('WebSocket server closed');
-        } catch (error) {
-          logger.error('Error closing WebSocket:', error);
-        }
-
-        logger.info('Graceful shutdown completed');
-        process.exit(0);
-      });
+      } catch (error) {
+        clearTimeout(shutdownTimeout);
+        logger.error('[SERVER] Error during shutdown:', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        process.exit(1);
+      }
     };
 
     // Handle shutdown signals
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
+    // Prevent process from exiting on unhandled errors (log only)
+    process.on('uncaughtException', (error) => {
+      logger.error('[SERVER] Uncaught exception:', {
+        error: error.message,
+        stack: error.stack,
+      });
+      // Don't exit immediately - let graceful shutdown handle it
+    });
+
+    process.on('unhandledRejection', (reason) => {
+      logger.error('[SERVER] Unhandled rejection:', {
+        reason: reason instanceof Error ? reason.message : String(reason),
+        stack: reason instanceof Error ? reason.stack : undefined,
+      });
+      // Don't exit immediately - let graceful shutdown handle it
+    });
   } catch (error) {
-    logger.error('Failed to start server:', error);
+    logger.error('[SERVER] Failed to start server:', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     process.exit(1);
   }
 };

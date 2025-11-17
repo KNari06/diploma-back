@@ -15,6 +15,11 @@ import path from 'path';
 
 dotenv.config();
 
+// Constants
+const MAX_FILE_SIZE_MB = 10; // Maximum file size to process
+const MAX_CHUNKS_BATCH = 100; // Maximum chunks to process in one batch (OpenAI limit)
+const MAX_TOTAL_CHUNKS = 10000; // Maximum total chunks to prevent memory issues
+
 interface Chunk {
   content: string;
   metadata: any;
@@ -57,23 +62,33 @@ async function buildGlobalKB() {
 
   // Recursively find all markdown files
   async function findMarkdownFiles(dir: string, baseDir: string = dir): Promise<string[]> {
-    const entries = await fs.readdir(dir, { withFileTypes: true });
-    const files: string[] = [];
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      const files: string[] = [];
 
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        // Recursively search subdirectories
-        const subFiles = await findMarkdownFiles(fullPath, baseDir);
-        files.push(...subFiles);
-      } else if (entry.name.endsWith('.md')) {
-        // Store relative path from baseDir
-        const relativePath = path.relative(baseDir, fullPath);
-        files.push(relativePath);
+      for (const entry of entries) {
+        try {
+          const fullPath = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            // Recursively search subdirectories
+            const subFiles = await findMarkdownFiles(fullPath, baseDir);
+            files.push(...subFiles);
+          } else if (entry.name.endsWith('.md')) {
+            // Store relative path from baseDir
+            const relativePath = path.relative(baseDir, fullPath);
+            files.push(relativePath);
+          }
+        } catch (error) {
+          console.warn(`⚠️ Skipping entry ${entry.name}:`, error instanceof Error ? error.message : String(error));
+          continue;
+        }
       }
-    }
 
-    return files;
+      return files;
+    } catch (error) {
+      console.error(`❌ Error reading directory ${dir}:`, error instanceof Error ? error.message : String(error));
+      return [];
+    }
   }
 
   // Collect all files from all source directories
@@ -115,56 +130,323 @@ async function buildGlobalKB() {
   const allChunks: Array<Chunk & { source_file: string; language: string }> = [];
 
   for (const fileInfo of allFiles) {
-    console.log(`📖 Processing [${fileInfo.language}] ${fileInfo.file}...`);
-    const filePath = path.join(fileInfo.baseDir, fileInfo.file);
-    const content = await fs.readFile(filePath, 'utf-8');
+    try {
+      console.log(`📖 Processing [${fileInfo.language}] ${fileInfo.file}...`);
+      const filePath = path.join(fileInfo.baseDir, fileInfo.file);
 
-    const chunks = chunkMarkdown(content, fileInfo.file);
-    console.log(`   ✓ Created ${chunks.length} chunks`);
+      // Check file size before reading
+      const stats = await fs.stat(filePath);
+      const fileSizeMB = stats.size / (1024 * 1024);
 
-    allChunks.push(
-      ...chunks.map((c) => ({
-        ...c,
-        source_file: `${fileInfo.language}/${fileInfo.file}`,
-        language: fileInfo.language,
-      }))
-    );
+      if (fileSizeMB > MAX_FILE_SIZE_MB) {
+        console.warn(`   ⚠️ Skipping file: size (${fileSizeMB.toFixed(2)} MB) exceeds limit (${MAX_FILE_SIZE_MB} MB)`);
+        continue;
+      }
+
+      // Read file content
+      const content = await fs.readFile(filePath, 'utf-8');
+
+      if (!content || content.trim().length === 0) {
+        console.warn(`   ⚠️ Skipping empty file: ${fileInfo.file}`);
+        continue;
+      }
+
+      // Chunk markdown content
+      const chunks = chunkMarkdown(content, fileInfo.file);
+
+      if (!chunks || chunks.length === 0) {
+        console.warn(`   ⚠️ No chunks created from file: ${fileInfo.file}`);
+        continue;
+      }
+
+      // Filter out empty chunks
+      const validChunks = chunks.filter((c) => c.content && c.content.trim().length > 0);
+
+      if (validChunks.length === 0) {
+        console.warn(`   ⚠️ No valid chunks in file: ${fileInfo.file}`);
+        continue;
+      }
+
+      console.log(`   ✓ Created ${validChunks.length} chunks`);
+
+      allChunks.push(
+        ...validChunks.map((c) => ({
+          ...c,
+          source_file: `${fileInfo.language}/${fileInfo.file}`,
+          language: fileInfo.language,
+        }))
+      );
+
+      // Check total chunks limit
+      if (allChunks.length > MAX_TOTAL_CHUNKS) {
+        console.warn(`\n⚠️ Total chunks (${allChunks.length}) exceeds limit (${MAX_TOTAL_CHUNKS}). Stopping processing.`);
+        break;
+      }
+    } catch (error) {
+      console.error(`   ❌ Error processing file ${fileInfo.file}:`, error instanceof Error ? error.message : String(error));
+      continue;
+    }
+  }
+
+  if (allChunks.length === 0) {
+    console.error('❌ No valid chunks found to process');
+    process.exit(1);
   }
 
   console.log(`\n📊 Total chunks: ${allChunks.length}`);
   console.log('🧠 Generating embeddings...');
 
-  // Generate embeddings in batch
-  const embeddings = await generateEmbeddings(allChunks.map((c) => c.content));
+  // Generate embeddings in batches (OpenAI has limits)
+  const chunkContents = allChunks.map((c) => c.content);
+  const embeddings: number[][] = [];
 
-  console.log('✓ Embeddings generated\n');
+  try {
+    // Split into batches if needed
+    if (chunkContents.length > MAX_CHUNKS_BATCH) {
+      console.log(`   ℹ️ Processing ${chunkContents.length} chunks in batches of ${MAX_CHUNKS_BATCH}...`);
+
+      for (let i = 0; i < chunkContents.length; i += MAX_CHUNKS_BATCH) {
+        const batch = chunkContents.slice(i, i + MAX_CHUNKS_BATCH);
+        console.log(`   📦 Processing batch ${Math.floor(i / MAX_CHUNKS_BATCH) + 1}/${Math.ceil(chunkContents.length / MAX_CHUNKS_BATCH)}...`);
+
+        const batchEmbeddings = await generateEmbeddings(batch);
+        embeddings.push(...batchEmbeddings);
+
+        // Small delay between batches to avoid rate limits
+        if (i + MAX_CHUNKS_BATCH < chunkContents.length) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+    } else {
+      // Single batch
+      const batchEmbeddings = await generateEmbeddings(chunkContents);
+      embeddings.push(...batchEmbeddings);
+    }
+
+    // Validate embeddings count matches chunks count
+    if (embeddings.length !== allChunks.length) {
+      throw new Error(
+        `Embeddings count mismatch: expected ${allChunks.length}, got ${embeddings.length}`
+      );
+    }
+
+    // Validate each embedding has correct dimensions (1536 for text-embedding-3-small)
+    const invalidEmbeddings = embeddings.filter((emb) => !emb || !Array.isArray(emb) || emb.length !== 1536);
+    if (invalidEmbeddings.length > 0) {
+      throw new Error(`Invalid embeddings found: ${invalidEmbeddings.length} embeddings have incorrect dimensions`);
+    }
+
+    console.log('✓ Embeddings generated\n');
+  } catch (error) {
+    console.error('❌ Failed to generate embeddings:', error instanceof Error ? error.message : String(error));
+    throw error;
+  }
 
   // Extract tags from content (simple keyword extraction)
   function extractTags(content: string): string[] {
+    if (!content || typeof content !== 'string') {
+      return [];
+    }
+
     const keywords = [
+      // API & HTTP
       'api',
-      'testing',
-      'playwright',
-      'qa',
       'http',
+      'https',
+      'rest',
+      'graphql',
       'get',
       'post',
       'delete',
       'put',
       'patch',
-      'authentication',
-      'authorization',
-      'validation',
-      'error',
-      'performance',
+      'request',
+      'response',
+      'status',
+      'headers',
+      'body',
+      'endpoint',
+
+      // Testing & QA
+      'testing',
+      'test',
+      'qa',
+      'quality',
+      'e2e',
+      'end-to-end',
+      'integration',
+      'automated',
+      'manual',
+      'assert',
+      'expect',
+      'verify',
+      'check',
+      'assertion',
+
+      // Playwright & Browsers
+      'playwright',
+      'browser',
+      'chrome',
+      'firefox',
+      'safari',
+      'edge',
+      'webkit',
+      'mobile',
+      'ios',
+      'android',
+      'device',
+      'viewport',
+
+      // UI Elements
       'ui',
+      'user-interface',
       'form',
       'button',
       'input',
+      'select',
+      'dropdown',
+      'checkbox',
+      'radio',
+      'link',
+      'text',
+      'label',
+      'selector',
+      'xpath',
+      'css',
+      'id',
+      'class',
+
+      // Actions & Navigation
+      'click',
+      'type',
+      'fill',
+      'submit',
+      'navigate',
+      'goto',
+      'wait',
+      'timeout',
+      'loading',
+      'async',
+      'promise',
+
+      // Screenshots & Visual
+      'screenshot',
+      'image',
+      'visual',
+      'snapshot',
+      'video',
+      'trace',
+      'recording',
+
+      // Network & Performance
+      'network',
+      'performance',
+      'speed',
+      'latency',
+      'bandwidth',
+      'cache',
+      'cors',
+
+      // Security
+      'authentication',
+      'authorization',
+      'security',
+      'xss',
+      'csrf',
+      'sql-injection',
+      'token',
+      'jwt',
+      'oauth',
+      'session',
+
+      // Data & Formats
+      'data',
+      'json',
+      'xml',
+      'csv',
+      'database',
+      'db',
+      'sql',
+      'query',
+
+      // Errors & Debugging
+      'error',
+      'exception',
+      'bug',
+      'issue',
+      'debug',
+      'log',
+      'console',
+      'stack',
+
+      // Validation & Checks
+      'validation',
+      'validate',
+      'required',
+      'optional',
+      'format',
+      'pattern',
+      'regex',
+
+      // AI & ML
+      'ai',
+      'artificial-intelligence',
+      'machine-learning',
+      'gpt',
+      'openai',
+      'embedding',
+      'vector',
+      'rag',
+      'semantic',
+
+      // CI/CD & DevOps
+      'ci',
+      'cd',
+      'pipeline',
+      'deploy',
+      'deployment',
+      'environment',
+      'staging',
+      'production',
+      'dev',
+      'development',
+
+      // Configuration
+      'config',
+      'configuration',
+      'setting',
+      'option',
+      'parameter',
+      'env',
+
+      // WebSocket & Real-time
+      'websocket',
+      'ws',
+      'realtime',
+      'socket',
+      'connection',
+
+      // Reporting & Analytics
+      'report',
+      'result',
+      'summary',
+      'analytics',
+      'statistics',
+      'metrics',
+
+      // Accessibility
+      'accessibility',
+      'a11y',
+      'wcag',
+      'aria',
+      'screen-reader',
     ];
 
     const contentLower = content.toLowerCase();
-    return keywords.filter((keyword) => contentLower.includes(keyword));
+    const foundTags = keywords.filter((keyword) => contentLower.includes(keyword));
+
+    // Deduplicate tags (in case of duplicates)
+    return Array.from(new Set(foundTags));
   }
 
   // Build final KB structure
@@ -172,24 +454,45 @@ async function buildGlobalKB() {
     version: '1.0.0',
     model: 'text-embedding-3-small',
     generated_at: new Date().toISOString(),
-    chunks: allChunks.map((chunk, idx) => ({
-      id: `chunk_${idx.toString().padStart(4, '0')}`,
-      content: chunk.content,
-      embedding: embeddings[idx],
-      source_file: chunk.source_file,
-      language: chunk.language,
-      tags: extractTags(chunk.content),
-      metadata: {
-        chunkIndex: chunk.chunkIndex,
-        totalChunks: chunk.totalChunks,
-        tokenCount: chunk.tokenCount,
-        ...(chunk.metadata || {}),
-      },
-    })),
+    chunks: allChunks.map((chunk, idx) => {
+      // Validate embedding exists
+      if (!embeddings[idx] || !Array.isArray(embeddings[idx])) {
+        throw new Error(`Missing or invalid embedding at index ${idx}`);
+      }
+
+      return {
+        id: `chunk_${idx.toString().padStart(4, '0')}`,
+        content: chunk.content,
+        embedding: embeddings[idx],
+        source_file: chunk.source_file,
+        language: chunk.language,
+        tags: extractTags(chunk.content),
+        metadata: {
+          chunkIndex: chunk.chunkIndex,
+          totalChunks: chunk.totalChunks,
+          tokenCount: chunk.tokenCount,
+          ...(chunk.metadata || {}),
+        },
+      };
+    }),
   };
 
+  // Ensure output directory exists
+  const outputDir = path.dirname(outputPath);
+  try {
+    await fs.mkdir(outputDir, { recursive: true });
+  } catch (error) {
+    console.error(`❌ Failed to create output directory ${outputDir}:`, error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+
   // Save to file
-  await fs.writeFile(outputPath, JSON.stringify(kb, null, 2));
+  try {
+    await fs.writeFile(outputPath, JSON.stringify(kb, null, 2), 'utf-8');
+  } catch (error) {
+    console.error(`❌ Failed to write output file ${outputPath}:`, error instanceof Error ? error.message : String(error));
+    throw error;
+  }
 
   console.log('💾 Saved to:', outputPath);
   console.log(`\n✅ Global KB built successfully!`);

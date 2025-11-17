@@ -14,12 +14,46 @@ export class ChatService {
     sessionId: string,
     messages: Array<{ role: 'user' | 'ai'; content: string; metadata?: any }>
   ): Promise<void> {
+    // Validate inputs
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      throw new Error('Invalid sessionId');
+    }
+
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      logger.warn('[CHAT_SERVICE] No messages to save', { sessionId });
+      return;
+    }
+
     try {
-      const records = messages.map(msg => ({
+      // Validate each message
+      const validMessages = messages.filter(
+        (msg) =>
+          msg &&
+          typeof msg === 'object' &&
+          (msg.role === 'user' || msg.role === 'ai') &&
+          msg.content &&
+          typeof msg.content === 'string' &&
+          msg.content.trim().length > 0
+      );
+
+      if (validMessages.length === 0) {
+        logger.warn('[CHAT_SERVICE] No valid messages to save', { sessionId, totalMessages: messages.length });
+        return;
+      }
+
+      if (validMessages.length < messages.length) {
+        logger.warn('[CHAT_SERVICE] Filtered out invalid messages', {
+          sessionId,
+          valid: validMessages.length,
+          invalid: messages.length - validMessages.length,
+        });
+      }
+
+      const records = validMessages.map((msg) => ({
         session_id: sessionId,
         role: msg.role,
-        content: msg.content,
-        metadata: msg.metadata || {},
+        content: msg.content.trim(),
+        metadata: msg.metadata && typeof msg.metadata === 'object' ? msg.metadata : {},
         created_at: new Date().toISOString(),
       }));
 
@@ -28,13 +62,18 @@ export class ChatService {
         .insert(records);
 
       if (error) {
-        logger.error('[CHAT_SERVICE] Failed to save chat messages', { error, sessionId });
+        logger.error('[CHAT_SERVICE] Failed to save chat messages', {
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
+          sessionId,
+          recordCount: records.length,
+        });
         throw error;
       }
 
       logger.info('[CHAT_SERVICE] Chat messages saved successfully', {
         sessionId,
-        messageCount: messages.length,
+        messageCount: records.length,
       });
 
     } catch (error) {
@@ -53,31 +92,65 @@ export class ChatService {
     sessionId: string,
     limit: number = 20
   ): Promise<Array<{ role: 'user' | 'ai'; content: string; created_at: string; metadata?: any }>> {
+    // Validate inputs
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      logger.warn('[CHAT_SERVICE] Invalid sessionId in getRecentMessages', { sessionId: typeof sessionId });
+      return [];
+    }
+
+    // Validate and clamp limit
+    const validLimit = Math.max(1, Math.min(100, Math.floor(limit || 20)));
+
     try {
-      logger.debug('[CHAT_SERVICE] Fetching recent messages', { sessionId, limit });
+      logger.debug('[CHAT_SERVICE] Fetching recent messages', { sessionId, limit: validLimit });
 
       const { data, error } = await supabaseAdmin
         .from('chat_messages')
         .select('role, content, created_at, metadata')
         .eq('session_id', sessionId)
         .order('created_at', { ascending: false })
-        .limit(limit);
+        .limit(validLimit);
 
       if (error) {
-        logger.error('[CHAT_SERVICE] Failed to get recent messages', { error, sessionId });
+        logger.error('[CHAT_SERVICE] Failed to get recent messages', {
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
+          sessionId,
+        });
         return []; // Don't throw, return empty array for graceful degradation
       }
 
-      const messages = (data || []).reverse(); // Reverse to get chronological order
+      // Validate data is array
+      const validData = Array.isArray(data) ? data : [];
+      const messages = validData.reverse(); // Reverse to get chronological order
+
+      // Filter out invalid messages
+      const validMessages = messages.filter(
+        (msg) =>
+          msg &&
+          typeof msg === 'object' &&
+          (msg.role === 'user' || msg.role === 'ai') &&
+          msg.content &&
+          typeof msg.content === 'string' &&
+          msg.created_at
+      );
+
+      if (validMessages.length < messages.length) {
+        logger.warn('[CHAT_SERVICE] Filtered out invalid messages', {
+          sessionId,
+          valid: validMessages.length,
+          invalid: messages.length - validMessages.length,
+        });
+      }
 
       logger.debug('[CHAT_SERVICE] Retrieved messages', {
         sessionId,
-        count: messages.length,
-        firstMessage: messages[0]?.created_at,
-        lastMessage: messages[messages.length - 1]?.created_at
+        count: validMessages.length,
+        firstMessage: validMessages[0]?.created_at,
+        lastMessage: validMessages[validMessages.length - 1]?.created_at,
       });
 
-      return messages;
+      return validMessages;
 
     } catch (error) {
       logger.error('[CHAT_SERVICE] Error getting recent messages', { error, sessionId });
@@ -95,6 +168,15 @@ export class ChatService {
     userId: string,
     workspaceId: string
   ): Promise<string> {
+    // Validate inputs
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new Error('Invalid userId');
+    }
+
+    if (!workspaceId || typeof workspaceId !== 'string' || workspaceId.trim().length === 0) {
+      throw new Error('Invalid workspaceId');
+    }
+
     try {
       const { data, error } = await supabaseAdmin
         .from('chat_sessions')
@@ -104,11 +186,21 @@ export class ChatService {
           created_at: new Date().toISOString(),
         })
         .select('id')
-        .single();
+        .maybeSingle();
 
       if (error) {
-        logger.error('[CHAT_SERVICE] Failed to create chat session', { error, userId, workspaceId });
+        logger.error('[CHAT_SERVICE] Failed to create chat session', {
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
+          userId,
+          workspaceId,
+        });
         throw error;
+      }
+
+      if (!data || !data.id) {
+        logger.error('[CHAT_SERVICE] No data returned from session creation', { userId, workspaceId });
+        throw new Error('Failed to create chat session: no data returned');
       }
 
       logger.info('[CHAT_SERVICE] Chat session created', {
@@ -134,6 +226,17 @@ export class ChatService {
     sessionId: string,
     projectId: string
   ): Promise<void> {
+    // Validate inputs
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      logger.warn('[CHAT_SERVICE] Invalid sessionId in updateSessionProject', { sessionId: typeof sessionId });
+      return;
+    }
+
+    if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+      logger.warn('[CHAT_SERVICE] Invalid projectId in updateSessionProject', { projectId: typeof projectId });
+      return;
+    }
+
     try {
       const { error } = await supabaseAdmin
         .from('chat_sessions')
@@ -141,8 +244,14 @@ export class ChatService {
         .eq('id', sessionId);
 
       if (error) {
-        logger.error('[CHAT_SERVICE] Failed to update session project', { error, sessionId, projectId });
-        throw error;
+        logger.error('[CHAT_SERVICE] Failed to update session project', {
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
+          sessionId,
+          projectId,
+        });
+        // Don't throw - this is not critical
+        return;
       }
 
       logger.info('[CHAT_SERVICE] Session project updated', {
@@ -174,6 +283,12 @@ export class ChatService {
       settings?: { main_url?: string };
     };
   } | null> {
+    // Validate input
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      logger.warn('[CHAT_SERVICE] Invalid sessionId in getSessionWithProject', { sessionId: typeof sessionId });
+      return null;
+    }
+
     try {
       const { data, error } = await supabaseAdmin
         .from('chat_sessions')
@@ -189,23 +304,65 @@ export class ChatService {
           )
         `)
         .eq('id', sessionId)
-        .single();
+        .maybeSingle();
 
       if (error) {
-        logger.error('[CHAT_SERVICE] Failed to get session with project', { error, sessionId });
+        logger.error('[CHAT_SERVICE] Failed to get session with project', {
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
+          sessionId,
+        });
+        return null;
+      }
+
+      if (!data || !data.id) {
+        logger.debug('[CHAT_SERVICE] Session not found', { sessionId });
         return null;
       }
 
       // Transform nested project data
-      const result: any = {
+      const result: {
+        id: string;
+        user_id: string;
+        workspace_id: string;
+        project_id?: string;
+        project?: {
+          id: string;
+          name: string;
+          settings?: { main_url?: string };
+        };
+      } = {
         id: data.id,
-        user_id: data.user_id,
-        workspace_id: data.workspace_id,
-        project_id: data.project_id,
+        user_id: data.user_id || '',
+        workspace_id: data.workspace_id || '',
+        project_id: data.project_id || undefined,
       };
 
+      // Safely extract project data
       if (data.projects) {
-        result.project = Array.isArray(data.projects) ? data.projects[0] : data.projects;
+        if (Array.isArray(data.projects) && data.projects.length > 0) {
+          const project = data.projects[0];
+          if (project && typeof project === 'object' && project.id && project.name) {
+            result.project = {
+              id: project.id,
+              name: project.name,
+              settings: project.settings && typeof project.settings === 'object' ? project.settings : undefined,
+            };
+          }
+        } else if (!Array.isArray(data.projects) && typeof data.projects === 'object') {
+          // Handle single project object (not array)
+          const projectObj = data.projects as any;
+          if (projectObj.id && projectObj.name) {
+            result.project = {
+              id: projectObj.id,
+              name: projectObj.name,
+              settings:
+                projectObj.settings && typeof projectObj.settings === 'object'
+                  ? projectObj.settings
+                  : undefined,
+            };
+          }
+        }
       }
 
       logger.info('[CHAT_SERVICE] Session with project retrieved', {
@@ -248,6 +405,15 @@ export class ChatService {
     }>;
     total: number;
   }> {
+    // Validate inputs
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new Error('Invalid userId');
+    }
+
+    // Validate and clamp limit and offset
+    const validLimit = Math.max(1, Math.min(100, Math.floor(limit || 50)));
+    const validOffset = Math.max(0, Math.floor(offset || 0));
+
     try {
       // Get total count
       const { count } = await supabaseAdmin
@@ -272,33 +438,50 @@ export class ChatService {
         `)
         .eq('user_id', userId)
         .order('updated_at', { ascending: false })
-        .range(offset, offset + limit - 1);
+        .range(validOffset, validOffset + validLimit - 1);
 
       if (error) {
-        logger.error('[CHAT_SERVICE] Failed to get user chat sessions', { error, userId });
+        logger.error('[CHAT_SERVICE] Failed to get user chat sessions', {
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
+          userId,
+        });
         throw error;
       }
 
-      // Transform data
-      const processedSessions = (sessions || []).map((session: any) => {
-        const messages = session.chat_messages || [];
-        const lastMessage = messages.length > 0 ? messages[0] : null;
+      // Validate and transform data
+      const validSessions = Array.isArray(sessions) ? sessions : [];
+      const processedSessions = validSessions
+        .filter((session: any) => session && session.id)
+        .map((session: any) => {
+          const messages = Array.isArray(session.chat_messages) ? session.chat_messages : [];
+          const lastMessage =
+            messages.length > 0 &&
+            messages[0] &&
+            messages[0].role &&
+            messages[0].content &&
+            messages[0].created_at
+              ? messages[0]
+              : null;
 
-        return {
-          id: session.id,
-          title: session.title || 'New Chat',
-          created_at: session.created_at,
-          updated_at: session.updated_at || session.created_at,
-          message_count: messages.length,
-          last_message: lastMessage
-            ? {
-                role: lastMessage.role,
-                content: lastMessage.content.substring(0, 200), // Truncate for preview
-                created_at: lastMessage.created_at,
-              }
-            : undefined,
-        };
-      });
+          return {
+            id: session.id,
+            title: typeof session.title === 'string' && session.title.trim().length > 0
+              ? session.title.trim()
+              : 'New Chat',
+            created_at: session.created_at || new Date().toISOString(),
+            updated_at: session.updated_at || session.created_at || new Date().toISOString(),
+            message_count: messages.length,
+            last_message:
+              lastMessage && typeof lastMessage.content === 'string'
+                ? {
+                    role: lastMessage.role,
+                    content: lastMessage.content.substring(0, 200), // Truncate for preview
+                    created_at: lastMessage.created_at,
+                  }
+                : undefined,
+          };
+        });
 
       logger.info('[CHAT_SERVICE] Retrieved user chat sessions', {
         userId,
@@ -326,6 +509,15 @@ export class ChatService {
     sessionId: string,
     userId: string
   ): Promise<{ success: boolean; message: string }> {
+    // Validate inputs
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      return { success: false, message: 'Invalid sessionId' };
+    }
+
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      return { success: false, message: 'Invalid userId' };
+    }
+
     try {
       // Verify session belongs to user
       const { data: session, error: verifyError } = await supabaseAdmin
@@ -335,11 +527,20 @@ export class ChatService {
         .eq('user_id', userId)
         .maybeSingle();
 
-      if (verifyError || !session) {
+      if (verifyError) {
+        logger.warn('[CHAT_SERVICE] Error verifying session ownership', {
+          sessionId,
+          userId,
+          error: verifyError instanceof Error ? verifyError.message : String(verifyError),
+          code: verifyError.code,
+        });
+        return { success: false, message: 'Chat session not found' };
+      }
+
+      if (!session || !session.id) {
         logger.warn('[CHAT_SERVICE] Session not found or unauthorized', {
           sessionId,
           userId,
-          error: verifyError,
         });
         return { success: false, message: 'Chat session not found' };
       }
@@ -353,7 +554,8 @@ export class ChatService {
 
       if (deleteError) {
         logger.error('[CHAT_SERVICE] Failed to delete chat session', {
-          error: deleteError,
+          error: deleteError instanceof Error ? deleteError.message : String(deleteError),
+          code: deleteError.code,
           sessionId,
           userId,
         });
@@ -384,15 +586,24 @@ export class ChatService {
     userId: string,
     title: string
   ): Promise<{ success: boolean; message: string }> {
-    try {
-      // Validate title
-      if (!title || title.trim().length === 0) {
-        return { success: false, message: 'Title cannot be empty' };
-      }
+    // Validate inputs
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      return { success: false, message: 'Invalid sessionId' };
+    }
 
-      if (title.length > 200) {
-        return { success: false, message: 'Title too long (max 200 characters)' };
-      }
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      return { success: false, message: 'Invalid userId' };
+    }
+
+    if (!title || typeof title !== 'string' || title.trim().length === 0) {
+      return { success: false, message: 'Title cannot be empty' };
+    }
+
+    if (title.length > 200) {
+      return { success: false, message: 'Title too long (max 200 characters)' };
+    }
+
+    try {
 
       // Update title (with user verification)
       const { data, error } = await supabaseAdmin
@@ -405,7 +616,8 @@ export class ChatService {
 
       if (error) {
         logger.error('[CHAT_SERVICE] Failed to update chat title', {
-          error,
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
           sessionId,
           userId,
         });
@@ -439,6 +651,12 @@ export class ChatService {
    * @returns Generated title or null if failed
    */
   static async autoGenerateTitle(sessionId: string): Promise<string | null> {
+    // Validate input
+    if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      logger.warn('[CHAT_SERVICE] Invalid sessionId in autoGenerateTitle', { sessionId: typeof sessionId });
+      return null;
+    }
+
     try {
       // Get first user message
       const { data: firstMessage, error } = await supabaseAdmin
@@ -450,10 +668,19 @@ export class ChatService {
         .limit(1)
         .maybeSingle();
 
-      if (error || !firstMessage) {
-        logger.warn('[CHAT_SERVICE] No first message found for title generation', {
+      if (error) {
+        logger.warn('[CHAT_SERVICE] Error fetching first message for title generation', {
           sessionId,
-          error,
+          error: error instanceof Error ? error.message : String(error),
+          code: error.code,
+        });
+        return null;
+      }
+
+      if (!firstMessage || !firstMessage.content || typeof firstMessage.content !== 'string') {
+        logger.warn('[CHAT_SERVICE] No valid first message found for title generation', {
+          sessionId,
+          hasMessage: !!firstMessage,
         });
         return null;
       }
@@ -484,7 +711,8 @@ export class ChatService {
 
       if (updateError) {
         logger.error('[CHAT_SERVICE] Failed to update auto-generated title', {
-          error: updateError,
+          error: updateError instanceof Error ? updateError.message : String(updateError),
+          code: updateError.code,
           sessionId,
         });
         return null;

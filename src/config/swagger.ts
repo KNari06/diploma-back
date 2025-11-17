@@ -159,6 +159,30 @@ const options: swaggerJsdoc.Options = {
         name: 'Jira',
         description: 'Jira OAuth 2.0 интеграция (требует auth)',
       },
+      {
+        name: 'Test Visualization',
+        description: 'Визуализация тестовых шагов как нейронная сеть (граф nodes + edges) (требует auth)',
+      },
+      {
+        name: 'Intelligent Tests',
+        description: 'AI-генерированные intelligent test сессии с детальной визуализацией (требует auth)',
+      },
+      {
+        name: 'Knowledge Base',
+        description: 'Управление базой знаний и RAG поиск (требует auth)',
+      },
+      {
+        name: 'Playwright',
+        description: 'Работа с Playwright trace файлами и видео (требует auth)',
+      },
+      {
+        name: 'Workspaces',
+        description: 'Управление рабочими пространствами и проектами',
+      },
+      {
+        name: 'Reports',
+        description: 'Генерация и получение отчетов о тестировании (требует auth)',
+      },
     ],
   },
   apis: [

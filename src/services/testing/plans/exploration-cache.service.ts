@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { ExplorationResult } from '@/services/testing/autonomous-explorer.service';
-import { TestPlan } from '@/services/testing/test-plan-generator.service';
+import { ExplorationResult } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
+import { TestPlan } from '@/services/testing/plans/test-plan-generator.service';
 import { logger } from '@/utils/logger';
 
 // ═══════════════════════════════════════════════════════════════════════════

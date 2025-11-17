@@ -1,9 +1,12 @@
-import { supabase } from '@/db/supabase';
-import { TraceFile, TraceUploadRequest, TraceUploadResponse, TraceFileListItem, TraceStepsResponse, TraceStep } from '@/types';
+import { supabaseAdmin } from '@/db/supabase';
+import { TraceFile, TraceFileListItem, TraceStep, TraceStepsResponse, TraceUploadRequest, TraceUploadResponse } from '@/types';
 import { logger } from '@/utils/logger';
+import AdmZip from 'adm-zip';
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import AdmZip from 'adm-zip';
+
+// UUID validation regex
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Handle Playwright trace file upload to Supabase Storage
@@ -34,6 +37,36 @@ export const uploadTrace = async (
       return;
     }
 
+    // Validate userId format (UUID)
+    if (!UUID_REGEX.test(userId)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid userId format',
+        error: 'INVALID_USER_ID',
+      });
+      return;
+    }
+
+    // Validate testId format if provided (UUID)
+    if (testId && !UUID_REGEX.test(testId)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid testId format',
+        error: 'INVALID_TEST_ID',
+      });
+      return;
+    }
+
+    // Validate file size (max 100MB)
+    if (req.file.size > 100 * 1024 * 1024) {
+      res.status(400).json({
+        success: false,
+        message: 'File too large. Maximum size is 100MB',
+        error: 'FILE_TOO_LARGE',
+      });
+      return;
+    }
+
     const timestamp = Date.now();
     const traceId = uuidv4();
     const fileName = `trace_${timestamp}_${userId}_${testId || 'standalone'}_${browser || 'chrome'}.zip`;
@@ -50,7 +83,7 @@ export const uploadTrace = async (
     });
 
     // Upload to Supabase Storage
-    const { error: uploadError } = await supabase.storage
+    const { error: uploadError } = await supabaseAdmin.storage
       .from('traces')
       .upload(storagePath, req.file.buffer, {
         contentType: 'application/zip',
@@ -73,7 +106,7 @@ export const uploadTrace = async (
     }
 
     // Get public URL (or signed URL for private buckets)
-    const { data: urlData } = supabase.storage
+    const { data: urlData } = supabaseAdmin.storage
       .from('traces')
       .getPublicUrl(storagePath);
 
@@ -93,7 +126,7 @@ export const uploadTrace = async (
       created_at: new Date().toISOString(),
     };
 
-    const { error: insertError } = await supabase
+    const { error: insertError } = await supabaseAdmin
       .from('trace_files')
       .insert(traceRecord);
 
@@ -104,7 +137,7 @@ export const uploadTrace = async (
       });
 
       // Try to clean up uploaded file
-      await supabase.storage.from('traces').remove([storagePath]);
+      await supabaseAdmin.storage.from('traces').remove([storagePath]);
 
       res.status(500).json({
         success: false,
@@ -116,7 +149,7 @@ export const uploadTrace = async (
 
     // Update test_results table if testId is provided
     if (testId && browser) {
-      const { error: testResultError } = await supabase
+      const { error: testResultError } = await supabaseAdmin
         .from('test_results')
         .update({
           trace_file: fileName,
@@ -157,6 +190,11 @@ export const uploadTrace = async (
   } catch (error) {
     logger.error('Trace upload error', { error });
 
+    if (res.headersSent) {
+      logger.warn('[PLAYWRIGHT_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       message: 'Failed to upload trace file',
@@ -182,8 +220,28 @@ export const getTrace = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // Validate trace ID format (UUID)
+    if (!UUID_REGEX.test(id)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid trace ID format',
+        error: 'INVALID_TRACE_ID',
+      });
+      return;
+    }
+
+    // Validate userId format if provided (UUID)
+    if (userId && !UUID_REGEX.test(userId as string)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid userId format',
+        error: 'INVALID_USER_ID',
+      });
+      return;
+    }
+
     // Get trace metadata from database
-    let query = supabase
+    let query = supabaseAdmin
       .from('trace_files')
       .select('*')
       .eq('id', id);
@@ -207,7 +265,7 @@ export const getTrace = async (req: Request, res: Response): Promise<void> => {
     }
 
     // Generate signed URL for private bucket (valid for 1 hour)
-    const { data: signedUrlData, error: urlError } = await supabase.storage
+    const { data: signedUrlData, error: urlError } = await supabaseAdmin.storage
       .from('traces')
       .createSignedUrl(traceFile.storage_path, 3600);
 
@@ -242,6 +300,12 @@ export const getTrace = async (req: Request, res: Response): Promise<void> => {
     });
   } catch (error) {
     logger.error('Get trace error', { error });
+
+    if (res.headersSent) {
+      logger.warn('[PLAYWRIGHT_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       message: 'Failed to retrieve trace file',
@@ -266,7 +330,27 @@ export const listTraces = async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
-    let query = supabase
+    // Validate testId format if provided (UUID)
+    if (testId && !UUID_REGEX.test(testId as string)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid testId format',
+        error: 'INVALID_TEST_ID',
+      });
+      return;
+    }
+
+    // Validate userId format if provided (UUID)
+    if (userId && !UUID_REGEX.test(userId as string)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid userId format',
+        error: 'INVALID_USER_ID',
+      });
+      return;
+    }
+
+    let query = supabaseAdmin
       .from('trace_files')
       .select('*')
       .order('created_at', { ascending: false });
@@ -305,6 +389,12 @@ export const listTraces = async (req: Request, res: Response): Promise<void> => 
     });
   } catch (error) {
     logger.error('List traces error', { error });
+
+    if (res.headersSent) {
+      logger.warn('[PLAYWRIGHT_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       message: 'Failed to list trace files',
@@ -330,8 +420,28 @@ export const deleteTrace = async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
+    // Validate trace ID format (UUID)
+    if (!UUID_REGEX.test(id)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid trace ID format',
+        error: 'INVALID_TRACE_ID',
+      });
+      return;
+    }
+
+    // Validate userId format if provided (UUID)
+    if (userId && !UUID_REGEX.test(userId)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid userId format',
+        error: 'INVALID_USER_ID',
+      });
+      return;
+    }
+
     // Get trace metadata
-    let query = supabase
+    let query = supabaseAdmin
       .from('trace_files')
       .select('*')
       .eq('id', id);
@@ -353,7 +463,7 @@ export const deleteTrace = async (req: Request, res: Response): Promise<void> =>
     }
 
     // Delete from storage
-    const { error: storageError } = await supabase.storage
+    const { error: storageError } = await supabaseAdmin.storage
       .from('traces')
       .remove([traceFile.storage_path]);
 
@@ -365,7 +475,7 @@ export const deleteTrace = async (req: Request, res: Response): Promise<void> =>
     }
 
     // Delete from database
-    const { error: deleteError } = await supabase
+    const { error: deleteError } = await supabaseAdmin
       .from('trace_files')
       .delete()
       .eq('id', id);
@@ -394,6 +504,12 @@ export const deleteTrace = async (req: Request, res: Response): Promise<void> =>
     });
   } catch (error) {
     logger.error('Delete trace error', { error });
+
+    if (res.headersSent) {
+      logger.warn('[PLAYWRIGHT_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       message: 'Failed to delete trace file',
@@ -418,8 +534,18 @@ export const getTraceFilesByUser = async (req: Request, res: Response): Promise<
       return;
     }
 
+    // Validate userId format (UUID)
+    if (!UUID_REGEX.test(userId as string)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid userId format',
+        error: 'INVALID_USER_ID',
+      });
+      return;
+    }
+
     // Fetch all trace files for the user
-    const { data: traceFiles, error: fetchError } = await supabase
+    const { data: traceFiles, error: fetchError } = await supabaseAdmin
       .from('trace_files')
       .select('*')
       .eq('user_id', userId as string)
@@ -460,6 +586,12 @@ export const getTraceFilesByUser = async (req: Request, res: Response): Promise<
     });
   } catch (error) {
     logger.error('Get trace files by user error', { error });
+
+    if (res.headersSent) {
+      logger.warn('[PLAYWRIGHT_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       message: 'Failed to retrieve trace files',
@@ -484,8 +616,18 @@ export const getTraceSteps = async (req: Request, res: Response<TraceStepsRespon
       return;
     }
 
+    // Validate testId format (UUID)
+    if (!UUID_REGEX.test(testId)) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid testId format',
+        error: 'INVALID_TEST_ID',
+      });
+      return;
+    }
+
     // Find trace file for this test
-    const { data: traceFiles, error: fetchError } = await supabase
+    const { data: traceFiles, error: fetchError } = await supabaseAdmin
       .from('trace_files')
       .select('*')
       .eq('test_id', testId)
@@ -523,7 +665,7 @@ export const getTraceSteps = async (req: Request, res: Response<TraceStepsRespon
     }
 
     // Download trace file from Supabase Storage
-    const { data: fileData, error: downloadError } = await supabase.storage
+    const { data: fileData, error: downloadError } = await supabaseAdmin.storage
       .from('traces')
       .download(traceFile.storage_path);
 
@@ -616,7 +758,7 @@ export const getTraceSteps = async (req: Request, res: Response<TraceStepsRespon
 
     // Save parsed data to database
     const parsedAt = new Date().toISOString();
-    const { error: updateError } = await supabase
+    const { error: updateError } = await supabaseAdmin
       .from('trace_files')
       .update({
         status: 'parsed',
@@ -650,6 +792,12 @@ export const getTraceSteps = async (req: Request, res: Response<TraceStepsRespon
     });
   } catch (error) {
     logger.error('Get trace steps error', { error });
+
+    if (res.headersSent) {
+      logger.warn('[PLAYWRIGHT_API] Response already sent, cannot send error response');
+      return;
+    }
+
     res.status(500).json({
       success: false,
       message: 'Failed to retrieve trace steps',

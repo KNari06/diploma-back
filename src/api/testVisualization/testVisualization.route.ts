@@ -11,7 +11,7 @@ const router = Router();
 
 /**
  * @swagger
- * /api/test-visualization/parse:
+ * /api/v1/test-visualization/parse:
  *   post:
  *     summary: Parse test steps into graph visualization
  *     tags: [Test Visualization]
@@ -68,7 +68,7 @@ router.post('/parse', requireAuth, parseTestSteps);
 
 /**
  * @swagger
- * /api/test-visualization/export:
+ * /api/v1/test-visualization/export:
  *   post:
  *     summary: Export graph in different formats (JSON, Mermaid)
  *     tags: [Test Visualization]
@@ -103,7 +103,7 @@ router.post('/export', requireAuth, exportTestGraph);
 
 /**
  * @swagger
- * /api/test-visualization/validate:
+ * /api/v1/test-visualization/validate:
  *   post:
  *     summary: Validate test steps structure
  *     tags: [Test Visualization]
@@ -132,9 +132,18 @@ router.post('/validate', requireAuth, validateTestSteps);
 
 /**
  * @swagger
- * /api/test-visualization/{testId}:
+ * /api/v1/test-visualization/{testId}:
  *   get:
- *     summary: Get visualization for existing test
+ *     summary: Get comprehensive visualization for existing test from database
+ *     description: |
+ *       Retrieves test visualization by aggregating data from multiple sources:
+ *       - Trace files (Playwright traces)
+ *       - Test reports
+ *       - Intelligent test sessions
+ *       - AI summaries
+ *       - API configurations
+ *
+ *       Returns a graph structure (nodes + edges) ready for visualization as neural network.
  *     tags: [Test Visualization]
  *     security:
  *       - bearerAuth: []
@@ -144,21 +153,203 @@ router.post('/validate', requireAuth, validateTestSteps);
  *         required: true
  *         schema:
  *           type: string
+ *           format: uuid
+ *         description: Test ID (UUID)
+ *         example: "550e8400-e29b-41d4-a716-446655440000"
  *       - in: query
  *         name: format
  *         schema:
  *           type: string
  *           enum: [json, mermaid]
  *           default: json
+ *         description: Response format - JSON graph or Mermaid diagram
+ *         example: "json"
+ *       - in: query
+ *         name: options
+ *         schema:
+ *           type: string
+ *         description: JSON string with parser options (includeStartEnd, autoLayout, etc.)
+ *         example: '{"includeStartEnd":true,"autoLayout":true}'
  *     responses:
  *       200:
- *         description: Test visualization
- *       404:
- *         description: Test not found
+ *         description: Test visualization graph successfully generated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     nodes:
+ *                       type: array
+ *                       description: Graph nodes for visualization
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                             example: "node_1"
+ *                           type:
+ *                             type: string
+ *                             enum: [start, step, conditional, loop, end]
+ *                             example: "step"
+ *                           stepType:
+ *                             type: string
+ *                             description: Playwright step type
+ *                             example: "goto"
+ *                           label:
+ *                             type: string
+ *                             example: "Navigate to https://example.com"
+ *                           selector:
+ *                             type: string
+ *                             example: "button.login"
+ *                           value:
+ *                             type: string
+ *                             example: "https://example.com"
+ *                           group:
+ *                             type: string
+ *                           meta:
+ *                             type: object
+ *                             properties:
+ *                               color:
+ *                                 type: string
+ *                                 example: "#2196F3"
+ *                               icon:
+ *                                 type: string
+ *                                 example: "globe"
+ *                               source:
+ *                                 type: string
+ *                                 description: Data source (trace, report, intelligent, ai_summary, api_config, generated)
+ *                                 example: "trace"
+ *                               traceFile:
+ *                                 type: string
+ *                                 example: "trace_123.zip"
+ *                               browser:
+ *                                 type: string
+ *                                 example: "chrome"
+ *                               success:
+ *                                 type: boolean
+ *                               durationMs:
+ *                                 type: number
+ *                     edges:
+ *                       type: array
+ *                       description: Graph edges (connections between nodes)
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                             example: "edge_1"
+ *                           source:
+ *                             type: string
+ *                             example: "node_1"
+ *                           target:
+ *                             type: string
+ *                             example: "node_2"
+ *                           type:
+ *                             type: string
+ *                             enum: [normal, conditional-true, conditional-false, loop]
+ *                             example: "normal"
+ *                           label:
+ *                             type: string
+ *                           animated:
+ *                             type: boolean
+ *                     metadata:
+ *                       type: object
+ *                       properties:
+ *                         totalSteps:
+ *                           type: number
+ *                           example: 10
+ *                         conditionalBranches:
+ *                           type: number
+ *                           example: 2
+ *                         loops:
+ *                           type: number
+ *                           example: 1
+ *                         assertions:
+ *                           type: number
+ *                           example: 3
+ *                         testId:
+ *                           type: string
+ *                           format: uuid
+ *                         testUrl:
+ *                           type: string
+ *                           example: "https://example.com"
+ *                         testStatus:
+ *                           type: string
+ *                           enum: [pending, running, completed, failed, cancelled, timeout]
+ *                         executedAt:
+ *                           type: string
+ *                           format: date-time
+ *                         dataSources:
+ *                           type: object
+ *                           properties:
+ *                             traceFiles:
+ *                               type: number
+ *                             testResults:
+ *                               type: number
+ *                             intelligentSession:
+ *                               type: boolean
+ *                             report:
+ *                               type: boolean
+ *                             apiConfigs:
+ *                               type: number
+ *                         stepsSource:
+ *                           type: string
+ *                           description: Primary source of steps (trace_files, test_report, intelligent_session, ai_summary, api_configs, generated_basic)
+ *                         generatedAt:
+ *                           type: string
+ *                           format: date-time
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *           text/plain:
+ *             schema:
+ *               type: string
+ *             description: Mermaid diagram (when format=mermaid)
+ *             example: |
+ *               graph TD
+ *                   node_1[Start] --> node_2[Navigate to https://example.com]
+ *                   node_2 --> node_3[Click Login Button]
+ *       400:
+ *         description: Bad request - invalid test ID format or parameters
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Invalid test ID format"
  *       401:
- *         description: Unauthorized
- *       501:
- *         description: Not implemented yet
+ *         description: Unauthorized - authentication required
+ *       404:
+ *         description: Test not found or no steps available
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Test not found"
+ *                 message:
+ *                   type: string
+ *                 testData:
+ *                   type: object
+ *                   description: Available test data info
+ *       500:
+ *         description: Internal server error
  */
 router.get('/:testId', requireAuth, getTestVisualization);
 

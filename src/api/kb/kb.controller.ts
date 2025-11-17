@@ -1,20 +1,23 @@
-import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
-import { errorResponse, successResponse } from '@/utils/error-handler';
+import { supabaseAdmin } from '@/db/supabase';
 import * as kbService from '@/services/kb/kb.service';
-import { rebuildGlobalKB, getLocalKBStats } from '@/services/kb/localKB.service';
-import { supabase } from '@/db/supabase';
+import { getLocalKBStats, rebuildGlobalKB } from '@/services/kb/localKB.service';
+import { errorResponse, successResponse } from '@/utils/error-handler';
+import { logger } from '@/utils/logger';
+import { Request, Response } from 'express';
+
+// UUID validation regex
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Check if user is admin
  */
 async function isAdmin(userId: string): Promise<boolean> {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('users')
       .select('role')
       .eq('id', userId)
-      .single();
+      .maybeSingle();
 
     if (error || !data) {
       return false;
@@ -32,11 +35,16 @@ async function isAdmin(userId: string): Promise<boolean> {
  */
 async function isProjectOwner(userId: string, projectId: string): Promise<boolean> {
   try {
-    const { data, error } = await supabase
+    // Validate projectId format (UUID)
+    if (!UUID_REGEX.test(projectId)) {
+      return false;
+    }
+
+    const { data, error } = await supabaseAdmin
       .from('projects')
       .select('user_id')
       .eq('id', projectId)
-      .single();
+      .maybeSingle();
 
     if (error || !data) {
       return false;
@@ -74,7 +82,19 @@ export async function uploadGlobalKB(req: Request, res: Response): Promise<void>
       return;
     }
 
-    const tags = req.body.tags ? JSON.parse(req.body.tags) : [];
+    // Safe JSON parsing for tags
+    let tags = [];
+    if (req.body.tags) {
+      try {
+        tags = JSON.parse(req.body.tags);
+        if (!Array.isArray(tags)) {
+          tags = [];
+        }
+      } catch (error) {
+        logger.warn('Invalid tags JSON format', { tags: req.body.tags });
+        tags = [];
+      }
+    }
 
     const result = await kbService.uploadGlobalKB(file.path, file.originalname, tags, userId);
 
@@ -85,6 +105,12 @@ export async function uploadGlobalKB(req: Request, res: Response): Promise<void>
     });
   } catch (error: any) {
     logger.error('Upload global KB failed', { error });
+
+    if (res.headersSent) {
+      logger.warn('[KB_API] Response already sent, cannot send error response');
+      return;
+    }
+
     errorResponse(res, error.message || 'Upload failed', 500);
   }
 }
@@ -104,6 +130,12 @@ export async function uploadProjectKB(req: Request, res: Response): Promise<void
     const projectId = req.body.projectId;
     if (!projectId) {
       errorResponse(res, 'Project ID required', 400);
+      return;
+    }
+
+    // Validate projectId format (UUID)
+    if (!UUID_REGEX.test(projectId)) {
+      errorResponse(res, 'Invalid project ID format', 400);
       return;
     }
 
@@ -129,6 +161,12 @@ export async function uploadProjectKB(req: Request, res: Response): Promise<void
     });
   } catch (error: any) {
     logger.error('Upload project KB failed', { error });
+
+    if (res.headersSent) {
+      logger.warn('[KB_API] Response already sent, cannot send error response');
+      return;
+    }
+
     errorResponse(res, error.message || 'Upload failed', 500);
   }
 }
@@ -152,8 +190,29 @@ export async function queryKB(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    // If projectId provided, verify ownership
+    if (query.trim().length === 0) {
+      errorResponse(res, 'Query cannot be empty', 400);
+      return;
+    }
+
+    // Validate optional parameters
+    if (matchThreshold !== undefined && (typeof matchThreshold !== 'number' || matchThreshold < 0 || matchThreshold > 1)) {
+      errorResponse(res, 'matchThreshold must be a number between 0 and 1', 400);
+      return;
+    }
+
+    if (matchCount !== undefined && (typeof matchCount !== 'number' || matchCount < 1 || matchCount > 100)) {
+      errorResponse(res, 'matchCount must be a number between 1 and 100', 400);
+      return;
+    }
+
+    // If projectId provided, validate and verify ownership
     if (projectId) {
+      if (!UUID_REGEX.test(projectId)) {
+        errorResponse(res, 'Invalid project ID format', 400);
+        return;
+      }
+
       const isOwner = await isProjectOwner(userId, projectId);
       if (!isOwner) {
         errorResponse(res, 'Access denied to this project', 403);
@@ -169,6 +228,12 @@ export async function queryKB(req: Request, res: Response): Promise<void> {
     successResponse(res, results);
   } catch (error: any) {
     logger.error('KB query failed', { error });
+
+    if (res.headersSent) {
+      logger.warn('[KB_API] Response already sent, cannot send error response');
+      return;
+    }
+
     errorResponse(res, error.message || 'Query failed', 500);
   }
 }
@@ -191,6 +256,12 @@ export async function getProjectFiles(req: Request, res: Response): Promise<void
       return;
     }
 
+    // Validate projectId format (UUID)
+    if (!UUID_REGEX.test(projectId)) {
+      errorResponse(res, 'Invalid project ID format', 400);
+      return;
+    }
+
     // Check project ownership
     const isOwner = await isProjectOwner(userId, projectId);
     if (!isOwner) {
@@ -203,6 +274,12 @@ export async function getProjectFiles(req: Request, res: Response): Promise<void
     successResponse(res, files);
   } catch (error: any) {
     logger.error('Get project files failed', { error });
+
+    if (res.headersSent) {
+      logger.warn('[KB_API] Response already sent, cannot send error response');
+      return;
+    }
+
     errorResponse(res, error.message || 'Failed to get files', 500);
   }
 }
@@ -225,6 +302,18 @@ export async function deleteProjectFile(req: Request, res: Response): Promise<vo
       return;
     }
 
+    // Validate projectId format (UUID)
+    if (!UUID_REGEX.test(projectId)) {
+      errorResponse(res, 'Invalid project ID format', 400);
+      return;
+    }
+
+    // Validate fileName
+    if (typeof fileName !== 'string' || fileName.trim().length === 0) {
+      errorResponse(res, 'File name must be a non-empty string', 400);
+      return;
+    }
+
     // Check project ownership
     const isOwner = await isProjectOwner(userId, projectId);
     if (!isOwner) {
@@ -240,6 +329,12 @@ export async function deleteProjectFile(req: Request, res: Response): Promise<vo
     });
   } catch (error: any) {
     logger.error('Delete project file failed', { error });
+
+    if (res.headersSent) {
+      logger.warn('[KB_API] Response already sent, cannot send error response');
+      return;
+    }
+
     errorResponse(res, error.message || 'Delete failed', 500);
   }
 }
@@ -261,9 +356,15 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
     // Get local global KB stats
     const localStats = await getLocalKBStats();
 
-    // If projectId provided, verify ownership and get project stats
+    // If projectId provided, validate and verify ownership and get project stats
     let projectStats = null;
     if (projectId) {
+      // Validate projectId format (UUID)
+      if (!UUID_REGEX.test(projectId)) {
+        errorResponse(res, 'Invalid project ID format', 400);
+        return;
+      }
+
       const isOwner = await isProjectOwner(userId, projectId);
       if (!isOwner) {
         errorResponse(res, 'Access denied to this project', 403);
@@ -286,6 +387,12 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
     });
   } catch (error: any) {
     logger.error('Get KB stats failed', { error });
+
+    if (res.headersSent) {
+      logger.warn('[KB_API] Response already sent, cannot send error response');
+      return;
+    }
+
     errorResponse(res, error.message || 'Failed to get stats', 500);
   }
 }
@@ -320,6 +427,12 @@ export async function rebuildKB(req: Request, res: Response): Promise<void> {
     });
   } catch (error: any) {
     logger.error('Rebuild KB failed', { error });
+
+    if (res.headersSent) {
+      logger.warn('[KB_API] Response already sent, cannot send error response');
+      return;
+    }
+
     errorResponse(res, error.message || 'Failed to rebuild KB', 500);
   }
 }

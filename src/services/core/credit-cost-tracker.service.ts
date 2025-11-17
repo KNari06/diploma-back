@@ -1,6 +1,6 @@
-import { TokenCalculatorService, MODEL_PRICING } from './token-calculator.service';
-import { UserCreditsService } from './user-credits.service';
 import { logger } from '@/utils/logger';
+import { TokenCalculatorService } from './token-calculator.service';
+import { UserCreditsService } from './user-credits.service';
 
 /**
  * Credit Cost Tracker Service
@@ -29,6 +29,14 @@ export interface CreditDeduction {
   costUSD: number;
   testId?: string;
   description: string;
+}
+
+export interface TestCostBreakdown {
+  testType: 'intelligent' | 'standard' | 'api';
+  fixedCredits: number;
+  calculatedCostUSD?: number;
+  aiCalls?: number;
+  screenshots?: number;
 }
 
 export interface CreditCheck {
@@ -61,13 +69,21 @@ export class CreditCostTrackerService {
     credits: number;
     costUSD: number;
   } {
-    const totalTokens = inputTokens + outputTokens;
+    // Validate inputs
+    const validInputTokens = Number.isFinite(inputTokens) && inputTokens >= 0 ? inputTokens : 0;
+    const validOutputTokens = Number.isFinite(outputTokens) && outputTokens >= 0 ? outputTokens : 0;
+
+    const totalTokens = validInputTokens + validOutputTokens;
     const credits = TokenCalculatorService.tokensToCredits(totalTokens);
-    const costUSD = TokenCalculatorService.calculateCostFromTokens(inputTokens, outputTokens, model);
+    const costUSD = TokenCalculatorService.calculateCostFromTokens(
+      validInputTokens,
+      validOutputTokens,
+      model
+    );
 
     TokenCalculatorService.logTokenUsage(
       'AI Call',
-      { input: inputTokens, output: outputTokens, model },
+      { input: validInputTokens, output: validOutputTokens, model },
       credits
     );
 
@@ -80,7 +96,7 @@ export class CreditCostTrackerService {
 
   /**
    * Track screenshot analysis (GPT-4o Vision)
-   * @param count - Number of screenshots
+   * @param count - Number of screenshots (must be >= 0)
    * @returns Credit cost
    */
   static trackScreenshot(count: number): {
@@ -88,6 +104,12 @@ export class CreditCostTrackerService {
     credits: number;
     costUSD: number;
   } {
+    // Validate input
+    if (!Number.isFinite(count) || count < 0) {
+      count = 0;
+    }
+    count = Math.floor(count); // Ensure integer
+
     // Average screenshot: 700 input + 200 output tokens
     const tokensPerScreenshot = 900;
     const totalTokens = tokensPerScreenshot * count;
@@ -128,13 +150,20 @@ export class CreditCostTrackerService {
   ): {
     credits: number;
     costUSD: number;
-    breakdown: any;
+    breakdown: TestCostBreakdown;
   } {
+    // Validate testType
+    const validTestTypes = ['intelligent', 'standard', 'api'];
+    if (!validTestTypes.includes(testType)) {
+      logger.warn('[CREDIT_COST_TRACKER] Invalid test type, using standard', { testType });
+      testType = 'standard';
+    }
+
     // Use fixed costs for predictability
     const fixedCredits = TokenCalculatorService.getTestCreditCost(testType);
 
     let calculatedCost = 0;
-    let breakdown: any = {
+    const breakdown: TestCostBreakdown = {
       testType,
       fixedCredits,
     };
@@ -143,19 +172,21 @@ export class CreditCostTrackerService {
     if (operations) {
       let totalCost = 0;
 
-      if (operations.aiCalls) {
+      if (operations.aiCalls && Array.isArray(operations.aiCalls)) {
         for (const call of operations.aiCalls) {
-          const cost = TokenCalculatorService.calculateCostFromTokens(
-            call.inputTokens,
-            call.outputTokens,
-            call.model
-          );
-          totalCost += cost;
+          if (call && Number.isFinite(call.inputTokens) && Number.isFinite(call.outputTokens)) {
+            const cost = TokenCalculatorService.calculateCostFromTokens(
+              call.inputTokens,
+              call.outputTokens,
+              call.model || 'gpt-4o-mini'
+            );
+            totalCost += cost;
+          }
         }
         breakdown.aiCalls = operations.aiCalls.length;
       }
 
-      if (operations.screenshots) {
+      if (Number.isFinite(operations.screenshots) && operations.screenshots !== undefined) {
         const screenshotCost = this.trackScreenshot(operations.screenshots);
         totalCost += screenshotCost.costUSD;
         breakdown.screenshots = operations.screenshots;
@@ -187,6 +218,27 @@ export class CreditCostTrackerService {
     error?: string;
   }> {
     try {
+      // Validate inputs
+      if (!deduction.userId || typeof deduction.userId !== 'string') {
+        throw new Error('Invalid userId');
+      }
+
+      if (!deduction.testType || !['intelligent', 'standard', 'api'].includes(deduction.testType)) {
+        throw new Error('Invalid testType');
+      }
+
+      if (!Number.isFinite(deduction.credits) || deduction.credits < 0) {
+        throw new Error('Invalid credits amount');
+      }
+
+      if (!Number.isFinite(deduction.costUSD) || deduction.costUSD < 0) {
+        throw new Error('Invalid costUSD');
+      }
+
+      if (!deduction.description || typeof deduction.description !== 'string') {
+        throw new Error('Description is required');
+      }
+
       logger.info('[CREDIT_COST_TRACKER] Deducting credits for test', {
         userId: deduction.userId,
         testType: deduction.testType,
@@ -231,14 +283,16 @@ export class CreditCostTrackerService {
         logger.warn('[CREDIT_COST_TRACKER] Failed to deduct credits', {
           userId: deduction.userId,
           credits: deduction.credits,
+          error: 'Insufficient credits or database error',
         });
       }
 
       return result;
     } catch (error) {
       logger.error('[CREDIT_COST_TRACKER] Exception in deductCreditsForTest', {
-        error,
-        userId: deduction.userId,
+        error: error instanceof Error ? error.message : String(error),
+        userId: deduction?.userId,
+        testType: deduction?.testType,
       });
 
       return {
@@ -260,6 +314,17 @@ export class CreditCostTrackerService {
     testType: 'intelligent' | 'standard' | 'api' | 'chat'
   ): Promise<CreditCheck> {
     try {
+      // Validate inputs
+      if (!userId || typeof userId !== 'string') {
+        logger.warn('[CREDIT_COST_TRACKER] Invalid userId in checkCreditsForTest', { userId });
+        return {
+          hasEnough: false,
+          required: 0,
+          available: 0,
+          shortage: 0,
+        };
+      }
+
       // Chat is always free
       if (testType === 'chat') {
         return {
@@ -273,7 +338,10 @@ export class CreditCostTrackerService {
       const requiredCredits = TokenCalculatorService.getTestCreditCost(testType);
       const userCredits = await UserCreditsService.getUserCredits(userId);
 
-      const availableCredits = userCredits?.credits_balance || 0;
+      const availableCredits = Number.isFinite(userCredits?.credits_balance)
+        ? (userCredits?.credits_balance || 0)
+        : 0;
+
       const hasEnough = availableCredits >= requiredCredits;
       const shortage = hasEnough ? 0 : requiredCredits - availableCredits;
 
@@ -293,7 +361,7 @@ export class CreditCostTrackerService {
       };
     } catch (error) {
       logger.error('[CREDIT_COST_TRACKER] Exception in checkCreditsForTest', {
-        error,
+        error: error instanceof Error ? error.message : String(error),
         userId,
         testType,
       });
@@ -321,8 +389,23 @@ export class CreditCostTrackerService {
     };
   }> {
     try {
+      // Validate input
+      if (!userId || typeof userId !== 'string') {
+        logger.warn('[CREDIT_COST_TRACKER] Invalid userId in getUserTestCapacity', { userId });
+        return {
+          credits: 0,
+          capacity: {
+            intelligent: 0,
+            standard: 0,
+            api: 0,
+          },
+        };
+      }
+
       const userCredits = await UserCreditsService.getUserCredits(userId);
-      const credits = userCredits?.credits_balance || 0;
+      const credits = Number.isFinite(userCredits?.credits_balance)
+        ? (userCredits?.credits_balance || 0)
+        : 0;
 
       const capacity = TokenCalculatorService.calculateTestCapacity(credits);
 
@@ -332,7 +415,7 @@ export class CreditCostTrackerService {
       };
     } catch (error) {
       logger.error('[CREDIT_COST_TRACKER] Exception in getUserTestCapacity', {
-        error,
+        error: error instanceof Error ? error.message : String(error),
         userId,
       });
 
@@ -350,7 +433,7 @@ export class CreditCostTrackerService {
   /**
    * Estimate cost before running a test
    * @param testType - Type of test
-   * @param estimatedPages - For intelligent tests
+   * @param estimatedPages - For intelligent tests (optional)
    * @returns Estimated credits
    */
   static estimateTestCost(
@@ -360,11 +443,19 @@ export class CreditCostTrackerService {
     credits: number;
     description: string;
   } {
-    if (testType === 'intelligent' && estimatedPages) {
-      const estimated = TokenCalculatorService.estimateIntelligentTestCredits(estimatedPages);
+    // Validate testType
+    const validTestTypes = ['intelligent', 'standard', 'api'];
+    if (!validTestTypes.includes(testType)) {
+      logger.warn('[CREDIT_COST_TRACKER] Invalid test type in estimateTestCost', { testType });
+      testType = 'standard';
+    }
+
+    if (testType === 'intelligent' && Number.isFinite(estimatedPages) && estimatedPages !== undefined) {
+      const validatedPages = Math.max(1, Math.floor(estimatedPages));
+      const estimated = TokenCalculatorService.estimateIntelligentTestCredits(validatedPages);
       return {
         credits: estimated,
-        description: `~${estimatedPages} pages`,
+        description: `~${validatedPages} pages`,
       };
     }
 
