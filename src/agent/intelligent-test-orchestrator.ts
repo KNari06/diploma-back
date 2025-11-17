@@ -451,7 +451,11 @@ export class IntelligentTestOrchestrator {
           timeout: action.timeout,
           description: action.description,
           extract: action.extract,
-          assertion: action.assertion,
+          assertion: action.assertion ? {
+            type: 'text', // Default type for intelligent testing assertions
+            expected: action.assertion.expected,
+            operator: action.assertion.operator,
+          } : undefined,
         });
 
         await this.page.waitForTimeout(500); // Small delay for page to settle

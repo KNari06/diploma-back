@@ -81,7 +81,12 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
     // Create context with options
     const contextOptions: BrowserContextOptions = {
-      viewport: testData.options?.viewport || { width: 1920, height: 1080 },
+      viewport: testData.options?.viewport
+        ? {
+            width: testData.options.viewport.width || 1920,
+            height: testData.options.viewport.height || 1080
+          }
+        : { width: 1920, height: 1080 },
       userAgent: testData.options?.headers?.['User-Agent'] || undefined,
       // ✅ NEW: Enable video recording
       recordVideo: {
@@ -97,7 +102,12 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         : devices['Pixel 5'];
       Object.assign(contextOptions, device);
       // Update video size for mobile
-      contextOptions.recordVideo.size = contextOptions.viewport;
+      if (contextOptions.recordVideo && contextOptions.viewport) {
+        contextOptions.recordVideo.size = {
+          width: contextOptions.viewport.width,
+          height: contextOptions.viewport.height,
+        };
+      }
     }
 
     context = await browser.newContext(contextOptions);
