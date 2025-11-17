@@ -1,7 +1,16 @@
-import { Router } from 'express';
 import { requireAuth } from '@/middleware/auth.middleware';
 import { asyncHandler } from '@/utils/error-handler';
-import { getUserCredits, resetUserCredits, purchaseCredits, getCreditHistory, getPricingPlans } from './user.controller';
+import { Router } from 'express';
+import {
+  assignUserPlan,
+  checkUserCredits,
+  getCreditHistory,
+  getPricingPlans,
+  getUserCredits,
+  getUserPlan,
+  purchaseCredits,
+  resetUserCredits,
+} from './user.controller';
 
 const router = Router();
 
@@ -281,5 +290,88 @@ router.get('/credits/history', requireAuth, asyncHandler(getCreditHistory));
  *         description: Server error
  */
 router.get('/pricing-plans', asyncHandler(getPricingPlans));
+
+/**
+ * @swagger
+ * /api/v1/user/plan:
+ *   get:
+ *     summary: Get current user's plan information
+ *     description: Returns user's current pricing plan with credit usage details
+ *     tags: [User]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: User plan information
+ *       404:
+ *         description: User plan not found
+ *       500:
+ *         description: Server error
+ */
+router.get('/plan', requireAuth, asyncHandler(getUserPlan));
+
+/**
+ * @swagger
+ * /api/v1/user/plan/assign:
+ *   post:
+ *     summary: Assign plan to user (Admin only)
+ *     description: Assign a pricing plan to a specific user
+ *     tags: [User]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               user_id:
+ *                 type: string
+ *                 format: uuid
+ *               plan_slug:
+ *                 type: string
+ *                 enum: [free, pro, team]
+ *     responses:
+ *       200:
+ *         description: Plan assigned successfully
+ *       400:
+ *         description: Invalid request parameters
+ *       403:
+ *         description: Admin access required
+ *       500:
+ *         description: Server error
+ */
+router.post('/plan/assign', requireAuth, asyncHandler(assignUserPlan));
+
+/**
+ * @swagger
+ * /api/v1/user/credits/check:
+ *   post:
+ *     summary: Check if user can use credits
+ *     description: Check if user has enough credits within daily/monthly limits
+ *     tags: [User]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               credits_amount:
+ *                 type: integer
+ *                 minimum: 1
+ *                 default: 1
+ *     responses:
+ *       200:
+ *         description: Credit check result
+ *       400:
+ *         description: Invalid request parameters
+ *       500:
+ *         description: Server error
+ */
+router.post('/credits/check', requireAuth, asyncHandler(checkUserCredits));
 
 export default router;

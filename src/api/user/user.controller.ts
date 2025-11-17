@@ -1,6 +1,6 @@
-import { PRICING_METADATA, PRICING_PLANS } from '@/config/pricing-plans';
 import { supabaseAdmin } from '@/db/supabase';
 import { UserCreditsService } from '@/services/core/user-credits.service';
+import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 
@@ -409,76 +409,61 @@ export const getCreditHistory = async (req: Request, res: Response): Promise<voi
  */
 export const getPricingPlans = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { currency, billing_period, active_only = 'true' } = req.query;
+    const { currency, billing_period } = req.query;
 
-    logger.info('[PRICING] Getting pricing plans', {
+    logger.info('[PRICING] Getting pricing plans from database', {
       currency,
       billing_period,
-      active_only,
     });
 
-    // Validate currency if provided
-    if (currency && !PRICING_METADATA.currency_options.includes(currency as any)) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid currency',
-        code: 'INVALID_CURRENCY',
-        message: `Currency must be one of: ${PRICING_METADATA.currency_options.join(', ')}`,
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
+    // Get plans from database
+    const result = await PricingPlansService.getPlansForAPI();
 
-    // Validate billing_period if provided
-    if (billing_period && !PRICING_METADATA.billing_periods.includes(billing_period as any)) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid billing period',
-        code: 'INVALID_BILLING_PERIOD',
-        message: `Billing period must be one of: ${PRICING_METADATA.billing_periods.join(', ')}`,
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
+    let { plans, metadata } = result;
 
-    // Validate active_only if provided (accepts 'true', 'false', '1', '0')
-    if (active_only !== undefined) {
-      const activeOnlyStr = String(active_only).toLowerCase();
-      if (!['true', 'false', '1', '0'].includes(activeOnlyStr)) {
+    // Filter by currency if provided
+    if (currency) {
+      const validCurrencies = ['USD', 'EUR', 'KZT'];
+      if (!validCurrencies.includes(currency as string)) {
         res.status(400).json({
           success: false,
-          error: 'Invalid active_only parameter',
-          code: 'INVALID_ACTIVE_ONLY',
-          message: 'active_only must be one of: true, false, 1, 0',
+          error: 'Invalid currency',
+          code: 'INVALID_CURRENCY',
+          message: `Currency must be one of: ${validCurrencies.join(', ')}`,
           timestamp: new Date().toISOString(),
         });
         return;
       }
+
+      plans = plans.filter((plan) => plan.currency === currency);
+      metadata.count = plans.length;
     }
 
-    // Filter plans based on query parameters
-    let filteredPlans = [...PRICING_PLANS];
-
-    if (currency) {
-      filteredPlans = filteredPlans.filter((plan) => plan.currency === currency);
-    }
-
+    // Filter by billing_period if provided
     if (billing_period) {
-      filteredPlans = filteredPlans.filter((plan) =>
-        plan.credit_options.some((opt) => opt.billing_period === billing_period)
+      const validPeriods = ['monthly', 'yearly', 'custom'];
+      if (!validPeriods.includes(billing_period as string)) {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid billing period',
+          code: 'INVALID_BILLING_PERIOD',
+          message: `Billing period must be one of: ${validPeriods.join(', ')}`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      plans = plans.filter((plan) =>
+        plan.credit_options.some((opt: any) => opt.billing_period === billing_period)
       );
+      metadata.count = plans.length;
     }
 
     // Return enhanced structure with metadata
     res.json({
       success: true,
-      plans: filteredPlans,
-      metadata: {
-        count: filteredPlans.length,
-        currency_options: PRICING_METADATA.currency_options,
-        billing_periods: PRICING_METADATA.billing_periods,
-        last_updated: new Date().toISOString(),
-      },
+      plans,
+      metadata,
       timestamp: new Date().toISOString(),
     });
 
@@ -494,7 +479,246 @@ export const getPricingPlans = async (req: Request, res: Response): Promise<void
       success: false,
       error: 'Failed to get pricing plans',
       code: 'SERVER_ERROR',
-      message: 'Failed to get pricing plans',
+      message: 'Failed to get pricing plans from database',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * GET /api/v1/user/plan
+ * Get current user's plan information with credit usage
+ */
+export const getUserPlan = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.headers['x-user-id'] as string;
+
+    if (!userId || !isValidUUID(userId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid user ID',
+        code: 'INVALID_USER_ID',
+        message: 'Valid user ID is required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    logger.info('[USER_PLAN] Getting user plan info', {
+      userId: userId.substring(0, 8) + '...',
+    });
+
+    const planInfo = await PricingPlansService.getUserPlanInfo(userId);
+
+    if (!planInfo) {
+      res.status(404).json({
+        success: false,
+        error: 'User plan not found',
+        code: 'PLAN_NOT_FOUND',
+        message: 'User does not have an assigned plan',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      plan: {
+        id: planInfo.plan.slug,
+        name: planInfo.plan.name,
+        description: planInfo.plan.description,
+        price: planInfo.plan.price,
+        features: planInfo.plan.features,
+        limitations: planInfo.plan.limitations,
+        credits_per_month: planInfo.plan.credits_per_month,
+        credits_per_day: planInfo.plan.credits_per_day,
+        plan_started_at: planInfo.plan_started_at,
+      },
+      usage: {
+        credits_used_today: planInfo.credits_used_today,
+        credits_used_this_month: planInfo.credits_used_this_month,
+        daily_remaining: planInfo.daily_remaining,
+        monthly_remaining: planInfo.monthly_remaining,
+        last_reset_date: planInfo.last_credit_reset_date,
+        monthly_reset_date: planInfo.monthly_reset_date,
+      },
+      timestamp: new Date().toISOString(),
+    });
+
+  } catch (error) {
+    logger.error('[USER_PLAN] Error getting user plan', { error });
+
+    if (res.headersSent) {
+      logger.warn('[USER_CONTROLLER] Response already sent, cannot send error response');
+      return;
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get user plan',
+      code: 'SERVER_ERROR',
+      message: 'Failed to get user plan information',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * POST /api/v1/user/plan/assign
+ * Assign a plan to user (admin only)
+ */
+export const assignUserPlan = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const adminUserId = req.headers['x-user-id'] as string;
+    const { user_id, plan_slug } = req.body;
+
+    // Validate admin
+    if (!adminUserId || !isValidUUID(adminUserId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid admin user ID',
+        code: 'INVALID_ADMIN_ID',
+        message: 'Valid admin user ID is required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const isAdminUser = await isAdmin(adminUserId);
+    if (!isAdminUser) {
+      res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        code: 'ACCESS_DENIED',
+        message: 'Admin access required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate inputs
+    if (!user_id || !isValidUUID(user_id)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid user ID',
+        code: 'INVALID_USER_ID',
+        message: 'Valid user ID is required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!plan_slug || !['free', 'pro', 'team'].includes(plan_slug)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid plan slug',
+        code: 'INVALID_PLAN_SLUG',
+        message: 'Plan slug must be one of: free, pro, team',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    logger.info('[USER_PLAN] Assigning plan to user', {
+      adminUserId: adminUserId.substring(0, 8) + '...',
+      userId: user_id.substring(0, 8) + '...',
+      planSlug: plan_slug,
+    });
+
+    const success = await PricingPlansService.assignPlanToUser(user_id, plan_slug);
+
+    if (!success) {
+      res.status(400).json({
+        success: false,
+        error: 'Failed to assign plan',
+        code: 'PLAN_ASSIGNMENT_FAILED',
+        message: 'Could not assign plan to user',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: 'Plan assigned successfully',
+      user_id,
+      plan_slug,
+      timestamp: new Date().toISOString(),
+    });
+
+  } catch (error) {
+    logger.error('[USER_PLAN] Error assigning user plan', { error });
+
+    if (res.headersSent) {
+      logger.warn('[USER_CONTROLLER] Response already sent, cannot send error response');
+      return;
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to assign plan',
+      code: 'SERVER_ERROR',
+      message: 'Failed to assign plan to user',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * POST /api/v1/user/credits/check
+ * Check if user can use specified amount of credits
+ */
+export const checkUserCredits = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.headers['x-user-id'] as string;
+    const { credits_amount = 1 } = req.body;
+
+    if (!userId || !isValidUUID(userId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid user ID',
+        code: 'INVALID_USER_ID',
+        message: 'Valid user ID is required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!Number.isInteger(credits_amount) || credits_amount < 1) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid credits amount',
+        code: 'INVALID_CREDITS_AMOUNT',
+        message: 'Credits amount must be a positive integer',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const result = await PricingPlansService.checkUserCredits(userId, credits_amount);
+
+    res.json({
+      success: true,
+      can_use_credits: result.can_use_credits,
+      reason: result.reason,
+      daily_remaining: result.daily_remaining,
+      monthly_remaining: result.monthly_remaining,
+      timestamp: new Date().toISOString(),
+    });
+
+  } catch (error) {
+    logger.error('[USER_CREDITS] Error checking user credits', { error });
+
+    if (res.headersSent) {
+      logger.warn('[USER_CONTROLLER] Response already sent, cannot send error response');
+      return;
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to check credits',
+      code: 'SERVER_ERROR',
+      message: 'Failed to check user credits',
       timestamp: new Date().toISOString(),
     });
   }
