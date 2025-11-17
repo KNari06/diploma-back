@@ -1,5 +1,5 @@
--- Cleanup Team Plan options - remove 1000 credits option if exists
--- This ensures Team plan only has: 5000, 10000, 15000, 25000 credits
+-- Cleanup Team Plan options - ensure 1000 credits option exists with correct price
+-- This ensures Team plan has: 1000, 5000, 10000, 15000, 25000 credits
 
 DO $$
 DECLARE
@@ -15,19 +15,19 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Delete any team plan options with 1000 credits
-    DELETE FROM team_plan_options
-    WHERE plan_id = team_plan_id AND credits = 1000;
+    -- Update or insert 1000 credits option with correct price ($50)
+    INSERT INTO team_plan_options (plan_id, credits, price, price_per_credit, is_default, description, savings)
+    VALUES (team_plan_id, 1000, 50.00, 0.050, false, '1,000 credits - Starter', 0)
+    ON CONFLICT (plan_id, credits) DO UPDATE
+    SET
+        price = 50.00,
+        price_per_credit = 0.050,
+        description = '1,000 credits - Starter',
+        savings = 0;
 
-    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    RAISE NOTICE '1000 credits option updated/inserted with price $50';
 
-    IF deleted_count > 0 THEN
-        RAISE NOTICE 'Deleted % team plan option(s) with 1000 credits', deleted_count;
-    ELSE
-        RAISE NOTICE 'No team plan options with 1000 credits found.';
-    END IF;
-
-    -- Verify final state - should only have: 5000, 10000, 15000, 25000
+    -- Verify final state - should have: 1000, 5000, 10000, 15000, 25000
     RAISE NOTICE 'Current Team plan options:';
     FOR rec IN
         SELECT credits, price, description

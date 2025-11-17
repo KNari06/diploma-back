@@ -398,6 +398,15 @@ export class PricingPlansService {
         limitations: plan.limitations,
         credit_options: plan.slug === 'team' ? [
           {
+            credits: 1000,
+            price: 50,
+            price_per_credit: 0.050,
+            is_default: false,
+            billing_period: 'monthly',
+            description: '1,000 credits - Starter',
+            savings: 0,
+          },
+          {
             credits: 5000,
             price: 159,
             price_per_credit: 0.032,
