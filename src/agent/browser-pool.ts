@@ -7,7 +7,6 @@ import { BrowserType } from '@/types';
  */
 class BrowserPool {
   private browsers: Map<BrowserType, Browser> = new Map();
-  private initialized = false;
 
   /**
    * Get or create browser instance
@@ -73,7 +72,6 @@ class BrowserPool {
     }
 
     this.browsers.clear();
-    this.initialized = false;
   }
 
   /**

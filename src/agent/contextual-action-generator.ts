@@ -320,7 +320,28 @@ export class ContextualActionGenerator {
       }
 
       // Validate action type
-      const validActions = ['goto', 'click', 'fill', 'select', 'wait', 'scroll', 'press', 'hover'];
+      const validActions = [
+        'goto',
+        'click',
+        'fill',
+        'type',
+        'select',
+        'check',
+        'uncheck',
+        'hover',
+        'press',
+        'wait',
+        'waitForSelector',
+        'waitForNavigation',
+        'scroll',
+        'assertVisible',
+        'assertText',
+        'assertValue',
+        'assertUrl',
+        'assertCount',
+        'extract',
+        'screenshot',
+      ];
       if (!validActions.includes(action.action)) {
         logger.warn('[ACTION_GENERATOR] Invalid action type', { action: action.action });
         continue;

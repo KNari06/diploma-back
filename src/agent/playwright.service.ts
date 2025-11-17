@@ -1,6 +1,6 @@
 import { TestJobData } from '@/types';
 import { logger } from '@/utils/logger';
-import { devices, Page } from 'playwright';
+import { devices, Page, BrowserContext, BrowserContextOptions } from 'playwright';
 import { browserPool } from './browser-pool';
 import { CommandExecutor } from './command-executor';
 import { IntelligentTestOrchestrator } from './intelligent-test-orchestrator';
@@ -29,7 +29,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   error?: string;
 }> {
   let page: Page | null = null;
-  let context: any = null;
+  let context: BrowserContext | null = null;
   let videoPath: string | undefined;
   let tracePath: string | undefined;
   const collector = new ResultCollector();
@@ -80,7 +80,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     await fs.mkdir(tracesDir, { recursive: true });
 
     // Create context with options
-    const contextOptions: any = {
+    const contextOptions: BrowserContextOptions = {
       viewport: testData.options?.viewport || { width: 1920, height: 1080 },
       userAgent: testData.options?.headers?.['User-Agent'] || undefined,
       // ✅ NEW: Enable video recording
@@ -332,19 +332,38 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     const results = await collector.collect(page, true);
 
     // ✅ NEW: Stop tracing before closing
-    await context.tracing.stop({ path: tracePath });
-    logger.info('[PLAYWRIGHT] Trace saved', { tracePath });
-
-    // ✅ NEW: Get video path before closing page
-    const video = page.video();
-    await page.close();
-
-    if (video) {
-      videoPath = await video.path();
-      logger.info('[PLAYWRIGHT] Video saved', { videoPath });
+    if (context && tracePath) {
+      try {
+        await context.tracing.stop({ path: tracePath });
+        logger.info('[PLAYWRIGHT] Trace saved', { tracePath });
+      } catch (traceError) {
+        logger.warn('[PLAYWRIGHT] Failed to stop tracing', { error: traceError });
+      }
     }
 
-    await context.close();
+    // ✅ NEW: Get video path before closing page
+    if (page) {
+      try {
+        const video = page.video();
+        await page.close();
+
+        if (video) {
+          videoPath = await video.path();
+          logger.info('[PLAYWRIGHT] Video saved', { videoPath });
+        }
+      } catch (pageError) {
+        logger.warn('[PLAYWRIGHT] Failed to close page', { error: pageError });
+      }
+    }
+
+    // Close context
+    if (context) {
+      try {
+        await context.close();
+      } catch (contextError) {
+        logger.warn('[PLAYWRIGHT] Failed to close context', { error: contextError });
+      }
+    }
 
     // ✅ NEW: Upload video & trace to Supabase Storage
     let videoUrl: string | undefined;
@@ -401,7 +420,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       error,
     });
 
-    // Try to collect partial results
+    // Try to collect partial results and cleanup
     let partialResults = null;
     if (page) {
       try {
@@ -409,6 +428,21 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         await page.close();
       } catch (cleanupError) {
         logger.error('Failed to collect partial results', { error: cleanupError });
+      }
+    }
+
+    // Cleanup context if it exists
+    if (context) {
+      try {
+        // Stop tracing if it was started
+        if (tracePath) {
+          await context.tracing.stop({ path: tracePath }).catch(() => {
+            // Ignore errors when stopping trace in error scenario
+          });
+        }
+        await context.close();
+      } catch (contextError) {
+        logger.error('Failed to close context during error cleanup', { error: contextError });
       }
     }
 

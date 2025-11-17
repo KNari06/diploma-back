@@ -3,8 +3,8 @@
  * Helper class for emitting real-time test progress via WebSocket
  */
 
-import { webSocketService } from '@/websocket/websocket.service';
 import { logger } from '@/utils/logger';
+import { webSocketService } from '@/websocket/websocket.service';
 
 interface EmitParams {
   progress: number; // 0-100
@@ -53,20 +53,35 @@ export class TestProgressEmitter {
    */
   emit(params: EmitParams): void {
     try {
+      // Validate progress value
+      const progress = Math.max(0, Math.min(100, params.progress));
+
       const elapsedTime = Date.now() - this.startTime;
 
       // Calculate estimated remaining time based on current progress
       // Formula: if we're at X%, and it took Y ms, then 100% will take (Y / X) * 100 ms
       // Remaining = Total - Elapsed
-      const estimatedTotal =
-        params.progress > 0 ? (elapsedTime / params.progress) * 100 : 30000; // Default 30s if progress is 0
+      let estimatedTotal: number;
+      let estimatedRemaining: number;
 
-      const estimatedRemaining = Math.max(0, estimatedTotal - elapsedTime);
+      if (progress === 0) {
+        // At start, use default estimate
+        estimatedTotal = 30000; // 30 seconds default
+        estimatedRemaining = estimatedTotal;
+      } else if (progress >= 100) {
+        // At completion, no time remaining
+        estimatedTotal = elapsedTime;
+        estimatedRemaining = 0;
+      } else {
+        // Calculate based on current progress
+        estimatedTotal = (elapsedTime / progress) * 100;
+        estimatedRemaining = Math.max(0, estimatedTotal - elapsedTime);
+      }
 
       webSocketService.emitTestProgress(this.testId, {
         testId: this.testId,
         browser: this.browser,
-        progress: params.progress,
+        progress,
         phase: params.phase,
         currentStep: params.currentStep,
         action: params.action,
@@ -80,7 +95,7 @@ export class TestProgressEmitter {
 
       // Log key milestones (phase transitions and completion)
       const isKeyMilestone =
-        params.progress === 100 ||
+        progress === 100 ||
         params.status === 'completed' ||
         params.status === 'failed' ||
         params.phase !== this.lastLoggedPhase;
@@ -88,7 +103,7 @@ export class TestProgressEmitter {
       if (isKeyMilestone) {
         logger.info('[PROGRESS] Test milestone', {
           testId: this.testId,
-          progress: params.progress,
+          progress,
           phase: params.phase,
           status: params.status,
           elapsed: `${Math.round(elapsedTime / 1000)}s`,

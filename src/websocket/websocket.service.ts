@@ -8,6 +8,7 @@ import { getIO, isWebSocketInitialized } from './server';
 import {
   createRoomName,
   RoomType,
+  ServerToClientEvents,
   TestCreatedPayload,
   TestStartedPayload,
   TestProgressPayload,
@@ -66,7 +67,7 @@ class WebSocketService {
    */
   public emitToUser(
     userId: string,
-    event: string,
+    event: keyof ServerToClientEvents,
     data: any
   ): void {
     if (!this.isReady()) return;
@@ -84,7 +85,7 @@ class WebSocketService {
 
     try {
       const room = createRoomName('user', userId.trim());
-      getIO().to(room).emit(event.trim(), data);
+      getIO().to(room).emit(event, data);
 
       logger.debug('[WebSocketService] Emitted to user', {
         userId,
@@ -106,7 +107,7 @@ class WebSocketService {
    */
   public emitToTest(
     testId: string,
-    event: string,
+    event: keyof ServerToClientEvents,
     data: any
   ): void {
     if (!this.isReady()) return;
@@ -124,7 +125,7 @@ class WebSocketService {
 
     try {
       const room = createRoomName('test', testId.trim());
-      getIO().to(room).emit(event.trim(), data);
+      getIO().to(room).emit(event, data);
 
       logger.debug('[WebSocketService] Emitted to test', {
         testId,
@@ -146,7 +147,7 @@ class WebSocketService {
    */
   public emitToChat(
     sessionId: string,
-    event: string,
+    event: keyof ServerToClientEvents,
     data: any
   ): void {
     if (!this.isReady()) return;
@@ -164,7 +165,7 @@ class WebSocketService {
 
     try {
       const room = createRoomName('chat', sessionId.trim());
-      getIO().to(room).emit(event.trim(), data);
+      getIO().to(room).emit(event, data);
 
       logger.debug('[WebSocketService] Emitted to chat', {
         sessionId,
@@ -187,7 +188,7 @@ class WebSocketService {
   public emitToRoom(
     roomType: RoomType,
     roomId: string,
-    event: string,
+    event: keyof ServerToClientEvents,
     data: any
   ): void {
     if (!this.isReady()) return;
@@ -210,7 +211,7 @@ class WebSocketService {
 
     try {
       const room = createRoomName(roomType, roomId.trim());
-      getIO().to(room).emit(event.trim(), data);
+      getIO().to(room).emit(event, data);
 
       logger.debug('[WebSocketService] Emitted to room', {
         roomType,
@@ -233,7 +234,7 @@ class WebSocketService {
    * Broadcast to all connected clients
    */
   public broadcast(
-    event: string,
+    event: keyof ServerToClientEvents,
     data: any
   ): void {
     if (!this.isReady()) return;
@@ -245,7 +246,7 @@ class WebSocketService {
     }
 
     try {
-      getIO().emit(event.trim(), data);
+      getIO().emit(event, data);
 
       logger.debug('[WebSocketService] Broadcasted to all', {
         event,

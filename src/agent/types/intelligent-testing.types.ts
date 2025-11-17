@@ -129,12 +129,16 @@ export interface DynamicAction {
     // Wait & Scroll
     | 'wait'            // Wait for timeout
     | 'waitForSelector' // Wait for element to appear
+    | 'waitForNavigation' // Wait for page navigation/load
     | 'scroll'          // Scroll page/element
     // Assertions (for validation)
     | 'assertVisible'   // Assert element is visible
     | 'assertText'      // Assert element contains text
     | 'assertValue'     // Assert input has value
     | 'assertUrl'       // Assert current URL matches
+    | 'assertCount'     // Assert number of elements matches
+    // Data extraction (for intelligent testing)
+    | 'extract'         // Extract data from element
     // Screenshots (for analysis)
     | 'screenshot';     // Take screenshot for AI analysis
   selector?: string;
@@ -145,6 +149,17 @@ export interface DynamicAction {
   timeout?: number;
   optional?: boolean; // Can skip if fails
   retry?: number; // Max retry attempts
+  // Extract config (for extract action)
+  extract?: {
+    name: string; // Variable name to store extracted value
+    attribute?: string; // Attribute to extract (e.g., 'href', 'src')
+    property?: 'text' | 'value' | 'innerHTML'; // Property to extract
+  };
+  // Assertion config (for assert actions)
+  assertion?: {
+    expected: string | number;
+    operator?: '=' | '!=' | '>' | '<' | 'contains' | 'startsWith' | 'endsWith';
+  };
 }
 
 /**

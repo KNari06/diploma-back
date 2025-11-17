@@ -4,24 +4,24 @@
  * Manages: analyze → understand → generate → execute → validate → decide → repeat
  */
 
-import { Page, Browser } from 'playwright';
 import { logger } from '@/utils/logger';
 import { webSocketService } from '@/websocket/websocket.service';
+import { Browser, Page } from 'playwright';
+import { CommandExecutor } from './command-executor';
+import { ContextualActionGenerator } from './contextual-action-generator';
+import { IntelligentPageAnalyzer } from './intelligent-page-analyzer';
+import { ResultValidator } from './result-validator';
+import { SafetyGuard } from './safety-guard';
+import { StateTracker } from './state-tracker';
 import {
+  ActionResult,
+  DynamicAction,
   IntelligentTestConfig,
   IntelligentTestResult,
-  TestState,
   PageContext,
-  DynamicAction,
-  ActionResult,
   PageVisit,
+  TestState,
 } from './types/intelligent-testing.types';
-import { IntelligentPageAnalyzer } from './intelligent-page-analyzer';
-import { ContextualActionGenerator } from './contextual-action-generator';
-import { SafetyGuard, DEFAULT_SAFETY_CONFIG } from './safety-guard';
-import { StateTracker } from './state-tracker';
-import { ResultValidator } from './result-validator';
-import { CommandExecutor } from './command-executor';
 import { TestProgressEmitter } from './utils/progress-emitter';
 
 // AI cost estimation (updated with accurate pricing Nov 2024)
@@ -450,6 +450,8 @@ export class IntelligentTestOrchestrator {
           url: action.url,
           timeout: action.timeout,
           description: action.description,
+          extract: action.extract,
+          assertion: action.assertion,
         });
 
         await this.page.waitForTimeout(500); // Small delay for page to settle
@@ -475,8 +477,8 @@ export class IntelligentTestOrchestrator {
           this.page
         );
 
-        const validationPassed = typeof validation === 'boolean' ? validation : validation.passed;
-        const validationMessage = typeof validation === 'boolean' ? undefined : (validation.message || (!validation.passed ? 'Validation failed' : undefined));
+        const validationPassed = validation.passed;
+        const validationMessage = validation.message || (!validation.passed ? 'Validation failed' : undefined);
 
         const actionResult: ActionResult = {
           action,
@@ -618,7 +620,7 @@ export class IntelligentTestOrchestrator {
     }
 
     try {
-      webSocketService.emitToUser(this.userId, 'test_progress', {
+      webSocketService.emitToUser(this.userId, 'test:progress', {
         testId: this.testId,
         event,
         data,
