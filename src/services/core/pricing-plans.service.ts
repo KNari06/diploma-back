@@ -383,9 +383,23 @@ export class PricingPlansService {
           .order('credits', { ascending: true });
 
         if (error) {
-          logger.error('[PRICING_PLANS] Error getting pro plan options', { error: error.message });
+          logger.error('[PRICING_PLANS] Error getting pro plan options', {
+            error: error.message,
+            planId,
+            planSlug,
+          });
           return [];
         }
+
+        if (!data || data.length === 0) {
+          logger.warn('[PRICING_PLANS] No pro plan options found in database', { planId });
+          return [];
+        }
+
+        logger.info('[PRICING_PLANS] Found pro plan options', {
+          count: data.length,
+          planId,
+        });
 
         return (data || []).map(opt => ({
           credits: opt.credits,
