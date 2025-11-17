@@ -371,6 +371,68 @@ export class PricingPlansService {
   }
 
   /**
+   * Get credit options for a plan from database
+   */
+  private static async getPlanCreditOptions(planId: string, planSlug: string): Promise<any[]> {
+    try {
+      if (planSlug === 'pro') {
+        const { data, error } = await supabaseAdmin
+          .from('pro_plan_options')
+          .select('*')
+          .eq('plan_id', planId)
+          .order('credits', { ascending: true });
+
+        if (error) {
+          logger.error('[PRICING_PLANS] Error getting pro plan options', { error: error.message });
+          return [];
+        }
+
+        return (data || []).map(opt => ({
+          credits: opt.credits,
+          price: Number(opt.price),
+          price_per_credit: Number(opt.price_per_credit),
+          is_default: opt.is_default,
+          billing_period: 'monthly',
+          description: opt.description,
+          savings: opt.savings || 0,
+        }));
+      }
+
+      if (planSlug === 'team') {
+        const { data, error } = await supabaseAdmin
+          .from('team_plan_options')
+          .select('*')
+          .eq('plan_id', planId)
+          .order('credits', { ascending: true });
+
+        if (error) {
+          logger.error('[PRICING_PLANS] Error getting team plan options', { error: error.message });
+          return [];
+        }
+
+        return (data || []).map(opt => ({
+          credits: opt.credits,
+          price: Number(opt.price),
+          price_per_credit: Number(opt.price_per_credit),
+          is_default: opt.is_default,
+          billing_period: 'monthly',
+          description: opt.description,
+          savings: opt.savings || 0,
+        }));
+      }
+
+      return [];
+    } catch (error) {
+      logger.error('[PRICING_PLANS] Exception in getPlanCreditOptions', {
+        error: error instanceof Error ? error.message : String(error),
+        planId,
+        planSlug,
+      });
+      return [];
+    }
+  }
+
+  /**
    * Get pricing plans formatted for API response (similar to old format)
    */
   static async getPlansForAPI(): Promise<{
@@ -386,77 +448,43 @@ export class PricingPlansService {
       const plans = await this.getAllPlans();
 
       // Transform to API format
-      const formattedPlans = plans.map(plan => ({
-        id: plan.slug,
-        name: plan.name,
-        description: plan.description,
-        type: plan.slug === 'free' ? 'free' : (plan.slug === 'team' ? 'custom' : 'paid'),
-        popular: plan.slug === 'pro',
-        discount: 0,
-        currency: 'USD',
-        features: plan.features,
-        limitations: plan.limitations,
-        credit_options: plan.slug === 'team' ? [
-          {
-            credits: 1000,
-            price: 50,
-            price_per_credit: 0.050,
-            is_default: false,
-            billing_period: 'monthly',
-            description: '1,000 credits - Starter',
-            savings: 0,
-          },
-          {
-            credits: 5000,
-            price: 159,
-            price_per_credit: 0.032,
+      const formattedPlans = await Promise.all(plans.map(async plan => {
+        // Get credit options from database for pro and team plans
+        let creditOptions: any[];
+
+        if (plan.slug === 'pro' || plan.slug === 'team') {
+          creditOptions = await this.getPlanCreditOptions(plan.id, plan.slug);
+        } else {
+          // For free plan, use default option
+          creditOptions = [{
+            credits: plan.credits_per_month,
+            price: plan.price || 0,
+            price_per_credit: plan.price && plan.credits_per_month > 0
+              ? Math.round((plan.price / plan.credits_per_month) * 1000) / 1000
+              : 0,
             is_default: true,
             billing_period: 'monthly',
-            description: '5,000 credits - Team starter',
-            savings: 20,
-          },
-          {
-            credits: 10000,
-            price: 299,
-            price_per_credit: 0.030,
-            is_default: false,
-            billing_period: 'monthly',
-            description: '10,000 credits - Team standard',
-            savings: 25,
-          },
-          {
-            credits: 15000,
-            price: 399,
-            price_per_credit: 0.027,
-            is_default: false,
-            billing_period: 'monthly',
-            description: '15,000 credits - Team premium',
-            savings: 35,
-          },
-          {
-            credits: 25000,
-            price: 599,
-            price_per_credit: 0.024,
-            is_default: false,
-            billing_period: 'monthly',
-            description: '25,000 credits - Enterprise ready',
-            savings: 45,
-          },
-        ] : [{
-          credits: plan.credits_per_month,
-          price: plan.price || 0,
-          price_per_credit: plan.price && plan.credits_per_month > 0
-            ? Math.round((plan.price / plan.credits_per_month) * 1000) / 1000
-            : 0,
-          is_default: true,
-          billing_period: 'monthly',
-          description: plan.credits_per_month === -1
-            ? 'Unlimited credits'
-            : `${plan.credits_per_month} credits monthly${plan.credits_per_day ? ` (${plan.credits_per_day} per day)` : ''}`,
-          savings: 0,
-        }],
-        contact_required: false,
-        contact_info: undefined,
+            description: plan.credits_per_month === -1
+              ? 'Unlimited credits'
+              : `${plan.credits_per_month} credits monthly${plan.credits_per_day ? ` (${plan.credits_per_day} per day)` : ''}`,
+            savings: 0,
+          }];
+        }
+
+        return {
+          id: plan.slug,
+          name: plan.name,
+          description: plan.description,
+          type: plan.slug === 'free' ? 'free' : (plan.slug === 'team' ? 'custom' : 'paid'),
+          popular: plan.slug === 'pro',
+          discount: 0,
+          currency: 'USD',
+          features: plan.features,
+          limitations: plan.limitations,
+          credit_options: creditOptions,
+          contact_required: false,
+          contact_info: undefined,
+        };
       }));
 
       return {
