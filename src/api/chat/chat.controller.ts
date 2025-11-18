@@ -1600,10 +1600,42 @@ Use this knowledge to provide more accurate and helpful responses.`,
   // STEP 3: GET AI RESPONSE
   // ═══════════════════════════════════════════════════════════════════════
 
-  const gptResponse = await getChatCompletionWithMessages(messages, {
-    temperature: 0.5,
-    max_tokens: 1000,
-  });
+  let gptResponse: { content: string; usage?: any };
+  try {
+    gptResponse = await getChatCompletionWithMessages(messages, {
+      temperature: 0.5,
+      max_tokens: 1000,
+    });
+  } catch (openaiError: any) {
+    // Fallback response if OpenAI fails
+    logger.error('[GENERAL_CHAT] OpenAI API failed, using fallback response', {
+      error: openaiError instanceof Error ? openaiError.message : String(openaiError),
+      status: openaiError?.status,
+      code: openaiError?.code,
+      userId,
+    });
+
+    // Provide helpful fallback message based on error type
+    let fallbackMessage = 'I apologize, but I\'m currently experiencing technical difficulties. Please try again in a few moments.';
+
+    if (openaiError?.status === 401 || openaiError?.code === 'invalid_api_key') {
+      fallbackMessage = 'I\'m temporarily unavailable due to a configuration issue. Our team has been notified.';
+    } else if (openaiError?.status === 429 || openaiError?.code === 'insufficient_quota') {
+      fallbackMessage = 'I\'m temporarily unavailable due to high demand. Please try again in a few minutes.';
+    } else if (openaiError?.message?.includes('timeout')) {
+      fallbackMessage = 'The request took too long to process. Please try again with a shorter message.';
+    }
+
+    gptResponse = {
+      content: fallbackMessage,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        model: 'fallback',
+      },
+    };
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 4: SAVE MESSAGES

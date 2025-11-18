@@ -750,10 +750,15 @@ async function makeOpenAICall(
     });
 
     return text;
-  } catch (openaiError) {
+  } catch (openaiError: any) {
     logger.error('[INTENT_PARSER] OpenAI API call failed', {
-      error: openaiError instanceof Error ? openaiError.message : String(openaiError),
+      message: openaiError instanceof Error ? openaiError.message : String(openaiError),
       model,
+      status: openaiError?.status,
+      code: openaiError?.code,
+      type: openaiError?.type,
+      error: openaiError?.error?.message || openaiError?.error,
+      stack: openaiError instanceof Error ? openaiError.stack : undefined,
     });
     throw openaiError;
   }
@@ -1062,8 +1067,14 @@ function handleParsingError(
   const errorStack = error instanceof Error ? error.stack : undefined;
   const errorName = error instanceof Error ? error.name : 'UnknownError';
 
+  // Extract OpenAI-specific error details
+  const openaiError = error as any;
+  const openaiStatus = openaiError?.status;
+  const openaiCode = openaiError?.code;
+  const openaiType = openaiError?.type;
+
   // Categorize error type for better analysis
-  const errorCategory = categorizeError(errorMessage, errorName);
+  const errorCategory = categorizeError(errorMessage, errorName, openaiStatus, openaiCode);
 
   // Build comprehensive error context
   const errorContext = {
@@ -1072,6 +1083,10 @@ function handleParsingError(
     errorName,
     errorCategory,
     errorStack,
+    // OpenAI-specific fields
+    openaiStatus,
+    openaiCode,
+    openaiType,
 
     // Message context
     message: message,
@@ -1099,13 +1114,16 @@ function handleParsingError(
 
   // Log with appropriate level based on error category
   if (errorCategory === 'critical' || errorCategory === 'openai_api_error') {
-    logger.error('[INTENT_PARSER] ❌ CRITICAL ERROR - Intent parsing failed', errorContext);
+    // For OpenAI errors, show critical info upfront
+    const statusInfo = openaiStatus ? ` [HTTP ${openaiStatus}]` : '';
+    const codeInfo = openaiCode ? ` [Code: ${openaiCode}]` : '';
+    logger.error(`[INTENT_PARSER] ❌ OpenAI API Error${statusInfo}${codeInfo}: ${errorMessage}`, errorContext);
   } else if (errorCategory === 'timeout') {
     logger.warn('[INTENT_PARSER] ⏱️ TIMEOUT - Intent parsing timed out', errorContext);
   } else if (errorCategory === 'json_parse_error') {
     logger.warn('[INTENT_PARSER] 📝 JSON PARSE ERROR - Failed to parse GPT response', errorContext);
   } else {
-    logger.warn('[INTENT_PARSER] ⚠️ Intent parsing failed (will fallback to general_chat)', errorContext);
+    logger.warn(`[INTENT_PARSER] ⚠️ Intent parsing failed (will fallback to general_chat): ${message.substring(0, 50)}`, errorContext);
   }
 
   // Track error metrics for monitoring
@@ -1120,11 +1138,19 @@ function handleParsingError(
 /**
  * Categorize error type for better tracking and analysis
  */
-function categorizeError(errorMessage: string, errorName: string): string {
+function categorizeError(errorMessage: string, errorName: string, status?: number, code?: string): string {
   const lowerError = errorMessage.toLowerCase();
 
-  // OpenAI API errors
-  if (lowerError.includes('api') && (lowerError.includes('openai') || lowerError.includes('rate limit'))) {
+  // OpenAI API errors (check status codes and error codes)
+  if (
+    status || // Any HTTP status code indicates API error
+    code || // OpenAI error codes like 'insufficient_quota', 'invalid_api_key'
+    lowerError.includes('openai') ||
+    lowerError.includes('rate limit') ||
+    lowerError.includes('api key') ||
+    lowerError.includes('quota') ||
+    lowerError.includes('insufficient_quota')
+  ) {
     return 'openai_api_error';
   }
 
