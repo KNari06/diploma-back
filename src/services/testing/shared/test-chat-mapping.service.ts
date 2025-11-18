@@ -17,22 +17,44 @@ export class TestChatMappingService {
     try {
       const { testId, chatSessionId, userId } = params;
 
-      const { error } = await supabaseAdmin.from('test_chat_mappings').insert({
-        test_id: testId,
-        chat_session_id: chatSessionId,
-        user_id: userId,
-      });
+      // Use UPSERT to handle duplicate mappings gracefully
+      // This prevents errors when the same test-chat combination is saved multiple times
+      const { error } = await supabaseAdmin
+        .from('test_chat_mappings')
+        .upsert({
+          test_id: testId,
+          chat_session_id: chatSessionId,
+          user_id: userId,
+          updated_at: new Date().toISOString(), // Update timestamp on conflict
+        }, {
+          onConflict: 'test_id,chat_session_id', // Specify conflict columns
+          ignoreDuplicates: false, // Update on conflict instead of ignoring
+        });
 
       if (error) {
-        logger.error('[TEST_CHAT_MAPPING] Failed to save mapping', { error, params });
+        logger.error('[TEST_CHAT_MAPPING] Failed to save mapping', {
+          error: {
+            message: error.message,
+            code: error.code,
+            details: error.details,
+            hint: error.hint,
+          },
+          params
+        });
         return { success: false, error: error.message };
       }
 
-      logger.info('[TEST_CHAT_MAPPING] Mapping saved', { testId, chatSessionId });
+      logger.info('[TEST_CHAT_MAPPING] Mapping saved/updated', { testId, chatSessionId });
       return { success: true };
     } catch (error: any) {
-      logger.error('[TEST_CHAT_MAPPING] Unexpected error', { error, params });
-      return { success: false, error: error.message };
+      logger.error('[TEST_CHAT_MAPPING] Unexpected error', {
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        },
+        params
+      });
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
 
