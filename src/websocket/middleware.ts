@@ -24,10 +24,12 @@ export const authenticateSocket = async (
 
     // Validate token exists and is a string
     if (!token || typeof token !== 'string' || token.trim().length === 0) {
-      logger.debug('[WebSocket] No token provided', {
+      logger.warn('[WebSocket] No token provided', {
         socketId: socket.id,
         hasAuthToken: !!authToken,
         hasQueryToken: !!queryToken,
+        origin: socket.handshake.headers?.origin,
+        userAgent: socket.handshake.headers?.['user-agent'],
       });
       return next(new Error('Authentication required'));
     }
@@ -41,8 +43,9 @@ export const authenticateSocket = async (
     const user = await AuthService.verifyToken(token.trim());
 
     if (!user) {
-      logger.debug('[WebSocket] Invalid token', {
+      logger.warn('[WebSocket] Invalid token', {
         socketId: socket.id,
+        tokenLength: token.length,
       });
       return next(new Error('Authentication failed'));
     }
@@ -72,11 +75,12 @@ export const authenticateSocket = async (
 
     next();
   } catch (error) {
-    // Log as debug to avoid noise - auth errors are expected
-    logger.debug('[WebSocket] Authentication error', {
+    // Log auth errors to identify issues
+    logger.warn('[WebSocket] Authentication error', {
       socketId: socket.id,
       error: error instanceof Error ? error.message : String(error),
       errorType: error instanceof Error ? error.constructor.name : typeof error,
+      origin: socket.handshake.headers?.origin,
     });
 
     // Don't crash - just reject the connection gracefully

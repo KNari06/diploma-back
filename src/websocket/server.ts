@@ -65,10 +65,20 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
 
   // Handle connection errors (transport-level errors)
   io.engine.on('connection_error', (error) => {
-    // Log transport errors but don't crash
+    // Log transport errors with full context
     logger.warn('[WebSocket] Connection error', {
-      error: error.message,
-      // Don't log full stack for connection errors
+      message: error.message || 'Unknown error',
+      code: error.code,
+      type: error.type,
+      context: error.context,
+      req: error.req ? {
+        url: error.req.url,
+        method: error.req.method,
+        headers: {
+          origin: error.req.headers?.origin,
+          'user-agent': error.req.headers?.['user-agent'],
+        },
+      } : undefined,
     });
   });
 
