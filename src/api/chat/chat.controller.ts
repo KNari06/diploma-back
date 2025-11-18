@@ -458,15 +458,18 @@ async function handlePendingTestPlanApproval(params: {
     confidence: approvalResult.confidence,
   });
 
-  // Handle unclear response
+  // Handle unclear response - if confidence is too low, continue with normal flow
+  // This allows users to ask questions or modify the plan instead of just approving/rejecting
   if (approvalResult.confidence < 0.5) {
-    await saveAndRespond(
-      chatSessionId,
-      res,
-      message,
-      MESSAGES.APPROVAL_UNCLEAR
-    );
-    return true;
+    logger.info('[CHAT] Approval detection unclear, continuing with normal chat flow', {
+      planId: pendingPlan.id,
+      message: message.substring(0, 50),
+      confidence: approvalResult.confidence,
+      reasoning: 'User message might be a question or modification request, not approval/rejection',
+    });
+    // Return false to continue with normal intent parsing flow
+    // User can still approve/reject later with clearer message
+    return false;
   }
 
   // Handle approval

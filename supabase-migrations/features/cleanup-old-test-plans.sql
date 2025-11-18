@@ -21,19 +21,18 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Delete expired plans with non-UUID IDs (old format: api_test_*, plan_*, intelligent_*)
+    -- Delete ALL plans with non-UUID IDs (old format: api_test_*, plan_*, intelligent_*)
     -- Using ~* for case-insensitive regex match (UUID can be uppercase)
+    -- Safe to delete all old format plans since new ones use UUID only
     DELETE FROM test_plans
     WHERE
-        -- Only expired plans (safe to delete)
-        (expires_at < NOW() OR status = 'expired')
-        -- AND non-UUID format (old format)
-        AND NOT (id ~* uuid_regex);
+        -- Non-UUID format (old format) - delete ALL regardless of status
+        NOT (id ~* uuid_regex);
 
     GET DIAGNOSTICS deleted_count = ROW_COUNT;
     total_deleted := total_deleted + deleted_count;
 
-    RAISE NOTICE 'Cleaned up % old test plans with non-UUID IDs', deleted_count;
+    RAISE NOTICE 'Cleaned up % old test plans with non-UUID IDs (all statuses)', deleted_count;
 
     -- Also delete very old expired plans regardless of format (older than 7 days)
     DELETE FROM test_plans
