@@ -514,7 +514,7 @@ async function findPendingTestPlan(
 ): Promise<any | null> {
   logger.info('🔍 [PENDING_PLAN_SEARCH] Starting parallel search', {
     conversationId: conversationId || 'NONE',
-    userId,
+    userId: userId.substring(0, 8) + '...',
   });
 
   // Validate conversationId format
@@ -1201,10 +1201,12 @@ async function handleApiTest(
         ]);
       }
 
+      // Note: This conversationId is just for tracking clarification, not a test plan ID
+      // So it can use timestamp, but for consistency we could use UUID too
       res.json({
         reply: clarificationMessage,
         questions,
-        conversationId: `api_clarify_${Date.now()}`,
+        conversationId: `api_clarify_${Date.now()}`, // Clarification tracking ID (not a test plan)
         needsMoreInfo: true,
         timestamp: new Date().toISOString(),
         sessionId: chatSessionId,
@@ -1244,9 +1246,21 @@ async function handleApiTest(
   const testPlan = convertApiTestPlanToTestPlan(apiTestPlan);
 
   // Save test plan to database for approval tracking
-  await saveTestPlan(testPlan, userId, project_id);
+  // Note: userId/projectId are shortened for logs (privacy + readability)
+  logger.info('[API_TEST] Saving test plan to database', {
+    planId: testPlan.id,
+    userId: userId.substring(0, 8) + '...', // First 8 chars only (privacy)
+    projectId: project_id.substring(0, 8) + '...', // First 8 chars only (privacy)
+    scope: testPlan.scope,
+    status: testPlan.status,
+  });
 
-  logger.info('[API_TEST] Test plan saved', { planId: testPlan.id });
+  const saveResult = await saveTestPlan(testPlan, userId, project_id);
+
+  logger.info('[API_TEST] Test plan save result', {
+    planId: testPlan.id,
+    success: saveResult.success,
+  });
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 5: SHOW TEST PLAN TO USER FOR APPROVAL

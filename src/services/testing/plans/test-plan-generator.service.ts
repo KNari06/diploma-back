@@ -3,6 +3,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { ExplorationResult } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/logger';
+import { randomUUID } from 'crypto';
 
 /**
  * Test plan with user confirmation
@@ -83,8 +84,8 @@ export async function generateTestPlan(
       model: response.usage.model,
     });
 
-    // Generate unique ID
-    const planId = `plan_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    // Generate unique ID - IMPORTANT: Use UUID format for database compatibility
+    const planId = randomUUID();
 
     // Create structured test plan
     const testPlan: TestPlan = {
@@ -253,8 +254,8 @@ export async function generateIntelligentTestPlan(
       scope: userRequest.scope,
     });
 
-    // Generate unique ID
-    const planId = `intelligent_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    // Generate unique ID - IMPORTANT: Use UUID format for database compatibility
+    const planId = randomUUID();
 
     // Build surface-level plan for approval
     const testPlan: TestPlan = {

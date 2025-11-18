@@ -1,6 +1,7 @@
 import { logger } from '@/utils/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { buildApiTestPlanPrompt } from '@/ai/prompts/index';
+import { randomUUID } from 'crypto';
 
 /**
  * API Test Plan interface
@@ -64,8 +65,9 @@ export class ApiTestPlanService {
       const testPlan = JSON.parse(response.content);
 
       // Validate and normalize
+      // IMPORTANT: Use UUID format for compatibility with test plan lookup
       const normalized: ApiTestPlan = {
-        id: `api_test_${Date.now()}`,
+        id: randomUUID(), // Use UUID instead of timestamp-based ID
         summary: testPlan.summary || `API Test: ${params.method} ${params.url}`,
         method: params.method,
         url: params.url,

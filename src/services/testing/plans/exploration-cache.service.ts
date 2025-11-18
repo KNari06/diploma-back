@@ -123,6 +123,14 @@ export async function saveTestPlan(
   explorationId?: string
 ): Promise<{ success: boolean }> {
   try {
+    logger.info('[SAVE_TEST_PLAN] Starting to save test plan', {
+      planId: testPlan.id,
+      userId: userId.substring(0, 8) + '...',
+      projectId: projectId.substring(0, 8) + '...',
+      scope: testPlan.scope,
+      status: testPlan.status,
+      explorationId: explorationId ? explorationId.substring(0, 8) + '...' : 'none',
+    });
     // FIX #1: Input validation
     if (!testPlan) {
       throw new Error('TestPlan is required');
@@ -211,16 +219,20 @@ export async function saveTestPlan(
         testPlanId: testPlan.id,
         userId: validUserId?.substring(0, 8) + '...',
         projectId: projectId.substring(0, 8) + '...',
+        planIdFormat: testPlan.id.includes('-') ? 'UUID' : 'INVALID_FORMAT',
+        planIdLength: testPlan.id.length,
       });
       throw new Error(`Failed to save test plan: ${error.message}`);
     }
 
-    logger.info('[SAVE_TEST_PLAN] Test plan saved successfully', {
+    logger.info('[SAVE_TEST_PLAN] ✅ Test plan saved successfully to database', {
       planId: testPlan.id,
       stepsCount: testPlan.steps.length,
       commandsCount: testPlan.commands?.length || 0,
       intelligentMode: testPlan.intelligentMode,
       estimatedDuration: testPlan.estimatedDuration,
+      scope: testPlan.scope,
+      status: 'pending_confirmation',
     });
 
     return { success: true };
