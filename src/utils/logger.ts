@@ -1,5 +1,13 @@
 import { env } from '@/config/env';
+import * as fs from 'fs';
+import * as path from 'path';
 import winston from 'winston';
+
+// Ensure logs directory exists
+const logsDir = path.join(process.cwd(), 'logs');
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
+}
 
 // Define log levels
 const levels = {
@@ -23,7 +31,7 @@ const colors = {
 winston.addColors(colors);
 
 // Define which transports the logger must use
-const transports = [
+const transports: winston.transport[] = [
   // Console transport
   new winston.transports.Console({
     format: winston.format.combine(
@@ -36,24 +44,42 @@ const transports = [
   }),
 ];
 
-// Add file transport in production
+// Add file transports in production
 if (env.NODE_ENV === 'production') {
-  const fileTransports: any[] = [
+  const fileTransports: winston.transport[] = [
+    // Errors only (critical)
     new winston.transports.File({
-      filename: 'logs/error.log',
+      filename: path.join(logsDir, 'error.log'),
       level: 'error',
+      maxsize: 10 * 1024 * 1024, // 10MB
+      maxFiles: 5, // Keep last 5 files
+      format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.errors({ stack: true }),
+        winston.format.json()
+      ),
+    }),
+    // Warnings and errors
+    new winston.transports.File({
+      filename: path.join(logsDir, 'warn.log'),
+      level: 'warn',
+      maxsize: 10 * 1024 * 1024, // 10MB
+      maxFiles: 5,
       format: winston.format.combine(
         winston.format.timestamp(),
         winston.format.json()
       ),
     }),
+    // All logs (combined)
     new winston.transports.File({
-      filename: 'logs/combined.log',
+      filename: path.join(logsDir, 'combined.log'),
+      maxsize: 20 * 1024 * 1024, // 20MB
+      maxFiles: 10, // Keep last 10 files
       format: winston.format.combine(
         winston.format.timestamp(),
         winston.format.json()
       ),
-    })
+    }),
   ];
 
   transports.push(...fileTransports);

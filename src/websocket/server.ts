@@ -74,9 +74,8 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
 
   // Handle connections
   io.on('connection', (socket) => {
-    try {
-      handleConnection(socket);
-    } catch (error) {
+    // Handle async connection handler
+    handleConnection(socket).catch((error) => {
       logger.error('[WebSocket] Error handling connection', {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
@@ -84,7 +83,7 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
       });
       // Disconnect the socket if there's an error
       socket.disconnect(true);
-    }
+    });
   });
 
   logger.info('[WebSocket] WebSocket server initialized successfully', {

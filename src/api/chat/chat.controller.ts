@@ -252,7 +252,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     emitProcessingStep(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', PROGRESS.INTENT_PARSING);
 
     // Get chat history for context
-    const chatHistory = await getChatHistoryForIntent(chatSessionId);
+    const chatHistory = await getChatHistoryForIntent(chatSessionId, userId); // SECURITY: Pass userId for verification
 
     checkRequestTimeout();
 
@@ -363,7 +363,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
  * Get chat history for intent parsing (extracted helper)
  */
 async function getChatHistoryForIntent(
-  chatSessionId: string | undefined
+  chatSessionId: string | undefined,
+  userId?: string // SECURITY: Optional userId for verification
 ): Promise<Array<{ role: string; content: string }>> {
   if (!chatSessionId) {
     return [];
@@ -372,6 +373,7 @@ async function getChatHistoryForIntent(
   try {
     const recentMessages = await ChatService.getRecentMessages(
       chatSessionId,
+      userId, // SECURITY: Pass userId for verification
       CONSTANTS.RECENT_MESSAGES_LIMIT
     );
     const chatHistory = recentMessages.map(msg => ({
@@ -411,12 +413,20 @@ async function handlePendingTestPlanApproval(params: {
 }): Promise<boolean> {
   const { req, res, message, conversationId, userId, chatSessionId, workspace_id } = params;
 
+  logger.info('🔍 [APPROVAL_CHECK] Checking for pending test plan approval', {
+    userId: userId.substring(0, 8) + '...',
+    message: message.substring(0, 50),
+    hasConversationId: !!conversationId,
+    conversationId: conversationId || 'NOT PROVIDED',
+    chatSessionId: chatSessionId?.substring(0, 8) + '...' || 'none',
+  });
+
   // Find pending test plan (parallel search for performance)
   const pendingPlan = await findPendingTestPlan(conversationId, userId);
 
   if (!pendingPlan) {
     logger.info('[CHAT] No pending test plan found', {
-      userId,
+      userId: userId.substring(0, 8) + '...',
       conversationId: conversationId || 'none',
     });
     return false; // No approval to handle
@@ -639,7 +649,7 @@ async function handlePlatformTest(
   let sessionProject = null;
   if (chatSessionId) {
       try {
-    const sessionData = await ChatService.getSessionWithProject(chatSessionId);
+    const sessionData = await ChatService.getSessionWithProject(chatSessionId, userId); // SECURITY: Pass userId for verification
     sessionProject = sessionData?.project;
 
     if (sessionProject?.settings?.main_url) {
@@ -1345,7 +1355,7 @@ async function handleGeneralChat(
     });
 
     // Get recent messages (last 20)
-    const recentMessages = await ChatService.getRecentMessages(chatSessionId, CONSTANTS.RECENT_MESSAGES_LIMIT);
+    const recentMessages = await ChatService.getRecentMessages(chatSessionId, userId, CONSTANTS.RECENT_MESSAGES_LIMIT); // SECURITY: Pass userId for verification
 
     logger.info('[GENERAL_CHAT] Retrieved recent history', {
       messageCount: recentMessages.length

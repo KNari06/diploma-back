@@ -85,11 +85,13 @@ export class ChatService {
   /**
    * Get recent chat messages for a session
    * @param sessionId - Chat session ID
+   * @param userId - User ID (for security verification)
    * @param limit - Number of messages to retrieve
    * @returns Array of chat messages in chronological order (oldest first)
    */
   static async getRecentMessages(
     sessionId: string,
+    userId?: string,
     limit: number = 20
   ): Promise<Array<{ role: 'user' | 'ai'; content: string; created_at: string; metadata?: any }>> {
     // Validate inputs
@@ -102,6 +104,24 @@ export class ChatService {
     const validLimit = Math.max(1, Math.min(100, Math.floor(limit || 20)));
 
     try {
+      // SECURITY: Verify session belongs to user if userId provided
+      if (userId) {
+        const { data: session } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('id')
+          .eq('id', sessionId)
+          .eq('user_id', userId)
+          .maybeSingle();
+
+        if (!session) {
+          logger.warn('[CHAT_SERVICE] Session access denied - not owned by user', {
+            sessionId,
+            userId: userId.substring(0, 8) + '...',
+          });
+          return [];
+        }
+      }
+
       logger.debug('[CHAT_SERVICE] Fetching recent messages', { sessionId, limit: validLimit });
 
       const { data, error } = await supabaseAdmin
@@ -268,10 +288,12 @@ export class ChatService {
   /**
    * Get chat session with project info
    * @param sessionId - Chat session ID
+   * @param userId - User ID (for security verification)
    * @returns Session with project data
    */
   static async getSessionWithProject(
-    sessionId: string
+    sessionId: string,
+    userId?: string
   ): Promise<{
     id: string;
     user_id: string;
@@ -290,7 +312,7 @@ export class ChatService {
     }
 
     try {
-      const { data, error } = await supabaseAdmin
+      let query = supabaseAdmin
         .from('chat_sessions')
         .select(`
           id,
@@ -303,8 +325,14 @@ export class ChatService {
             settings
           )
         `)
-        .eq('id', sessionId)
-        .maybeSingle();
+        .eq('id', sessionId);
+
+      // SECURITY: Filter by userId if provided
+      if (userId) {
+        query = query.eq('user_id', userId);
+      }
+
+      const { data, error } = await query.maybeSingle();
 
       if (error) {
         logger.error('[CHAT_SERVICE] Failed to get session with project', {

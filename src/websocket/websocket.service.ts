@@ -87,7 +87,7 @@ class WebSocketService {
       const room = createRoomName('user', userId.trim());
       getIO().to(room).emit(event, data);
 
-      logger.debug('[WebSocketService] Emitted to user', {
+      logger.info('[WebSocketService] Emitted to user', {
         userId,
         event,
         room,
@@ -127,7 +127,7 @@ class WebSocketService {
       const room = createRoomName('test', testId.trim());
       getIO().to(room).emit(event, data);
 
-      logger.debug('[WebSocketService] Emitted to test', {
+      logger.info('[WebSocketService] Emitted to test', {
         testId,
         event,
         room,
@@ -167,7 +167,7 @@ class WebSocketService {
       const room = createRoomName('chat', sessionId.trim());
       getIO().to(room).emit(event, data);
 
-      logger.debug('[WebSocketService] Emitted to chat', {
+      logger.info('[WebSocketService] Emitted to chat', {
         sessionId,
         event,
         room,
@@ -213,7 +213,7 @@ class WebSocketService {
       const room = createRoomName(roomType, roomId.trim());
       getIO().to(room).emit(event, data);
 
-      logger.debug('[WebSocketService] Emitted to room', {
+      logger.info('[WebSocketService] Emitted to room', {
         roomType,
         roomId,
         event,
@@ -248,7 +248,7 @@ class WebSocketService {
     try {
       getIO().emit(event, data);
 
-      logger.debug('[WebSocketService] Broadcasted to all', {
+      logger.info('[WebSocketService] Broadcasted to all', {
         event,
       });
     } catch (error) {
@@ -274,10 +274,21 @@ class WebSocketService {
   }
 
   public emitTestStarted(testId: string, payload: TestStartedPayload): void {
+    logger.info('[WebSocketService] Emitting test started', {
+      testId,
+      timestamp: payload.timestamp,
+    });
     this.emitToTest(testId, 'test:started', payload);
   }
 
   public emitTestProgress(testId: string, payload: TestProgressPayload): void {
+    logger.info('[WebSocketService] Emitting test progress', {
+      testId,
+      progress: payload.progress,
+      phase: payload.phase,
+      currentStep: payload.currentStep,
+      action: payload.action?.type,
+    });
     this.emitToTest(testId, 'test:progress', payload);
   }
 
@@ -290,10 +301,20 @@ class WebSocketService {
   }
 
   public emitTestCompleted(testId: string, payload: TestCompletedPayload): void {
+    logger.info('[WebSocketService] Emitting test completed', {
+      testId,
+      status: payload.status,
+      timestamp: payload.timestamp,
+    });
     this.emitToTest(testId, 'test:completed', payload);
   }
 
   public emitTestFailed(testId: string, payload: TestFailedPayload): void {
+    logger.error('[WebSocketService] Emitting test failed', {
+      testId,
+      error: payload.error,
+      timestamp: payload.timestamp,
+    });
     this.emitToTest(testId, 'test:failed', payload);
   }
 

@@ -7,10 +7,10 @@ import { logger } from '@/utils/logger';
 import { Socket } from 'socket.io';
 import { getUserId } from '../middleware';
 import {
-    AuthenticatedPayload,
-    ClientToServerEvents,
-    ServerToClientEvents,
-    SocketData,
+  AuthenticatedPayload,
+  ClientToServerEvents,
+  ServerToClientEvents,
+  SocketData,
 } from '../types';
 import { handleHeartbeat } from './heartbeat.handler';
 import { handleSubscriptions } from './subscription.handler';
@@ -20,7 +20,7 @@ type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, So
 /**
  * Handle new WebSocket connection
  */
-export const handleConnection = (socket: TypedSocket): void => {
+export const handleConnection = async (socket: TypedSocket): Promise<void> => {
   // Validate socket data
   if (!socket || !socket.data) {
     logger.error('[WebSocket] Invalid socket or missing socket data', {
@@ -55,9 +55,28 @@ export const handleConnection = (socket: TypedSocket): void => {
     return;
   }
 
+  // Get user email for logging
+  let userEmail: string | undefined = undefined;
+  try {
+    const { supabaseAdmin } = await import('@/db/supabase');
+    const { data: user } = await supabaseAdmin
+      .from('users')
+      .select('email')
+      .eq('id', userId)
+      .maybeSingle();
+    userEmail = user?.email;
+  } catch (emailError) {
+    // Non-critical - continue without email
+    logger.debug('[WebSocket] Failed to fetch user email', {
+      userId,
+      error: emailError instanceof Error ? emailError.message : String(emailError),
+    });
+  }
+
   logger.info('[WebSocket] New connection', {
     socketId: socket.id,
-    userId,
+    email: userEmail || 'unknown',
+    userId: userId.substring(0, 8) + '...', // Shortened for logs
   });
 
   try {
@@ -74,7 +93,7 @@ export const handleConnection = (socket: TypedSocket): void => {
     socket.join(userRoom);
     logger.info('[WebSocket] User joined personal room', {
       socketId: socket.id,
-      userId,
+      email: userEmail || 'unknown',
       room: userRoom,
     });
 
