@@ -5,6 +5,40 @@ alwaysApply: false
 
 # Проверки качества кода
 
+## Chat Message Roles (CRITICAL)
+
+### ВСЕГДА используй helper для преобразования ролей
+
+**Проблема:** OpenAI API требует 'assistant', но наша БД использует 'ai'
+
+```typescript
+import { convertRoleForOpenAI } from "@/utils/chat-helpers";
+
+// ✅ ПРАВИЛЬНО
+const messages = chatHistory.map((msg) => ({
+  role: convertRoleForOpenAI(msg.role), // 'ai' → 'assistant'
+  content: msg.content,
+}));
+
+// ❌ НЕПРАВИЛЬНО - вызовет ошибку 400 от OpenAI
+const messages = chatHistory.map((msg) => ({
+  role: msg.role, // 'ai' недопустимо для OpenAI
+  content: msg.content,
+}));
+```
+
+**Важно:**
+
+- БД/TypeScript типы: `'user' | 'ai' | 'system'`
+- OpenAI принимает: `'user' | 'assistant' | 'system' | 'function' | 'tool' | 'developer'`
+- Helper: `convertRoleForOpenAI()` делает конверсию автоматически
+
+**Когда использовать:**
+
+- Перед отправкой сообщений в любой OpenAI API
+- При передаче chat history в intent parser
+- При построении conversation context для GPT
+
 ## Проверка импортов при рефакторинге
 
 ### КРИТИЧНО: При изменении exports ВСЕГДА проверяй imports
@@ -207,6 +241,7 @@ touch CHANGELOG.md
 4. **ОБНОВЛЯЙ** `/docs/README.md` при добавлении новых документов
 
 ### Исключения (когда можно создавать):
+
 - Пользователь **явно просит**: "создай документацию", "напиши README"
 - Пользователь **указывает название файла**: "создай docs/api-guide.md"
 - **Критические изменения** требуют обновления существующих документов

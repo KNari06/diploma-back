@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/logger';
+import { convertRoleForOpenAI } from '@/utils/chat-helpers';
 import { Request, Response } from 'express';
 
 // New services
@@ -376,8 +377,9 @@ async function getChatHistoryForIntent(
       userId, // SECURITY: Pass userId for verification
       CONSTANTS.RECENT_MESSAGES_LIMIT
     );
+    // Convert 'ai' role to 'assistant' for OpenAI compatibility
     const chatHistory = recentMessages.map(msg => ({
-      role: msg.role,
+      role: convertRoleForOpenAI(msg.role),
       content: msg.content,
     }));
 
@@ -1422,9 +1424,9 @@ async function handleGeneralChat(
       }
     }
 
-    // Build conversation history with compressed content
+    // Build conversation history with compressed content (use helper for role conversion)
     conversationHistory = recentMessages.map(msg => ({
-      role: msg.role === 'user' ? 'user' : 'assistant',
+      role: convertRoleForOpenAI(msg.role) as 'user' | 'assistant',
       content: compressMessageContent(msg.content),
     })) as Array<{ role: 'user' | 'assistant'; content: string }>;
   }
