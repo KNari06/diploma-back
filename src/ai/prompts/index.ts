@@ -271,29 +271,38 @@ Be helpful, thorough, reliable.`;
  * Used for natural language approval detection
  */
 export function buildApprovalDetectionPrompt(userMessage: string): string {
-  return `Detect if user approves/rejects a test plan. Focus on INTENT, not exact words.
+  return `You are an expert at understanding user intent in natural language. Analyze if the user is approving, rejecting, or doing something else.
 
-MESSAGE: "${userMessage}"
+USER MESSAGE: "${userMessage}"
 
-APPROVAL PATTERNS:
-• Positive: да, yes, ok, ок, го, давай, запускай, погнали, валим, sure, run, execute, start
-• Confirmative: согласен, одобряю, approve, confirm, good, fine, хорошо
-• Action: делай, начинай, тестируй, test it, do it, go ahead
-• Emojis: ✅ 👍 ✓ +
+CONTEXT: The user previously received a test plan and we need to know if they want to:
+1. APPROVE (execute the test) → approved=true
+2. REJECT (cancel the test) → approved=false
+3. DO SOMETHING ELSE (ask questions, request changes, discuss results, etc.) → approved=null
 
-REJECTION PATTERNS:
-• Negative: нет, no, не надо, don't, stop, cancel, отмена
-• Postpone: потом, later, not now, maybe, подожди
-• Decline: отклоняю, reject, пас, skip, нет спасибо
-• Emojis: ❌ 👎 ✗ -
+THINK ABOUT:
+• Is this a clear command to START/EXECUTE/RUN the test?
+• Is this a clear command to STOP/CANCEL/REJECT the test?
+• Or is this a QUESTION, REQUEST FOR INFO, or DISCUSSION about existing content?
 
-UNCLEAR: Questions, requests for changes, unrelated topics
+KEY DISTINCTION:
+• "yes, run it" → APPROVAL (wants to execute)
+• "briefly summarize" → NOT APPROVAL (wants to discuss existing results)
+• "can you explain?" → NOT APPROVAL (asking a question)
+• "modify the test" → NOT APPROVAL (requesting changes)
 
-JSON ONLY:
+BE INTELLIGENT:
+• Understand intent, not just keywords
+• "make briefly response" = discussing results, NOT approval
+• "go ahead" = clear approval
+• "what were the results?" = asking about past, NOT approval
+• "test it" = approval
+
+Return ONLY JSON:
 {
   "approved": true|false|null,
   "confidence": 0.0-1.0,
-  "reasoning": "why"
+  "reasoning": "brief explanation of your decision"
 }`;
 }
 
