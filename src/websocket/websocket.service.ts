@@ -6,28 +6,28 @@
 import { logger } from '@/utils/logger';
 import { getIO, isWebSocketInitialized } from './server';
 import {
-  createRoomName,
-  RoomType,
-  ServerToClientEvents,
-  TestCreatedPayload,
-  TestStartedPayload,
-  TestProgressPayload,
-  TestStepCompletedPayload,
-  TestBrowserCompletedPayload,
-  TestCompletedPayload,
-  TestFailedPayload,
-  TestCancelledPayload,
-  ResultReadyPayload,
-  ResultScreenshotPayload,
-  ResultErrorPayload,
-  AIAnalysisStartedPayload,
-  AIAnalysisProgressPayload,
   AIAnalysisCompletedPayload,
+  AIAnalysisProgressPayload,
+  AIAnalysisStartedPayload,
   AIBugFoundPayload,
   ChatMessagePayload,
   ChatTestUpdatePayload,
+  createRoomName,
+  ResultErrorPayload,
+  ResultReadyPayload,
+  ResultScreenshotPayload,
+  RoomType,
+  ServerToClientEvents,
   SystemErrorPayload,
   SystemMaintenancePayload,
+  TestBrowserCompletedPayload,
+  TestCancelledPayload,
+  TestCompletedPayload,
+  TestCreatedPayload,
+  TestFailedPayload,
+  TestProgressPayload,
+  TestStartedPayload,
+  TestStepCompletedPayload,
 } from './types';
 
 class WebSocketService {
@@ -87,7 +87,9 @@ class WebSocketService {
       const room = createRoomName('user', userId.trim());
       getIO().to(room).emit(event, data);
 
-      logger.info('[WebSocketService] Emitted to user', {
+      // Use debug for routine emits, info only for important events
+      const logLevel = ['test:started', 'test:completed', 'test:failed', 'chat:message'].includes(event) ? 'info' : 'debug';
+      logger[logLevel]('[WebSocketService] Emitted to user', {
         userId,
         event,
         room,
@@ -127,7 +129,9 @@ class WebSocketService {
       const room = createRoomName('test', testId.trim());
       getIO().to(room).emit(event, data);
 
-      logger.info('[WebSocketService] Emitted to test', {
+      // Use debug for routine emits, info only for important events
+      const logLevel = ['test:started', 'test:completed', 'test:failed'].includes(event) ? 'info' : 'debug';
+      logger[logLevel]('[WebSocketService] Emitted to test', {
         testId,
         event,
         room,
@@ -167,7 +171,9 @@ class WebSocketService {
       const room = createRoomName('chat', sessionId.trim());
       getIO().to(room).emit(event, data);
 
-      logger.info('[WebSocketService] Emitted to chat', {
+      // Use debug for routine emits, info only for important chat events
+      const logLevel = event === 'chat:message' ? 'info' : 'debug';
+      logger[logLevel]('[WebSocketService] Emitted to chat', {
         sessionId,
         event,
         room,
@@ -213,7 +219,8 @@ class WebSocketService {
       const room = createRoomName(roomType, roomId.trim());
       getIO().to(room).emit(event, data);
 
-      logger.info('[WebSocketService] Emitted to room', {
+      // Use debug for routine emits
+      logger.debug('[WebSocketService] Emitted to room', {
         roomType,
         roomId,
         event,
@@ -248,6 +255,7 @@ class WebSocketService {
     try {
       getIO().emit(event, data);
 
+      // Broadcast is always important - keep as info
       logger.info('[WebSocketService] Broadcasted to all', {
         event,
       });

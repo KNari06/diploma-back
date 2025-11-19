@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
 import { convertRoleForOpenAI } from '@/utils/chat-helpers';
+import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
 
 // New services
