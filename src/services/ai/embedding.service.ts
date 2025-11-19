@@ -16,7 +16,12 @@ const openai = new OpenAI({
 // Note: text-embedding-3-large (3072 dims) exceeds HNSW limit (2000 dims)
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 const EMBEDDING_DIMENSIONS = 1536;
-const MAX_TEXT_LENGTH = 8000; // OpenAI limit is ~8191 tokens, be safe
+// OpenAI limit: 8191 tokens
+// Safe char limit considering different languages:
+// - English: ~4 chars/token → 15K chars = ~3,750 tokens ✅
+// - Russian: ~2.5 chars/token → 15K chars = ~6,000 tokens ✅
+// - Chinese: ~1.5 chars/token → 15K chars = ~10,000 tokens ⚠️ (rare, but safe margin)
+const MAX_TEXT_LENGTH = 15000; // Safe limit for all languages (was 20K, too risky for Chinese/Japanese)
 const MAX_BATCH_SIZE = 100; // Limit batch size for safety
 
 /**

@@ -1414,8 +1414,8 @@ async function handleGeneralChat(
           chatSessionId,
           message, // Current user query
           {
-            matchCount: CONSTANTS.KB_MATCH_COUNT, // Top 3 most relevant old messages
-            matchThreshold: CONSTANTS.KB_MATCH_THRESHOLD, // Only include if similarity > 0.5
+            matchCount: 5, // Top 5 (increased from 3 for better recall)
+            matchThreshold: 0.4, // Lowered from 0.5 for better recall on vague questions
           }
         );
 

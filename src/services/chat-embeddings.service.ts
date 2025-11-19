@@ -43,11 +43,14 @@ export async function embedChatMessage(
       return false;
     }
 
-    // Truncate very long messages (OpenAI embedding limit: 8191 tokens ~= 30K chars)
-    // We use 20K chars as safe limit (~5400 tokens)
+    // Truncate very long messages (OpenAI embedding limit: 8191 tokens)
+    // Safe char limit considering different languages:
+    // - English: ~4 chars/token → 15K chars = ~3,750 tokens ✅
+    // - Russian: ~2.5 chars/token → 15K chars = ~6,000 tokens ✅
+    // - Chinese: ~1.5 chars/token → 15K chars = ~10,000 tokens ⚠️ (rare, but safe margin)
     let truncatedContent = content;
-    if (content.length > 20000) {
-      truncatedContent = content.substring(0, 20000) + '... [truncated]';
+    if (content.length > 15000) {
+      truncatedContent = content.substring(0, 15000) + '... [truncated]';
       logger.warn('[CHAT_EMBEDDINGS] Message truncated for embedding', {
         messageId,
         originalLength: content.length,
@@ -70,7 +73,7 @@ export async function embedChatMessage(
         metadata: {
           original_length: content.length,
           content_length: truncatedContent.length,
-          was_truncated: content.length > 20000,
+          was_truncated: content.length > 15000,
           embedded_at: new Date().toISOString(),
         },
       }, {
