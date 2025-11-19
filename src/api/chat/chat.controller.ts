@@ -53,7 +53,7 @@ const CONSTANTS = {
 
   // Knowledge base search
   KB_MATCH_COUNT: 3,
-  KB_MATCH_THRESHOLD: 0.6,
+  KB_MATCH_THRESHOLD: 0.5, // Lowered from 0.6 for better recall on short/ambiguous questions
 
   // Timeouts
   FUZZING_TIMEOUT: 30000, // 30 seconds
@@ -1413,7 +1413,7 @@ async function handleGeneralChat(
           message, // Current user query
           {
             matchCount: CONSTANTS.KB_MATCH_COUNT, // Top 3 most relevant old messages
-            matchThreshold: CONSTANTS.KB_MATCH_THRESHOLD, // Only include if similarity > 0.6
+            matchThreshold: CONSTANTS.KB_MATCH_THRESHOLD, // Only include if similarity > 0.5
           }
         );
 
