@@ -51,7 +51,7 @@ export async function detectUserApproval(
         content: prompt,
       },
     ], {
-      model: 'gpt-3.5-turbo',
+      model: 'gpt-4o-mini', // Better context understanding than gpt-3.5-turbo, cheaper too!
       temperature: 0.2, // Low temp for consistent results
       max_tokens: 100,
     });
@@ -203,7 +203,7 @@ Response:`;
     ], {
       temperature: 0,
       max_tokens: 100,
-      model: 'gpt-3.5-turbo', // Cheaper model for simple task
+      model: 'gpt-4o-mini', // Better AI, cheaper than gpt-3.5-turbo
     });
 
     const detectedPath = response.content.trim().replace(/['"]/g, '');
@@ -284,7 +284,7 @@ Return JSON:
       temperature: 0.2,
       max_tokens: 200,
       response_format: { type: 'json_object' },
-      model: 'gpt-3.5-turbo', // Cheaper for simple validation
+      model: 'gpt-4o-mini', // Better AI, cheaper than gpt-3.5-turbo
     });
 
     const result = JSON.parse(response.content);
@@ -370,7 +370,7 @@ Extracted answers (JSON only):`;
       temperature: 0,
       max_tokens: 300,
       response_format: { type: 'json_object' },
-      model: 'gpt-3.5-turbo', // Cheap and fast for simple parsing
+      model: 'gpt-4o-mini', // Better AI, cheaper than gpt-3.5-turbo
     });
 
     const parsed = JSON.parse(response.content);
@@ -450,7 +450,7 @@ Which option should we click? Return ONLY the number (1-${navOptions.length}) or
     ], {
       temperature: 0,
       max_tokens: 10,
-      model: 'gpt-3.5-turbo',
+      model: 'gpt-4o-mini',
     });
 
     const choice = response.content.trim();
@@ -592,7 +592,7 @@ RETURN ONLY VALID JSON:
         content: prompt,
       },
     ], {
-      model: 'gpt-3.5-turbo',
+      model: 'gpt-4o-mini',
       temperature: 0.1, // Very low for consistent extraction
       max_tokens: 200,
     });

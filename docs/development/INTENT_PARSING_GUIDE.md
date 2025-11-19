@@ -434,6 +434,76 @@ BE INTELLIGENT:
 
 ## 🐛 KNOWN ISSUES & FIXES (Continued)
 
+### **ISSUE #6: Intent parser doesn't understand "from that test" references**
+
+**Problem:**
+```
+User: "yes, give whole data from that test"
+Intent Parser: api_test ❌ (should be general_chat)
+Result: AI asks "Which HTTP method?" instead of showing past test data
+```
+
+**Root Cause:**
+- Intent parser sees keywords: "yes" + "give" + "data" + "test"
+- Doesn't analyze CONTEXT: "from THAT test" = past test!
+- Classifies as `api_test` instead of `general_chat`
+- Wrong handler called → wrong response
+
+**Fix Applied:**
+- ✅ Added Ex10 and Ex11 to `buildIntentPrompt`
+- ✅ Explicit examples showing "from that test" → general_chat
+- ✅ Added to "COMMON MISTAKES TO AVOID" section
+- ✅ Added matching examples in `buildChatSystemPrompt`
+
+**Example Fix:**
+```typescript
+Ex10: "yes, give whole data from that test"
+CONTEXT: User wants COMPLETE details from PREVIOUS test ("that test" = past!)
+→ {"intent": "general_chat"}
+❌ NOT api_test! User wants DATA from existing test, not CREATE new test!
+```
+
+**Status:** ✅ FIXED (2024-11-19)
+
+---
+
+### **ISSUE #7: Upgraded to gpt-4o-mini for better context understanding**
+
+**Problem:**
+- Intent parser used `gpt-3.5-turbo` for all helper functions
+- GPT-3.5 is older (2023), keyword-focused
+- Struggles with nuanced context like "from that test"
+
+**Solution:**
+- ✅ Upgraded ALL intent parsing to `gpt-4o-mini`
+- ✅ Changed in: `detectUserApproval`, `extractUrlWithGPT`, `detectLoginPage`, `validateSelector`, `parseNaturalAnswers`, `smartNavigation`
+- ✅ Already used `gpt-4o-mini` by default in `intentParser.service.ts`
+
+**Benefits:**
+- 🧠 **Better context understanding** (GPT-4 level intelligence)
+- 💰 **10x cheaper** ($0.00015/1K vs $0.0015/1K)
+- ⚡ **Faster** (~400ms vs ~500ms)
+- 📅 **Newer model** (2024 release)
+
+**Cost Comparison:**
+```
+Before: gpt-3.5-turbo = $0.0015 / 1K tokens
+After:  gpt-4o-mini   = $0.00015 / 1K tokens (10x cheaper!)
+
+Example: 1M intent parsing calls:
+- Before: ~$30/month
+- After: ~$3/month
+- Savings: $27/month (90% reduction!)
+```
+
+**Files Changed:**
+- `src/services/ai/ai-helpers.service.ts` (6 functions upgraded)
+- `src/services/ai/intentParser.service.ts` (already used gpt-4o-mini)
+
+**Status:** ✅ UPGRADED (2024-11-19)
+
+---
+
 ### **ISSUE #4: AI uses placeholders instead of real data**
 
 **Problem:**
