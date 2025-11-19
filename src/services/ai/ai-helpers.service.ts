@@ -77,7 +77,12 @@ export async function detectUserApproval(
       throw new Error('AI response is not a valid object');
     }
 
-    logger.info('✅ [APPROVAL_DETECT] User approval detected by AI', {
+    // Log based on actual result
+    const logPrefix = parsed.approved === true ? '✅ [APPROVAL_DETECT] Approved'
+                    : parsed.approved === false ? '❌ [APPROVAL_DETECT] Rejected'
+                    : '⚠️ [APPROVAL_DETECT] Unclear/Not approval';
+
+    logger.info(logPrefix, {
       approved: parsed.approved,
       confidence: parsed.confidence,
       reasoning: parsed.reasoning,

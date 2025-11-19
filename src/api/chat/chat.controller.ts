@@ -57,7 +57,7 @@ const CONSTANTS = {
 
   // Timeouts
   FUZZING_TIMEOUT: 30000, // 30 seconds
-  AUTO_EMBED_TIMEOUT: 5000, // 5 seconds
+  AUTO_EMBED_TIMEOUT: 30000, // 30 seconds (increased from 5s to allow more messages to embed)
   CHAT_REQUEST_TIMEOUT: 30000, // 30 seconds max for entire chat request
 
   // Test plan expiration
@@ -326,6 +326,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       userId,
       chatSessionId,
       context,
+      userLanguage: parsedIntent?.userLanguage, // Pass language from intent parser (avoid re-detection)
     });
 
   } catch (error) {
@@ -1337,9 +1338,10 @@ async function handleGeneralChat(
     userId: string;
     chatSessionId?: string;
     context?: any;
+    userLanguage?: 'en' | 'ru' | 'neutral'; // Language from intent parser (avoid re-detection)
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context } = params;
+  const { message, userId, chatSessionId, context, userLanguage: providedLanguage } = params;
 
   logger.info('[GENERAL_CHAT] Handling general conversation', {
     hasSession: !!chatSessionId,
@@ -1455,11 +1457,12 @@ async function handleGeneralChat(
   let kbContext = '';
   let kbRulesContext = '';
 
-  // Detect user language from message
-  const userLanguage = await detectLanguage(message);
+  // Use language from intent parser if available (avoid re-detection)
+  const userLanguage = providedLanguage || await detectLanguage(message);
 
-  logger.info('[GENERAL_CHAT] Detected user language', {
+  logger.info('[GENERAL_CHAT] User language', {
     language: userLanguage,
+    fromCache: !!providedLanguage,
     message: message.substring(0, 100),
   });
 
@@ -1566,9 +1569,7 @@ async function handleGeneralChat(
   if (kbRulesContext) {
     messages.push({
       role: 'system',
-      content: `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📚 RESPONSE GUIDELINES FROM KNOWLEDGE BASE:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      content: `--- RESPONSE GUIDELINES ---
 
 ${kbRulesContext}
 
@@ -1580,9 +1581,7 @@ IMPORTANT: Follow these guidelines when generating responses.`,
   if (kbContext) {
     messages.push({
       role: 'system',
-      content: `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📚 RELEVANT KNOWLEDGE FROM KNOWLEDGE BASE:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      content: `--- RELEVANT KNOWLEDGE ---
 
 ${kbContext}
 
@@ -1622,7 +1621,7 @@ Use this knowledge to provide more accurate and helpful responses.`,
   let gptResponse: { content: string; usage?: any };
   try {
     gptResponse = await getChatCompletionWithMessages(messages, {
-      temperature: 0.5,
+      temperature: 0.3, // Lowered from 0.5 for more consistent responses
       max_tokens: 1000,
     });
   } catch (openaiError: any) {

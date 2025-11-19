@@ -1,0 +1,289 @@
+---
+description: Rules for AI prompt optimization and context-first approach
+globs:
+  - "src/ai/prompts/**"
+  - "src/services/ai/**"
+  - "src/api/chat/**"
+alwaysRun: true
+---
+
+# AI Prompt Optimization Rules
+
+## 🎯 CORE PRINCIPLE: Context-First Approach
+
+**ALWAYS follow this priority when working with AI prompts:**
+
+```
+1. 🥇 CONTEXT & INTENT (что user хочет сделать?)
+2. 🥈 SENTENCE STRUCTURE (question vs command)
+3. 🥉 KEYWORDS (только для уточнения)
+```
+
+## 📚 PRIMARY REFERENCE DOCUMENT
+
+**BEFORE making ANY changes to prompts, read:**
+- `/docs/development/INTENT_PARSING_GUIDE.md`
+
+This document contains:
+- All known issues and their fixes
+- Prompt optimization history
+- Test cases and expected behavior
+- Debugging guide
+- Performance metrics
+
+## 🚫 NEVER DO THIS
+
+### ❌ DON'T use keyword-based approach:
+```typescript
+// BAD
+if (message.includes("API")) → api_test
+if (message.includes("test")) → api_test
+
+// GOOD
+if (user_is_requesting_action && has_url) → api_test
+if (user_is_asking_question) → general_chat
+```
+
+### ❌ DON'T hardcode keyword lists:
+```typescript
+// BAD
+const keywords = ['API', 'test', 'endpoint', 'HTTP'];
+if (keywords.some(k => message.includes(k))) → api_test
+
+// GOOD
+"Understand user's TRUE INTENT based on context"
+```
+
+### ❌ DON'T create rule-based prompts:
+```typescript
+// BAD
+RULES:
+1. If contains "test" → api_test
+2. If contains "API" → api_test
+
+// GOOD
+CONTEXT CLUES:
+✓ User is GIVING you URL + REQUESTING test → api_test
+✓ User is ASKING about past tests → general_chat
+```
+
+## ✅ ALWAYS DO THIS
+
+### ✅ Use context understanding:
+```typescript
+// Analyze WHAT user wants, not just WHAT they say
+"Did you test API?" → ASKING about past → general_chat ✓
+"Test this API" → REQUESTING action → api_test ✓
+```
+
+### ✅ Provide reasoning in examples:
+```typescript
+Ex: "Did you run API test already?"
+CONTEXT: User is ASKING about past action ("did you run") → QUESTION
+Keywords: Contains "API test" but context = ASKING, not REQUESTING
+→ {"intent": "general_chat"}
+```
+
+### ✅ Show signal-based detection:
+```typescript
+🔍 When user is REQUESTING a new test:
+   Signal: Giving you URL + asking to test something
+   Examples: "Test this API...", "Check this website..."
+   → Action: Guide them through test plan
+```
+
+## 📝 PROMPT MODIFICATION CHECKLIST
+
+Before committing prompt changes:
+
+- [ ] Read `/docs/development/INTENT_PARSING_GUIDE.md`
+- [ ] Check if similar issue already documented
+- [ ] Follow context-first approach (not keyword-based)
+- [ ] Add examples with CONTEXT reasoning
+- [ ] Test with known test cases from guide
+- [ ] Document token count changes
+- [ ] Update INTENT_PARSING_GUIDE.md with changes
+- [ ] Add new test cases if needed
+- [ ] Update Change Log in guide
+
+## 🎯 CRITICAL PROMPTS (Extra Care Required)
+
+These prompts determine routing and MUST use context-first:
+
+1. **`buildIntentPrompt`** (`src/ai/prompts/index.ts`)
+   - Determines: platform_test vs api_test vs general_chat
+   - Critical: Must understand questions vs commands
+   - Test: "Did you test API?" should be general_chat
+
+2. **`buildApprovalDetectionPrompt`** (`src/ai/prompts/index.ts`)
+   - Determines: approved vs rejected vs null
+   - Critical: "briefly" != approval
+   - Test: "can you make briefly" should be null
+
+3. **`buildChatSystemPrompt`** (`src/ai/prompts/index.ts`)
+   - Determines: AI behavior in general chat
+   - Critical: Must reference history, not create new tests
+   - Test: Should summarize existing results when asked
+
+## 🧪 TESTING REQUIREMENTS
+
+After ANY prompt change, test these scenarios:
+
+### Test Suite 1: Question vs Command
+```typescript
+"Test this API https://..." → api_test ✓
+"Did you run API test?" → general_chat ✓
+"Have you tested the endpoint?" → general_chat ✓
+```
+
+### Test Suite 2: Summarization vs New Test
+```typescript
+"can you make briefly response" → general_chat (summarize) ✓
+"Test this API again" → api_test (new test) ✓
+```
+
+### Test Suite 3: Approval Detection
+```typescript
+"yes, execute it" → approved=true ✓
+"can you make briefly" → approved=null ✓
+"no, cancel" → approved=false ✓
+```
+
+## 📊 PERFORMANCE GUIDELINES
+
+When optimizing prompts, track:
+
+- **Token count** (before/after)
+- **Cost impact** (per request)
+- **Accuracy improvement** (test pass rate)
+
+**Acceptable tradeoffs:**
+- ✅ +10% tokens for +50% accuracy = GOOD
+- ⚠️ +50% tokens for +10% accuracy = BAD
+- ✅ -20% tokens with same accuracy = EXCELLENT
+
+## 🔧 DEBUGGING WORKFLOW
+
+If AI behaves incorrectly:
+
+1. **Check logs** for intent classification:
+   ```
+   [INTENT_PARSER] Intent parsed { intent: "???" }
+   ```
+
+2. **Verify expected behavior** in INTENT_PARSING_GUIDE.md:
+   - Find similar test case
+   - Check expected intent
+   - Compare with actual
+
+3. **Locate issue**:
+   - Wrong intent? → Check `buildIntentPrompt`
+   - Wrong approval? → Check `buildApprovalDetectionPrompt`
+   - Wrong chat behavior? → Check `buildChatSystemPrompt`
+
+4. **Fix and document**:
+   - Apply fix following context-first approach
+   - Update INTENT_PARSING_GUIDE.md
+   - Add to Known Issues
+   - Add test case
+   - Update Change Log
+
+## 📚 RELATED FILES
+
+When working with prompts, also check:
+
+- `src/services/ai/intentParser.service.ts` - Intent parsing logic
+- `src/api/chat/chat.controller.ts` - Routing logic
+- `src/services/ai/ai-helpers.service.ts` - Approval detection
+- `docs/development/INTENT_PARSING_GUIDE.md` - Main reference
+
+## 🎓 EXAMPLES OF GOOD PROMPT DESIGN
+
+### ✅ GOOD: Context-First with Reasoning
+```typescript
+export function buildIntentPrompt(): string {
+  return `You are an AI understanding natural language like ChatGPT.
+
+  Think like a human:
+  • "Did you test API?" → they're asking about STATUS (not requesting test)
+  • "Test this API" → they're REQUESTING an action
+
+  🔍 When user is ASKING about past tests:
+     Signal: Questions about what already happened
+     Examples: "Did you run?", "What were results?"
+     → Action: Look at history, don't create new test
+  `;
+}
+```
+
+### ❌ BAD: Keyword-Based with Rules
+```typescript
+export function buildIntentPrompt(): string {
+  return `Detect user intent.
+
+  INDICATORS:
+  • Contains "API" → api_test
+  • Contains "test" → api_test
+
+  RULES:
+  1. If message has "API" → return api_test
+  2. If message has "test" → return api_test
+  `;
+}
+```
+
+## ⚠️ IMPORTANT REMINDERS
+
+1. **NEVER revert to keyword-based** - it breaks natural conversation
+2. **ALWAYS test with real scenarios** - not just syntax checking
+3. **ALWAYS update INTENT_PARSING_GUIDE.md** - keep it current
+4. **MONITOR logs after changes** - intent misclassification is visible
+
+## 🚀 WHEN ADDING NEW PROMPTS
+
+Follow this template:
+
+```typescript
+/**
+ * [Prompt Name]
+ * [Description of what it does]
+ * APPROACH: Context-First (not keyword-based)
+ */
+export function buildXxxPrompt(params): string {
+  return `You are [role]. Think like ChatGPT understanding natural language.
+
+  🎯 YOUR TASK: Understand [what], not just match keywords.
+
+  🔍 When user is [SCENARIO 1]:
+     Signal: [How to detect]
+     Examples: [Concrete examples]
+     → Action: [What to do]
+
+  🔍 When user is [SCENARIO 2]:
+     Signal: [How to detect]
+     Examples: [Concrete examples]
+     → Action: [What to do]
+
+  --- EXAMPLES ---
+
+  Ex1: "[User input]"
+  CONTEXT: [Reasoning about what user wants]
+  → [Expected output]
+
+  ❌ DON'T DO THIS:
+  [Bad example with explanation]
+  `;
+}
+```
+
+## 📞 REFERENCES
+
+- **Main Guide:** `/docs/development/INTENT_PARSING_GUIDE.md`
+- **Architecture:** `/docs/architecture/chat-flow.md`
+- **API Docs:** `/docs/api/README.md`
+
+---
+
+**Last Updated:** 2024-11-19
+**Version:** 1.0
+**Status:** 🟢 Active

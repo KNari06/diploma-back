@@ -129,7 +129,8 @@ export async function parseUserIntent(
       intentResult,
       confidence,
       kbRulesUsed,
-      cacheKey
+      cacheKey,
+      userLanguage
     );
     if (highConfidenceResult) return highConfidenceResult;
 
@@ -307,7 +308,8 @@ function handleHighConfidenceResult(
   intentResult: IntentResult,
   confidence: number,
   kbRulesUsed: boolean,
-  cacheKey: string
+  cacheKey: string,
+  userLanguage: 'en' | 'ru' | 'neutral'
 ): IntentResult | null {
     logger.info('[INTENT_PARSER] Initial parse confidence', {
       confidence,
@@ -321,6 +323,7 @@ function handleHighConfidenceResult(
       const finalResult = {
         ...intentResult,
         confidence,
+        userLanguage, // Include language for downstream use
         metadata: {
           ...intentResult.metadata,
           usedRAG: true,
@@ -338,6 +341,7 @@ function handleHighConfidenceResult(
       const finalResult = {
         ...intentResult,
         confidence,
+        userLanguage, // Include language for downstream use
       };
 
       setCacheEntry(cacheKey, finalResult);
@@ -404,7 +408,8 @@ async function handleLowConfidenceWithRAG(
       confidence,
       ragResults,
       cacheKey,
-      trimmedMessage
+      trimmedMessage,
+      userLanguage
     );
 
   } catch (ragError) {
@@ -467,7 +472,8 @@ function createEnhancedResult(
   originalConfidence: number,
   ragResults: any,
   cacheKey: string,
-  trimmedMessage: string
+  trimmedMessage: string,
+  userLanguage?: 'en' | 'ru' | 'neutral'
 ): IntentResult {
       const enhancedConfidence = calculateConfidence(enhancedResult, trimmedMessage);
 
@@ -483,6 +489,7 @@ function createEnhancedResult(
       const finalResult = {
         ...enhancedResult,
         confidence: enhancedConfidence,
+        userLanguage, // Include language for downstream use
         metadata: {
           ...enhancedResult.metadata,
           usedRAG: true,
@@ -592,29 +599,38 @@ async function extractUrlFromChatHistory(
       return { extractedUrl: null, extractedMethod: null };
     }
 
-    // FIX #1: Run approval detection and URL extraction in PARALLEL
-    // BEFORE: Sequential (~400ms) = detectUserApproval (200ms) + extractUrlWithGPT (200ms)
-    // AFTER: Parallel (~200ms) = Promise.all([...])
-    const [approvalResult, extractionResult] = await Promise.all([
-      detectUserApproval(message),
-      extractUrlWithGPT(userMessages, message)
-    ]);
+    // OPTIMIZATION: Skip extraction for absolute first message (no context to extract from)
+    // Safe: Only skips when userMessages.length === 1 (first user message)
+    // Covers approval scenarios: approval always comes AFTER test plan (at least 2+ messages)
+    if (userMessages.length === 1 && context.chatHistory.length <= 2) {
+      logger.info('[INTENT_PARSER] ⚡ Fast path: First user message, no previous context to extract');
+      return { extractedUrl: null, extractedMethod: null };
+    }
 
-    // Check if message is approval
-    if (!approvalResult.approved || approvalResult.confidence < 0.7) {
-      logger.info('[INTENT_PARSER] Message not recognized as approval', {
-        message,
+    // OPTIMIZATION: AI-powered fast pre-filtering
+    // Use cheap detection to skip expensive URL extraction when obviously not approval
+    // This saves ~200ms + cost for greetings/questions while staying universal
+    const approvalResult = await detectUserApproval(message);
+
+    // Early exit: If clearly NOT approval (greeting, question, discussion)
+    // Skip expensive URL extraction (saves ~200ms + $0.0004)
+    if (approvalResult.approved !== true || approvalResult.confidence < 0.7) {
+      logger.info('[INTENT_PARSER] ⚡ Fast path: Message is not approval, skipping URL extraction', {
+        message: message.substring(0, 30),
         approved: approvalResult.approved,
         confidence: approvalResult.confidence,
+        reasoning: approvalResult.reasoning,
       });
       return { extractedUrl: null, extractedMethod: null };
     }
 
-    logger.info('[INTENT_PARSER] ✅ Approval detected', {
-      message,
-      approvalConfidence: approvalResult.confidence,
-      reasoning: approvalResult.reasoning,
+    // Only extract URL if approval detected with high confidence
+    logger.info('[INTENT_PARSER] Approval detected, extracting URL from history', {
+      message: message.substring(0, 30),
+      confidence: approvalResult.confidence,
     });
+
+    const extractionResult = await extractUrlWithGPT(userMessages, message);
 
     // Check if URL was extracted
     if (!extractionResult.url) {
@@ -626,14 +642,13 @@ async function extractUrlFromChatHistory(
       return { extractedUrl: null, extractedMethod: null };
     }
 
-    // Success: Both approval detected AND URL extracted
+    // Success: Approval detected AND URL extracted
     logger.info('[INTENT_PARSER] ✅ Successfully extracted URL from history!', {
       url: extractionResult.url,
       method: extractionResult.method,
       approvalConfidence: approvalResult.confidence,
       extractionConfidence: extractionResult.confidence,
       reasoning: extractionResult.reasoning,
-      timeSaved: '~200ms (parallel execution)',
     });
 
     return {

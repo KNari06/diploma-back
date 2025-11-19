@@ -58,6 +58,18 @@
 - Центральный индекс: `/docs/DOCUMENTATION_INDEX.md`
 - СПРАШИВАЙ перед созданием
 
+### 6. prompt-optimization-rules.mdc (auto)
+
+**Applied to: src/ai/prompts/\*\*, src/services/ai/\*\*, src/api/chat/\*\***
+
+Правила оптимизации AI промптов:
+
+- 🥇 Context-First подход (НЕ keyword-based!)
+- 📚 Читай `/docs/development/INTENT_PARSING_GUIDE.md` ПЕРЕД изменениями
+- ✅ Тестируй с known test cases
+- ✅ Документируй все изменения
+- 🚫 НИКОГДА не возвращайся к keyword matching
+
 ## 🚨 Критически важное
 
 ### Перед КАЖДЫМ деплоем:
