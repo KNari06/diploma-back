@@ -1,5 +1,7 @@
 import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { TestRunRequest } from '@/types';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { logger } from '@/utils/logger';
@@ -202,6 +204,32 @@ router.post('/run', requireAuth, requireCredits(1), asyncHandler(async (req: Req
 
     // Use user ID from auth middleware
     const userId = req.user!.id;
+
+    // Deduct credits BEFORE running test
+    const uiTestType = validatedData.intelligentMode ? 'intelligent' : 'standard';
+    const testId = `ui_direct_${Date.now()}`;
+
+    try {
+      await CreditCostTrackerService.deductCreditsForTest({
+        userId,
+        testType: uiTestType,
+        credits: TokenCalculatorService.getTestCreditCost(uiTestType),
+        costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001,
+        testId,
+        description: `${uiTestType} UI test: ${validatedData.url}`,
+      });
+    } catch (creditError) {
+      logger.error('[MANUAL_TEST_API] Failed to deduct credits', {
+        error: creditError instanceof Error ? creditError.message : String(creditError),
+        userId,
+      });
+      res.status(402).json({
+        success: false,
+        error: 'Insufficient credits',
+        message: creditError instanceof Error ? creditError.message : 'Payment error',
+      });
+      return;
+    }
 
     const testRequest: TestRunRequest = {
       url: validatedData.url,

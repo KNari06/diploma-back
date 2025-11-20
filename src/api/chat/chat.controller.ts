@@ -585,6 +585,7 @@ async function saveAndRespond(
   }
 
   res.json({
+    success: true, // ← Frontend expects this!
     reply: aiMessage,
     timestamp: new Date().toISOString(),
     sessionId: chatSessionId,
@@ -1021,6 +1022,7 @@ async function handlePlatformTest(
 
     // Send response with test plan
         res.json({
+      success: true, // ← Frontend expects this!
       reply: formattedPlan,
       testPlan,
       conversationId: testPlan.id, // ← For tracking approval
@@ -1288,6 +1290,7 @@ async function handleApiTest(
   }
 
     res.json({
+      success: true, // ← Frontend expects this!
       reply: formattedPlan,
       testPlan: apiTestPlan,
       conversationId: testPlan.id, // Use this to track approval
@@ -1679,6 +1682,7 @@ Use this knowledge to provide more accurate and helpful responses.`,
   // Credits are only deducted for TESTS (intelligent, standard, api)
 
   const response: any = {
+    success: true, // ← Frontend expects this!
     reply: gptResponse.content,
             timestamp: new Date().toISOString(),
     sessionId: chatSessionId,
@@ -1980,6 +1984,7 @@ async function executeApiTestFlow(
 
     // Send response immediately (don't wait for chat save)
     res.json({
+      success: true, // ← Frontend expects this!
       reply: finalMessage,
       testResult: apiTestResult,
       fuzzingReport: fuzzingReport || undefined,
@@ -2418,6 +2423,7 @@ async function executeUiTestFlow(
 
     // Send response immediately (don't wait for chat save)
         res.json({
+          success: true, // ← Frontend expects this!
           reply: successMessage,
       testId: testCreated.data.id,
           timestamp: new Date().toISOString(),

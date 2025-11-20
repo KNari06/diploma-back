@@ -24,12 +24,16 @@ export class ManualTestService {
       this.validateTestRequest(testRequest);
       logger.info('🟢 [MANUAL_TEST_FLOW] Step 2: Validation passed');
 
-      // Check user credits (userId is required)
+      // Validate userId (required)
       if (!testRequest.userId) {
         throw new ValidationError('User ID is required - anonymous users are not supported');
       }
-      await this.checkUserCredits(testRequest.userId, testRequest.browsers, testRequest.intelligentMode, testRequest.estimatedCost);
-      logger.info('🟢 [MANUAL_TEST_FLOW] Step 3: Credit check passed');
+
+      // NOTE: Credits check and deduction should be done BEFORE calling runTest()
+      // - Chat flow: Done in executeUiTestFlow via CreditCostTrackerService
+      // - Direct API: Done in /manual-test/run controller via CreditCostTrackerService
+      // - Retry: Done in retryTest() method via checkUserCredits + deductCredits
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 3: Credits check/deduction handled by caller');
 
       // Create test record
       logger.info('🟢 [MANUAL_TEST_FLOW] Step 4: Creating test record in DB');
@@ -69,9 +73,11 @@ export class ManualTestService {
         }
       }
 
-      // Deduct credits
-      logger.info('🟢 [MANUAL_TEST_FLOW] Step 9: Deducting credits');
-      await this.deductCredits(testRequest.userId, testRequest.browsers, testRequest.intelligentMode, testRequest.estimatedCost);
+      // NOTE: Credits should be deducted BEFORE calling runTest()
+      // - Chat flow: Credits deducted in executeUiTestFlow via CreditCostTrackerService
+      // - Direct API: Credits should be deducted in controller before calling runTest()
+      // - Retry: Credits deducted in retryTest() method
+      logger.info('🟢 [MANUAL_TEST_FLOW] Step 9: Credits already deducted by caller');
 
       logTestEvent('created', test.id, { url: testRequest.url, browsers: testRequest.browsers });
 
@@ -330,6 +336,7 @@ export class ManualTestService {
       // Deduct credits
       await this.deductCredits(
         userId,
+        test.id,
         test.browsers,
         test.intelligent_mode,
         test.options?.estimatedCost
@@ -579,6 +586,7 @@ export class ManualTestService {
    */
   private static async deductCredits(
     userId: string,
+    testId: string,
     browsers: BrowserType[],
     intelligentMode?: boolean,
     estimatedCost?: string
@@ -587,6 +595,7 @@ export class ManualTestService {
 
     logger.info('[CREDIT_DEDUCT] Deducting credits', {
       userId: userId.substring(0, 8) + '...',
+      testId: testId.substring(0, 8) + '...',
       requiredCredits,
       intelligentMode,
     });
@@ -595,7 +604,7 @@ export class ManualTestService {
     const { data, error } = await dbService.supabaseAdmin
       .rpc('deduct_test_credits', {
         user_uuid: userId,
-        test_uuid: 'temp', // This will be updated with actual test ID
+        test_uuid: testId, // Real test ID (not 'temp')
         credit_amount: requiredCredits,
       });
 
