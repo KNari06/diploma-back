@@ -1,0 +1,281 @@
+/**
+ * Script to create 10 test users with authentication
+ *
+ * This script:
+ * 1. Creates users in auth.users via Supabase Admin API
+ * 2. Trigger automatically syncs to public.users
+ * 3. Updates public.users with correct credits and subscription
+ *
+ * Usage:
+ *   npm run ts-node scripts/create-test-users.ts
+ *
+ * Or compile and run:
+ *   npm run build
+ *   node dist/scripts/create-test-users.js
+ */
+
+import { supabaseAdmin } from '../src/db/supabase';
+import { logger } from '../src/utils/logger';
+
+// Test users configuration
+// All users have: professional plan, 1000 credits
+const TEST_USERS = [
+  {
+    email: 'test1@qai-test.local',
+    password: 'test123456',
+    name: 'Test User 1',
+    role: 'user' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+  {
+    email: 'test2@qai-test.local',
+    password: 'test123456',
+    name: 'Test User 2',
+    role: 'user' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+  {
+    email: 'test3@qai-test.local',
+    password: 'test123456',
+    name: 'Test User 3',
+    role: 'user' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+  {
+    email: 'test4@qai-test.local',
+    password: 'test123456',
+    name: 'Test User 4',
+    role: 'user' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+  {
+    email: 'test5@qai-test.local',
+    password: 'test123456',
+    name: 'Test User 5',
+    role: 'user' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+  {
+    email: 'test6@qai-test.local',
+    password: 'test123456',
+    name: 'Test User 6',
+    role: 'user' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+  {
+    email: 'admin@qai-test.local',
+    password: 'test123456',
+    name: 'Test Admin User',
+    role: 'admin' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+  {
+    email: 'test8@qai-test.local',
+    password: 'test123456',
+    name: 'Test User 8',
+    role: 'user' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+  {
+    email: 'test9@qai-test.local',
+    password: 'test123456',
+    name: 'Test User 9',
+    role: 'user' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+  {
+    email: 'test10@qai-test.local',
+    password: 'test123456',
+    name: 'Test User 10',
+    role: 'user' as const,
+    credits: 1000,
+    subscription: { plan: 'professional', status: 'active', credits_included: 500 },
+  },
+];
+
+/**
+ * Create a test user in auth.users and update public.users
+ */
+async function createTestUser(userConfig: typeof TEST_USERS[0]): Promise<void> {
+  try {
+    logger.info(`[CREATE_USER] Creating user: ${userConfig.email}`);
+
+    // Step 1: Create user in auth.users via Admin API
+    const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      email: userConfig.email,
+      password: userConfig.password,
+      email_confirm: true, // Auto-confirm email (no verification needed for test users)
+      user_metadata: {
+        name: userConfig.name,
+      },
+    });
+
+    if (authError) {
+      // If user already exists, try to get existing user
+      if (authError.message.includes('already registered') || authError.message.includes('already exists')) {
+        logger.warn(`[CREATE_USER] User ${userConfig.email} already exists, fetching existing user`);
+
+        const { data: existingUsers } = await supabaseAdmin.auth.admin.listUsers();
+        const existingUser = existingUsers?.users.find(u => u.email === userConfig.email);
+
+        if (!existingUser) {
+          throw new Error(`User ${userConfig.email} already exists but could not be found`);
+        }
+
+        // Update existing user's metadata
+        await supabaseAdmin.auth.admin.updateUserById(existingUser.id, {
+          user_metadata: {
+            name: userConfig.name,
+          },
+        });
+
+        // Step 2: Wait a bit for trigger to sync (if needed)
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        // Step 3: Update public.users with credits and subscription
+        const { error: updateError } = await supabaseAdmin
+          .from('users')
+          .update({
+            name: userConfig.name,
+            role: userConfig.role,
+            credits: userConfig.credits,
+            subscription: userConfig.subscription,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', existingUser.id);
+
+        if (updateError) {
+          logger.error(`[CREATE_USER] Failed to update public.users for ${userConfig.email}`, {
+            error: updateError.message,
+          });
+          throw updateError;
+        }
+
+        logger.info(`[CREATE_USER] ✅ Updated existing user: ${userConfig.email} (${existingUser.id})`);
+        return;
+      }
+
+      throw authError;
+    }
+
+    if (!authUser?.user) {
+      throw new Error(`Failed to create user ${userConfig.email}: no user returned`);
+    }
+
+    logger.info(`[CREATE_USER] User created in auth.users: ${authUser.user.id}`);
+
+    // Step 2: Wait a bit for trigger to sync auth.users → public.users
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // Step 3: Update public.users with credits and subscription
+    const { error: updateError } = await supabaseAdmin
+      .from('users')
+      .update({
+        name: userConfig.name,
+        role: userConfig.role,
+        credits: userConfig.credits,
+        subscription: userConfig.subscription,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', authUser.user.id);
+
+    if (updateError) {
+      logger.error(`[CREATE_USER] Failed to update public.users for ${userConfig.email}`, {
+        error: updateError.message,
+        userId: authUser.user.id,
+      });
+      throw updateError;
+    }
+
+    logger.info(`[CREATE_USER] ✅ User created successfully: ${userConfig.email} (${authUser.user.id})`);
+  } catch (error) {
+    logger.error(`[CREATE_USER] Failed to create user ${userConfig.email}`, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+/**
+ * Main function
+ */
+async function main() {
+  logger.info('[CREATE_TEST_USERS] Starting test users creation...');
+
+  const results = {
+    success: 0,
+    failed: 0,
+    errors: [] as string[],
+  };
+
+  for (const userConfig of TEST_USERS) {
+    try {
+      await createTestUser(userConfig);
+      results.success++;
+    } catch (error) {
+      results.failed++;
+      results.errors.push(`${userConfig.email}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  // Summary
+  logger.info('[CREATE_TEST_USERS] Summary:', {
+    total: TEST_USERS.length,
+    success: results.success,
+    failed: results.failed,
+  });
+
+  if (results.errors.length > 0) {
+    logger.error('[CREATE_TEST_USERS] Errors:', results.errors);
+  }
+
+  // Verify users
+  logger.info('[CREATE_TEST_USERS] Verifying created users...');
+  const { data: users, error: verifyError } = await supabaseAdmin
+    .from('users')
+    .select('id, email, name, role, credits, subscription')
+    .in('email', TEST_USERS.map(u => u.email))
+    .order('email');
+
+  if (verifyError) {
+    logger.error('[CREATE_TEST_USERS] Failed to verify users', { error: verifyError.message });
+  } else {
+    logger.info(`[CREATE_TEST_USERS] ✅ Verified ${users?.length || 0} users in public.users`);
+    users?.forEach(user => {
+      logger.info(`  - ${user.email}: ${user.credits} credits, role: ${user.role}`);
+    });
+  }
+
+  logger.info('[CREATE_TEST_USERS] ✅ Done!');
+  logger.info('');
+  logger.info('📋 Test Users Credentials:');
+  logger.info('   All users have password: test123456');
+  logger.info('');
+  TEST_USERS.forEach(user => {
+    logger.info(`   ${user.email} (${user.role})`);
+  });
+  logger.info('');
+  logger.info('💡 You can now login with these credentials!');
+}
+
+// Run script
+main()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((error) => {
+    logger.error('[CREATE_TEST_USERS] Script failed', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    process.exit(1);
+  });
