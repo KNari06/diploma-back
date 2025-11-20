@@ -357,8 +357,10 @@ You work with a real testing platform that:
    → DON'T ask for test details (user wants EXISTING data, not to create new test)!
 
 🔍 **When user is APPROVING a test:**
-   Signal: Confirmation after seeing test plan
-   Examples: "yes", "go ahead", "execute it", "давай"
+   Signal: Confirmation IMMEDIATELY after seeing test plan (must be LAST AI message!)
+   Examples: "yes", "go ahead", "execute it", "давай", "start!"
+   ⚠️ CRITICAL: Approval ONLY works if last AI message was a test plan!
+   → If user said "yes" but last message was regular chat → ask what they want to test
    → Acknowledge approval
    → Platform executes automatically
    → Report results when complete
@@ -434,28 +436,35 @@ export function buildApprovalDetectionPrompt(userMessage: string): string {
 
 USER MESSAGE: "${userMessage}"
 
-CONTEXT: The user previously received a test plan and we need to know if they want to:
+CONTEXT: The system is checking if this message is an approval for a test plan.
+⚠️ IMPORTANT: Approval ONLY works if the LAST AI message was a test plan!
+If user is responding to a regular chat message, this is NOT an approval.
+
+We need to know if they want to:
 1. APPROVE (execute the test) → approved=true
 2. REJECT (cancel the test) → approved=false
 3. DO SOMETHING ELSE (ask questions, request changes, discuss results, etc.) → approved=null
 
 THINK ABOUT:
-• Is this a clear command to START/EXECUTE/RUN the test?
-• Is this a clear command to STOP/CANCEL/REJECT the test?
+• Is this a clear command to START/EXECUTE/RUN a test?
+• Is this a clear command to STOP/CANCEL/REJECT a test?
 • Or is this a QUESTION, REQUEST FOR INFO, or DISCUSSION about existing content?
 
 KEY DISTINCTION:
 • "yes, run it" → APPROVAL (wants to execute)
+• "yes, start!" → APPROVAL (wants to start test)
+• "go ahead" → APPROVAL (clear approval)
+• "давай" → APPROVAL (Russian for "let's go")
 • "briefly summarize" → NOT APPROVAL (wants to discuss existing results)
 • "can you explain?" → NOT APPROVAL (asking a question)
 • "modify the test" → NOT APPROVAL (requesting changes)
+• "what were the results?" → NOT APPROVAL (asking about past)
 
 BE INTELLIGENT:
 • Understand intent, not just keywords
 • "make briefly response" = discussing results, NOT approval
-• "go ahead" = clear approval
-• "what were the results?" = asking about past, NOT approval
-• "test it" = approval
+• "yes" alone = likely approval (but check confidence)
+• "no" or "cancel" = rejection
 
 Return ONLY JSON:
 {

@@ -424,6 +424,50 @@ async function handlePendingTestPlanApproval(params: {
     chatSessionId: chatSessionId?.substring(0, 8) + '...' || 'none',
   });
 
+  // CRITICAL: Check if LAST AI MESSAGE was a test plan
+  // This prevents false approvals when user says "yes" but last message wasn't a plan
+  let lastAiMessageWasTestPlan = false;
+
+  if (chatSessionId) {
+    try {
+      const recentMessages = await ChatService.getRecentMessages(chatSessionId, 5); // Last 5 messages
+
+      // Find last AI message
+      const lastAiMessage = recentMessages
+        .slice()
+        .reverse()
+        .find((msg: any) => msg.role === 'ai');
+
+      if (lastAiMessage?.metadata) {
+        // Check if last AI message was a test plan
+        lastAiMessageWasTestPlan =
+          lastAiMessage.metadata.requiresApproval === true ||
+          !!lastAiMessage.metadata.testPlan ||
+          !!lastAiMessage.metadata.conversationId; // conversationId indicates test plan
+
+        logger.info('[APPROVAL_CHECK] Last AI message analysis', {
+          wasTestPlan: lastAiMessageWasTestPlan,
+          hasRequiresApproval: lastAiMessage.metadata.requiresApproval,
+          hasTestPlan: !!lastAiMessage.metadata.testPlan,
+          hasConversationId: !!lastAiMessage.metadata.conversationId,
+        });
+      }
+    } catch (error) {
+      logger.warn('[APPROVAL_CHECK] Failed to check last AI message', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Continue without this check (fallback to plan search)
+    }
+  }
+
+  // If last AI message was NOT a test plan, no approval to handle
+  if (!lastAiMessageWasTestPlan) {
+    logger.info('[APPROVAL_CHECK] Last AI message was not a test plan, no approval to handle', {
+      chatSessionId: chatSessionId?.substring(0, 8) + '...' || 'none',
+    });
+    return false; // No pending approval, continue with intent parsing
+  }
+
   // Find pending test plan (parallel search for performance)
   const pendingPlan = await findPendingTestPlan(conversationId, userId);
 

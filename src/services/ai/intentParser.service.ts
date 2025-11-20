@@ -716,6 +716,14 @@ Always return valid JSON matching the expected format.`;
 
   // FIX #5: Only add URL context if we actually found one
   if (historyData?.extractedUrl) {
+    // Check if URL looks like API endpoint (contains /api/ or is API-like)
+    // If not, it's likely a website URL for platform_test
+    const isApiUrl = historyData.extractedUrl.includes('/api/') ||
+                     historyData.extractedUrl.match(/^https?:\/\/api\./i) ||
+                     historyData.extractedMethod; // If method specified, likely API
+
+    const suggestedIntent = isApiUrl ? 'api_test' : 'platform_test';
+
     return `${basePrompt}
 
 ⚠️ IMPORTANT: URL FOUND IN HISTORY!
@@ -723,7 +731,13 @@ URL: ${historyData.extractedUrl}
 Method: ${historyData.extractedMethod || 'Not specified'}
 User current message: "${message}"
 
-Since URL is already extracted, use it for intent "api_test"!`;
+Since URL is already extracted, analyze the URL to determine intent:
+- If URL contains "/api/" or starts with "api." → likely "api_test"
+- If URL is a website (like https://example.com) → likely "platform_test"
+- If HTTP method is specified → likely "api_test"
+- Otherwise, use context from chat history to determine intent
+
+Suggested intent: "${suggestedIntent}" (but verify with chat history context!)`;
   }
 
   // FIX #5: If no URL found, don't mention extraction at all
