@@ -311,12 +311,13 @@ export class ManualTestService {
               });
             } else if (state === 'active') {
               // Active jobs will be checked by worker and stopped
-              // Mark job as cancelled by updating data
-              await job.updateData({ ...job.data, cancelled: true });
-              logger.info(`[CANCEL_TEST] Marked active job for cancellation: ${jobId}`, {
+              // Worker checks test status in DB via checkTestCancelled()
+              // No need to update job.data - status in DB is the source of truth
+              logger.info(`[CANCEL_TEST] Active job will be cancelled by worker: ${jobId}`, {
                 testId,
                 browser,
                 state,
+                note: 'Worker checks test status in DB',
               });
             } else {
               logger.debug(`[CANCEL_TEST] Job already in final state: ${jobId}`, {
