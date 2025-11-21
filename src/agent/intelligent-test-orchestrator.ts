@@ -23,6 +23,7 @@ import {
   TestState,
 } from './types/intelligent-testing.types';
 import { TestProgressEmitter } from './utils/progress-emitter';
+import { dbAdminService } from '@/db/supabase';
 
 // AI cost estimation (updated with accurate pricing Nov 2024)
 // Based on: GPT-4o $0.005 input / $0.015 output per 1K tokens
@@ -98,10 +99,40 @@ export class IntelligentTestOrchestrator {
     });
 
     try {
-      // Main testing loop
-      await this.mainLoop();
+      // Main testing loop (returns true if cancelled)
+      const wasCancelled = await this.mainLoop();
 
-      // Build result
+      // If cancelled, build result with cancellation info
+      if (wasCancelled) {
+        const result = this.buildResult(false);
+        result.summary = 'Test was cancelled by user';
+        // Add cancellation error (errors array has { message, page } structure)
+        result.errors.push({
+          message: 'Test was cancelled by user',
+          page: this.state.currentUrl || this.config.startUrl,
+        });
+
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Test cancelled', {
+          pagesVisited: result.pagesVisited,
+          actionsTaken: result.actionsTaken,
+          duration: `${Math.round(result.duration / 1000)}s`,
+        });
+
+        this.progressEmitter?.emit({
+          progress: 100,
+          phase: 'finalization',
+          currentStep: '❌ Test cancelled',
+          status: 'cancelled',
+        });
+
+        this.emitEvent('test_cancelled', {
+          message: 'Test was cancelled by user',
+        });
+
+        return result;
+      }
+
+      // Build result for successful completion
       const result = this.buildResult(true);
 
       logger.info('[INTELLIGENT_ORCHESTRATOR] Test completed successfully', {
@@ -150,9 +181,26 @@ export class IntelligentTestOrchestrator {
   // MAIN TESTING LOOP
   // ═══════════════════════════════════════════════════════════════════════════
 
-  private async mainLoop(): Promise<void> {
+  /**
+   * Check if test was cancelled
+   */
+  private async checkTestCancelled(): Promise<boolean> {
+    if (!this.testId) {
+      return false;
+    }
+
+    try {
+      const test = await dbAdminService.getTest(this.testId) as any;
+      return test?.status === 'cancelled';
+    } catch (error) {
+      logger.warn(`[INTELLIGENT_ORCHESTRATOR] Failed to check test status: ${this.testId}`, error);
+      return false; // Don't block execution if check fails
+    }
+  }
+
+  private async mainLoop(): Promise<boolean> {
     let continueLoop = true;
-    let iteration = 0;
+    let iteration = 0; // Track iteration count
 
     logger.info('[INTELLIGENT_ORCHESTRATOR] Starting main test loop', {
       testId: this.testId,
@@ -168,6 +216,22 @@ export class IntelligentTestOrchestrator {
         actionsCompleted: this.state.completedActions.length,
         currentUrl: this.page.url(),
       });
+
+      // Check if test was cancelled before each iteration
+      if (await this.checkTestCancelled()) {
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Test was cancelled, stopping execution', {
+          testId: this.testId,
+          iteration,
+          pagesVisited: this.state.pagesAnalyzed,
+          actionsCompleted: this.state.completedActions.length,
+        });
+
+        this.emitEvent('test_cancelled', {
+          message: 'Test was cancelled by user',
+        });
+
+        return true; // Return true to indicate cancellation
+      }
 
       // Check limits before each iteration
       const limitsCheck = SafetyGuard.checkLimits(this.state, this.config.safety);
@@ -193,6 +257,15 @@ export class IntelligentTestOrchestrator {
       try {
         // STEP 1: Analyze current page
         const context = await this.analyzePage();
+
+        // Check if test was cancelled after analysis (before expensive operations)
+        if (await this.checkTestCancelled()) {
+          logger.info('[INTELLIGENT_ORCHESTRATOR] Test was cancelled after page analysis', {
+            testId: this.testId,
+            iteration,
+          });
+          return true; // Return true to indicate cancellation
+        }
 
         // STEP 2: Check for cycles
         const cycleCheck = StateTracker.detectCycle(this.state, context.url);
@@ -303,6 +376,15 @@ export class IntelligentTestOrchestrator {
 
         // Small delay between iterations
         await this.page.waitForTimeout(1000);
+
+        // Check cancellation after iteration
+        if (await this.checkTestCancelled()) {
+          logger.info('[INTELLIGENT_ORCHESTRATOR] Test was cancelled after iteration', {
+            testId: this.testId,
+            iteration,
+          });
+          return true; // Return true to indicate cancellation
+        }
       } catch (error) {
         // ✅ FIX: Enhanced error logging with iteration context
         logger.error('[INTELLIGENT_ORCHESTRATOR] Loop iteration failed', {
@@ -345,8 +427,11 @@ export class IntelligentTestOrchestrator {
     }
 
     logger.info('[INTELLIGENT_ORCHESTRATOR] Main loop ended', {
+      testId: this.testId,
       stats: StateTracker.formatStatistics(this.state),
     });
+
+    return false; // ✅ FIX: Return false to indicate normal completion (not cancelled)
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

@@ -8,6 +8,120 @@ import { ResultCollector } from './result-collector';
 import { DEFAULT_SAFETY_CONFIG } from './safety-guard';
 import { IntelligentTestConfig } from './types/intelligent-testing.types';
 import { webSocketService } from '@/websocket/websocket.service';
+import { dbAdminService } from '@/db/supabase';
+
+/**
+ * Check if test is cancelled and throw error if so
+ */
+async function checkTestCancelled(testId: string): Promise<void> {
+  try {
+    const test = await dbAdminService.getTest(testId) as any;
+    if (test?.status === 'cancelled') {
+      throw new Error(`Test ${testId} was cancelled`);
+    }
+  } catch (error) {
+    // If error is already about cancellation, rethrow it
+    if (error instanceof Error && error.message.includes('cancelled')) {
+      throw error;
+    }
+    // Otherwise, log warning but don't block execution
+    logger.warn(`[PLAYWRIGHT] Failed to check test status: ${testId}`, error);
+  }
+}
+
+/**
+ * Request tracker for intelligent mode
+ * Setup BEFORE navigation to catch all API requests
+ */
+class RequestTracker {
+  private pendingRequests = new Set<string>();
+  private completedRequests = new Set<string>();
+  private page: Page;
+
+  constructor(page: Page) {
+    this.page = page;
+    this.setupListeners();
+  }
+
+  private setupListeners() {
+    // Track all requests
+    this.page.on('request', (request) => {
+      const url = request.url();
+      // Filter: only track API requests (not static assets, not websockets, not long-polling)
+      if (
+        url.includes('/api/') ||
+        url.includes('/graphql') ||
+        url.includes('/rest/') ||
+        (request.resourceType() === 'xhr' || request.resourceType() === 'fetch')
+      ) {
+        // Ignore websockets and long-polling patterns
+        if (
+          !url.includes('ws://') &&
+          !url.includes('wss://') &&
+          !url.includes('/poll') &&
+          !url.includes('/stream') &&
+          !url.includes('/events') &&
+          !url.includes('/sse')
+        ) {
+          this.pendingRequests.add(url);
+          logger.debug('[PLAYWRIGHT] Tracking API request', { url: url.substring(0, 100) });
+        }
+      }
+    });
+
+    // Track completed requests
+    this.page.on('response', (response) => {
+      const url = response.url();
+      if (this.pendingRequests.has(url)) {
+        this.pendingRequests.delete(url);
+        this.completedRequests.add(url);
+        logger.debug('[PLAYWRIGHT] API request completed', {
+          url: url.substring(0, 100),
+          status: response.status(),
+        });
+      }
+    });
+  }
+
+  async waitForCompletion(timeout: number = 15000): Promise<void> {
+    const startTime = Date.now();
+    const checkInterval = 500; // Check every 500ms
+
+    // Wait for all tracked requests to complete or timeout
+    while (this.pendingRequests.size > 0 && (Date.now() - startTime) < timeout) {
+      await this.page.waitForTimeout(checkInterval);
+    }
+
+    const duration = Date.now() - startTime;
+
+    if (this.pendingRequests.size > 0) {
+      logger.warn('[PLAYWRIGHT] Some API requests did not complete within timeout', {
+        pendingCount: this.pendingRequests.size,
+        completedCount: this.completedRequests.size,
+        duration: `${duration}ms`,
+        pendingUrls: Array.from(this.pendingRequests).slice(0, 3).map(url => url.substring(0, 100)),
+      });
+    } else {
+      logger.info('[PLAYWRIGHT] All important API requests completed', {
+        completedCount: this.completedRequests.size,
+        duration: `${duration}ms`,
+      });
+    }
+
+    // Additional wait for DOM to render API data (common patterns)
+    try {
+      // Wait for common content indicators to appear
+      await Promise.race([
+        this.page.waitForSelector('[data-loaded], .content-loaded, [class*="list"], [class*="grid"]', { timeout: 3000 }).catch(() => null),
+        this.page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => null),
+        this.page.waitForTimeout(2000), // Fallback: wait 2 seconds for rendering
+      ]);
+    } catch (error) {
+      // Continue anyway - data might already be rendered
+      logger.debug('[PLAYWRIGHT] Content rendering wait completed or timed out');
+    }
+  }
+}
 
 /**
  * Execute Playwright test
@@ -35,6 +149,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   const collector = new ResultCollector();
 
   try {
+    // Check if test was cancelled before starting
+    await checkTestCancelled(testData.testId);
+
     logger.info('[PLAYWRIGHT] Starting test', {
       testId: testData.testId,
       url: testData.url,
@@ -154,8 +271,20 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         timestamp: new Date().toISOString(),
       });
 
-      // Navigate to URL
-      await page.goto(testData.url, { waitUntil: 'networkidle', timeout: 30000 });
+      // ✅ FIX: Setup request tracking BEFORE navigation
+      const requestTracker = new RequestTracker(page);
+
+      // Navigate to URL with smart waiting strategy for intelligent mode
+      await page.goto(testData.url, {
+        waitUntil: 'load',  // Wait for all resources (HTML, CSS, JS, images)
+        timeout: 30000
+      });
+
+      // ✅ FIX: Wait for important API requests to complete
+      await requestTracker.waitForCompletion(15000);
+
+      // Check if test was cancelled after navigation
+      await checkTestCancelled(testData.testId);
 
       // Emit progress: Page loaded (25%)
       webSocketService.emitTestProgress(testData.testId, {
@@ -185,14 +314,14 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         },
       };
 
-      // Create orchestrator
+      // Create orchestrator (with testId for cancellation checks)
       const orchestrator = new IntelligentTestOrchestrator(
         intelligentConfig,
         testData.userId,
         testData.testId
       );
 
-      // Execute intelligent test
+      // Execute intelligent test (will check cancellation internally)
       const intelligentResult = await orchestrator.execute(browser, page);
 
       logger.info('[PLAYWRIGHT] Intelligent test completed', {
@@ -424,6 +553,49 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       tracePath,
     };
   } catch (error) {
+    // Check if error is about cancellation
+    const isCancelled = error instanceof Error && error.message.includes('cancelled');
+
+    if (isCancelled) {
+      logger.info('[PLAYWRIGHT] Test was cancelled', {
+        testId: testData.testId,
+        browser: testData.browser,
+      });
+
+      // Cleanup resources
+      if (page) {
+        try {
+          await page.close();
+        } catch (cleanupError) {
+          logger.warn('Failed to close page during cancellation', { error: cleanupError });
+        }
+      }
+
+      if (context) {
+        try {
+          if (tracePath) {
+            await context.tracing.stop({ path: tracePath }).catch(() => {});
+          }
+          await context.close();
+        } catch (contextError) {
+          logger.warn('Failed to close context during cancellation', { error: contextError });
+        }
+      }
+
+      return {
+        success: false,
+        status: 'cancelled',
+        logs: [],
+        networkLogs: [],
+        errors: [{
+          type: 'cancelled',
+          message: 'Test was cancelled by user',
+          timestamp: new Date(),
+        }],
+        error: 'Test cancelled',
+      };
+    }
+
     // ✅ FIX: Explicitly extract error details for better debugging
     logger.error('Playwright test failed', {
       testId: testData.testId,
@@ -502,15 +674,15 @@ export async function executePlaywrightTestWithRetry(
   });
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (attempt > 0) {
-      const retryDelay = 2000 * attempt;
-      logger.info('[PLAYWRIGHT_RETRY] Retrying Playwright test', {
-        testId: testData.testId,
-        attempt,
-        maxRetries,
-        retryDelay: `${retryDelay}ms`,
-        lastError: lastError instanceof Error ? lastError.message : String(lastError),
-      });
+      if (attempt > 0) {
+        const retryDelay = 2000 * attempt;
+        logger.info('[PLAYWRIGHT_RETRY] Retrying Playwright test', {
+          testId: testData.testId,
+          attempt: attempt + 1, // ✅ FIX: Human-readable numbering (2, 3, 4)
+          maxAttempts: maxRetries + 1,
+          retryDelay: `${retryDelay}ms`,
+          lastError: lastError instanceof Error ? lastError.message : String(lastError),
+        });
       // Wait before retry
       await new Promise((resolve) => setTimeout(resolve, retryDelay));
     } else {
@@ -523,11 +695,20 @@ export async function executePlaywrightTestWithRetry(
     try {
       const result = await executePlaywrightTest(testData);
 
+      // Check if test was cancelled (result will have cancelled status)
+      if (result.status === 'cancelled' || (result.error && result.error.includes('cancelled'))) {
+        logger.info('[PLAYWRIGHT_RETRY] Test was cancelled', {
+          testId: testData.testId,
+          attempt: attempt + 1,
+        });
+        return result; // Return cancelled result immediately, don't retry
+      }
+
       if (result.success) {
         if (attempt > 0) {
           logger.info('[PLAYWRIGHT_RETRY] Test succeeded after retry', {
             testId: testData.testId,
-            successfulAttempt: attempt + 1,
+            successfulAttempt: attempt + 1, // ✅ FIX: Human-readable numbering
             totalAttempts: attempt + 1,
           });
         }
@@ -537,11 +718,33 @@ export async function executePlaywrightTestWithRetry(
       lastError = result.error;
       logger.warn('[PLAYWRIGHT_RETRY] Test attempt returned failure', {
         testId: testData.testId,
-        attempt: attempt + 1,
+        attempt: attempt + 1, // ✅ FIX: Human-readable numbering (1, 2, 3, 4)
+        maxAttempts: maxRetries + 1,
         status: result.status,
         error: result.error,
       });
     } catch (error) {
+      // Check if error is about cancellation
+      if (error instanceof Error && error.message.includes('cancelled')) {
+        logger.info('[PLAYWRIGHT_RETRY] Test was cancelled during execution', {
+          testId: testData.testId,
+          attempt: attempt + 1,
+        });
+        // Return cancelled result
+        return {
+          success: false,
+          status: 'cancelled',
+          logs: [],
+          networkLogs: [],
+          errors: [{
+            type: 'cancelled',
+            message: 'Test was cancelled by user',
+            timestamp: new Date(),
+          }],
+          error: 'Test cancelled',
+        };
+      }
+
       lastError = error;
       // ✅ FIX: Enhanced error logging with full context
       logger.warn('[PLAYWRIGHT_RETRY] Test attempt threw exception', {

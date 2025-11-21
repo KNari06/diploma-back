@@ -180,9 +180,10 @@ export class IntelligentPageAnalyzer {
     }
 
     try {
-      // Wait for page to be stable
-      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-        logger.warn('[INTELLIGENT_ANALYZER] Network not idle, proceeding anyway');
+      // ✅ FIX: Don't wait for networkidle in analyzer - request tracking already done in playwright.service
+      // Just ensure DOM is ready
+      await page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {
+        logger.debug('[INTELLIGENT_ANALYZER] DOM not fully loaded, proceeding anyway');
       });
 
       const screenshot = await page.screenshot({

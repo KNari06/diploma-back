@@ -397,6 +397,22 @@ const startServer = async () => {
       if (server) {
         initializeWebSocket(server);
         logger.info('🌐 WebSocket server initialized');
+
+        // ✅ NEW: Start Redis subscriber for worker events
+        // This bridges worker process events to WebSocket clients
+        try {
+          const { webSocketRedisSubscriber } = await import('@/websocket/redis-subscriber');
+          await webSocketRedisSubscriber.start();
+          logger.info('📡 WebSocket Redis subscriber started (worker → WebSocket bridge)');
+        } catch (subError) {
+          logger.error('[SERVER] Failed to start WebSocket Redis subscriber:', {
+            error: subError instanceof Error ? subError.message : String(subError),
+          });
+          // Continue without subscriber - events from workers will be lost
+          if (env.NODE_ENV !== 'development') {
+            logger.warn('[SERVER] Running without Redis subscriber - worker events will not reach clients!');
+          }
+        }
       }
     } catch (wsError) {
       logger.error('[SERVER] Failed to initialize WebSocket server:', {
@@ -433,6 +449,19 @@ const startServer = async () => {
 
             // Close services in parallel with error handling
             const cleanupResults = await Promise.allSettled([
+              // ✅ NEW: Stop Redis subscriber
+              (async () => {
+                try {
+                  const { webSocketRedisSubscriber } = await import('@/websocket/redis-subscriber');
+                  await webSocketRedisSubscriber.stop();
+                  logger.info('[SERVER] WebSocket Redis subscriber stopped');
+                } catch (error) {
+                  logger.error('[SERVER] Error stopping Redis subscriber:', {
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              })(),
+
               // Close browser pool
               (async () => {
                 try {

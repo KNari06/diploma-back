@@ -84,6 +84,7 @@ export interface NetworkLog {
   requestHeaders: Record<string, string>;
   responseHeaders: Record<string, string>;
   body?: string;
+  responseBody?: any; // ✅ NEW: Response body for API requests (parsed JSON or truncated text)
   timestamp: Date;
 }
 

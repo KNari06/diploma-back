@@ -1,25 +1,49 @@
-import { Job } from 'bullmq';
-import { logger, logQueueEvent } from '@/utils/logger';
-import { handleAgentError, shouldRetry, calculateRetryDelay } from '@/utils/error-handler';
-import { TestJobData, AgentResponse } from '@/types';
-import { dbAdminService } from '@/db/supabase';
-import { QueueManager } from '@/config/queues';
-import { env } from '@/config/env';
 import { executePlaywrightTestWithRetry } from '@/agent';
-import { webSocketService } from '@/websocket/websocket.service';
+import { env } from '@/config/env';
+import { QueueManager } from '@/config/queues';
+import { dbAdminService } from '@/db/supabase';
+import { AgentResponse, TestJobData } from '@/types';
+import { calculateRetryDelay, handleAgentError, shouldRetry } from '@/utils/error-handler';
+import { logger, logQueueEvent } from '@/utils/logger';
 import {
-  TestStartedPayload,
-  TestBrowserCompletedPayload,
-  TestFailedPayload,
-  ResultReadyPayload,
   ResultErrorPayload,
+  ResultReadyPayload,
+  TestBrowserCompletedPayload,
+  TestCancelledPayload,
+  TestFailedPayload,
+  TestStartedPayload,
 } from '@/websocket/types';
+import { webSocketService } from '@/websocket/websocket.service';
+import { Job } from 'bullmq';
 
 // Constants
 const MAX_RETRIES = env.AGENT_MAX_RETRIES || 2;
 const DEFAULT_ADMIN_EMAIL = 'admin@qai.so';
 
+/**
+ * Custom error for test cancellation
+ */
+export class TestCancelledError extends Error {
+  constructor(testId: string, browser: string) {
+    super(`Test ${testId} (${browser}) was cancelled`);
+    this.name = 'TestCancelledError';
+  }
+}
+
 export class ManualTestRunJobHandler {
+  /**
+   * Check if test is cancelled
+   */
+  private static async checkTestCancelled(testId: string): Promise<boolean> {
+    try {
+      const test = await dbAdminService.getTest(testId) as any;
+      return test?.status === 'cancelled';
+    } catch (error) {
+      logger.warn(`[TEST-RUN] Failed to check test status: ${testId}`, error);
+      return false; // Don't block execution if check fails
+    }
+  }
+
   /**
    * Process test run job
    */
@@ -30,6 +54,15 @@ export class ManualTestRunJobHandler {
     if (!testId || !url || !browser) {
       throw new Error('Missing required parameters: testId, url, or browser');
     }
+
+    // Check if test was cancelled before starting
+    if (await this.checkTestCancelled(testId)) {
+      logger.info(`[TEST-RUN] Test was cancelled before execution: ${testId} (${browser})`);
+      throw new TestCancelledError(testId, browser);
+    }
+
+    // Check if job was marked for cancellation (via metadata or status)
+    // Note: cancelled flag is not in TestJobData type, but can be checked via test status
 
     logger.info(`[TEST-RUN] Processing job for test: ${testId} (${browser})`, {
       hasCommands: !!commands,
@@ -45,6 +78,12 @@ export class ManualTestRunJobHandler {
       // Update test status to running
       logger.info(`[TEST-RUN] Updating test status to running: ${testId}`);
       await this.updateTestStatus(testId, 'running', new Date().toISOString());
+
+      // Check again after status update (in case it was cancelled between checks)
+      if (await this.checkTestCancelled(testId)) {
+        logger.info(`[TEST-RUN] Test was cancelled after status update: ${testId} (${browser})`);
+        throw new TestCancelledError(testId, browser);
+      }
 
       // Emit WebSocket: test started
       this.emitTestStarted(testId, browser);
@@ -82,10 +121,61 @@ export class ManualTestRunJobHandler {
       if (result.success) {
         await this.handleSuccessfulTest(testId, browser, result);
       } else {
-        throw new Error(result.error || 'Test execution failed');
+        // ✅ FIX: Don't throw exception - executePlaywrightTestWithRetry already exhausted all retries
+        // Just handle the final failure result
+        logger.error(`[TEST-RUN] Test execution failed after all retries: ${testId}`, {
+          testId,
+          browser,
+          url,
+          status: result.status,
+          error: result.error,
+          errors: result.errors?.length || 0,
+        });
+
+        // Mark test as failed (final failure)
+        await this.updateTestStatus(testId, 'failed', undefined, new Date().toISOString());
+
+        // Emit WebSocket events for failure
+        this.emitTestFailed(testId, browser, new Error(result.error || 'Test execution failed'));
+        this.emitResultError(testId, browser, new Error(result.error || 'Test execution failed'));
+
+        // Send failure notification
+        await this.sendFailureNotification(testId, new Error(result.error || 'Test execution failed'));
+
+        // Don't throw - this is the final result after all retries
+        // BullMQ retry should NOT happen here - executePlaywrightTestWithRetry already did all retries
       }
 
     } catch (error) {
+      // Handle test cancellation separately
+      if (error instanceof TestCancelledError) {
+        logger.info(`[TEST-RUN] Test cancelled: ${testId} (${browser})`, {
+          testId,
+          browser,
+        });
+
+        // Emit WebSocket event for cancellation
+        const payload: TestCancelledPayload = {
+          testId,
+          timestamp: new Date().toISOString(),
+        };
+        webSocketService.emitTestCancelled(testId, payload);
+
+        // Don't mark as failed, don't retry, just exit gracefully
+        return {
+          success: false,
+          status: 'cancelled',
+          logs: [],
+          networkLogs: [],
+          errors: [{
+            type: 'cancelled',
+            message: 'Test was cancelled by user',
+            timestamp: new Date(),
+          }],
+          error: 'Test cancelled',
+        };
+      }
+
       // ✅ FIX: Detailed error logging with full context
       logger.error(`[TEST-RUN] Job failed for test ${testId} (${browser}):`, {
         testId,

@@ -18,6 +18,7 @@ interface NetworkLog {
   responseTime: number;
   requestHeaders: Record<string, string>;
   responseHeaders: Record<string, string>;
+  responseBody?: any; // ✅ NEW: Response body for API requests
   timestamp: Date;
 }
 
@@ -66,20 +67,56 @@ export class ResultCollector {
       logger.warn('JavaScript error captured', { message: error.message });
     });
 
-    // Network requests
+    // Network requests with response bodies for intelligent mode
     page.on('response', async (response) => {
       try {
         const request = response.request();
         const timing = response.request().timing();
+        const url = response.url();
+
+        // ✅ FIX: Collect response bodies for important API requests (intelligent mode needs this)
+        let responseBody: any = null;
+        const isImportantRequest =
+          url.includes('/api/') ||
+          url.includes('/graphql') ||
+          url.includes('/rest/') ||
+          (request.resourceType() === 'xhr' || request.resourceType() === 'fetch');
+
+        if (isImportantRequest && response.status() < 400) {
+          try {
+            // Try to get response body (with size limit to avoid memory issues)
+            const contentType = response.headers()['content-type'] || '';
+            if (contentType.includes('application/json') || contentType.includes('text/')) {
+              const body = await response.text();
+              // Limit body size to 100KB to avoid memory issues
+              if (body.length <= 100 * 1024) {
+                try {
+                  responseBody = JSON.parse(body); // Try to parse as JSON
+                } catch {
+                  responseBody = body.substring(0, 10000); // If not JSON, truncate to 10KB
+                }
+              } else {
+                responseBody = { _truncated: true, _size: body.length };
+              }
+            }
+          } catch (bodyError) {
+            // Failed to get body - continue without it
+            logger.debug('[RESULT_COLLECTOR] Failed to capture response body', {
+              url: url.substring(0, 100),
+              error: bodyError instanceof Error ? bodyError.message : String(bodyError),
+            });
+          }
+        }
 
         this.networkLogs.push({
-          url: response.url(),
+          url,
           method: request.method(),
           status: response.status(),
           statusText: response.statusText(),
           responseTime: timing?.responseEnd || 0,
           requestHeaders: await request.allHeaders(),
           responseHeaders: await response.allHeaders(),
+          responseBody, // ✅ NEW: Include response body for API requests
           timestamp: new Date(),
         });
       } catch (error) {
