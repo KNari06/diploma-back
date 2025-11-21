@@ -86,7 +86,21 @@ export class ManualTestRunJobHandler {
       }
 
     } catch (error) {
-      logger.error(`[TEST-RUN] Job failed for test ${testId} (${browser}):`, error);
+      // ✅ FIX: Detailed error logging with full context
+      logger.error(`[TEST-RUN] Job failed for test ${testId} (${browser}):`, {
+        testId,
+        browser,
+        url,
+        intelligentMode,
+        testGoal: testGoal ? `"${testGoal.substring(0, 50)}..."` : undefined,
+        retryAttempt: retryCount,
+        maxRetries: MAX_RETRIES,
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
+      });
 
       // Emit WebSocket events for failure
       this.emitTestFailed(testId, browser, error as Error);

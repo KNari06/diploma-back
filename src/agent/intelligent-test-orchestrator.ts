@@ -126,7 +126,17 @@ export class IntelligentTestOrchestrator {
 
       return result;
     } catch (error) {
-      logger.error('[INTELLIGENT_ORCHESTRATOR] Test failed', { error });
+      // ✅ FIX: Explicitly extract error details for debugging
+      logger.error('[INTELLIGENT_ORCHESTRATOR] Test failed', {
+        testId: this.testId,
+        userId: this.userId,
+        goal: this.config.goal,
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
+      });
 
       this.emitEvent('test_failed', {
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -142,13 +152,35 @@ export class IntelligentTestOrchestrator {
 
   private async mainLoop(): Promise<void> {
     let continueLoop = true;
+    let iteration = 0;
+
+    logger.info('[INTELLIGENT_ORCHESTRATOR] Starting main test loop', {
+      testId: this.testId,
+      goal: this.config.goal,
+      mode: this.config.mode,
+    });
 
     while (continueLoop) {
+      iteration++;
+      logger.info(`[INTELLIGENT_ORCHESTRATOR] Loop iteration ${iteration}`, {
+        testId: this.testId,
+        pagesVisited: this.state.pagesAnalyzed,
+        actionsCompleted: this.state.completedActions.length,
+        currentUrl: this.page.url(),
+      });
+
       // Check limits before each iteration
       const limitsCheck = SafetyGuard.checkLimits(this.state, this.config.safety);
       if (!limitsCheck.safe) {
         logger.warn('[INTELLIGENT_ORCHESTRATOR] Limits exceeded', {
+          testId: this.testId,
+          iteration,
           reason: limitsCheck.reason,
+          stats: {
+            pagesVisited: this.state.pagesAnalyzed,
+            actionsCompleted: this.state.completedActions.length,
+            duration: Date.now() - this.state.startTime,
+          },
         });
 
         this.emitEvent('test_warning', {
@@ -272,7 +304,20 @@ export class IntelligentTestOrchestrator {
         // Small delay between iterations
         await this.page.waitForTimeout(1000);
       } catch (error) {
-        logger.error('[INTELLIGENT_ORCHESTRATOR] Loop iteration failed', { error });
+        // ✅ FIX: Enhanced error logging with iteration context
+        logger.error('[INTELLIGENT_ORCHESTRATOR] Loop iteration failed', {
+          testId: this.testId,
+          iteration,
+          currentUrl: this.page.url(),
+          pagesVisited: this.state.pagesAnalyzed,
+          actionsCompleted: this.state.completedActions.length,
+          errorCount: this.state.errors.length,
+          error: error instanceof Error ? {
+            message: error.message,
+            name: error.name,
+            stack: error.stack,
+          } : String(error),
+        });
 
         this.state.errors.push({
           message: error instanceof Error ? error.message : 'Iteration failed',
@@ -281,11 +326,20 @@ export class IntelligentTestOrchestrator {
 
         // Too many errors? Stop
         if (this.state.errors.length > 5) {
-          logger.error('[INTELLIGENT_ORCHESTRATOR] Too many errors, stopping');
+          logger.error('[INTELLIGENT_ORCHESTRATOR] Too many errors, stopping', {
+            testId: this.testId,
+            totalErrors: this.state.errors.length,
+            recentErrors: this.state.errors.slice(-3).map(e => e.message),
+          });
           break;
         }
 
         // Continue despite error
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Continuing despite error', {
+          testId: this.testId,
+          iteration,
+          errorCount: this.state.errors.length,
+        });
         continue;
       }
     }
@@ -535,15 +589,36 @@ export class IntelligentTestOrchestrator {
           break;
         }
       } catch (error) {
+        // ✅ FIX: Enhanced error logging for action execution
         logger.error('[INTELLIGENT_ORCHESTRATOR] Action execution error', {
-          action: action.description,
-          error,
+          testId: this.testId,
+          action: {
+            type: action.action,
+            description: action.description,
+            selector: action.selector,
+            optional: action.optional,
+          },
+          currentUrl: this.page.url(),
+          error: error instanceof Error ? {
+            message: error.message,
+            name: error.name,
+            stack: error.stack,
+          } : String(error),
         });
 
         success = false;
 
         if (!action.optional) {
+          logger.error('[INTELLIGENT_ORCHESTRATOR] Required action failed, stopping', {
+            testId: this.testId,
+            action: action.description,
+          });
           break;
+        } else {
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] Optional action failed, continuing', {
+            testId: this.testId,
+            action: action.description,
+          });
         }
       }
     }
@@ -631,9 +706,15 @@ export class IntelligentTestOrchestrator {
         timestamp: Date.now(),
       });
     } catch (error) {
+      // ✅ FIX: Enhanced error logging for event emission
       logger.error('[INTELLIGENT_ORCHESTRATOR] Failed to emit event', {
+        testId: this.testId,
         event,
-        error,
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
       });
     }
   }

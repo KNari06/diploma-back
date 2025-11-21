@@ -424,10 +424,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       tracePath,
     };
   } catch (error) {
+    // ✅ FIX: Explicitly extract error details for better debugging
     logger.error('Playwright test failed', {
       testId: testData.testId,
       browser: testData.browser,
-      error,
+      error: error instanceof Error ? {
+        message: error.message,
+        name: error.name,
+        stack: error.stack,
+      } : String(error),
+      url: testData.url,
+      intelligentMode: testData.intelligentMode || false,
     });
 
     // Try to collect partial results and cleanup
@@ -486,40 +493,84 @@ export async function executePlaywrightTestWithRetry(
 ): Promise<ReturnType<typeof executePlaywrightTest>> {
   let lastError: any;
 
+  logger.info('[PLAYWRIGHT_RETRY] Starting test with retry logic', {
+    testId: testData.testId,
+    url: testData.url,
+    browser: testData.browser,
+    intelligentMode: testData.intelligentMode || false,
+    maxRetries,
+  });
+
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (attempt > 0) {
-      logger.info('Retrying Playwright test', {
+      const retryDelay = 2000 * attempt;
+      logger.info('[PLAYWRIGHT_RETRY] Retrying Playwright test', {
         testId: testData.testId,
         attempt,
         maxRetries,
+        retryDelay: `${retryDelay}ms`,
+        lastError: lastError instanceof Error ? lastError.message : String(lastError),
       });
       // Wait before retry
-      await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+      await new Promise((resolve) => setTimeout(resolve, retryDelay));
+    } else {
+      logger.info('[PLAYWRIGHT_RETRY] Initial test attempt', {
+        testId: testData.testId,
+        url: testData.url,
+      });
     }
 
     try {
       const result = await executePlaywrightTest(testData);
 
       if (result.success) {
+        if (attempt > 0) {
+          logger.info('[PLAYWRIGHT_RETRY] Test succeeded after retry', {
+            testId: testData.testId,
+            successfulAttempt: attempt + 1,
+            totalAttempts: attempt + 1,
+          });
+        }
         return result;
       }
 
       lastError = result.error;
+      logger.warn('[PLAYWRIGHT_RETRY] Test attempt returned failure', {
+        testId: testData.testId,
+        attempt: attempt + 1,
+        status: result.status,
+        error: result.error,
+      });
     } catch (error) {
       lastError = error;
-      logger.warn('Test attempt failed', {
+      // ✅ FIX: Enhanced error logging with full context
+      logger.warn('[PLAYWRIGHT_RETRY] Test attempt threw exception', {
         testId: testData.testId,
-        attempt,
-        error,
+        attempt: attempt + 1,
+        url: testData.url,
+        browser: testData.browser,
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
       });
     }
   }
 
   // All retries exhausted
-  logger.error('Test failed after all retries', {
+  logger.error('[PLAYWRIGHT_RETRY] Test failed after all retries', {
     testId: testData.testId,
+    url: testData.url,
+    browser: testData.browser,
+    intelligentMode: testData.intelligentMode || false,
     maxRetries,
-    lastError,
+    totalAttempts: maxRetries + 1,
+    lastError: lastError instanceof Error ? {
+      message: lastError.message,
+      name: lastError.name,
+      stack: lastError.stack,
+    } : String(lastError),
   });
 
   return {

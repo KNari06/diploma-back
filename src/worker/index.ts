@@ -44,10 +44,14 @@ const testRunWorker = new Worker(
       throw new Error('Invalid job: missing id');
     }
 
-    logger.info(`[TEST_RUN_WORKER] Processing job: ${job.id}`, {
+    const startTime = Date.now();
+    logger.info(`[TEST_RUN_WORKER] 🔄 Processing job: ${job.id}`, {
       testId: job.data?.testId,
+      url: job.data?.url,
       browser: job.data?.browser,
       intelligentMode: job.data?.intelligentMode,
+      retryCount: job.data?.retryCount || 0,
+      jobAttempts: job.attemptsMade,
     });
 
     try {
@@ -57,12 +61,33 @@ const testRunWorker = new Worker(
       }
 
       const result = await ManualTestRunJobHandler.process(job);
-      logger.info(`[TEST_RUN_WORKER] Job completed successfully: ${job.id}`);
+      const duration = Date.now() - startTime;
+
+      logger.info(`[TEST_RUN_WORKER] ✅ Job completed successfully: ${job.id}`, {
+        testId: job.data?.testId,
+        browser: job.data?.browser,
+        duration: `${duration}ms`,
+        attemptsMade: job.attemptsMade,
+      });
+
       return result;
     } catch (error) {
-      logger.error(`[TEST_RUN_WORKER] Job failed: ${job.id}`, {
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
+      const duration = Date.now() - startTime;
+
+      // ✅ FIX: Enhanced error logging with full context
+      logger.error(`[TEST_RUN_WORKER] ❌ Job failed: ${job.id}`, {
+        testId: job.data?.testId,
+        url: job.data?.url,
+        browser: job.data?.browser,
+        intelligentMode: job.data?.intelligentMode,
+        retryCount: job.data?.retryCount || 0,
+        jobAttempts: job.attemptsMade,
+        duration: `${duration}ms`,
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
         jobData: job.data ? JSON.stringify(job.data).substring(0, 200) : 'N/A',
       });
       throw error;

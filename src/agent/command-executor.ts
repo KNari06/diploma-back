@@ -1,6 +1,6 @@
-import { Page } from 'playwright';
+import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/logger';
-import { PlaywrightCommand, PlaywrightActionType } from '@/types';
+import { Page } from 'playwright';
 
 /**
  * Execute Playwright commands on a page
@@ -171,10 +171,20 @@ export class CommandExecutor {
       return { success: true };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error(`Command execution failed: ${action}`, {
+      // ✅ FIX: Enhanced error logging with full context
+      logger.error(`[COMMAND_EXECUTOR] Command execution failed: ${action}`, {
         action,
         selector,
-        error: errorMessage,
+        value: value ? String(value).substring(0, 100) : undefined,
+        url,
+        timeout,
+        description,
+        currentUrl: this.page.url(),
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
       });
 
       if (continueOnError) {
@@ -197,7 +207,9 @@ export class CommandExecutor {
     const results: Array<{ command: PlaywrightCommand; result: any }> = [];
     const errors: Array<{ command: PlaywrightCommand; error: string }> = [];
 
-    for (const command of commands) {
+    for (let index = 0; index < commands.length; index++) {
+      const command = commands[index];
+
       try {
         const result = await this.executeCommand(command);
         results.push({ command, result });
@@ -210,7 +222,22 @@ export class CommandExecutor {
         errors.push({ command, error: errorMessage });
 
         if (!command.continueOnError) {
-          logger.error('Command execution stopped due to error', { command, error: errorMessage });
+          // ✅ FIX: Enhanced error logging with full command context
+          logger.error('[COMMAND_EXECUTOR] Command execution stopped due to error', {
+            command: {
+              action: command.action,
+              selector: command.selector,
+              description: command.description,
+              index: index,
+            },
+            totalCommands: commands.length,
+            currentUrl: this.page.url(),
+            error: error instanceof Error ? {
+              message: error.message,
+              name: error.name,
+              stack: error.stack,
+            } : String(error),
+          });
           break;
         }
       }

@@ -18,7 +18,12 @@ import {
   buildNextStepPrompt,
 } from '@/ai/prompts/index';
 
-const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+// ✅ FIX: Add timeout to prevent hanging requests
+const openai = new OpenAI({
+  apiKey: env.OPENAI_API_KEY,
+  timeout: 60000, // 60 seconds timeout for OpenAI API calls
+  maxRetries: 2,  // Retry failed requests up to 2 times
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ACTION GENERATOR

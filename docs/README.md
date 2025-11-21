@@ -35,6 +35,7 @@
 - [**Руководство разработчика**](./development/README.md) - как разрабатывать
 - [**Стандарты кодирования**](./development/coding-standards.md) - правила написания кода
 - [**🤖 Intent Parsing Guide**](./development/INTENT_PARSING_GUIDE.md) - ✨ Context-First AI подход и трекинг изменений
+- [**🔍 Playwright Logging Improvements**](./development/PLAYWRIGHT_LOGGING_IMPROVEMENTS.md) - Детальное логирование всего testing flow
 - [**Auth Implementation**](./development/auth-implementation.md) - технические детали аутентификации
 - [**Auth Validation**](./development/auth-validation.md) - отчет проверки auth файлов
 - [**Anonymous User Migration**](./development/anonymous-user-migration.md) - миграция анонимных пользователей

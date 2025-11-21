@@ -36,10 +36,25 @@ const transports: winston.transport[] = [
   new winston.transports.Console({
     format: winston.format.combine(
       winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss:ms' }),
+      winston.format.errors({ stack: true }), // ← FIX: Extract error.stack
       winston.format.colorize({ all: true }),
-      winston.format.printf(
-        (info) => `${info.timestamp} ${info.level}: ${info.message}`
-      )
+      winston.format.printf((info) => {
+        // Include all metadata fields (error details, context, etc.)
+        const { timestamp, level, message, stack, ...meta } = info;
+        let logMessage = `${timestamp} ${level}: ${message}`;
+
+        // If error stack exists, append it
+        if (stack) {
+          logMessage += `\n${stack}`;
+        }
+
+        // If there's additional metadata, stringify it
+        if (Object.keys(meta).length > 0) {
+          logMessage += `\n${JSON.stringify(meta, null, 2)}`;
+        }
+
+        return logMessage;
+      })
     ),
   }),
 ];

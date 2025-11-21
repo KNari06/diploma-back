@@ -17,7 +17,12 @@ import {
 import { buildPageAnalysisPrompt, buildLogicAnalysisPrompt } from '@/ai/prompts/index';
 import { analyzeDOMStructure } from '@/services/testing/ui/autonomous/dom-analyzer.service';
 
-const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+// ✅ FIX: Add timeout to prevent hanging requests (default is 10 minutes!)
+const openai = new OpenAI({
+  apiKey: env.OPENAI_API_KEY,
+  timeout: 60000, // 60 seconds timeout for OpenAI API calls
+  maxRetries: 2,  // Retry failed requests up to 2 times
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MAIN ANALYZER
@@ -48,33 +53,59 @@ export class IntelligentPageAnalyzer {
 
     try {
       // Parallel analysis for speed
+      logger.info('[INTELLIGENT_ANALYZER] Starting parallel screenshot & DOM capture', { url });
       const [screenshot, domAnalysis] = await Promise.all([
         this.captureScreenshot(page, mode),
         this.analyzeDOMFull(page),
       ]);
+      logger.info('[INTELLIGENT_ANALYZER] Screenshot & DOM captured successfully', {
+        url,
+        screenshotSize: screenshot ? `${Math.round(screenshot.length / 1024)}KB` : 'skipped',
+        domElementsCount: {
+          forms: domAnalysis.forms.length,
+          buttons: domAnalysis.buttons.length,
+          links: domAnalysis.links.length,
+          inputs: domAnalysis.inputs.length,
+        },
+      });
 
       // Vision analysis (conditional based on mode)
       let visionAnalysis: VisionAnalysis;
 
       if (mode === 'full' || (mode === 'balanced' && await this.shouldUseVision(domAnalysis))) {
-        logger.info('[INTELLIGENT_ANALYZER] Using GPT-4 Vision for analysis');
+        logger.info('[INTELLIGENT_ANALYZER] Using GPT-4 Vision for analysis', { url });
+        const visionStartTime = Date.now();
         visionAnalysis = await this.analyzeWithVision(
           screenshot,
           url,
           goal,
           previousContext
         );
+        logger.info('[INTELLIGENT_ANALYZER] Vision analysis completed', {
+          url,
+          duration: `${Date.now() - visionStartTime}ms`,
+          pageType: visionAnalysis.pageType,
+          elementsFound: visionAnalysis.elements.length,
+        });
       } else {
-        logger.info('[INTELLIGENT_ANALYZER] Using DOM-only analysis (fast mode)');
+        logger.info('[INTELLIGENT_ANALYZER] Using DOM-only analysis (fast mode)', { url });
         visionAnalysis = await this.analyzeWithoutVision(domAnalysis, url);
       }
 
       // Understand logical dependencies
+      logger.info('[INTELLIGENT_ANALYZER] Starting logic analysis', { url });
+      const logicStartTime = Date.now();
       const logicAnalysis = await this.analyzeLogic(
         visionAnalysis.pageType,
         visionAnalysis.elements,
         domAnalysis
       );
+      logger.info('[INTELLIGENT_ANALYZER] Logic analysis completed', {
+        url,
+        duration: `${Date.now() - logicStartTime}ms`,
+        requiredActions: logicAnalysis.requiredActions.length,
+        possibleActions: logicAnalysis.possibleActions.length,
+      });
 
       // Build complete context
       const context: PageContext = {
@@ -100,7 +131,15 @@ export class IntelligentPageAnalyzer {
 
       return context;
     } catch (error) {
-      logger.error('[INTELLIGENT_ANALYZER] Page analysis failed', { error, url });
+      // ✅ FIX: Explicitly extract error details for debugging
+      logger.error('[INTELLIGENT_ANALYZER] Page analysis failed', {
+        url,
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
+      });
 
       // Return minimal fallback context
       return {
