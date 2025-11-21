@@ -430,7 +430,7 @@ async function handlePendingTestPlanApproval(params: {
 
   if (chatSessionId) {
     try {
-      const recentMessages = await ChatService.getRecentMessages(chatSessionId, 5); // Last 5 messages
+      const recentMessages = await ChatService.getRecentMessages(chatSessionId, userId, 5); // Last 5 messages (SECURITY: Pass userId)
 
       // Find last AI message
       const lastAiMessage = recentMessages
