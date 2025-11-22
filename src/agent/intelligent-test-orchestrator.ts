@@ -212,7 +212,7 @@ export class IntelligentTestOrchestrator {
         result.success = false;
         result.summary = `❌ Test failed: ${isValidTest.reason}`;
         result.errors.push({
-          message: isValidTest.reason,
+          message: isValidTest.reason ?? "Unknown reason",
           page: this.state.currentUrl || this.config.startUrl,
         });
 
