@@ -264,13 +264,8 @@ function generateFooter(
   });
 
   // ✅ FIX: Natural, conversational footer - sounds like AI, not a bot
-  if (lang === 'ru') {
-    return `План действителен до ${expiresTime}.\n` +
-      `Если подходит - дай знать, запущу тест. Если нужно что-то изменить - скажи, скорректирую.\n`;
-  } else {
-    return `Plan valid until ${expiresTime}.\n` +
-      `Let me know if you want to proceed with this test, or if you'd like to adjust anything.\n`;
-  }
+  return `Plan valid until ${expiresTime}.\n` +
+    `Let me know if you want to proceed with this test, or if you'd like to adjust anything.\n`;
 }
 
 

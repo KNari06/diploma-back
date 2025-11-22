@@ -479,7 +479,7 @@ export class SmartApiContextService {
     if (context.missingInfo.baseUrl) {
       questions.push({
         id: 'base_url',
-        question: `Базовый URL для тестирования ${intent.apiUrl}`,
+        question: `Base URL for testing ${intent.apiUrl}`,
         type: 'url',
         required: true,
         suggestions: UrlResolverService.generateBaseUrlSuggestions(intent.apiUrl || ''),
@@ -490,7 +490,7 @@ export class SmartApiContextService {
       const authType = context.environment?.auth_type || 'bearer';
       questions.push({
         id: 'auth_token',
-        question: `Токен авторизации (${authType})`,
+        question: `Authorization token (${authType})`,
         type: 'text',
         required: true,
         suggestions: authType === 'bearer' ? ['Bearer your-token-here'] : ['your-api-key-here'],
@@ -500,7 +500,7 @@ export class SmartApiContextService {
     if (context.missingInfo.requestBody && ['POST', 'PUT', 'PATCH'].includes(intent.apiMethod || '')) {
       questions.push({
         id: 'request_body',
-        question: 'Пример тела запроса (JSON)',
+        question: 'Request body example (JSON)',
         type: 'json',
         required: false,
         suggestions: ['{"name": "test", "active": true}'],
@@ -510,7 +510,7 @@ export class SmartApiContextService {
     if (context.missingInfo.customHeaders) {
       questions.push({
         id: 'custom_headers',
-        question: 'Дополнительные заголовки (JSON)',
+        question: 'Additional headers (JSON)',
         type: 'json',
         required: false,
         suggestions: ['{"X-Custom-Header": "value"}'],

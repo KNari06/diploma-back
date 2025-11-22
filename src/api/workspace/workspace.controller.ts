@@ -1,8 +1,8 @@
+import { supabaseAdmin } from '@/db/supabase';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { WorkspaceCreateRequest } from '@/types';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
-import { supabaseAdmin } from '@/db/supabase';
 
 // UUID validation regex
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -294,7 +294,7 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
       res.status(401).json({
         success: false,
         error: 'Unauthorized',
-        message: 'Требуется авторизация',
+        message: 'Authentication required',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -314,7 +314,7 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
       res.status(400).json({
         success: false,
         error: 'Missing workspace ID',
-        message: 'Не указан ID workspace',
+        message: 'Workspace ID is required',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -338,7 +338,7 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
       res.status(404).json({
         success: false,
         error: 'Workspace not found',
-        message: 'Workspace не найден',
+        message: 'Workspace not found',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -372,7 +372,7 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to get workspace',
-      message: 'Не удалось получить workspace',
+      message: 'Failed to get workspace',
       timestamp: new Date().toISOString(),
     });
   }
@@ -392,7 +392,7 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
       res.status(401).json({
         success: false,
         error: 'Unauthorized',
-        message: 'Требуется авторизация',
+        message: 'Authentication required',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -412,7 +412,7 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
       res.status(400).json({
         success: false,
         error: 'Missing workspace ID',
-        message: 'Не указан ID workspace',
+        message: 'Workspace ID is required',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -523,7 +523,7 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
       res.status(404).json({
         success: false,
         error: 'Workspace not found',
-        message: 'Workspace не найден',
+        message: 'Workspace not found',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -532,7 +532,7 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
     res.json({
       success: true,
       data: workspace,
-      message: 'Workspace успешно обновлен',
+      message: 'Workspace updated successfully',
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -546,7 +546,7 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to update workspace',
-      message: 'Не удалось обновить workspace',
+      message: 'Failed to update workspace',
       timestamp: new Date().toISOString(),
     });
   }
@@ -565,7 +565,7 @@ export const deleteWorkspace = async (req: Request, res: Response): Promise<void
       res.status(401).json({
         success: false,
         error: 'Unauthorized',
-        message: 'Требуется авторизация',
+        message: 'Authentication required',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -585,7 +585,7 @@ export const deleteWorkspace = async (req: Request, res: Response): Promise<void
       res.status(400).json({
         success: false,
         error: 'Missing workspace ID',
-        message: 'Не указан ID workspace',
+        message: 'Workspace ID is required',
         timestamp: new Date().toISOString(),
       });
       return;
@@ -619,7 +619,7 @@ export const deleteWorkspace = async (req: Request, res: Response): Promise<void
 
     res.json({
       success: true,
-      message: 'Workspace успешно удален',
+      message: 'Workspace deleted successfully',
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -633,7 +633,7 @@ export const deleteWorkspace = async (req: Request, res: Response): Promise<void
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to delete workspace',
-      message: 'Не удалось удалить workspace',
+      message: 'Failed to delete workspace',
       timestamp: new Date().toISOString(),
     });
   }

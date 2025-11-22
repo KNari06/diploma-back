@@ -4,7 +4,7 @@ import { QueueMonitor } from '@/utils/queue-monitor';
 
 /**
  * GET /api/v1/queue/status
- * Получить состояние очереди (для debugging)
+ * Get queue status (for debugging)
  */
 export const getQueueStatus = async (req: Request, res: Response) => {
   try {
@@ -52,7 +52,7 @@ export const getQueueStatus = async (req: Request, res: Response) => {
 
 /**
  * GET /api/v1/queue/job/:jobId
- * Получить информацию о конкретном job
+ * Get information about a specific job
  */
 export const getJobStatus = async (req: Request, res: Response) => {
   try {

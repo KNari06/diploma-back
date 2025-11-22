@@ -88,8 +88,8 @@ export const getUserCredits = async (req: Request, res: Response): Promise<void>
         expiresAt: userCredits.subscription_expires_at,
       },
       message: userCredits.credits_balance === 0
-        ? '💳 Купите кредиты для продолжения работы'
-        : `✅ У вас ${userCredits.credits_balance} кредитов`,
+        ? '💳 Purchase credits to continue'
+        : `✅ You have ${userCredits.credits_balance} credits`,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {

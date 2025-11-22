@@ -1,6 +1,6 @@
-import { logger } from '@/utils/logger';
-import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { buildApiTestPlanPrompt } from '@/ai/prompts/index';
+import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { logger } from '@/utils/logger';
 import { randomUUID } from 'crypto';
 
 /**
@@ -210,10 +210,7 @@ export class ApiTestPlanService {
 
     formatted += `**Estimated Duration:** ${plan.estimated_duration}\n\n`;
     formatted += `─────────────────────────────────\n\n`;
-    formatted += `**Actions:**\n`;
-    formatted += `✅ Type "да", "yes", "одобряю" to approve and execute\n`;
-    formatted += `❌ Type "нет", "no", "отклоняю" to cancel\n`;
-    formatted += `✏️ Type your adjustments to modify the test\n`;
+    formatted += `Let me know if you'd like to proceed with this test plan, or if you want me to adjust anything.\n`;
 
     return formatted;
   }

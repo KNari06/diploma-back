@@ -95,7 +95,7 @@ export async function getChatCompletion(
     if (context) {
       messages.push({
         role: 'system',
-        content: `Контекст: ${context}`,
+        content: `Context: ${context}`,
       });
     }
 
@@ -110,7 +110,7 @@ export async function getChatCompletion(
       temperature: 0.5, // Softer, more balanced responses
     });
 
-    const reply = response.choices[0]?.message?.content || '🤖 Не понял запрос.';
+    const reply = response.choices[0]?.message?.content || '🤖 Could not understand the request.';
     const usage = response.usage;
 
     logger.info('[OPENAI] Chat completion successful', {

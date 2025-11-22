@@ -112,7 +112,7 @@ export async function exploreProduct(options: {
 
   try {
     // 1. Launch browser
-    emitExplorationProgress('🌐 Подключаюсь к браузеру...');
+    emitExplorationProgress('🌐 Connecting to browser...');
     const browser = await browserPool.getBrowser('chrome');
     context = await browser.newContext({
       viewport: { width: 1920, height: 1080 },
@@ -128,13 +128,13 @@ export async function exploreProduct(options: {
     // 2. Handle authentication if needed
     if (needsAuth && credentials) {
       logger.info('Performing authentication before exploration');
-      emitExplorationProgress('🔐 Выполняю авторизацию...');
+      emitExplorationProgress('🔐 Performing authentication...');
       await performAuthentication(page, url, credentials);
     }
 
     // 3. Navigate to target URL
     logger.info('Navigating to target URL', { url });
-    emitExplorationProgress(`📄 Открываю страницу ${url}...`);
+    emitExplorationProgress(`📄 Opening page ${url}...`);
 
     // ✅ FIX: Use 'domcontentloaded' instead of 'networkidle' (more reliable for SPAs)
     await page.goto(url, {
@@ -155,7 +155,7 @@ export async function exploreProduct(options: {
 
     // 4. Capture full page screenshot
     logger.info('Capturing screenshot');
-    emitExplorationProgress('📸 Делаю скриншот страницы...');
+    emitExplorationProgress('📸 Taking page screenshot...');
 
     // ✅ FIX: Limit screenshot height to prevent huge images (max 10,000px)
     const viewportHeight = await page.evaluate(() => {
@@ -272,7 +272,7 @@ export async function exploreProduct(options: {
 
     // 6. Analyze with GPT-4o Vision (parallel)
     logger.info('Analyzing screenshot with GPT-4o Vision');
-    emitExplorationProgress('🤖 Анализирую скриншот с помощью GPT-4o Vision...');
+    emitExplorationProgress('🤖 Analyzing screenshot with GPT-4o Vision...');
     const visualAnalysisPromise = analyzeScreenshotWithVision(screenshotBase64, {
       scope,
       url,
@@ -280,7 +280,7 @@ export async function exploreProduct(options: {
 
     // 7. Analyze DOM structure (parallel)
     logger.info('Analyzing DOM structure');
-    emitExplorationProgress('🔍 Анализирую структуру DOM...');
+    emitExplorationProgress('🔍 Analyzing DOM structure...');
     const domAnalysisPromise = analyzeDOMStructure(page);
 
     // ✅ FIX: Add timeout for parallel analysis (30 seconds max)

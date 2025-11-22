@@ -302,25 +302,25 @@ export class UrlResolverService {
       suggestions?: string[];
     }>;
   } {
-    const message = `🔗 Для тестирования API нужен полный URL. Вы указали только путь: \`${relativePath}\`\n\nПожалуйста, укажите базовый URL вашего API:`;
+    const message = `🔗 For API testing, a full URL is required. You provided only a path: \`${relativePath}\`\n\nPlease provide your API base URL:`;
 
     const questions = [
       {
         id: 'base_url',
-        question: 'Базовый URL API (например: https://api.example.com)',
+        question: 'API base URL (e.g., https://api.example.com)',
         type: 'url',
         required: true,
         suggestions,
       },
       {
         id: 'auth_token',
-        question: 'Токен авторизации (если требуется)',
+        question: 'Authorization token (if required)',
         type: 'text',
         required: false,
       },
       {
         id: 'additional_headers',
-        question: 'Дополнительные заголовки (JSON формат, если нужны)',
+        question: 'Additional headers (JSON format, if needed)',
         type: 'json',
         required: false,
       },
@@ -407,11 +407,11 @@ export class UrlResolverService {
       }
 
       return {
-        error: 'Не удалось найти URL в ответе. Пожалуйста, укажите полный URL (например: https://api.example.com)',
+        error: 'Could not find URL in response. Please provide a full URL (e.g., https://api.example.com)',
       };
     } catch (error) {
       return {
-        error: 'Ошибка при обработке ответа. Пожалуйста, укажите корректный URL.',
+        error: 'Error processing response. Please provide a valid URL.',
       };
     }
   }

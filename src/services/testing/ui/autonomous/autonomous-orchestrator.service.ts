@@ -298,7 +298,7 @@ export async function runAutonomousExploration(params: {
 
   try {
     logger.info('[AUTONOMOUS] Step 1: Starting exploration', { userId, projectId });
-    emitProgress('analyzing', '🔍 Начинаю анализ...', 10);
+    emitProgress('analyzing', '🔍 Starting analysis...', 10);
 
     // Parse answers
     logger.info('[AUTONOMOUS] Step 2: Parsing answers', { answers });
@@ -315,7 +315,7 @@ export async function runAutonomousExploration(params: {
       scope: parsedAnswers.scope,
       needsAuth: parsedAnswers.needsAuth,
     });
-    emitProgress('analyzing', '📦 Проверяю кэш...', 15);
+    emitProgress('analyzing', '📦 Checking cache...', 15);
 
     // Check cache first
     logger.info('[AUTONOMOUS] Step 5: Checking cache');
@@ -326,12 +326,12 @@ export async function runAutonomousExploration(params: {
 
     if (cached) {
       logger.info('Using cached exploration', { url: parsedAnswers.url });
-      emitProgress('analyzing', '✅ Использую кэшированные данные', 20);
+      emitProgress('analyzing', '✅ Using cached data', 20);
       exploration = cached;
     } else {
       // Run fresh exploration
       logger.info('[AUTONOMOUS] Step 7: Running fresh exploration');
-      emitProgress('analyzing', '🚀 Запускаю браузер...', 20);
+      emitProgress('analyzing', '🚀 Launching browser...', 20);
 
       // ✅ FIX #5: Handle credentials with proper validation
       let credentials;
@@ -351,7 +351,7 @@ export async function runAutonomousExploration(params: {
         }
 
         // Store credentials securely
-        emitProgress('analyzing', '🔐 Сохраняю учетные данные...', 25);
+        emitProgress('analyzing', '🔐 Saving credentials...', 25);
         const stored = await storeCredentials({
           userId,
           projectId,
@@ -376,7 +376,7 @@ export async function runAutonomousExploration(params: {
       }
 
       // ✅ FIX #1: Add real-time WebSocket events during exploration
-      emitProgress('analyzing', '🌐 Открываю страницу...', 30);
+      emitProgress('analyzing', '🌐 Opening page...', 30);
 
       // Explore product
       logger.info('[AUTONOMOUS] Step 9: Launching browser and exploring product', {
@@ -401,25 +401,25 @@ export async function runAutonomousExploration(params: {
         )
       );
 
-      emitProgress('analyzing', '🔍 Анализирую страницу (это может занять 1-2 минуты)...', 35);
+      emitProgress('analyzing', '🔍 Analyzing page (this may take 1-2 minutes)...', 35);
 
       exploration = await Promise.race([explorationPromise, timeoutPromise]);
 
       logger.info('[AUTONOMOUS] Step 10: Exploration completed successfully');
-      emitProgress('analyzing', '✅ Анализ завершен успешно!', 50);
+      emitProgress('analyzing', '✅ Analysis completed successfully!', 50);
 
       // Save to cache
-      emitProgress('analyzing', '💾 Сохраняю результаты в кэш...', 52);
+      emitProgress('analyzing', '💾 Saving results to cache...', 52);
       const cacheResult = await saveExplorationToCache(exploration, userId, projectId);
       explorationId = cacheResult.id;
     }
 
     // Generate test plan from exploration
     logger.info('[AUTONOMOUS] Step 11: Generating test plan');
-    emitProgress('generating_plan', '📋 Генерирую план тестирования с помощью AI...', 55);
+    emitProgress('generating_plan', '📋 Generating test plan with AI...', 55);
 
     // ✅ ENHANCED: Analyze URL context before generating plan
-    emitProgress('generating_plan', '🧠 Анализирую контекст URL...', 58);
+    emitProgress('generating_plan', '🧠 Analyzing URL context...', 58);
     const urlContext = analyzeUrlContext(parsedAnswers.url);
     const scopeStrategy = getScopeStrategy(parsedAnswers.scope || 'general');
 
@@ -436,11 +436,11 @@ export async function runAutonomousExploration(params: {
       parsedAnswers.scope === 'flow' ||
       parsedAnswers.scope === 'platform';
 
-    emitProgress(
+      emitProgress(
       'generating_plan',
       shouldUseIntelligentMode
-        ? '🤖 Генерирую интеллектуальный план тестирования...'
-        : '📝 Генерирую стандартный план тестирования...',
+        ? '🤖 Generating intelligent test plan...'
+        : '📝 Generating standard test plan...',
       62
     );
 
@@ -471,14 +471,14 @@ export async function runAutonomousExploration(params: {
       intelligentMode: testPlan.intelligentMode || false,
     });
 
-    emitProgress('generating_plan', '✅ План тестирования сгенерирован!', 75);
+    emitProgress('generating_plan', '✅ Test plan generated!', 75);
 
     // Save test plan
-    emitProgress('generating_plan', '💾 Сохраняю план тестирования...', 80);
+    emitProgress('generating_plan', '💾 Saving test plan...', 80);
     await saveTestPlan(testPlan, userId, projectId, explorationId);
 
     // Format for user confirmation
-    emitProgress('generating_plan', '📄 Форматирую план для подтверждения...', 85);
+    emitProgress('generating_plan', '📄 Formatting plan for confirmation...', 85);
 
     // ✅ FIX: Detect user language for natural footer text
     const { detectLanguage } = await import('@/services/kb/kb.service');
@@ -491,7 +491,7 @@ export async function runAutonomousExploration(params: {
       stepsCount: testPlan.steps.length,
     });
 
-    emitProgress('generating_plan', '✅ Все готово! Жду подтверждения...', 100);
+    emitProgress('generating_plan', '✅ All ready! Waiting for confirmation...', 100);
 
     return {
       exploration,

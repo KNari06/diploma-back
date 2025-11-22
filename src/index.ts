@@ -135,11 +135,11 @@ app.get('/api/docs.json', (req: express.Request, res: express.Response) => {
  * /health:
  *   get:
  *     summary: Health check endpoint
- *     description: Проверка состояния сервисов (БД, очередь)
+ *     description: Health check for services (database, queue)
  *     tags: [Health]
  *     responses:
  *       200:
- *         description: Все сервисы работают
+ *         description: All services are operational
  *         content:
  *           application/json:
  *             schema:
@@ -161,7 +161,7 @@ app.get('/api/docs.json', (req: express.Request, res: express.Response) => {
  *                       type: string
  *                       example: healthy
  *       503:
- *         description: Один или несколько сервисов недоступны
+ *         description: One or more services are unavailable
  */
 // Health check endpoint
 app.get('/health', async (req: express.Request, res: express.Response) => {
