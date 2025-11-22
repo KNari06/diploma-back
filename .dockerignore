@@ -1,0 +1,98 @@
+# Environment variables - CRITICAL: Never copy .env files to Docker images!
+.env
+.env.*
+!.env.example
+!env.example
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Documentation (not needed in Docker image)
+README.md
+SECURITY_FIX_REQUIRED.md
+*.md
+docs/
+
+# Docker files (not needed inside image)
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+
+# CI/CD (not needed in image)
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Node modules (will be installed during build)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs (will be built inside container)
+dist/
+build/
+*.tsbuildinfo
+
+# Test files
+coverage/
+test-results/
+.nyc_output/
+*.test.ts
+*.spec.ts
+**/__tests__/
+**/*.test.ts
+**/*.spec.ts
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# SSH Keys and credentials - CRITICAL
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.pub
+
+# AWS/GCP/Azure credentials
+.aws/
+.gcp/
+.azure/
+gcp
+gcp-*
+aws-*
+azure-*
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+dump.rdb
+
+# PM2 config (contains credentials potentially)
+ecosystem.config.js
+.pm2/
+
+# Scripts that might contain credentials
+scripts/deploy*.sh
+scripts/*.key
+scripts/*.pem

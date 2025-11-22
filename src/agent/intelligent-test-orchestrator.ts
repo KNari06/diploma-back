@@ -68,6 +68,64 @@ export class IntelligentTestOrchestrator {
     this.page = page;
     this.commandExecutor = new CommandExecutor(page);
 
+    // ✅ CRITICAL FIX: Verify we're on the correct URL before starting
+    const initialUrl = page.url();
+    if (initialUrl === 'about:blank' || !initialUrl || initialUrl.includes('about:')) {
+      logger.error('[INTELLIGENT_ORCHESTRATOR] Page is on about:blank - navigation failed', {
+        testId: this.testId,
+        expectedUrl: this.config.startUrl,
+        actualUrl: initialUrl,
+      });
+
+      // Try to navigate again
+      try {
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Attempting to navigate to start URL', {
+          testId: this.testId,
+          startUrl: this.config.startUrl,
+        });
+        await page.goto(this.config.startUrl, {
+          waitUntil: 'load',
+          timeout: 30000,
+        });
+
+        const newUrl = page.url();
+        if (newUrl === 'about:blank' || !newUrl || newUrl.includes('about:')) {
+          throw new Error(`Navigation failed: page is at "${newUrl}"`);
+        }
+
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Navigation retry successful', {
+          testId: this.testId,
+          url: newUrl,
+        });
+      } catch (navError) {
+        const errorMsg = `Cannot start test: page is at "${initialUrl}" instead of "${this.config.startUrl}". Navigation error: ${navError instanceof Error ? navError.message : 'Unknown'}`;
+        logger.error('[INTELLIGENT_ORCHESTRATOR] ' + errorMsg, {
+          testId: this.testId,
+          startUrl: this.config.startUrl,
+          currentUrl: page.url(),
+        });
+
+        // Return failed result immediately
+        return {
+          success: false,
+          goal: this.config.goal,
+          startUrl: this.config.startUrl,
+          pagesVisited: 0,
+          actionsTaken: 0,
+          duration: 0,
+          cost: 0,
+          errors: [{
+            message: errorMsg,
+            page: initialUrl,
+          }],
+          warnings: ['Navigation failed - test cannot proceed'],
+          summary: `❌ Test failed: Could not navigate to ${this.config.startUrl}`,
+          pageVisits: [],
+          screenshots: [],
+        };
+      }
+    }
+
     const safetyConfig = SafetyGuard.getConfigForLevel(this.config.safety.level);
 
     // Initialize state
@@ -81,6 +139,7 @@ export class IntelligentTestOrchestrator {
     logger.info('[INTELLIGENT_ORCHESTRATOR] Starting intelligent test', {
       goal: this.config.goal,
       startUrl: this.config.startUrl,
+      actualUrl: page.url(),
       mode: this.config.mode,
       userId: this.userId,
       testId: this.testId,
@@ -132,28 +191,70 @@ export class IntelligentTestOrchestrator {
         return result;
       }
 
-      // Build result for successful completion
+      // Build result and validate it
       const result = this.buildResult(true);
 
-      logger.info('[INTELLIGENT_ORCHESTRATOR] Test completed successfully', {
-        pagesVisited: result.pagesVisited,
-        actionsTaken: result.actionsTaken,
-        duration: `${Math.round(result.duration / 1000)}s`,
-        cost: `$${result.cost.toFixed(3)}`,
-      });
+      // ✅ CRITICAL FIX: Validate test result quality
+      const isValidTest = this.validateTestResult(result);
 
-      // Emit progress: Test completed
+      if (!isValidTest.isValid) {
+        logger.warn('[INTELLIGENT_ORCHESTRATOR] Test completed but result is invalid', {
+          testId: this.testId,
+          reason: isValidTest.reason,
+          stats: {
+            pagesVisited: result.pagesVisited,
+            actionsTaken: result.actionsTaken,
+            successRate: `${Math.round((result.actionsTaken - result.errors.length) / Math.max(result.actionsTaken, 1) * 100)}%`,
+          },
+        });
+
+        // Mark as failed if test was invalid
+        result.success = false;
+        result.summary = `❌ Test failed: ${isValidTest.reason}`;
+        result.errors.push({
+          message: isValidTest.reason,
+          page: this.state.currentUrl || this.config.startUrl,
+        });
+
+        logger.error('[INTELLIGENT_ORCHESTRATOR] Test failed due to invalid result', {
+          testId: this.testId,
+          reason: isValidTest.reason,
+          pagesVisited: result.pagesVisited,
+          actionsTaken: result.actionsTaken,
+          errors: result.errors.length,
+        });
+      } else {
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Test completed successfully', {
+          pagesVisited: result.pagesVisited,
+          actionsTaken: result.actionsTaken,
+          duration: `${Math.round(result.duration / 1000)}s`,
+          cost: `$${result.cost.toFixed(3)}`,
+          successRate: `${Math.round((result.actionsTaken - result.errors.length) / Math.max(result.actionsTaken, 1) * 100)}%`,
+        });
+      }
+
+      // Emit progress: Test completed (with correct status based on result)
       this.progressEmitter?.emit({
         progress: 100,
         phase: 'finalization',
-        currentStep: '✅ Test completed successfully!',
-        status: 'completed',
+        currentStep: result.success
+          ? '✅ Test completed successfully!'
+          : '❌ Test completed with issues',
+        status: result.success ? 'completed' : 'failed',
       });
 
-      this.emitEvent('test_completed', {
-        success: true,
-        summary: result.summary,
-      });
+      // Emit appropriate event based on result
+      if (result.success) {
+        this.emitEvent('test_completed', {
+          success: true,
+          summary: result.summary,
+        });
+      } else {
+        this.emitEvent('test_failed', {
+          error: isValidTest.reason || 'Test failed validation',
+          summary: result.summary,
+        });
+      }
 
       return result;
     } catch (error) {
@@ -226,9 +327,8 @@ export class IntelligentTestOrchestrator {
           actionsCompleted: this.state.completedActions.length,
         });
 
-        this.emitEvent('test_cancelled', {
-          message: 'Test was cancelled by user',
-        });
+        // ✅ FIX: Don't emit event here - it will be emitted in execute() when handling cancellation
+        // This prevents duplicate test_cancelled events
 
         return true; // Return true to indicate cancellation
       }
@@ -721,6 +821,75 @@ export class IntelligentTestOrchestrator {
   // ═══════════════════════════════════════════════════════════════════════════
   // RESULT BUILDING
   // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Validate test result quality
+   * Returns false if test didn't actually test anything meaningful
+   */
+  private validateTestResult(result: IntelligentTestResult): { isValid: boolean; reason?: string } {
+    // Check if all pages were about:blank
+    const aboutBlankPages = result.pageVisits.filter(p =>
+      p.url === 'about:blank' ||
+      p.url.includes('about:') ||
+      !p.url ||
+      p.url === ''
+    ).length;
+
+    if (aboutBlankPages === result.pagesVisited && result.pagesVisited > 0) {
+      return {
+        isValid: false,
+        reason: 'All pages were about:blank - navigation failed, no pages were actually tested',
+      };
+    }
+
+    // Check if we visited the start URL
+    const visitedStartUrl = result.pageVisits.some(p =>
+      p.url && (
+        p.url === this.config.startUrl ||
+        p.url.startsWith(this.config.startUrl.split('?')[0]) // Ignore query params
+      )
+    );
+
+    if (!visitedStartUrl && result.pagesVisited > 0) {
+      return {
+        isValid: false,
+        reason: `Start URL "${this.config.startUrl}" was never visited - navigation may have failed`,
+      };
+    }
+
+    // Check success rate
+    if (result.actionsTaken > 0) {
+      const successCount = result.actionsTaken - result.errors.length;
+      const successRate = successCount / result.actionsTaken;
+
+      if (successRate === 0) {
+        return {
+          isValid: false,
+          reason: 'All actions failed (0% success rate) - test did not successfully interact with the page',
+        };
+      }
+
+      // Warn if success rate is very low
+      if (successRate < 0.2 && result.actionsTaken >= 3) {
+        logger.warn('[INTELLIGENT_ORCHESTRATOR] Very low success rate', {
+          testId: this.testId,
+          successRate: `${Math.round(successRate * 100)}%`,
+          actionsTaken: result.actionsTaken,
+          errors: result.errors.length,
+        });
+      }
+    }
+
+    // Check if we have meaningful page visits
+    if (result.pagesVisited === 0) {
+      return {
+        isValid: false,
+        reason: 'No pages were visited - test did not execute properly',
+      };
+    }
+
+    return { isValid: true };
+  }
 
   private buildResult(success: boolean): IntelligentTestResult {
     const stats = StateTracker.getStatistics(this.state);

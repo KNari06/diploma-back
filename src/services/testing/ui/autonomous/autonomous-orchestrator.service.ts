@@ -479,7 +479,12 @@ export async function runAutonomousExploration(params: {
 
     // Format for user confirmation
     emitProgress('generating_plan', '📄 Форматирую план для подтверждения...', 85);
-    const formattedPlan = formatTestPlanForConfirmation(testPlan);
+
+    // ✅ FIX: Detect user language for natural footer text
+    const { detectLanguage } = await import('@/services/kb/kb.service');
+    const userLanguage = await detectLanguage(userMessage).catch(() => 'neutral' as const);
+
+    const formattedPlan = formatTestPlanForConfirmation(testPlan, userLanguage, userMessage);
 
     logger.info('Autonomous exploration completed', {
       planId: testPlan.id,

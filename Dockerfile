@@ -6,7 +6,8 @@ COPY package*.json ./
 ENV HUSKY=0
 RUN npm ci
 
-# Копируем исходники и билдим
+# Copy source files (note: .env is excluded via .dockerignore)
+# Environment variables should be passed via docker run -e or --env-file at runtime
 COPY . .
 RUN npx tsc -p tsconfig.build.json
 

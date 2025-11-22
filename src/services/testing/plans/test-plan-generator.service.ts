@@ -121,15 +121,22 @@ export async function generateTestPlan(
 /**
  * Format test plan for user confirmation
  * Returns markdown formatted plan
+ * @param plan - Test plan to format
+ * @param userLanguage - Optional user language for localized footer ('en' | 'ru' | 'neutral')
+ * @param userMessage - Optional user message to detect language from
  */
-export function formatTestPlanForConfirmation(plan: TestPlan): string {
+export function formatTestPlanForConfirmation(
+  plan: TestPlan,
+  userLanguage?: 'en' | 'ru' | 'neutral',
+  userMessage?: string
+): string {
   // ✅ UNIFIED: Support both AI-generated and standard test plans
   const isAiGenerated = plan.intelligentMode;
 
   // Header with appropriate mode indication
   let markdown = isAiGenerated
-    ? `# 🧠 AI Test Plan for Confirmation\n\n`
-    : `# 🧪 Test Plan для подтверждения\n\n`;
+    ? `# 🧠 AI Test Plan for Confirmation\n`
+    : `# 🧪 Test Plan для подтверждения\n`;
 
   // Basic info
   markdown += `**Plan ID:** \`${plan.id}\`\n`;
@@ -140,14 +147,14 @@ export function formatTestPlanForConfirmation(plan: TestPlan): string {
     markdown += `**Mode:** 🤖 **AI-Generated Testing**\n`;
   }
 
-  markdown += `**Estimated Duration:** ${plan.estimatedDuration}\n\n`;
+  markdown += `**Estimated Duration:** ${plan.estimatedDuration}\n`;
 
   // Summary
-  markdown += `## 📋 Summary\n\n${plan.summary}\n\n`;
+  markdown += `## 📋 Summary\n${plan.summary}\n`;
 
   // AI-specific estimates (if available)
   if (isAiGenerated && (plan.estimatedPages || plan.estimatedCost)) {
-    markdown += `## 📊 AI Estimates\n\n`;
+    markdown += `## 📊 AI Estimates\n`;
     if (plan.estimatedPages) {
       markdown += `- **Pages to Test:** ${plan.estimatedPages}\n`;
     }
@@ -159,23 +166,23 @@ export function formatTestPlanForConfirmation(plan: TestPlan): string {
 
   // AI explanation (for AI-generated plans)
   if (isAiGenerated) {
-    markdown += `## 🤖 How AI Testing Works\n\n`;
+    markdown += `## 🤖 How AI Testing Works\n`;
     markdown += `This AI-generated test plan will:\n`;
     markdown += `1. **Execute pre-analyzed test steps** tailored to your specific site\n`;
     markdown += `2. **Adapt to page context** based on URL analysis and user intent\n`;
     markdown += `3. **Follow intelligent test scenarios** created by GPT-4o\n`;
-    markdown += `4. **Provide detailed results** with actionable insights\n\n`;
+    markdown += `4. **Provide detailed results** with actionable insights\n`;
   }
 
   // What will be tested
-  markdown += `## ✅ What Will Be Tested\n\n`;
+  markdown += `## ✅ What Will Be Tested\n`;
   for (const item of plan.whatWillBeTested) {
     markdown += `- ${item}\n`;
   }
 
   // What will NOT be tested
   if (plan.whatWillNotBeTested.length > 0) {
-    markdown += `\n## ❌ What Will NOT Be Tested\n\n`;
+    markdown += `\n## ❌ What Will NOT Be Tested\n`;
     for (const item of plan.whatWillNotBeTested) {
       markdown += `- ${item}\n`;
     }
@@ -183,7 +190,7 @@ export function formatTestPlanForConfirmation(plan: TestPlan): string {
 
   // Test Steps (show for non-AI or if steps are meaningful)
   if (!isAiGenerated || (plan.steps && plan.steps.length > 0 && plan.steps.some(s => s.action !== 'intelligent_explore'))) {
-    markdown += `\n## 🔍 Test Steps\n\n`;
+    markdown += `\n## 🔍 Test Steps\n`;
     for (let i = 0; i < plan.steps.length; i++) {
       const step = plan.steps[i];
       markdown += `**${i + 1}. ${step.description}**\n`;
@@ -194,16 +201,16 @@ export function formatTestPlanForConfirmation(plan: TestPlan): string {
       if (step.value) {
         markdown += `   - Value: \`${step.value}\`\n`;
       }
-      markdown += `   - Expected: ${step.expectedOutcome}\n\n`;
+      markdown += `   - Expected: ${step.expectedOutcome}\n`;
     }
   } else if (isAiGenerated) {
     markdown += `\n## 🔍 Test Execution\n\n`;
-    markdown += `⚠️ **Note:** Detailed test steps are AI-generated and will be executed automatically based on the analysis above.\n\n`;
+    markdown += `⚠️ **Note:** Detailed test steps are AI-generated and will be executed automatically based on the analysis above.\n`;
   }
 
   // Risks
   if (plan.risks.length > 0) {
-    markdown += `## 🚨 Potential Risks\n\n`;
+    markdown += `## 🚨 Potential Risks\n`;
     for (const risk of plan.risks) {
       markdown += `- ${risk}\n`;
     }
@@ -212,23 +219,58 @@ export function formatTestPlanForConfirmation(plan: TestPlan): string {
 
   // Safety features (for AI plans)
   if (isAiGenerated) {
-    markdown += `## 🛡️ Safety Features\n\n`;
+    markdown += `## 🛡️ Safety Features\n`;
     markdown += `- Real-time progress updates via WebSocket\n`;
     markdown += `- Automatic detection of dangerous actions (payment, delete, etc.)\n`;
     markdown += `- Intelligent timeout and error handling\n`;
-    markdown += `- Safe execution with rollback capabilities\n\n`;
+    markdown += `- Safe execution with rollback capabilities\n`;
   }
 
   // Footer
-  markdown += `---\n\n`;
-  markdown += `**⏳ Plan expires at:** ${new Date(plan.expiresAt).toLocaleString()}\n\n`;
-  markdown += `💬 **Подтвердить тест план?**\n\n`;
-  markdown += `Напишите свой ответ (любыми словами):\n`;
-  markdown += `- ✅ Да / Давай / Ок / Go / Запускай → Выполнить тест\n`;
-  markdown += `- ❌ Нет / Отмена / Стоп / Cancel → Отклонить\n\n`;
-  markdown += `AI поймёт ваш ответ на любом языке! 🤖\n`;
+  markdown += `---\n`;
+
+  // ✅ FIX: Generate natural, language-aware footer
+  const footer = generateFooter(plan, userLanguage, userMessage);
+  markdown += footer;
 
   return markdown;
+}
+
+/**
+ * Generate natural footer text based on user language
+ * More natural, less bot-like formatting that adapts to user's language
+ */
+function generateFooter(
+  plan: TestPlan,
+  userLanguage?: 'en' | 'ru' | 'neutral',
+  userMessage?: string
+): string {
+  // Auto-detect language from user message if not provided
+  let detectedLang = userLanguage;
+  if (!detectedLang && userMessage) {
+    // Simple detection: if message contains Cyrillic → ru, else → en
+    const hasCyrillic = /[а-яА-ЯёЁ]/.test(userMessage);
+    detectedLang = hasCyrillic ? 'ru' : 'en';
+  }
+
+  // Default to English if no language detected
+  const lang = detectedLang === 'ru' ? 'ru' : 'en';
+
+  // Format expiration time
+  const expiresAt = new Date(plan.expiresAt);
+  const expiresTime = expiresAt.toLocaleString(lang === 'ru' ? 'ru-RU' : 'en-US', {
+    dateStyle: 'short',
+    timeStyle: 'short',
+  });
+
+  // ✅ FIX: Natural, conversational footer - sounds like AI, not a bot
+  if (lang === 'ru') {
+    return `План действителен до ${expiresTime}.\n` +
+      `Если подходит - дай знать, запущу тест. Если нужно что-то изменить - скажи, скорректирую.\n`;
+  } else {
+    return `Plan valid until ${expiresTime}.\n` +
+      `Let me know if you want to proceed with this test, or if you'd like to adjust anything.\n`;
+  }
 }
 
 

@@ -128,18 +128,47 @@ async function createTestUser(userConfig: typeof TEST_USERS[0]): Promise<void> {
         const existingUser = existingUsers?.users.find(u => u.email === userConfig.email);
 
         if (!existingUser) {
-          throw new Error(`User ${userConfig.email} already exists but could not be found`);
+          // ✅ FIX: User might exist in public.users but not in auth.users
+          // Check public.users first
+          const { data: publicUser } = await supabaseAdmin
+            .from('users')
+            .select('id, email')
+            .eq('email', userConfig.email)
+            .single();
+
+          if (publicUser) {
+            logger.warn(`[CREATE_USER] User exists in public.users but NOT in auth.users! Recreating in auth...`);
+            // User exists in public.users but not in auth.users - need to recreate
+            // This can happen if auth.users was cleared but public.users wasn't
+            // We'll need to delete from public.users first, then recreate
+            await supabaseAdmin.from('users').delete().eq('id', publicUser.id);
+            logger.info(`[CREATE_USER] Deleted orphaned user from public.users, will recreate...`);
+            // Retry creation (will go through normal flow)
+            return createTestUser(userConfig);
+          }
+
+          throw new Error(`User ${userConfig.email} already exists but could not be found in auth.users or public.users`);
         }
 
-        // Update existing user's metadata
-        await supabaseAdmin.auth.admin.updateUserById(existingUser.id, {
+        // ✅ FIX: Reset password to ensure access (CRITICAL for session recovery)
+        const { error: passwordResetError } = await supabaseAdmin.auth.admin.updateUserById(existingUser.id, {
+          password: userConfig.password, // Reset password to known value: test123456
           user_metadata: {
             name: userConfig.name,
           },
         });
 
+        if (passwordResetError) {
+          logger.error(`[CREATE_USER] Failed to reset password for ${userConfig.email}`, {
+            error: passwordResetError.message,
+          });
+          // Don't throw - continue with other updates
+        } else {
+          logger.info(`[CREATE_USER] ✅ Password reset for existing user: ${userConfig.email} (password: ${userConfig.password})`);
+        }
+
         // Step 2: Wait a bit for trigger to sync (if needed)
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 1000));
 
         // Step 3: Update public.users with credits and subscription
         const { error: updateError } = await supabaseAdmin
@@ -154,13 +183,38 @@ async function createTestUser(userConfig: typeof TEST_USERS[0]): Promise<void> {
           .eq('id', existingUser.id);
 
         if (updateError) {
-          logger.error(`[CREATE_USER] Failed to update public.users for ${userConfig.email}`, {
-            error: updateError.message,
-          });
-          throw updateError;
-        }
+          // ✅ FIX: If update fails, user might not exist in public.users - create it
+          if (updateError.code === 'PGRST116' || updateError.message.includes('No rows')) {
+            logger.warn(`[CREATE_USER] User not found in public.users, creating...`);
+            const { error: insertError } = await supabaseAdmin
+              .from('users')
+              .insert({
+                id: existingUser.id,
+                email: existingUser.email,
+                name: userConfig.name,
+                role: userConfig.role,
+                credits: userConfig.credits,
+                subscription: userConfig.subscription,
+                created_at: existingUser.created_at || new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              });
 
-        logger.info(`[CREATE_USER] ✅ Updated existing user: ${userConfig.email} (${existingUser.id})`);
+            if (insertError) {
+              logger.error(`[CREATE_USER] Failed to create user in public.users`, {
+                error: insertError.message,
+              });
+              throw insertError;
+            }
+            logger.info(`[CREATE_USER] ✅ Created user in public.users: ${userConfig.email}`);
+          } else {
+            logger.error(`[CREATE_USER] Failed to update public.users for ${userConfig.email}`, {
+              error: updateError.message,
+            });
+            throw updateError;
+          }
+        } else {
+          logger.info(`[CREATE_USER] ✅ Updated existing user: ${userConfig.email} (${existingUser.id})`);
+        }
         return;
       }
 
