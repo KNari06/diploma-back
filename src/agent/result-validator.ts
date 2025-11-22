@@ -29,6 +29,18 @@ export class ResultValidator {
     result: ActionResult,
     page: Page
   ): Promise<ValidationResult> {
+    // ✅ FIX: Wait actions should always pass if execution succeeded
+    // Wait actions don't need text validation - they just wait for timeout
+    if (action.action === 'wait' || action.action === 'waitForSelector' || action.action === 'waitForNavigation') {
+      return {
+        valid: true,
+        expected: 'Wait action should complete without errors',
+        actual: result.success ? 'Wait completed successfully' : 'Wait failed',
+        passed: result.success,
+        message: result.success ? 'Wait action completed' : result.error || 'Wait action failed',
+      };
+    }
+
     if (!action.expectedResult) {
       // No expectation, assume valid
       return {

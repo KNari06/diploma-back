@@ -16,6 +16,8 @@
 
 import { supabaseAdmin } from '../src/db/supabase';
 import { logger } from '../src/utils/logger';
+import { UserCreditsService } from '../src/services/core/user-credits.service';
+import { WorkspaceService } from '../src/services/core/workspace.service';
 
 // Test users configuration
 // All users have: professional plan, 1000 credits
@@ -170,13 +172,12 @@ async function createTestUser(userConfig: typeof TEST_USERS[0]): Promise<void> {
         // Step 2: Wait a bit for trigger to sync (if needed)
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        // Step 3: Update public.users with credits and subscription
+        // Step 3: Update public.users (without credits - they're in user_credits now)
         const { error: updateError } = await supabaseAdmin
           .from('users')
           .update({
             name: userConfig.name,
             role: userConfig.role,
-            credits: userConfig.credits,
             subscription: userConfig.subscription,
             updated_at: new Date().toISOString(),
           })
@@ -193,7 +194,6 @@ async function createTestUser(userConfig: typeof TEST_USERS[0]): Promise<void> {
                 email: existingUser.email,
                 name: userConfig.name,
                 role: userConfig.role,
-                credits: userConfig.credits,
                 subscription: userConfig.subscription,
                 created_at: existingUser.created_at || new Date().toISOString(),
                 updated_at: new Date().toISOString(),
@@ -215,6 +215,29 @@ async function createTestUser(userConfig: typeof TEST_USERS[0]): Promise<void> {
         } else {
           logger.info(`[CREATE_USER] ✅ Updated existing user: ${userConfig.email} (${existingUser.id})`);
         }
+
+        // Step 4: Create/update user_credits
+        await UserCreditsService.getOrCreateUserCredits(existingUser.id);
+        const userCredits = await UserCreditsService.getUserCredits(existingUser.id);
+        if (userCredits && userCredits.credits_balance === 0) {
+          await UserCreditsService.addCredits(
+            existingUser.id,
+            userConfig.credits,
+            'bonus',
+            'Initial credits for test user',
+            {}
+          );
+        }
+        await UserCreditsService.updateSubscription(
+          existingUser.id,
+          userConfig.subscription.plan === 'professional' ? 'pro' : 'free',
+          userConfig.subscription.status === 'active' ? 'active' : 'inactive',
+          null
+        );
+
+        // Step 5: Create workspace
+        await WorkspaceService.checkOrCreateWorkspace(existingUser.id);
+
         return;
       }
 
@@ -230,13 +253,12 @@ async function createTestUser(userConfig: typeof TEST_USERS[0]): Promise<void> {
     // Step 2: Wait a bit for trigger to sync auth.users → public.users
     await new Promise(resolve => setTimeout(resolve, 1000));
 
-    // Step 3: Update public.users with credits and subscription
+    // Step 3: Update public.users (without credits - they're in user_credits now)
     const { error: updateError } = await supabaseAdmin
       .from('users')
       .update({
         name: userConfig.name,
         role: userConfig.role,
-        credits: userConfig.credits,
         subscription: userConfig.subscription,
         updated_at: new Date().toISOString(),
       })
@@ -249,6 +271,25 @@ async function createTestUser(userConfig: typeof TEST_USERS[0]): Promise<void> {
       });
       throw updateError;
     }
+
+    // Step 4: Create user_credits with initial credits
+    await UserCreditsService.getOrCreateUserCredits(authUser.user.id);
+    await UserCreditsService.addCredits(
+      authUser.user.id,
+      userConfig.credits,
+      'bonus',
+      'Initial credits for test user',
+      {}
+    );
+    await UserCreditsService.updateSubscription(
+      authUser.user.id,
+      userConfig.subscription.plan === 'professional' ? 'pro' : 'free',
+      userConfig.subscription.status === 'active' ? 'active' : 'inactive',
+      null
+    );
+
+    // Step 5: Create workspace
+    await WorkspaceService.checkOrCreateWorkspace(authUser.user.id);
 
     logger.info(`[CREATE_USER] ✅ User created successfully: ${userConfig.email} (${authUser.user.id})`);
   } catch (error) {
@@ -296,7 +337,7 @@ async function main() {
   logger.info('[CREATE_TEST_USERS] Verifying created users...');
   const { data: users, error: verifyError } = await supabaseAdmin
     .from('users')
-    .select('id, email, name, role, credits, subscription')
+    .select('id, email, name, role, subscription')
     .in('email', TEST_USERS.map(u => u.email))
     .order('email');
 
@@ -304,9 +345,11 @@ async function main() {
     logger.error('[CREATE_TEST_USERS] Failed to verify users', { error: verifyError.message });
   } else {
     logger.info(`[CREATE_TEST_USERS] ✅ Verified ${users?.length || 0} users in public.users`);
-    users?.forEach(user => {
-      logger.info(`  - ${user.email}: ${user.credits} credits, role: ${user.role}`);
-    });
+    for (const user of users || []) {
+      const userCredits = await UserCreditsService.getUserCredits(user.id);
+      const creditsBalance = userCredits ? userCredits.credits_balance : 0;
+      logger.info(`  - ${user.email}: ${creditsBalance} credits, role: ${user.role}`);
+    }
   }
 
   logger.info('[CREATE_TEST_USERS] ✅ Done!');

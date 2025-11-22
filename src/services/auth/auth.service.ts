@@ -522,12 +522,17 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
             throw new Error('User data not found and could not be created. Please try logging in again.');
           }
 
+          // Get credits from user_credits table
+          const { UserCreditsService } = await import('@/services/core/user-credits.service');
+          const userCredits = await UserCreditsService.getUserCredits(userId);
+          const creditsBalance = userCredits ? (userCredits.credits_balance || 0) : 0;
+
           return {
             id: userId,
             email: userEmail,
             name: retryUserData.name,
             role: retryUserData.role,
-            credits: retryUserData.credits || 0,
+            credits: creditsBalance,
             subscription: retryUserData.subscription,
             created_at: retryUserData.created_at,
           };
@@ -548,23 +553,33 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
 
       logger.info('[AUTH] Fallback user created successfully', { userId });
 
+      // Get credits from user_credits table
+      const { UserCreditsService } = await import('@/services/core/user-credits.service');
+      const userCredits = await UserCreditsService.getUserCredits(userId);
+      const creditsBalance = userCredits ? (userCredits.credits_balance || 0) : 0;
+
       return {
         id: userId,
         email: userEmail,
         name: createdUser.name,
         role: createdUser.role,
-        credits: createdUser.credits || 0,
+        credits: creditsBalance,
         subscription: createdUser.subscription,
         created_at: createdUser.created_at,
       };
     }
+
+    // Get credits from user_credits table
+    const { UserCreditsService } = await import('@/services/core/user-credits.service');
+    const userCredits = await UserCreditsService.getUserCredits(userId);
+    const creditsBalance = userCredits ? (userCredits.credits_balance || 0) : 0;
 
     return {
       id: userId,
       email: userEmail,
       name: userData.name,
       role: userData.role || 'user',
-      credits: userData.credits || 0,
+      credits: creditsBalance,
       subscription: userData.subscription,
       created_at: userData.created_at,
     };
@@ -797,12 +812,17 @@ export async function updateUserProfile(
 
         logger.info('[AUTH] User profile updated successfully', { userId });
 
+        // Get credits from user_credits table
+        const { UserCreditsService } = await import('@/services/core/user-credits.service');
+        const userCredits = await UserCreditsService.getUserCredits(userId);
+        const creditsBalance = userCredits ? (userCredits.credits_balance || 0) : 0;
+
         return {
           id: userId,
           email: userEmail,
           name: updatedUser.name,
           role: updatedUser.role || 'user',
-          credits: updatedUser.credits || 0,
+          credits: creditsBalance,
           subscription: updatedUser.subscription,
           createdAt: updatedUser.created_at,
           updatedAt: updatedUser.updated_at,
@@ -824,12 +844,17 @@ export async function updateUserProfile(
 
     logger.info('[AUTH] User profile updated successfully', { userId });
 
+    // Get credits from user_credits table
+    const { UserCreditsService } = await import('@/services/core/user-credits.service');
+    const userCredits = await UserCreditsService.getUserCredits(userId);
+    const creditsBalance = userCredits ? (userCredits.credits_balance || 0) : 0;
+
     return {
       id: userId,
       email: userEmail,
       name: userData.name || trimmedName,
       role: userData.role || 'user',
-      credits: userData.credits || 0,
+      credits: creditsBalance,
       subscription: userData.subscription,
       createdAt: userData.created_at,
       updatedAt: userData.updated_at,

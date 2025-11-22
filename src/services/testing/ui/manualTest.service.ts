@@ -648,6 +648,13 @@ export class ManualTestService {
       throw new NotFoundError('User', userId);
     }
 
+    // Get credits from user_credits table
+    const { UserCreditsService } = await import('@/services/core/user-credits.service');
+    const userCredits = await UserCreditsService.getOrCreateUserCredits(userId);
+    const availableCredits = Number.isFinite(userCredits.credits_balance)
+      ? (userCredits.credits_balance || 0)
+      : 0;
+
     // Calculate required credits
     const requiredCredits = this.calculateRequiredCredits(browsers, intelligentMode, estimatedCost);
 
@@ -656,11 +663,11 @@ export class ManualTestService {
       intelligentMode,
       estimatedCost,
       requiredCredits,
-      availableCredits: user.credits,
+      availableCredits,
     });
 
-    if (user.credits < requiredCredits) {
-      throw new ValidationError(`Insufficient credits. Required: ${requiredCredits}, Available: ${user.credits}`);
+    if (availableCredits < requiredCredits) {
+      throw new ValidationError(`Insufficient credits. Required: ${requiredCredits}, Available: ${availableCredits}`);
     }
   }
 

@@ -193,43 +193,64 @@ export const requireCredits = (requiredCredits: number = 1) => {
         path: req.path,
       });
 
-      // Get user credits from database
-      const { data: userData, error } = await supabaseAdmin
-        .from('users')
-        .select('credits')
-        .eq('id', userId)
-        .maybeSingle(); // Use maybeSingle() instead of single() - safer
+      // Get user credits from user_credits table
+      const { UserCreditsService } = await import('@/services/core/user-credits.service');
+      const userCredits = await UserCreditsService.getUserCredits(userId);
 
-      if (error) {
-        logger.error('[AUTH] Failed to fetch user credits', {
-          userId,
-          error: error.message,
-          code: error.code,
-          path: req.path,
-        });
-        res.status(500).json({
-          success: false,
-          error: 'Failed to check credits',
-          message: 'Database error while checking credits',
-        });
-        return;
-      }
-
-      // Handle case when user not found
-      if (!userData) {
-        logger.warn('[AUTH] User not found in database', {
+      if (!userCredits) {
+        logger.warn('[AUTH] User credits not found, creating record...', {
           userId,
           path: req.path,
         });
-        res.status(404).json({
-          success: false,
-          error: 'User not found',
-          message: 'User data not found in database',
+        // Create user_credits record if it doesn't exist
+        await UserCreditsService.getOrCreateUserCredits(userId);
+        const retryCredits = await UserCreditsService.getUserCredits(userId);
+        if (!retryCredits) {
+          logger.error('[AUTH] Failed to create user credits', {
+            userId,
+            path: req.path,
+          });
+          res.status(500).json({
+            success: false,
+            error: 'Failed to check credits',
+            message: 'Database error while checking credits',
+          });
+          return;
+        }
+        const currentCredits = Number.isFinite(retryCredits.credits_balance)
+          ? (retryCredits.credits_balance || 0)
+          : 0;
+
+        if (currentCredits < requiredCredits) {
+          logger.warn('[AUTH] Insufficient credits', {
+            userId,
+            currentCredits,
+            requiredCredits,
+            path: req.path,
+          });
+          res.status(402).json({
+            success: false,
+            error: 'Insufficient credits',
+            message: `You need at least ${requiredCredits} credits to perform this action. Current: ${currentCredits}`,
+            currentCredits,
+            requiredCredits,
+          });
+          return;
+        }
+
+        logger.debug('[AUTH] Credits check passed', {
+          userId,
+          currentCredits,
+          requiredCredits,
+          path: req.path,
         });
+        next();
         return;
       }
 
-      const currentCredits = userData.credits || 0;
+      const currentCredits = Number.isFinite(userCredits.credits_balance)
+        ? (userCredits.credits_balance || 0)
+        : 0;
 
       // Check if user has sufficient credits
       if (currentCredits < requiredCredits) {

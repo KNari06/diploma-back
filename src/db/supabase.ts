@@ -494,6 +494,10 @@ export class SupabaseService {
     return data;
   }
 
+  /**
+   * @deprecated Use UserCreditsService.addCredits() instead
+   * This method is kept for backwards compatibility but now uses user_credits table
+   */
   async updateUserCredits(userId: string, amount: number) {
     // Validate inputs
     if (!userId || typeof userId !== 'string') {
@@ -503,33 +507,35 @@ export class SupabaseService {
       throw new Error('Invalid amount: must be a valid number');
     }
 
-    logger.info('[DB] Updating user credits', { userId, amount });
+    logger.warn('[DB] updateUserCredits is deprecated, use UserCreditsService.addCredits() instead', { userId });
 
-    const { data, error } = await (this.client as any)
-      .from('users')
-      .update({
-        credits: amount,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', userId)
-      .select()
-      .maybeSingle(); // Use maybeSingle() for safety
+    // Use UserCreditsService instead of direct update
+    const { UserCreditsService } = await import('@/services/core/user-credits.service');
+    const userCredits = await UserCreditsService.getOrCreateUserCredits(userId);
+    const currentBalance = Number.isFinite(userCredits.credits_balance) ? (userCredits.credits_balance || 0) : 0;
+    const difference = amount - currentBalance;
 
-    if (error) {
-      logger.error('[DB] Failed to update user credits', {
+    if (difference > 0) {
+      // Add credits
+      const result = await UserCreditsService.addCredits(
+        userId,
+        difference,
+        'bonus',
+        `Updated credits via deprecated updateUserCredits method`,
+        {}
+      );
+      return { credits: result.newBalance };
+    } else if (difference < 0) {
+      // This shouldn't happen with this method, but handle it
+      logger.warn('[DB] updateUserCredits called with amount less than current balance', {
         userId,
         amount,
-        error: error.message,
-        code: error.code,
+        currentBalance,
       });
-      throw error;
+      return { credits: currentBalance };
     }
 
-    if (!data) {
-      logger.warn('[DB] User credits update returned no data', { userId });
-    }
-
-    return data as any;
+    return { credits: currentBalance };
   }
 
   // Credit transaction operations
