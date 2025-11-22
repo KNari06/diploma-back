@@ -1,13 +1,4 @@
-# Environment variables - CRITICAL: Never copy .env files to Docker images!
-.env
-.env.*
-!.env.example
-!env.example
 
-# Git
-.git
-.gitignore
-.gitattributes
 
 # Documentation (not needed in Docker image)
 README.md
@@ -15,11 +6,7 @@ SECURITY_FIX_REQUIRED.md
 *.md
 docs/
 
-# Docker files (not needed inside image)
-Dockerfile
-.dockerignore
-docker-compose.yml
-docker-compose.*.yml
+
 
 # CI/CD (not needed in image)
 .github/
