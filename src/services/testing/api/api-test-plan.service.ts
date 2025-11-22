@@ -155,62 +155,101 @@ export class ApiTestPlanService {
   }
 
   /**
-   * Format test plan for user confirmation
+   * Format test plan for user confirmation (compact version)
    */
   static formatApiTestPlanForConfirmation(plan: ApiTestPlan): string {
     let formatted = `📋 **API Test Plan**\n\n`;
-    formatted += `**Summary:** ${plan.summary}\n\n`;
-    formatted += `**Request Details:**\n`;
-    formatted += `• Method: \`${plan.method}\`\n`;
-    formatted += `• URL: \`${plan.url}\`\n`;
-    formatted += `• Expected Status: ${plan.expected_status}\n\n`;
+    formatted += `${plan.summary}\n\n`;
 
-    // Headers
-    if (Object.keys(plan.headers).length > 0) {
-      formatted += `**Headers:**\n`;
-      formatted += '```json\n';
-      formatted += JSON.stringify(plan.headers, null, 2);
-      formatted += '\n```\n\n';
+    // Request details (compact)
+    formatted += `**Request:** \`${plan.method}\` ${plan.url}\n`;
+    formatted += `**Expected Status:** ${plan.expected_status}\n`;
+
+    // ✅ FIX: Check for authentication requirements
+    const authHeaders = ['authorization', 'bearer', 'x-api-key', 'x-auth-token', 'api-key'];
+    const hasAuth = Object.keys(plan.headers).some(key =>
+      authHeaders.some(auth => key.toLowerCase().includes(auth))
+    );
+    const needsAuth = plan.potential_issues.some(issue =>
+      issue.toLowerCase().includes('401') ||
+      issue.toLowerCase().includes('403') ||
+      issue.toLowerCase().includes('authentication') ||
+      issue.toLowerCase().includes('authorization')
+    );
+
+    if (hasAuth) {
+      formatted += `🔐 **Auth:** Required (included in headers)\n`;
+    } else if (needsAuth) {
+      formatted += `⚠️ **Auth:** May be required (401/403 possible)\n`;
     }
 
-    // Body
-    if (plan.body) {
-      formatted += `**Request Body:**\n`;
-      formatted += '```json\n';
-      formatted += JSON.stringify(plan.body, null, 2);
-      formatted += '\n```\n\n';
+    // Headers (only if non-standard and not auth)
+    const standardHeaders = ['Content-Type'];
+    const hasNonStandardHeaders = Object.keys(plan.headers).some(
+      key => !standardHeaders.includes(key) &&
+      !authHeaders.some(auth => key.toLowerCase().includes(auth)) &&
+      (key === 'Content-Type' && plan.headers[key] !== 'application/json')
+    );
+    if (hasNonStandardHeaders && Object.keys(plan.headers).length > 0) {
+      formatted += `**Headers:** ${JSON.stringify(plan.headers)}\n`;
     }
 
-    // Validation steps
-    if (plan.validation_steps.length > 0) {
-      formatted += `**Validation Steps:**\n`;
-      plan.validation_steps.forEach((step, i) => {
-        formatted += `${i + 1}. ${step}\n`;
-      });
-      formatted += '\n';
+    // Body (only if present, show size for large bodies)
+    if (plan.body && Object.keys(plan.body).length > 0) {
+      const bodyStr = JSON.stringify(plan.body);
+      if (bodyStr.length > 100) {
+        formatted += `**Body:** ${bodyStr.substring(0, 80)}... (${bodyStr.length} chars)\n`;
+      } else {
+        formatted += `**Body:** ${bodyStr}\n`;
+      }
     }
 
-    // What will be tested
+    // ✅ FIX: Show important method-specific info
+    if (plan.method.toUpperCase() === 'POST' || plan.method.toUpperCase() === 'PUT' || plan.method.toUpperCase() === 'PATCH') {
+      const hasBody = plan.body && Object.keys(plan.body).length > 0;
+      if (!hasBody) {
+        formatted += `⚠️ **Note:** ${plan.method} request without body\n`;
+      }
+    }
+
+    formatted += `**Duration:** ${plan.estimated_duration}\n`;
+
+    // What will be tested (compact - max 3 items)
     if (plan.what_will_be_tested.length > 0) {
-      formatted += `**What Will Be Tested:**\n`;
-      plan.what_will_be_tested.forEach(item => {
-        formatted += `✓ ${item}\n`;
-      });
+      const items = plan.what_will_be_tested.slice(0, 3);
+      formatted += `**Tests:** ${items.join(', ')}`;
+      if (plan.what_will_be_tested.length > 3) {
+        formatted += ` (+${plan.what_will_be_tested.length - 3} more)`;
+      }
       formatted += '\n';
     }
 
-    // Potential issues
+    // ✅ FIX: Show critical risks (auth, CORS, rate limit)
     if (plan.potential_issues.length > 0) {
-      formatted += `**Potential Issues:**\n`;
-      plan.potential_issues.forEach(issue => {
-        formatted += `⚠️ ${issue}\n`;
-      });
-      formatted += '\n';
+      const criticalIssues = plan.potential_issues
+        .filter(issue => {
+          const lower = issue.toLowerCase();
+          return lower.includes('401') ||
+                 lower.includes('403') ||
+                 lower.includes('500') ||
+                 lower.includes('timeout') ||
+                 lower.includes('cors') ||
+                 lower.includes('rate limit') ||
+                 lower.includes('429');
+        })
+        .slice(0, 3); // Show up to 3 critical issues
+
+      if (criticalIssues.length > 0) {
+        formatted += `**Risks:** ${criticalIssues.join(' • ')}`;
+        if (plan.potential_issues.length > criticalIssues.length) {
+          formatted += ` (+${plan.potential_issues.length - criticalIssues.length} more)`;
+        }
+        formatted += '\n';
+      }
     }
 
-    formatted += `**Estimated Duration:** ${plan.estimated_duration}\n\n`;
-    formatted += `─────────────────────────────────\n\n`;
-    formatted += `Let me know if you'd like to proceed with this test plan, or if you want me to adjust anything.\n`;
+    formatted += `\n---\n`;
+    formatted += `If this looks good, just reply and I'll start testing. If you want to change something, let me know.\n`;
 
     return formatted;
   }

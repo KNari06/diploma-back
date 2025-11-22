@@ -237,21 +237,21 @@ EXAMPLES:
   // Add context if available
   if (context) {
     if (context.documentation && context.documentation.length > 0) {
-      prompt += `\n\n📚 DOCS: ${context.documentation.slice(0, 3).join('\n')}`;
+      prompt += `\n📚 DOCS: ${context.documentation.slice(0, 3).join('\n')}`;
     }
     if (context.knownSelectors && Object.keys(context.knownSelectors).length > 0) {
-      prompt += `\n\n🔍 SELECTORS: ${JSON.stringify(context.knownSelectors, null, 2)}`;
+      prompt += `\n🔍 SELECTORS: ${JSON.stringify(context.knownSelectors, null, 2)}`;
     }
     if (context.tracesContext) {
-      prompt += `\n\n📊 TRACES: ${context.tracesContext}`;
+      prompt += `\n📊 TRACES: ${context.tracesContext}`;
     }
     if (context.projectInfo) {
-      prompt += `\n\n📁 PROJECT: ${context.projectInfo}`;
+      prompt += `\n📁 PROJECT: ${context.projectInfo}`;
     }
   }
 
-  prompt += `\n\n--- USER MESSAGE ---\n${userMessage}`;
-  prompt += `\n\n⚠️ RETURN ONLY VALID JSON (no markdown):`;
+  prompt += `\n--- USER MESSAGE ---\n${userMessage}`;
+  prompt += `\n⚠️ RETURN ONLY VALID JSON (no markdown):`;
 
   return prompt;
 }
@@ -1088,18 +1088,18 @@ export function buildContextString(context?: {
 }): string {
   if (!context) return '';
 
-  let contextStr = '\n\nAVAILABLE CONTEXT:\n';
+  let contextStr = '\nAVAILABLE CONTEXT:\n';
 
   if (context.documentation && context.documentation.length > 0) {
     contextStr += `\nDocumentation:\n${context.documentation.join('\n')}`;
   }
 
   if (context.traces) {
-    contextStr += `\n\nPrevious Test Traces:\n${context.traces}`;
+    contextStr += `\nPrevious Test Traces:\n${context.traces}`;
   }
 
   if (context.projectInfo) {
-    contextStr += `\n\nProject Information:\n${context.projectInfo}`;
+    contextStr += `\nProject Information:\n${context.projectInfo}`;
   }
 
   return contextStr;

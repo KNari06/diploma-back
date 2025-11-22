@@ -1241,7 +1241,7 @@ async function handleApiTest(
         });
       }
 
-      const clarificationMessage = `📋 I need a few more details to set up the API test:\n\n${questions.map(q => `• ${q.question}`).join('\n')}`;
+      const clarificationMessage = `📋 I need a few more details to set up the API test:\n${questions.map(q => `• ${q.question}`).join('\n')}`;
 
       // Save to history
       if (chatSessionId) {
@@ -1605,7 +1605,7 @@ async function handleGeneralChat(
 
   // Enhance system prompt with old context summary
   const enhancedSystemPrompt = oldContextSummary
-    ? `${systemPrompt}\n\n--- Previous Conversation Context ---\n${oldContextSummary}\n\nNote: The above is a summary of earlier messages. Recent messages follow below.`
+    ? `${systemPrompt}\n--- Previous Conversation Context ---\n${oldContextSummary}\n\nNote: The above is a summary of earlier messages. Recent messages follow below.`
     : systemPrompt;
 
   const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
@@ -2209,18 +2209,18 @@ async function formatApiResponse(
 
       if (apiTestResult.responseBody) {
         if (typeof apiTestResult.responseBody === 'object') {
-      responseBodyDisplay = '\n\n**Response Body:**\n```json\n' +
+      responseBodyDisplay = '\n**Response Body:**\n```json\n' +
         JSON.stringify(apiTestResult.responseBody, null, 2) + '\n```';
         } else if (typeof apiTestResult.responseBody === 'string' && apiTestResult.responseBody.length > 0) {
           try {
             const parsed = JSON.parse(apiTestResult.responseBody);
-        responseBodyDisplay = '\n\n**Response Body:**\n```json\n' +
+        responseBodyDisplay = '\n**Response Body:**\n```json\n' +
           JSON.stringify(parsed, null, 2) + '\n```';
           } catch {
             const truncated = apiTestResult.responseBody.length > 500
               ? apiTestResult.responseBody.substring(0, 500) + '...'
               : apiTestResult.responseBody;
-            responseBodyDisplay = '\n\n**Response Body:**\n```\n' + truncated + '\n```';
+            responseBodyDisplay = '\n**Response Body:**\n```\n' + truncated + '\n```';
           }
         }
   }
@@ -2231,14 +2231,14 @@ async function formatApiResponse(
     const { ApiFuzzingFormatterService } = await import('@/services/testing/api/fuzzing/api-fuzzing-formatter.service');
     const fuzzingFormatted = ApiFuzzingFormatterService.formatComprehensiveReport(fuzzingReport);
 
-    finalMessage = `✅ **API Test Results**\n\n` +
+    finalMessage = `✅ **API Test Results**\n` +
       `**Happy Path Test:** PASSED ✅\n` +
       `• URL: ${plan.url}\n` +
       `• Method: ${apiDetails.method}\n` +
       `• Status: ${apiTestResult.status}\n` +
       `• Duration: ${apiTestResult.durationMs}ms\n` +
-      responseBodyDisplay + '\n\n' +
-      '─────────────────────────────────────────────\n\n' +
+      responseBodyDisplay + '\n' +
+      '─────────────────────────────────────────────\n' +
       fuzzingFormatted;
   } else {
     finalMessage = `✅ API test executed successfully!

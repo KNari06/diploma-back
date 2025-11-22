@@ -1,15 +1,15 @@
-import { Job } from 'bullmq';
-import { logger, logQueueEvent, logAIAnalysis } from '@/utils/logger';
-import { handleAIError } from '@/utils/error-handler';
-import { aiService } from '@/services/ai/ai.service';
-import { dbAdminService } from '@/db/supabase';
 import { QueueManager } from '@/config/queues';
-import { webSocketService } from '@/websocket/websocket.service';
+import { dbAdminService } from '@/db/supabase';
+import { aiService } from '@/services/ai/ai.service';
+import { handleAIError } from '@/utils/error-handler';
+import { logAIAnalysis, logger, logQueueEvent } from '@/utils/logger';
 import {
-  AIAnalysisStartedPayload,
   AIAnalysisCompletedPayload,
+  AIAnalysisStartedPayload,
   AIBugFoundPayload,
 } from '@/websocket/types';
+import { webSocketService } from '@/websocket/websocket.service';
+import { Job } from 'bullmq';
 
 // Types for better type safety
 interface BugSeverity {
@@ -235,7 +235,7 @@ export class AIAnalysisJobHandler {
         type: 'email',
         recipient: test.user_id || 'admin@qai.so',
         subject: `🚨 Critical Issues Found: ${testId}`,
-        message: `Critical issues detected in test ${testId}:\n\n${issuesSummary}`,
+        message: `Critical issues detected in test ${testId}:\n${issuesSummary}`,
         data: { testId, criticalBugs, aiSummary },
       });
 

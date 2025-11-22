@@ -371,7 +371,7 @@ export function formatTracesForPrompt(
   // Add known selectors
   if (Object.keys(validSelectors).length > 0) {
     context += '\n=== KNOWN SELECTORS FROM PREVIOUS TESTS ===\n';
-    context += 'Use these exact selectors when they match the user request:\n\n';
+    context += 'Use these exact selectors when they match the user request:\n';
 
     for (const [label, selector] of Object.entries(validSelectors)) {
       context += `- ${label}: "${selector}"\n`;
@@ -385,7 +385,7 @@ export function formatTracesForPrompt(
     context += '\n=== EXAMPLE TEST FLOW FROM PREVIOUS TESTS ===\n';
 
     const steps = (validTraces[0].parsed_data.steps as TraceStep[]).slice(0, 10); // First 10 steps
-    context += 'Here is how a similar test was performed:\n\n';
+    context += 'Here is how a similar test was performed:\n';
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];

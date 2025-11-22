@@ -38,7 +38,7 @@ export interface TestPlan {
 
 /**
  * Generate test plan from exploration results
- * ВАЖНО: Plan требует подтверждения от юзера!
+ * IMPORTANT: Plan requires user confirmation!
  */
 export async function generateTestPlan(
   explorationResult: ExplorationResult,
@@ -136,7 +136,7 @@ export function formatTestPlanForConfirmation(
   // Header with appropriate mode indication
   let markdown = isAiGenerated
     ? `# 🧠 AI Test Plan for Confirmation\n`
-    : `# 🧪 Test Plan для подтверждения\n`;
+    : `# 🧪 Test Plan for Confirmation\n`;
 
   // Basic info
   markdown += `**Plan ID:** \`${plan.id}\`\n`;

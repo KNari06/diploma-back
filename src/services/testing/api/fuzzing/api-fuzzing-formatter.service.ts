@@ -1,4 +1,4 @@
-import { FuzzingReport, SecurityIssue, IssueSeverity } from '@/types';
+import { FuzzingReport, IssueSeverity, SecurityIssue } from '@/types';
 
 /**
  * API Fuzzing Report Formatter
@@ -21,7 +21,7 @@ export class ApiFuzzingFormatterService {
     if (report.issues.length > 0) {
       formatted += this.formatIssues(report.issues);
     } else {
-      formatted += '\n\n✅ **No Security Issues Found!**\n';
+      formatted += '\n✅ **No Security Issues Found!**\n';
       formatted += 'All negative test scenarios passed. The API appears to be well-secured.\n';
     }
 
@@ -46,7 +46,7 @@ export class ApiFuzzingFormatterService {
    * Format report header
    */
   private static formatHeader(): string {
-    return `🔒 **Comprehensive API Security Testing Report**\n\n`;
+    return `🔒 **Comprehensive API Security Testing Report**\n`;
   }
 
   /**
@@ -57,11 +57,11 @@ export class ApiFuzzingFormatterService {
     const passRate = ((summary.passed / summary.totalTests) * 100).toFixed(1);
 
     let formatted = '📊 **Test Summary**\n';
-    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
+    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
     formatted += `• Total Tests: ${summary.totalTests}\n`;
     formatted += `• Passed: ✅ ${summary.passed} (${passRate}%)\n`;
     formatted += `• Failed: ❌ ${summary.failed}\n`;
-    formatted += `• Duration: ${(summary.duration / 1000).toFixed(2)}s\n\n`;
+    formatted += `• Duration: ${(summary.duration / 1000).toFixed(2)}s\n`;
 
     // Test categories breakdown
     const byType = this.groupByType(report);
@@ -78,7 +78,7 @@ export class ApiFuzzingFormatterService {
    */
   private static formatIssues(issues: SecurityIssue[]): string {
     let formatted = '🐛 **Security Issues Found**\n';
-    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
+    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
 
     issues.forEach((issue, index) => {
       formatted += this.formatSingleIssue(issue, index + 1);
@@ -95,20 +95,20 @@ export class ApiFuzzingFormatterService {
     const severityEmoji = this.getSeverityEmoji(issue.severity);
     const severityLabel = issue.severity.toUpperCase();
 
-    let formatted = `**${number}. ${severityEmoji} ${severityLabel}: ${issue.title}**\n\n`;
+    let formatted = `**${number}. ${severityEmoji} ${severityLabel}: ${issue.title}**\n`;
     formatted += `**Category:** ${this.formatTypeName(issue.type)}\n`;
-    formatted += `**Description:** ${issue.description}\n\n`;
-    formatted += `**Risk:** ${issue.risk}\n\n`;
-    formatted += `**Recommendation:** ${issue.recommendation}\n\n`;
+    formatted += `**Description:** ${issue.description}\n`;
+    formatted += `**Risk:** ${issue.risk}\n`;
+    formatted += `**Recommendation:** ${issue.recommendation}\n`;
 
     if (issue.cwe) {
-      formatted += `**Reference:** [${issue.cwe}](https://cwe.mitre.org/data/definitions/${issue.cwe.replace('CWE-', '')}.html)\n\n`;
+      formatted += `**Reference:** [${issue.cwe}](https://cwe.mitre.org/data/definitions/${issue.cwe.replace('CWE-', '')}.html)\n`;
     }
 
     // Evidence with full test details
     formatted += `**📋 Test Details:**\n`;
-    formatted += '```\n' + issue.evidence + '\n```\n\n';
-    formatted += '─────────────────────────────────────────────\n\n';
+    formatted += '```\n' + issue.evidence + '\n```\n';
+    formatted += '─────────────────────────────────────────────\n';
 
     return formatted;
   }
@@ -118,15 +118,15 @@ export class ApiFuzzingFormatterService {
    */
   private static formatSecurityScore(score: number): string {
     let formatted = '🎯 **Security Score**\n';
-    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
+    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
 
     const scoreEmoji = this.getScoreEmoji(score);
     const scoreLabel = this.getScoreLabel(score);
 
-    formatted += `${scoreEmoji} **${score.toFixed(1)}/10** - ${scoreLabel}\n\n`;
+    formatted += `${scoreEmoji} **${score.toFixed(1)}/10** - ${scoreLabel}\n`;
 
     // Score explanation
-    formatted += this.getScoreExplanation(score) + '\n\n';
+    formatted += this.getScoreExplanation(score) + '\n';
 
     return formatted;
   }
@@ -142,7 +142,7 @@ export class ApiFuzzingFormatterService {
     }
 
     let formatted = '✅ **Good Security Practices Detected**\n';
-    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
+    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
 
     // Group passed tests by type
     const byType = passedScenarios.reduce((acc, s) => {
@@ -175,7 +175,7 @@ export class ApiFuzzingFormatterService {
    */
   private static formatRecommendations(recommendations: string[]): string {
     let formatted = '📈 **Recommendations**\n';
-    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
+    formatted += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
 
     recommendations.forEach((rec, index) => {
       formatted += `${index + 1}. ${rec}\n`;
@@ -188,12 +188,12 @@ export class ApiFuzzingFormatterService {
    * Format report footer
    */
   private static formatFooter(): string {
-    let formatted = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
+    let formatted = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
     formatted += '💡 **Next Steps:**\n';
     formatted += '• Review and fix critical/high severity issues immediately\n';
     formatted += '• Implement recommended security controls\n';
     formatted += '• Re-test after fixes to verify improvements\n';
-    formatted += '• Consider regular security testing as part of CI/CD\n\n';
+    formatted += '• Consider regular security testing as part of CI/CD\n';
     formatted += '_Report generated by QAIT Intelligent API Fuzzer_\n';
 
     return formatted;
