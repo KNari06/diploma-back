@@ -4,19 +4,19 @@
  * Understands logical dependencies and creates realistic test scenarios
  */
 
-import { OpenAI } from 'openai';
-import { env } from '@/config/env';
-import { logger } from '@/utils/logger';
-import {
-  PageContext,
-  DynamicAction,
-  TestState,
-  NextStepDecision,
-} from './types/intelligent-testing.types';
 import {
   buildActionGenerationPrompt,
   buildNextStepPrompt,
 } from '@/ai/prompts/index';
+import { env } from '@/config/env';
+import { logger } from '@/utils/logger';
+import { OpenAI } from 'openai';
+import {
+  DynamicAction,
+  NextStepDecision,
+  PageContext,
+  TestState,
+} from './types/intelligent-testing.types';
 
 // ✅ FIX: Add timeout to prevent hanging requests
 const openai = new OpenAI({
@@ -51,6 +51,27 @@ export class ContextualActionGenerator {
       url: context.url,
       goal: state.goal,
     });
+
+    // Early exit: Check for empty/invalid pages before generating actions
+    const isEmptyPage = this.isPageEmpty(context);
+    if (isEmptyPage) {
+      logger.warn('[ACTION_GENERATOR] Empty page detected, skipping action generation', {
+        url: context.url,
+        elementsCount: context.vision.elements.length,
+        domElementsCount: {
+          forms: context.dom.forms?.length || 0,
+          buttons: context.dom.buttons?.length || 0,
+          links: context.dom.links?.length || 0,
+          inputs: context.dom.inputs?.length || 0,
+        },
+      });
+
+      return {
+        actions: [],
+        reasoning: isEmptyPage.reason,
+        confidence: 0.1,
+      };
+    }
 
     try {
       // Build history summary
@@ -113,6 +134,16 @@ export class ContextualActionGenerator {
     } catch (error) {
       logger.error('[ACTION_GENERATOR] Action generation failed', { error });
 
+      // Check if page is empty before generating fallback actions
+      const isEmptyPage = this.isPageEmpty(context);
+      if (isEmptyPage) {
+        return {
+          actions: [],
+          reasoning: isEmptyPage.reason,
+          confidence: 0.1,
+        };
+      }
+
       // Return safe fallback actions
       return {
         actions: this.generateFallbackActions(context),
@@ -120,6 +151,38 @@ export class ContextualActionGenerator {
         confidence: 0.3,
       };
     }
+  }
+
+  /**
+   * Check if page is empty or invalid (about:blank, no elements)
+   * @param context - Current page context
+   * @returns Object with isEmpty flag and reason, or null if page is valid
+   */
+  private static isPageEmpty(context: PageContext): { isEmpty: boolean; reason: string } | null {
+    // Check for about:blank
+    if (context.url === 'about:blank' || context.url.startsWith('about:')) {
+      return {
+        isEmpty: true,
+        reason: 'Page is about:blank (empty browser page). No actions can be performed on this page.',
+      };
+    }
+
+    // Check for completely empty page (no vision elements and no DOM elements)
+    const hasVisionElements = context.vision.elements && context.vision.elements.length > 0;
+    const hasDomElements =
+      (context.dom.forms && context.dom.forms.length > 0) ||
+      (context.dom.buttons && context.dom.buttons.length > 0) ||
+      (context.dom.links && context.dom.links.length > 0) ||
+      (context.dom.inputs && context.dom.inputs.length > 0);
+
+    if (!hasVisionElements && !hasDomElements) {
+      return {
+        isEmpty: true,
+        reason: 'Page has no interactive elements (forms, buttons, links, inputs). No actions can be performed.',
+      };
+    }
+
+    return null; // Page is valid
   }
 
   /**

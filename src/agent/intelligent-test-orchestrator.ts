@@ -68,6 +68,9 @@ export class IntelligentTestOrchestrator {
     this.page = page;
     this.commandExecutor = new CommandExecutor(page);
 
+    // ✅ CRITICAL FIX: Setup navigation listeners to track all URL changes
+    this.setupNavigationListeners();
+
     // ✅ CRITICAL FIX: Verify we're on the correct URL before starting
     const initialUrl = page.url();
     if (initialUrl === 'about:blank' || !initialUrl || initialUrl.includes('about:')) {
@@ -393,7 +396,12 @@ export class IntelligentTestOrchestrator {
         const { actions, reasoning, confidence } = await this.generateActions(context);
 
         if (actions.length === 0) {
-          logger.warn('[INTELLIGENT_ORCHESTRATOR] No actions generated');
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] No actions generated', {
+            url: context.url,
+            reason: reasoning,
+            pageType: context.pageType,
+            elementsCount: context.vision.elements.length,
+          });
 
           // Decide next step
           const decision = await ContextualActionGenerator.decideNextStep(
@@ -535,6 +543,83 @@ export class IntelligentTestOrchestrator {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // NAVIGATION TRACKING
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Setup navigation listeners to track all URL changes in real-time
+   * This helps detect when and why redirects to about:blank happen
+   */
+  private setupNavigationListeners(): void {
+    // Track all frame navigations (main frame + iframes)
+    this.page.on('framenavigated', (frame) => {
+      const url = frame.url();
+      const isMainFrame = frame === this.page.mainFrame();
+
+      logger.debug('[NAVIGATION_TRACKER] Frame navigated', {
+        testId: this.testId,
+        url,
+        isMainFrame,
+        frameName: frame.name() || 'main',
+      });
+
+      // Alert on about:blank redirects
+      if (isMainFrame && (url === 'about:blank' || url.startsWith('about:'))) {
+        logger.warn('[NAVIGATION_TRACKER] ⚠️ Main frame redirected to about:blank', {
+          testId: this.testId,
+          url,
+          stackTrace: new Error().stack?.split('\n').slice(0, 5).join('\n'), // Capture call stack
+        });
+      }
+    });
+
+    // Track responses to detect redirects
+    this.page.on('response', (response) => {
+      const url = response.url();
+      const status = response.status();
+      const headers = response.headers();
+      const location = headers['location'] || headers['Location'];
+
+      // Log redirects (3xx status codes)
+      if (status >= 300 && status < 400 && location) {
+        logger.info('[NAVIGATION_TRACKER] Redirect detected', {
+          testId: this.testId,
+          from: url,
+          to: location,
+          status,
+        });
+
+        // Alert if redirecting to about:blank
+        if (location === 'about:blank' || location.startsWith('about:')) {
+          logger.error('[NAVIGATION_TRACKER] ⚠️ Redirect to about:blank detected', {
+            testId: this.testId,
+            from: url,
+            to: location,
+            status,
+          });
+        }
+      }
+    });
+
+    // Track console errors (might indicate navigation issues)
+    this.page.on('console', (msg) => {
+      if (msg.type() === 'error') {
+        const text = msg.text();
+        if (text.includes('navigation') || text.includes('redirect') || text.includes('about:blank')) {
+          logger.warn('[NAVIGATION_TRACKER] Console error related to navigation', {
+            testId: this.testId,
+            error: text,
+          });
+        }
+      }
+    });
+
+    logger.info('[NAVIGATION_TRACKER] Navigation listeners setup complete', {
+      testId: this.testId,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // STEP IMPLEMENTATIONS
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -542,9 +627,45 @@ export class IntelligentTestOrchestrator {
    * STEP 1: Analyze current page
    */
   private async analyzePage(): Promise<PageContext> {
+    const currentUrl = this.page.url();
+
     logger.info('[INTELLIGENT_ORCHESTRATOR] Analyzing page', {
-      url: this.page.url(),
+      url: currentUrl,
     });
+
+    // ✅ CRITICAL FIX: Check for about:blank before analysis
+    if (currentUrl === 'about:blank' || currentUrl.startsWith('about:')) {
+      logger.warn('[INTELLIGENT_ORCHESTRATOR] Page is about:blank, attempting to navigate back', {
+        testId: this.testId,
+        currentUrl,
+      });
+
+      // Try to go back to previous page
+      try {
+        await this.page.goBack({ timeout: 5000 });
+        const newUrl = this.page.url();
+
+        if (newUrl === 'about:blank' || newUrl.startsWith('about:')) {
+          // Still on about:blank, try to go to start URL
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] Still on about:blank after goBack, navigating to start URL', {
+            startUrl: this.config.startUrl,
+          });
+          await this.page.goto(this.config.startUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+          });
+        }
+
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Successfully recovered from about:blank', {
+          newUrl: this.page.url(),
+        });
+      } catch (recoveryError) {
+        logger.error('[INTELLIGENT_ORCHESTRATOR] Failed to recover from about:blank', {
+          error: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+          currentUrl,
+        });
+      }
+    }
 
     this.emitEvent('page_analyzing', {
       url: this.page.url(),
@@ -681,6 +802,13 @@ export class IntelligentTestOrchestrator {
 
         const urlBefore = this.page.url();
 
+        logger.debug('[INTELLIGENT_ORCHESTRATOR] Before action execution', {
+          testId: this.testId,
+          action: action.description,
+          urlBefore,
+          actionType: action.action,
+        });
+
         // Execute action using CommandExecutor
         const executionResult = await this.commandExecutor.executeCommand({
           action: action.action as any,
@@ -701,6 +829,58 @@ export class IntelligentTestOrchestrator {
 
         const urlAfter = this.page.url();
         const urlChanged = urlBefore !== urlAfter;
+
+        logger.debug('[INTELLIGENT_ORCHESTRATOR] After action execution', {
+          testId: this.testId,
+          action: action.description,
+          urlBefore,
+          urlAfter,
+          urlChanged,
+          executionSuccess: executionResult.success,
+        });
+
+        // ✅ CRITICAL FIX: Check if action redirected to about:blank
+        if (urlAfter === 'about:blank' || urlAfter.startsWith('about:')) {
+          logger.error('[INTELLIGENT_ORCHESTRATOR] Action redirected to about:blank', {
+            testId: this.testId,
+            action: action.description,
+            urlBefore,
+            urlAfter,
+          });
+
+          // Try to go back
+          try {
+            await this.page.goBack({ timeout: 5000 });
+            logger.info('[INTELLIGENT_ORCHESTRATOR] Successfully navigated back from about:blank');
+          } catch (backError) {
+            logger.error('[INTELLIGENT_ORCHESTRATOR] Failed to navigate back from about:blank', {
+              error: backError instanceof Error ? backError.message : String(backError),
+            });
+          }
+
+          // Mark action as failed
+          const actionResult: ActionResult = {
+            action,
+            success: false,
+            error: `Action redirected to empty page (${urlAfter})`,
+            urlChanged: true,
+            urlBefore,
+            urlAfter,
+            timestamp: Date.now(),
+          };
+
+          completedActions.push(actionResult);
+          this.state = StateTracker.recordActionResult(this.state, actionResult);
+
+          this.emitEvent('action_failed', {
+            action: action.description,
+            error: `Redirected to empty page: ${urlAfter}`,
+          });
+
+          // Stop executing remaining actions - we're on invalid page
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] Stopping action execution due to about:blank redirect');
+          break;
+        }
 
         // Create preliminary action result
         const preliminaryResult: ActionResult = {

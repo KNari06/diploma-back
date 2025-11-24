@@ -158,9 +158,9 @@ export function formatTestPlanForConfirmation(
     if (plan.estimatedPages) {
       markdown += `- **Pages to Test:** ${plan.estimatedPages}\n`;
     }
-    if (plan.estimatedCost) {
-      markdown += `- **Estimated Cost:** ${plan.estimatedCost}\n`;
-    }
+    // if (plan.estimatedCost) {
+    //   markdown += `- **Estimated Cost:** ${plan.estimatedCost}\n`;
+    // }
     markdown += '\n';
   }
 
@@ -182,7 +182,7 @@ export function formatTestPlanForConfirmation(
 
   // What will NOT be tested
   if (plan.whatWillNotBeTested.length > 0) {
-    markdown += `\n## ❌ What Will NOT Be Tested\n`;
+    markdown += `## ❌ What Will NOT Be Tested\n`;
     for (const item of plan.whatWillNotBeTested) {
       markdown += `- ${item}\n`;
     }
@@ -214,7 +214,7 @@ export function formatTestPlanForConfirmation(
     for (const risk of plan.risks) {
       markdown += `- ${risk}\n`;
     }
-    markdown += '\n';
+    // markdown += '\n';
   }
 
   // Safety features (for AI plans)
