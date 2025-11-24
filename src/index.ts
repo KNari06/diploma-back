@@ -17,7 +17,7 @@ import workspaceRoutes from '@/api/workspace/workspace.routes';
 import { env, isDevelopment } from '@/config/env';
 import { QueueManager } from '@/config/queues';
 import { swaggerSpec } from '@/config/swagger';
-import { testSupabaseConnection } from '@/db/supabase';
+import { testSupabaseConnection, testSupabaseAuthHealth } from '@/db/supabase';
 import { errorHandler, notFoundHandler } from '@/utils/error-handler';
 import { logger, morganStream } from '@/utils/logger';
 import cors from 'cors';
@@ -173,15 +173,22 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Database check timeout')), 5000)),
       ]),
       Promise.race([
+        testSupabaseAuthHealth(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Auth check timeout')), 5000)),
+      ]),
+      Promise.race([
         QueueManager.healthCheck(),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Queue check timeout')), 5000)),
       ]),
     ]);
 
-    const [dbResult, queueResult] = await healthCheckPromise;
+    const [dbResult, authResult, queueResult] = await healthCheckPromise;
 
     // Safely extract results
     const dbHealth = dbResult.status === 'fulfilled' ? dbResult.value : false;
+    const authHealth = authResult.status === 'fulfilled'
+      ? authResult.value
+      : { healthy: false, error: 'Auth check failed' };
     const queueHealth = queueResult.status === 'fulfilled'
       ? queueResult.value
       : {
@@ -195,18 +202,25 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
         error: dbResult.reason instanceof Error ? dbResult.reason.message : String(dbResult.reason),
       });
     }
+    if (authResult.status === 'rejected') {
+      logger.warn('[HEALTH] Auth check failed', {
+        error: authResult.reason instanceof Error ? authResult.reason.message : String(authResult.reason),
+      });
+    }
     if (queueResult.status === 'rejected') {
       logger.warn('[HEALTH] Queue check failed', {
         error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason),
       });
     }
 
-    const isHealthy = dbHealth && queueHealth.status === 'healthy';
+    const isHealthy = dbHealth && authHealth.healthy && queueHealth.status === 'healthy';
     const health = {
       status: isHealthy ? 'healthy' : 'unhealthy',
       timestamp: new Date().toISOString(),
       services: {
         database: dbHealth ? 'healthy' : 'unhealthy',
+        auth: authHealth.healthy ? 'healthy' : 'unhealthy',
+        authLatency: authHealth.latency ? `${authHealth.latency}ms` : undefined,
         queue: queueHealth.status || 'unhealthy',
       },
       version: process.env.npm_package_version || '1.0.0',

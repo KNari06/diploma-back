@@ -134,11 +134,24 @@ export async function signInWithEmail(
     });
 
     if (error) {
+      // Check if Supabase returned HTML instead of JSON (503/500 errors)
+      const errorMessage = error.message || '';
+      const isSupabaseDown = errorMessage.includes('not valid JSON') ||
+                              errorMessage.includes('Unexpected token') ||
+                              errorMessage.includes('Internal server error');
+
       logger.error('[AUTH] Sign in error', {
         error: error.message,
         code: error.status,
         email: email.substring(0, 5) + '***',
+        supabaseDown: isSupabaseDown,
       });
+
+      // User-friendly error for service unavailability
+      if (isSupabaseDown) {
+        throw new Error('Authentication service temporarily unavailable. Please try again in a moment.');
+      }
+
       throw error;
     }
 
@@ -170,9 +183,19 @@ export async function signInWithEmail(
       },
     };
   } catch (error) {
+    // Enhanced error logging for debugging Supabase issues
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+
     logger.error('[AUTH] Sign in error', {
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage,
       email: email.substring(0, 5) + '***',
+      stack: errorStack,
+      // Check if it's a network/Supabase infrastructure error
+      isNetworkError: errorMessage.includes('fetch') ||
+                       errorMessage.includes('network') ||
+                       errorMessage.includes('ECONNREFUSED') ||
+                       errorMessage.includes('ETIMEDOUT'),
     });
     throw error;
   }

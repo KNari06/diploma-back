@@ -28,7 +28,7 @@ export const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
 });
 
 /**
- * Test Supabase connection
+ * Test Supabase connection (database)
  */
 export const testSupabaseConnection = async (): Promise<boolean> => {
   try {
@@ -54,6 +54,67 @@ export const testSupabaseConnection = async (): Promise<boolean> => {
       error: error instanceof Error ? error.message : String(error),
     });
     return false;
+  }
+};
+
+/**
+ * Test Supabase Auth health
+ * Returns true if Auth service is healthy, false otherwise
+ */
+export const testSupabaseAuthHealth = async (): Promise<{
+  healthy: boolean;
+  error?: string;
+  latency?: number;
+}> => {
+  const startTime = Date.now();
+
+  try {
+    // Attempt a lightweight auth operation (get session)
+    // This will fail gracefully if auth is down
+    const { error } = await supabase.auth.getSession();
+
+    const latency = Date.now() - startTime;
+
+    if (error) {
+      // Check for HTML error response (503/500)
+      const errorMessage = error.message || '';
+      const isSupabaseDown = errorMessage.includes('not valid JSON') ||
+                              errorMessage.includes('Unexpected token') ||
+                              errorMessage.includes('Internal server error') ||
+                              errorMessage.includes('Service Unavailable');
+
+      if (isSupabaseDown) {
+        logger.error('[AUTH_HEALTH] Supabase Auth service is down', {
+          error: errorMessage,
+          latency,
+        });
+        return { healthy: false, error: 'Auth service unavailable', latency };
+      }
+
+      // Other errors (not necessarily downtime)
+      logger.warn('[AUTH_HEALTH] Auth health check returned error', {
+        error: errorMessage,
+        latency,
+      });
+      return { healthy: true, latency }; // Still consider healthy for non-critical errors
+    }
+
+    logger.debug('[AUTH_HEALTH] ✅ Supabase Auth healthy', { latency });
+    return { healthy: true, latency };
+  } catch (error) {
+    const latency = Date.now() - startTime;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    logger.error('[AUTH_HEALTH] Supabase Auth health check exception', {
+      error: errorMessage,
+      latency,
+    });
+
+    return {
+      healthy: false,
+      error: errorMessage,
+      latency,
+    };
   }
 };
 
