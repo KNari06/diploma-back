@@ -545,6 +545,45 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         // Don't fail the test if storage fails
       }
 
+      // ✅ NEW: Upload screenshots from intelligent test to Supabase Storage
+      const screenshotUrls: string[] = [];
+      if (intelligentResult.screenshots && intelligentResult.screenshots.length > 0) {
+        try {
+          const { uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+
+          for (let i = 0; i < intelligentResult.screenshots.length; i++) {
+            const screenshot = intelligentResult.screenshots[i];
+            if (screenshot.screenshot) {
+              try {
+                const screenshotUrl = await uploadScreenshotToStorage(
+                  screenshot.screenshot,
+                  testData.testId,
+                  testData.userId || 'anonymous',
+                  i
+                );
+                screenshotUrls.push(screenshotUrl);
+                logger.info('[PLAYWRIGHT] Intelligent test screenshot uploaded', {
+                  testId: testData.testId,
+                  index: i,
+                  url: screenshotUrl,
+                });
+              } catch (screenshotError) {
+                logger.error('[PLAYWRIGHT] Failed to upload intelligent test screenshot', {
+                  testId: testData.testId,
+                  index: i,
+                  error: screenshotError instanceof Error ? screenshotError.message : String(screenshotError),
+                });
+              }
+            }
+          }
+        } catch (uploadError) {
+          logger.error('[PLAYWRIGHT] Failed to upload intelligent test screenshots', {
+            testId: testData.testId,
+            error: uploadError instanceof Error ? uploadError.message : String(uploadError),
+          });
+        }
+      }
+
       // Convert intelligent result to standard format
       return {
         success: intelligentResult.success,

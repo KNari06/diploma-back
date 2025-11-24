@@ -4,18 +4,18 @@
  * Understands page context, type, and available actions
  */
 
-import { Page } from 'playwright';
-import { OpenAI } from 'openai';
+import { buildLogicAnalysisPrompt, buildPageAnalysisPrompt } from '@/ai/prompts/index';
 import { env } from '@/config/env';
-import { logger } from '@/utils/logger';
-import {
-  PageContext,
-  VisionAnalysis,
-  DOMAnalysis,
-  PageType,
-} from './types/intelligent-testing.types';
-import { buildPageAnalysisPrompt, buildLogicAnalysisPrompt } from '@/ai/prompts/index';
 import { analyzeDOMStructure } from '@/services/testing/ui/autonomous/dom-analyzer.service';
+import { logger } from '@/utils/logger';
+import { OpenAI } from 'openai';
+import { Page } from 'playwright';
+import {
+  DOMAnalysis,
+  PageContext,
+  PageType,
+  VisionAnalysis,
+} from './types/intelligent-testing.types';
 
 // ✅ FIX: Add timeout to prevent hanging requests (default is 10 minutes!)
 const openai = new OpenAI({
@@ -52,6 +52,9 @@ export class IntelligentPageAnalyzer {
     });
 
     try {
+      // ✅ NEW: Wait for modals to appear (many sites show modals with delay)
+      await this.waitForModals(page);
+
       // Parallel analysis for speed
       logger.info('[INTELLIGENT_ANALYZER] Starting parallel screenshot & DOM capture', { url });
       const [screenshot, domAnalysis] = await Promise.all([
@@ -86,11 +89,20 @@ export class IntelligentPageAnalyzer {
           duration: `${Date.now() - visionStartTime}ms`,
           pageType: visionAnalysis.pageType,
           elementsFound: visionAnalysis.elements.length,
+          modalsDetected: visionAnalysis.modals?.length || 0,
         });
       } else {
         logger.info('[INTELLIGENT_ANALYZER] Using DOM-only analysis (fast mode)', { url });
         visionAnalysis = await this.analyzeWithoutVision(domAnalysis, url);
       }
+
+      // ✅ IMPROVED: Enhance DOM analysis with Vision AI modal detection
+      // Vision AI sees modals visually, DOM analysis finds selectors
+      const enhancedDomAnalysis = await this.enhanceDOMWithVisionModals(
+        page,
+        domAnalysis,
+        visionAnalysis.modals
+      );
 
       // Understand logical dependencies
       logger.info('[INTELLIGENT_ANALYZER] Starting logic analysis', { url });
@@ -98,7 +110,7 @@ export class IntelligentPageAnalyzer {
       const logicAnalysis = await this.analyzeLogic(
         visionAnalysis.pageType,
         visionAnalysis.elements,
-        domAnalysis
+        enhancedDomAnalysis
       );
       logger.info('[INTELLIGENT_ANALYZER] Logic analysis completed', {
         url,
@@ -113,7 +125,7 @@ export class IntelligentPageAnalyzer {
         pageType: visionAnalysis.pageType,
         timestamp: Date.now(),
         vision: visionAnalysis,
-        dom: domAnalysis,
+        dom: enhancedDomAnalysis, // ✅ Use enhanced DOM analysis with merged modals
         screenshot: mode !== 'fast' ? screenshot : undefined,
         requiredActions: logicAnalysis.requiredActions,
         possibleActions: logicAnalysis.possibleActions,
@@ -199,6 +211,107 @@ export class IntelligentPageAnalyzer {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // MODAL WAITING
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * ✅ NEW: Wait for modals to appear before analysis
+   * Many sites show modals with delay (2-5 seconds after page load)
+   * This ensures we capture modals that appear after initial page load
+   */
+  private static async waitForModals(page: Page): Promise<void> {
+    const startTime = Date.now();
+    const maxWaitTime = 5000; // Maximum 5 seconds
+    const checkInterval = 500; // Check every 500ms
+    let lastModalCount = 0;
+
+    logger.info('[INTELLIGENT_ANALYZER] Waiting for modals to appear', {
+      url: page.url(),
+      maxWaitTime: `${maxWaitTime}ms`,
+    });
+
+    while (Date.now() - startTime < maxWaitTime) {
+      try {
+        // Check for modals using DOM analysis
+        const modalCount = await page.evaluate(() => {
+          // @ts-ignore - browser context
+          const allElements = document.querySelectorAll('*');
+          let count = 0;
+
+          for (let i = 0; i < allElements.length; i++) {
+            const el = allElements[i] as any;
+
+            // Skip if not visible
+            // @ts-ignore - browser context
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+              continue;
+            }
+
+            // Check if element behaves like a modal
+            const zIndex = parseInt(style.zIndex) || 0;
+            const position = style.position;
+            const isFixedOrAbsolute = position === 'fixed' || position === 'absolute';
+            const hasHighZIndex = zIndex > 100;
+
+            // Check for overlay (large element with background)
+            // @ts-ignore - browser context
+            const hasOverlay = style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
+                              // @ts-ignore - browser context
+                              (el.offsetWidth > window.innerWidth * 0.5 || el.offsetHeight > window.innerHeight * 0.5);
+
+            // Check for modal-like attributes
+            const role = el.getAttribute('role');
+            const ariaModal = el.getAttribute('aria-modal');
+            const hasModalRole = role === 'dialog' || role === 'alertdialog' || ariaModal === 'true';
+
+            // Check for modal-like classes/ids
+            const className = el.className?.toLowerCase() || '';
+            const id = el.id?.toLowerCase() || '';
+            const hasModalKeywords = className.includes('modal') || className.includes('popup') ||
+                                     className.includes('dialog') || className.includes('overlay') ||
+                                     id.includes('modal') || id.includes('popup') || id.includes('dialog');
+
+            // If element matches modal characteristics
+            if ((hasModalRole || hasModalKeywords || (hasHighZIndex && isFixedOrAbsolute && hasOverlay)) &&
+                el.offsetWidth > 100 && el.offsetHeight > 100) {
+              count++;
+            }
+          }
+
+          return count;
+        });
+
+        // If modals appeared, wait a bit more for them to fully render
+        if (modalCount > lastModalCount) {
+          logger.info('[INTELLIGENT_ANALYZER] Modal detected, waiting for full render', {
+            modalCount,
+            elapsed: `${Date.now() - startTime}ms`,
+          });
+          lastModalCount = modalCount;
+          // Wait additional 500ms for modal to fully render (animations, etc.)
+          await page.waitForTimeout(500);
+          break; // Modal appeared, continue with analysis
+        }
+
+        // Wait before next check
+        await page.waitForTimeout(checkInterval);
+      } catch (error) {
+        logger.warn('[INTELLIGENT_ANALYZER] Error while waiting for modals', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        break; // Continue with analysis even if check failed
+      }
+    }
+
+    const elapsed = Date.now() - startTime;
+    logger.info('[INTELLIGENT_ANALYZER] Modal waiting completed', {
+      elapsed: `${elapsed}ms`,
+      modalsDetected: lastModalCount > 0,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // DOM ANALYSIS
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -225,6 +338,141 @@ export class IntelligentPageAnalyzer {
     }
   }
 
+  /**
+   * ✅ NEW: Enhance DOM analysis with Vision AI modal detection
+   * Vision AI sees modals visually, DOM analysis finds selectors
+   */
+  private static async enhanceDOMWithVisionModals(
+    page: Page,
+    domAnalysis: DOMAnalysis,
+    visionModals?: VisionAnalysis['modals']
+  ): Promise<DOMAnalysis> {
+    // If no Vision modals detected, return DOM analysis as-is
+    if (!visionModals || visionModals.length === 0) {
+      return domAnalysis;
+    }
+
+    logger.info('[INTELLIGENT_ANALYZER] Merging Vision AI modals with DOM analysis', {
+      visionModals: visionModals.length,
+      domModals: domAnalysis.modals?.length || 0,
+    });
+
+    // Get DOM modals (with selectors)
+    const domModals = domAnalysis.modals || [];
+    const mergedModals = await this.mergeModalDetections(visionModals, domModals, page);
+
+    return {
+      ...domAnalysis,
+      modals: mergedModals,
+    };
+  }
+
+  /**
+   * ✅ NEW: Merge Vision AI modal detection with DOM analysis
+   * Vision AI sees modals visually, DOM analysis finds selectors
+   */
+  private static async mergeModalDetections(
+    visionModals: VisionAnalysis['modals'],
+    domModals: DOMAnalysis['modals'],
+    page: Page
+  ): Promise<DOMAnalysis['modals']> {
+    const merged: DOMAnalysis['modals'] = [];
+
+    // Process Vision AI modals (prioritize visual detection)
+    for (const visionModal of visionModals || []) {
+      // Try to find matching DOM modal by type
+      const matchingDomModal = domModals?.find(
+        dm => dm.type === visionModal.type ||
+        (visionModal.type === 'welcome' && dm.type === 'popup')
+      );
+
+      if (matchingDomModal && matchingDomModal.closeSelector) {
+        // Perfect match: Vision AI found modal, DOM found selector
+        merged.push({
+          type: visionModal.type as any,
+          closeSelector: matchingDomModal.closeSelector,
+        });
+        logger.debug('[INTELLIGENT_ANALYZER] Modal matched: Vision + DOM', {
+          type: visionModal.type,
+          closeSelector: matchingDomModal.closeSelector,
+        });
+      } else if (visionModal.hasCloseButton && visionModal.closeButtonText) {
+        // Vision AI found modal with close button text - try to find selector
+        const closeSelector = await this.findCloseButtonByText(
+          page,
+          visionModal.closeButtonText
+        );
+        merged.push({
+          type: visionModal.type as any,
+          closeSelector,
+        });
+        logger.debug('[INTELLIGENT_ANALYZER] Modal found by Vision, selector found by text', {
+          type: visionModal.type,
+          closeButtonText: visionModal.closeButtonText,
+          closeSelector,
+        });
+      } else {
+        // Vision AI found modal but no close button visible
+        merged.push({
+          type: visionModal.type as any,
+          closeSelector: undefined,
+        });
+        logger.debug('[INTELLIGENT_ANALYZER] Modal found by Vision, no close button', {
+          type: visionModal.type,
+        });
+      }
+    }
+
+    // Add DOM modals that Vision AI didn't detect (edge cases, hidden modals)
+    if (domModals) {
+      for (const domModal of domModals) {
+        const alreadyAdded = merged.some(m => m.closeSelector === domModal.closeSelector);
+        if (!alreadyAdded) {
+          merged.push(domModal);
+          logger.debug('[INTELLIGENT_ANALYZER] Modal found by DOM only', {
+            type: domModal.type,
+            closeSelector: domModal.closeSelector,
+          });
+        }
+      }
+    }
+
+    return merged;
+  }
+
+  /**
+   * ✅ NEW: Find close button selector by visible text (from Vision AI)
+   */
+  private static async findCloseButtonByText(
+    page: Page,
+    closeButtonText: string
+  ): Promise<string | undefined> {
+    try {
+      // Try various selectors based on text
+      const selectors = [
+        `button:has-text("${closeButtonText}")`,
+        `[aria-label*="${closeButtonText}" i]`,
+        `button[title*="${closeButtonText}" i]`,
+        `.close-button:has-text("${closeButtonText}")`,
+      ];
+
+      for (const selector of selectors) {
+        const count = await page.locator(selector).count();
+        if (count > 0) {
+          return selector;
+        }
+      }
+
+      return undefined;
+    } catch (error) {
+      logger.warn('[INTELLIGENT_ANALYZER] Failed to find close button by text', {
+        closeButtonText,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
   private static async detectModals(page: Page): Promise<DOMAnalysis['modals']> {
     try {
       return await page.evaluate(() => {
@@ -233,55 +481,143 @@ export class IntelligentPageAnalyzer {
           closeSelector?: string;
         }> = [];
 
-        // Cookie banners
-        const cookieSelectors = [
-          '[class*="cookie"]',
-          '[id*="cookie"]',
-          '[class*="gdpr"]',
-          '[class*="consent"]',
-        ];
+        // ✅ DYNAMIC: Find modals by behavior, not hardcoded selectors
+        // Strategy: Find elements that behave like modals (high z-index, overlay, fixed/absolute positioning)
 
-        for (const selector of cookieSelectors) {
+        // @ts-ignore - browser context
+        const allElements = document.querySelectorAll('*');
+        const potentialModals: any[] = [];
+
+        for (let i = 0; i < allElements.length; i++) {
+          const el = allElements[i] as any;
+
+          // Skip if not visible
           // @ts-ignore - browser context
-          const el = document.querySelector(selector);
-          if (el) {
-            const acceptBtn = el.querySelector(
-              'button:has-text("Accept"), button:has-text("Agree"), button:has-text("OK"), .accept, .agree'
-            );
-            modals.push({
-              type: 'cookie_banner',
-              closeSelector: acceptBtn ? selector : undefined,
-            });
-            break;
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+            continue;
+          }
+
+          // Check if element behaves like a modal
+          const zIndex = parseInt(style.zIndex) || 0;
+          const position = style.position;
+          const isFixedOrAbsolute = position === 'fixed' || position === 'absolute';
+          const hasHighZIndex = zIndex > 100; // Modals usually have high z-index
+          // @ts-ignore - browser context
+          const hasOverlay = style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
+                            // @ts-ignore - browser context
+                            (el.offsetWidth > window.innerWidth * 0.5 || el.offsetHeight > window.innerHeight * 0.5);
+
+          // Check for modal-like attributes
+          const role = el.getAttribute('role');
+          const ariaModal = el.getAttribute('aria-modal');
+          const hasModalRole = role === 'dialog' || role === 'alertdialog' || ariaModal === 'true';
+
+          // Check for modal-like classes/ids (dynamic, not hardcoded)
+          const className = el.className?.toLowerCase() || '';
+          const id = el.id?.toLowerCase() || '';
+          const hasModalKeywords = className.includes('modal') || className.includes('popup') ||
+                                   className.includes('dialog') || className.includes('overlay') ||
+                                   id.includes('modal') || id.includes('popup') || id.includes('dialog');
+
+          // If element matches modal characteristics
+          if ((hasModalRole || hasModalKeywords || (hasHighZIndex && isFixedOrAbsolute && hasOverlay)) &&
+              el.offsetWidth > 100 && el.offsetHeight > 100) { // Must be reasonably sized
+            potentialModals.push(el);
           }
         }
 
-        // Newsletter popups
-        const newsletterSelectors = [
-          '[class*="newsletter"]',
-          '[class*="subscribe"]',
-          '[class*="popup"]',
-        ];
-
-        for (const selector of newsletterSelectors) {
+        // Process each potential modal
+        for (const modalEl of potentialModals) {
+          // ✅ DYNAMIC: Find close button by analyzing button properties, not hardcoded selectors
           // @ts-ignore - browser context
-          const el = document.querySelector(selector);
-          if (el) {
-            // @ts-ignore - browser context
-            const closeBtn = el.querySelector(
-              'button:has-text("Close"), button:has-text("Dismiss"), .close, [aria-label*="close"]'
+          const buttons = modalEl.querySelectorAll('button, [role="button"], a[href="#"], a[href="javascript:void(0)"]');
+          let closeSelector: string | undefined;
+
+          for (let j = 0; j < buttons.length; j++) {
+            const btn = buttons[j] as any;
+
+            // Check if button looks like a close button
+            const btnText = btn.textContent?.trim() || '';
+            const btnAriaLabel = btn.getAttribute('aria-label')?.toLowerCase() || '';
+            const btnTitle = btn.getAttribute('title')?.toLowerCase() || '';
+            const btnClass = btn.className?.toLowerCase() || '';
+            const btnId = btn.id?.toLowerCase() || '';
+
+            // Dynamic patterns for close buttons
+            const closeKeywords = ['close', 'закрыть', 'dismiss', 'cancel', 'отмена', '×', '✕', 'x'];
+            const hasCloseText = closeKeywords.some(keyword =>
+              btnText.toLowerCase().includes(keyword) ||
+              btnAriaLabel.includes(keyword) ||
+              btnTitle.includes(keyword) ||
+              btnClass.includes(keyword) ||
+              btnId.includes(keyword)
             );
-            modals.push({
-              type: 'newsletter',
-              closeSelector: closeBtn ? selector : undefined,
-            });
-            break;
+
+            // Check for icon-only close buttons (SVG, icon fonts)
+            const hasCloseIcon = btn.querySelector('svg') ||
+                                 btnClass.includes('icon') && (btnClass.includes('close') || btnClass.includes('x'));
+
+            // Check for short text (likely icon text like "X", "×")
+            const isShortText = btnText.length <= 3 && /[x×✕✖]/i.test(btnText);
+
+            if (hasCloseText || hasCloseIcon || isShortText) {
+              // Generate selector dynamically
+              if (btn.id) {
+                closeSelector = `#${btn.id}`;
+              } else if (btn.getAttribute('aria-label')) {
+                const ariaLabel = btn.getAttribute('aria-label');
+                closeSelector = `button[aria-label="${ariaLabel}"]`;
+              } else if (btnText && btnText.length <= 10) {
+                // Escape special characters for selector
+                const escapedText = btnText.replace(/"/g, '\\"');
+                closeSelector = `button:has-text("${escapedText}")`;
+              } else if (btnClass) {
+                const classes = btnClass.split(' ').filter((c: string) => c && (c.includes('close') || c.includes('dismiss')));
+                if (classes.length > 0) {
+                  closeSelector = `button.${classes[0]}`;
+                }
+              }
+
+              if (closeSelector) break;
+            }
           }
+
+          // Determine modal type dynamically
+          const modalText = modalEl.textContent?.toLowerCase() || '';
+          const modalClass = modalEl.className?.toLowerCase() || '';
+          const modalId = modalEl.id?.toLowerCase() || '';
+
+          let modalType: 'cookie_banner' | 'newsletter' | 'popup' | 'other' = 'other';
+
+          // Check for cookie/GDPR keywords
+          if (modalText.includes('cookie') || modalText.includes('gdpr') || modalText.includes('consent') ||
+              modalClass.includes('cookie') || modalClass.includes('gdpr') || modalClass.includes('consent') ||
+              modalId.includes('cookie') || modalId.includes('gdpr')) {
+            modalType = 'cookie_banner';
+          }
+          // Check for newsletter/subscribe keywords
+          else if (modalText.includes('newsletter') || modalText.includes('subscribe') || modalText.includes('email') ||
+                   modalClass.includes('newsletter') || modalClass.includes('subscribe') ||
+                   modalId.includes('newsletter') || modalId.includes('subscribe')) {
+            modalType = 'newsletter';
+          }
+          // Check for popup/modal keywords
+          else if (modalClass.includes('popup') || modalClass.includes('modal') || modalClass.includes('dialog') ||
+                   modalId.includes('popup') || modalId.includes('modal') || modalId.includes('dialog')) {
+            modalType = 'popup';
+          }
+
+          modals.push({
+            type: modalType,
+            closeSelector,
+          });
         }
 
         return modals;
       });
     } catch (error) {
+      logger.warn('[INTELLIGENT_ANALYZER] Modal detection failed', { error });
       return [];
     }
   }
@@ -338,6 +674,7 @@ export class IntelligentPageAnalyzer {
         elements: parsed.elements || [],
         suggestions: parsed.suggestions || [],
         warnings: parsed.warnings || [],
+        modals: parsed.modals || [], // ✅ NEW: Modals detected by Vision AI
       };
     } catch (error) {
       logger.error('[INTELLIGENT_ANALYZER] Vision analysis failed', { error });
@@ -348,6 +685,7 @@ export class IntelligentPageAnalyzer {
         elements: [],
         suggestions: [],
         warnings: ['Vision analysis failed'],
+        modals: [],
       };
     }
   }
@@ -372,6 +710,7 @@ export class IntelligentPageAnalyzer {
       elements,
       suggestions: ['Perform basic interactions', 'Test visible elements'],
       warnings: [],
+      modals: [], // Fast mode: no Vision AI modal detection
     };
   }
 

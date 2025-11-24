@@ -632,12 +632,12 @@ export function buildPageAnalysisPrompt(params: {
 }): string {
   return `You are an expert QA engineer analyzing a web page screenshot.
 
---- CONTEXT ---
+- CONTEXT -
 URL: ${params.url}
 Testing Goal: ${params.goal}
 ${params.previousContext ? `Previous Context: ${params.previousContext}` : ''}
 
---- TASK ---
+- TASK -
 Analyze this screenshot and provide detailed information.
 
 RESPONSE FORMAT (JSON):
@@ -661,6 +661,14 @@ RESPONSE FORMAT (JSON):
   "warnings": [
     "Payment form detected - requires manual approval",
     "CAPTCHA present - manual intervention needed"
+  ],
+  "modals": [
+    {
+      "type": "cookie_banner|newsletter|popup|welcome|other",
+      "description": "Brief description of the modal",
+      "hasCloseButton": true/false,
+      "closeButtonText": "X|Close|Закрыть|etc or null if not visible"
+    }
   ]
 }
 
@@ -674,6 +682,10 @@ IMPORTANT RULES:
    - low = optional features
 4. **warnings**: Flag dangerous actions (payment, delete, etc.) and blockers (captcha)
 5. **required**: Mark elements that MUST be interacted with before proceeding
+6. **modals**: List ALL visible modals, popups, overlays, cookie banners, welcome screens
+   - Include modals that block interaction with the page
+   - Specify if close button is visible and its text (X, Close, ×, etc.)
+   - This is CRITICAL for test automation - modals must be closed before testing
 
 Focus on elements relevant to the testing goal.`;
 }
@@ -753,6 +765,9 @@ CRITICAL RULES:
    - NEVER generate actions for: delete, remove account, pay, purchase, subscribe
    - If you see payment form → set action to "wait" with description "requires manual approval"
    - If you see CAPTCHA → set action to "wait" with description "CAPTCHA detected"
+   - ⚠️ **MODAL CLOSING**: Only close modals if a close selector is provided in "DOM Summary"
+   - If modal is detected but NO close selector is shown → DO NOT generate close action (set optional: true or skip)
+   - If you see "⚠️ No close button selector found" → DO NOT try to close the modal
 
 4. **Validation**:
    - Always specify expectedResult (e.g., "URL changes", "cart count increases", "error message appears")

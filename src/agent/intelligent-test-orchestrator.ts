@@ -425,6 +425,9 @@ export class IntelligentTestOrchestrator {
         // STEP 4: Execute actions
         const pageVisit = await this.executeActions(context, actions);
 
+        // ✅ NEW: Add screenshot from context to page visit
+        pageVisit.screenshot = context.screenshot;
+
         // STEP 5: Record visit
         this.state = StateTracker.recordPageVisit(this.state, pageVisit);
 
@@ -810,6 +813,45 @@ export class IntelligentTestOrchestrator {
           actionType: action.action,
         });
 
+        // ✅ NEW: Validate selector exists before execution (for click/fill/type actions)
+        if (action.selector && ['click', 'fill', 'type', 'select', 'check', 'uncheck', 'hover'].includes(action.action)) {
+          try {
+            const elementExists = await this.page.locator(action.selector).count();
+            if (elementExists === 0) {
+              logger.warn('[INTELLIGENT_ORCHESTRATOR] Selector not found, marking action as optional', {
+                testId: this.testId,
+                action: action.description,
+                selector: action.selector,
+              });
+
+              // Mark as optional and skip
+              const actionResult: ActionResult = {
+                action,
+                success: false,
+                error: `Selector not found: ${action.selector}`,
+                urlChanged: false,
+                urlBefore,
+                urlAfter: urlBefore,
+                timestamp: Date.now(),
+              };
+
+              completedActions.push(actionResult);
+              this.state = StateTracker.recordActionResult(this.state, actionResult);
+
+              // Mark action as optional to continue
+              action.optional = true;
+              continue; // Skip this action
+            }
+          } catch (selectorError) {
+            logger.warn('[INTELLIGENT_ORCHESTRATOR] Selector validation failed', {
+              testId: this.testId,
+              selector: action.selector,
+              error: selectorError instanceof Error ? selectorError.message : String(selectorError),
+            });
+            // Continue anyway - might be a valid selector that just needs more time
+          }
+        }
+
         // Execute action using CommandExecutor
         const executionResult = await this.commandExecutor.executeCommand({
           action: action.action as any,
@@ -1077,6 +1119,14 @@ export class IntelligentTestOrchestrator {
 
     const summary = this.buildSummary(success, stats);
 
+    // ✅ NEW: Collect screenshots from page visits
+    const screenshots = this.state.visitedPages
+      .filter(pageVisit => pageVisit.screenshot)
+      .map((pageVisit, index) => ({
+        url: pageVisit.url,
+        screenshot: pageVisit.screenshot!,
+      }));
+
     return {
       success,
       goal: this.config.goal,
@@ -1092,7 +1142,7 @@ export class IntelligentTestOrchestrator {
       warnings: [],
       summary,
       pageVisits: this.state.visitedPages,
-      screenshots: [],
+      screenshots,
     };
   }
 

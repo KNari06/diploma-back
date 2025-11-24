@@ -99,7 +99,7 @@ export class ContextualActionGenerator {
       });
 
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: 'gpt-4o', // ✅ UPGRADED: Using GPT-4o for better Playwright code generation
         messages: [
           {
             role: 'system',
@@ -404,7 +404,14 @@ export class ContextualActionGenerator {
     }
 
     if (dom.modals && dom.modals.length > 0) {
-      summary.push(`\n⚠️ Modals detected: ${dom.modals.map(m => `${m.type}${m.closeSelector ? ` (close: ${m.closeSelector})` : ''}`).join(', ')}`);
+      summary.push(`\n⚠️ Modals detected:`);
+      dom.modals.forEach((modal, idx) => {
+        if (modal.closeSelector) {
+          summary.push(`  Modal ${idx + 1} (${modal.type}): Close button selector: "${modal.closeSelector}"`);
+        } else {
+          summary.push(`  Modal ${idx + 1} (${modal.type}): ⚠️ No close button selector found - DO NOT generate close action`);
+        }
+      });
     }
 
     return summary.join('\n');
@@ -500,7 +507,7 @@ export class ContextualActionGenerator {
         url: action.url,
         description: action.description,
         expectedResult: action.expectedResult,
-        timeout: action.timeout || 5000,
+         timeout: action.timeout || 10000, // ✅ FIX: Increased default timeout from 5s to 10s
         optional: action.optional || false,
         retry: action.retry || 3,
       };

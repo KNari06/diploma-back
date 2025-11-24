@@ -49,6 +49,12 @@ export interface VisionAnalysis {
   elements: PageElement[];
   suggestions: string[];
   warnings?: string[]; // e.g., "payment form detected", "captcha present"
+  modals?: Array<{ // ✅ NEW: Modal detection from Vision AI
+    type: 'cookie_banner' | 'newsletter' | 'popup' | 'welcome' | 'other';
+    description: string;
+    hasCloseButton: boolean;
+    closeButtonText?: string; // Visible text on close button (X, Close, ×, etc.)
+  }>;
 }
 
 /**
@@ -191,6 +197,7 @@ export interface PageVisit {
   actions: DynamicAction[]; // Planned actions
   actionResults?: ActionResult[]; // Actual execution results
   success: boolean;
+  screenshot?: string; // ✅ NEW: Base64 screenshot from page analysis
 }
 
 /**
