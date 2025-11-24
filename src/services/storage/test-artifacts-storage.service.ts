@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/logger';
+import { env } from '@/config/env';
 import fs from 'fs/promises';
 
 /**
@@ -19,11 +20,11 @@ export async function uploadVideoToStorage(
     // Read file
     const fileBuffer = await fs.readFile(localPath);
     const fileName = `video-${testId}-${Date.now()}.webm`;
-    const storagePath = `test-artifacts/${userId}/videos/${fileName}`;
+    const storagePath = `${userId}/videos/${fileName}`;
 
     // Upload to Supabase Storage
     const { data, error } = await supabaseAdmin.storage
-      .from('test-artifacts')
+      .from(env.SUPABASE_BUCKET_NAME)
       .upload(storagePath, fileBuffer, {
         contentType: 'video/webm',
         upsert: false,
@@ -41,7 +42,7 @@ export async function uploadVideoToStorage(
 
     // Get public URL
     const { data: urlData } = supabaseAdmin.storage
-      .from('test-artifacts')
+      .from(env.SUPABASE_BUCKET_NAME)
       .getPublicUrl(storagePath);
 
     logger.info('[STORAGE] Video uploaded successfully', {
@@ -87,11 +88,11 @@ export async function uploadTraceToStorage(
     // Read file
     const fileBuffer = await fs.readFile(localPath);
     const fileName = `trace-${testId}-${Date.now()}.zip`;
-    const storagePath = `test-artifacts/${userId}/traces/${fileName}`;
+    const storagePath = `${userId}/traces/${fileName}`;
 
     // Upload to Supabase Storage
     const { data, error} = await supabaseAdmin.storage
-      .from('test-artifacts')
+      .from(env.SUPABASE_BUCKET_NAME)
       .upload(storagePath, fileBuffer, {
         contentType: 'application/zip',
         upsert: false,
@@ -109,7 +110,7 @@ export async function uploadTraceToStorage(
 
     // Get public URL
     const { data: urlData } = supabaseAdmin.storage
-      .from('test-artifacts')
+      .from(env.SUPABASE_BUCKET_NAME)
       .getPublicUrl(storagePath);
 
     logger.info('[STORAGE] Trace uploaded successfully', {
@@ -158,11 +159,11 @@ export async function uploadScreenshotToStorage(
     const buffer = Buffer.from(base64Data, 'base64');
 
     const fileName = `screenshot-${testId}-${index}-${Date.now()}.png`;
-    const storagePath = `test-artifacts/${userId}/screenshots/${fileName}`;
+    const storagePath = `${userId}/screenshots/${fileName}`;
 
     // Upload to Supabase Storage
     const { data, error } = await supabaseAdmin.storage
-      .from('test-artifacts')
+      .from(env.SUPABASE_BUCKET_NAME)
       .upload(storagePath, buffer, {
         contentType: 'image/png',
         upsert: false,
@@ -180,7 +181,7 @@ export async function uploadScreenshotToStorage(
 
     // Get public URL
     const { data: urlData } = supabaseAdmin.storage
-      .from('test-artifacts')
+      .from(env.SUPABASE_BUCKET_NAME)
       .getPublicUrl(storagePath);
 
     logger.info('[STORAGE] Screenshot uploaded successfully', {

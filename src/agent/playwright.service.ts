@@ -683,12 +683,13 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       }
     }
 
-    // ✅ NEW: Upload video & trace to Supabase Storage
+    // ✅ NEW: Upload video, trace, and screenshots to Supabase Storage
     let videoUrl: string | undefined;
     let traceUrl: string | undefined;
+    let screenshotUrl: string | undefined;
 
     try {
-      const { uploadVideoToStorage, uploadTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+      const { uploadVideoToStorage, uploadTraceToStorage, uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');
 
       if (videoPath) {
         videoUrl = await uploadVideoToStorage(videoPath, testData.testId, testData.userId || 'anonymous');
@@ -698,6 +699,24 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       if (tracePath) {
         traceUrl = await uploadTraceToStorage(tracePath, testData.testId, testData.userId || 'anonymous');
         logger.info('[PLAYWRIGHT] Trace uploaded to storage', { traceUrl });
+      }
+
+      // ✅ CRITICAL FIX: Upload screenshot to Supabase Storage
+      if (results.screenshot) {
+        try {
+          screenshotUrl = await uploadScreenshotToStorage(
+            results.screenshot,
+            testData.testId,
+            testData.userId || 'anonymous',
+            0
+          );
+          logger.info('[PLAYWRIGHT] Screenshot uploaded to storage', { screenshotUrl });
+        } catch (screenshotError) {
+          logger.error('[PLAYWRIGHT] Failed to upload screenshot', {
+            error: screenshotError instanceof Error ? screenshotError.message : String(screenshotError),
+          });
+          // Don't fail the test if screenshot upload fails
+        }
       }
     } catch (uploadError) {
       logger.error('[PLAYWRIGHT] Failed to upload artifacts', {

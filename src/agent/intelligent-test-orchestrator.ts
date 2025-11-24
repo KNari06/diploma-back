@@ -712,7 +712,8 @@ export class IntelligentTestOrchestrator {
 
     const result = await ContextualActionGenerator.generateActions(
       context,
-      this.state
+      this.state,
+      this.page  // ✅ NEW: Pass page for HTML extraction
     );
 
     // Update cost

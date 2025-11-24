@@ -688,6 +688,7 @@ export function buildActionGenerationPrompt(params: {
   availableElements: string; // JSON string of elements
   history: string; // What has been done so far
   domSummary: string; // DOM analysis summary
+  actualHTML?: string; // ✅ NEW: Actual HTML from page (limited)
 }): string {
   return `You are an expert QA automation engineer deciding what actions to take next.
 
@@ -704,6 +705,7 @@ ${params.availableElements}
 
 DOM Summary:
 ${params.domSummary}
+${params.actualHTML ? `\n--- ACTUAL HTML (for reference) ---\n${params.actualHTML}\n` : ''}
 
 --- TASK ---
 Generate a sequence of actions to test this page based on the goal.
@@ -714,7 +716,7 @@ RESPONSE FORMAT (JSON):
   "actions": [
     {
       "action": "click|fill|select|wait|scroll|press|hover",
-      "selector": "CSS selector or text selector",
+      "selector": "CSS selector or Playwright text selector",
       "value": "value for fill/select actions",
       "description": "What this action does",
       "expectedResult": "What should happen after this action",
@@ -727,6 +729,15 @@ RESPONSE FORMAT (JSON):
 }
 
 CRITICAL RULES:
+
+0. **SELECTOR USAGE (MOST IMPORTANT)**:
+   - ✅ ALWAYS use the EXACT selector from "Available Elements" or "DOM Summary" sections
+   - ✅ If selector is provided: use it EXACTLY as shown (e.g., button:has-text('Войти'))
+   - ✅ For Playwright text selectors: use text='Button Text' or button:has-text('Button Text')
+   - ❌ NEVER use jQuery syntax like ":contains()" - it's NOT supported in Playwright
+   - ❌ NEVER invent selectors - only use ones provided in the context
+   - Example: If DOM Summary shows Selector: "button:has-text('Войти')" → use exactly that
+   - Example: If no selector but text is "Login" → use text='Login' or button:has-text('Login')
 
 1. **Logical Dependencies**:
    - On product page: MUST select size/color BEFORE "add to cart"

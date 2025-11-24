@@ -11,6 +11,7 @@ import {
 import { env } from '@/config/env';
 import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
+import { Page } from 'playwright';
 import {
   DynamicAction,
   NextStepDecision,
@@ -38,7 +39,8 @@ export class ContextualActionGenerator {
    */
   static async generateActions(
     context: PageContext,
-    state: TestState
+    state: TestState,
+    page?: Page  // ✅ NEW: Optional page for getting HTML
   ): Promise<{
     actions: DynamicAction[];
     reasoning: string;
@@ -83,6 +85,9 @@ export class ContextualActionGenerator {
       // Build DOM summary
       const domSummary = this.buildDOMSummary(context.dom);
 
+      // ✅ NEW: Get actual HTML from page (limited to avoid token overflow)
+      const actualHTML = page ? await this.getPageHTML(page) : '';
+
       const prompt = buildActionGenerationPrompt({
         pageType: context.pageType,
         goal: state.goal,
@@ -90,6 +95,7 @@ export class ContextualActionGenerator {
         availableElements: elementsSummary,
         history: historySummary,
         domSummary,
+        actualHTML,
       });
 
       const response = await openai.chat.completions.create({
@@ -320,22 +326,30 @@ export class ContextualActionGenerator {
 
     const summary: string[] = [];
 
+    // ✅ CRITICAL FIX: Include REAL selectors from DOM analysis
     if (critical.length > 0) {
       summary.push('Critical Elements:');
       critical.forEach(el => {
-        summary.push(`- ${el.type}: ${el.purpose} (${el.text || 'no text'})`);
+        // Include selector so AI can use it directly
+        summary.push(`- ${el.type}: ${el.purpose} | Text: "${el.text || 'no text'}" | Selector: "${el.selector}"`);
       });
     }
 
     if (high.length > 0) {
       summary.push('\nHigh Priority:');
       high.forEach(el => {
-        summary.push(`- ${el.type}: ${el.purpose} (${el.text || 'no text'})`);
+        summary.push(`- ${el.type}: ${el.purpose} | Text: "${el.text || 'no text'}" | Selector: "${el.selector}"`);
       });
     }
 
     if (others.length > 0) {
-      summary.push(`\nOther Elements: ${others.length} additional elements`);
+      summary.push(`\nOther Elements (${others.length}):`);
+      others.slice(0, 10).forEach(el => { // Limit to 10 to avoid token overflow
+        summary.push(`- ${el.type}: ${el.purpose} | Text: "${el.text || 'no text'}" | Selector: "${el.selector}"`);
+      });
+      if (others.length > 10) {
+        summary.push(`  ... and ${others.length - 10} more elements`);
+      }
     }
 
     return summary.join('\n');
@@ -344,30 +358,93 @@ export class ContextualActionGenerator {
   private static buildDOMSummary(dom: PageContext['dom']): string {
     const summary: string[] = [];
 
+    // ✅ CRITICAL FIX: Include REAL selectors from DOM
     if (dom.forms.length > 0) {
       summary.push(`Forms: ${dom.forms.length}`);
       dom.forms.forEach((form, idx) => {
         summary.push(`  Form ${idx + 1}: ${form.fields.length} fields`);
+        form.fields.slice(0, 5).forEach(field => {
+          summary.push(`    - ${field.name || 'unnamed'}: ${field.type} | Selector: "${field.selector}"`);
+        });
+        if (form.fields.length > 5) {
+          summary.push(`    ... and ${form.fields.length - 5} more fields`);
+        }
       });
     }
 
     if (dom.buttons.length > 0) {
-      summary.push(`Buttons: ${dom.buttons.length}`);
+      summary.push(`\nButtons (${dom.buttons.length}):`);
+      dom.buttons.slice(0, 10).forEach(btn => {
+        summary.push(`  - "${btn.text}" | Selector: "${btn.selector}"`);
+      });
+      if (dom.buttons.length > 10) {
+        summary.push(`  ... and ${dom.buttons.length - 10} more buttons`);
+      }
     }
 
     if (dom.inputs.length > 0) {
-      summary.push(`Inputs: ${dom.inputs.length}`);
+      summary.push(`\nInputs (${dom.inputs.length}):`);
+      dom.inputs.slice(0, 10).forEach(input => {
+        const label = input.name || input.placeholder || input.type;
+        summary.push(`  - ${label} (${input.type}) | Selector: "${input.selector}"`);
+      });
+      if (dom.inputs.length > 10) {
+        summary.push(`  ... and ${dom.inputs.length - 10} more inputs`);
+      }
     }
 
     if (dom.links.length > 0) {
-      summary.push(`Links: ${dom.links.length}`);
+      summary.push(`\nLinks (${dom.links.length}):`);
+      dom.links.slice(0, 10).forEach(link => {
+        summary.push(`  - "${link.text}" → ${link.href} | Selector: "${link.selector}"`);
+      });
+      if (dom.links.length > 10) {
+        summary.push(`  ... and ${dom.links.length - 10} more links`);
+      }
     }
 
     if (dom.modals && dom.modals.length > 0) {
-      summary.push(`⚠️ Modals detected: ${dom.modals.map(m => m.type).join(', ')}`);
+      summary.push(`\n⚠️ Modals detected: ${dom.modals.map(m => `${m.type}${m.closeSelector ? ` (close: ${m.closeSelector})` : ''}`).join(', ')}`);
     }
 
     return summary.join('\n');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HELPERS - HTML EXTRACTION
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get actual HTML from page (limited to avoid token overflow)
+   * Returns simplified HTML with only interactive elements
+   */
+  private static async getPageHTML(page: Page): Promise<string> {
+    try {
+      // Get simplified HTML - only body with interactive elements
+      const html = await page.evaluate(() => {
+        // @ts-ignore - browser context
+        const relevant = document.querySelectorAll('form, button, input, select, textarea, a[href]');
+        const relevantHTML: string[] = [];
+
+        // @ts-ignore - browser context
+        relevant.forEach((el: any) => {
+          const outerHTML = el.outerHTML;
+          // Limit each element to 500 chars
+          relevantHTML.push(outerHTML.length > 500 ? outerHTML.substring(0, 500) + '...' : outerHTML);
+        });
+
+        // Limit total to 3000 chars
+        const result = relevantHTML.join('\n');
+        return result.length > 3000 ? result.substring(0, 3000) + '\n... (truncated)' : result;
+      });
+
+      return html || '';
+    } catch (error) {
+      logger.warn('[ACTION_GENERATOR] Failed to extract HTML', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return '';
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
