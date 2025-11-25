@@ -547,6 +547,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
       // ✅ NEW: Upload screenshots from intelligent test to Supabase Storage
       const screenshotUrls: string[] = [];
+      logger.info('[PLAYWRIGHT] Checking screenshots for upload', {
+        testId: testData.testId,
+        screenshotsCount: intelligentResult.screenshots?.length || 0,
+        hasScreenshots: !!(intelligentResult.screenshots && intelligentResult.screenshots.length > 0),
+      });
       if (intelligentResult.screenshots && intelligentResult.screenshots.length > 0) {
         try {
           const { uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');

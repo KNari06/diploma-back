@@ -428,6 +428,14 @@ export class IntelligentTestOrchestrator {
         // ✅ NEW: Add screenshot from context to page visit
         pageVisit.screenshot = context.screenshot;
 
+        // ✅ DEBUG: Log screenshot status
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Screenshot status', {
+          testId: this.testId,
+          url: context.url,
+          hasScreenshot: !!context.screenshot,
+          screenshotSize: context.screenshot ? `${Math.round(context.screenshot.length / 1024)}KB` : 'none',
+        });
+
         // STEP 5: Record visit
         this.state = StateTracker.recordPageVisit(this.state, pageVisit);
 
@@ -1126,6 +1134,13 @@ export class IntelligentTestOrchestrator {
         url: pageVisit.url,
         screenshot: pageVisit.screenshot!,
       }));
+
+    // ✅ DEBUG: Log collected screenshots
+    logger.info('[INTELLIGENT_ORCHESTRATOR] Collected screenshots for upload', {
+      totalPageVisits: this.state.visitedPages.length,
+      pagesWithScreenshots: screenshots.length,
+      screenshotSizes: screenshots.map(s => `${Math.round(s.screenshot.length / 1024)}KB`),
+    });
 
     return {
       success,
