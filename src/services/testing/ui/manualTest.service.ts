@@ -172,6 +172,65 @@ export class ManualTestService {
   }
 
   /**
+   * Get all tests for user with pagination
+   */
+  static async getTestsByUser(
+    userId: string,
+    page: number = 1,
+    limit: number = 20
+  ): Promise<PaginatedResponse<Test>> {
+    try {
+      const offset = (page - 1) * limit;
+
+      // Get tests for user
+      const { data: tests, error: testsError } = await dbService.supabaseAdmin
+        .from('tests')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .range(offset, offset + limit - 1);
+
+      if (testsError) {
+        throw new Error(`Failed to get tests: ${testsError.message}`);
+      }
+
+      // Get total count for pagination
+      const { count, error: countError } = await dbService.supabaseAdmin
+        .from('tests')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', userId);
+
+      if (countError) {
+        throw new Error(`Failed to get test count: ${countError.message}`);
+      }
+
+      const totalPages = Math.ceil((count || 0) / limit);
+
+      logTestEvent('user_tests_retrieved', userId, {
+        userId,
+        page,
+        limit,
+        total: count,
+      });
+
+      return {
+        success: true,
+        data: tests || [],
+        pagination: {
+          page,
+          limit,
+          total: count || 0,
+          totalPages,
+        },
+        timestamp: new Date(),
+      };
+    } catch (error) {
+      logger.error(`Failed to get tests for user ${userId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
    * Get tests by project with pagination
    */
   static async getTestsByProject(

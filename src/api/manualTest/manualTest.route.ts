@@ -1,7 +1,10 @@
+import { supabaseAdmin } from '@/db/supabase';
 import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
-import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { IntelligentTestStorageService } from '@/services/testing/results/intelligent-test-storage.service';
+import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
+import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { TestRunRequest } from '@/types';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { logger } from '@/utils/logger';
@@ -271,6 +274,99 @@ router.post('/result', asyncHandler(async (req: Request, res: Response) => {
 }));
 
 /**
+ * @swagger
+ * /api/v1/manual-test:
+ *   get:
+ *     summary: Get all tests for current user
+ *     description: |
+ *       Returns a paginated list of all tests created by the authenticated user.
+ *       Includes tests from all projects and all statuses (pending, running, completed, failed, etc.).
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           default: 1
+ *         description: Page number for pagination
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 20
+ *         description: Number of tests per page
+ *     responses:
+ *       200:
+ *         description: List of tests retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                         format: uuid
+ *                       url:
+ *                         type: string
+ *                       status:
+ *                         type: string
+ *                         enum: [pending, running, completed, failed, cancelled, timeout]
+ *                       browsers:
+ *                         type: array
+ *                         items:
+ *                           type: string
+ *                       project_id:
+ *                         type: string
+ *                         format: uuid
+ *                       created_at:
+ *                         type: string
+ *                         format: date-time
+ *                       updated_at:
+ *                         type: string
+ *                         format: date-time
+ *                 pagination:
+ *                   type: object
+ *                   properties:
+ *                     page:
+ *                       type: integer
+ *                     limit:
+ *                       type: integer
+ *                     total:
+ *                       type: integer
+ *                     totalPages:
+ *                       type: integer
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+
+  // Validate pagination parameters
+  const pagination = paginationSchema.parse(req.query);
+
+  const result = await ManualTestService.getTestsByUser(
+    userId,
+    pagination.page,
+    pagination.limit
+  );
+
+  res.status(200).json(result);
+}));
+
+/**
  * GET /manual-test/:id
  * Get manual test by ID
  */
@@ -381,6 +477,271 @@ router.get('/:id/status', requireAuth, asyncHandler(async (req: Request, res: Re
     },
     timestamp: new Date(),
   });
+}));
+
+/**
+ * @swagger
+ * /api/v1/manual-test/{testId}/full:
+ *   get:
+ *     summary: Get complete test data with all details
+ *     description: |
+ *       Returns comprehensive information about a specific test including:
+ *       - Test basic information (id, url, status, browsers)
+ *       - Test results for each browser (screenshots, DOM, videos, traces)
+ *       - Generated Playwright test code (from report)
+ *       - Intelligent test session data (if intelligent mode was used)
+ *       - All screenshots, videos, logs, network logs, and errors
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: testId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Test ID
+ *     responses:
+ *       200:
+ *         description: Complete test data retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     test:
+ *                       type: object
+ *                       description: Basic test information
+ *                     results:
+ *                       type: array
+ *                       description: Test results for each browser
+ *                     report:
+ *                       type: object
+ *                       nullable: true
+ *                       description: Test report with generated code
+ *                       properties:
+ *                         generatedCode:
+ *                           type: object
+ *                         artifacts:
+ *                           type: object
+ *                         analysis:
+ *                           type: object
+ *                         summary:
+ *                           type: object
+ *                     intelligentSession:
+ *                       type: object
+ *                       nullable: true
+ *                       description: Intelligent test session data
+ *                     traceFiles:
+ *                       type: array
+ *                       description: Playwright trace files
+ *                     screenshots:
+ *                       type: array
+ *                       description: All screenshots from test execution
+ *                     videos:
+ *                       type: array
+ *                       description: All videos from test execution
+ *                     logs:
+ *                       type: array
+ *                       description: All logs grouped by browser
+ *                     networkLogs:
+ *                       type: array
+ *                       description: Network logs grouped by browser
+ *                     errors:
+ *                       type: array
+ *                       description: All errors grouped by browser
+ *       404:
+ *         description: Test not found
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const userId = req.user!.id;
+
+  try {
+    // 1. Get test basic info
+    const testResponse = await ManualTestService.getTest(id, userId);
+    if (!testResponse.success || !testResponse.data) {
+      res.status(404).json({
+        success: false,
+        error: 'Test not found',
+      });
+      return;
+    }
+
+    const test = testResponse.data;
+
+    // 2. Get test results with all details
+    const resultsResponse = await ManualTestService.getTestResults(id, userId);
+    const results = resultsResponse.data || [];
+
+    // 3. Get test report (includes generated code)
+    let report = null;
+    try {
+      report = await TestReportGeneratorService.getReportByTestId(id);
+    } catch (error) {
+      logger.warn('[MANUAL_TEST] Report not found or error getting report', {
+        testId: id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // 4. Get intelligent test session (if exists)
+    let intelligentSession = null;
+    try {
+      const { data: sessions, error: sessionError } = await supabaseAdmin
+        .from('intelligent_test_sessions')
+        .select('id')
+        .eq('test_id', id)
+        .limit(1);
+
+      if (!sessionError && sessions && sessions.length > 0) {
+        intelligentSession = await IntelligentTestStorageService.getTestSession(sessions[0].id);
+      }
+    } catch (error) {
+      logger.warn('[MANUAL_TEST] Error getting intelligent session', {
+        testId: id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // 5. Get trace files (for videos/traces)
+    const { data: traceFiles, error: traceError } = await supabaseAdmin
+      .from('trace_files')
+      .select(`
+        id, test_id, user_id, file_name, storage_path, file_size,
+        browser, status, public_url, parsed_data, parsed_at, created_at
+      `)
+      .eq('test_id', id)
+      .order('created_at', { ascending: false });
+
+    if (traceError) {
+      logger.warn('[MANUAL_TEST] Error getting trace files', {
+        testId: id,
+        error: traceError,
+      });
+    }
+
+    // 6. Collect all screenshots from results
+    const screenshots = results
+      .filter(r => r.screenshot)
+      .map(r => ({
+        browser: r.browser,
+        screenshot: r.screenshot,
+        status: r.status,
+        completed_at: r.completedAt,
+      }));
+
+    // 7. Collect all videos from results and trace files
+    const videos = [
+      ...results.filter(r => r.videoUrl).map(r => ({
+        browser: r.browser,
+        video_url: r.videoUrl,
+        status: r.status,
+        completed_at: r.completedAt,
+      })),
+      ...(traceFiles || []).filter(tf => tf.public_url && tf.file_name?.endsWith('.webm')).map(tf => ({
+        browser: tf.browser,
+        video_url: tf.public_url,
+        file_name: tf.file_name,
+        file_size: tf.file_size,
+        created_at: tf.created_at,
+      })),
+    ];
+
+    // 8. Collect all logs from results
+    const allLogs = results
+      .filter(r => r.logs && Array.isArray(r.logs) && r.logs.length > 0)
+      .map(r => ({
+        browser: r.browser,
+        logs: r.logs,
+        status: r.status,
+      }));
+
+    // 9. Collect all network logs
+    const networkLogs = results
+      .filter(r => r.networkLogs && Array.isArray(r.networkLogs) && r.networkLogs.length > 0)
+      .map(r => ({
+        browser: r.browser,
+        network_logs: r.networkLogs,
+        status: r.status,
+      }));
+
+    // 10. Collect all errors
+    const errors = results
+      .filter(r => r.errors && Array.isArray(r.errors) && r.errors.length > 0)
+      .map(r => ({
+        browser: r.browser,
+        errors: r.errors,
+        status: r.status,
+      }));
+
+    // Build comprehensive response
+    const fullTestData = {
+      test: {
+        id: test.id,
+        url: test.url,
+        status: test.status,
+        browsers: test.browsers,
+        options: test.options,
+        created_at: test.createdAt,
+        updated_at: test.updatedAt,
+        started_at: test.startedAt,
+        completed_at: test.completedAt,
+      },
+      results: results.map(r => ({
+        id: r.id,
+        browser: r.browser,
+        status: r.status,
+        screenshot: r.screenshot,
+        dom: r.dom,
+        video_url: r.videoUrl,
+        trace_url: r.traceUrl,
+        performance: r.performance,
+        ai_summary: r.aiSummary,
+        created_at: r.createdAt,
+        completed_at: r.completedAt,
+      })),
+      report: report ? {
+        generatedCode: report.generatedCode,
+        artifacts: report.artifacts,
+        analysis: report.analysis,
+        summary: report.summary,
+      } : null,
+      intelligentSession,
+      traceFiles: traceFiles || [],
+      screenshots,
+      videos,
+      logs: allLogs,
+      networkLogs,
+      errors,
+    };
+
+    res.status(200).json({
+      success: true,
+      data: fullTestData,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[MANUAL_TEST] Error getting full test data', {
+      error: error instanceof Error ? error.message : String(error),
+      testId: id,
+      userId,
+    });
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get full test data',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
 }));
 
 /**

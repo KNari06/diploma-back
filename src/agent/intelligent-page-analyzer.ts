@@ -25,6 +25,40 @@ const openai = new OpenAI({
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// CONFIGURATION: Modal Detection Settings
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Configuration for modal detection
+ * These values are based on common web patterns and can be adjusted if needed
+ */
+const MODAL_DETECTION_CONFIG = {
+  // Timing settings
+  maxWaitTime: 5000,        // Maximum time to wait for modals to appear (ms)
+  checkInterval: 500,       // Interval between modal checks (ms)
+  renderWaitTime: 500,     // Additional wait after modal detected for full render (ms)
+
+  // Visual detection thresholds
+  zIndexThreshold: 100,     // Minimum z-index to consider element as modal
+  minModalSize: 100,        // Minimum width/height for modal (px)
+  overlaySizeRatio: 0.5,    // Element must cover at least 50% of viewport to be overlay
+
+  // Close button detection
+  closeButtonKeywords: [
+    'close', 'закрыть', 'dismiss', 'cancel', 'отмена',
+    '×', '✕', '✖', 'x', 'exit', 'выход'
+  ],
+  maxCloseButtonTextLength: 10, // Maximum text length for close button selector
+
+  // Modal type detection keywords
+  modalTypeKeywords: {
+    cookie: ['cookie', 'gdpr', 'consent', 'privacy', 'куки', 'согласие'],
+    newsletter: ['newsletter', 'subscribe', 'email', 'подписка', 'рассылка'],
+    popup: ['popup', 'modal', 'dialog', 'overlay', 'всплывающее'],
+  },
+} as const;
+
+// ═══════════════════════════════════════════════════════════════════════════
 // MAIN ANALYZER
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -221,8 +255,7 @@ export class IntelligentPageAnalyzer {
    */
   private static async waitForModals(page: Page): Promise<void> {
     const startTime = Date.now();
-    const maxWaitTime = 5000; // Maximum 5 seconds
-    const checkInterval = 500; // Check every 500ms
+    const { maxWaitTime, checkInterval, renderWaitTime } = MODAL_DETECTION_CONFIG;
     let lastModalCount = 0;
 
     logger.info('[INTELLIGENT_ANALYZER] Waiting for modals to appear', {
@@ -233,7 +266,9 @@ export class IntelligentPageAnalyzer {
     while (Date.now() - startTime < maxWaitTime) {
       try {
         // Check for modals using DOM analysis
-        const modalCount = await page.evaluate(() => {
+        // Pass config values to page.evaluate since it runs in browser context
+        const { zIndexThreshold, minModalSize, overlaySizeRatio } = MODAL_DETECTION_CONFIG;
+        const modalCount = await page.evaluate((config) => {
           // @ts-ignore - browser context
           const allElements = document.querySelectorAll('*');
           let count = 0;
@@ -252,13 +287,18 @@ export class IntelligentPageAnalyzer {
             const zIndex = parseInt(style.zIndex) || 0;
             const position = style.position;
             const isFixedOrAbsolute = position === 'fixed' || position === 'absolute';
-            const hasHighZIndex = zIndex > 100;
+            const hasHighZIndex = zIndex > config.zIndexThreshold;
 
             // Check for overlay (large element with background)
             // @ts-ignore - browser context
+            const viewportWidth = window.innerWidth;
+            // @ts-ignore - browser context
+            const viewportHeight = window.innerHeight;
+            // @ts-ignore - browser context
             const hasOverlay = style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
                               // @ts-ignore - browser context
-                              (el.offsetWidth > window.innerWidth * 0.5 || el.offsetHeight > window.innerHeight * 0.5);
+                              (el.offsetWidth > viewportWidth * config.overlaySizeRatio ||
+                               el.offsetHeight > viewportHeight * config.overlaySizeRatio);
 
             // Check for modal-like attributes
             const role = el.getAttribute('role');
@@ -266,21 +306,34 @@ export class IntelligentPageAnalyzer {
             const hasModalRole = role === 'dialog' || role === 'alertdialog' || ariaModal === 'true';
 
             // Check for modal-like classes/ids
-            const className = el.className?.toLowerCase() || '';
-            const id = el.id?.toLowerCase() || '';
+            // ✅ FIX: Handle className as string, SVGAnimatedString, or DOMTokenList
+            let className = '';
+            if (typeof el.className === 'string') {
+              className = el.className.toLowerCase();
+            } else if (el.className && typeof el.className === 'object') {
+              // Handle DOMTokenList or SVGAnimatedString
+              if ('baseVal' in el.className) {
+                className = (el.className.baseVal || '').toLowerCase();
+              } else if ('value' in el.className) {
+                className = (el.className.value || '').toLowerCase();
+              } else if (typeof el.className.toString === 'function') {
+                className = el.className.toString().toLowerCase();
+              }
+            }
+            const id = (el.id || '').toLowerCase();
             const hasModalKeywords = className.includes('modal') || className.includes('popup') ||
                                      className.includes('dialog') || className.includes('overlay') ||
                                      id.includes('modal') || id.includes('popup') || id.includes('dialog');
 
             // If element matches modal characteristics
             if ((hasModalRole || hasModalKeywords || (hasHighZIndex && isFixedOrAbsolute && hasOverlay)) &&
-                el.offsetWidth > 100 && el.offsetHeight > 100) {
+                el.offsetWidth > config.minModalSize && el.offsetHeight > config.minModalSize) {
               count++;
             }
           }
 
           return count;
-        });
+        }, { zIndexThreshold, minModalSize, overlaySizeRatio });
 
         // If modals appeared, wait a bit more for them to fully render
         if (modalCount > lastModalCount) {
@@ -289,8 +342,8 @@ export class IntelligentPageAnalyzer {
             elapsed: `${Date.now() - startTime}ms`,
           });
           lastModalCount = modalCount;
-          // Wait additional 500ms for modal to fully render (animations, etc.)
-          await page.waitForTimeout(500);
+          // Wait additional time for modal to fully render (animations, etc.)
+          await page.waitForTimeout(renderWaitTime);
           break; // Modal appeared, continue with analysis
         }
 
@@ -502,11 +555,16 @@ export class IntelligentPageAnalyzer {
           const zIndex = parseInt(style.zIndex) || 0;
           const position = style.position;
           const isFixedOrAbsolute = position === 'fixed' || position === 'absolute';
-          const hasHighZIndex = zIndex > 100; // Modals usually have high z-index
+          const hasHighZIndex = zIndex > MODAL_DETECTION_CONFIG.zIndexThreshold;
+          // @ts-ignore - browser context
+          const viewportWidth = window.innerWidth;
+          // @ts-ignore - browser context
+          const viewportHeight = window.innerHeight;
           // @ts-ignore - browser context
           const hasOverlay = style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
                             // @ts-ignore - browser context
-                            (el.offsetWidth > window.innerWidth * 0.5 || el.offsetHeight > window.innerHeight * 0.5);
+                            (el.offsetWidth > viewportWidth * MODAL_DETECTION_CONFIG.overlaySizeRatio ||
+                             el.offsetHeight > viewportHeight * MODAL_DETECTION_CONFIG.overlaySizeRatio);
 
           // Check for modal-like attributes
           const role = el.getAttribute('role');
@@ -514,15 +572,29 @@ export class IntelligentPageAnalyzer {
           const hasModalRole = role === 'dialog' || role === 'alertdialog' || ariaModal === 'true';
 
           // Check for modal-like classes/ids (dynamic, not hardcoded)
-          const className = el.className?.toLowerCase() || '';
-          const id = el.id?.toLowerCase() || '';
+          // ✅ FIX: Handle className as string, SVGAnimatedString, or DOMTokenList
+          let className = '';
+          if (typeof el.className === 'string') {
+            className = el.className.toLowerCase();
+          } else if (el.className && typeof el.className === 'object') {
+            // Handle DOMTokenList or SVGAnimatedString
+            if ('baseVal' in el.className) {
+              className = (el.className.baseVal || '').toLowerCase();
+            } else if ('value' in el.className) {
+              className = (el.className.value || '').toLowerCase();
+            } else if (typeof el.className.toString === 'function') {
+              className = el.className.toString().toLowerCase();
+            }
+          }
+          const id = (el.id || '').toLowerCase();
           const hasModalKeywords = className.includes('modal') || className.includes('popup') ||
                                    className.includes('dialog') || className.includes('overlay') ||
                                    id.includes('modal') || id.includes('popup') || id.includes('dialog');
 
           // If element matches modal characteristics
+          const { minModalSize } = MODAL_DETECTION_CONFIG;
           if ((hasModalRole || hasModalKeywords || (hasHighZIndex && isFixedOrAbsolute && hasOverlay)) &&
-              el.offsetWidth > 100 && el.offsetHeight > 100) { // Must be reasonably sized
+              el.offsetWidth > minModalSize && el.offsetHeight > minModalSize) {
             potentialModals.push(el);
           }
         }
@@ -541,12 +613,24 @@ export class IntelligentPageAnalyzer {
             const btnText = btn.textContent?.trim() || '';
             const btnAriaLabel = btn.getAttribute('aria-label')?.toLowerCase() || '';
             const btnTitle = btn.getAttribute('title')?.toLowerCase() || '';
-            const btnClass = btn.className?.toLowerCase() || '';
-            const btnId = btn.id?.toLowerCase() || '';
+            // ✅ FIX: Handle className as string, SVGAnimatedString, or DOMTokenList
+            let btnClass = '';
+            if (typeof btn.className === 'string') {
+              btnClass = btn.className.toLowerCase();
+            } else if (btn.className && typeof btn.className === 'object') {
+              if ('baseVal' in btn.className) {
+                btnClass = (btn.className.baseVal || '').toLowerCase();
+              } else if ('value' in btn.className) {
+                btnClass = (btn.className.value || '').toLowerCase();
+              } else if (typeof btn.className.toString === 'function') {
+                btnClass = btn.className.toString().toLowerCase();
+              }
+            }
+            const btnId = (btn.id || '').toLowerCase();
 
             // Dynamic patterns for close buttons
-            const closeKeywords = ['close', 'закрыть', 'dismiss', 'cancel', 'отмена', '×', '✕', 'x'];
-            const hasCloseText = closeKeywords.some(keyword =>
+            const { closeButtonKeywords, maxCloseButtonTextLength } = MODAL_DETECTION_CONFIG;
+            const hasCloseText = closeButtonKeywords.some(keyword =>
               btnText.toLowerCase().includes(keyword) ||
               btnAriaLabel.includes(keyword) ||
               btnTitle.includes(keyword) ||
@@ -568,12 +652,15 @@ export class IntelligentPageAnalyzer {
               } else if (btn.getAttribute('aria-label')) {
                 const ariaLabel = btn.getAttribute('aria-label');
                 closeSelector = `button[aria-label="${ariaLabel}"]`;
-              } else if (btnText && btnText.length <= 10) {
+              } else if (btnText && btnText.length <= maxCloseButtonTextLength) {
                 // Escape special characters for selector
                 const escapedText = btnText.replace(/"/g, '\\"');
                 closeSelector = `button:has-text("${escapedText}")`;
               } else if (btnClass) {
-                const classes = btnClass.split(' ').filter((c: string) => c && (c.includes('close') || c.includes('dismiss')));
+                const closeClassKeywords = ['close', 'dismiss', 'cancel'];
+                const classes = btnClass.split(' ').filter((c: string) =>
+                  c && closeClassKeywords.some(keyword => c.includes(keyword))
+                );
                 if (classes.length > 0) {
                   closeSelector = `button.${classes[0]}`;
                 }
@@ -583,29 +670,51 @@ export class IntelligentPageAnalyzer {
             }
           }
 
-          // Determine modal type dynamically
+          // Determine modal type dynamically using configuration
           const modalText = modalEl.textContent?.toLowerCase() || '';
-          const modalClass = modalEl.className?.toLowerCase() || '';
-          const modalId = modalEl.id?.toLowerCase() || '';
+          // ✅ FIX: Handle className as string, SVGAnimatedString, or DOMTokenList
+          let modalClass = '';
+          if (typeof modalEl.className === 'string') {
+            modalClass = modalEl.className.toLowerCase();
+          } else if (modalEl.className && typeof modalEl.className === 'object') {
+            if ('baseVal' in modalEl.className) {
+              modalClass = (modalEl.className.baseVal || '').toLowerCase();
+            } else if ('value' in modalEl.className) {
+              modalClass = (modalEl.className.value || '').toLowerCase();
+            } else if (typeof modalEl.className.toString === 'function') {
+              modalClass = modalEl.className.toString().toLowerCase();
+            }
+          }
+          const modalId = (modalEl.id || '').toLowerCase();
 
+          // Determine modal type using configured keywords
+          const { modalTypeKeywords } = MODAL_DETECTION_CONFIG;
           let modalType: 'cookie_banner' | 'newsletter' | 'popup' | 'other' = 'other';
 
           // Check for cookie/GDPR keywords
-          if (modalText.includes('cookie') || modalText.includes('gdpr') || modalText.includes('consent') ||
-              modalClass.includes('cookie') || modalClass.includes('gdpr') || modalClass.includes('consent') ||
-              modalId.includes('cookie') || modalId.includes('gdpr')) {
+          const hasCookieKeywords = modalTypeKeywords.cookie.some(keyword =>
+            modalText.includes(keyword) || modalClass.includes(keyword) || modalId.includes(keyword)
+          );
+          if (hasCookieKeywords) {
             modalType = 'cookie_banner';
           }
           // Check for newsletter/subscribe keywords
-          else if (modalText.includes('newsletter') || modalText.includes('subscribe') || modalText.includes('email') ||
-                   modalClass.includes('newsletter') || modalClass.includes('subscribe') ||
-                   modalId.includes('newsletter') || modalId.includes('subscribe')) {
-            modalType = 'newsletter';
-          }
-          // Check for popup/modal keywords
-          else if (modalClass.includes('popup') || modalClass.includes('modal') || modalClass.includes('dialog') ||
-                   modalId.includes('popup') || modalId.includes('modal') || modalId.includes('dialog')) {
-            modalType = 'popup';
+          else {
+            const hasNewsletterKeywords = modalTypeKeywords.newsletter.some(keyword =>
+              modalText.includes(keyword) || modalClass.includes(keyword) || modalId.includes(keyword)
+            );
+            if (hasNewsletterKeywords) {
+              modalType = 'newsletter';
+            }
+            // Check for popup/modal keywords
+            else {
+              const hasPopupKeywords = modalTypeKeywords.popup.some(keyword =>
+                modalClass.includes(keyword) || modalId.includes(keyword)
+              );
+              if (hasPopupKeywords) {
+                modalType = 'popup';
+              }
+            }
           }
 
           modals.push({

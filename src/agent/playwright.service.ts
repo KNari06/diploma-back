@@ -951,7 +951,7 @@ export async function executePlaywrightTestWithRetry(
           logger.info('[PLAYWRIGHT_RETRY] Test succeeded after retry', {
             testId: testData.testId,
             successfulAttempt: attempt + 1, // ✅ FIX: Human-readable numbering
-            totalAttempts: attempt + 1,
+            totalAttempts: maxRetries + 1, // ✅ FIX: Total attempts = maxRetries + 1 (initial + retries)
           });
         }
         return result;
