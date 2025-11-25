@@ -70,9 +70,33 @@ export class ResultCollector {
     // Network requests with response bodies for intelligent mode
     page.on('response', async (response) => {
       try {
+        const url = response.url();
+
+        // ✅ FIX: Ignore external services (Google Analytics, Firebase, etc.)
+        // These are third-party services used by the user's website, not part of the platform
+        const externalServicePatterns = [
+          'google-analytics.com',
+          'googleapis.com',
+          'firebase.googleapis.com',
+          'googletagmanager.com',
+          'doubleclick.net',
+          'googleadservices.com',
+          'facebook.com',
+          'facebook.net',
+          'analytics.js',
+          'gtag.js',
+          'ga.js',
+          'adservice',
+          'adsystem',
+        ];
+
+        const isExternalService = externalServicePatterns.some(pattern => url.includes(pattern));
+        if (isExternalService) {
+          return; // Skip logging external services
+        }
+
         const request = response.request();
         const timing = response.request().timing();
-        const url = response.url();
 
         // ✅ FIX: Collect response bodies for important API requests (intelligent mode needs this)
         let responseBody: any = null;
@@ -126,13 +150,37 @@ export class ResultCollector {
 
     // Request failures
     page.on('requestfailed', (request) => {
+      const url = request.url();
+
+      // ✅ FIX: Ignore external services failures (not our concern)
+      const externalServicePatterns = [
+        'google-analytics.com',
+        'googleapis.com',
+        'firebase.googleapis.com',
+        'googletagmanager.com',
+        'doubleclick.net',
+        'googleadservices.com',
+        'facebook.com',
+        'facebook.net',
+        'analytics.js',
+        'gtag.js',
+        'ga.js',
+        'adservice',
+        'adsystem',
+      ];
+
+      const isExternalService = externalServicePatterns.some(pattern => url.includes(pattern));
+      if (isExternalService) {
+        return; // Skip logging external service failures
+      }
+
       this.errors.push({
         type: 'network',
-        message: `Request failed: ${request.url()}`,
-        url: request.url(),
+        message: `Request failed: ${url}`,
+        url,
         timestamp: new Date(),
       });
-      logger.warn('Request failed', { url: request.url() });
+      logger.warn('Request failed', { url });
     });
   }
 

@@ -130,6 +130,16 @@ export class IntelligentPageAnalyzer {
         visionAnalysis = await this.analyzeWithoutVision(domAnalysis, url);
       }
 
+      // ✅ CRITICAL FIX: Match Vision AI elements with real DOM selectors
+      // Vision AI sees elements visually but doesn't know selectors
+      // DOM analysis has selectors but doesn't know which element is which
+      // We need to match them by text, type, and purpose
+      visionAnalysis = await this.matchVisionElementsWithDOMSelectors(
+        page,
+        visionAnalysis,
+        domAnalysis
+      );
+
       // ✅ IMPROVED: Enhance DOM analysis with Vision AI modal detection
       // Vision AI sees modals visually, DOM analysis finds selectors
       const enhancedDomAnalysis = await this.enhanceDOMWithVisionModals(
@@ -494,6 +504,132 @@ export class IntelligentPageAnalyzer {
   }
 
   /**
+   * ✅ CRITICAL FIX: Match Vision AI elements with real DOM selectors
+   * Vision AI sees elements visually but doesn't know selectors
+   * DOM analysis has selectors but doesn't know which element is which
+   * We match them by text, type, and purpose
+   */
+  private static async matchVisionElementsWithDOMSelectors(
+    page: Page,
+    visionAnalysis: VisionAnalysis,
+    domAnalysis: DOMAnalysis
+  ): Promise<VisionAnalysis> {
+    // Import PageElement type
+    type PageElement = import('./types/intelligent-testing.types').PageElement;
+    logger.info('[INTELLIGENT_ANALYZER] Matching Vision elements with DOM selectors', {
+      visionElements: visionAnalysis.elements.length,
+      domButtons: domAnalysis.buttons.length,
+      domInputs: domAnalysis.inputs.length,
+      domLinks: domAnalysis.links.length,
+    });
+
+    const matchedElements: PageElement[] = [];
+
+    for (const visionElement of visionAnalysis.elements) {
+      let matchedSelector: string | undefined;
+
+      // Try to match by type and text
+      if (visionElement.type === 'button' && visionElement.text) {
+        // Find button in DOM with matching text
+        const matchingButton = domAnalysis.buttons.find(btn => {
+          const btnText = btn.text.toLowerCase().trim();
+          const visionText = visionElement.text?.toLowerCase().trim() || '';
+          // Exact match or contains
+          return btnText === visionText ||
+                 btnText.includes(visionText) ||
+                 visionText.includes(btnText);
+        });
+
+        if (matchingButton) {
+          matchedSelector = matchingButton.selector;
+          logger.debug('[INTELLIGENT_ANALYZER] Matched button by text', {
+            visionText: visionElement.text,
+            selector: matchedSelector,
+          });
+        }
+      }
+
+      // Try to match input by type and purpose
+      if (visionElement.type === 'input') {
+        const matchingInput = domAnalysis.inputs.find(input => {
+          // Match by purpose (email, password, search, etc.)
+          const purpose = visionElement.purpose.toLowerCase();
+          const inputType = input.type.toLowerCase();
+          const inputName = (input.name || '').toLowerCase();
+          const inputPlaceholder = (input.placeholder || '').toLowerCase();
+
+          return purpose.includes(inputType) ||
+                 inputType.includes(purpose) ||
+                 inputName.includes(purpose) ||
+                 inputPlaceholder.includes(purpose);
+        });
+
+        if (matchingInput) {
+          matchedSelector = matchingInput.selector;
+          logger.debug('[INTELLIGENT_ANALYZER] Matched input by purpose', {
+            purpose: visionElement.purpose,
+            selector: matchedSelector,
+          });
+        }
+      }
+
+      // Try to match link by text
+      if (visionElement.type === 'link' && visionElement.text) {
+        const matchingLink = domAnalysis.links.find(link => {
+          const linkText = link.text.toLowerCase().trim();
+          const visionText = visionElement.text?.toLowerCase().trim() || '';
+          return linkText === visionText ||
+                 linkText.includes(visionText) ||
+                 visionText.includes(linkText);
+        });
+
+        if (matchingLink) {
+          matchedSelector = matchingLink.selector;
+          logger.debug('[INTELLIGENT_ANALYZER] Matched link by text', {
+            visionText: visionElement.text,
+            selector: matchedSelector,
+          });
+        }
+      }
+
+      // If no match found, try to find selector dynamically by text
+      if (!matchedSelector && visionElement.text) {
+        try {
+          // Try Playwright text selector
+          const textSelector = `${visionElement.type}:has-text("${visionElement.text}")`;
+          const count = await page.locator(textSelector).count();
+          if (count > 0) {
+            matchedSelector = textSelector;
+            logger.debug('[INTELLIGENT_ANALYZER] Found selector by text search', {
+              text: visionElement.text,
+              selector: matchedSelector,
+            });
+          }
+        } catch (error) {
+          // Ignore errors, continue
+        }
+      }
+
+      // Add element with matched selector (or keep original if no match)
+      matchedElements.push({
+        ...visionElement,
+        selector: matchedSelector || visionElement.selector || '', // Use matched selector or keep original
+      });
+    }
+
+    logger.info('[INTELLIGENT_ANALYZER] Vision-DOM matching completed', {
+      totalElements: visionAnalysis.elements.length,
+      matchedElements: matchedElements.filter(el => el.selector).length,
+      unmatchedElements: matchedElements.filter(el => !el.selector).length,
+    });
+
+    return {
+      ...visionAnalysis,
+      elements: matchedElements,
+    };
+  }
+
+  /**
    * ✅ NEW: Find close button selector by visible text (from Vision AI)
    */
   private static async findCloseButtonByText(
@@ -584,8 +720,8 @@ export class IntelligentPageAnalyzer {
               className = (el.className.value || '').toLowerCase();
             } else if (typeof el.className.toString === 'function') {
               className = el.className.toString().toLowerCase();
-            }
           }
+        }
           const id = (el.id || '').toLowerCase();
           const hasModalKeywords = className.includes('modal') || className.includes('popup') ||
                                    className.includes('dialog') || className.includes('overlay') ||
@@ -713,7 +849,7 @@ export class IntelligentPageAnalyzer {
               );
               if (hasPopupKeywords) {
                 modalType = 'popup';
-              }
+          }
             }
           }
 

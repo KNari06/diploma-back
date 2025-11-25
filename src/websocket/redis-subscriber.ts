@@ -13,8 +13,8 @@
  */
 
 import { redisWebSocketBridge } from '@/services/websocket/redis-bridge.service';
-import { webSocketService } from './websocket.service';
 import { logger } from '@/utils/logger';
+import { webSocketService } from './websocket.service';
 
 class WebSocketRedisSubscriber {
   private isRunning = false;
@@ -69,6 +69,10 @@ class WebSocketRedisSubscriber {
 
         case 'test:progress':
           wsService.emitTestProgress(payload.testId, payload);
+          break;
+
+        case 'test:graph-update': // ✅ NEW: Real-time graph streaming
+          wsService.emitTestGraphUpdate(payload.testId, payload);
           break;
 
         case 'test:step:completed':
@@ -149,6 +153,14 @@ class WebSocketRedisSubscriber {
           } else if (payload.testId) {
             // Emit to test room if testId is in payload
             wsService.emitTestProgress(payload.testId, payload);
+          }
+          break;
+
+        case 'test:graph-update': // ✅ NEW
+          if (target?.userId) {
+            wsService.emitToUser(target.userId, 'test:graph-update', payload);
+          } else if (payload.testId) {
+            wsService.emitTestGraphUpdate(payload.testId, payload);
           }
           break;
 

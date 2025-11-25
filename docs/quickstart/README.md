@@ -26,6 +26,7 @@ nano .env
 ```
 
 **Required Environment Variables:**
+
 ```env
 # Supabase (Required)
 SUPABASE_URL=your_supabase_url
@@ -46,11 +47,13 @@ API_KEY_SECRET=your_32_character_api_secret_here
 ### 3. Setup Database
 
 1. **Create Supabase Project:**
+
    - Go to [supabase.com](https://supabase.com/)
    - Create new project
    - Note down your project URL and API keys
 
 2. **Run Database Schema:**
+
    ```sql
    -- Copy and paste the contents of supabase-schema.sql
    -- into your Supabase SQL editor and run it
@@ -58,7 +61,7 @@ API_KEY_SECRET=your_32_character_api_secret_here
 
 3. **Create Storage Bucket:**
    - Go to Storage in Supabase dashboard
-   - Create bucket named `qai-screenshots`
+   - Create bucket named `qai-assets`
    - Set to public if needed
 
 ### 4. Start Redis
@@ -89,11 +92,13 @@ npm run worker
 ## 🧪 Test the API
 
 ### Health Check
+
 ```bash
 curl http://localhost:3000/health
 ```
 
 ### Create a Test
+
 ```bash
 curl -X POST http://localhost:3000/api/v1/tests/run \
   -H "Content-Type: application/json" \
@@ -105,6 +110,7 @@ curl -X POST http://localhost:3000/api/v1/tests/run \
 ```
 
 ### Check Test Status
+
 ```bash
 curl http://localhost:3000/api/v1/tests/{test-id}
 ```
@@ -127,16 +133,19 @@ docker-compose up --build
 ## 📊 Monitor the System
 
 ### API Health
+
 - **Health Check**: http://localhost:3000/health
 - **API Info**: http://localhost:3000/
 
 ### Queue Status
+
 ```bash
 # Check queue stats (if implemented)
 curl http://localhost:3000/api/v1/queue/stats
 ```
 
 ### Logs
+
 ```bash
 # View API logs
 npm run dev
@@ -152,6 +161,7 @@ docker-compose logs -f worker
 ## 🔧 Common Issues
 
 ### Redis Connection Failed
+
 ```bash
 # Check if Redis is running
 redis-cli ping
@@ -162,16 +172,19 @@ redis-server
 ```
 
 ### Supabase Connection Failed
+
 - Verify your Supabase URL and keys
 - Check if your project is active
 - Ensure RLS policies are set up correctly
 
 ### OpenAI API Errors
+
 - Verify your API key is valid
 - Check if you have credits available
 - Ensure the model is accessible
 
 ### Port Already in Use
+
 ```bash
 # Kill process on port 3000
 lsof -ti:3000 | xargs kill -9
@@ -192,20 +205,20 @@ PORT=3001
 
 ### Test Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/tests/run` | Create and run test |
-| GET | `/api/v1/tests/:id` | Get test details |
-| GET | `/api/v1/tests/:id/result` | Get test results |
-| POST | `/api/v1/tests/:id/cancel` | Cancel test |
-| POST | `/api/v1/tests/:id/retry` | Retry test |
+| Method | Endpoint                   | Description         |
+| ------ | -------------------------- | ------------------- |
+| POST   | `/api/v1/tests/run`        | Create and run test |
+| GET    | `/api/v1/tests/:id`        | Get test details    |
+| GET    | `/api/v1/tests/:id/result` | Get test results    |
+| POST   | `/api/v1/tests/:id/cancel` | Cancel test         |
+| POST   | `/api/v1/tests/:id/retry`  | Retry test          |
 
 ### Health Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | System health check |
-| GET | `/` | API information |
+| Method | Endpoint  | Description         |
+| ------ | --------- | ------------------- |
+| GET    | `/health` | System health check |
+| GET    | `/`       | API information     |
 
 ## 🆘 Need Help?
 

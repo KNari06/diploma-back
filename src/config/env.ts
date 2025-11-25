@@ -17,7 +17,7 @@ const envSchema = z.object({
   SUPABASE_URL: z.string().min(1, 'SUPABASE_URL is required'),
   SUPABASE_ANON_KEY: z.string().min(1, 'SUPABASE_ANON_KEY is required'),
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1, 'SUPABASE_SERVICE_ROLE_KEY is required'),
-  SUPABASE_BUCKET_NAME: z.string().default('qai-screenshots'),
+  SUPABASE_BUCKET_NAME: z.string().default('qai-assets'),
 
   // Redis
   REDIS_URL: z.string().default('redis://35.202.242.230:6379'),

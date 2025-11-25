@@ -493,15 +493,15 @@ $$ LANGUAGE plpgsql;
 
 -- Create storage bucket for screenshots
 INSERT INTO storage.buckets (id, name, public)
-VALUES ('qai-screenshots', 'qai-screenshots', true);
+VALUES ('qai-assets', 'qai-assets', true);
 
 -- Storage policies for screenshots
 CREATE POLICY "Public read access for screenshots" ON storage.objects
-    FOR SELECT USING (bucket_id = 'qai-screenshots');
+    FOR SELECT USING (bucket_id = 'qai-assets');
 
 CREATE POLICY "Authenticated users can upload screenshots" ON storage.objects
     FOR INSERT WITH CHECK (
-        bucket_id = 'qai-screenshots'
+        bucket_id = 'qai-assets'
         AND auth.role() = 'authenticated'
     );
 

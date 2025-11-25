@@ -11,28 +11,29 @@ import { redisWebSocketBridge } from '@/services/websocket/redis-bridge.service'
 import { logger } from '@/utils/logger';
 import { getIO, isWebSocketInitialized } from './server';
 import {
-  AIAnalysisCompletedPayload,
-  AIAnalysisProgressPayload,
-  AIAnalysisStartedPayload,
-  AIBugFoundPayload,
-  ChatMessagePayload,
-  ChatTestUpdatePayload,
-  createRoomName,
-  ResultErrorPayload,
-  ResultReadyPayload,
-  ResultScreenshotPayload,
-  RoomType,
-  ServerToClientEvents,
-  SystemErrorPayload,
-  SystemMaintenancePayload,
-  TestBrowserCompletedPayload,
-  TestCancelledPayload,
-  TestCompletedPayload,
-  TestCreatedPayload,
-  TestFailedPayload,
-  TestProgressPayload,
-  TestStartedPayload,
-  TestStepCompletedPayload,
+    AIAnalysisCompletedPayload,
+    AIAnalysisProgressPayload,
+    AIAnalysisStartedPayload,
+    AIBugFoundPayload,
+    ChatMessagePayload,
+    ChatTestUpdatePayload,
+    createRoomName,
+    ResultErrorPayload,
+    ResultReadyPayload,
+    ResultScreenshotPayload,
+    RoomType,
+    ServerToClientEvents,
+    SystemErrorPayload,
+    SystemMaintenancePayload,
+    TestBrowserCompletedPayload,
+    TestCancelledPayload,
+    TestCompletedPayload,
+    TestCreatedPayload,
+    TestFailedPayload,
+    TestGraphUpdatePayload, // ✅ NEW
+    TestProgressPayload,
+    TestStartedPayload,
+    TestStepCompletedPayload,
 } from './types';
 
 class WebSocketService {
@@ -370,6 +371,18 @@ class WebSocketService {
           action: payload.action?.type,
         });
         this.emitToTest(testId, 'test:progress', payload);
+      },
+      { testId }
+    );
+  }
+
+  // ✅ NEW: Emit real-time graph update
+  public emitTestGraphUpdate(testId: string, payload: TestGraphUpdatePayload): void {
+    this.emitWithFallback(
+      'test:graph-update',
+      payload,
+      () => {
+        this.emitToTest(testId, 'test:graph-update', payload);
       },
       { testId }
     );

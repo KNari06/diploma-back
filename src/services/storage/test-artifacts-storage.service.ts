@@ -12,13 +12,37 @@ export async function uploadVideoToStorage(
   userId: string
 ): Promise<string> {
   try {
+    // ✅ FIX: Check if file exists before reading
+    try {
+      await fs.access(localPath);
+    } catch (accessError) {
+      logger.error('[STORAGE] Video file does not exist', {
+        testId,
+        localPath,
+        error: accessError instanceof Error ? accessError.message : String(accessError),
+      });
+      throw new Error(`Video file not found: ${localPath}`);
+    }
+
     logger.info('[STORAGE] Uploading video', {
       testId,
       localPath,
+      userId,
     });
 
     // Read file
     const fileBuffer = await fs.readFile(localPath);
+    const fileSize = fileBuffer.length;
+
+    if (fileSize === 0) {
+      logger.warn('[STORAGE] Video file is empty', { testId, localPath });
+      throw new Error('Video file is empty');
+    }
+
+    logger.debug('[STORAGE] Video file read successfully', {
+      testId,
+      fileSize: `${Math.round(fileSize / 1024)}KB`,
+    });
     const fileName = `video-${testId}-${Date.now()}.webm`;
     const storagePath = `${userId}/videos/${fileName}`;
 
@@ -80,13 +104,37 @@ export async function uploadTraceToStorage(
   userId: string
 ): Promise<string> {
   try {
+    // ✅ FIX: Check if file exists before reading
+    try {
+      await fs.access(localPath);
+    } catch (accessError) {
+      logger.error('[STORAGE] Trace file does not exist', {
+        testId,
+        localPath,
+        error: accessError instanceof Error ? accessError.message : String(accessError),
+      });
+      throw new Error(`Trace file not found: ${localPath}`);
+    }
+
     logger.info('[STORAGE] Uploading trace', {
       testId,
       localPath,
+      userId,
     });
 
     // Read file
     const fileBuffer = await fs.readFile(localPath);
+    const fileSize = fileBuffer.length;
+
+    if (fileSize === 0) {
+      logger.warn('[STORAGE] Trace file is empty', { testId, localPath });
+      throw new Error('Trace file is empty');
+    }
+
+    logger.debug('[STORAGE] Trace file read successfully', {
+      testId,
+      fileSize: `${Math.round(fileSize / 1024)}KB`,
+    });
     const fileName = `trace-${testId}-${Date.now()}.zip`;
     const storagePath = `${userId}/traces/${fileName}`;
 

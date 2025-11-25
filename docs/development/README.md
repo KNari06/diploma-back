@@ -40,7 +40,7 @@ API_VERSION=v1
 SUPABASE_URL=your_supabase_url
 SUPABASE_ANON_KEY=your_supabase_anon_key
 SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
-SUPABASE_BUCKET_NAME=qai-screenshots
+SUPABASE_BUCKET_NAME=qai-assets
 
 # Redis Configuration
 REDIS_URL=redis://35.202.242.230:6379
@@ -59,7 +59,7 @@ API_KEY_SECRET=your_api_key_secret_32_chars_min
 
 1. Create a new Supabase project
 2. Run the SQL schema from `supabase-schema.sql`
-3. Create a storage bucket named `qai-screenshots`
+3. Create a storage bucket named `qai-assets`
 4. Set up RLS policies as defined in the schema
 
 ### Running the Application
@@ -111,20 +111,24 @@ src/
 ### Key Components
 
 #### 1. API Layer (`/api`)
+
 - RESTful endpoints for test management
 - Request validation and response formatting
 - Authentication and authorization (future)
 
 #### 2. Services Layer (`/services`)
+
 - **TestService**: Core test management logic
 - **AIService**: GPT integration for analysis
 
 #### 3. Queue System (`/jobs`, `/config/queues`)
+
 - **BullMQ** for job processing
 - **Redis** for queue storage
 - Background workers for async processing
 
 #### 4. Database Layer (`/db`)
+
 - **Supabase** client configuration
 - Type-safe database operations
 - Row Level Security (RLS) policies
@@ -290,16 +294,19 @@ Ensure all required environment variables are set in production:
 ### Common Issues
 
 1. **Redis Connection Failed**
+
    - Check Redis server status
    - Verify connection string
    - Check firewall settings
 
 2. **Supabase Connection Failed**
+
    - Verify API keys
    - Check project status
    - Verify RLS policies
 
 3. **OpenAI API Errors**
+
    - Check API key validity
    - Verify rate limits
    - Check model availability

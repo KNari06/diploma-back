@@ -51,30 +51,25 @@ class RedisWebSocketBridge {
 
         // Error handler - DON'T throw, just log
         this.publisher.on('error', (error) => {
-          logger.error('[REDIS_BRIDGE] Publisher error', {
-            error: error instanceof Error ? {
-              message: error.message,
-              name: error.name,
-              stack: error.stack,
-            } : String(error),
-          });
+          // ✅ REMOVED: REDIS_BRIDGE logs
         });
 
         this.publisher.on('connect', () => {
-          logger.debug('[REDIS_BRIDGE] Publisher connected');
+          // ✅ REMOVED: REDIS_BRIDGE logs
         });
 
         // ✅ FIX: Handle ready event for connection tracking
         this.publisher.on('ready', () => {
-          logger.debug('[REDIS_BRIDGE] Publisher ready');
+          // ✅ REMOVED: REDIS_BRIDGE logs
         });
 
         // ✅ FIX: Handle close event for graceful shutdown
         this.publisher.on('close', () => {
-          logger.debug('[REDIS_BRIDGE] Publisher connection closed');
+          // ✅ REMOVED: REDIS_BRIDGE logs
         });
       } catch (error) {
-        logger.error('[REDIS_BRIDGE] Failed to create publisher client', {
+        // ✅ REMOVED: REDIS_BRIDGE logs
+        logger.error('Failed to create publisher client', {
           error: error instanceof Error ? {
             message: error.message,
             name: error.name,
@@ -107,9 +102,7 @@ class RedisWebSocketBridge {
       // ✅ FIX: Wait for publisher to be ready (with timeout)
       const currentStatus = publisher.status as string;
       if (currentStatus !== 'ready') {
-        logger.debug('[REDIS_BRIDGE] Waiting for publisher to be ready...', {
-          currentStatus,
-        });
+        // ✅ REMOVED: REDIS_BRIDGE logs
 
         // Wait up to 2 seconds for connection
         const timeout = 2000;
@@ -119,11 +112,7 @@ class RedisWebSocketBridge {
         }
 
         if ((publisher.status as string) !== 'ready') {
-          logger.warn('[REDIS_BRIDGE] Publisher not ready after timeout, skipping event', {
-            event,
-            status: publisher.status,
-            waited: `${Date.now() - startTime}ms`,
-          });
+          // ✅ REMOVED: REDIS_BRIDGE logs
           return;
         }
       }
@@ -139,11 +128,7 @@ class RedisWebSocketBridge {
 
       // ✅ FIX: Limit payload size (1MB max) to prevent Redis overload
       if (serialized.length > 1000000) {
-        logger.warn('[REDIS_BRIDGE] Event payload too large, truncating', {
-          event,
-          originalSize: serialized.length,
-          maxSize: 1000000,
-        });
+        // ✅ REMOVED: REDIS_BRIDGE logs
         // Truncate payload (keep only first 1MB)
         const truncatedPayload = {
           ...payload,
@@ -161,21 +146,9 @@ class RedisWebSocketBridge {
         await publisher.publish(WEBSOCKET_EVENTS_CHANNEL, serialized);
       }
 
-      logger.debug('[REDIS_BRIDGE] Published event to Redis', {
-        event,
-        target,
-        payloadSize: serialized.length,
-      });
+      // ✅ REMOVED: REDIS_BRIDGE logs
     } catch (error) {
-      logger.error('[REDIS_BRIDGE] Failed to publish event', {
-        event,
-        target,
-        error: error instanceof Error ? {
-          message: error.message,
-          name: error.name,
-          stack: error.stack,
-        } : String(error),
-      });
+      // ✅ REMOVED: REDIS_BRIDGE logs
       // Don't throw - events can be lost in worker, but don't crash the process
     }
   }
@@ -190,7 +163,7 @@ class RedisWebSocketBridge {
     callback: (event: string, payload: any, target?: any) => void
   ): Promise<void> {
     if (this.isSubscribed) {
-      logger.warn('[REDIS_BRIDGE] Already subscribed to WebSocket events');
+      // ✅ REMOVED: REDIS_BRIDGE logs
       return;
     }
 
@@ -201,24 +174,19 @@ class RedisWebSocketBridge {
           this.subscriber = new Redis(connection as any);
 
           this.subscriber.on('error', (error) => {
-            logger.error('[REDIS_BRIDGE] Subscriber error', {
-              error: error instanceof Error ? {
-                message: error.message,
-                name: error.name,
-                stack: error.stack,
-              } : String(error),
-            });
+            // ✅ REMOVED: REDIS_BRIDGE logs
           });
 
           this.subscriber.on('connect', () => {
-            logger.info('[REDIS_BRIDGE] Subscriber connected');
+            // ✅ REMOVED: REDIS_BRIDGE logs
           });
 
           this.subscriber.on('ready', () => {
-            logger.info('[REDIS_BRIDGE] Subscriber ready');
+            // ✅ REMOVED: REDIS_BRIDGE logs
           });
         } catch (error) {
-          logger.error('[REDIS_BRIDGE] Failed to create subscriber client', {
+          // ✅ REMOVED: REDIS_BRIDGE logs
+          logger.error('Failed to create subscriber client', {
             error: error instanceof Error ? {
               message: error.message,
               name: error.name,
@@ -246,40 +214,26 @@ class RedisWebSocketBridge {
           // Calculate message age (for monitoring)
           const age = Date.now() - timestamp;
           if (age > 1000) {
-            logger.warn('[REDIS_BRIDGE] Received old message', {
-              event,
-              age: `${age}ms`,
-            });
+            // ✅ REMOVED: REDIS_BRIDGE logs
           }
 
-          logger.debug('[REDIS_BRIDGE] Received event from Redis', {
-            event,
-            target,
-            age: `${age}ms`,
-          });
+          // ✅ REMOVED: REDIS_BRIDGE logs
 
           // ✅ FIX: Wrap callback in try-catch to prevent subscriber crash
           try {
             callback(event, payload, target);
           } catch (callbackError) {
-            logger.error('[REDIS_BRIDGE] Callback error', {
-              event,
-              error: callbackError instanceof Error ? callbackError.message : String(callbackError),
-            });
+            // ✅ REMOVED: REDIS_BRIDGE logs
           }
         } catch (parseError) {
-          logger.error('[REDIS_BRIDGE] Failed to parse event message', {
-            error: parseError instanceof Error ? parseError.message : String(parseError),
-            message: message.substring(0, 200), // Log first 200 chars for debugging
-          });
+          // ✅ REMOVED: REDIS_BRIDGE logs
         }
       });
 
-      logger.info('[REDIS_BRIDGE] Subscribed to WebSocket events channel', {
-        channel: WEBSOCKET_EVENTS_CHANNEL,
-      });
+      // ✅ REMOVED: REDIS_BRIDGE logs
     } catch (error) {
-      logger.error('[REDIS_BRIDGE] Failed to subscribe', {
+      // ✅ REMOVED: REDIS_BRIDGE logs
+      logger.error('Failed to subscribe', {
         error: error instanceof Error ? {
           message: error.message,
           name: error.name,
@@ -304,16 +258,10 @@ class RedisWebSocketBridge {
         await this.subscriber.quit();
         this.subscriber = null;
         this.isSubscribed = false;
-        logger.info('[REDIS_BRIDGE] Unsubscribed from WebSocket events');
+        // ✅ REMOVED: REDIS_BRIDGE logs
       } catch (error) {
         errors.push(error as Error);
-        logger.error('[REDIS_BRIDGE] Failed to unsubscribe', {
-          error: error instanceof Error ? {
-            message: error.message,
-            name: error.name,
-            stack: error.stack,
-          } : String(error),
-        });
+        // ✅ REMOVED: REDIS_BRIDGE logs
       }
     }
 
@@ -322,16 +270,10 @@ class RedisWebSocketBridge {
       try {
         await this.publisher.quit();
         this.publisher = null;
-        logger.info('[REDIS_BRIDGE] Publisher connection closed');
+        // ✅ REMOVED: REDIS_BRIDGE logs
       } catch (error) {
         errors.push(error as Error);
-        logger.error('[REDIS_BRIDGE] Failed to close publisher', {
-          error: error instanceof Error ? {
-            message: error.message,
-            name: error.name,
-            stack: error.stack,
-          } : String(error),
-        });
+        // ✅ REMOVED: REDIS_BRIDGE logs
       }
     }
 
@@ -358,13 +300,7 @@ class RedisWebSocketBridge {
         subscribed: this.isSubscribed,
       };
     } catch (error) {
-      logger.error('[REDIS_BRIDGE] Failed to get status', {
-        error: error instanceof Error ? {
-          message: error.message,
-          name: error.name,
-          stack: error.stack,
-        } : String(error),
-      });
+      // ✅ REMOVED: REDIS_BRIDGE logs
       // Return safe defaults on error
       return {
         publisher: false,

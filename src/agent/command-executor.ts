@@ -44,7 +44,20 @@ export class CommandExecutor {
 
         case 'click':
           if (!selector) throw new Error('Selector is required for click action');
-          await this.page.click(selector, { timeout: timeout || 30000 });
+          // ✅ IMPROVED: Use locator with better error handling
+          try {
+            const locator = this.page.locator(selector);
+            // Wait for element to be visible and actionable
+            await locator.waitFor({ state: 'visible', timeout: timeout || 30000 });
+            await locator.click({ timeout: timeout || 30000 });
+          } catch (clickError) {
+            // ✅ IMPROVED: Provide more detailed error message
+            const errorMessage = clickError instanceof Error ? clickError.message : String(clickError);
+            if (errorMessage.includes('not found') || errorMessage.includes('timeout')) {
+              throw new Error(`Element not found or not visible: ${selector}. ${errorMessage}`);
+            }
+            throw clickError;
+          }
           break;
 
         case 'fill':

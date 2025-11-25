@@ -49,6 +49,30 @@ class RequestTracker {
     // Track all requests
     this.page.on('request', (request) => {
       const url = request.url();
+
+      // ✅ FIX: Ignore external services (Google Analytics, Firebase, etc.)
+      // These are third-party services used by the user's website, not part of the platform
+      const externalServicePatterns = [
+        'google-analytics.com',
+        'googleapis.com',
+        'firebase.googleapis.com',
+        'googletagmanager.com',
+        'doubleclick.net',
+        'googleadservices.com',
+        'facebook.com',
+        'facebook.net',
+        'analytics.js',
+        'gtag.js',
+        'ga.js',
+        'adservice',
+        'adsystem',
+      ];
+
+      const isExternalService = externalServicePatterns.some(pattern => url.includes(pattern));
+      if (isExternalService) {
+        return; // Skip tracking external services
+      }
+
       // Filter: only track API requests (not static assets, not websockets, not long-polling)
       if (
         url.includes('/api/') ||
@@ -79,6 +103,29 @@ class RequestTracker {
     // Track completed requests
     this.page.on('response', (response) => {
       const url = response.url();
+
+      // ✅ FIX: Ignore external services (Google Analytics, Firebase, etc.)
+      const externalServicePatterns = [
+        'google-analytics.com',
+        'googleapis.com',
+        'firebase.googleapis.com',
+        'googletagmanager.com',
+        'doubleclick.net',
+        'googleadservices.com',
+        'facebook.com',
+        'facebook.net',
+        'analytics.js',
+        'gtag.js',
+        'ga.js',
+        'adservice',
+        'adsystem',
+      ];
+
+      const isExternalService = externalServicePatterns.some(pattern => url.includes(pattern));
+      if (isExternalService) {
+        return; // Skip tracking external services
+      }
+
       const pendingCount = this.pendingRequests.get(url);
 
       if (pendingCount !== undefined && pendingCount > 0) {
@@ -465,15 +512,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         throw new Error(`Page redirected to "${finalUrl}" instead of staying on "${testData.url}"`);
       }
 
-      // Emit progress: Page loaded (25%)
-      webSocketService.emitTestProgress(testData.testId, {
+      // ✅ REMOVED: WebSocketService - workers should not emit WebSocket events directly
+      logger.debug('[PLAYWRIGHT] Page loaded', {
         testId: testData.testId,
         browser: testData.browser,
-        progress: 25,
-        phase: 'initialization',
-        currentStep: `✅ Page loaded: ${finalUrl}`,
-        status: 'running',
-        timestamp: new Date().toISOString(),
+        url: finalUrl,
       });
 
       // Build intelligent test config
@@ -589,6 +632,71 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         }
       }
 
+      // ✅ CRITICAL FIX: Stop tracing before closing (intelligent mode)
+      if (context && tracePath) {
+        try {
+          await context.tracing.stop({ path: tracePath });
+          logger.info('[PLAYWRIGHT] Trace saved (intelligent mode)', { tracePath });
+        } catch (traceError) {
+          logger.warn('[PLAYWRIGHT] Failed to stop tracing (intelligent mode)', { error: traceError });
+        }
+      }
+
+      // ✅ CRITICAL FIX: Get video path before closing page (intelligent mode)
+      if (page) {
+        try {
+          const video = page.video();
+          if (video) {
+            videoPath = await video.path();
+            logger.info('[PLAYWRIGHT] Video saved (intelligent mode)', { videoPath });
+          }
+        } catch (videoError) {
+          logger.warn('[PLAYWRIGHT] Failed to get video path (intelligent mode)', { error: videoError });
+        }
+      }
+
+      // ✅ CRITICAL FIX: Close page and context after intelligent test (free resources)
+      if (page) {
+        try {
+          await page.close();
+          logger.debug('[PLAYWRIGHT] Page closed (intelligent mode)');
+        } catch (pageError) {
+          logger.warn('[PLAYWRIGHT] Failed to close page (intelligent mode)', { error: pageError });
+        }
+      }
+
+      if (context) {
+        try {
+          await context.close();
+          logger.debug('[PLAYWRIGHT] Context closed (intelligent mode)');
+        } catch (contextError) {
+          logger.warn('[PLAYWRIGHT] Failed to close context (intelligent mode)', { error: contextError });
+        }
+      }
+
+      // ✅ NEW: Upload video and trace for intelligent tests
+      let videoUrl: string | undefined;
+      let traceUrl: string | undefined;
+
+      try {
+        const { uploadVideoToStorage, uploadTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+
+        if (videoPath) {
+          videoUrl = await uploadVideoToStorage(videoPath, testData.testId, testData.userId || 'anonymous');
+          logger.info('[PLAYWRIGHT] Video uploaded to storage (intelligent mode)', { videoUrl });
+        }
+
+        if (tracePath) {
+          traceUrl = await uploadTraceToStorage(tracePath, testData.testId, testData.userId || 'anonymous');
+          logger.info('[PLAYWRIGHT] Trace uploaded to storage (intelligent mode)', { traceUrl });
+        }
+      } catch (uploadError) {
+        logger.error('[PLAYWRIGHT] Failed to upload artifacts (intelligent mode)', {
+          error: uploadError instanceof Error ? uploadError.message : String(uploadError),
+        });
+        // Don't fail the test if upload fails
+      }
+
       // Convert intelligent result to standard format
       return {
         success: intelligentResult.success,
@@ -608,6 +716,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           duration: intelligentResult.duration,
           cost: intelligentResult.cost,
         },
+        // ✅ NEW: Include video and trace URLs
+        videoUrl,
+        videoPath,
+        traceUrl,
+        tracePath,
       };
     }
 
@@ -696,8 +809,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     // ✅ NEW: Stop tracing before closing
     if (context && tracePath) {
       try {
-        await context.tracing.stop({ path: tracePath });
-        logger.info('[PLAYWRIGHT] Trace saved', { tracePath });
+    await context.tracing.stop({ path: tracePath });
+    logger.info('[PLAYWRIGHT] Trace saved', { tracePath });
       } catch (traceError) {
         logger.warn('[PLAYWRIGHT] Failed to stop tracing', { error: traceError });
       }
@@ -706,12 +819,12 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     // ✅ NEW: Get video path before closing page
     if (page) {
       try {
-        const video = page.video();
-        await page.close();
+    const video = page.video();
+    await page.close();
 
-        if (video) {
-          videoPath = await video.path();
-          logger.info('[PLAYWRIGHT] Video saved', { videoPath });
+    if (video) {
+      videoPath = await video.path();
+      logger.info('[PLAYWRIGHT] Video saved', { videoPath });
         }
       } catch (pageError) {
         logger.warn('[PLAYWRIGHT] Failed to close page', { error: pageError });
@@ -721,7 +834,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     // Close context
     if (context) {
       try {
-        await context.close();
+    await context.close();
       } catch (contextError) {
         logger.warn('[PLAYWRIGHT] Failed to close context', { error: contextError });
       }
@@ -851,18 +964,34 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       intelligentMode: testData.intelligentMode || false,
     });
 
-    // Try to collect partial results and cleanup
+    // ✅ CRITICAL FIX: Try to collect partial results and cleanup (works for both standard and intelligent mode)
     let partialResults = null;
     if (page) {
       try {
-        partialResults = await collector.collect(page, true);
+        // Only collect if not in intelligent mode (intelligent mode doesn't use collector)
+        if (!testData.intelligentMode) {
+          partialResults = await collector.collect(page, true);
+        }
+
+        // ✅ FIX: Get video path before closing page (error scenario)
+        try {
+          const video = page.video();
+          if (video) {
+            videoPath = await video.path();
+            logger.debug('[PLAYWRIGHT] Video path saved (error scenario)', { videoPath });
+          }
+        } catch (videoError) {
+          logger.debug('[PLAYWRIGHT] Failed to get video path (error scenario)', { error: videoError });
+        }
+
         await page.close();
+        logger.debug('[PLAYWRIGHT] Page closed (error cleanup)');
       } catch (cleanupError) {
-        logger.error('Failed to collect partial results', { error: cleanupError });
+        logger.error('Failed to collect partial results or close page', { error: cleanupError });
       }
     }
 
-    // Cleanup context if it exists
+    // ✅ CRITICAL FIX: Cleanup context if it exists (error scenario)
     if (context) {
       try {
         // Stop tracing if it was started
@@ -872,6 +1001,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           });
         }
         await context.close();
+        logger.debug('[PLAYWRIGHT] Context closed (error cleanup)');
       } catch (contextError) {
         logger.error('Failed to close context during error cleanup', { error: contextError });
       }
@@ -916,7 +1046,7 @@ export async function executePlaywrightTestWithRetry(
   });
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      if (attempt > 0) {
+    if (attempt > 0) {
         const retryDelay = 2000 * attempt;
         logger.info('[PLAYWRIGHT_RETRY] Retrying Playwright test', {
           testId: testData.testId,

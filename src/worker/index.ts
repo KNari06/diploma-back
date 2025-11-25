@@ -261,13 +261,25 @@ const gracefulShutdown = async (signal: string) => {
       aiAnalysisWorker.close(),
       notificationWorker.close(),
       webhookWorker.close(),
+      // ✅ CRITICAL FIX: Close all browsers to free server resources
+      (async () => {
+        try {
+          const { browserPool } = await import('@/agent/browser-pool');
+          await browserPool.closeAll();
+          logger.info('[WORKER] All browsers closed');
+        } catch (error) {
+          logger.error('[WORKER] Failed to close browsers', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      })(),
     ]);
 
     // Log any failures but continue shutdown
     closeResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook'];
-        logger.warn(`[WORKER] Failed to close ${workerNames[index]} worker`, {
+        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'browserPool'];
+        logger.warn(`[WORKER] Failed to close ${workerNames[index]}`, {
           error: result.reason instanceof Error ? result.reason.message : String(result.reason),
         });
       }

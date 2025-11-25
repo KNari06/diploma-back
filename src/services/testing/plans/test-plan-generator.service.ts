@@ -256,16 +256,11 @@ function generateFooter(
   // Default to English if no language detected
   const lang = detectedLang === 'ru' ? 'ru' : 'en';
 
-  // Format expiration time
-  const expiresAt = new Date(plan.expiresAt);
-  const expiresTime = expiresAt.toLocaleString(lang === 'ru' ? 'ru-RU' : 'en-US', {
-    dateStyle: 'short',
-    timeStyle: 'short',
-  });
-
-  // ✅ FIX: Natural, conversational footer - sounds like AI, not a bot
-  return `Plan valid until ${expiresTime}.\n` +
-    `Let me know if you want to proceed with this test, or if you'd like to adjust anything.\n`;
+  // Natural, conversational footer - sounds like AI, not a bot
+  if (lang === 'ru') {
+    return `Дайте знать, если хотите продолжить с этим тестом, или если нужно что-то изменить.\n`;
+  }
+  return `Let me know if you want to proceed with this test, or if you'd like to adjust anything.\n`;
 }
 
 

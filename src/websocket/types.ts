@@ -31,6 +31,7 @@ export interface ServerToClientEvents {
   'test:created': (data: TestCreatedPayload) => void;
   'test:started': (data: TestStartedPayload) => void;
   'test:progress': (data: TestProgressPayload) => void;
+  'test:graph-update': (data: TestGraphUpdatePayload) => void; // ✅ NEW: Real-time graph streaming
   'test:step:completed': (data: TestStepCompletedPayload) => void;
   'test:browser:completed': (data: TestBrowserCompletedPayload) => void;
   'test:completed': (data: TestCompletedPayload) => void;
@@ -118,6 +119,79 @@ export interface TestStepCompletedPayload {
   step: number;
   stepDescription: string;
   success: boolean;
+  timestamp: string;
+}
+
+// ✅ NEW: Graph visualization update payload
+export interface TestGraphUpdatePayload {
+  testId: string;
+  type: 'full' | 'incremental';
+  data: {
+    // For type='incremental': single node + edge update
+    newNode?: {
+      id: string;
+      type: 'start' | 'end' | 'action' | 'assertion' | 'condition' | 'loop' | 'merge';
+      stepType?: string;
+      label: string;
+      selector?: string;
+      value?: any;
+      meta?: {
+        icon?: string;
+        color?: string;
+        success?: boolean;
+        durationMs?: number;
+        errorMessage?: string;
+        urlChanged?: boolean;
+        urlBefore?: string;
+        urlAfter?: string;
+        timestamp?: number;
+        elapsedTime?: number;
+        [key: string]: any;
+      };
+    };
+    newEdge?: {
+      id: string;
+      source: string;
+      target: string;
+      type: 'normal' | 'branch' | 'loop' | 'return' | 'merge';
+      label?: string;
+      meta?: {
+        color?: string;
+        style?: 'solid' | 'dashed' | 'dotted';
+        animated?: boolean;
+      };
+    };
+    updatedNode?: {
+      id: string;
+      meta?: Record<string, any>;
+    };
+
+    // For type='full': complete graph
+    fullGraph?: {
+      nodes: Array<{
+        id: string;
+        type: string;
+        stepType?: string;
+        label: string;
+        selector?: string;
+        value?: any;
+        meta?: Record<string, any>;
+      }>;
+      edges: Array<{
+        id: string;
+        source: string;
+        target: string;
+        type: string;
+        label?: string;
+        meta?: Record<string, any>;
+      }>;
+      metadata: {
+        totalSteps: number;
+        completedSteps: number;
+        failedSteps: number;
+      };
+    };
+  };
   timestamp: string;
 }
 

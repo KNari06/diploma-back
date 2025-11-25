@@ -4,6 +4,7 @@
  * Manages: analyze → understand → generate → execute → validate → decide → repeat
  */
 
+import { dbAdminService } from '@/db/supabase';
 import { logger } from '@/utils/logger';
 import { webSocketService } from '@/websocket/websocket.service';
 import { Browser, Page } from 'playwright';
@@ -22,8 +23,9 @@ import {
   PageVisit,
   TestState,
 } from './types/intelligent-testing.types';
+import { ActionPattern, ActionPatternDetector } from './utils/action-pattern-detector'; // ✅ NEW
+import { GraphBuilder } from './utils/graph-builder.service'; // ✅ NEW
 import { TestProgressEmitter } from './utils/progress-emitter';
-import { dbAdminService } from '@/db/supabase';
 
 // AI cost estimation (updated with accurate pricing Nov 2024)
 // Based on: GPT-4o $0.005 input / $0.015 output per 1K tokens
@@ -46,6 +48,7 @@ export class IntelligentTestOrchestrator {
   private testId?: string;
   private commandExecutor!: CommandExecutor;
   private progressEmitter?: TestProgressEmitter;
+  private graphBuilder!: GraphBuilder; // ✅ NEW: Graph builder for real-time visualization
 
   constructor(config: IntelligentTestConfig, userId?: string, testId?: string) {
     this.config = config;
@@ -139,6 +142,9 @@ export class IntelligentTestOrchestrator {
       safetyConfig.maxDuration
     );
 
+    // ✅ NEW: Initialize graph builder
+    this.graphBuilder = new GraphBuilder();
+
     logger.info('[INTELLIGENT_ORCHESTRATOR] Starting intelligent test', {
       goal: this.config.goal,
       startUrl: this.config.startUrl,
@@ -152,6 +158,12 @@ export class IntelligentTestOrchestrator {
       goal: this.config.goal,
       mode: this.config.mode,
     });
+
+    // ✅ NEW: Add start node and emit initial graph
+    if (this.testId && this.userId) {
+      const startUpdate = this.graphBuilder.addStartNode();
+      this.emitGraphUpdate(startUpdate);
+    }
 
     // Emit progress: Analysis phase starting
     this.progressEmitter?.emit({
@@ -361,6 +373,12 @@ export class IntelligentTestOrchestrator {
         // STEP 1: Analyze current page
         const context = await this.analyzePage();
 
+        // ✅ NEW: Add page node to graph when analyzing new page
+        if (this.testId && this.userId && this.graphBuilder) {
+          const pageUpdate = this.graphBuilder.addPageNode(context.url, context.pageType);
+          this.emitGraphUpdate(pageUpdate);
+        }
+
         // Check if test was cancelled after analysis (before expensive operations)
         if (await this.checkTestCancelled()) {
           logger.info('[INTELLIGENT_ORCHESTRATOR] Test was cancelled after page analysis', {
@@ -370,10 +388,10 @@ export class IntelligentTestOrchestrator {
           return true; // Return true to indicate cancellation
         }
 
-        // STEP 2: Check for cycles
+        // STEP 2: Check for cycles (URL-based)
         const cycleCheck = StateTracker.detectCycle(this.state, context.url);
         if (cycleCheck.cycleDetected) {
-          logger.warn('[INTELLIGENT_ORCHESTRATOR] Cycle detected', {
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] URL cycle detected', {
             suggestion: cycleCheck.suggestion,
           });
 
@@ -389,6 +407,41 @@ export class IntelligentTestOrchestrator {
 
           if (decision.action === 'stop' || decision.action === 'skip') {
             break;
+          }
+        }
+
+        // ✅ NEW: STEP 2.5: Check for action patterns (repeated actions, failed chains, etc.)
+        const patternCheck = ActionPatternDetector.detectPatterns(this.state);
+        if (patternCheck.hasPattern) {
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] Problematic action patterns detected', {
+            patternsCount: patternCheck.patterns.length,
+            shouldStop: patternCheck.shouldStop,
+            patterns: patternCheck.patterns.map((p: ActionPattern) => ({
+              type: p.type,
+              severity: p.severity,
+              description: p.description,
+            })),
+          });
+
+          // Emit warnings for each pattern
+          patternCheck.patterns.forEach((pattern: ActionPattern) => {
+            this.emitEvent('test_warning', {
+              message: `⚠️ ${pattern.type}: ${pattern.description}`,
+              severity: pattern.severity,
+            });
+          });
+
+          // If critical pattern detected → stop test
+          if (patternCheck.shouldStop) {
+            logger.error('[INTELLIGENT_ORCHESTRATOR] Critical pattern detected - stopping test', {
+              reason: patternCheck.reason,
+            });
+
+            this.emitEvent('test_stopped', {
+              reason: patternCheck.reason,
+            });
+
+            break; // Stop test execution
           }
         }
 
@@ -821,11 +874,13 @@ export class IntelligentTestOrchestrator {
           actionType: action.action,
         });
 
-        // ✅ NEW: Validate selector exists before execution (for click/fill/type actions)
+        // ✅ IMPROVED: Validate selector exists AND is visible/actionable before execution
         if (action.selector && ['click', 'fill', 'type', 'select', 'check', 'uncheck', 'hover'].includes(action.action)) {
           try {
-            const elementExists = await this.page.locator(action.selector).count();
-            if (elementExists === 0) {
+            const locator = this.page.locator(action.selector);
+            const elementCount = await locator.count();
+
+            if (elementCount === 0) {
               logger.warn('[INTELLIGENT_ORCHESTRATOR] Selector not found, marking action as optional', {
                 testId: this.testId,
                 action: action.description,
@@ -849,6 +904,43 @@ export class IntelligentTestOrchestrator {
               // Mark action as optional to continue
               action.optional = true;
               continue; // Skip this action
+            }
+
+            // ✅ NEW: For click actions, also check if element is visible and actionable
+            if (action.action === 'click') {
+              try {
+                // Wait for element to be visible and actionable (with shorter timeout for validation)
+                await locator.waitFor({ state: 'visible', timeout: 2000 }).catch(() => {
+                  throw new Error('Element not visible');
+                });
+
+                // Check if element is actionable (not covered by other elements)
+                const isActionable = await locator.evaluate((el) => {
+                  // @ts-ignore - browser context
+                  const rect = el.getBoundingClientRect();
+                  const centerX = rect.left + rect.width / 2;
+                  const centerY = rect.top + rect.height / 2;
+                  // @ts-ignore - browser context
+                  const topElement = document.elementFromPoint(centerX, centerY);
+                  return topElement === el || el.contains(topElement);
+                }).catch(() => false);
+
+                if (!isActionable) {
+                  logger.warn('[INTELLIGENT_ORCHESTRATOR] Element found but not actionable (covered by another element)', {
+                    testId: this.testId,
+                    action: action.description,
+                    selector: action.selector,
+                  });
+                  // Don't skip - try to click anyway, might work
+                }
+              } catch (visibilityError) {
+                logger.warn('[INTELLIGENT_ORCHESTRATOR] Element not visible or actionable', {
+                  testId: this.testId,
+                  selector: action.selector,
+                  error: visibilityError instanceof Error ? visibilityError.message : String(visibilityError),
+                });
+                // Continue anyway - might become visible during click
+              }
             }
           } catch (selectorError) {
             logger.warn('[INTELLIGENT_ORCHESTRATOR] Selector validation failed', {
@@ -966,6 +1058,21 @@ export class IntelligentTestOrchestrator {
 
         completedActions.push(actionResult);
         this.state = StateTracker.recordActionResult(this.state, actionResult);
+
+        // ✅ NEW: Add action to graph and emit real-time update
+        if (this.testId && this.userId && this.graphBuilder) {
+          const graphUpdate = this.graphBuilder.addActionNode(action, {
+            success: actionResult.success,
+            error: actionResult.error,
+            durationMs: undefined, // Duration not available in executionResult
+            urlChanged: actionResult.urlChanged,
+            urlBefore: actionResult.urlBefore,
+            urlAfter: actionResult.urlAfter,
+            retryCount: actionResult.retryCount, // ✅ NEW: Track retries
+            isTimeout: actionResult.error?.toLowerCase().includes('timeout'), // ✅ NEW: Flag timeouts
+          });
+          this.emitGraphUpdate(graphUpdate);
+        }
 
         // Log action result (success/failure)
         if (!actionResult.success) {
@@ -1142,6 +1249,12 @@ export class IntelligentTestOrchestrator {
       screenshotSizes: screenshots.map(s => `${Math.round(s.screenshot.length / 1024)}KB`),
     });
 
+    // ✅ NEW: Add end node and emit final graph
+    if (this.testId && this.userId && this.graphBuilder) {
+      const endUpdate = this.graphBuilder.addEndNode(success, summary);
+      this.emitGraphUpdate(endUpdate);
+    }
+
     return {
       success,
       goal: this.config.goal,
@@ -1206,15 +1319,33 @@ export class IntelligentTestOrchestrator {
         timestamp: Date.now(),
       });
     } catch (error) {
-      // ✅ FIX: Enhanced error logging for event emission
-      logger.error('[INTELLIGENT_ORCHESTRATOR] Failed to emit event', {
+      // Silent fail - don't log WebSocket errors
+    }
+  }
+
+  // ✅ NEW: Emit graph update via WebSocket
+  private emitGraphUpdate(update: import('./utils/graph-builder.service').GraphUpdate): void {
+    if (!this.userId || !this.testId) {
+      return;
+    }
+
+    try {
+      webSocketService.emitToUser(this.userId, 'test:graph-update', {
         testId: this.testId,
-        event,
-        error: error instanceof Error ? {
-          message: error.message,
-          name: error.name,
-          stack: error.stack,
-        } : String(error),
+        type: update.type,
+        data: {
+          newNode: update.newNode,
+          newEdge: update.newEdge,
+          updatedNode: update.updatedNode,
+          fullGraph: update.fullGraph,
+        },
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      // Silent fail - don't log WebSocket errors
+      logger.error('[INTELLIGENT_ORCHESTRATOR] Failed to emit graph update', {
+        testId: this.testId,
+        error: error instanceof Error ? error.message : String(error),
       });
     }
   }
