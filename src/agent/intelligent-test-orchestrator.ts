@@ -1322,9 +1322,34 @@ export class IntelligentTestOrchestrator {
   // WEBSOCKET EVENTS
   // ═══════════════════════════════════════════════════════════════════════════
 
+  /**
+   * Emit event via WebSocket
+   * ✅ OPTIMIZED: Deduplicates redundant events, only emits on state changes
+   */
+  private lastEmittedEvent: { event: string; timestamp: number } | null = null;
+
   private emitEvent(event: string, data: any): void {
     if (!this.userId || !this.testId) {
       return;
+    }
+
+    // ✅ OPTIMIZATION: Deduplicate rapid-fire identical events
+    // Skip if same event was emitted less than 500ms ago
+    const now = Date.now();
+    if (this.lastEmittedEvent &&
+        this.lastEmittedEvent.event === event &&
+        now - this.lastEmittedEvent.timestamp < 500) {
+      return; // Skip duplicate
+    }
+
+    // ✅ OPTIMIZATION: Filter out noisy events
+    // These are redundant as graph updates already show action progress
+    const noisyEvents = ['action_executing', 'action_completed', 'action_failed'];
+    if (noisyEvents.includes(event)) {
+      // Only emit on failures or every 3rd action
+      if (!event.includes('failed') && this.state.completedActions.length % 3 !== 0) {
+        return; // Skip
+      }
     }
 
     try {
@@ -1332,8 +1357,10 @@ export class IntelligentTestOrchestrator {
         testId: this.testId,
         event,
         data,
-        timestamp: Date.now(),
+        timestamp: now,
       });
+
+      this.lastEmittedEvent = { event, timestamp: now };
     } catch (error) {
       // Silent fail - don't log WebSocket errors
     }

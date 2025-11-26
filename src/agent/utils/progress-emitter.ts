@@ -26,6 +26,11 @@ export class TestProgressEmitter {
   private totalActions: number = 0;
   private lastLoggedPhase: string = '';
 
+  // ✅ OPTIMIZATION: Deduplicate and throttle progress updates
+  private lastEmittedProgress: number = -1;
+  private lastEmitTime: number = 0;
+  private EMIT_THROTTLE_MS: number = 300; // Min 300ms between emits
+
   constructor(testId: string, browser: string) {
     this.testId = testId;
     this.browser = browser;
@@ -50,13 +55,31 @@ export class TestProgressEmitter {
 
   /**
    * Emit progress update via WebSocket
+   * ✅ OPTIMIZED: Throttles updates to reduce WebSocket noise
    */
   emit(params: EmitParams): void {
     try {
       // Validate progress value
       const progress = Math.max(0, Math.min(100, params.progress));
+      const now = Date.now();
 
-      const elapsedTime = Date.now() - this.startTime;
+      // ✅ OPTIMIZATION: Skip if progress unchanged and not enough time passed
+      // Always emit for key events (phase change, completion, failure)
+      const isKeyEvent =
+        progress === 100 ||
+        progress === 0 ||
+        params.status === 'completed' ||
+        params.status === 'failed' ||
+        params.phase !== this.lastLoggedPhase;
+
+      const timeSinceLastEmit = now - this.lastEmitTime;
+      const progressUnchanged = progress === this.lastEmittedProgress;
+
+      if (!isKeyEvent && progressUnchanged && timeSinceLastEmit < this.EMIT_THROTTLE_MS) {
+        return; // Skip duplicate/rapid updates
+      }
+
+      const elapsedTime = now - this.startTime;
 
       // Calculate estimated remaining time based on current progress
       // Formula: if we're at X%, and it took Y ms, then 100% will take (Y / X) * 100 ms
@@ -93,14 +116,12 @@ export class TestProgressEmitter {
         estimatedRemaining,
       });
 
-      // Log key milestones (phase transitions and completion)
-      const isKeyMilestone =
-        progress === 100 ||
-        params.status === 'completed' ||
-        params.status === 'failed' ||
-        params.phase !== this.lastLoggedPhase;
+      // Update tracking state
+      this.lastEmittedProgress = progress;
+      this.lastEmitTime = now;
 
-      if (isKeyMilestone) {
+      // Log key milestones (phase transitions and completion)
+      if (isKeyEvent) {
         logger.info('[PROGRESS] Test milestone', {
           testId: this.testId,
           progress,
