@@ -115,10 +115,80 @@ export interface GraphNode {
   value?: any;
   group?: string; // For nested blocks (if/loop)
   meta?: {
+    // Visual properties
     position?: { x: number; y: number };
     icon?: string;
     color?: string;
     buttons?: NodeButton[];
+
+    // Execution metadata
+    success?: boolean;
+    durationMs?: number;
+    errorMessage?: string;
+    timestamp?: number;
+    elapsedTime?: number;
+    retryCount?: number;
+    isRepeated?: boolean;
+    isTimeout?: boolean;
+    warning?: string;
+
+    // URL tracking
+    urlChanged?: boolean;
+    urlBefore?: string;
+    urlAfter?: string;
+
+    // ✅ NEW: Rich metadata for modal display
+    pageType?: string; // 'login', 'checkout', 'product', etc.
+    screenshot?: string; // URL to page screenshot
+    screenshotBefore?: string; // Screenshot before action
+    screenshotAfter?: string; // Screenshot after action
+    domSnapshot?: string; // HTML DOM snapshot
+
+    // Console logs from browser
+    consoleLogs?: Array<{
+      type: 'log' | 'warn' | 'error' | 'info';
+      message: string;
+      timestamp: string;
+      source?: string;
+    }>;
+
+    // Network activity
+    networkRequests?: number; // Total requests count
+    networkErrors?: Array<{
+      url: string;
+      status: number;
+      error: string;
+      timestamp: string;
+    }>;
+
+    // Validation details
+    validation?: {
+      expected: string;
+      actual: string;
+      passed: boolean;
+      message?: string;
+    };
+
+    // Page analysis (for page nodes)
+    pageAnalysis?: {
+      title?: string;
+      metaDescription?: string;
+      formsCount?: number;
+      buttonsCount?: number;
+      linksCount?: number;
+      inputsCount?: number;
+      loadTime?: number;
+    };
+
+    // Test summary (for end nodes)
+    testSummary?: {
+      pagesVisited?: number;
+      actionsTaken?: number;
+      successRate?: string;
+      duration?: string;
+      cost?: string;
+    };
+
     [key: string]: any;
   };
 }

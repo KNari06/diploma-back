@@ -3,7 +3,6 @@
  * Supports dynamic, context-aware test execution
  */
 
-import { PlaywrightCommand } from '@/types';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PAGE CONTEXT & ANALYSIS
@@ -292,6 +291,7 @@ export interface IntelligentTestResult {
   summary: string;
   pageVisits: PageVisit[];
   screenshots: Array<{ url: string; screenshot: string }>;
+  graphData?: any; // ✅ NEW: Complete graph from GraphBuilder
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

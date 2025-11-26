@@ -9,6 +9,7 @@ import { DynamicAction } from '../types/intelligent-testing.types';
 
 /**
  * Action result for graph building
+ * ✅ ENHANCED: Now includes rich metadata for modal display
  */
 export interface GraphActionResult {
   success: boolean;
@@ -17,8 +18,43 @@ export interface GraphActionResult {
   urlChanged?: boolean;
   urlBefore?: string;
   urlAfter?: string;
-  retryCount?: number; // ✅ NEW: Track retry attempts
-  isTimeout?: boolean; // ✅ NEW: Flag timeout errors
+  retryCount?: number;
+  isTimeout?: boolean;
+
+  // ✅ NEW: Screenshots
+  // Note: During test execution these are base64 strings.
+  // After test completion, they are uploaded to storage and replaced with public URLs.
+  screenshot?: string; // Base64 during execution, public URL after upload
+  screenshotBefore?: string; // Base64 during execution, public URL after upload
+  screenshotAfter?: string; // Base64 during execution, public URL after upload
+
+  // ✅ NEW: DOM snapshot
+  domSnapshot?: string;
+
+  // ✅ NEW: Console logs
+  consoleLogs?: Array<{
+    type: 'log' | 'warn' | 'error' | 'info';
+    message: string;
+    timestamp: string;
+    source?: string;
+  }>;
+
+  // ✅ NEW: Network info
+  networkRequests?: number;
+  networkErrors?: Array<{
+    url: string;
+    status: number;
+    error: string;
+    timestamp: string;
+  }>;
+
+  // ✅ NEW: Validation result
+  validation?: {
+    expected: string;
+    actual: string;
+    passed: boolean;
+    message?: string;
+  };
 }
 
 /**
@@ -146,8 +182,11 @@ export class GraphBuilder {
       selector: action.selector,
       value: action.value,
       meta: {
+        // Visual
         icon: this.getActionIcon(actionType),
         color: nodeColor,
+
+        // Execution
         success: isSuccess,
         durationMs: result?.durationMs,
         errorMessage: result?.error,
@@ -156,11 +195,20 @@ export class GraphBuilder {
         urlAfter: result?.urlAfter,
         timestamp: Date.now(),
         elapsedTime: Date.now() - this.startTime,
-        // ✅ NEW: Add pattern indicators
         retryCount: result?.retryCount,
         isTimeout,
         isRepeated,
         warning: isRepeated ? 'Action repeated - possible cycle' : undefined,
+
+        // ✅ NEW: Rich metadata for modal display
+        screenshot: result?.screenshot,
+        screenshotBefore: result?.screenshotBefore,
+        screenshotAfter: result?.screenshotAfter,
+        domSnapshot: result?.domSnapshot,
+        consoleLogs: result?.consoleLogs,
+        networkRequests: result?.networkRequests,
+        networkErrors: result?.networkErrors,
+        validation: result?.validation,
       },
     };
 
@@ -199,8 +247,25 @@ export class GraphBuilder {
 
   /**
    * Add page navigation node
+   * ✅ ENHANCED: Now accepts pageContext with screenshots and analysis
    */
-  addPageNode(url: string, pageType: string): GraphUpdate {
+  addPageNode(
+    url: string,
+    pageType: string,
+    pageContext?: {
+      screenshot?: string;
+      title?: string;
+      metaDescription?: string;
+      dom?: {
+        formsCount?: number;
+        buttonsCount?: number;
+        linksCount?: number;
+        inputsCount?: number;
+      };
+      loadTime?: number;
+      networkRequests?: number;
+    }
+  ): GraphUpdate {
     const id = this.generateNodeId();
 
     const node: GraphNode = {
@@ -215,6 +280,19 @@ export class GraphBuilder {
         pageType,
         timestamp: Date.now(),
         elapsedTime: Date.now() - this.startTime,
+
+        // ✅ NEW: Page analysis data
+        screenshot: pageContext?.screenshot,
+        pageAnalysis: {
+          title: pageContext?.title,
+          metaDescription: pageContext?.metaDescription,
+          formsCount: pageContext?.dom?.formsCount,
+          buttonsCount: pageContext?.dom?.buttonsCount,
+          linksCount: pageContext?.dom?.linksCount,
+          inputsCount: pageContext?.dom?.inputsCount,
+          loadTime: pageContext?.loadTime,
+        },
+        networkRequests: pageContext?.networkRequests,
       },
     };
 
@@ -247,8 +325,20 @@ export class GraphBuilder {
 
   /**
    * Add end node and return final graph
+   * ✅ ENHANCED: Now accepts test statistics
    */
-  addEndNode(success: boolean, summary?: string): GraphUpdate {
+  addEndNode(
+    success: boolean,
+    summary?: string,
+    stats?: {
+      pagesVisited?: number;
+      actionsTaken?: number;
+      successRate?: string;
+      duration?: string;
+      cost?: string;
+      finalScreenshot?: string;
+    }
+  ): GraphUpdate {
     const id = this.generateNodeId();
 
     const node: GraphNode = {
@@ -261,6 +351,16 @@ export class GraphBuilder {
         success,
         summary,
         timestamp: Date.now(),
+
+        // ✅ NEW: Test summary statistics
+        testSummary: stats ? {
+          pagesVisited: stats.pagesVisited,
+          actionsTaken: stats.actionsTaken,
+          successRate: stats.successRate,
+          duration: stats.duration,
+          cost: stats.cost,
+        } : undefined,
+        screenshot: stats?.finalScreenshot,
         totalDuration: Date.now() - this.startTime,
       },
     };
@@ -308,6 +408,45 @@ export class GraphBuilder {
     return {
       nodes: [...this.nodes],
       edges: [...this.edges],
+    };
+  }
+
+  /**
+   * ✅ NEW: Get complete graph with metadata for storage in DB
+   */
+  getFullGraph(): {
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+    metadata: {
+      totalNodes: number;
+      totalEdges: number;
+      totalActions: number;
+      completedSteps: number;
+      failedSteps: number;
+      startNodeId: string | null;
+      endNodeId: string | null;
+      generatedAt: string;
+      version: string;
+    };
+  } {
+    const startNode = this.nodes.find(n => n.type === 'start');
+    const endNode = this.nodes.find(n => n.type === 'end');
+    const actionNodes = this.nodes.filter(n => n.type === 'action');
+
+    return {
+      nodes: [...this.nodes],
+      edges: [...this.edges],
+      metadata: {
+        totalNodes: this.nodes.length,
+        totalEdges: this.edges.length,
+        totalActions: actionNodes.length,
+        completedSteps: this.completedSteps,
+        failedSteps: this.failedSteps,
+        startNodeId: startNode?.id || null,
+        endNodeId: endNode?.id || null,
+        generatedAt: new Date().toISOString(),
+        version: '1.0',
+      },
     };
   }
 

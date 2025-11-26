@@ -454,10 +454,10 @@ export class ManualTestResultJobHandler {
         completed_at: allCompleted ? new Date().toISOString() : undefined,
       });
 
-      // Send completion notification if all tests are done
-      if (allCompleted) {
-        await this.sendCompletionNotification(testId, status, results);
-      }
+      // Email notifications disabled - all data is available in DB via API
+      // if (allCompleted) {
+      //   await this.sendCompletionNotification(testId, status, results);
+      // }
 
     } catch (error) {
       logger.error(`[TEST-RESULT] Failed to update test status for ${testId}:`, error);

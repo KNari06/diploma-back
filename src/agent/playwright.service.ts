@@ -574,6 +574,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             viewport: testData.options?.viewport,
             credentialsUsed: !!testData.options?.credentials,
           },
+          graphData: intelligentResult.graphData, // ✅ NEW: Save complete graph
         });
 
         logger.info('[PLAYWRIGHT] Test data saved to database', {

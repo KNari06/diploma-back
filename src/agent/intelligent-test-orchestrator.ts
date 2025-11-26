@@ -375,7 +375,22 @@ export class IntelligentTestOrchestrator {
 
         // ✅ NEW: Add page node to graph when analyzing new page
         if (this.testId && this.userId && this.graphBuilder) {
-          const pageUpdate = this.graphBuilder.addPageNode(context.url, context.pageType);
+          const pageUpdate = this.graphBuilder.addPageNode(
+            context.url,
+            context.pageType,
+            {
+              screenshot: context.screenshot, // Base64 screenshot
+              title: context.pageInfo?.title,
+              metaDescription: context.pageInfo?.metaDescription,
+              dom: {
+                formsCount: context.interactiveElements.forms?.length || 0,
+                buttonsCount: context.interactiveElements.buttons?.length || 0,
+                linksCount: context.interactiveElements.links?.length || 0,
+                inputsCount: context.interactiveElements.inputs?.length || 0,
+              },
+              networkRequests: context.pageInfo?.networkRequests,
+            }
+          );
           this.emitGraphUpdate(pageUpdate);
         }
 
@@ -962,6 +977,22 @@ export class IntelligentTestOrchestrator {
           }
         }
 
+        // ✅ NEW: Capture screenshot BEFORE action (only for important actions)
+        let screenshotBefore: string | undefined;
+        if (['click', 'fill', 'type', 'select'].includes(action.action)) {
+          try {
+            const screenshotBuffer = await this.page.screenshot({
+              fullPage: false,
+              type: 'png',
+            });
+            screenshotBefore = screenshotBuffer.toString('base64');
+          } catch (error) {
+            logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to capture before screenshot', {
+              action: action.description
+            });
+          }
+        }
+
         // Execute action using CommandExecutor
         const executionResult = await this.commandExecutor.executeCommand({
           action: action.action as any,
@@ -982,6 +1013,22 @@ export class IntelligentTestOrchestrator {
 
         const urlAfter = this.page.url();
         const urlChanged = urlBefore !== urlAfter;
+
+        // ✅ NEW: Capture screenshot AFTER action (only if action succeeded)
+        let screenshotAfter: string | undefined;
+        if (executionResult.success && ['click', 'fill', 'type', 'select'].includes(action.action)) {
+          try {
+            const screenshotBuffer = await this.page.screenshot({
+              fullPage: false,
+              type: 'png',
+            });
+            screenshotAfter = screenshotBuffer.toString('base64');
+          } catch (error) {
+            logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to capture after screenshot', {
+              action: action.description
+            });
+          }
+        }
 
         logger.debug('[INTELLIGENT_ORCHESTRATOR] After action execution', {
           testId: this.testId,
@@ -1078,8 +1125,12 @@ export class IntelligentTestOrchestrator {
             urlChanged: actionResult.urlChanged,
             urlBefore: actionResult.urlBefore,
             urlAfter: actionResult.urlAfter,
-            retryCount: actionResult.retryCount, // ✅ NEW: Track retries
-            isTimeout: (actionResult.error?.toLowerCase() ?? '').includes('timeout'), // ✅ NEW: Flag timeouts
+            retryCount: actionResult.retryCount,
+            isTimeout: (actionResult.error?.toLowerCase() ?? '').includes('timeout'),
+            // ✅ NEW: Include screenshots
+            screenshotBefore,
+            screenshotAfter,
+            screenshot: executionResult.screenshot, // From command executor if available
           });
           this.emitGraphUpdate(graphUpdate);
         }
@@ -1292,8 +1343,35 @@ export class IntelligentTestOrchestrator {
 
     // ✅ NEW: Add end node and emit final graph
     if (this.testId && this.userId && this.graphBuilder) {
-      const endUpdate = this.graphBuilder.addEndNode(success, summary);
+      const endUpdate = this.graphBuilder.addEndNode(
+        success,
+        summary,
+        {
+          pagesVisited: stats.pagesVisited,
+          actionsTaken: stats.actionsTaken,
+          successRate: `${Math.round((stats.actionsTaken - this.state.errors.length) / Math.max(stats.actionsTaken, 1) * 100)}%`,
+          duration: `${Math.round(stats.duration / 1000)}s`,
+          cost: `$${stats.estimatedCost.toFixed(3)}`,
+          finalScreenshot: screenshots[screenshots.length - 1]?.screenshot,
+        }
+      );
       this.emitGraphUpdate(endUpdate);
+    }
+
+    // ✅ NEW: Get final graph for storage
+    let graphData = this.graphBuilder ? this.graphBuilder.getFullGraph() : undefined;
+
+    // ✅ NEW: Upload screenshots from graph to storage and replace base64 with public URLs
+    if (graphData && this.testId && this.userId) {
+      try {
+        graphData = await this.uploadGraphScreenshotsToStorage(graphData);
+      } catch (uploadError) {
+        logger.error('[INTELLIGENT_ORCHESTRATOR] Failed to upload graph screenshots', {
+          testId: this.testId,
+          error: uploadError instanceof Error ? uploadError.message : String(uploadError),
+        });
+        // Continue without screenshots - graph will still work
+      }
     }
 
     return {
@@ -1312,7 +1390,131 @@ export class IntelligentTestOrchestrator {
       summary,
       pageVisits: this.state.visitedPages,
       screenshots,
+      graphData, // ✅ NEW: Include complete graph with public URLs
     };
+  }
+
+  /**
+   * ✅ NEW: Upload all screenshots from graph to storage and replace base64 with public URLs
+   * This reduces graph_data size and makes screenshots accessible via public URLs
+   */
+  private async uploadGraphScreenshotsToStorage(graphData: any): Promise<any> {
+    if (!this.testId || !this.userId) {
+      return graphData; // Can't upload without testId/userId
+    }
+
+    try {
+      const { uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+      let screenshotIndex = 0;
+
+      // Helper to check if string is base64 image
+      const isBase64Image = (str: string | undefined): boolean => {
+        if (!str || typeof str !== 'string') return false;
+        // Check if it's base64 (starts with data:image or is long base64 string)
+        return str.startsWith('data:image/') || (str.length > 100 && /^[A-Za-z0-9+/=]+$/.test(str));
+      };
+
+      // Helper to extract base64 data
+      const extractBase64 = (str: string): string => {
+        if (str.startsWith('data:image/')) {
+          return str.split(',')[1] || str;
+        }
+        return str;
+      };
+
+      // Process all nodes
+      if (graphData.nodes && Array.isArray(graphData.nodes)) {
+        for (const node of graphData.nodes) {
+          if (!node.meta) continue;
+
+          // Upload page screenshot
+          if (isBase64Image(node.meta.screenshot)) {
+            try {
+              const base64Data = extractBase64(node.meta.screenshot);
+              const publicUrl = await uploadScreenshotToStorage(
+                base64Data,
+                this.testId!,
+                this.userId!,
+                screenshotIndex++
+              );
+              node.meta.screenshot = publicUrl;
+              logger.debug('[INTELLIGENT_ORCHESTRATOR] Uploaded page screenshot', {
+                nodeId: node.id,
+                url: publicUrl,
+              });
+            } catch (error) {
+              logger.warn('[INTELLIGENT_ORCHESTRATOR] Failed to upload page screenshot', {
+                nodeId: node.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              // Remove base64 to save space, keep empty string
+              node.meta.screenshot = '';
+            }
+          }
+
+          // Upload before/after action screenshots
+          if (isBase64Image(node.meta.screenshotBefore)) {
+            try {
+              const base64Data = extractBase64(node.meta.screenshotBefore);
+              const publicUrl = await uploadScreenshotToStorage(
+                base64Data,
+                this.testId!,
+                this.userId!,
+                screenshotIndex++
+              );
+              node.meta.screenshotBefore = publicUrl;
+              logger.debug('[INTELLIGENT_ORCHESTRATOR] Uploaded before screenshot', {
+                nodeId: node.id,
+                url: publicUrl,
+              });
+            } catch (error) {
+              logger.warn('[INTELLIGENT_ORCHESTRATOR] Failed to upload before screenshot', {
+                nodeId: node.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              node.meta.screenshotBefore = '';
+            }
+          }
+
+          if (isBase64Image(node.meta.screenshotAfter)) {
+            try {
+              const base64Data = extractBase64(node.meta.screenshotAfter);
+              const publicUrl = await uploadScreenshotToStorage(
+                base64Data,
+                this.testId!,
+                this.userId!,
+                screenshotIndex++
+              );
+              node.meta.screenshotAfter = publicUrl;
+              logger.debug('[INTELLIGENT_ORCHESTRATOR] Uploaded after screenshot', {
+                nodeId: node.id,
+                url: publicUrl,
+              });
+            } catch (error) {
+              logger.warn('[INTELLIGENT_ORCHESTRATOR] Failed to upload after screenshot', {
+                nodeId: node.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              node.meta.screenshotAfter = '';
+            }
+          }
+        }
+      }
+
+      logger.info('[INTELLIGENT_ORCHESTRATOR] Graph screenshots uploaded to storage', {
+        testId: this.testId,
+        totalScreenshots: screenshotIndex,
+      });
+
+      return graphData;
+    } catch (error) {
+      logger.error('[INTELLIGENT_ORCHESTRATOR] Error uploading graph screenshots', {
+        testId: this.testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Return original graph if upload fails
+      return graphData;
+    }
   }
 
   private buildSummary(success: boolean, stats: any): string {

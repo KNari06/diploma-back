@@ -9,6 +9,7 @@ import { logger } from '@/utils/logger';
 export class IntelligentTestStorageService {
   /**
    * Save complete intelligent test session with all details
+   * ✅ ENHANCED: Now accepts graph_data for perfect visualization consistency
    */
   static async saveTestSession(params: {
     testId: string;
@@ -23,6 +24,7 @@ export class IntelligentTestStorageService {
       viewport?: any;
       credentialsUsed?: boolean;
     };
+    graphData?: any; // ✅ NEW: Complete graph from GraphBuilder
   }): Promise<{ sessionId: string; success: boolean }> {
     const { testId, userId, projectId, result, config } = params;
 
@@ -66,6 +68,7 @@ export class IntelligentTestStorageService {
           credentials_used: config.credentialsUsed || false,
           started_at: startedAt,
           completed_at: new Date().toISOString(),
+          graph_data: params.graphData || null, // ✅ NEW: Save complete graph
         })
         .select('id')
         .single();

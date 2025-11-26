@@ -213,50 +213,63 @@ export async function getTestVisualization(req: Request, res: Response): Promise
       return;
     }
 
-    // Extract and convert steps from all available sources
-    const steps = await extractTestSteps(testData);
+    // ✅ NEW: Check if we have saved graph_data (perfect 1:1 match with real-time)
+    let graph;
+    let stepsSource = 'unknown';
 
-    if (!steps || steps.length === 0) {
-      res.status(404).json({
-        success: false,
-        error: 'No test steps found',
-        message: 'No executable steps found for this test',
-        testData: {
-          id: testData.test.id,
-          status: testData.test.status,
-          url: testData.test.url,
-          hasResults: testData.results.length > 0,
-          hasTraceFiles: testData.traceFiles.length > 0,
-          hasIntelligentSession: !!testData.intelligentSession,
-          hasReport: !!testData.report,
-        },
-      });
-      return;
-    }
+    if (testData.intelligentSession?.session?.graph_data) {
+      // Use saved graph directly (no conversion needed)
+      logger.info('[TEST_VISUALIZATION] Using saved graph_data from intelligent session');
+      graph = testData.intelligentSession.session.graph_data;
+      stepsSource = 'saved_graph';
+    } else {
+      // Fallback: Extract and convert steps from all available sources
+      const steps = await extractTestSteps(testData);
 
-    // Parse options
-    let parsedOptions = {};
-    if (options && typeof options === 'string') {
-      try {
-        parsedOptions = JSON.parse(options);
-      } catch (e) {
-        logger.warn('[TEST_VISUALIZATION] Invalid options JSON', { options });
+      if (!steps || steps.length === 0) {
+        res.status(404).json({
+          success: false,
+          error: 'No test steps found',
+          message: 'No executable steps found for this test',
+          testData: {
+            id: testData.test.id,
+            status: testData.test.status,
+            url: testData.test.url,
+            hasResults: testData.results.length > 0,
+            hasTraceFiles: testData.traceFiles.length > 0,
+            hasIntelligentSession: !!testData.intelligentSession,
+            hasReport: !!testData.report,
+          },
+        });
+        return;
       }
-    } else if (options && typeof options === 'object') {
-      parsedOptions = options;
-    }
 
-    // Generate visualization
-    const graph = parsePlaywrightTestSteps(steps, {
-      includeStartEnd: true,
-      autoLayout: true,
-      addButtons: true,
-      ...parsedOptions,
-    });
+      // Parse options
+      let parsedOptions = {};
+      if (options && typeof options === 'string') {
+        try {
+          parsedOptions = JSON.parse(options);
+        } catch (e) {
+          logger.warn('[TEST_VISUALIZATION] Invalid options JSON', { options });
+        }
+      } else if (options && typeof options === 'object') {
+        parsedOptions = options;
+      }
+
+      // Generate visualization from steps
+      logger.info('[TEST_VISUALIZATION] Generating graph from steps (no saved graph_data)');
+      graph = parsePlaywrightTestSteps(steps, {
+        includeStartEnd: true,
+        autoLayout: true,
+        addButtons: true,
+        ...parsedOptions,
+      });
+      stepsSource = determineStepsSource(testData);
+    }
 
     // Add metadata about data sources
     const metadata = {
-      ...graph.metadata,
+      ...(graph.metadata || {}),
       testId,
       testUrl: testData.test.url,
       testStatus: testData.test.status,
@@ -267,8 +280,9 @@ export async function getTestVisualization(req: Request, res: Response): Promise
         intelligentSession: !!testData.intelligentSession,
         report: !!testData.report,
         apiConfigs: testData.apiConfigs.length,
+        usedSavedGraph: stepsSource === 'saved_graph', // ✅ NEW: Indicate if we used saved graph
       },
-      stepsSource: determineStepsSource(testData),
+      stepsSource,
       generatedAt: new Date().toISOString(),
     };
 
@@ -292,8 +306,8 @@ export async function getTestVisualization(req: Request, res: Response): Promise
 
     logger.info('[TEST_VISUALIZATION] Test visualization generated successfully', {
       testId,
-      stepsCount: steps.length,
-      nodesCount: graph.nodes.length,
+      stepsCount: stepsSource === 'saved_graph' ? (graph.nodes?.length || 0) : (steps?.length || 0),
+      nodesCount: graph.nodes?.length || 0,
       edgesCount: graph.edges.length,
       format,
     });
@@ -540,16 +554,24 @@ async function getComprehensiveTestData(testId: string, userId?: string): Promis
     }
 
     // 4. Get intelligent test session (if exists)
+    // ✅ ENHANCED: Load graph_data along with session
     let intelligentSession = null;
     try {
       const { data: sessions, error: sessionError } = await supabaseAdmin
         .from('intelligent_test_sessions')
-        .select('id')
+        .select('id, graph_data') // ✅ NEW: Include graph_data
         .eq('test_id', testId)
         .limit(1);
 
       if (!sessionError && sessions && sessions.length > 0) {
         intelligentSession = await IntelligentTestStorageService.getTestSession(sessions[0].id);
+        // ✅ NEW: Attach graph_data to session if available
+        if (intelligentSession && sessions[0].graph_data) {
+          intelligentSession.session = {
+            ...intelligentSession.session,
+            graph_data: sessions[0].graph_data,
+          };
+        }
       }
     } catch (error) {
       logger.warn('[TEST_VISUALIZATION] Error getting intelligent session', { error, testId });
@@ -633,10 +655,20 @@ async function extractTestSteps(testData: {
   }
 
   // Priority 3: Intelligent test session (AI-generated)
+  // ✅ ENHANCED: Check if session has saved graph_data first
   if (testData.intelligentSession) {
+    // ✅ NEW: If we have saved graph_data, use it directly (perfect 1:1 match with real-time)
+    if (testData.intelligentSession.session?.graph_data) {
+      logger.info('[TEST_VISUALIZATION] Using saved graph from intelligent session (1:1 match with real-time)');
+      // Graph is already complete, no need to convert to steps
+      // We'll handle this in a special way below
+      return []; // Return empty to trigger graph_data usage
+    }
+
+    // Fallback: Convert from page visits if no graph_data
     const intelligentSteps = convertIntelligentSessionToPlaywright(testData.intelligentSession);
     if (intelligentSteps.length > 0) {
-      logger.info('[TEST_VISUALIZATION] Using steps from intelligent session', { count: intelligentSteps.length });
+      logger.info('[TEST_VISUALIZATION] Using steps from intelligent session (converted)', { count: intelligentSteps.length });
       return intelligentSteps;
     }
   }
