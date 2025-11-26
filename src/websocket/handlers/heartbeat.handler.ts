@@ -39,10 +39,10 @@ export const handleHeartbeat = (socket: TypedSocket): void => {
 
       socket.emit('pong');
 
-      logger.debug('[WebSocket] Heartbeat', {
-        socketId: socket.id,
-        userId: userId || 'anonymous',
-      });
+      // logger.debug('[WebSocket] Heartbeat', {
+      //   socketId: socket.id,
+      //   userId: userId || 'anonymous',
+      // });
     } catch (error) {
       logger.error('[WebSocket] Error in ping handler', {
         socketId: socket.id,

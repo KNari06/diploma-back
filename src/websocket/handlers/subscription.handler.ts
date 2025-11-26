@@ -7,11 +7,11 @@ import { logger } from '@/utils/logger';
 import { Socket } from 'socket.io';
 import { getUserId } from '../middleware';
 import {
-  ClientToServerEvents,
-  createRoomName,
-  ErrorPayload,
-  ServerToClientEvents,
-  SocketData,
+    ClientToServerEvents,
+    createRoomName,
+    ErrorPayload,
+    ServerToClientEvents,
+    SocketData,
 } from '../types';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
@@ -203,12 +203,12 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       socket.join(room);
       incrementSubscriptions(socket.id);
 
-      logger.info('[WebSocket] Subscribed to chat', {
-        socketId: socket.id,
-        userId: userId || 'anonymous',
-        sessionId,
-        room,
-      });
+      // logger.info('[WebSocket] Subscribed to chat', {
+      //   socketId: socket.id,
+      //   userId: userId || 'anonymous',
+      //   sessionId,
+      //   room,
+      // });
     } catch (error) {
       logger.error('[WebSocket] Error in subscribe:chat', {
         socketId: socket.id,
@@ -241,12 +241,12 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       socket.leave(room);
       decrementSubscriptions(socket.id);
 
-      logger.info('[WebSocket] Unsubscribed from chat', {
-        socketId: socket.id,
-        userId: userId || 'anonymous',
-        sessionId,
-        room,
-      });
+      // logger.info('[WebSocket] Unsubscribed from chat', {
+      //   socketId: socket.id,
+      //   userId: userId || 'anonymous',
+      //   sessionId,
+      //   room,
+      // });
     } catch (error) {
       logger.error('[WebSocket] Error in unsubscribe:chat', {
         socketId: socket.id,

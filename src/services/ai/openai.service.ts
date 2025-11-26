@@ -67,8 +67,33 @@ export async function getChatCompletionWithMessages(
         model,
       },
     };
-  } catch (error) {
-    logger.error('[OPENAI] Chat completion with messages error:', error);
+  } catch (error: any) {
+    // Handle abort signal errors (client closed connection, timeout, etc.)
+    if (error?.message?.includes('aborted') || error?.message?.includes('signal')) {
+      logger.warn('[OPENAI] Request aborted', {
+        message: error.message,
+        code: error.code,
+        type: error.type,
+      });
+      throw new Error('Request was cancelled. Please try again.');
+    }
+
+    // Handle timeout errors
+    if (error?.message?.includes('timeout') || error?.code === 'ETIMEDOUT') {
+      logger.warn('[OPENAI] Request timeout', {
+        message: error.message,
+        code: error.code,
+      });
+      throw new Error('Request took too long. Please try again.');
+    }
+
+    logger.error('[OPENAI] Chat completion with messages error:', {
+      message: error instanceof Error ? error.message : String(error),
+      code: error?.code,
+      status: error?.status,
+      type: error?.type,
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     throw new Error('AI chat failed');
   }
 }
@@ -131,8 +156,33 @@ export async function getChatCompletion(
         model,
       },
     };
-  } catch (error) {
-    logger.error('[OPENAI] Chat completion error:', error);
+  } catch (error: any) {
+    // Handle abort signal errors (client closed connection, timeout, etc.)
+    if (error?.message?.includes('aborted') || error?.message?.includes('signal')) {
+      logger.warn('[OPENAI] Request aborted', {
+        message: error.message,
+        code: error.code,
+        type: error.type,
+      });
+      throw new Error('Request was cancelled. Please try again.');
+    }
+
+    // Handle timeout errors
+    if (error?.message?.includes('timeout') || error?.code === 'ETIMEDOUT') {
+      logger.warn('[OPENAI] Request timeout', {
+        message: error.message,
+        code: error.code,
+      });
+      throw new Error('Request took too long. Please try again.');
+    }
+
+    logger.error('[OPENAI] Chat completion error:', {
+      message: error instanceof Error ? error.message : String(error),
+      code: error?.code,
+      status: error?.status,
+      type: error?.type,
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     throw new Error('AI chat failed');
   }
 }

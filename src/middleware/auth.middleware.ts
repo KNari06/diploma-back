@@ -74,12 +74,12 @@ export const requireAuth = async (
     // Attach user to request
     req.user = user;
 
-    logger.debug('[AUTH] Authentication successful', {
-      userId: user.id,
-      email: user.email,
-      role: user.role,
-      path: req.path,
-    });
+    // logger.debug('[AUTH] Authentication successful', {
+    //   userId: user.id,
+    //   email: user.email,
+    //   role: user.role,
+    //   path: req.path,
+    // });
 
     next();
   } catch (error) {

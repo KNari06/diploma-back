@@ -122,7 +122,16 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
   };
 
+  // Check if client connection is still alive
+  const checkConnection = () => {
+    if (req.aborted || req.socket?.destroyed) {
+      throw new Error('Client connection closed');
+    }
+  };
+
   try {
+    // Check connection before processing
+    checkConnection();
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 0: INPUT VALIDATION (FIX #1 & #2)
     // ═══════════════════════════════════════════════════════════════════════
@@ -153,6 +162,9 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       });
       return;
     }
+
+    // Check connection after validation
+    checkConnection();
 
     const { message, context, sessionId, conversationId, answers } = req.body as ChatRequest;
 
@@ -330,9 +342,31 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     });
 
   } catch (error) {
+    // Check if client connection was closed
+    if (error instanceof Error && (
+      error.message.includes('Client connection closed') ||
+      error.message.includes('aborted') ||
+      error.message.includes('ECONNRESET')
+    )) {
+      logger.warn('[CHAT] Client connection closed during request', {
+        error: error.message,
+        duration: Date.now() - requestStartTime,
+      });
+      // Don't send response if connection is closed
+      return;
+    }
+
     // FIX #6: Check if response already sent
     if (res.headersSent) {
       logger.warn('[CHAT] Response already sent, cannot send error response', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+
+    // Check if connection is still alive before sending error
+    if (req.aborted || req.socket?.destroyed) {
+      logger.warn('[CHAT] Cannot send error response - connection closed', {
         error: error instanceof Error ? error.message : String(error),
       });
       return;
@@ -1672,6 +1706,29 @@ Use this knowledge to provide more accurate and helpful responses.`,
       max_tokens: 1000,
     });
   } catch (openaiError: any) {
+    // Check if request was aborted (client closed connection)
+    if (openaiError?.message?.includes('cancelled') ||
+        openaiError?.message?.includes('aborted') ||
+        openaiError?.message?.includes('signal')) {
+      logger.warn('[GENERAL_CHAT] Request was cancelled by client', {
+        error: openaiError instanceof Error ? openaiError.message : String(openaiError),
+        userId,
+      });
+
+      // Check if response already sent
+      if (res.headersSent) {
+        return;
+      }
+
+      res.status(499).json({
+        success: false,
+        error: 'Request was cancelled',
+        message: 'The request was cancelled. Please try again.',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     // Fallback response if OpenAI fails
     logger.error('[GENERAL_CHAT] OpenAI API failed, using fallback response', {
       error: openaiError instanceof Error ? openaiError.message : String(openaiError),
@@ -1687,7 +1744,7 @@ Use this knowledge to provide more accurate and helpful responses.`,
       fallbackMessage = 'I\'m temporarily unavailable due to a configuration issue. Our team has been notified.';
     } else if (openaiError?.status === 429 || openaiError?.code === 'insufficient_quota') {
       fallbackMessage = 'I\'m temporarily unavailable due to high demand. Please try again in a few minutes.';
-    } else if (openaiError?.message?.includes('timeout')) {
+    } else if (openaiError?.message?.includes('timeout') || openaiError?.message?.includes('took too long')) {
       fallbackMessage = 'The request took too long to process. Please try again with a shorter message.';
     }
 
@@ -1724,6 +1781,21 @@ Use this knowledge to provide more accurate and helpful responses.`,
   // ═══════════════════════════════════════════════════════════════════════
   // IMPORTANT: Chat messages are FREE
   // Credits are only deducted for TESTS (intelligent, standard, api)
+
+  // Check if client connection is still alive before sending response
+  if (req.aborted || req.socket?.destroyed) {
+    logger.warn('[GENERAL_CHAT] Client connection closed, cannot send response', {
+      userId,
+      chatSessionId,
+    });
+    return;
+  }
+
+  // Check if response already sent
+  if (res.headersSent) {
+    logger.warn('[GENERAL_CHAT] Response already sent', { userId, chatSessionId });
+    return;
+  }
 
   const response: any = {
     success: true, // ← Frontend expects this!

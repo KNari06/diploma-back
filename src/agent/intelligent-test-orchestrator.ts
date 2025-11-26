@@ -1069,7 +1069,7 @@ export class IntelligentTestOrchestrator {
             urlBefore: actionResult.urlBefore,
             urlAfter: actionResult.urlAfter,
             retryCount: actionResult.retryCount, // ✅ NEW: Track retries
-            isTimeout: actionResult.error?.toLowerCase().includes('timeout'), // ✅ NEW: Flag timeouts
+            isTimeout: (actionResult.error?.toLowerCase() ?? '').includes('timeout'), // ✅ NEW: Flag timeouts
           });
           this.emitGraphUpdate(graphUpdate);
         }
@@ -1197,23 +1197,39 @@ export class IntelligentTestOrchestrator {
 
     // Check success rate
     if (result.actionsTaken > 0) {
-      const successCount = result.actionsTaken - result.errors.length;
-      const successRate = successCount / result.actionsTaken;
+      // Count successful actions from actual action results (not loop-level errors)
+      // Loop-level errors (result.errors) are for validation/analysis failures, not action failures
+      const allActionResults = result.pageVisits
+        .flatMap(pageVisit => pageVisit.actionResults || []);
 
-      if (successRate === 0) {
-        return {
-          isValid: false,
-          reason: 'All actions failed (0% success rate) - test did not successfully interact with the page',
-        };
-      }
+      // Use actual action results if available, otherwise fallback (shouldn't happen in normal flow)
+      if (allActionResults.length > 0) {
+        const successCount = allActionResults.filter(ar => ar.success).length;
+        const successRate = successCount / allActionResults.length;
 
-      // Warn if success rate is very low
-      if (successRate < 0.2 && result.actionsTaken >= 3) {
-        logger.warn('[INTELLIGENT_ORCHESTRATOR] Very low success rate', {
+        if (successRate === 0) {
+          return {
+            isValid: false,
+            reason: 'All actions failed (0% success rate) - test did not successfully interact with the page',
+          };
+        }
+
+        // Warn if success rate is very low
+        if (successRate < 0.2 && allActionResults.length >= 3) {
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] Very low success rate', {
+            testId: this.testId,
+            successRate: `${Math.round(successRate * 100)}%`,
+            actionsTaken: allActionResults.length,
+            successfulActions: successCount,
+            failedActions: allActionResults.length - successCount,
+          });
+        }
+      } else {
+        // Fallback: if no action results available, use old logic (shouldn't happen normally)
+        logger.warn('[INTELLIGENT_ORCHESTRATOR] No action results found for success rate calculation', {
           testId: this.testId,
-          successRate: `${Math.round(successRate * 100)}%`,
           actionsTaken: result.actionsTaken,
-          errors: result.errors.length,
+          pagesVisited: result.pagesVisited,
         });
       }
     }

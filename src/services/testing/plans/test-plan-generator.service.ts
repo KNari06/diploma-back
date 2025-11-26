@@ -210,7 +210,7 @@ export function formatTestPlanForConfirmation(
 
   // Risks
   if (plan.risks.length > 0) {
-    markdown += `## 🚨 Potential Risks\n`;
+    markdown += `## 🚨 Warning Points\n`;
     for (const risk of plan.risks) {
       markdown += `- ${risk}\n`;
     }
