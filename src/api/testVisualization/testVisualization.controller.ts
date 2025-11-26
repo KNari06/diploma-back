@@ -216,6 +216,7 @@ export async function getTestVisualization(req: Request, res: Response): Promise
     // ✅ NEW: Check if we have saved graph_data (perfect 1:1 match with real-time)
     let graph;
     let stepsSource = 'unknown';
+    let steps: PlaywrightStep[] | undefined;
 
     if (testData.intelligentSession?.session?.graph_data) {
       // Use saved graph directly (no conversion needed)
@@ -224,7 +225,7 @@ export async function getTestVisualization(req: Request, res: Response): Promise
       stepsSource = 'saved_graph';
     } else {
       // Fallback: Extract and convert steps from all available sources
-      const steps = await extractTestSteps(testData);
+      steps = await extractTestSteps(testData);
 
       if (!steps || steps.length === 0) {
         res.status(404).json({

@@ -178,7 +178,7 @@ export class IntelligentTestOrchestrator {
 
       // If cancelled, build result with cancellation info
       if (wasCancelled) {
-        const result = this.buildResult(false);
+        const result = await this.buildResult(false);
         result.summary = 'Test was cancelled by user';
         // Add cancellation error (errors array has { message, page } structure)
         result.errors.push({
@@ -207,7 +207,7 @@ export class IntelligentTestOrchestrator {
       }
 
       // Build result and validate it
-      const result = this.buildResult(true);
+      const result = await this.buildResult(true);
 
       // ✅ CRITICAL FIX: Validate test result quality
       const isValidTest = this.validateTestResult(result);
@@ -289,7 +289,7 @@ export class IntelligentTestOrchestrator {
         error: error instanceof Error ? error.message : 'Unknown error',
       });
 
-      return this.buildResult(false);
+      return await this.buildResult(false);
     }
   }
 
@@ -375,20 +375,30 @@ export class IntelligentTestOrchestrator {
 
         // ✅ NEW: Add page node to graph when analyzing new page
         if (this.testId && this.userId && this.graphBuilder) {
+          // Get page title and metadata from page
+          let pageTitle: string | undefined;
+          let metaDescription: string | undefined;
+          try {
+            pageTitle = await this.page.title();
+            metaDescription = await this.page.$eval('meta[name="description"]', (el) => el.getAttribute('content') || '').catch(() => undefined);
+          } catch (error) {
+            logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to get page metadata', { error });
+          }
+
           const pageUpdate = this.graphBuilder.addPageNode(
             context.url,
             context.pageType,
             {
               screenshot: context.screenshot, // Base64 screenshot
-              title: context.pageInfo?.title,
-              metaDescription: context.pageInfo?.metaDescription,
+              title: pageTitle,
+              metaDescription: metaDescription,
               dom: {
-                formsCount: context.interactiveElements.forms?.length || 0,
-                buttonsCount: context.interactiveElements.buttons?.length || 0,
-                linksCount: context.interactiveElements.links?.length || 0,
-                inputsCount: context.interactiveElements.inputs?.length || 0,
+                formsCount: context.dom.forms?.length || 0,
+                buttonsCount: context.dom.buttons?.length || 0,
+                linksCount: context.dom.links?.length || 0,
+                inputsCount: context.dom.inputs?.length || 0,
               },
-              networkRequests: context.pageInfo?.networkRequests,
+              // Network requests count not available in PageContext, skip for now
             }
           );
           this.emitGraphUpdate(pageUpdate);
@@ -1321,7 +1331,7 @@ export class IntelligentTestOrchestrator {
     return { isValid: true };
   }
 
-  private buildResult(success: boolean): IntelligentTestResult {
+  private async buildResult(success: boolean): Promise<IntelligentTestResult> {
     const stats = StateTracker.getStatistics(this.state);
 
     const summary = this.buildSummary(success, stats);
