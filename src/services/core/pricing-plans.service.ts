@@ -4,7 +4,7 @@ import { logger } from '@/utils/logger';
 export interface PricingPlan {
   id: string;
   name: string;
-  slug: 'free' | 'pro' | 'team';
+  slug: 'free' | 'pro' | 'ultra';
   description: string;
   price: number | null; // NULL for free plan
   credits_per_month: number; // -1 for unlimited
@@ -412,17 +412,98 @@ export class PricingPlansService {
         }));
       }
 
-      if (planSlug === 'team') {
+      if (planSlug === 'ultra') {
+        logger.info('[PRICING_PLANS] Fetching ultra plan options', {
+          planId,
+          planIdType: typeof planId,
+          planSlug,
+        });
+
+        // First, verify the plan exists
+        const { data: planCheck } = await supabaseAdmin
+          .from('pricing_plans')
+          .select('id, slug, name')
+          .eq('slug', 'ultra')
+          .eq('is_active', true)
+          .maybeSingle();
+
+        if (planCheck) {
+          logger.info('[PRICING_PLANS] Ultra plan found in DB', {
+            dbPlanId: planCheck.id,
+            requestedPlanId: planId,
+            match: planCheck.id === planId,
+          });
+        }
+
         const { data, error } = await supabaseAdmin
-          .from('team_plan_options')
+          .from('ultra_plan_options')
           .select('*')
           .eq('plan_id', planId)
           .order('credits', { ascending: true });
 
         if (error) {
-          logger.error('[PRICING_PLANS] Error getting team plan options', { error: error.message });
+          logger.error('[PRICING_PLANS] Error getting ultra plan options', {
+            error: error.message,
+            errorCode: error.code,
+            planId,
+            planSlug,
+          });
           return [];
         }
+
+        if (!data || data.length === 0) {
+          logger.warn('[PRICING_PLANS] No ultra plan options found in database', {
+            planId,
+            planSlug,
+            queryResult: data,
+          });
+
+          // Try to find any ultra plan options (for debugging)
+          const { data: allUltraOptions } = await supabaseAdmin
+            .from('ultra_plan_options')
+            .select('plan_id, credits, price');
+
+          logger.warn('[PRICING_PLANS] All ultra_plan_options in DB', {
+            allOptions: allUltraOptions,
+            searchingForPlanId: planId,
+            planIdType: typeof planId,
+          });
+
+          // Try alternative: find by plan slug via join
+          const { data: optionsBySlug } = await supabaseAdmin
+            .from('ultra_plan_options')
+            .select(`
+              *,
+              pricing_plans!inner(id, slug, name)
+            `)
+            .eq('pricing_plans.slug', 'ultra')
+            .eq('pricing_plans.is_active', true)
+            .order('credits', { ascending: true });
+
+          if (optionsBySlug && optionsBySlug.length > 0) {
+            logger.warn('[PRICING_PLANS] Found options via join query', {
+              count: optionsBySlug.length,
+              firstOption: optionsBySlug[0],
+            });
+            // Use the found options
+            return (optionsBySlug || []).map((opt: any) => ({
+              credits: opt.credits,
+              price: Number(opt.price),
+              price_per_credit: Number(opt.price_per_credit),
+              is_default: opt.is_default,
+              billing_period: 'monthly',
+              description: opt.description,
+              savings: opt.savings || 0,
+            }));
+          }
+
+          return [];
+        }
+
+        logger.info('[PRICING_PLANS] Found ultra plan options', {
+          count: data.length,
+          planId,
+        });
 
         return (data || []).map(opt => ({
           credits: opt.credits,
@@ -462,44 +543,79 @@ export class PricingPlansService {
       const plans = await this.getAllPlans();
 
       // Transform to API format
-      const formattedPlans = await Promise.all(plans.map(async plan => {
-        // Get credit options from database for pro and team plans
-        let creditOptions: any[];
+      const formattedPlans = await Promise.all(
+        plans
+          .map(async plan => {
+            // Get credit options from database for pro and ultra plans
+            let creditOptions: any[];
 
-        if (plan.slug === 'pro' || plan.slug === 'team') {
-          creditOptions = await this.getPlanCreditOptions(plan.id, plan.slug);
-        } else {
-          // For free plan, use default option
-          creditOptions = [{
-            credits: plan.credits_per_month,
-            price: plan.price || 0,
-            price_per_credit: plan.price && plan.credits_per_month > 0
-              ? Math.round((plan.price / plan.credits_per_month) * 1000) / 1000
-              : 0,
-            is_default: true,
-            billing_period: 'monthly',
-            description: plan.credits_per_month === -1
-              ? 'Unlimited credits'
-              : `${plan.credits_per_month} credits monthly${plan.credits_per_day ? ` (${plan.credits_per_day} per day)` : ''}`,
-            savings: 0,
-          }];
-        }
+            if (plan.slug === 'pro' || plan.slug === 'ultra') {
+              logger.info('[PRICING_PLANS] Loading credit options for plan', {
+                planSlug: plan.slug,
+                planId: plan.id,
+                planName: plan.name,
+              });
 
-        return {
-          id: plan.slug,
-          name: plan.name,
-          description: plan.description,
-          type: plan.slug === 'free' ? 'free' : (plan.slug === 'team' ? 'custom' : 'paid'),
-          popular: plan.slug === 'pro',
-          discount: 0,
-          currency: 'USD',
-          features: plan.features,
-          limitations: plan.limitations,
-          credit_options: creditOptions,
-          contact_required: false,
-          contact_info: undefined,
-        };
-      }));
+              creditOptions = await this.getPlanCreditOptions(plan.id, plan.slug);
+
+              logger.info('[PRICING_PLANS] Credit options loaded', {
+                planSlug: plan.slug,
+                planId: plan.id,
+                optionsCount: creditOptions?.length || 0,
+              });
+
+              // Fallback: if no options found, create default from plan
+              if (!creditOptions || creditOptions.length === 0) {
+                logger.warn('[PRICING_PLANS] No credit options found for plan, using fallback', {
+                  planSlug: plan.slug,
+                  planId: plan.id,
+                  planName: plan.name,
+                });
+                creditOptions = [{
+                  credits: plan.credits_per_month,
+                  price: plan.price || 0,
+                  price_per_credit: plan.price && plan.credits_per_month > 0
+                    ? Math.round((plan.price / plan.credits_per_month) * 10000) / 10000
+                    : 0,
+                  is_default: true,
+                  billing_period: 'monthly',
+                  description: `${plan.credits_per_month} credits monthly`,
+                  savings: 0,
+                }];
+              }
+            } else {
+              // For free plan, use default option
+              creditOptions = [{
+                credits: plan.credits_per_month,
+                price: plan.price || 0,
+                price_per_credit: plan.price && plan.credits_per_month > 0
+                  ? Math.round((plan.price / plan.credits_per_month) * 1000) / 1000
+                  : 0,
+                is_default: true,
+                billing_period: 'monthly',
+                description: plan.credits_per_month === -1
+                  ? 'Unlimited credits'
+                  : `${plan.credits_per_month} credits monthly${plan.credits_per_day ? ` (${plan.credits_per_day} per day)` : ''}`,
+                savings: 0,
+              }];
+            }
+
+            return {
+              id: plan.slug,
+              name: plan.name,
+              description: plan.description,
+              type: plan.slug === 'free' ? 'free' : (plan.slug === 'ultra' ? 'custom' : 'paid'),
+              popular: plan.slug === 'pro',
+              discount: 0,
+              currency: 'USD',
+              features: plan.features,
+              limitations: plan.limitations,
+              credit_options: creditOptions,
+              contact_required: false,
+              contact_info: undefined,
+            };
+          })
+      );
 
       return {
         plans: formattedPlans,
