@@ -393,11 +393,21 @@ export class IntelligentTestOrchestrator {
         if (cycleCheck.cycleDetected) {
           logger.warn('[INTELLIGENT_ORCHESTRATOR] URL cycle detected', {
             suggestion: cycleCheck.suggestion,
+            visitCount: cycleCheck.visitCount,
           });
 
           this.emitEvent('test_warning', {
             message: cycleCheck.suggestion,
           });
+
+          // ✅ FIX: More aggressive stopping - if cycle detected 5+ times, stop immediately
+          if (cycleCheck.visitCount && cycleCheck.visitCount >= 5) {
+            logger.warn('[INTELLIGENT_ORCHESTRATOR] Stopping due to excessive URL cycles', {
+              visitCount: cycleCheck.visitCount,
+              url: context.url,
+            });
+            break;
+          }
 
           // Try to decide next step despite cycle
           const decision = await ContextualActionGenerator.decideNextStep(
@@ -1180,12 +1190,27 @@ export class IntelligentTestOrchestrator {
       };
     }
 
-    // Check if we visited the start URL
+    // ✅ FIX: Check if we visited the start URL (with normalization)
+    const normalizeUrl = (url: string): string => {
+      try {
+        const urlObj = new URL(url);
+        urlObj.search = '';
+        urlObj.hash = '';
+        let hostname = urlObj.hostname;
+        if (hostname.startsWith('www.')) {
+          hostname = hostname.substring(4);
+        }
+        urlObj.hostname = hostname;
+        urlObj.protocol = 'https:';
+        return urlObj.toString().replace(/\/$/, '');
+      } catch {
+        return url.split('?')[0].split('#')[0].replace(/\/$/, '');
+      }
+    };
+
+    const normalizedStartUrl = normalizeUrl(this.config.startUrl);
     const visitedStartUrl = result.pageVisits.some(p =>
-      p.url && (
-        p.url === this.config.startUrl ||
-        p.url.startsWith(this.config.startUrl.split('?')[0]) // Ignore query params
-      )
+      p.url && normalizeUrl(p.url) === normalizedStartUrl
     );
 
     if (!visitedStartUrl && result.pagesVisited > 0) {

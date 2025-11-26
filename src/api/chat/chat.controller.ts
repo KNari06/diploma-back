@@ -2070,30 +2070,9 @@ async function executeApiTestFlow(
       apiDetails
     );
 
-    // ✅ NEW: Check if test is already completed/failed (for API tests, usually completed when message is created)
-    let isTestRunned = false;
-    try {
-      const { data: testStatus, error: testStatusError } = await supabaseAdmin
-        .from('tests')
-        .select('status')
-        .eq('id', apiTestId)
-        .single();
-
-      if (!testStatusError && testStatus) {
-        // Test is considered "runned" if status is 'completed' or 'failed'
-        isTestRunned = testStatus.status === 'completed' || testStatus.status === 'failed';
-      } else {
-        // For API tests, if test was just executed, consider it as "runned"
-        isTestRunned = true; // API test is completed when message is created
-      }
-    } catch (error) {
-      logger.warn('[API_TEST] Failed to check test status for is_test_runned flag', {
-        error: error instanceof Error ? error.message : String(error),
-        testId: apiTestId,
-      });
-      // Default to true for API tests (they're usually completed when message is created)
-      isTestRunned = true;
-    }
+    // ✅ FIX: Test is considered "runned" if it was successfully created
+    // For API tests, if apiTestId exists, the test was executed (API tests run synchronously)
+    const isTestRunned = !!apiTestId;
 
     // FIX #5: Make chat save non-blocking (fire-and-forget)
     if (chatSessionId) {
@@ -2543,26 +2522,9 @@ async function executeUiTestFlow(
 
     const successMessage = `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${testCreated.data.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data.id}/status`;
 
-    // ✅ NEW: Check if test is already completed/failed
-    let isTestRunned = false;
-    try {
-      const { data: testStatus, error: testStatusError } = await supabaseAdmin
-        .from('tests')
-        .select('status')
-        .eq('id', testCreated.data.id)
-        .single();
-
-      if (!testStatusError && testStatus) {
-        // Test is considered "runned" if status is 'completed' or 'failed'
-        isTestRunned = testStatus.status === 'completed' || testStatus.status === 'failed';
-      }
-    } catch (error) {
-      logger.warn('[UI_TEST] Failed to check test status for is_test_runned flag', {
-        error: error instanceof Error ? error.message : String(error),
-        testId: testCreated.data.id,
-      });
-      // Default to false if check fails
-    }
+    // ✅ FIX: Test is considered "runned" if it was successfully created and added to queue
+    // If testCreated.data.id exists, the test was launched (added to queue), even if not yet completed
+    const isTestRunned = !!testCreated.data.id;
 
     // FIX #11: Make chat save non-blocking (fire-and-forget)
         if (chatSessionId) {

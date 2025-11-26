@@ -94,7 +94,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           const ariaLabel = element.getAttribute('aria-label');
           if (ariaLabel && ariaLabel.length > 0 && ariaLabel.length < 50) {
             const selector = `[aria-label="${escapeSelector(ariaLabel)}"]`;
-            return makeUnique(selector, selectorCounts);
+            return makeUnique(selector, selectorCounts, element);
           }
         }
 
@@ -103,7 +103,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           const name = element.getAttribute('name');
           if (name && name.length > 0) {
             const selector = `${element.tagName.toLowerCase()}[name="${escapeSelector(name)}"]`;
-            return makeUnique(selector, selectorCounts);
+            return makeUnique(selector, selectorCounts, element);
           }
         }
 
@@ -121,7 +121,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           const roleName = element.hasAttribute('aria-label')
             ? `[role="${role}"][aria-label="${escapeSelector(element.getAttribute('aria-label'))}"]`
             : `[role="${role}"]`;
-          return makeUnique(roleName, selectorCounts);
+          return makeUnique(roleName, selectorCounts, element);
         }
 
         // Try meaningful classes (filter out dynamic ones)
@@ -132,7 +132,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
 
           if (classes.length > 0 && classes.length < 3) {
             const selector = `.${classes.join('.')}`;
-            return makeUnique(selector, selectorCounts);
+            return makeUnique(selector, selectorCounts, element);
           }
         }
 
@@ -141,7 +141,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           const placeholder = element.getAttribute('placeholder');
           if (placeholder && placeholder.length > 0) {
             const selector = `input[placeholder="${escapeSelector(placeholder)}"]`;
-            return makeUnique(selector, selectorCounts);
+            return makeUnique(selector, selectorCounts, element);
           }
         }
 
@@ -151,7 +151,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           if (text.length > 0 && text.length < 50) {
             const tag = element.tagName.toLowerCase();
             const selector = `${tag}:has-text("${escapeSelector(text)}")`;
-            return makeUnique(selector, selectorCounts);
+            return makeUnique(selector, selectorCounts, element);
           }
         }
 
@@ -167,15 +167,40 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
       }
 
       /**
-       * Make selector unique by adding :nth() if duplicate
+       * Make selector unique by adding parent context if duplicate
+       * ✅ FIX: Playwright doesn't support :nth() in CSS selector
+       * Instead, we use more specific selector with parent context
        */
-      function makeUnique(selector: string, selectorCounts: Map<string, number>): string {
+      function makeUnique(selector: string, selectorCounts: Map<string, number>, element?: any): string {
         const count = selectorCounts.get(selector) || 0;
         selectorCounts.set(selector, count + 1);
 
-        // If we've seen this selector before, add :nth()
-        if (count > 0) {
-          return `${selector}:nth(${count})`;
+        // If we've seen this selector before, try to make it more specific
+        if (count > 0 && element) {
+          // Try to add parent context for uniqueness
+          const parent = element.parentElement;
+          if (parent) {
+            // Try parent ID
+            if (parent.id) {
+              return `#${parent.id} > ${selector}`;
+            }
+            // Try parent class (first meaningful class)
+            if (parent.className && typeof parent.className === 'string') {
+              const classes = parent.className.split(' ').filter((c: string) => c && !isDynamicClass(c));
+              if (classes.length > 0 && classes.length < 3) {
+                return `.${classes[0]} > ${selector}`;
+              }
+            }
+            // Try parent tag
+            const parentTag = parent.tagName.toLowerCase();
+            if (parentTag !== 'body' && parentTag !== 'html') {
+              return `${parentTag} > ${selector}`;
+            }
+          }
+
+          // Fallback: return base selector (Playwright will use .first() or .nth() method)
+          // This is better than invalid :nth() in selector string
+          return selector;
         }
 
         return selector;

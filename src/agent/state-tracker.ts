@@ -113,6 +113,35 @@ export class StateTracker {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // URL NORMALIZATION
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Normalize URL for comparison (remove query params, normalize www, protocol)
+   * ✅ FIX: URLs with different query params should be considered the same
+   */
+  private static normalizeUrl(url: string): string {
+    try {
+      const urlObj = new URL(url);
+      // Remove query params and hash
+      urlObj.search = '';
+      urlObj.hash = '';
+      // Normalize www (remove www for comparison)
+      let hostname = urlObj.hostname;
+      if (hostname.startsWith('www.')) {
+        hostname = hostname.substring(4);
+      }
+      urlObj.hostname = hostname;
+      // Normalize protocol (always use https for comparison)
+      urlObj.protocol = 'https:';
+      return urlObj.toString().replace(/\/$/, ''); // Remove trailing slash
+    } catch {
+      // If URL parsing fails, just remove query params manually
+      return url.split('?')[0].split('#')[0].replace(/\/$/, '');
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // CYCLE DETECTION
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -128,9 +157,12 @@ export class StateTracker {
     currentUrl: string,
     maxVisits: number = 3
   ): CycleDetectionResult {
-    // Count how many times we've visited this URL
+    // ✅ FIX: Normalize URLs for comparison
+    const normalizedCurrent = this.normalizeUrl(currentUrl);
+
+    // Count how many times we've visited this URL (normalized)
     const visitCount = state.visitedPages.filter(
-      page => page.url === currentUrl
+      page => this.normalizeUrl(page.url) === normalizedCurrent
     ).length;
 
     if (visitCount >= maxVisits) {
