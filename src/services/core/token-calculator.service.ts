@@ -5,9 +5,10 @@ import { logger } from '@/utils/logger';
  * Converts between tokens and credits for accurate billing
  *
  * PRICING MODEL (as of 2024):
- * - Plan: $39/month = 1000 credits
+ * - Pro Plan: $28.9/month = 1000 credits
+ * - Ultra Plan: $43.9/month = 1000 credits
  * - 1 credit = 562.5 tokens
- * - Margin: 50%
+ * - Margin: 83-89%
  */
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -16,7 +17,7 @@ import { logger } from '@/utils/logger';
 
 /**
  * How many tokens equals 1 credit
- * Calculated: $39/month = 1000 credits
+ * Calculated: $28.9/month = 1000 credits (Pro Plan)
  * AI budget: $4.50 / $0.008 per 1K tokens = 562,500 tokens
  * 562,500 tokens ÷ 1000 credits = 562.5 tokens per credit
  */
@@ -51,10 +52,8 @@ export const TEST_CREDITS = {
  * Subscription plans
  */
 export const SUBSCRIPTION_PLANS = {
-  starter: { price: 39, credits: 1000 },
-  pro: { price: 69, credits: 2000 },
-  business: { price: 149, credits: 5000 },
-  enterprise: { price: 249, credits: 10000 },
+  pro: { price: 28.9, credits: 1000 },
+  ultra: { price: 43.9, credits: 1000 },
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════

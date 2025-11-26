@@ -43,11 +43,11 @@ BEGIN
 
     -- Insert pro plan credit options (update if exists)
     INSERT INTO pro_plan_options (plan_id, credits, price, price_per_credit, is_default, description, savings) VALUES
-    (pro_plan_id, 1000, 39.00, 0.039, true, '1,000 credits - Most popular', 0),
-    (pro_plan_id, 1500, 55.00, 0.037, false, '1,500 credits - Better value', 3),
-    (pro_plan_id, 2000, 69.00, 0.035, false, '2,000 credits - Great value', 9),
-    (pro_plan_id, 2500, 85.00, 0.034, false, '2,500 credits - Excellent value', 12),
-    (pro_plan_id, 3000, 99.00, 0.033, false, '3,000 credits - Best value', 18)
+    (pro_plan_id, 1000, 28.9, 0.0289, true, '1,000 credits - Most popular', 0),
+    (pro_plan_id, 1500, 39.9, 0.0266, false, '1,500 credits - Better value', 4),
+    (pro_plan_id, 2000, 49.9, 0.02495, false, '2,000 credits - Great value', 8),
+    (pro_plan_id, 2500, 59.9, 0.02396, false, '2,500 credits - Excellent value', 13),
+    (pro_plan_id, 3000, 69.9, 0.0233, false, '3,000 credits - Best value', 18)
     ON CONFLICT (plan_id, credits) DO UPDATE
     SET
         price = EXCLUDED.price,
