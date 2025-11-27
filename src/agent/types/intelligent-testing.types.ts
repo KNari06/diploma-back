@@ -159,6 +159,11 @@ export interface DynamicAction {
     name: string; // Variable name to store extracted value
     attribute?: string; // Attribute to extract (e.g., 'href', 'src')
     property?: 'text' | 'value' | 'innerHTML'; // Property to extract
+    // ✅ NEW: AI Extract with JSON schema
+    useAI?: boolean; // Use AI extraction with schema validation
+    schema?: any; // JSON schema for AI extraction
+    mode?: 'html' | 'text' | 'auto'; // Extraction mode for AI
+    instructions?: string; // Additional instructions for AI
   };
   // Assertion config (for assert actions)
   assertion?: {

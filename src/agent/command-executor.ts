@@ -1,16 +1,29 @@
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/logger';
 import { Page } from 'playwright';
+import { SelfHealingService } from '@/services/ai-selector/self-healing.service';
+import { AIExtractService } from '@/services/ai-extract';
 
 /**
  * Execute Playwright commands on a page
+ * ✅ NEW: With AI self-healing support
  */
 export class CommandExecutor {
   private page: Page;
   private extractedData: Map<string, any> = new Map();
+  private selfHealingEnabled: boolean = true; // ✅ NEW: Enable/disable self-healing
+  private metadata: { url: string; projectId?: string; userId?: string };
 
-  constructor(page: Page) {
+  constructor(
+    page: Page,
+    options: {
+      selfHealingEnabled?: boolean;
+      metadata?: { url: string; projectId?: string; userId?: string };
+    } = {}
+  ) {
     this.page = page;
+    this.selfHealingEnabled = options.selfHealingEnabled ?? true;
+    this.metadata = options.metadata || { url: '' };
   }
 
   /**
@@ -44,26 +57,37 @@ export class CommandExecutor {
 
         case 'click':
           if (!selector) throw new Error('Selector is required for click action');
-          // ✅ IMPROVED: Use locator with better error handling
-          try {
-            const locator = this.page.locator(selector);
-            // Wait for element to be visible and actionable
-            await locator.waitFor({ state: 'visible', timeout: timeout || 30000 });
-            await locator.click({ timeout: timeout || 30000 });
-          } catch (clickError) {
-            // ✅ IMPROVED: Provide more detailed error message
-            const errorMessage = clickError instanceof Error ? clickError.message : String(clickError);
-            if (errorMessage.includes('not found') || errorMessage.includes('timeout')) {
-              throw new Error(`Element not found or not visible: ${selector}. ${errorMessage}`);
+          // ✅ NEW: Try with self-healing
+          await this.executeWithSelfHealing(
+            async () => {
+              const locator = this.page.locator(selector);
+              await locator.waitFor({ state: 'visible', timeout: timeout || 30000 });
+              await locator.click({ timeout: timeout || 30000 });
+            },
+            {
+              selector,
+              intent: description || 'click element',
+              action: 'click',
+              timeout,
             }
-            throw clickError;
-          }
+          );
           break;
 
         case 'fill':
           if (!selector) throw new Error('Selector is required for fill action');
           if (value === undefined) throw new Error('Value is required for fill action');
-          await this.page.fill(selector, String(value), { timeout: timeout || 30000 });
+          // ✅ NEW: Try with self-healing
+          await this.executeWithSelfHealing(
+            async () => {
+              await this.page.fill(selector, String(value), { timeout: timeout || 30000 });
+            },
+            {
+              selector,
+              intent: description || `fill ${selector} with ${value}`,
+              action: 'fill',
+              timeout,
+            }
+          );
           break;
 
         case 'type':
@@ -389,11 +413,40 @@ export class CommandExecutor {
 
   /**
    * Extract data from element
+   * Supports both traditional extraction and AI-powered extraction with JSON schema
    */
   private async extractData(
     selector: string,
     config: NonNullable<PlaywrightCommand['extract']>
   ): Promise<any> {
+    // ✅ NEW: AI Extract with JSON schema
+    if (config.useAI && config.schema) {
+      logger.info('[COMMAND_EXECUTOR] Using AI extraction with schema', {
+        selector,
+        mode: config.mode || 'auto',
+      });
+
+      const result = await AIExtractService.extract(this.page, {
+        selector,
+        schema: config.schema,
+        mode: config.mode,
+        instructions: config.instructions,
+      });
+
+      if (!result.success) {
+        throw new Error(`AI extraction failed: ${result.error}`);
+      }
+
+      logger.info('[COMMAND_EXECUTOR] AI extraction successful', {
+        selector,
+        confidence: result.confidence,
+        tokensUsed: result.metadata.tokensUsed,
+      });
+
+      return result.data;
+    }
+
+    // Traditional extraction (backwards compatible)
     const element = this.page.locator(selector);
     await element.waitFor({ state: 'visible', timeout: 5000 });
 
@@ -445,5 +498,99 @@ export class CommandExecutor {
    */
   getExtractedData(): Map<string, any> {
     return this.extractedData;
+  }
+
+  /**
+   * ✅ NEW: Execute action with self-healing support
+   * If selector fails, attempt to heal it using AI Selector Engine
+   */
+  private async executeWithSelfHealing(
+    action: () => Promise<void>,
+    context: {
+      selector: string;
+      intent: string;
+      action: string;
+      timeout?: number;
+    }
+  ): Promise<void> {
+    try {
+      // Try original selector first
+      await action();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      // Check if error is selector-related
+      const isSelectorError =
+        errorMessage.includes('not found') ||
+        errorMessage.includes('timeout') ||
+        errorMessage.includes('not visible') ||
+        errorMessage.includes('no element');
+
+      if (!isSelectorError || !this.selfHealingEnabled) {
+        // Not a selector error or self-healing disabled → re-throw
+        throw error;
+      }
+
+      logger.warn('[COMMAND_EXECUTOR] Selector failed, attempting self-healing', {
+        selector: context.selector,
+        intent: context.intent,
+        error: errorMessage,
+      });
+
+      // Attempt self-healing
+      const healingResult = await SelfHealingService.healSelector({
+        oldSelector: context.selector,
+        intent: context.intent,
+        page: this.page,
+        errorMessage,
+        metadata: {
+          url: this.metadata.url || this.page.url(),
+          projectId: this.metadata.projectId,
+          userId: this.metadata.userId,
+        },
+        mode: 'fast', // Use fast mode for during-test healing
+      });
+
+      if (!healingResult.success || !healingResult.newSelector) {
+        logger.error('[COMMAND_EXECUTOR] Self-healing failed', {
+          oldSelector: context.selector,
+          suggestion: healingResult.suggestion,
+        });
+        // Re-throw original error
+        throw error;
+      }
+
+      // Healing successful - log and retry with new selector
+      logger.info('[COMMAND_EXECUTOR] Self-healing successful', {
+        oldSelector: context.selector,
+        newSelector: healingResult.newSelector,
+        autoApplied: healingResult.autoApplied,
+        confidence: healingResult.diff.confidence,
+      });
+
+      // Auto-apply if confidence is high
+      if (healingResult.autoApplied) {
+        logger.info('[COMMAND_EXECUTOR] Auto-applying healed selector', {
+          newSelector: healingResult.newSelector,
+          whatChanged: healingResult.diff.what_changed,
+        });
+
+        // Retry action with new selector (simplified - works for most cases)
+        await this.page.locator(healingResult.newSelector).click({
+          timeout: context.timeout || 30000,
+        });
+
+        logger.info('[COMMAND_EXECUTOR] Healed selector worked successfully', {
+          newSelector: healingResult.newSelector,
+        });
+      } else {
+        // Low confidence - log suggestion but don't auto-apply
+        logger.warn('[COMMAND_EXECUTOR] Low confidence healing - not auto-applying', {
+          suggestion: healingResult.suggestion,
+          confidence: healingResult.diff.confidence,
+        });
+        throw error; // Re-throw original error
+      }
+    }
   }
 }

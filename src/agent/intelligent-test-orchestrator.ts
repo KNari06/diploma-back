@@ -50,6 +50,16 @@ export class IntelligentTestOrchestrator {
   private progressEmitter?: TestProgressEmitter;
   private graphBuilder!: GraphBuilder; // ✅ NEW: Graph builder for real-time visualization
 
+  // ✅ OPTIMIZED: Screenshot metrics for monitoring
+  private screenshotMetrics = {
+    totalCaptured: 0,
+    beforeActions: 0,
+    afterActions: 0,
+    onErrors: 0,
+    onNavigation: 0,
+    onPageAnalysis: 0,
+  };
+
   constructor(config: IntelligentTestConfig, userId?: string, testId?: string) {
     this.config = config;
     this.userId = userId;
@@ -516,12 +526,18 @@ export class IntelligentTestOrchestrator {
         // ✅ NEW: Add screenshot from context to page visit
         pageVisit.screenshot = context.screenshot;
 
-        // ✅ DEBUG: Log screenshot status
-        logger.info('[INTELLIGENT_ORCHESTRATOR] Screenshot status', {
+        // ✅ OPTIMIZED: Track page analysis screenshots
+        if (context.screenshot) {
+          this.screenshotMetrics.onPageAnalysis++;
+          this.screenshotMetrics.totalCaptured++;
+        }
+
+        logger.debug('[INTELLIGENT_ORCHESTRATOR] Page screenshot captured during analysis', {
           testId: this.testId,
           url: context.url,
           hasScreenshot: !!context.screenshot,
           screenshotSize: context.screenshot ? `${Math.round(context.screenshot.length / 1024)}KB` : 'none',
+          totalScreenshots: this.screenshotMetrics.totalCaptured
         });
 
         // STEP 5: Record visit
@@ -581,8 +597,8 @@ export class IntelligentTestOrchestrator {
             break;
         }
 
-        // Small delay between iterations
-        await this.page.waitForTimeout(1000);
+        // ✅ OPTIMIZED: No delay between iterations - not needed
+        // Previous: await this.page.waitForTimeout(1000); // Removed - saves 1 second per iteration
 
         // Check cancellation after iteration
         if (await this.checkTestCancelled()) {
@@ -987,15 +1003,34 @@ export class IntelligentTestOrchestrator {
           }
         }
 
-        // ✅ NEW: Capture screenshot BEFORE action (only for important actions)
+        // ✅ OPTIMIZED: Smart screenshot capture - only when necessary
+        // BEFORE optimization: 2-3 screenshots per action (before + after + page analysis)
+        // AFTER optimization: 0-1 screenshots per action (only when needed)
+        //
+        // Strategy:
+        // - Before: Only for navigation actions (to show state before page change)
+        // - After: Only on errors OR page navigation OR button interactions (to show what went wrong/changed)
+        // - Page analysis: Already captured once per page (in analyzePage)
+        //
+        // Expected reduction: ~60-70% fewer screenshots
         let screenshotBefore: string | undefined;
-        if (['click', 'fill', 'type', 'select'].includes(action.action)) {
+        let screenshotAfter: string | undefined;
+
+        // Capture BEFORE screenshot only for navigation actions
+        const isNavigationAction = action.action === 'click' && action.description?.toLowerCase().includes('link');
+        if (isNavigationAction) {
           try {
             const screenshotBuffer = await this.page.screenshot({
               fullPage: false,
               type: 'png',
             });
             screenshotBefore = screenshotBuffer.toString('base64');
+            this.screenshotMetrics.beforeActions++;
+            this.screenshotMetrics.totalCaptured++;
+            logger.debug('[INTELLIGENT_ORCHESTRATOR] Captured before screenshot for navigation', {
+              action: action.description,
+              totalScreenshots: this.screenshotMetrics.totalCaptured
+            });
           } catch (error) {
             logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to capture before screenshot', {
               action: action.description
@@ -1019,20 +1054,52 @@ export class IntelligentTestOrchestrator {
           } : undefined,
         });
 
-        await this.page.waitForTimeout(500); // Small delay for page to settle
-
+        // ✅ OPTIMIZED: Smart waiting - only wait if URL changed (page navigation)
         const urlAfter = this.page.url();
         const urlChanged = urlBefore !== urlAfter;
 
-        // ✅ NEW: Capture screenshot AFTER action (only if action succeeded)
-        let screenshotAfter: string | undefined;
-        if (executionResult.success && ['click', 'fill', 'type', 'select'].includes(action.action)) {
+        // Wait only if page navigation occurred (new page needs to stabilize)
+        if (urlChanged) {
+          // Wait for new page to stabilize
+          await this.page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => {
+            logger.debug('[INTELLIGENT_ORCHESTRATOR] DOM not fully loaded after navigation, continuing anyway');
+          });
+        }
+        // ✅ REMOVED: No delay needed for same-page actions (most actions don't need delay)
+
+        // ✅ OPTIMIZED: Capture AFTER screenshot only in critical cases:
+        // 1. Action failed (to debug what went wrong)
+        // 2. URL changed (new page loaded, need to capture it)
+        // 3. Action was a click on a button (might show modal/message)
+        const shouldCaptureAfter = !executionResult.success ||
+                                    urlChanged ||
+                                    (action.action === 'click' && !isNavigationAction);
+
+        if (shouldCaptureAfter) {
           try {
             const screenshotBuffer = await this.page.screenshot({
               fullPage: false,
               type: 'png',
             });
             screenshotAfter = screenshotBuffer.toString('base64');
+
+            // Track metrics
+            this.screenshotMetrics.afterActions++;
+            this.screenshotMetrics.totalCaptured++;
+            if (!executionResult.success) {
+              this.screenshotMetrics.onErrors++;
+            }
+            if (urlChanged) {
+              this.screenshotMetrics.onNavigation++;
+            }
+
+            const reason = !executionResult.success ? 'error' :
+                          urlChanged ? 'navigation' : 'interaction';
+            logger.debug('[INTELLIGENT_ORCHESTRATOR] Captured after screenshot', {
+              action: action.description,
+              reason,
+              totalScreenshots: this.screenshotMetrics.totalCaptured
+            });
           } catch (error) {
             logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to capture after screenshot', {
               action: action.description
@@ -1344,11 +1411,21 @@ export class IntelligentTestOrchestrator {
         screenshot: pageVisit.screenshot!,
       }));
 
-    // ✅ DEBUG: Log collected screenshots
-    logger.info('[INTELLIGENT_ORCHESTRATOR] Collected screenshots for upload', {
-      totalPageVisits: this.state.visitedPages.length,
-      pagesWithScreenshots: screenshots.length,
-      screenshotSizes: screenshots.map(s => `${Math.round(s.screenshot.length / 1024)}KB`),
+    // ✅ OPTIMIZED: Log screenshot metrics
+    logger.info('[INTELLIGENT_ORCHESTRATOR] Screenshot optimization metrics', {
+      totalCaptured: this.screenshotMetrics.totalCaptured,
+      breakdown: {
+        pageAnalysis: this.screenshotMetrics.onPageAnalysis,
+        beforeActions: this.screenshotMetrics.beforeActions,
+        afterActions: this.screenshotMetrics.afterActions,
+        onErrors: this.screenshotMetrics.onErrors,
+        onNavigation: this.screenshotMetrics.onNavigation,
+      },
+      uploadedToStorage: screenshots.length,
+      averageSize: screenshots.length > 0
+        ? `${Math.round(screenshots.reduce((sum, s) => sum + s.screenshot.length, 0) / screenshots.length / 1024)}KB`
+        : '0KB',
+      totalSize: `${Math.round(screenshots.reduce((sum, s) => sum + s.screenshot.length, 0) / 1024)}KB`,
     });
 
     // ✅ NEW: Add end node and emit final graph

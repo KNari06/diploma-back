@@ -6,6 +6,8 @@
 
 import { buildLogicAnalysisPrompt, buildPageAnalysisPrompt } from '@/ai/prompts/index';
 import { env } from '@/config/env';
+import { AISelectorEngine } from '@/services/ai-selector/ai-selector-engine.service';
+import { DOMNodeExtractor } from '@/services/ai-selector/dom-node-extractor';
 import { analyzeDOMStructure } from '@/services/testing/ui/autonomous/dom-analyzer.service';
 import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
@@ -34,8 +36,8 @@ const openai = new OpenAI({
  */
 const MODAL_DETECTION_CONFIG = {
   // Timing settings
-  maxWaitTime: 5000,        // Maximum time to wait for modals to appear (ms)
-  checkInterval: 500,       // Interval between modal checks (ms)
+  maxWaitTime: 2000,        // ✅ OPTIMIZED: Reduced from 5000ms to 2000ms (2 seconds)
+  checkInterval: 300,       // ✅ OPTIMIZED: Reduced from 500ms to 300ms (faster checks)
   renderWaitTime: 500,     // Additional wait after modal detected for full render (ms)
 
   // Visual detection thresholds
@@ -86,15 +88,35 @@ export class IntelligentPageAnalyzer {
     });
 
     try {
-      // ✅ NEW: Wait for modals to appear (many sites show modals with delay)
-      await this.waitForModals(page);
-
-      // Parallel analysis for speed
-      logger.info('[INTELLIGENT_ANALYZER] Starting parallel screenshot & DOM capture', { url });
-      const [screenshot, domAnalysis] = await Promise.all([
-        this.captureScreenshot(page, mode),
+      // ✅ OPTIMIZED: Run modal check and DOM analysis in parallel
+      logger.info('[INTELLIGENT_ANALYZER] Starting parallel analysis', { url });
+      const [modalCheckResult, domAnalysis] = await Promise.all([
+        this.quickModalCheck(page), // Fast check
         this.analyzeDOMFull(page),
       ]);
+
+      // Only wait for modals if found or triggers detected
+      if (modalCheckResult > 0) {
+        await this.waitForModals(page);
+      } else {
+        // Quick check for modal triggers (in parallel with screenshot)
+        const hasTriggers = await this.checkModalTriggers(page);
+        if (hasTriggers) {
+          await this.waitForModals(page);
+        }
+      }
+
+      // ✅ OPTIMIZED: Capture screenshot in parallel with modal check (if needed)
+      const screenshot = await this.captureScreenshot(page, mode);
+
+      // ✅ NEW: Enhance DOM selectors with AI Selector Engine
+      logger.info('[INTELLIGENT_ANALYZER] Enhancing DOM selectors with AI', { url });
+      let enhancedDomAnalysis = await this.enhanceDOMWithAISelectors(
+        page,
+        domAnalysis,
+        url,
+        goal
+      );
       logger.info('[INTELLIGENT_ANALYZER] Screenshot & DOM captured successfully', {
         url,
         screenshotSize: screenshot ? `${Math.round(screenshot.length / 1024)}KB` : 'skipped',
@@ -106,18 +128,28 @@ export class IntelligentPageAnalyzer {
         },
       });
 
-      // Vision analysis (conditional based on mode)
-      let visionAnalysis: VisionAnalysis;
+      // ✅ OPTIMIZED: Decide if Vision needed early (before expensive operations)
+      const shouldUseVisionResult = mode === 'full' ||
+        (mode === 'balanced' && await this.shouldUseVision(domAnalysis));
 
-      if (mode === 'full' || (mode === 'balanced' && await this.shouldUseVision(domAnalysis))) {
+      // ✅ OPTIMIZED: Run Vision and Logic analysis in parallel (if Vision needed)
+      let visionAnalysis: VisionAnalysis;
+      let logicAnalysis: any;
+
+      if (shouldUseVisionResult) {
         logger.info('[INTELLIGENT_ANALYZER] Using GPT-4 Vision for analysis', { url });
         const visionStartTime = Date.now();
-        visionAnalysis = await this.analyzeWithVision(
-          screenshot,
-          url,
-          goal,
-          previousContext
-        );
+
+        // ✅ OPTIMIZED: Run Vision and Logic in parallel
+        const [visionResult, logicResult] = await Promise.all([
+          this.analyzeWithVision(screenshot, url, goal, previousContext),
+          // Start Logic analysis early (can use DOM-only data initially)
+          this.analyzeLogic('unknown', [], domAnalysis),
+        ]);
+
+        visionAnalysis = visionResult;
+        logicAnalysis = logicResult;
+
         logger.info('[INTELLIGENT_ANALYZER] Vision analysis completed', {
           url,
           duration: `${Date.now() - visionStartTime}ms`,
@@ -128,37 +160,35 @@ export class IntelligentPageAnalyzer {
       } else {
         logger.info('[INTELLIGENT_ANALYZER] Using DOM-only analysis (fast mode)', { url });
         visionAnalysis = await this.analyzeWithoutVision(domAnalysis, url);
+        // Run Logic analysis for DOM-only mode
+        logicAnalysis = await this.analyzeLogic(
+          visionAnalysis.pageType,
+          visionAnalysis.elements,
+          domAnalysis
+        );
       }
 
-      // ✅ CRITICAL FIX: Match Vision AI elements with real DOM selectors
-      // Vision AI sees elements visually but doesn't know selectors
-      // DOM analysis has selectors but doesn't know which element is which
-      // We need to match them by text, type, and purpose
-      visionAnalysis = await this.matchVisionElementsWithDOMSelectors(
-        page,
-        visionAnalysis,
-        domAnalysis
-      );
+      // ✅ OPTIMIZED: Match Vision-DOM and enhance DOM in parallel
+      const [matchedVision, enhancedDomWithModals] = await Promise.all([
+        this.matchVisionElementsWithDOMSelectors(page, visionAnalysis, enhancedDomAnalysis),
+        this.enhanceDOMWithVisionModals(page, enhancedDomAnalysis, visionAnalysis.modals),
+      ]);
 
-      // ✅ IMPROVED: Enhance DOM analysis with Vision AI modal detection
-      // Vision AI sees modals visually, DOM analysis finds selectors
-      const enhancedDomAnalysis = await this.enhanceDOMWithVisionModals(
-        page,
-        domAnalysis,
-        visionAnalysis.modals
-      );
+      visionAnalysis = matchedVision;
+      const finalEnhancedDom = enhancedDomWithModals;
 
-      // Understand logical dependencies
-      logger.info('[INTELLIGENT_ANALYZER] Starting logic analysis', { url });
-      const logicStartTime = Date.now();
-      const logicAnalysis = await this.analyzeLogic(
-        visionAnalysis.pageType,
-        visionAnalysis.elements,
-        enhancedDomAnalysis
-      );
+      // ✅ OPTIMIZED: Update Logic analysis with Vision elements (if Vision was used)
+      if (shouldUseVisionResult && visionAnalysis.elements.length > 0) {
+        // Re-run Logic with Vision elements for better accuracy
+        logicAnalysis = await this.analyzeLogic(
+          visionAnalysis.pageType,
+          visionAnalysis.elements,
+          finalEnhancedDom
+        );
+      }
+
       logger.info('[INTELLIGENT_ANALYZER] Logic analysis completed', {
         url,
-        duration: `${Date.now() - logicStartTime}ms`,
         requiredActions: logicAnalysis.requiredActions.length,
         possibleActions: logicAnalysis.possibleActions.length,
       });
@@ -169,7 +199,7 @@ export class IntelligentPageAnalyzer {
         pageType: visionAnalysis.pageType,
         timestamp: Date.now(),
         vision: visionAnalysis,
-        dom: enhancedDomAnalysis, // ✅ Use enhanced DOM analysis with merged modals
+        dom: finalEnhancedDom, // ✅ Use AI-enhanced DOM analysis
         screenshot: mode !== 'fast' ? screenshot : undefined,
         requiredActions: logicAnalysis.requiredActions,
         possibleActions: logicAnalysis.possibleActions,
@@ -259,19 +289,121 @@ export class IntelligentPageAnalyzer {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * ✅ NEW: Wait for modals to appear before analysis
-   * Many sites show modals with delay (2-5 seconds after page load)
-   * This ensures we capture modals that appear after initial page load
+   * ✅ OPTIMIZED: Wait for modals to appear before analysis
+   * Smart detection with early exit - doesn't wait if no modals expected
    */
   private static async waitForModals(page: Page): Promise<void> {
     const startTime = Date.now();
     const { maxWaitTime, checkInterval, renderWaitTime } = MODAL_DETECTION_CONFIG;
-    let lastModalCount = 0;
 
-    logger.info('[INTELLIGENT_ANALYZER] Waiting for modals to appear', {
+    // ✅ OPTIMIZED: Quick check first (most pages don't have modals)
+    let modalCount = await this.quickModalCheck(page);
+
+    // If modals found immediately, wait for full render and exit
+    if (modalCount > 0) {
+      logger.info('[INTELLIGENT_ANALYZER] Modal found immediately', {
+        modalCount,
+        elapsed: `${Date.now() - startTime}ms`,
+      });
+      await page.waitForTimeout(renderWaitTime);
+      return; // Exit early
+    }
+
+    // ✅ OPTIMIZED: Check if page has modal triggers (cookies, newsletter, etc.)
+    const hasModalTriggers = await this.checkModalTriggers(page);
+    if (!hasModalTriggers) {
+      logger.debug('[INTELLIGENT_ANALYZER] No modal triggers detected, skipping wait', {
+        elapsed: `${Date.now() - startTime}ms`,
+      });
+      return; // Exit early - no modals expected
+    }
+
+    logger.info('[INTELLIGENT_ANALYZER] Modal triggers detected, waiting for modals', {
       url: page.url(),
       maxWaitTime: `${maxWaitTime}ms`,
     });
+
+    // ✅ OPTIMIZED: Check periodically with early exit
+    while (Date.now() - startTime < maxWaitTime) {
+      try {
+        // Quick check (lightweight)
+        modalCount = await this.quickModalCheck(page);
+
+        if (modalCount > 0) {
+          logger.info('[INTELLIGENT_ANALYZER] Modal appeared', {
+            modalCount,
+            elapsed: `${Date.now() - startTime}ms`,
+          });
+          await page.waitForTimeout(renderWaitTime);
+          return; // Exit early when modal found
+        }
+
+        // Wait before next check
+        await page.waitForTimeout(checkInterval);
+      } catch (error) {
+        logger.warn('[INTELLIGENT_ANALYZER] Error while waiting for modals', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        break; // Continue with analysis even if check failed
+      }
+    }
+
+    const elapsed = Date.now() - startTime;
+    logger.debug('[INTELLIGENT_ANALYZER] Modal waiting completed (no modals found)', {
+      elapsed: `${elapsed}ms`,
+    });
+  }
+
+  /**
+   * ✅ NEW: Quick modal check (lightweight)
+   * Only checks for obvious modals (role="dialog", aria-modal)
+   */
+  private static async quickModalCheck(page: Page): Promise<number> {
+    try {
+      return await page.evaluate(() => {
+        // Quick check: only look for obvious modals
+        // @ts-ignore - browser context
+        const modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+        return modals.length;
+      });
+    } catch (error) {
+      logger.debug('[INTELLIGENT_ANALYZER] Quick modal check failed', { error });
+      return 0;
+    }
+  }
+
+  /**
+   * ✅ NEW: Check if page has modal triggers (cookies, newsletter, etc.)
+   * Helps decide if we should wait for modals
+   */
+  private static async checkModalTriggers(page: Page): Promise<boolean> {
+    try {
+      return await page.evaluate(() => {
+        // @ts-ignore - browser context
+        const bodyText = document.body.textContent?.toLowerCase() || '';
+        const hasCookieKeywords = bodyText.includes('cookie') ||
+                                   bodyText.includes('gdpr') ||
+                                   bodyText.includes('consent') ||
+                                   bodyText.includes('privacy');
+        const hasNewsletterKeywords = bodyText.includes('newsletter') ||
+                                      bodyText.includes('subscribe') ||
+                                      bodyText.includes('email');
+        return hasCookieKeywords || hasNewsletterKeywords;
+      });
+    } catch (error) {
+      logger.debug('[INTELLIGENT_ANALYZER] Modal trigger check failed', { error });
+      return false; // Assume no triggers if check fails
+    }
+  }
+
+  /**
+   * ✅ DEPRECATED: Old modal waiting logic (kept for reference)
+   * Replaced with optimized version above
+   */
+  private static async waitForModalsOld(page: Page): Promise<void> {
+    const startTime = Date.now();
+    const { maxWaitTime, checkInterval, renderWaitTime } = MODAL_DETECTION_CONFIG;
+    let lastModalCount = 0;
 
     while (Date.now() - startTime < maxWaitTime) {
       try {
@@ -398,6 +530,177 @@ export class IntelligentPageAnalyzer {
         inputs: [],
         modals: [],
       };
+    }
+  }
+
+  /**
+   * ✅ NEW: Enhance DOM selectors with AI Selector Engine
+   * Uses AI to generate robust, intent-based selectors for critical elements
+   */
+  private static async enhanceDOMWithAISelectors(
+    page: Page,
+    domAnalysis: DOMAnalysis,
+    url: string,
+    goal?: string
+  ): Promise<DOMAnalysis> {
+    const startTime = Date.now();
+
+    // Skip if no interactive elements (nothing to enhance)
+    const totalInteractive = domAnalysis.buttons.length + domAnalysis.inputs.length;
+    if (totalInteractive === 0) {
+      logger.debug('[INTELLIGENT_ANALYZER] No interactive elements to enhance', { url });
+      return domAnalysis;
+    }
+
+    logger.info('[INTELLIGENT_ANALYZER] Starting AI selector enhancement', {
+      url,
+      elementsCount: {
+        buttons: domAnalysis.buttons.length,
+        inputs: domAnalysis.inputs.length,
+        links: domAnalysis.links.length,
+      },
+    });
+
+    try {
+      // Extract DOM nodes for AI analysis
+      const nodes = await DOMNodeExtractor.extractNodes(page, {
+        visibleOnly: true,
+        interactiveOnly: true,
+      });
+
+      const viewport = page.viewportSize() || { width: 1920, height: 1080 };
+      const dom = await page.content();
+
+      // Enhance buttons with AI selectors (limit to top 10 for performance)
+      const buttonsToEnhance = domAnalysis.buttons.slice(0, 10);
+      const enhancedButtons = await Promise.all(
+        buttonsToEnhance.map(async (button) => {
+          if (!button.text) return button;
+
+          const intent = `Click ${button.text} button`;
+
+          try {
+            const result = await AISelectorEngine.resolve({
+              intent,
+              dom,
+              nodes,
+              metadata: {
+                url,
+                viewport,
+                projectId: 'intelligent-test',
+              },
+              mode: 'fast', // Use fast mode for performance
+            });
+
+            if (result.success && result.selectedNode) {
+              logger.debug('[INTELLIGENT_ANALYZER] AI selector found for button', {
+                oldSelector: button.selector,
+                newSelector: result.selectedNode.primarySelector,
+                confidence: result.selectedNode.confidence,
+                text: button.text,
+              });
+
+              return {
+                ...button,
+                selector: result.selectedNode.primarySelector,
+                aiSelector: {
+                  primary: result.selectedNode.primarySelector,
+                  fallbacks: result.fallbackSelectors.map(s => s.selector),
+                  confidence: result.selectedNode.confidence,
+                  explanation: result.explanation,
+                },
+              };
+            }
+          } catch (error) {
+            logger.debug('[INTELLIGENT_ANALYZER] Failed to enhance button selector', {
+              text: button.text,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+
+          return button;
+        })
+      );
+
+      // Keep remaining buttons unchanged
+      const allButtons = [
+        ...enhancedButtons,
+        ...domAnalysis.buttons.slice(10),
+      ];
+
+      // Enhance inputs with AI selectors (limit to top 10)
+      const inputsToEnhance = domAnalysis.inputs.slice(0, 10);
+      const enhancedInputs = await Promise.all(
+        inputsToEnhance.map(async (input) => {
+          const labelText = (input as any).label || input.name || input.placeholder || '';
+          const intent = `Fill ${input.type || 'text'} input ${labelText}`.trim();
+
+          try {
+            const result = await AISelectorEngine.resolve({
+              intent,
+              dom,
+              nodes,
+              metadata: {
+                url,
+                viewport,
+                projectId: 'intelligent-test',
+              },
+              mode: 'fast',
+            });
+
+            if (result.success && result.selectedNode) {
+              logger.debug('[INTELLIGENT_ANALYZER] AI selector found for input', {
+                oldSelector: input.selector,
+                newSelector: result.selectedNode.primarySelector,
+                confidence: result.selectedNode.confidence,
+                type: input.type,
+              });
+
+              return {
+                ...input,
+                selector: result.selectedNode.primarySelector,
+                aiSelector: {
+                  primary: result.selectedNode.primarySelector,
+                  fallbacks: result.fallbackSelectors.map(s => s.selector),
+                  confidence: result.selectedNode.confidence,
+                  explanation: result.explanation,
+                },
+              };
+            }
+          } catch (error) {
+            logger.debug('[INTELLIGENT_ANALYZER] Failed to enhance input selector', {
+              type: input.type,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+
+          return input;
+        })
+      );
+
+      const allInputs = [
+        ...enhancedInputs,
+        ...domAnalysis.inputs.slice(10),
+      ];
+
+      const duration = Date.now() - startTime;
+      logger.info('[INTELLIGENT_ANALYZER] AI selector enhancement completed', {
+        url,
+        duration: `${duration}ms`,
+        buttonsEnhanced: enhancedButtons.filter(b => (b as any).aiSelector).length,
+        inputsEnhanced: enhancedInputs.filter(i => (i as any).aiSelector).length,
+      });
+
+      return {
+        ...domAnalysis,
+        buttons: allButtons,
+        inputs: allInputs,
+      };
+    } catch (error) {
+      logger.error('[INTELLIGENT_ANALYZER] Failed to enhance DOM with AI selectors', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return domAnalysis; // Return original on failure
     }
   }
 
@@ -592,29 +895,60 @@ export class IntelligentPageAnalyzer {
         }
       }
 
-      // If no match found, try to find selector dynamically by text
+      // ✅ OPTIMIZED: Collect text selectors for batch check (instead of checking one-by-one)
+      // Will be checked in batch after the loop
       if (!matchedSelector && visionElement.text) {
-        try {
-          // Try Playwright text selector
-          const textSelector = `${visionElement.type}:has-text("${visionElement.text}")`;
-          const count = await page.locator(textSelector).count();
-          if (count > 0) {
-            matchedSelector = textSelector;
-            logger.debug('[INTELLIGENT_ANALYZER] Found selector by text search', {
-              text: visionElement.text,
-              selector: matchedSelector,
-            });
-          }
-        } catch (error) {
-          // Ignore errors, continue
-        }
+        // Store for batch processing
+        (visionElement as any)._needsTextCheck = true;
+        (visionElement as any)._textSelector = `${visionElement.type}:has-text("${visionElement.text}")`;
       }
 
-      // Add element with matched selector (or keep original if no match)
+      // Add element with matched selector (will be updated after batch check if needed)
       matchedElements.push({
         ...visionElement,
-        selector: matchedSelector || visionElement.selector || '', // Use matched selector or keep original
+        selector: matchedSelector || visionElement.selector || '',
       });
+    }
+
+    // ✅ OPTIMIZED: Batch check all text selectors at once (one page.evaluate call)
+    const elementsNeedingTextCheck = visionAnalysis.elements
+      .map((el, idx) => ({ element: el, index: idx }))
+      .filter((_, idx) => (visionAnalysis.elements[idx] as any)._needsTextCheck);
+
+    if (elementsNeedingTextCheck.length > 0) {
+      try {
+        const textSelectors = elementsNeedingTextCheck.map(
+          item => (visionAnalysis.elements[item.index] as any)._textSelector
+        );
+
+        const selectorResults = await page.evaluate((selectors) => {
+          const results: Record<string, number> = {};
+          for (const sel of selectors) {
+            try {
+              // @ts-ignore - browser context
+              const count = document.querySelectorAll(sel).length;
+              results[sel] = count;
+            } catch {
+              results[sel] = 0;
+            }
+          }
+          return results;
+        }, textSelectors);
+
+        // Update matched elements with batch results
+        for (const item of elementsNeedingTextCheck) {
+          const textSelector = (visionAnalysis.elements[item.index] as any)._textSelector;
+          if (selectorResults[textSelector] > 0) {
+            matchedElements[item.index].selector = textSelector;
+            logger.debug('[INTELLIGENT_ANALYZER] Found selector by batch text search', {
+              text: visionAnalysis.elements[item.index].text,
+              selector: textSelector,
+            });
+          }
+        }
+      } catch (error) {
+        logger.debug('[INTELLIGENT_ANALYZER] Batch selector check failed', { error });
+      }
     }
 
     logger.info('[INTELLIGENT_ANALYZER] Vision-DOM matching completed', {
@@ -1115,13 +1449,28 @@ export class IntelligentPageAnalyzer {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Decide if Vision should be used in balanced mode
-   * Use Vision for important pages, skip for simple ones
+   * ✅ OPTIMIZED: Decide if Vision should be used in balanced mode
+   * More aggressive skipping - use Vision only for complex pages
    */
   private static async shouldUseVision(domAnalysis: DOMAnalysis): Promise<boolean> {
-    // Use Vision if page has complex interactions
+    // ✅ OPTIMIZED: Skip Vision if page is too simple
+    const totalElements = domAnalysis.forms.length +
+                         domAnalysis.buttons.length +
+                         domAnalysis.inputs.length;
+
+    if (totalElements < 5) {
+      logger.debug('[INTELLIGENT_ANALYZER] Page too simple, skipping Vision', {
+        totalElements,
+        forms: domAnalysis.forms.length,
+        buttons: domAnalysis.buttons.length,
+        inputs: domAnalysis.inputs.length,
+      });
+      return false; // Skip Vision for very simple pages
+    }
+
+    // Use Vision only for complex pages
     const hasComplexForms = domAnalysis.forms.length > 1;
-    const hasManyButtons = domAnalysis.buttons.length > 5;
+    const hasManyButtons = domAnalysis.buttons.length > 10; // ✅ OPTIMIZED: Increased threshold from 5 to 10
     const hasModals = (domAnalysis.modals?.length || 0) > 0;
 
     return hasComplexForms || hasManyButtons || hasModals;
