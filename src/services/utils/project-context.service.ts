@@ -60,19 +60,47 @@ export class ProjectContextService {
   }
 
   /**
-   * Validate URL format
+   * Validate URL format and normalize it
+   * Automatically adds https:// if protocol is missing
    */
   private static isValidUrl(url: string): boolean {
     if (typeof url !== 'string' || url.trim().length === 0) {
       return false;
     }
 
+    const trimmedUrl = url.trim();
+
     try {
-      new URL(url);
+      // If URL doesn't have protocol, try adding https://
+      if (!trimmedUrl.includes('://')) {
+        new URL(`https://${trimmedUrl}`);
+        return true;
+      }
+
+      // If URL has protocol, validate as-is
+      new URL(trimmedUrl);
       return true;
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Normalize URL by adding protocol if missing
+   */
+  private static normalizeUrl(url: string): string {
+    if (typeof url !== 'string' || url.trim().length === 0) {
+      return url;
+    }
+
+    const trimmedUrl = url.trim();
+
+    // If URL doesn't have protocol, add https://
+    if (!trimmedUrl.includes('://')) {
+      return `https://${trimmedUrl}`;
+    }
+
+    return trimmedUrl;
   }
 
   /**
@@ -123,14 +151,18 @@ export class ProjectContextService {
         throw new Error(`Invalid URL format: ${url}`);
       }
 
+      // Normalize URL (add https:// if missing)
+      const normalizedUrl = this.normalizeUrl(url);
+
       logger.info('[PROJECT] Finding or creating project', {
         workspaceId,
-        url: url.substring(0, 100), // Truncate for logging
+        url: normalizedUrl.substring(0, 100), // Truncate for logging
+        originalUrl: url.substring(0, 100),
         userId,
       });
 
       // 1. Extract and validate base URL
-      const baseUrl = this.extractBaseUrl(url);
+      const baseUrl = this.extractBaseUrl(normalizedUrl);
       logger.info('[PROJECT] Extracted base URL', { baseUrl, originalUrl: url.substring(0, 100) });
 
       // 2. Try to find existing project first (optimized query)

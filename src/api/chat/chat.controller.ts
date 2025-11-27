@@ -672,6 +672,30 @@ async function saveAndRespond(
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: URL NORMALIZATION
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * Normalize URL by adding protocol if missing
+ */
+function normalizeUrl(url: string): string {
+  if (typeof url !== 'string' || url.trim().length === 0) {
+    return url;
+  }
+
+  const trimmedUrl = url.trim();
+
+  // If URL doesn't have protocol, add https://
+  if (!trimmedUrl.includes('://')) {
+    return `https://${trimmedUrl}`;
+  }
+
+  return trimmedUrl;
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
  * HANDLER: PLATFORM TEST (UI Testing) - REFACTORED & FIXED
  * ═══════════════════════════════════════════════════════════════════════════
  *
@@ -827,11 +851,14 @@ async function handlePlatformTest(
   // ═══════════════════════════════════════════════════════════════════════
 
     // FIX #5: Safe URL extraction with priority: answers > parsedIntent > session
-    const extractedUrl =
+    const rawUrl =
       parsedAnswers?.url ||
       parsedIntent?.page ||
       sessionProject?.settings?.main_url ||
       null;
+
+    // Normalize URL: add https:// if protocol is missing
+    const extractedUrl = rawUrl ? normalizeUrl(rawUrl) : null;
 
   const hasUrl = !!extractedUrl;
   const hasScope = !!(parsedAnswers?.scope || parsedIntent?.scope);
@@ -2420,7 +2447,7 @@ async function executeUiTestFlow(
     try {
       const projectResult = await ProjectContextService.findOrCreateProject(
           workspace_id,
-          plan.url,
+          normalizeUrl(plan.url),
           userId
         );
       project_id = projectResult.project_id;
