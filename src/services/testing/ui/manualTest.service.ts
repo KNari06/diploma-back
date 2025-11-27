@@ -112,10 +112,12 @@ export class ManualTestService {
 
   /**
    * Get test by ID with results
+   * Uses admin client to bypass RLS, consistent with getTestsByUser()
    */
   static  async getTest(testId: string, userId?: string): Promise<ApiResponse<Test>> {
     try {
-      const test = await dbService.getTest(testId) as any;
+      // Use admin client to bypass RLS (consistent with getTestsByUser)
+      const test = await dbAdminService.getTest(testId) as any;
 
       if (!test) {
         throw new NotFoundError('Test', testId);
@@ -142,11 +144,13 @@ export class ManualTestService {
 
   /**
    * Get test results
+   * Uses admin client to bypass RLS, consistent with getTest()
    */
   static   async getTestResults(testId: string, userId?: string): Promise<ApiResponse<TestResult[]>> {
     try {
       // First check if test exists and user has access
-      const test = await dbService.getTest(testId) as any;
+      // Use admin client for consistency
+      const test = await dbAdminService.getTest(testId) as any;
       if (!test) {
         throw new NotFoundError('Test', testId);
       }
@@ -155,7 +159,8 @@ export class ManualTestService {
         throw new ValidationError('Access denied to this test');
       }
 
-      const results = await dbService.getTestResults(testId) as any[];
+      // Use admin client to get results
+      const results = await dbAdminService.getTestResults(testId) as any[];
 
       logTestEvent('results_retrieved', testId, { resultsCount: results.length });
 

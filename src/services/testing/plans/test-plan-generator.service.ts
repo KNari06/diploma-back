@@ -258,7 +258,7 @@ export function formatTestPlanForConfirmation(
     // if (plan.estimatedCost) {
     //   markdown += `- **Estimated Cost:** ${plan.estimatedCost}\n`;
     // }
-    markdown += '\n';
+    markdown += '';
   }
 
   // AI explanation (for AI-generated plans)
@@ -280,9 +280,15 @@ export function formatTestPlanForConfirmation(
   // Note: whatWillNotBeTested is kept in plan structure for AI responses
   // but not shown in markdown to avoid negative framing
 
-  // Test Steps (show for non-AI or if steps are meaningful)
-  if (!isAiGenerated || (plan.steps && plan.steps.length > 0 && plan.steps.some(s => s.action !== 'intelligent_explore'))) {
+  // Test Steps - Always show if we have steps with selectors (even for intelligent mode)
+  const hasConcreteSteps = plan.steps && plan.steps.length > 0 &&
+    plan.steps.some(s => s.selector || (s.action && !s.action.startsWith('intelligent_')));
+
+  if (hasConcreteSteps || (!isAiGenerated && plan.steps && plan.steps.length > 0)) {
     markdown += `\n## 🔍 Test Steps\n`;
+    if (isAiGenerated) {
+      markdown += `*These steps will be executed intelligently by the AI agent, adapting to page context dynamically.*\n\n`;
+    }
     for (let i = 0; i < plan.steps.length; i++) {
       const step = plan.steps[i];
       markdown += `**${i + 1}. ${step.description}**\n`;
@@ -295,9 +301,16 @@ export function formatTestPlanForConfirmation(
       }
       markdown += `   - Expected: ${step.expectedOutcome}\n`;
     }
-  } else if (isAiGenerated) {
+  } else if (isAiGenerated && plan.steps && plan.steps.length > 0) {
+    // Show intelligent steps even if they don't have selectors
     markdown += `\n## 🔍 Test Execution\n\n`;
-    markdown += `⚠️ **Note:** Detailed test steps are AI-generated and will be executed automatically based on the analysis above.\n`;
+    for (let i = 0; i < plan.steps.length; i++) {
+      const step = plan.steps[i];
+      markdown += `**${i + 1}. ${step.description}**\n`;
+      markdown += `   - Action: \`${step.action}\`\n`;
+      markdown += `   - Expected: ${step.expectedOutcome}\n`;
+    }
+    markdown += `\n⚠️ **Note:** Detailed test steps will be generated dynamically by the AI agent during execution.\n`;
   }
 
   // Risks
@@ -361,8 +374,8 @@ function generateFooter(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Generate intelligent test plan (surface-level for user approval)
- * Details will be determined dynamically during execution
+ * Generate intelligent test plan with AI-generated specific steps
+ * Uses DOM analysis to create concrete steps that will be executed intelligently
  */
 export async function generateIntelligentTestPlan(
   explorationResult: ExplorationResult,
@@ -378,17 +391,54 @@ export async function generateIntelligentTestPlan(
       scope: userRequest.scope,
     });
 
-    // Generate unique ID - IMPORTANT: Use UUID format for database compatibility
+    // Build comprehensive prompt for AI (same as regular plan, but with intelligent mode context)
+    const prompt = buildTestPlanPrompt(explorationResult, {
+      ...userRequest,
+      message: `${userRequest.message}\n\nNOTE: This is an intelligent test plan. Generate specific test steps with selectors from DOM analysis, but these steps will be executed adaptively by the AI agent during runtime.`,
+    });
+
+    // Generate plan using AI
+    const response = await getChatCompletionWithMessages([
+      {
+        role: 'system',
+        content: 'You are an expert QA engineer creating intelligent test plans. Generate specific, actionable steps with real selectors from DOM analysis. These steps will be executed by an AI agent that can adapt dynamically.',
+      },
+      {
+        role: 'user',
+        content: prompt,
+      },
+    ], {
+      temperature: 0.4,
+      max_tokens: 3000,
+      response_format: { type: 'json_object' },
+    });
+
+    // Extract content from response
+    const aiPlan = JSON.parse(response.content);
+
+    // Log token usage
+    logger.debug('[TEST_PLAN_GENERATOR] AI tokens used (intelligent)', {
+      inputTokens: response.usage.inputTokens,
+      outputTokens: response.usage.outputTokens,
+      totalTokens: response.usage.totalTokens,
+      model: response.usage.model,
+    });
+
+    // Generate unique ID
     const planId = randomUUID();
 
-    // Build surface-level plan for approval
+    // Validate selectors against DOM analysis
+    validateSelectorsInPlan(aiPlan, explorationResult);
+
+    // Create structured test plan with AI-generated steps
     const testPlan: TestPlan = {
       id: planId,
       status: 'pending_confirmation',
       url: explorationResult.url,
       scope: userRequest.scope,
-      summary: `Intelligent testing of ${explorationResult.url}. The AI agent will autonomously explore and test the site, adapting to each page dynamically.`,
-      steps: [
+      summary: aiPlan.summary || `Intelligent testing of ${explorationResult.url}. The AI agent will autonomously explore and test the site, adapting to each page dynamically.`,
+      steps: aiPlan.steps || [
+        // Fallback steps if AI didn't generate any
         {
           id: 'step_1',
           description: 'Analyze and explore the site',
@@ -401,16 +451,10 @@ export async function generateIntelligentTestPlan(
           action: 'intelligent_test',
           expectedOutcome: 'Comprehensive testing adapted to page context',
         },
-        {
-          id: 'step_3',
-          description: 'Validate logical dependencies and user flows',
-          action: 'intelligent_validate',
-          expectedOutcome: 'Verification of UX logic and workflows',
-        },
       ],
-      commands: [], // No static commands - will be generated dynamically
-      estimatedDuration: '1-3 minutes',
-      whatWillBeTested: [
+      commands: aiPlan.commands || [], // AI-generated commands with real selectors
+      estimatedDuration: aiPlan.estimatedDuration || '1-3 minutes',
+      whatWillBeTested: aiPlan.whatWillBeTested || [
         'Page navigation and routing',
         'Interactive elements (buttons, forms, inputs)',
         'Logical dependencies between elements',
@@ -418,13 +462,13 @@ export async function generateIntelligentTestPlan(
         'Visual elements and layouts',
         'Dynamic content and state changes',
       ],
-      whatWillNotBeTested: [
+      whatWillNotBeTested: aiPlan.whatWillNotBeTested || [
         'Payment processing (requires manual approval)',
         'Account deletion (safety restriction)',
         'Email/SMS sending (external systems)',
         'Third-party integrations',
       ],
-      risks: [
+      risks: aiPlan.risks || [
         'CAPTCHA may require manual intervention',
         'Authentication may be needed for protected pages',
         'Dynamic content may cause unpredictable behavior',
@@ -442,6 +486,8 @@ export async function generateIntelligentTestPlan(
     logger.info('Intelligent test plan generated', {
       planId,
       intelligentMode: true,
+      stepsCount: testPlan.steps.length,
+      commandsCount: testPlan.commands.length,
     });
 
     return testPlan;

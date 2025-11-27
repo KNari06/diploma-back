@@ -60,6 +60,9 @@ export class IntelligentTestOrchestrator {
     onPageAnalysis: 0,
   };
 
+  // ✅ NEW: Track consecutive empty pages to stop early
+  private consecutiveEmptyPages = 0;
+
   constructor(config: IntelligentTestConfig, userId?: string, testId?: string) {
     this.config = config;
     this.userId = userId;
@@ -435,8 +438,9 @@ export class IntelligentTestOrchestrator {
             message: cycleCheck.suggestion,
           });
 
-          // ✅ FIX: More aggressive stopping - if cycle detected 5+ times, stop immediately
-          if (cycleCheck.visitCount && cycleCheck.visitCount >= 5) {
+          // ✅ FIX: More aggressive stopping - if cycle detected 3+ times, stop immediately
+          // Changed from 5 to 3 to prevent wasting time on stuck pages
+          if (cycleCheck.visitCount && cycleCheck.visitCount >= 3) {
             logger.warn('[INTELLIGENT_ORCHESTRATOR] Stopping due to excessive URL cycles', {
               visitCount: cycleCheck.visitCount,
               url: context.url,
@@ -492,6 +496,40 @@ export class IntelligentTestOrchestrator {
 
         // STEP 3: Generate actions
         const { actions, reasoning, confidence } = await this.generateActions(context);
+
+        // ✅ NEW: Track empty pages and stop if 2+ consecutive empty pages
+        const isEmptyPage = actions.length === 0 && (
+          (context.vision.elements.length === 0 &&
+           (context.dom.forms?.length || 0) === 0 &&
+           (context.dom.buttons?.length || 0) === 0 &&
+           (context.dom.links?.length || 0) === 0 &&
+           (context.dom.inputs?.length || 0) === 0)
+        );
+
+        if (isEmptyPage) {
+          this.consecutiveEmptyPages++;
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] Empty page detected', {
+            url: context.url,
+            consecutiveCount: this.consecutiveEmptyPages,
+            pageType: context.pageType,
+            elementsCount: context.vision.elements.length,
+          });
+
+          // Stop if 2+ consecutive empty pages
+          if (this.consecutiveEmptyPages >= 2) {
+            logger.warn('[INTELLIGENT_ORCHESTRATOR] Stopping due to consecutive empty pages', {
+              consecutiveCount: this.consecutiveEmptyPages,
+              url: context.url,
+            });
+            this.emitEvent('test_warning', {
+              message: `Stopped: ${this.consecutiveEmptyPages} consecutive empty pages detected. No interactive elements found.`,
+            });
+            break;
+          }
+        } else {
+          // Reset counter if page has elements
+          this.consecutiveEmptyPages = 0;
+        }
 
         if (actions.length === 0) {
           logger.warn('[INTELLIGENT_ORCHESTRATOR] No actions generated', {
@@ -794,7 +832,8 @@ export class IntelligentTestOrchestrator {
       this.page,
       this.config.goal,
       this.config.mode,
-      previousContext
+      previousContext,
+      this.config.spaLoadConfig // ✅ FIX 7: Pass configurable SPA load settings
     );
 
     // Update cost
@@ -1318,7 +1357,9 @@ export class IntelligentTestOrchestrator {
       };
     }
 
-    // ✅ FIX: Check if we visited the start URL (with normalization)
+    // ✅ IMPROVED: Check if we visited the start URL (with normalization and redirect handling)
+    // Many sites redirect (e.g., https://repetino.kz → https://repetino.kz/onboarding)
+    // We should check if we visited the base domain, not just the exact URL
     const normalizeUrl = (url: string): string => {
       try {
         const urlObj = new URL(url);
@@ -1336,15 +1377,39 @@ export class IntelligentTestOrchestrator {
       }
     };
 
+    // Extract base domain from start URL (e.g., "repetino.kz" from "https://repetino.kz")
+    const getBaseDomain = (url: string): string => {
+      try {
+        const urlObj = new URL(url);
+        let hostname = urlObj.hostname;
+        if (hostname.startsWith('www.')) {
+          hostname = hostname.substring(4);
+        }
+        return hostname;
+      } catch {
+        // Fallback: extract domain from URL string
+        const match = url.match(/https?:\/\/(?:www\.)?([^\/]+)/);
+        return match ? match[1] : '';
+      }
+    };
+
     const normalizedStartUrl = normalizeUrl(this.config.startUrl);
-    const visitedStartUrl = result.pageVisits.some(p =>
-      p.url && normalizeUrl(p.url) === normalizedStartUrl
-    );
+    const startBaseDomain = getBaseDomain(this.config.startUrl);
+
+    // Check if we visited the start URL (exact match) OR any page on the same domain (redirect handling)
+    const visitedStartUrl = result.pageVisits.some(p => {
+      if (!p.url) return false;
+      const normalizedPageUrl = normalizeUrl(p.url);
+      const pageBaseDomain = getBaseDomain(p.url);
+
+      // Exact match OR same base domain (handles redirects)
+      return normalizedPageUrl === normalizedStartUrl || pageBaseDomain === startBaseDomain;
+    });
 
     if (!visitedStartUrl && result.pagesVisited > 0) {
       return {
         isValid: false,
-        reason: `Start URL "${this.config.startUrl}" was never visited - navigation may have failed`,
+        reason: `Start URL "${this.config.startUrl}" (domain: ${startBaseDomain}) was never visited - navigation may have failed`,
       };
     }
 

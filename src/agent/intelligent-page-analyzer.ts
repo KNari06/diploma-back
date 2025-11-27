@@ -76,7 +76,18 @@ export class IntelligentPageAnalyzer {
     page: Page,
     goal: string,
     mode: 'full' | 'fast' | 'balanced' = 'balanced',
-    previousContext?: string
+    previousContext?: string,
+    spaLoadConfig?: {
+      maxWaitTime?: number;
+      networkIdleTimeout?: number;
+      networkSettleTime?: number;
+      elementRetries?: number;
+      elementRetryDelay?: number;
+      minContentElements?: number;
+      minTextLength?: number;
+      checkShadowDOM?: boolean;
+      checkIframes?: boolean;
+    }
   ): Promise<PageContext> {
     const startTime = Date.now();
     const url = page.url();
@@ -88,6 +99,14 @@ export class IntelligentPageAnalyzer {
     });
 
     try {
+      // ✅ FIX: Wait for SPA to fully load before analysis
+      // SPA pages need time for:
+      // 1. API requests to complete (50+ requests for locales, data, etc.)
+      // 2. React/Vue components to render
+      // 3. Interactive elements to appear in DOM
+      logger.info('[INTELLIGENT_ANALYZER] Waiting for SPA to fully load', { url });
+      await this.waitForSPALoad(page, spaLoadConfig || undefined);
+
       // ✅ OPTIMIZED: Run modal check and DOM analysis in parallel
       logger.info('[INTELLIGENT_ANALYZER] Starting parallel analysis', { url });
       const [modalCheckResult, domAnalysis] = await Promise.all([
@@ -181,10 +200,10 @@ export class IntelligentPageAnalyzer {
       if (shouldUseVisionResult && visionAnalysis.elements.length > 0) {
         // Re-run Logic with Vision elements for better accuracy
         logicAnalysis = await this.analyzeLogic(
-          visionAnalysis.pageType,
-          visionAnalysis.elements,
+        visionAnalysis.pageType,
+        visionAnalysis.elements,
           finalEnhancedDom
-        );
+      );
       }
 
       logger.info('[INTELLIGENT_ANALYZER] Logic analysis completed', {
@@ -250,6 +269,230 @@ export class IntelligentPageAnalyzer {
         criticalElements: [],
         warnings: ['Page analysis failed'],
       };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SPA LOADING WAIT
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Wait for SPA (Single Page Application) to fully load
+   * SPA pages need time for:
+   * 1. API requests to complete (locales, data, etc.)
+   * 2. React/Vue components to render
+   * 3. Interactive elements to appear in DOM
+   *
+   * ✅ IMPROVED: Configurable, optimized, handles long-polling/websockets
+   */
+  private static async waitForSPALoad(page: Page, config?: {
+    maxWaitTime?: number;
+    networkIdleTimeout?: number;
+    networkSettleTime?: number;
+    elementRetries?: number;
+    elementRetryDelay?: number;
+    minContentElements?: number;
+    minTextLength?: number;
+    checkShadowDOM?: boolean;
+    checkIframes?: boolean;
+  }): Promise<void> {
+    const startTime = Date.now();
+    // ✅ FIX 1: Use configurable maxWaitTime, default 10s
+    const maxWaitTime = config?.maxWaitTime ?? 10000;
+    const networkIdleTimeout = config?.networkIdleTimeout ?? 8000;
+    const networkSettleTime = config?.networkSettleTime ?? 500;
+    const elementRetries = config?.elementRetries ?? 3;
+    const elementRetryDelay = config?.elementRetryDelay ?? 1500;
+    const minContentElements = config?.minContentElements ?? 3;
+    const minTextLength = config?.minTextLength ?? 100;
+
+    try {
+      // ✅ FIX 2: Better network idle detection - settle approach for long-polling/websockets
+      logger.debug('[INTELLIGENT_ANALYZER] Waiting for network to settle', {
+        url: page.url(),
+      });
+
+      // Try networkidle first, but with settle fallback
+      await Promise.race([
+        page.waitForLoadState('networkidle', { timeout: networkIdleTimeout }),
+        // Fallback: Wait for network to settle (no new requests for N ms)
+        this.waitForNetworkSettle(page, networkSettleTime, networkIdleTimeout),
+      ]).catch(() => {
+        logger.debug('[INTELLIGENT_ANALYZER] Network settle timeout, continuing anyway');
+      });
+
+      // Step 2: Wait for interactive elements to appear (buttons, inputs, links)
+      // This ensures React/Vue components have rendered
+      logger.debug('[INTELLIGENT_ANALYZER] Waiting for interactive elements', {
+        url: page.url(),
+      });
+
+      // ✅ IMPROVED: Retry logic - check multiple times for elements
+      // Many SPAs render elements in waves (first structure, then content, then interactive)
+      let elementsFound = false;
+
+      for (let attempt = 1; attempt <= elementRetries; attempt++) {
+        try {
+          // ✅ FIX 3: Use 'visible' instead of 'attached' for interactive elements
+          await page.waitForSelector('button, input, a, [role="button"], [onclick], select, textarea', {
+            timeout: 3000,
+            state: 'visible', // Changed from 'attached' - ensures element is visible and interactive
+          });
+          elementsFound = true;
+          logger.debug('[INTELLIGENT_ANALYZER] Interactive elements found', {
+            attempt,
+            url: page.url(),
+          });
+          break;
+        } catch (error) {
+          if (attempt < elementRetries) {
+            logger.debug('[INTELLIGENT_ANALYZER] Elements not found yet, retrying', {
+              attempt,
+              maxRetries: elementRetries,
+              url: page.url(),
+            });
+            await page.waitForTimeout(elementRetryDelay);
+          } else {
+            logger.debug('[INTELLIGENT_ANALYZER] Elements not found after all retries', {
+              url: page.url(),
+            });
+          }
+        }
+      }
+
+      // Step 3: Additional wait for dynamic content (API data rendering)
+      // Many SPAs render content after API responses
+      // ✅ IMPROVED: Use universal content detection instead of hardcoded selectors
+      if (elementsFound) {
+        // Wait for page to have meaningful content (not just skeleton loaders)
+        await Promise.race([
+          // ✅ FIX 5: Optimized - limit scope to app root, pass config as args
+          // Check if page has substantial content (more than just basic structure)
+          page.waitForFunction(
+            ({ minContentElements, minTextLength }: { minContentElements: number; minTextLength: number }) => {
+              // @ts-expect-error - browser context
+              // ✅ FIX 5: Limit scope to app root (faster than scanning entire body)
+              const appRoot = document.querySelector('[id*="app"], [id*="root"], [data-reactroot], [data-v-app], main, [role="main"]') || document.body;
+              if (!appRoot) return false;
+
+              // ✅ IMPROVED: More robust content detection (scoped to app root)
+              // 1. Check for meaningful structural elements
+              const meaningfulElements = appRoot.querySelectorAll('div, section, article, main, header, footer, nav, aside, form, ul, ol, table');
+
+            // 2. Filter out skeleton loaders and empty containers
+            // Skeleton loaders typically have classes like "skeleton", "loading", "placeholder", "shimmer"
+            const skeletonIndicators = ['skeleton', 'loading', 'placeholder', 'shimmer', 'spinner', 'loader', 'skeleton-loader'];
+            let realContentElements = 0;
+
+            meaningfulElements.forEach((el: any) => {
+              const className = el.className || '';
+              const id = el.id || '';
+              const isSkeleton = skeletonIndicators.some(indicator =>
+                className.toLowerCase().includes(indicator) || id.toLowerCase().includes(indicator)
+              );
+
+              // Check if element has actual content (text, images, interactive elements)
+              const hasText = el.innerText && el.innerText.trim().length > 0;
+              const hasImages = el.querySelectorAll('img').length > 0;
+              const hasInteractive = el.querySelectorAll('button, input, a, select, textarea').length > 0;
+              const hasChildren = el.children.length > 0;
+
+              // Count as real content if not skeleton and has actual content
+              if (!isSkeleton && (hasText || hasImages || hasInteractive || hasChildren)) {
+                realContentElements++;
+              }
+            });
+
+              // 3. Check for text content (minimum meaningful length)
+              // ✅ FIX 4: Use configurable minTextLength (passed as argument)
+              const appText = appRoot.innerText || '';
+              const hasTextContent = appText.trim().length > minTextLength;
+
+              // 4. Check for interactive elements (buttons, inputs, links)
+              const interactiveElements = appRoot.querySelectorAll('button, input, a, select, textarea, [role="button"], [onclick]');
+              const hasInteractiveContent = interactiveElements.length > 0;
+
+              // ✅ FIX 4: Use configurable minContentElements (passed as argument)
+              // Page is considered loaded if:
+              // - Has at least N real content elements (not skeletons), OR
+              // - Has substantial text content, OR
+              // - Has interactive elements
+              const isContentLoaded = realContentElements >= minContentElements || hasTextContent || hasInteractiveContent;
+
+              return isContentLoaded;
+            },
+            { minContentElements, minTextLength },
+            { timeout: 2000 }
+          ).catch(() => null),
+
+          // Or check if SPA app root is populated with content (simpler fallback)
+          page.waitForFunction(() => {
+            // @ts-expect-error - browser context
+            const appRoot = document.querySelector('[id*="app"], [id*="root"], [data-reactroot], [data-v-app], main, [role="main"]');
+            if (!appRoot) return false;
+            // Check if app root has children with content (not just empty containers)
+            const hasChildren = appRoot.children.length > 0;
+            const hasText = appRoot.innerText && appRoot.innerText.trim().length > 20;
+            return hasChildren && hasText;
+          }, { timeout: 2000 }).catch(() => null),
+
+          // Fallback: wait 1 second for any late-loading content
+          page.waitForTimeout(1000),
+        ]);
+      } else {
+        // If no elements found, wait a bit more for late-loading content
+        await page.waitForTimeout(2000);
+      }
+
+      // ✅ FIX 1: Enforce maxWaitTime with Promise.race
+      const duration = Date.now() - startTime;
+      if (duration >= maxWaitTime) {
+        logger.debug('[INTELLIGENT_ANALYZER] SPA load wait reached max time', {
+          url: page.url(),
+          duration: `${duration}ms`,
+          maxWaitTime: `${maxWaitTime}ms`,
+        });
+      }
+
+      logger.debug('[INTELLIGENT_ANALYZER] SPA load wait completed', {
+        url: page.url(),
+        duration: `${duration}ms`,
+        elementsFound,
+      });
+    } catch (error) {
+      logger.debug('[INTELLIGENT_ANALYZER] SPA load wait failed, continuing anyway', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Continue anyway - page might already be loaded
+    }
+  }
+
+  /**
+   * ✅ FIX 2: Wait for network to settle (no new requests for N ms)
+   * Better than networkidle for long-polling/websockets
+   */
+  private static async waitForNetworkSettle(
+    page: Page,
+    settleTime: number,
+    maxTimeout: number
+  ): Promise<void> {
+    const startTime = Date.now();
+    let lastRequestTime = Date.now();
+
+    // Track requests
+    const requestTimes: number[] = [];
+    page.on('request', () => {
+      requestTimes.push(Date.now());
+      lastRequestTime = Date.now();
+    });
+
+    // Wait until no new requests for settleTime
+    while (Date.now() - startTime < maxTimeout) {
+      const timeSinceLastRequest = Date.now() - lastRequestTime;
+      if (timeSinceLastRequest >= settleTime) {
+        return; // Network settled
+      }
+      await page.waitForTimeout(100); // Check every 100ms
     }
   }
 
@@ -1007,7 +1250,7 @@ export class IntelligentPageAnalyzer {
         // ✅ DYNAMIC: Find modals by behavior, not hardcoded selectors
         // Strategy: Find elements that behave like modals (high z-index, overlay, fixed/absolute positioning)
 
-        // @ts-ignore - browser context
+          // @ts-ignore - browser context
         const allElements = document.querySelectorAll('*');
         const potentialModals: any[] = [];
 
@@ -1187,10 +1430,10 @@ export class IntelligentPageAnalyzer {
             }
           }
 
-          modals.push({
+            modals.push({
             type: modalType,
             closeSelector,
-          });
+            });
         }
 
         return modals;

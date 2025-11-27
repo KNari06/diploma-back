@@ -5,7 +5,7 @@ import { TokenCalculatorService } from '@/services/core/token-calculator.service
 import { IntelligentTestStorageService } from '@/services/testing/results/intelligent-test-storage.service';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
-import { TestRunRequest } from '@/types';
+import { NotFoundError, TestRunRequest, ValidationError } from '@/types';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { logger } from '@/utils/logger';
 import { Request, Response, Router } from 'express';
@@ -658,10 +658,10 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
 
     // 8. Collect all logs from results
     const allLogs = results
-      .filter(r => r.logs && Array.isArray(r.logs) && r.logs.length > 0)
+      .filter(r => (r.logs || []) && Array.isArray(r.logs) && r.logs.length > 0)
       .map(r => ({
         browser: r.browser,
-        logs: r.logs,
+        logs: r.logs || [],
         status: r.status,
       }));
 
@@ -670,24 +670,27 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
       .filter(r => r.networkLogs && Array.isArray(r.networkLogs) && r.networkLogs.length > 0)
       .map(r => ({
         browser: r.browser,
-        network_logs: r.networkLogs,
+        network_logs: r.networkLogs || [],
         status: r.status,
       }));
 
     // 10. Collect all errors
     const errors = results
-      .filter(r => r.errors && Array.isArray(r.errors) && r.errors.length > 0)
+      .filter(r => (r.errors || []) && Array.isArray(r.errors) && r.errors.length > 0)
       .map(r => ({
         browser: r.browser,
-        errors: r.errors,
+        errors: r.errors || [],
         status: r.status,
       }));
 
     // Build comprehensive response
+    // Note: Convert TypeScript camelCase to snake_case for API response (DB format)
     const fullTestData = {
       test: {
         id: test.id,
         url: test.url,
+        project_id: test.projectId,
+        user_id: test.userId,
         status: test.status,
         browsers: test.browsers,
         options: test.options,
@@ -695,9 +698,12 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
         updated_at: test.updatedAt,
         started_at: test.startedAt,
         completed_at: test.completedAt,
+        intelligent_mode: test.intelligentMode,
+        test_goal: test.testGoal,
       },
       results: results.map(r => ({
         id: r.id,
+        test_id: r.testId,
         browser: r.browser,
         status: r.status,
         screenshot: r.screenshot,
@@ -706,6 +712,9 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
         trace_url: r.traceUrl,
         performance: r.performance,
         ai_summary: r.aiSummary,
+        logs: r.logs || [],
+        network_logs: r.networkLogs || [],
+        errors: r.errors || [],
         created_at: r.createdAt,
         completed_at: r.completedAt,
       })),
@@ -730,6 +739,26 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
+    // Handle NotFoundError with proper 404 response
+    if (error instanceof NotFoundError) {
+      res.status(404).json({
+        success: false,
+        error: 'Test not found',
+        message: error.message,
+      });
+      return;
+    }
+
+    // Handle ValidationError (e.g., access denied)
+    if (error instanceof ValidationError) {
+      res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        message: error.message,
+      });
+      return;
+    }
+
     logger.error('[MANUAL_TEST] Error getting full test data', {
       error: error instanceof Error ? error.message : String(error),
       testId: id,

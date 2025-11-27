@@ -266,6 +266,18 @@ export interface ValidationResult {
 /**
  * Intelligent test configuration
  */
+export interface SPALoadConfig {
+  maxWaitTime?: number; // Max total wait time (default: 10000ms)
+  networkIdleTimeout?: number; // Network idle timeout (default: 8000ms)
+  networkSettleTime?: number; // Time to wait for no new requests (default: 500ms)
+  elementRetries?: number; // Number of retries for element detection (default: 3)
+  elementRetryDelay?: number; // Delay between retries (default: 1500ms)
+  minContentElements?: number; // Minimum real content elements (default: 3)
+  minTextLength?: number; // Minimum text content length (default: 100)
+  checkShadowDOM?: boolean; // Check shadow DOM (default: false)
+  checkIframes?: boolean; // Check iframes (default: false)
+}
+
 export interface IntelligentTestConfig {
   mode: 'full' | 'fast' | 'balanced'; // Vision+DOM | DOM only | Selective Vision
   safety: SafetyConfig;
@@ -278,6 +290,7 @@ export interface IntelligentTestConfig {
     password?: string;
   };
   userContext?: Record<string, any>; // Additional user-provided context
+  spaLoadConfig?: SPALoadConfig; // ✅ NEW: Configurable SPA loading settings
 }
 
 /**

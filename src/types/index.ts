@@ -146,6 +146,10 @@ export interface Test {
   startedAt?: Date;
   completedAt?: Date;
   results?: TestResult[];
+  // ✅ Intelligent testing fields (from DB migration)
+  intelligentMode?: boolean;
+  testGoal?: string;
+  commands?: any[]; // PlaywrightCommand[] stored as JSONB
 }
 
 export interface Workspace {
