@@ -516,7 +516,7 @@ export class AiExtractStep {
     );
 
     // 3. Call LLM with JSON schema constraint
-    const extracted = await this.callLLMExtract(prompt, schema);
+    const extracted = await this.callLLMExtract(prompt, schema, pageState);
 
     // 4. Validate against schema
     const validated = this.validateAgainstSchema(extracted, schema);
@@ -561,7 +561,8 @@ Extract data matching the schema. Return ONLY valid JSON matching the schema.
    */
   private static async callLLMExtract(
     prompt: string,
-    schema: JSONSchema
+    schema: JSONSchema,
+    pageState: PageState
   ): Promise<any> {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
@@ -577,7 +578,7 @@ Extract data matching the schema. Return ONLY valid JSON matching the schema.
             {
               type: 'image_url',
               image_url: {
-                url: `data:image/png;base64,${state.screenshot}`,
+                url: `data:image/png;base64,${pageState.screenshot}`,
                 detail: 'high',
               },
             },

@@ -6,6 +6,100 @@ import { logger } from '@/utils/logger';
 import { randomUUID } from 'crypto';
 
 /**
+ * Validate selectors in generated plan against DOM analysis
+ * Logs warnings if AI invented selectors instead of using real ones
+ */
+function validateSelectorsInPlan(aiPlan: any, explorationResult: ExplorationResult): void {
+  // Collect all valid selectors from DOM analysis
+  const validSelectors = new Set<string>();
+
+  // Add button selectors
+  explorationResult.domAnalysis.buttons.forEach(btn => {
+    if (btn.selector) validSelectors.add(btn.selector);
+  });
+
+  // Add input selectors
+  explorationResult.domAnalysis.inputs.forEach(input => {
+    if (input.selector) validSelectors.add(input.selector);
+  });
+
+  // Add form field selectors
+  explorationResult.domAnalysis.forms.forEach(form => {
+    form.fields.forEach(field => {
+      if (field.selector) validSelectors.add(field.selector);
+    });
+  });
+
+  // Add link selectors
+  if (explorationResult.domAnalysis.links) {
+    explorationResult.domAnalysis.links.forEach(link => {
+      if (link.selector) validSelectors.add(link.selector);
+    });
+  }
+
+  // Check steps
+  const invalidSelectors: Array<{ step: string; selector: string; reason: string }> = [];
+
+  if (aiPlan.steps) {
+    aiPlan.steps.forEach((step: any, idx: number) => {
+      if (step.selector && step.action !== 'goto' && step.action !== 'wait' && step.action !== 'resize') {
+        const selector = step.selector;
+
+        // Check if selector is invented (contains :has-text or text=)
+        if (selector.includes(':has-text(') || selector.startsWith('text=')) {
+          invalidSelectors.push({
+            step: `Step ${idx + 1}: ${step.description || step.action}`,
+            selector,
+            reason: 'AI invented selector instead of using DOM analysis selector',
+          });
+        } else if (!validSelectors.has(selector) && !selector.startsWith('http')) {
+          // Selector not in valid list (but might be a valid CSS selector)
+          // Only warn if it looks like an invented text selector
+          if (selector.includes('text') || selector.includes('contains')) {
+            invalidSelectors.push({
+              step: `Step ${idx + 1}: ${step.description || step.action}`,
+              selector,
+              reason: 'Selector not found in DOM analysis - may be incorrect',
+            });
+          }
+        }
+      }
+    });
+  }
+
+  // Check commands
+  if (aiPlan.commands) {
+    aiPlan.commands.forEach((cmd: any, idx: number) => {
+      if (cmd.selector && cmd.action !== 'goto' && cmd.action !== 'wait' && cmd.action !== 'resize') {
+        const selector = cmd.selector;
+
+        if (selector.includes(':has-text(') || selector.startsWith('text=')) {
+          invalidSelectors.push({
+            step: `Command ${idx + 1}: ${cmd.description || cmd.action}`,
+            selector,
+            reason: 'AI invented selector instead of using DOM analysis selector',
+          });
+        }
+      }
+    });
+  }
+
+  // Log warnings if invalid selectors found
+  if (invalidSelectors.length > 0) {
+    logger.warn('[TEST_PLAN_GENERATOR] Invalid selectors detected in plan', {
+      invalidCount: invalidSelectors.length,
+      invalidSelectors: invalidSelectors.slice(0, 5), // Log first 5
+      totalValidSelectors: validSelectors.size,
+      suggestion: 'AI should use selectors from DOM analysis, not invent new ones',
+    });
+  } else {
+    logger.debug('[TEST_PLAN_GENERATOR] All selectors validated successfully', {
+      totalValidSelectors: validSelectors.size,
+    });
+  }
+}
+
+/**
  * Test plan with user confirmation
  */
 export interface TestPlan {
@@ -86,6 +180,9 @@ export async function generateTestPlan(
 
     // Generate unique ID - IMPORTANT: Use UUID format for database compatibility
     const planId = randomUUID();
+
+    // Validate selectors against DOM analysis
+    validateSelectorsInPlan(aiPlan, explorationResult);
 
     // Create structured test plan
     const testPlan: TestPlan = {
@@ -180,13 +277,8 @@ export function formatTestPlanForConfirmation(
     markdown += `- ${item}\n`;
   }
 
-  // What will NOT be tested
-  if (plan.whatWillNotBeTested.length > 0) {
-    markdown += `## ❌ What Will NOT Be Tested\n`;
-    for (const item of plan.whatWillNotBeTested) {
-      markdown += `- ${item}\n`;
-    }
-  }
+  // Note: whatWillNotBeTested is kept in plan structure for AI responses
+  // but not shown in markdown to avoid negative framing
 
   // Test Steps (show for non-AI or if steps are meaningful)
   if (!isAiGenerated || (plan.steps && plan.steps.length > 0 && plan.steps.some(s => s.action !== 'intelligent_explore'))) {

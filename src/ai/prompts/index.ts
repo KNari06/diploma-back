@@ -985,15 +985,36 @@ PAGE INFORMATION:
 VISUAL ANALYSIS (from GPT-4o Vision):
 ${JSON.stringify(exploration.visualAnalysis, null, 2)}
 
-DOM ANALYSIS:
-- Forms: ${exploration.domAnalysis.forms.length}
-${exploration.domAnalysis.forms.map((f: any, i: number) => `  Form ${i + 1}: ${f.fields.length} fields (${f.fields.map((field: any) => field.name || field.type).join(', ')})`).join('\n')}
+DOM ANALYSIS (USE THESE EXACT SELECTORS - DO NOT INVENT NEW ONES):
 
-- Buttons: ${exploration.domAnalysis.buttons.length}
-${exploration.domAnalysis.buttons.map((b: any) => `  - ${b.text || b.type} (${b.selector})`).join('\n')}
+AVAILABLE BUTTONS (${exploration.domAnalysis.buttons.length}):
+${exploration.domAnalysis.buttons.length > 0
+  ? exploration.domAnalysis.buttons.map((b: any, idx: number) =>
+      `${idx + 1}. Text: "${b.text || b.type}" → USE THIS SELECTOR: "${b.selector}"`
+    ).join('\n')
+  : '  (no buttons found)'}
 
-- Inputs: ${exploration.domAnalysis.inputs.length}
-${exploration.domAnalysis.inputs.map((i: any) => `  - ${i.type} ${i.name || ''} ${i.required ? '(required)' : ''}`).join('\n')}
+AVAILABLE INPUTS (${exploration.domAnalysis.inputs.length}):
+${exploration.domAnalysis.inputs.length > 0
+  ? exploration.domAnalysis.inputs.map((i: any, idx: number) =>
+      `${idx + 1}. Type: ${i.type}, Name: ${i.name || 'none'}, Placeholder: ${i.placeholder || 'none'} → USE THIS SELECTOR: "${i.selector}"`
+    ).join('\n')
+  : '  (no inputs found)'}
+
+AVAILABLE FORMS (${exploration.domAnalysis.forms.length}):
+${exploration.domAnalysis.forms.map((f: any, i: number) => {
+  const fields = f.fields.map((field: any) =>
+    `    - ${field.name || field.type} (${field.required ? 'required' : 'optional'}) → SELECTOR: "${field.selector}"`
+  ).join('\n');
+  return `  Form ${i + 1}:\n${fields}`;
+}).join('\n')}
+
+AVAILABLE LINKS (${exploration.domAnalysis.links?.length || 0}):
+${exploration.domAnalysis.links && exploration.domAnalysis.links.length > 0
+  ? exploration.domAnalysis.links.map((l: any, idx: number) =>
+      `${idx + 1}. Text: "${l.text}" → USE THIS SELECTOR: "${l.selector}"`
+    ).join('\n')
+  : '  (no links found)'}
 
 RECOMMENDATIONS:
 ${exploration.recommendations.map((r: any) => `- ${r}`).join('\n')}
@@ -1047,10 +1068,38 @@ Generate a test plan in this EXACT JSON format:
   ]
 }
 
-IMPORTANT:
-- Use REAL selectors from DOM analysis
+🚨 CRITICAL SELECTOR RULES (MUST FOLLOW):
+
+1. **ONLY USE SELECTORS FROM DOM ANALYSIS ABOVE**
+   - ❌ NEVER invent selectors like "button:has-text('Войти')" or "button:has-text('Close')"
+   - ✅ ALWAYS use the EXACT selector from "USE THIS SELECTOR" above
+   - ✅ Example: If button shows "USE THIS SELECTOR: 'button.login-btn'" → use exactly that
+
+2. **SELECTOR MATCHING PROCESS**:
+   - Find the button/input by its TEXT in the DOM analysis list
+   - Copy the EXACT selector from "USE THIS SELECTOR" field
+   - Use that selector in your test plan
+   - If you can't find a matching element → mark that step as "optional: true" or skip it
+
+3. **EXAMPLE (CORRECT)**:
+   - User wants to click "Войти" button
+   - DOM Analysis shows: "Text: 'Войти' → USE THIS SELECTOR: 'button.auth-btn'"
+   - ✅ CORRECT: Use selector "button.auth-btn"
+   - ❌ WRONG: Using "button:has-text('Войти')"
+
+4. **EXAMPLE (INCORRECT - DO NOT DO THIS)**:
+   - ❌ "selector": "button:has-text('Войти')" ← WRONG! Use selector from DOM analysis
+   - ❌ "selector": "button:has-text('Close')" ← WRONG! Use selector from DOM analysis
+   - ❌ "selector": "button:has-text('Далее')" ← WRONG! Use selector from DOM analysis
+
+5. **IF SELECTOR NOT FOUND**:
+   - If you need to interact with an element but it's NOT in the DOM analysis list
+   - Mark that step as "optional": true
+   - Add a note in description: "Element may not be available"
+
+OTHER REQUIREMENTS:
 - Create 5-10 specific test steps
-- Generate matching Playwright commands
+- Generate matching Playwright commands with REAL selectors from DOM analysis
 - Be specific about expected outcomes
 - Estimate realistic duration
 - List what WILL and WILL NOT be tested
