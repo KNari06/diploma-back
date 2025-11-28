@@ -9,6 +9,7 @@ import kbRoutes from '@/api/kb/kb.route';
 import rulesReloadRoutes from '@/api/kb/rules-reload.route';
 import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
+import notificationsRoutes from '@/api/notifications/notifications.routes';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import reportsRoutes from '@/api/reports/reports.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
@@ -17,7 +18,7 @@ import workspaceRoutes from '@/api/workspace/workspace.routes';
 import { env, isDevelopment } from '@/config/env';
 import { QueueManager } from '@/config/queues';
 import { swaggerSpec } from '@/config/swagger';
-import { testSupabaseConnection, testSupabaseAuthHealth } from '@/db/supabase';
+import { testSupabaseAuthHealth, testSupabaseConnection } from '@/db/supabase';
 import { errorHandler, notFoundHandler } from '@/utils/error-handler';
 import { logger, morganStream } from '@/utils/logger';
 import cors from 'cors';
@@ -258,6 +259,7 @@ app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, reportsRoutes); // ✅ NEW: Test reports & Jira integration
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
+app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications
 app.use(`/api/${env.API_VERSION}/queue`, queueStatusRoutes); // Queue monitoring
 
 // Root endpoint
@@ -279,6 +281,7 @@ app.get('/', (req: express.Request, res: express.Response) => {
       kb: `/api/${env.API_VERSION}/kb`,
       playwright: `/api/${env.API_VERSION}/playwright`,
       testVisualization: `/api/${env.API_VERSION}/test-visualization`,
+      notifications: `/api/${env.API_VERSION}/notifications`,
       docs: '/api/docs',
       docsJson: '/api/docs.json',
     },

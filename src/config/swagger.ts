@@ -183,6 +183,14 @@ const options: swaggerJsdoc.Options = {
         name: 'Reports',
         description: 'Генерация и получение отчетов о тестировании (требует auth)',
       },
+      {
+        name: 'Notifications',
+        description: 'Управление уведомлениями пользователя (персональные, общие, системные) (требует auth)',
+      },
+      {
+        name: 'User',
+        description: 'Управление профилем пользователя, кредитами и планами (требует auth)',
+      },
     ],
   },
   apis: [
