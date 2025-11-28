@@ -121,52 +121,105 @@ export class DOMNodeExtractor {
           return attrs;
         }
 
-        // Get all elements
-        // @ts-ignore - browser context
-        const allElements = Array.from(document.querySelectorAll('*'));
+        /**
+         * ✅ NEW: Recursively traverse Shadow DOM to extract nodes
+         * Handles nested Shadow DOM, closed Shadow DOM (skips), and visited set
+         */
+        function extractFromShadowDOM(
+          root: any, // Document | ShadowRoot (browser context)
+          shadowHost: any | undefined,
+          depth: number,
+          maxDepth: number,
+          visited: Set<any>,
+          nodeCounter: { count: number } // ✅ FIX: Global counter passed by reference
+        ): any[] {
+          const nodes: any[] = [];
 
-        // Filter and extract nodes
-        const nodes: any[] = [];
-        let nodeIndex = 0;
+          // Prevent infinite loops and excessive depth
+          if (depth > maxDepth) {
+            return nodes;
+          }
 
-        for (const el of allElements) {
-          const element: any = el;
+          // Get all elements in current root
+          // @ts-ignore - browser context
+          const allElements = Array.from(root.querySelectorAll('*'));
 
-          // Skip if not visible (when visibleOnly = true)
-          if (visibleOnly && !isVisible(element)) continue;
+          for (const el of allElements) {
+            const element: any = el;
 
-          // Skip if not interactive (when interactiveOnly = true)
-          if (interactiveOnly && !isInteractive(element)) continue;
+            // Skip if already visited (prevent duplicates)
+            if (visited.has(element)) continue;
+            visited.add(element);
 
-          // Get bounding box
-          const rect = element.getBoundingClientRect();
+            // Check if element has Shadow DOM
+            let shadowRoot: any = null;
+            try {
+              shadowRoot = element.shadowRoot;
+            } catch (e) {
+              // Closed Shadow DOM - skip (can't access)
+              // @ts-ignore
+            }
 
-          // Skip elements with no size
-          if (rect.width === 0 || rect.height === 0) continue;
+            // Recurse into Shadow DOM if exists (BEFORE processing current element)
+            if (shadowRoot) {
+              const shadowNodes = extractFromShadowDOM(
+                shadowRoot,
+                element, // Current element becomes shadow host for children
+                depth + 1,
+                maxDepth,
+                visited,
+                nodeCounter // ✅ FIX: Pass same counter
+              );
+              nodes.push(...shadowNodes);
+            }
 
-          // Extract node data
-          const tag = element.tagName.toLowerCase();
-          const text = element.textContent?.trim().substring(0, 200) || '';
-          const attributes = getAttributes(element);
-          const role = element.getAttribute('role') || undefined;
+            // Process current element
+            if (visibleOnly && !isVisible(element)) continue;
+            if (interactiveOnly && !isInteractive(element)) continue;
 
-          nodes.push({
-            nodeId: `node-${nodeIndex}`,
-            tag,
-            text,
-            attributes,
-            boundingBox: {
-              x: Math.round(rect.x),
-              y: Math.round(rect.y),
-              width: Math.round(rect.width),
-              height: Math.round(rect.height),
-            },
-            isVisible: isVisible(element),
-            role,
-          });
+            // Get bounding box
+            const rect = element.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
 
-          nodeIndex++;
+            // Extract node data
+            const tag = element.tagName.toLowerCase();
+            const text = element.textContent?.trim().substring(0, 200) || '';
+            const attributes = getAttributes(element);
+            const role = element.getAttribute('role') || undefined;
+
+            // ✅ FIX: Use global counter to ensure unique nodeId
+            const nodeId = `node-${nodeCounter.count}`;
+            nodeCounter.count++;
+
+            nodes.push({
+              nodeId,
+              tag,
+              text,
+              attributes,
+              boundingBox: {
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+              },
+              isVisible: isVisible(element),
+              role,
+              shadowHost: shadowHost ? {
+                tag: shadowHost.tagName.toLowerCase(),
+                id: shadowHost.id || undefined,
+                attributes: getAttributes(shadowHost),
+              } : undefined,
+            });
+          }
+
+          return nodes;
         }
+
+        // ✅ NEW: Extract from regular DOM and Shadow DOM
+        // ✅ FIX: Use object for counter to pass by reference
+        const nodeCounter = { count: 0 };
+        // @ts-ignore - browser context
+        const nodes = extractFromShadowDOM(document, undefined, 0, 5, new Set(), nodeCounter);
 
         return nodes;
       },

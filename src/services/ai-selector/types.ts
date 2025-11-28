@@ -24,6 +24,12 @@ export interface DOMNode {
   selector?: string; // Static selector (fallback)
   isVisible: boolean; // Is element visible on screen
   role?: string; // ARIA role
+  // Shadow DOM support
+  shadowHost?: {
+    tag: string; // Shadow host tag name
+    id?: string; // Shadow host ID
+    attributes: Record<string, string>; // Shadow host attributes
+  };
   // CDP-specific (optional, for advanced use)
   cdpNodeId?: number; // Chrome DevTools Protocol node ID
 }

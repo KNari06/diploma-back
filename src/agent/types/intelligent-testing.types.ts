@@ -74,11 +74,13 @@ export interface DOMAnalysis {
     text: string;
     type?: string;
     selector: string;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
   }>;
   links: Array<{
     href: string;
     text: string;
     selector: string;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
   }>;
   inputs: Array<{
     type: string;
@@ -86,6 +88,31 @@ export interface DOMAnalysis {
     required?: boolean;
     placeholder?: string;
     selector: string;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
+  }>;
+  checkboxes?: Array<{
+    name?: string;
+    label?: string;
+    selector: string;
+    checked: boolean;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
+  }>;
+  radios?: Array<{
+    name?: string;
+    label?: string;
+    selector: string;
+    checked: boolean;
+    value?: string;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
+  }>;
+  interactiveElements?: Array<{
+    tag: string;
+    text?: string;
+    selector: string;
+    role?: string;
+    tabindex?: number;
+    reason: 'onclick' | 'cursor-pointer' | 'tabindex' | 'role';
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
   }>;
   modals?: Array<{
     type: 'cookie_banner' | 'newsletter' | 'popup' | 'other';

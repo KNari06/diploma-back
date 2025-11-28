@@ -722,6 +722,11 @@ ${params.actualHTML ? `\n--- ACTUAL HTML (for reference) ---\n${params.actualHTM
 --- TASK ---
 Generate a sequence of actions to test this page based on the goal.
 
+⚠️ **CRITICAL**: The goal is "${params.goal}". Prioritize actions that help achieve this goal.
+///improvement: Added explicit goal prioritization in prompt to ensure registration flow is found
+If the goal mentions "registration", "signup", "register", or similar - prioritize finding and interacting with registration/signup elements.
+If the goal mentions a specific flow (e.g., "registration flow"), focus on navigating to and testing that flow.
+
 RESPONSE FORMAT (JSON):
 {
   "reasoning": "Explain your thought process (2-3 sentences)",

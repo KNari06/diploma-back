@@ -403,6 +403,41 @@ export class ContextualActionGenerator {
       }
     }
 
+    // ✅ NEW: Include checkboxes and radios
+    if (dom.checkboxes && dom.checkboxes.length > 0) {
+      summary.push(`\nCheckboxes (${dom.checkboxes.length}):`);
+      dom.checkboxes.slice(0, 10).forEach(cb => {
+        const label = cb.label || cb.name || 'unnamed';
+        summary.push(`  - "${label}" ${cb.checked ? '(checked)' : ''} | Selector: "${cb.selector}"`);
+      });
+      if (dom.checkboxes.length > 10) {
+        summary.push(`  ... and ${dom.checkboxes.length - 10} more checkboxes`);
+      }
+    }
+
+    if (dom.radios && dom.radios.length > 0) {
+      summary.push(`\nRadio buttons (${dom.radios.length}):`);
+      dom.radios.slice(0, 10).forEach(radio => {
+        const label = radio.label || radio.name || 'unnamed';
+        summary.push(`  - "${label}" ${radio.checked ? '(selected)' : ''} | Selector: "${radio.selector}"`);
+      });
+      if (dom.radios.length > 10) {
+        summary.push(`  ... and ${dom.radios.length - 10} more radio buttons`);
+      }
+    }
+
+    // ✅ NEW: Include other interactive elements
+    if (dom.interactiveElements && dom.interactiveElements.length > 0) {
+      summary.push(`\nOther interactive elements (${dom.interactiveElements.length}):`);
+      dom.interactiveElements.slice(0, 10).forEach(el => {
+        const text = el.text || el.role || el.tag;
+        summary.push(`  - <${el.tag}> "${text}" (${el.reason}) | Selector: "${el.selector}"`);
+      });
+      if (dom.interactiveElements.length > 10) {
+        summary.push(`  ... and ${dom.interactiveElements.length - 10} more interactive elements`);
+      }
+    }
+
     if (dom.modals && dom.modals.length > 0) {
       summary.push(`\n⚠️ Modals detected:`);
       dom.modals.forEach((modal, idx) => {

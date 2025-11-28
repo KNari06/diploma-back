@@ -267,7 +267,7 @@ export function formatTestPlanForConfirmation(
     markdown += `This AI-generated test plan will:\n`;
     markdown += `1. **Execute pre-analyzed test steps** tailored to your specific site\n`;
     markdown += `2. **Adapt to page context** based on URL analysis and user intent\n`;
-    markdown += `3. **Follow intelligent test scenarios** created by GPT-4o\n`;
+    markdown += `3. **Follow intelligent test scenarios** created by AI\n`;
     markdown += `4. **Provide detailed results** with actionable insights\n`;
   }
 

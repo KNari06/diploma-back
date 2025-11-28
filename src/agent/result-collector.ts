@@ -7,6 +7,7 @@ export interface CollectedResults {
   logs: string[];
   networkLogs: NetworkLog[];
   errors: TestError[];
+  dialogs?: Array<{ type: string; message: string; timestamp: Date }>;
   performance?: PerformanceMetrics;
 }
 
@@ -23,11 +24,12 @@ interface NetworkLog {
 }
 
 interface TestError {
-  type: 'javascript' | 'network' | 'timeout' | 'assertion' | 'other';
+  type: 'javascript' | 'network' | 'timeout' | 'assertion' | 'dialog' | 'other';
   message: string;
   stack?: string;
   url?: string;
   timestamp: Date;
+  dialogType?: 'alert' | 'confirm' | 'prompt' | 'beforeunload';
 }
 
 interface PerformanceMetrics {
@@ -43,6 +45,7 @@ export class ResultCollector {
   public logs: string[] = [];
   public networkLogs: NetworkLog[] = [];
   public errors: TestError[] = [];
+  public dialogs: Array<{ type: string; message: string; timestamp: Date }> = [];
   private startTime: number = Date.now();
 
   /**
@@ -182,6 +185,43 @@ export class ResultCollector {
       });
       logger.warn('Request failed', { url });
     });
+
+    // ✅ NEW: Capture dialogs (alert, confirm, prompt, beforeunload)
+    page.on('dialog', async (dialog) => {
+      const dialogType = dialog.type(); // 'alert' | 'confirm' | 'prompt' | 'beforeunload'
+      const message = dialog.message();
+
+      // Log dialog
+      this.dialogs.push({
+        type: dialogType,
+        message,
+        timestamp: new Date(),
+      });
+
+      // Add to errors for visibility (dialogs are often errors or warnings)
+      this.errors.push({
+        type: 'dialog',
+        message: `${dialogType}: ${message}`,
+        dialogType: dialogType as 'alert' | 'confirm' | 'prompt' | 'beforeunload',
+        timestamp: new Date(),
+      });
+
+      // Add to logs
+      this.logs.push(`[DIALOG ${dialogType.toUpperCase()}] ${message}`);
+
+      logger.info('Dialog detected', { type: dialogType, message });
+
+      // Auto-dismiss dialogs to prevent blocking test execution
+      try {
+        await dialog.dismiss();
+        logger.debug('Dialog auto-dismissed', { type: dialogType });
+      } catch (dismissError) {
+        logger.warn('Failed to dismiss dialog', {
+          type: dialogType,
+          error: dismissError instanceof Error ? dismissError.message : String(dismissError),
+        });
+      }
+    });
   }
 
   /**
@@ -192,6 +232,7 @@ export class ResultCollector {
       logs: this.logs,
       networkLogs: this.networkLogs,
       errors: this.errors,
+      dialogs: this.dialogs.length > 0 ? this.dialogs : undefined,
     };
 
     // Screenshot
@@ -256,6 +297,7 @@ export class ResultCollector {
     this.logs = [];
     this.networkLogs = [];
     this.errors = [];
+    this.dialogs = [];
     this.startTime = Date.now();
   }
 

@@ -30,7 +30,7 @@ const chatRequestSchema = z.object({
  *     summary: Отправить сообщение в AI чат
  *     description: |
  *       Чат с AI поддерживает:
- *       - **Intelligent Testing** - автономное тестирование с GPT-4o Vision
+ *       - **Intelligent Testing** - автономное тестирование с AI Vision
  *       - **API Testing** - тестирование API endpoints
  *       - **General Chat** - обычный разговор с AI
  *

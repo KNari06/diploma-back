@@ -276,6 +276,7 @@ export class ManualTestRunJobHandler {
 
   /**
    * Handle successful test completion
+   * ///improvement: Added synchronous test status update to prevent race condition
    */
   private static async handleSuccessfulTest(testId: string, browser: string, result: any) {
     logger.info(`[TEST-RUN] Creating test result in database: ${testId}`);
@@ -319,6 +320,10 @@ export class ManualTestRunJobHandler {
       await QueueManager.addAIAnalysisJob(testResult.id, testId);
       logger.info(`[TEST-RUN] AI analysis job queued for test result: ${testResult.id}`);
     }
+
+    // ///improvement: Update overall test status synchronously to prevent race condition
+    // This ensures test status is updated immediately after result is created
+    await ManualTestResultJobHandler.updateOverallTestStatus(testId);
 
     logger.info(`[TEST-RUN] Test completed successfully: ${testId}`, {
       browser,
@@ -425,8 +430,9 @@ export class ManualTestResultJobHandler {
 
   /**
    * Update overall test status based on all results
+   * ///improvement: Made public to allow synchronous status updates from handleSuccessfulTest
    */
-  private static async updateOverallTestStatus(testId: string) {
+  static async updateOverallTestStatus(testId: string) {
     try {
       // Get all results for this test
       const results = await dbAdminService.getTestResults(testId) as any[];

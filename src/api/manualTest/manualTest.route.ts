@@ -66,7 +66,7 @@ const paginationSchema = z.object({
  *
  *       **Поддерживает два режима:**
  *       - **Standard Mode** - выполнение предопределенных команд
- *       - **Intelligent Mode** - автономное тестирование с GPT-4o Vision
+ *       - **Intelligent Mode** - автономное тестирование с AI Vision
  *
  *       **Стоимость:**
  *       - Standard: 1 кредит
@@ -106,7 +106,7 @@ const paginationSchema = z.object({
  *                 type: boolean
  *                 default: false
  *                 description: |
- *                   Включить intelligent testing режим (GPT-4o Vision).
+ *                   Включить intelligent testing режим (AI Vision).
  *                   Если true - AI автономно исследует и тестирует сайт.
  *               testGoal:
  *                 type: string

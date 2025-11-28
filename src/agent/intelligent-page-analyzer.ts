@@ -263,6 +263,9 @@ export class IntelligentPageAnalyzer {
           buttons: [],
           links: [],
           inputs: [],
+          checkboxes: undefined,
+          radios: undefined,
+          interactiveElements: undefined,
         },
         requiredActions: [],
         possibleActions: [],
@@ -284,6 +287,7 @@ export class IntelligentPageAnalyzer {
    * 3. Interactive elements to appear in DOM
    *
    * ✅ IMPROVED: Configurable, optimized, handles long-polling/websockets
+   * ///improvement: Enhanced SPA loading detection with configurable thresholds and retry logic
    */
   private static async waitForSPALoad(page: Page, config?: {
     maxWaitTime?: number;
@@ -771,6 +775,9 @@ export class IntelligentPageAnalyzer {
         buttons: [],
         links: [],
         inputs: [],
+        checkboxes: undefined,
+        radios: undefined,
+        interactiveElements: undefined,
         modals: [],
       };
     }
@@ -817,10 +824,15 @@ export class IntelligentPageAnalyzer {
       // Enhance buttons with AI selectors (limit to top 10 for performance)
       const buttonsToEnhance = domAnalysis.buttons.slice(0, 10);
       const enhancedButtons = await Promise.all(
-        buttonsToEnhance.map(async (button) => {
+        buttonsToEnhance.map(async (button, index) => {
           if (!button.text) return button;
 
-          const intent = `Click ${button.text} button`;
+          // ✅ FIX: Make intent more specific to ensure unique cache keys
+          // Include button text and index to differentiate similar buttons
+          // Always include index to ensure uniqueness even if text is the same
+          // Note: aria-label is already included in button.text by dom-analyzer.service.ts
+          const buttonIdentifier = button.text || `button-${index}`;
+          const intent = `Click "${buttonIdentifier}" button (index: ${index})`;
 
           try {
             const result = await AISelectorEngine.resolve({
@@ -1241,7 +1253,17 @@ export class IntelligentPageAnalyzer {
 
   private static async detectModals(page: Page): Promise<DOMAnalysis['modals']> {
     try {
-      return await page.evaluate(() => {
+      // ✅ FIX: Pass config values as parameters to page.evaluate() (browser context can't access Node.js variables)
+      const config = {
+        zIndexThreshold: MODAL_DETECTION_CONFIG.zIndexThreshold,
+        overlaySizeRatio: MODAL_DETECTION_CONFIG.overlaySizeRatio,
+        minModalSize: MODAL_DETECTION_CONFIG.minModalSize,
+        closeButtonKeywords: MODAL_DETECTION_CONFIG.closeButtonKeywords,
+        maxCloseButtonTextLength: MODAL_DETECTION_CONFIG.maxCloseButtonTextLength,
+        modalTypeKeywords: MODAL_DETECTION_CONFIG.modalTypeKeywords,
+      };
+
+      return await page.evaluate((config) => {
         const modals: Array<{
           type: 'cookie_banner' | 'newsletter' | 'popup' | 'other';
           closeSelector?: string;
@@ -1250,7 +1272,7 @@ export class IntelligentPageAnalyzer {
         // ✅ DYNAMIC: Find modals by behavior, not hardcoded selectors
         // Strategy: Find elements that behave like modals (high z-index, overlay, fixed/absolute positioning)
 
-          // @ts-ignore - browser context
+        // @ts-ignore - browser context
         const allElements = document.querySelectorAll('*');
         const potentialModals: any[] = [];
 
@@ -1268,7 +1290,7 @@ export class IntelligentPageAnalyzer {
           const zIndex = parseInt(style.zIndex) || 0;
           const position = style.position;
           const isFixedOrAbsolute = position === 'fixed' || position === 'absolute';
-          const hasHighZIndex = zIndex > MODAL_DETECTION_CONFIG.zIndexThreshold;
+          const hasHighZIndex = zIndex > config.zIndexThreshold;
           // @ts-ignore - browser context
           const viewportWidth = window.innerWidth;
           // @ts-ignore - browser context
@@ -1276,8 +1298,8 @@ export class IntelligentPageAnalyzer {
           // @ts-ignore - browser context
           const hasOverlay = style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
                             // @ts-ignore - browser context
-                            (el.offsetWidth > viewportWidth * MODAL_DETECTION_CONFIG.overlaySizeRatio ||
-                             el.offsetHeight > viewportHeight * MODAL_DETECTION_CONFIG.overlaySizeRatio);
+                            (el.offsetWidth > viewportWidth * config.overlaySizeRatio ||
+                             el.offsetHeight > viewportHeight * config.overlaySizeRatio);
 
           // Check for modal-like attributes
           const role = el.getAttribute('role');
@@ -1297,17 +1319,16 @@ export class IntelligentPageAnalyzer {
               className = (el.className.value || '').toLowerCase();
             } else if (typeof el.className.toString === 'function') {
               className = el.className.toString().toLowerCase();
+            }
           }
-        }
           const id = (el.id || '').toLowerCase();
           const hasModalKeywords = className.includes('modal') || className.includes('popup') ||
                                    className.includes('dialog') || className.includes('overlay') ||
                                    id.includes('modal') || id.includes('popup') || id.includes('dialog');
 
           // If element matches modal characteristics
-          const { minModalSize } = MODAL_DETECTION_CONFIG;
           if ((hasModalRole || hasModalKeywords || (hasHighZIndex && isFixedOrAbsolute && hasOverlay)) &&
-              el.offsetWidth > minModalSize && el.offsetHeight > minModalSize) {
+              el.offsetWidth > config.minModalSize && el.offsetHeight > config.minModalSize) {
             potentialModals.push(el);
           }
         }
@@ -1342,8 +1363,7 @@ export class IntelligentPageAnalyzer {
             const btnId = (btn.id || '').toLowerCase();
 
             // Dynamic patterns for close buttons
-            const { closeButtonKeywords, maxCloseButtonTextLength } = MODAL_DETECTION_CONFIG;
-            const hasCloseText = closeButtonKeywords.some(keyword =>
+            const hasCloseText = config.closeButtonKeywords.some(keyword =>
               btnText.toLowerCase().includes(keyword) ||
               btnAriaLabel.includes(keyword) ||
               btnTitle.includes(keyword) ||
@@ -1365,7 +1385,7 @@ export class IntelligentPageAnalyzer {
               } else if (btn.getAttribute('aria-label')) {
                 const ariaLabel = btn.getAttribute('aria-label');
                 closeSelector = `button[aria-label="${ariaLabel}"]`;
-              } else if (btnText && btnText.length <= maxCloseButtonTextLength) {
+              } else if (btnText && btnText.length <= config.maxCloseButtonTextLength) {
                 // Escape special characters for selector
                 const escapedText = btnText.replace(/"/g, '\\"');
                 closeSelector = `button:has-text("${escapedText}")`;
@@ -1401,11 +1421,10 @@ export class IntelligentPageAnalyzer {
           const modalId = (modalEl.id || '').toLowerCase();
 
           // Determine modal type using configured keywords
-          const { modalTypeKeywords } = MODAL_DETECTION_CONFIG;
           let modalType: 'cookie_banner' | 'newsletter' | 'popup' | 'other' = 'other';
 
           // Check for cookie/GDPR keywords
-          const hasCookieKeywords = modalTypeKeywords.cookie.some(keyword =>
+          const hasCookieKeywords = config.modalTypeKeywords.cookie.some(keyword =>
             modalText.includes(keyword) || modalClass.includes(keyword) || modalId.includes(keyword)
           );
           if (hasCookieKeywords) {
@@ -1413,7 +1432,7 @@ export class IntelligentPageAnalyzer {
           }
           // Check for newsletter/subscribe keywords
           else {
-            const hasNewsletterKeywords = modalTypeKeywords.newsletter.some(keyword =>
+            const hasNewsletterKeywords = config.modalTypeKeywords.newsletter.some(keyword =>
               modalText.includes(keyword) || modalClass.includes(keyword) || modalId.includes(keyword)
             );
             if (hasNewsletterKeywords) {
@@ -1421,23 +1440,23 @@ export class IntelligentPageAnalyzer {
             }
             // Check for popup/modal keywords
             else {
-              const hasPopupKeywords = modalTypeKeywords.popup.some(keyword =>
+              const hasPopupKeywords = config.modalTypeKeywords.popup.some(keyword =>
                 modalClass.includes(keyword) || modalId.includes(keyword)
               );
               if (hasPopupKeywords) {
                 modalType = 'popup';
-          }
+              }
             }
           }
 
-            modals.push({
+          modals.push({
             type: modalType,
             closeSelector,
-            });
+          });
         }
 
         return modals;
-      });
+      }, config);
     } catch (error) {
       logger.warn('[INTELLIGENT_ANALYZER] Modal detection failed', { error });
       return [];

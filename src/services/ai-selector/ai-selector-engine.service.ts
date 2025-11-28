@@ -101,6 +101,8 @@ export class AISelectorEngine {
 
   /**
    * Generate cache key
+   * ///improvement: Fixed cache key generation to include element-specific identifier
+   * This prevents different buttons from getting the same cached selector
    */
   private static async getCacheKey(request: SelectorResolveRequest): Promise<string> {
     const { intent, metadata, nodes } = request;
@@ -108,14 +110,58 @@ export class AISelectorEngine {
     // Generate DOM hash
     const domHash = await this.generateDOMHashFromNodes(nodes);
 
+    // ✅ FIX: Include element-specific identifier in intent to ensure unique cache keys
+    // This prevents different buttons from getting the same cached selector
+    // Extract element identifier from intent (e.g., button text, aria-label, etc.)
+    const elementIdentifier = this.extractElementIdentifier(intent, nodes);
+    const uniqueIntent = elementIdentifier
+      ? `${IntentParserService.normalizeIntent(intent)}|${elementIdentifier}`
+      : IntentParserService.normalizeIntent(intent);
+
     return SelectorCacheService.generateCacheKey({
       projectId: metadata.projectId || 'default',
-      intent: IntentParserService.normalizeIntent(intent),
+      intent: uniqueIntent,
       domHash,
       viewport: `${metadata.viewport.width}x${metadata.viewport.height}`,
       modelVersion: 'gpt-4o-2024-11-20',
       engineVersion: '1.0.0',
     });
+  }
+
+  /**
+   * Extract element-specific identifier from intent to ensure unique cache keys
+   * ///improvement: Added extraction of element identifier (text + index) to ensure unique cache keys
+   * This prevents duplicate selectors for different elements with same text
+   * @param intent - Original intent string
+   * @param nodes - Available DOM nodes
+   * @returns Element identifier (text, aria-label, id, etc.) or null
+   */
+  private static extractElementIdentifier(intent: string, nodes: DOMNode[]): string | null {
+    // Try to extract button text, aria-label, or other unique identifier from intent
+    // Pattern: "Click "{text}" button (index: N)" or "Click {text} button" -> extract {text} and index
+    const buttonMatch = intent.match(/Click\s+["']?(.+?)["']?\s+button(?:\s+\(index:\s*(\d+)\))?/i);
+    if (buttonMatch && buttonMatch[1]) {
+      // Remove quotes if present and normalize
+      const text = buttonMatch[1].trim().replace(/^["']|["']$/g, '').toLowerCase();
+      const index = buttonMatch[2] ? `:${buttonMatch[2]}` : '';
+      return `${text}${index}`;
+    }
+
+    // Pattern: "Fill {label} input" -> extract {label}
+    const inputMatch = intent.match(/Fill\s+.+?\s+input\s+["']?(.+?)["']?$/i);
+    if (inputMatch && inputMatch[1]) {
+      return inputMatch[1].trim().replace(/^["']|["']$/g, '').toLowerCase();
+    }
+
+    // Pattern: "with aria-label "{label}"" -> extract aria-label
+    const ariaLabelMatch = intent.match(/aria-label\s+["'](.+?)["']/i);
+    if (ariaLabelMatch && ariaLabelMatch[1]) {
+      return `aria:${ariaLabelMatch[1].trim().toLowerCase()}`;
+    }
+
+    // If no pattern matches, try to find unique identifier in nodes
+    // This is a fallback - prefer explicit extraction from intent
+    return null;
   }
 
   /**

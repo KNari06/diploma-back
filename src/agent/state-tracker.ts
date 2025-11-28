@@ -119,6 +119,7 @@ export class StateTracker {
   /**
    * Normalize URL for comparison (remove query params, normalize www, protocol)
    * ✅ FIX: URLs with different query params should be considered the same
+   * ///improvement: Added URL normalization to prevent false cycle detection and improve start URL validation
    */
   private static normalizeUrl(url: string): string {
     try {

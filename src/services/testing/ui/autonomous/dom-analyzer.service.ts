@@ -22,11 +22,13 @@ export interface DOMAnalysisResult {
     text: string;
     selector: string;
     type: string;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
   }>;
   links: Array<{
     text: string;
     href: string;
     selector: string;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
   }>;
   inputs: Array<{
     type: string;
@@ -34,6 +36,31 @@ export interface DOMAnalysisResult {
     placeholder?: string;
     selector: string;
     required: boolean;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
+  }>;
+  checkboxes?: Array<{
+    name?: string;
+    label?: string;
+    selector: string;
+    checked: boolean;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
+  }>;
+  radios?: Array<{
+    name?: string;
+    label?: string;
+    selector: string;
+    checked: boolean;
+    value?: string;
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
+  }>;
+  interactiveElements?: Array<{
+    tag: string;
+    text?: string;
+    selector: string;
+    role?: string;
+    tabindex?: number;
+    reason: 'onclick' | 'cursor-pointer' | 'tabindex' | 'role';
+    inShadowDOM?: boolean; // ✅ NEW: Mark if element is in Shadow DOM
   }>;
 }
 
@@ -47,17 +74,25 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
     const result = await page.evaluate(() => {
       /**
        * Check if element is visible (not hidden by CSS)
+       * ✅ SAFETY: Added error handling for edge cases
        */
       function isVisible(element: any): boolean {
-        // @ts-expect-error - browser context
-        const style = window.getComputedStyle(element);
-        return (
-          style.display !== 'none' &&
-          style.visibility !== 'hidden' &&
-          style.opacity !== '0' &&
-          element.offsetWidth > 0 &&
-          element.offsetHeight > 0
-        );
+        try {
+          // @ts-expect-error - browser context
+          const style = window.getComputedStyle(element);
+          return (
+            style &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            style.opacity !== '0' &&
+            element &&
+            element.offsetWidth > 0 &&
+            element.offsetHeight > 0
+          );
+        } catch (e) {
+          // Element might be detached or not in DOM
+          return false;
+        }
       }
 
       /**
@@ -206,10 +241,274 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
         return selector;
       }
 
+      /**
+       * ✅ NEW: Generate selector for element in Shadow DOM
+       * For Shadow DOM elements, we need to use Playwright syntax: parent >> child
+       */
+      function generateShadowSelector(
+        element: any,
+        shadowHost: any,
+        selectorCounts: Map<string, number>
+      ): string {
+        // First, generate selector for the shadow host (parent)
+        const hostSelector = generateSelector(shadowHost, selectorCounts);
+
+        // Then, generate selector for the element inside shadow
+        const elementSelector = generateSelector(element, selectorCounts);
+
+        // Use Playwright syntax for Shadow DOM: parent >> child
+        return `${hostSelector} >> ${elementSelector}`;
+      }
+
+      /**
+       * ✅ NEW: Recursively traverse Shadow DOM and collect elements
+       * Handles nested Shadow DOM, closed Shadow DOM (skips), and performance
+       */
+      function traverseShadowDOM(
+        root: any, // Document | ShadowRoot (browser context)
+        shadowHost: any | undefined,
+        depth: number,
+        maxDepth: number,
+        visited: Set<any>, // ✅ SAFETY: Set is available in all modern browsers
+        selectorCounts: Map<string, number> // ✅ SAFETY: Map is available in all modern browsers
+      ): {
+        buttons: any[];
+        links: any[];
+        inputs: any[];
+        checkboxes: any[];
+        radios: any[];
+        interactiveElements: any[];
+      } {
+        const result = {
+          buttons: [] as any[],
+          links: [] as any[],
+          inputs: [] as any[],
+          checkboxes: [] as any[],
+          radios: [] as any[],
+          interactiveElements: [] as any[],
+        };
+
+        // Prevent infinite loops and excessive depth
+        if (depth > maxDepth) {
+          return result;
+        }
+
+        // Get all elements in current root
+        // ✅ SAFETY: Added error handling for querySelectorAll
+        let allElements: any[] = [];
+        try {
+          // @ts-ignore - browser context
+          allElements = Array.from(root.querySelectorAll('*'));
+        } catch (e) {
+          // Root might be detached or invalid
+          return result;
+        }
+
+        for (const el of allElements) {
+          const element: any = el;
+
+          // ✅ SAFETY: Skip if already visited (prevent duplicates in nested structures)
+          if (visited.has(element)) continue;
+          visited.add(element);
+
+          // Check if element has Shadow DOM
+          // ✅ SAFETY: Enhanced error handling for Shadow DOM access
+          let shadowRoot: any = null;
+          try {
+            // Try to access shadowRoot (works for open Shadow DOM)
+            if (element && typeof element.shadowRoot !== 'undefined') {
+              shadowRoot = element.shadowRoot;
+            }
+          } catch (e) {
+            // Closed Shadow DOM or error accessing - skip (can't access)
+            shadowRoot = null;
+          }
+
+          // If element has Shadow DOM, recurse into it
+          if (shadowRoot) {
+            const shadowResult = traverseShadowDOM(
+              shadowRoot,
+              element, // Pass current element as shadow host
+              depth + 1,
+              maxDepth,
+              visited,
+              selectorCounts // ✅ FIX: Pass selectorCounts
+            );
+
+            // Merge results from Shadow DOM
+            result.buttons.push(...shadowResult.buttons);
+            result.links.push(...shadowResult.links);
+            result.inputs.push(...shadowResult.inputs);
+            result.checkboxes.push(...shadowResult.checkboxes);
+            result.radios.push(...shadowResult.radios);
+            result.interactiveElements.push(...shadowResult.interactiveElements);
+          }
+
+          // Process current element (if visible)
+          if (!isVisible(element)) continue;
+
+          const tag = element.tagName.toLowerCase();
+
+          // Collect buttons from Shadow DOM
+          if ((tag === 'button' ||
+               (tag === 'input' && (element.type === 'submit' || element.type === 'button')) ||
+               element.getAttribute('role') === 'button') &&
+              element.textContent?.trim()) {
+            result.buttons.push({
+              text: element.textContent?.trim() || element.value || element.getAttribute('aria-label') || '',
+              selector: shadowHost
+                ? generateShadowSelector(element, shadowHost, selectorCounts)
+                : generateSelector(element, selectorCounts),
+              type: element.type || element.getAttribute('role') || 'button',
+              inShadowDOM: !!shadowHost,
+            });
+          }
+
+          // Collect links from Shadow DOM
+          if (tag === 'a' && element.href &&
+              !element.href.startsWith('#') &&
+              !element.href.startsWith('javascript:') &&
+              element.textContent?.trim()) {
+            result.links.push({
+              text: element.textContent?.trim() || element.getAttribute('aria-label') || '',
+              href: element.href,
+              selector: shadowHost
+                ? generateShadowSelector(element, shadowHost, selectorCounts)
+                : generateSelector(element, selectorCounts),
+              inShadowDOM: !!shadowHost,
+            });
+          }
+
+          // Collect inputs from Shadow DOM
+          if (tag === 'input' || tag === 'select' || tag === 'textarea') {
+            if (element.type === 'checkbox') {
+              let label: string | undefined;
+              const id = element.id;
+              if (id) {
+                // Try to find label in Shadow DOM
+                try {
+                  // @ts-ignore
+                  const labelEl = root.querySelector(`label[for="${id}"]`);
+                  if (labelEl) {
+                    label = labelEl.textContent?.trim() || undefined;
+                  }
+                } catch {}
+              }
+
+              result.checkboxes.push({
+                name: element.name || element.id || undefined,
+                label: label || element.getAttribute('aria-label') || undefined,
+                selector: shadowHost
+                  ? generateShadowSelector(element, shadowHost, selectorCounts)
+                  : generateSelector(element, selectorCounts),
+                checked: element.checked,
+                inShadowDOM: !!shadowHost,
+              });
+            } else if (element.type === 'radio') {
+              let label: string | undefined;
+              const id = element.id;
+              if (id) {
+                // Try to find label in current root (Shadow DOM or document)
+                try {
+                  const labelEl = root.querySelector(`label[for="${id}"]`);
+                  if (labelEl) {
+                    label = labelEl.textContent?.trim() || undefined;
+                  }
+                } catch {}
+              }
+
+              result.radios.push({
+                name: element.name || undefined,
+                label: label || element.getAttribute('aria-label') || undefined,
+                selector: shadowHost
+                  ? generateShadowSelector(element, shadowHost, selectorCounts)
+                  : generateSelector(element, selectorCounts),
+                checked: element.checked,
+                value: element.value || undefined,
+                inShadowDOM: !!shadowHost,
+              });
+            } else {
+              // Regular input
+              result.inputs.push({
+                type: element.type || tag,
+                name: element.name || element.id || undefined,
+                placeholder: element.getAttribute('placeholder') || undefined,
+                selector: shadowHost
+                  ? generateShadowSelector(element, shadowHost, selectorCounts)
+                  : generateSelector(element, selectorCounts),
+                required: element.hasAttribute('required') || element.getAttribute('aria-required') === 'true',
+                inShadowDOM: !!shadowHost,
+              });
+            }
+          }
+
+          // Collect other interactive elements from Shadow DOM
+          if (!['button', 'a', 'input', 'select', 'textarea', 'form'].includes(tag)) {
+            const role = element.getAttribute('role');
+            if (role === 'button' || role === 'link') continue; // Already handled
+
+            const tabindex = element.getAttribute('tabindex');
+            // ✅ SAFETY: Added error handling for getComputedStyle
+            let cursor = 'auto';
+            try {
+              // @ts-ignore
+              const style = window.getComputedStyle(element);
+              cursor = style ? style.cursor || 'auto' : 'auto';
+            } catch (e) {
+              // Element might be detached
+              cursor = 'auto';
+            }
+
+            let reason: string | undefined;
+
+            // @ts-ignore
+            if (element.onclick || element.hasAttribute('onclick') || element.hasAttribute('data-onclick')) {
+              reason = 'onclick';
+            } else if (cursor === 'pointer') {
+              reason = 'cursor-pointer';
+            } else if (tabindex !== null && parseInt(tabindex) >= 0) {
+              reason = 'tabindex';
+            } else if (role && ['button', 'link', 'menuitem', 'tab', 'option'].includes(role)) {
+              reason = 'role';
+            } else if ((tag === 'img' || tag === 'svg' || element.tagName === 'SVG') &&
+                       (element.onclick || element.hasAttribute('onclick'))) {
+              reason = 'onclick';
+            }
+
+            if (reason) {
+              const text = element.textContent?.trim().substring(0, 100) ||
+                          element.getAttribute('aria-label') ||
+                          element.getAttribute('alt') ||
+                          element.getAttribute('title') ||
+                          undefined;
+
+              result.interactiveElements.push({
+                tag,
+                text,
+                selector: shadowHost
+                  ? generateShadowSelector(element, shadowHost, selectorCounts)
+                  : generateSelector(element, selectorCounts),
+                role: role || undefined,
+                tabindex: tabindex ? parseInt(tabindex) : undefined,
+                reason: reason as any,
+                inShadowDOM: !!shadowHost,
+              });
+            }
+          }
+        }
+
+        return result;
+      }
+
       // ✅ FIX: Create selector count map to track duplicates
       const selectorCounts = new Map<string, number>();
 
-      // ✅ FIX: Analyze forms (only visible ones)
+      // ✅ NEW: Traverse Shadow DOM and collect elements
+      // Start from document root (depth 0)
+      // @ts-expect-error - browser context
+      const shadowDOMResult = traverseShadowDOM(document, undefined, 0, 5, new Set(), selectorCounts);
+
+      // ✅ FIX: Analyze forms (only visible ones) - including Shadow DOM
       // @ts-expect-error - browser context
       const forms = Array.from(document.querySelectorAll('form'))
         .filter((form: any) => isVisible(form))
@@ -286,23 +585,209 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           };
         });
 
+      // ✅ NEW: Extract checkboxes separately
+      // @ts-expect-error - browser context (document is available in page.evaluate)
+      const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+        .filter((checkbox: any) => isVisible(checkbox))
+        .map((checkbox: any) => {
+          // Find associated label
+          let label: string | undefined;
+          const id = checkbox.id;
+          if (id) {
+            // @ts-expect-error - browser context (document is available in page.evaluate)
+            const labelEl = document.querySelector(`label[for="${id}"]`);
+            if (labelEl) {
+              label = labelEl.textContent?.trim() || undefined;
+            }
+          }
+          if (!label && checkbox.parentElement?.tagName === 'LABEL') {
+            label = checkbox.parentElement.textContent?.trim().replace(checkbox.value || '', '').trim() || undefined;
+          }
+
+          return {
+            name: checkbox.name || checkbox.id || undefined,
+            label: label || checkbox.getAttribute('aria-label') || undefined,
+            selector: generateSelector(checkbox, selectorCounts),
+            checked: checkbox.checked,
+          };
+        });
+
+      // ✅ NEW: Extract radio buttons separately
+      // @ts-expect-error - browser context (document is available in page.evaluate)
+      const radios = Array.from(document.querySelectorAll('input[type="radio"]'))
+        .filter((radio: any) => isVisible(radio))
+        .map((radio: any) => {
+          // Find associated label
+          let label: string | undefined;
+          const id = radio.id;
+          if (id) {
+            // @ts-expect-error - browser context (document is available in page.evaluate)
+            const labelEl = document.querySelector(`label[for="${id}"]`);
+            if (labelEl) {
+              label = labelEl.textContent?.trim() || undefined;
+            }
+          }
+          if (!label && radio.parentElement?.tagName === 'LABEL') {
+            label = radio.parentElement.textContent?.trim().replace(radio.value || '', '').trim() || undefined;
+          }
+
+          return {
+            name: radio.name || undefined,
+            label: label || radio.getAttribute('aria-label') || undefined,
+            selector: generateSelector(radio, selectorCounts),
+            checked: radio.checked,
+            value: radio.value || undefined,
+          };
+        });
+
+      // ✅ NEW: Extract other interactive elements (div/span/img with onClick, cursor:pointer, tabindex)
+      const interactiveElements: any[] = [];
+
+      // Find elements with onClick handlers
+      // @ts-ignore - browser context
+      const allElements = Array.from(document.querySelectorAll('*'));
+      for (const el of allElements) {
+        const element: any = el;
+        if (!isVisible(element)) continue;
+
+        const tag = element.tagName.toLowerCase();
+        const role = element.getAttribute('role');
+        const tabindex = element.getAttribute('tabindex');
+        // @ts-ignore - browser context
+        const style = window.getComputedStyle(element);
+        const cursor = style.cursor;
+
+        // Skip already collected elements
+        if (['button', 'a', 'input', 'select', 'textarea', 'form'].includes(tag)) continue;
+        if (role === 'button' || role === 'link') continue; // Already in buttons/links
+
+        let reason: string | undefined;
+
+        // Check for onClick (inline or event listener)
+        // @ts-ignore
+        if (element.onclick || element.hasAttribute('onclick') || element.hasAttribute('data-onclick')) {
+          reason = 'onclick';
+        }
+        // Check for cursor pointer (clickable element)
+        else if (cursor === 'pointer') {
+          reason = 'cursor-pointer';
+        }
+        // Check for tabindex (focusable element)
+        else if (tabindex !== null && parseInt(tabindex) >= 0) {
+          reason = 'tabindex';
+        }
+        // Check for interactive role
+        else if (role && ['button', 'link', 'menuitem', 'tab', 'option'].includes(role)) {
+          reason = 'role';
+        }
+        // Check for img/SVG with onClick
+        else if ((tag === 'img' || tag === 'svg' || element.tagName === 'SVG') && (element.onclick || element.hasAttribute('onclick'))) {
+          reason = 'onclick';
+        }
+
+        if (reason) {
+          const text = element.textContent?.trim().substring(0, 100) ||
+                      element.getAttribute('aria-label') ||
+                      element.getAttribute('alt') ||
+                      element.getAttribute('title') ||
+                      undefined;
+
+          interactiveElements.push({
+            tag,
+            text,
+            selector: generateSelector(element, selectorCounts),
+            role: role || undefined,
+            tabindex: tabindex ? parseInt(tabindex) : undefined,
+            reason,
+          });
+        }
+      }
+
+      // ✅ NEW: Merge Shadow DOM results with regular DOM results
+      // Priority: Regular DOM first, then Shadow DOM (for deduplication)
+      const allButtons = [
+        ...buttons,
+        ...shadowDOMResult.buttons.filter(shadowBtn =>
+          !buttons.some(btn => btn.selector === shadowBtn.selector)
+        ),
+      ];
+
+      const allLinks = [
+        ...links,
+        ...shadowDOMResult.links.filter(shadowLink =>
+          !links.some(link => link.selector === shadowLink.selector)
+        ),
+      ];
+
+      const allInputs = [
+        ...inputs,
+        ...shadowDOMResult.inputs.filter(shadowInput =>
+          !inputs.some(input => input.selector === shadowInput.selector)
+        ),
+      ];
+
+      const allCheckboxes = [
+        ...checkboxes,
+        ...shadowDOMResult.checkboxes.filter(shadowCb =>
+          !checkboxes.some(cb => cb.selector === shadowCb.selector)
+        ),
+      ];
+
+      const allRadios = [
+        ...radios,
+        ...shadowDOMResult.radios.filter(shadowRadio =>
+          !radios.some(radio => radio.selector === shadowRadio.selector)
+        ),
+      ];
+
+      const allInteractiveElements = [
+        ...interactiveElements,
+        ...shadowDOMResult.interactiveElements.filter(shadowEl =>
+          !interactiveElements.some(el => el.selector === shadowEl.selector)
+        ),
+      ];
+
       return {
         forms,
-        buttons: buttons.slice(0, 20), // Limit to first 20
-        links: links.slice(0, 30), // Limit to first 30
-        inputs: inputs.slice(0, 30), // Limit to first 30
+        buttons: allButtons.slice(0, 20), // Limit to first 20
+        links: allLinks.slice(0, 30), // Limit to first 30
+        inputs: allInputs.slice(0, 30), // Limit to first 30
+        checkboxes: allCheckboxes.length > 0 ? allCheckboxes.slice(0, 50) : undefined,
+        radios: allRadios.length > 0 ? allRadios.slice(0, 50) : undefined,
+        interactiveElements: allInteractiveElements.length > 0 ? allInteractiveElements.slice(0, 30) : undefined,
       };
     });
 
-    // ✅ FIX: Enhanced metrics with visibility info
+    // ✅ FIX: Enhanced metrics with visibility info and Shadow DOM stats
+    const shadowDOMButtons = result.buttons.filter(b => b.inShadowDOM).length;
+    const shadowDOMLinks = result.links.filter(l => l.inShadowDOM).length;
+    const shadowDOMInputs = result.inputs.filter(i => i.inShadowDOM).length;
+    const shadowDOMCheckboxes = result.checkboxes?.filter(c => c.inShadowDOM).length || 0;
+    const shadowDOMRadios = result.radios?.filter(r => r.inShadowDOM).length || 0;
+    const shadowDOMInteractive = result.interactiveElements?.filter(e => e.inShadowDOM).length || 0;
+
+    // ✅ FIX: Enhanced metrics with visibility info and Shadow DOM stats
     logger.info('DOM analysis completed', {
       formsCount: result.forms.length,
       buttonsCount: result.buttons.length,
       linksCount: result.links.length,
       inputsCount: result.inputs.length,
+      checkboxesCount: result.checkboxes?.length || 0,
+      radiosCount: result.radios?.length || 0,
+      interactiveElementsCount: result.interactiveElements?.length || 0,
       totalFields: result.forms.reduce((sum, f) => sum + f.fields.length, 0),
+      shadowDOMCount: {
+        buttons: shadowDOMButtons,
+        links: shadowDOMLinks,
+        inputs: shadowDOMInputs,
+        checkboxes: shadowDOMCheckboxes,
+        radios: shadowDOMRadios,
+        interactiveElements: shadowDOMInteractive,
+        total: shadowDOMButtons + shadowDOMLinks + shadowDOMInputs + shadowDOMCheckboxes + shadowDOMRadios + shadowDOMInteractive,
+      },
       visibilityFiltered: true,
       duplicatesHandled: true,
+      shadowDOMSupported: true,
     });
 
     return result;
@@ -324,6 +809,9 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
       buttons: [],
       links: [],
       inputs: [],
+      checkboxes: undefined,
+      radios: undefined,
+      interactiveElements: undefined,
     };
   }
 }
