@@ -92,9 +92,12 @@ class RequestTracker {
           // ✅ FIX: Increment counter for this URL (supports duplicate requests)
           const currentCount = this.pendingRequests.get(url) || 0;
           this.pendingRequests.set(url, currentCount + 1);
+          // ✅ IMPORTANT: These logs are valuable for debugging SPA loading issues
+          // Shows which API requests are being made and their status
           logger.debug('[PLAYWRIGHT] Tracking API request', {
             url: url.substring(0, 100),
             requestCount: currentCount + 1,
+            totalPending: this.pendingRequests.size, // Total unique URLs pending
           });
         }
       }
@@ -142,10 +145,13 @@ class RequestTracker {
           this.pendingRequests.set(url, newCount);
         }
 
+        // ✅ IMPORTANT: These logs are valuable for debugging SPA loading issues
+        // Shows request completion status and remaining pending requests
         logger.debug('[PLAYWRIGHT] API request completed', {
           url: url.substring(0, 100),
           status: response.status(),
-          remainingPending: newCount,
+          remainingPending: newCount, // Requests to this specific URL still pending
+          totalPendingUrls: this.pendingRequests.size, // Total unique URLs still pending
         });
       }
     });
