@@ -12,6 +12,7 @@
     "start:worker": "node dist/worker/index.js",
     "build-kb": "ts-node -r tsconfig-paths/register src/scripts/build-global-kb.ts",
     "create-test-users": "ts-node -r tsconfig-paths/register scripts/create-test-users.ts",
+    "create-admin-user": "ts-node -r tsconfig-paths/register scripts/create-admin-user.ts",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",

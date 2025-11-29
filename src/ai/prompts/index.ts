@@ -732,29 +732,46 @@ RESPONSE FORMAT (JSON):
   "reasoning": "Explain your thought process (2-3 sentences)",
   "actions": [
     {
-      "action": "click|fill|select|wait|scroll|press|hover",
-      "selector": "CSS selector or Playwright text selector",
-      "value": "value for fill/select actions",
+      "action": "click|dblclick|fill|type|select|check|uncheck|hover|focus|blur|press|dragAndDrop|tap|swipe|wait|scroll|scrollIntoView|goBack|goForward|reload|assertVisible|assertText|assertValue|assertUrl|assertCount|extract|screenshot",
+      "selector": "CSS selector or Playwright text selector (use EXACT selector from context)",
+      "value": "value for fill/select/type/press/dragAndDrop actions",
       "description": "What this action does",
       "expectedResult": "What should happen after this action",
       "optional": true/false,
-      "timeout": 5000
+      "timeout": 10000
     }
   ],
   "nextExpectedPage": "product|cart|etc or null if staying on same page",
   "confidence": 0.0-1.0
 }
 
+AVAILABLE ACTIONS (choose appropriate one):
+- **Interactions**: click, dblclick, fill, type, select, check, uncheck, hover, focus, blur, press
+- **Drag & Drop**: dragAndDrop (value = target selector), tap, swipe
+- **Navigation**: goBack, goForward, reload
+- **Scroll**: scroll, scrollIntoView
+- **Wait**: wait, waitForSelector
+- **Assertions**: assertVisible, assertText, assertValue, assertUrl, assertCount
+- **Data**: extract, screenshot
+
 CRITICAL RULES:
 
 0. **SELECTOR USAGE (MOST IMPORTANT)**:
    - ✅ ALWAYS use the EXACT selector from "Available Elements" or "DOM Summary" sections
-   - ✅ If selector is provided: use it EXACTLY as shown (e.g., button:has-text('Войти'))
-   - ✅ For Playwright text selectors: use text='Button Text' or button:has-text('Button Text')
-   - ❌ NEVER use jQuery syntax like ":contains()" - it's NOT supported in Playwright
+   - ✅ If selector is provided: use it EXACTLY as shown (e.g., role=button[name="Login"], text="Login")
+   - ✅ Selector formats supported:
+     * role=button[name="Login"] - ARIA role with name (BEST - most stable)
+     * text="Login" - Text content selector
+     * label="Email" - Label selector (for inputs)
+     * #id - ID selector
+     * .class - Class selector
+     * [data-testid="value"] - Test ID selector
+   - ❌ NEVER use jQuery syntax like ":contains()" - NOT supported
+   - ❌ NEVER use button:has-text() - use text= or role= instead
    - ❌ NEVER invent selectors - only use ones provided in the context
-   - Example: If DOM Summary shows Selector: "button:has-text('Войти')" → use exactly that
-   - Example: If no selector but text is "Login" → use text='Login' or button:has-text('Login')
+   - ❌ NEVER use single quotes in selectors - ALWAYS use double quotes
+   - Example: If DOM shows Selector: "role=button[name=\"Login\"]" → use exactly that
+   - Example: If DOM shows Selector: "text=\"Login\"" → use exactly that
 
 1. **Logical Dependencies**:
    - On product page: MUST select size/color BEFORE "add to cart"

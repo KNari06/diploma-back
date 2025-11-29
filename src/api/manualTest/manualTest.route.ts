@@ -427,8 +427,56 @@ router.get('/project/:projectId/stats', requireAuth, asyncHandler(async (req: Re
 }));
 
 /**
- * POST /manual-test/:id/cancel
- * Cancel a running manual test
+ * @swagger
+ * /api/v1/manual-test/{id}/cancel:
+ *   post:
+ *     summary: Отменить запущенный тест
+ *     description: |
+ *       Отменяет запущенный или ожидающий тест.
+ *
+ *       **Действия:**
+ *       - Обновляет статус теста на 'cancelled'
+ *       - Удаляет все связанные задачи из очереди
+ *       - Останавливает активные процессы тестирования
+ *       - Отправляет WebSocket уведомление
+ *
+ *       **Ограничения:**
+ *       - Нельзя отменить уже завершенный тест
+ *       - Требуется авторизация
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: ID теста для отмены
+ *     responses:
+ *       200:
+ *         description: Тест успешно отменен
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   description: Информация об отмененном тесте
+ *                 message:
+ *                   type: string
+ *                   example: "Test cancelled successfully"
+ *       400:
+ *         description: Тест уже завершен или отменен
+ *       403:
+ *         description: Доступ запрещен
+ *       404:
+ *         description: Тест не найден
  */
 router.post('/:id/cancel', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -442,8 +490,59 @@ router.post('/:id/cancel', requireAuth, asyncHandler(async (req: Request, res: R
 }));
 
 /**
- * POST /manual-test/:id/retry
- * Retry a failed manual test
+ * @swagger
+ * /api/v1/manual-test/{id}/retry:
+ *   post:
+ *     summary: Повторить тест
+ *     description: |
+ *       Повторяет выполнение теста (только для failed тестов).
+ *
+ *       **Действия:**
+ *       - Создает новые задачи в очереди для всех браузеров
+ *       - Обновляет статус теста на 'pending'
+ *       - Списывает 1 кредит
+ *
+ *       **Стоимость:**
+ *       - Standard mode: 1 кредит
+ *       - Intelligent mode: 20 кредитов
+ *
+ *       **Требования:**
+ *       - Тест должен иметь статус 'failed'
+ *       - У пользователя должны быть кредиты
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: ID теста для повтора
+ *     responses:
+ *       200:
+ *         description: Тест успешно перезапущен
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   description: Информация о перезапущенном тесте
+ *                 message:
+ *                   type: string
+ *                   example: "Test retry initiated successfully"
+ *       400:
+ *         description: Тест не failed или недостаточно кредитов
+ *       403:
+ *         description: Доступ запрещен
+ *       404:
+ *         description: Тест не найден
  */
 router.post('/:id/retry', requireAuth, requireCredits(1), asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -457,8 +556,70 @@ router.post('/:id/retry', requireAuth, requireCredits(1), asyncHandler(async (re
 }));
 
 /**
- * GET /manual-test/:id/status
- * Get manual test status (lightweight endpoint for polling)
+ * @swagger
+ * /api/v1/manual-test/{id}/status:
+ *   get:
+ *     summary: Получить статус теста (легковесный endpoint)
+ *     description: |
+ *       Возвращает только статус теста без полной информации.
+ *
+ *       **Использование:**
+ *       - Идеален для polling (проверка статуса каждые N секунд)
+ *       - Минимальная нагрузка на БД
+ *       - Быстрый ответ
+ *
+ *       **Возвращает:**
+ *       - id - ID теста
+ *       - status - текущий статус (pending, running, completed, failed, cancelled)
+ *       - progress - количество завершенных браузеров
+ *       - totalBrowsers - общее количество браузеров
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: ID теста
+ *     responses:
+ *       200:
+ *         description: Статус теста получен
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     id:
+ *                       type: string
+ *                       format: uuid
+ *                     status:
+ *                       type: string
+ *                       enum: [pending, running, completed, failed, cancelled]
+ *                       example: running
+ *                     progress:
+ *                       type: number
+ *                       description: Количество завершенных браузеров
+ *                       example: 1
+ *                     totalBrowsers:
+ *                       type: number
+ *                       description: Общее количество браузеров
+ *                       example: 3
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       403:
+ *         description: Доступ запрещен
+ *       404:
+ *         description: Тест не найден
  */
 router.get('/:id/status', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;

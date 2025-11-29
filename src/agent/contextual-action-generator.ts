@@ -9,9 +9,11 @@ import {
   buildNextStepPrompt,
 } from '@/ai/prompts/index';
 import { env } from '@/config/env';
+import { AICostManager, AIModel } from '@/services/ai-cost-manager.service';
 import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
 import { Page } from 'playwright';
+import { z } from 'zod';
 import {
   DynamicAction,
   NextStepDecision,
@@ -27,6 +29,84 @@ const openai = new OpenAI({
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ZOD SCHEMAS FOR VALIDATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+const ActionSchema = z.object({
+  action: z.string(),
+  selector: z.string().optional(),
+  value: z.union([z.string(), z.number()]).optional(),
+  url: z.string().optional(),
+  description: z.string(),
+  expectedResult: z.string().optional(),
+  timeout: z.number().optional(),
+  optional: z.boolean().optional(),
+  retry: z.number().optional(),
+});
+
+const ActionGenerationResponseSchema = z.object({
+  reasoning: z.string(),
+  actions: z.array(ActionSchema),
+  nextExpectedPage: z.string().nullable().optional(),
+  confidence: z.number().min(0).max(1),
+});
+
+const NextStepResponseSchema = z.object({
+  decision: z.enum(['continue', 'stop', 'wait_for_user', 'retry', 'skip']),
+  reason: z.string(),
+  progress: z.number().min(0).max(100).optional(),
+  goalAchieved: z.boolean().optional(),
+  nextTarget: z.string().nullable().optional(),
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CACHE FOR RECENT GENERATIONS (1-5 min TTL)
+// ═══════════════════════════════════════════════════════════════════════════
+
+interface CachedGeneration {
+  actions: DynamicAction[];
+  reasoning: string;
+  confidence: number;
+  timestamp: number;
+}
+
+const generationCache = new Map<string, CachedGeneration>();
+const CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
+
+function getCacheKey(context: PageContext, goal: string): string {
+  // Simple hash based on URL + pageType + goal
+  const str = `${context.url}|${context.pageType}|${goal}`;
+  return Buffer.from(str).toString('base64').substring(0, 32);
+}
+
+function getCachedGeneration(context: PageContext, goal: string): CachedGeneration | null {
+  const key = getCacheKey(context, goal);
+  const cached = generationCache.get(key);
+
+  if (!cached) return null;
+
+  const age = Date.now() - cached.timestamp;
+  if (age > CACHE_TTL_MS) {
+    generationCache.delete(key);
+    return null;
+  }
+
+  return cached;
+}
+
+function setCachedGeneration(context: PageContext, goal: string, result: CachedGeneration): void {
+  const key = getCacheKey(context, goal);
+  generationCache.set(key, { ...result, timestamp: Date.now() });
+
+  // Cleanup old entries (keep max 50)
+  if (generationCache.size > 50) {
+    const oldestKey = Array.from(generationCache.entries())
+      .sort((a, b) => a[1].timestamp - b[1].timestamp)[0][0];
+    generationCache.delete(oldestKey);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ACTION GENERATOR
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -40,7 +120,8 @@ export class ContextualActionGenerator {
   static async generateActions(
     context: PageContext,
     state: TestState,
-    page?: Page  // ✅ NEW: Optional page for getting HTML
+    page?: Page,  // ✅ NEW: Optional page for getting HTML
+    costManager?: AICostManager  // ✅ FIX 9: Cost manager for budget control
   ): Promise<{
     actions: DynamicAction[];
     reasoning: string;
@@ -48,11 +129,37 @@ export class ContextualActionGenerator {
   }> {
     const startTime = Date.now();
 
+    // ✅ FIX 9: Check budget before proceeding
+    if (costManager && !costManager.canContinue()) {
+      logger.warn('[ACTION_GENERATOR] Budget exceeded, stopping action generation', {
+        stats: costManager.getStats(),
+      });
+      return {
+        actions: [],
+        reasoning: 'Budget exceeded - stopping test to prevent cost overrun',
+        confidence: 0,
+      };
+    }
+
     logger.info('[ACTION_GENERATOR] Generating actions', {
       pageType: context.pageType,
       url: context.url,
       goal: state.goal,
     });
+
+    // ✅ FIX 6: Check cache first (debounce rapid navigations)
+    const cached = getCachedGeneration(context, state.goal);
+    if (cached) {
+      logger.info('[ACTION_GENERATOR] Using cached actions', {
+        age: Date.now() - cached.timestamp,
+        count: cached.actions.length,
+      });
+      return {
+        actions: cached.actions,
+        reasoning: `[CACHED] ${cached.reasoning}`,
+        confidence: cached.confidence,
+      };
+    }
 
     // Early exit: Check for empty/invalid pages before generating actions
     const isEmptyPage = this.isPageEmpty(context);
@@ -85,8 +192,9 @@ export class ContextualActionGenerator {
       // Build DOM summary
       const domSummary = this.buildDOMSummary(context.dom);
 
-      // ✅ NEW: Get actual HTML from page (limited to avoid token overflow)
+      // ✅ FIX 5: Mask PII before sending to LLM
       const actualHTML = page ? await this.getPageHTML(page) : '';
+      const sanitizedHTML = this.maskPII(actualHTML);
 
       const prompt = buildActionGenerationPrompt({
         pageType: context.pageType,
@@ -95,22 +203,39 @@ export class ContextualActionGenerator {
         availableElements: elementsSummary,
         history: historySummary,
         domSummary,
-        actualHTML,
+        actualHTML: sanitizedHTML,
       });
 
+      // ✅ FIX 2: Dynamic token budget based on prompt length
+      const promptLength = prompt.length;
+      const estimatedPromptTokens = Math.ceil(promptLength / 4); // rough estimate
+      const maxTokensBudget = Math.min(1500, 4000 - estimatedPromptTokens); // leave room for response
+
+      logger.debug('[ACTION_GENERATOR] Token budget', {
+        promptLength,
+        estimatedPromptTokens,
+        maxTokensBudget,
+      });
+
+      // ✅ FIX 9: Get recommended model based on budget
+      const preferredModel: AIModel = 'gpt-4o';
+      const model = costManager ? costManager.getRecommendedModel(preferredModel) : preferredModel;
+
+      logger.debug('[ACTION_GENERATOR] Using model', { model, preferredModel });
+
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o', // ✅ UPGRADED: Using GPT-4o for better Playwright code generation
+        model, // ✅ FIX 9: Use adaptive model selection
         messages: [
           {
             role: 'system',
-            content: 'You are an expert QA automation engineer generating test actions.',
+            content: 'You are an expert QA automation engineer generating test actions. ALWAYS return valid JSON matching the schema.',
           },
           {
             role: 'user',
             content: prompt,
           },
         ],
-        max_tokens: 1500,
+        max_tokens: maxTokensBudget,
         temperature: 0.4, // Some creativity, but not too much
         response_format: { type: 'json_object' },
       });
@@ -120,23 +245,60 @@ export class ContextualActionGenerator {
         throw new Error('Empty response from Action Generator');
       }
 
-      const parsed = JSON.parse(content);
+      // ✅ FIX 9: Record AI cost
+      if (costManager) {
+        const inputTokens = response.usage?.prompt_tokens || estimatedPromptTokens;
+        const outputTokens = response.usage?.completion_tokens || 0;
+
+        const costResult = costManager.recordOperation({
+          operation: 'action_generation',
+          model,
+          inputTokens,
+          outputTokens,
+        });
+
+        if (!costResult.allowed) {
+          logger.warn('[ACTION_GENERATOR] Operation would exceed budget', {
+            cost: costResult.cost,
+            warning: costResult.warning,
+          });
+        } else if (costResult.warning) {
+          logger.warn('[ACTION_GENERATOR] Budget warning', {
+            warning: costResult.warning,
+          });
+        }
+      }
+
+      // ✅ FIX 1: Robust JSON parsing with fallback
+      const parsed = this.parseRobustJSON(content, ActionGenerationResponseSchema);
 
       // Validate and sanitize actions
       const actions = this.sanitizeActions(parsed.actions || []);
 
       const duration = Date.now() - startTime;
+
+      // ✅ FIX 8: Log metrics
       logger.info('[ACTION_GENERATOR] Actions generated', {
         count: actions.length,
         confidence: parsed.confidence || 0,
         duration: `${duration}ms`,
+        tokensUsed: response.usage?.total_tokens || 0,
+        model: response.model,
       });
 
-      return {
+      const result = {
         actions,
         reasoning: parsed.reasoning || 'No reasoning provided',
         confidence: parsed.confidence || 0.5,
       };
+
+      // ✅ FIX 6: Cache result (timestamp will be added by setCachedGeneration)
+      setCachedGeneration(context, state.goal, {
+        ...result,
+        timestamp: Date.now(),
+      });
+
+      return result;
     } catch (error) {
       logger.error('[ACTION_GENERATOR] Action generation failed', { error });
 
@@ -199,13 +361,26 @@ export class ContextualActionGenerator {
    */
   static async decideNextStep(
     state: TestState,
-    context: PageContext
+    context: PageContext,
+    costManager?: AICostManager  // ✅ FIX 9: Cost manager for budget control
   ): Promise<NextStepDecision> {
     logger.info('[ACTION_GENERATOR] Deciding next step', {
       pageType: context.pageType,
       pagesVisited: state.pagesAnalyzed,
       goal: state.goal,
     });
+
+    // ✅ FIX 9: Check budget before proceeding
+    if (costManager && !costManager.canContinue()) {
+      logger.warn('[ACTION_GENERATOR] Budget exceeded, stopping test', {
+        stats: costManager.getStats(),
+      });
+      return {
+        action: 'stop',
+        reason: 'Budget exceeded - stopping test to prevent cost overrun',
+        confidence: 1.0,
+      };
+    }
 
     try {
       const historySummary = this.buildHistorySummary(state);
@@ -220,12 +395,16 @@ export class ContextualActionGenerator {
         errors,
       });
 
+      // ✅ FIX 9: Get recommended model (always use mini for next step - it's cheaper)
+      const preferredModel: AIModel = 'gpt-4o-mini';
+      const model = costManager ? costManager.getRecommendedModel(preferredModel) : preferredModel;
+
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model,
         messages: [
           {
             role: 'system',
-            content: 'You are an expert QA engineer deciding next testing steps.',
+            content: 'You are an expert QA engineer deciding next testing steps. ALWAYS return valid JSON matching the schema.',
           },
           {
             role: 'user',
@@ -242,7 +421,21 @@ export class ContextualActionGenerator {
         throw new Error('Empty response from Next Step Decision');
       }
 
-      const parsed = JSON.parse(content);
+      // ✅ FIX 9: Record AI cost
+      if (costManager) {
+        const inputTokens = response.usage?.prompt_tokens || Math.ceil(prompt.length / 4);
+        const outputTokens = response.usage?.completion_tokens || 0;
+
+        costManager.recordOperation({
+          operation: 'next_step_decision',
+          model,
+          inputTokens,
+          outputTokens,
+        });
+      }
+
+      // ✅ FIX 1: Robust JSON parsing
+      const parsed = this.parseRobustJSON(content, NextStepResponseSchema);
 
       const decision: NextStepDecision = {
         action: parsed.decision || 'stop',
@@ -506,31 +699,29 @@ export class ContextualActionGenerator {
         continue;
       }
 
-      // Validate action type
+      // ✅ CRITICAL FIX: Validate action type - include ALL supported actions (30+)
       const validActions = [
-        'goto',
-        'click',
-        'fill',
-        'type',
-        'select',
-        'check',
-        'uncheck',
-        'hover',
-        'press',
-        'wait',
-        'waitForSelector',
-        'waitForNavigation',
-        'scroll',
-        'assertVisible',
-        'assertText',
-        'assertValue',
-        'assertUrl',
-        'assertCount',
-        'extract',
-        'screenshot',
+        // Navigation
+        'goto', 'goBack', 'goForward', 'reload',
+        // Interactions
+        'click', 'dblclick', 'fill', 'type', 'select', 'selectOption',
+        'check', 'uncheck', 'hover', 'focus', 'blur', 'press',
+        // Drag & Drop / Mobile
+        'dragAndDrop', 'tap', 'swipe',
+        // Wait & Scroll
+        'wait', 'waitForSelector', 'waitForTimeout', 'waitForLoadState',
+        'waitForNavigation', 'scroll', 'scrollIntoView',
+        // Assertions
+        'assertVisible', 'assertHidden', 'assertEnabled', 'assertDisabled',
+        'assertText', 'assertValue', 'assertUrl', 'assertCount',
+        // Data & Scripts
+        'extract', 'evaluate', 'script', 'screenshot',
       ];
       if (!validActions.includes(action.action)) {
-        logger.warn('[ACTION_GENERATOR] Invalid action type', { action: action.action });
+        logger.warn('[ACTION_GENERATOR] Invalid action type, skipping', {
+          action: action.action,
+          validActions: validActions.slice(0, 10).join(', ') + '...',
+        });
         continue;
       }
 
@@ -640,5 +831,82 @@ export class ContextualActionGenerator {
       default:
         return 'Test Input';
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HELPER METHODS - JSON PARSING, PII MASKING, VALIDATION
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * ✅ FIX 1: Robust JSON parsing with fallback extraction
+   * Handles cases where LLM returns text + JSON or invalid JSON
+   */
+  private static parseRobustJSON<T>(content: string, schema: z.ZodSchema<T>): T {
+    // Try direct parse first
+    try {
+      const parsed = JSON.parse(content);
+      const validated = schema.parse(parsed);
+      return validated;
+    } catch (directError) {
+      logger.warn('[ACTION_GENERATOR] Direct JSON parse failed, trying extraction', {
+        error: directError instanceof Error ? directError.message : String(directError),
+      });
+    }
+
+    // Try to extract JSON from markdown code blocks or text
+    const jsonBlockMatch = content.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+    if (jsonBlockMatch) {
+      try {
+        const parsed = JSON.parse(jsonBlockMatch[1]);
+        const validated = schema.parse(parsed);
+        logger.info('[ACTION_GENERATOR] Successfully extracted JSON from markdown block');
+        return validated;
+      } catch (blockError) {
+        logger.warn('[ACTION_GENERATOR] Markdown block extraction failed', {
+          error: blockError instanceof Error ? blockError.message : String(blockError),
+        });
+      }
+    }
+
+    // Try to find first { ... } in content
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        const validated = schema.parse(parsed);
+        logger.info('[ACTION_GENERATOR] Successfully extracted JSON from content');
+        return validated;
+      } catch (matchError) {
+        logger.warn('[ACTION_GENERATOR] Content extraction failed', {
+          error: matchError instanceof Error ? matchError.message : String(matchError),
+        });
+      }
+    }
+
+    // All attempts failed
+    throw new Error(`Failed to parse JSON from LLM response. Content preview: ${content.substring(0, 200)}...`);
+  }
+
+  /**
+   * ✅ FIX 5: Mask PII (emails, phone numbers, tokens) before sending to LLM
+   */
+  private static maskPII(html: string): string {
+    if (!html) return '';
+
+    let masked = html;
+
+    // Mask emails: test@example.com → [EMAIL]
+    masked = masked.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[EMAIL]');
+
+    // Mask phone numbers: +1234567890, (123) 456-7890, etc.
+    masked = masked.replace(/[\+]?[(]?[0-9]{1,4}[)]?[-\s\.]?[(]?[0-9]{1,4}[)]?[-\s\.]?[0-9]{1,9}/g, '[PHONE]');
+
+    // Mask tokens/keys (long alphanumeric strings > 20 chars)
+    masked = masked.replace(/[a-zA-Z0-9_-]{32,}/g, '[TOKEN]');
+
+    // Mask credit card numbers (basic pattern)
+    masked = masked.replace(/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g, '[CARD]');
+
+    return masked;
   }
 }

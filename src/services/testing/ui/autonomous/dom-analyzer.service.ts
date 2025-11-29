@@ -116,33 +116,17 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
       }
 
       /**
-       * Generate unique CSS selector for an element
+       * ✅ CRITICAL FIX: Generate Playwright API selector (not CSS contextual locators)
+       * Priority: getByRole > getByLabel > getByText > data-testid > CSS
+       * Format: role=button[name="Login"], text="Login", label="Email", #id, .class
        */
       function generateSelector(element: any, selectorCounts: Map<string, number>): string {
-        // Try ID first (most reliable)
+        // Try ID first (most reliable, use CSS)
         if (element.id && element.id.length > 0) {
           return `#${element.id}`;
         }
 
-        // Try ARIA label (accessibility-first approach)
-        if (element.hasAttribute('aria-label')) {
-          const ariaLabel = element.getAttribute('aria-label');
-          if (ariaLabel && ariaLabel.length > 0 && ariaLabel.length < 50) {
-            const selector = `[aria-label="${escapeSelector(ariaLabel)}"]`;
-            return makeUnique(selector, selectorCounts, element);
-          }
-        }
-
-        // Try name attribute (common for forms)
-        if (element.hasAttribute('name')) {
-          const name = element.getAttribute('name');
-          if (name && name.length > 0) {
-            const selector = `${element.tagName.toLowerCase()}[name="${escapeSelector(name)}"]`;
-            return makeUnique(selector, selectorCounts, element);
-          }
-        }
-
-        // Try data-testid or data-cy (test-friendly)
+        // Try data-testid or data-cy (test-friendly, use CSS)
         if (element.hasAttribute('data-testid')) {
           return `[data-testid="${escapeSelector(element.getAttribute('data-testid'))}"]`;
         }
@@ -150,13 +134,53 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           return `[data-cy="${escapeSelector(element.getAttribute('data-cy'))}"]`;
         }
 
-        // Try role attribute (accessibility + semantic)
-        if (element.hasAttribute('role')) {
-          const role = element.getAttribute('role');
-          const roleName = element.hasAttribute('aria-label')
-            ? `[role="${role}"][aria-label="${escapeSelector(element.getAttribute('aria-label'))}"]`
-            : `[role="${role}"]`;
-          return makeUnique(roleName, selectorCounts, element);
+        // ✅ NEW: Try getByRole (best practice for accessibility)
+        // Detect implicit ARIA roles from HTML elements
+        const implicitRole = getImplicitRole(element);
+        if (implicitRole) {
+          const text = element.textContent?.trim();
+          // Use role with name if text is available and reasonable length
+          if (text && text.length > 0 && text.length < 50) {
+            return `role=${implicitRole}[name="${escapeSelector(text)}"]`;
+          }
+          // Use role without name (less specific, but still good)
+          return makeUnique(`role=${implicitRole}`, selectorCounts, element);
+        }
+
+        // ✅ NEW: Try getByLabel for inputs (accessibility-first)
+        if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
+          // Try aria-label first
+          if (element.hasAttribute('aria-label')) {
+            const ariaLabel = element.getAttribute('aria-label');
+            if (ariaLabel && ariaLabel.length > 0 && ariaLabel.length < 50) {
+              return `label="${escapeSelector(ariaLabel)}"`;
+            }
+          }
+
+          // Try placeholder as label
+          if (element.hasAttribute('placeholder')) {
+            const placeholder = element.getAttribute('placeholder');
+            if (placeholder && placeholder.length > 0 && placeholder.length < 50) {
+              return `label="${escapeSelector(placeholder)}"`;
+            }
+          }
+
+          // Try name attribute (fallback to CSS)
+          if (element.hasAttribute('name')) {
+            const name = element.getAttribute('name');
+            if (name && name.length > 0) {
+              const selector = `${element.tagName.toLowerCase()}[name="${escapeSelector(name)}"]`;
+              return makeUnique(selector, selectorCounts, element);
+            }
+          }
+        }
+
+        // ✅ NEW: Try getByText for buttons/links (Playwright API format)
+        if ((element.tagName === 'BUTTON' || element.tagName === 'A') && element.textContent) {
+          const text = element.textContent.trim();
+          if (text.length > 0 && text.length < 50) {
+            return `text="${escapeSelector(text)}"`;
+          }
         }
 
         // Try meaningful classes (filter out dynamic ones)
@@ -171,25 +195,6 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           }
         }
 
-        // Try placeholder for inputs
-        if (element.tagName === 'INPUT' && element.hasAttribute('placeholder')) {
-          const placeholder = element.getAttribute('placeholder');
-          if (placeholder && placeholder.length > 0) {
-            const selector = `input[placeholder="${escapeSelector(placeholder)}"]`;
-            return makeUnique(selector, selectorCounts, element);
-          }
-        }
-
-        // Try text content for buttons (Playwright-friendly)
-        if ((element.tagName === 'BUTTON' || element.tagName === 'A') && element.textContent) {
-          const text = element.textContent.trim();
-          if (text.length > 0 && text.length < 50) {
-            const tag = element.tagName.toLowerCase();
-            const selector = `${tag}:has-text("${escapeSelector(text)}")`;
-            return makeUnique(selector, selectorCounts, element);
-          }
-        }
-
         // Fallback to nth-of-type with parent context
         const parent = element.parentElement;
         if (parent) {
@@ -199,6 +204,92 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
         }
 
         return element.tagName.toLowerCase();
+      }
+
+      /**
+       * ✅ NEW: Get implicit ARIA role from HTML element
+       * Maps HTML elements to their implicit ARIA roles
+       * https://www.w3.org/TR/html-aria/#docconformance
+       */
+      function getImplicitRole(element: any): string | null {
+        const tag = element.tagName.toLowerCase();
+
+        // Explicit role attribute takes precedence
+        if (element.hasAttribute('role')) {
+          return element.getAttribute('role');
+        }
+
+        // Map HTML elements to implicit roles
+        switch (tag) {
+          case 'button':
+            return 'button';
+          case 'a':
+            return element.hasAttribute('href') ? 'link' : null;
+          case 'input':
+            const inputType = (element.getAttribute('type') || 'text').toLowerCase();
+            switch (inputType) {
+              case 'button':
+              case 'submit':
+              case 'reset':
+                return 'button';
+              case 'checkbox':
+                return 'checkbox';
+              case 'radio':
+                return 'radio';
+              case 'range':
+                return 'slider';
+              case 'text':
+              case 'email':
+              case 'tel':
+              case 'url':
+              case 'search':
+                return 'textbox';
+              default:
+                return null;
+            }
+          case 'textarea':
+            return 'textbox';
+          case 'select':
+            return element.hasAttribute('multiple') ? 'listbox' : 'combobox';
+          case 'img':
+            return element.hasAttribute('alt') ? 'img' : null;
+          case 'nav':
+            return 'navigation';
+          case 'main':
+            return 'main';
+          case 'header':
+            return 'banner';
+          case 'footer':
+            return 'contentinfo';
+          case 'aside':
+            return 'complementary';
+          case 'form':
+            return 'form';
+          case 'dialog':
+            return 'dialog';
+          case 'h1':
+          case 'h2':
+          case 'h3':
+          case 'h4':
+          case 'h5':
+          case 'h6':
+            return 'heading';
+          case 'ul':
+          case 'ol':
+            return 'list';
+          case 'li':
+            return 'listitem';
+          case 'table':
+            return 'table';
+          case 'tr':
+            return 'row';
+          case 'td':
+            return 'cell';
+          case 'th':
+            return 'columnheader';
+          default:
+            return null;
+        }
       }
 
       /**

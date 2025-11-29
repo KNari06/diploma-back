@@ -5,6 +5,7 @@
  */
 
 import { dbAdminService } from '@/db/supabase';
+import { AICostManager, getCostManager, removeCostManager } from '@/services/ai-cost-manager.service';
 import { logger } from '@/utils/logger';
 import { webSocketService } from '@/websocket/websocket.service';
 import { Browser, Page } from 'playwright';
@@ -14,6 +15,7 @@ import { IntelligentPageAnalyzer } from './intelligent-page-analyzer';
 import { ResultValidator } from './result-validator';
 import { SafetyGuard } from './safety-guard';
 import { StateTracker } from './state-tracker';
+import { normalizeSelector, getLocator, validateAndGetLocator } from './utils/selector-utils';
 import {
   ActionResult,
   DynamicAction,
@@ -49,6 +51,8 @@ export class IntelligentTestOrchestrator {
   private commandExecutor!: CommandExecutor;
   private progressEmitter?: TestProgressEmitter;
   private graphBuilder!: GraphBuilder; // ✅ NEW: Graph builder for real-time visualization
+  private abortController: AbortController; // ✅ FIX 7: AbortController for cancellation
+  private costManager?: AICostManager; // ✅ FIX 9: AI cost manager for budget control
 
   // ✅ OPTIMIZED: Screenshot metrics for monitoring
   private screenshotMetrics = {
@@ -63,15 +67,49 @@ export class IntelligentTestOrchestrator {
   // ✅ NEW: Track consecutive empty pages to stop early
   private consecutiveEmptyPages = 0;
 
+  // ✅ NEW: Track selector failures to prevent infinite loops
+  private selectorFailures = new Map<string, number>(); // selector -> failure count
+  private readonly MAX_SELECTOR_FAILURES = 3; // Stop trying after 3 failures
+
   constructor(config: IntelligentTestConfig, userId?: string, testId?: string) {
     this.config = config;
     this.userId = userId;
     this.testId = testId;
 
+    // ✅ FIX 7: Initialize AbortController
+    this.abortController = new AbortController();
+
+    // ✅ FIX 9: Initialize AI cost manager
+    if (this.testId) {
+      this.costManager = getCostManager(this.testId, {
+        maxCostPerTest: 1.0,      // $1 per test
+        warningThreshold: 0.7,     // Warning at 70%
+        adaptiveMode: true,        // Enable adaptive mode
+        fallbackModel: 'gpt-4o-mini', // Fallback to mini
+      });
+    }
+
     // Initialize progress emitter if testId is provided
     if (this.testId) {
       const browser = this.config.browser || 'chrome';
       this.progressEmitter = new TestProgressEmitter(this.testId, browser);
+    }
+  }
+
+  /**
+   * ✅ FIX 7: Abort test execution
+   * Called when user cancels the test
+   */
+  abort(): void {
+    logger.info('[INTELLIGENT_ORCHESTRATOR] Aborting test execution', {
+      testId: this.testId,
+    });
+
+    this.abortController.abort();
+
+    // Abort command executor if initialized
+    if (this.commandExecutor) {
+      this.commandExecutor.abort();
     }
   }
 
@@ -82,7 +120,18 @@ export class IntelligentTestOrchestrator {
   async execute(browser: Browser, page: Page): Promise<IntelligentTestResult> {
     this.browser = browser;
     this.page = page;
-    this.commandExecutor = new CommandExecutor(page);
+
+    // ✅ FIX 7: Pass AbortSignal to CommandExecutor
+    // ✅ FIX 9: Pass cost manager to CommandExecutor
+    this.commandExecutor = new CommandExecutor(page, {
+      abortSignal: this.abortController.signal,
+      costManager: this.costManager, // ✅ FIX 9: Pass cost manager
+      metadata: {
+        url: this.config.startUrl,
+        projectId: this.testId,
+        userId: this.userId,
+      },
+    });
 
     // ✅ CRITICAL FIX: Setup navigation listeners to track all URL changes
     this.setupNavigationListeners();
@@ -303,6 +352,21 @@ export class IntelligentTestOrchestrator {
       });
 
       return await this.buildResult(false);
+    } finally {
+      // ✅ FIX 9: Cleanup cost manager after test completion
+      if (this.testId) {
+        // Log final cost stats before cleanup
+        if (this.costManager) {
+          const stats = this.costManager.getStats();
+          logger.info('[INTELLIGENT_ORCHESTRATOR] Final AI cost stats', {
+            testId: this.testId,
+            ...stats,
+          });
+        }
+
+        // Remove cost manager from registry
+        removeCostManager(this.testId);
+      }
     }
   }
 
@@ -451,7 +515,8 @@ export class IntelligentTestOrchestrator {
           // Try to decide next step despite cycle
           const decision = await ContextualActionGenerator.decideNextStep(
             this.state,
-            context
+            context,
+            this.costManager  // ✅ FIX 9: Pass cost manager
           );
 
           if (decision.action === 'stop' || decision.action === 'skip') {
@@ -542,7 +607,8 @@ export class IntelligentTestOrchestrator {
           // Decide next step
           const decision = await ContextualActionGenerator.decideNextStep(
             this.state,
-            context
+            context,
+            this.costManager  // ✅ FIX 9: Pass cost manager
           );
 
           if (decision.action !== 'continue') {
@@ -584,7 +650,8 @@ export class IntelligentTestOrchestrator {
         // STEP 6: Decide next step
         const decision = await ContextualActionGenerator.decideNextStep(
           this.state,
-          context
+          context,
+          this.costManager  // ✅ FIX 9: Pass cost manager
         );
 
         logger.info('[INTELLIGENT_ORCHESTRATOR] Next step decision', {
@@ -667,8 +734,27 @@ export class IntelligentTestOrchestrator {
           timestamp: Date.now(),
         });
 
+        // ✅ IMPROVED: Check for repeated selector errors (infinite loop detection)
+        const recentSelectorErrors = this.state.errors
+          .slice(-5)
+          .filter(e => e.message.includes('Selector not found') || e.message.includes('not found'))
+          .length;
+
+        if (recentSelectorErrors >= 3) {
+          logger.error('[INTELLIGENT_ORCHESTRATOR] Too many selector errors in a row, possible infinite loop', {
+            testId: this.testId,
+            recentSelectorErrors,
+            totalErrors: this.state.errors.length,
+            recentErrors: this.state.errors.slice(-3).map(e => e.message),
+          });
+          this.emitEvent('test_warning', {
+            message: 'Too many selector errors detected. Test may be stuck in a loop.',
+          });
+          // Don't break immediately - try one more iteration with different approach
+        }
+
         // Too many errors? Stop
-        if (this.state.errors.length > 5) {
+        if (this.state.errors.length > 10) {
           logger.error('[INTELLIGENT_ORCHESTRATOR] Too many errors, stopping', {
             testId: this.testId,
             totalErrors: this.state.errors.length,
@@ -864,10 +950,12 @@ export class IntelligentTestOrchestrator {
 
     this.emitEvent('actions_generating', {});
 
+    // ✅ FIX 9: Pass cost manager to action generator
     const result = await ContextualActionGenerator.generateActions(
       context,
       this.state,
-      this.page  // ✅ NEW: Pass page for HTML extraction
+      this.page,  // ✅ NEW: Pass page for HTML extraction
+      this.costManager  // ✅ FIX 9: Pass cost manager for budget control
     );
 
     // Update cost
@@ -967,21 +1055,40 @@ export class IntelligentTestOrchestrator {
         // ✅ IMPROVED: Validate selector exists AND is visible/actionable before execution
         if (action.selector && ['click', 'fill', 'type', 'select', 'check', 'uncheck', 'hover'].includes(action.action)) {
           try {
-            const locator = this.page.locator(action.selector);
+            // ✅ FIX: Normalize selector format before using (convert getByText('text') → text="text")
+            const normalizedSelector = normalizeSelector(action.selector);
+            // ✅ CRITICAL FIX: Use getLocator() helper to support text=, role=, label= formats
+            const locator = this.getLocatorWrapper(normalizedSelector);
             const elementCount = await locator.count();
 
             if (elementCount === 0) {
+              // ✅ NEW: Track selector failures to prevent infinite loops
+              const failureCount = (this.selectorFailures.get(normalizedSelector) || 0) + 1;
+              this.selectorFailures.set(normalizedSelector, failureCount);
+
               logger.warn('[INTELLIGENT_ORCHESTRATOR] Selector not found, marking action as optional', {
                 testId: this.testId,
                 action: action.description,
                 selector: action.selector,
+                normalizedSelector,
+                failureCount,
+                maxFailures: this.MAX_SELECTOR_FAILURES,
               });
+
+              // If selector failed too many times, skip permanently
+              if (failureCount >= this.MAX_SELECTOR_FAILURES) {
+                logger.error('[INTELLIGENT_ORCHESTRATOR] Selector failed too many times, skipping permanently', {
+                  testId: this.testId,
+                  selector: normalizedSelector,
+                  failureCount,
+                });
+              }
 
               // Mark as optional and skip
               const actionResult: ActionResult = {
-                action,
+                action: { ...action, selector: normalizedSelector }, // Update with normalized selector
                 success: false,
-                error: `Selector not found: ${action.selector}`,
+                error: `Selector not found: ${normalizedSelector} (failed ${failureCount} times)`,
                 urlChanged: false,
                 urlBefore,
                 urlAfter: urlBefore,
@@ -994,6 +1101,9 @@ export class IntelligentTestOrchestrator {
               // Mark action as optional to continue
               action.optional = true;
               continue; // Skip this action
+            } else {
+              // ✅ NEW: Reset failure count if selector works
+              this.selectorFailures.delete(normalizedSelector);
             }
 
             // ✅ NEW: For click actions, also check if element is visible and actionable
@@ -1005,7 +1115,9 @@ export class IntelligentTestOrchestrator {
                 });
 
                 // Check if element is actionable (not covered by other elements)
-                const isActionable = await locator.evaluate((el) => {
+                // ✅ FIX: Use first() to get single element for evaluate
+                const firstLocator = locator.first();
+                const isActionable = await firstLocator.evaluate((el) => {
                   // @ts-ignore - browser context
                   const rect = el.getBoundingClientRect();
                   const centerX = rect.left + rect.width / 2;
@@ -1019,14 +1131,14 @@ export class IntelligentTestOrchestrator {
                   logger.warn('[INTELLIGENT_ORCHESTRATOR] Element found but not actionable (covered by another element)', {
                     testId: this.testId,
                     action: action.description,
-                    selector: action.selector,
+                    selector: normalizedSelector,
                   });
                   // Don't skip - try to click anyway, might work
                 }
               } catch (visibilityError) {
                 logger.warn('[INTELLIGENT_ORCHESTRATOR] Element not visible or actionable', {
                   testId: this.testId,
-                  selector: action.selector,
+                  selector: normalizedSelector,
                   error: visibilityError instanceof Error ? visibilityError.message : String(visibilityError),
                 });
                 // Continue anyway - might become visible during click
@@ -1036,6 +1148,7 @@ export class IntelligentTestOrchestrator {
             logger.warn('[INTELLIGENT_ORCHESTRATOR] Selector validation failed', {
               testId: this.testId,
               selector: action.selector,
+              normalizedSelector: normalizeSelector(action.selector),
               error: selectorError instanceof Error ? selectorError.message : String(selectorError),
             });
             // Continue anyway - might be a valid selector that just needs more time
@@ -1078,9 +1191,11 @@ export class IntelligentTestOrchestrator {
         }
 
         // Execute action using CommandExecutor
+        // ✅ FIX: Normalize selector before passing to CommandExecutor (it will normalize again, but this ensures consistency)
+        const selectorForExecution = action.selector ? normalizeSelector(action.selector) : action.selector;
         const executionResult = await this.commandExecutor.executeCommand({
           action: action.action as any,
-          selector: action.selector,
+          selector: selectorForExecution,
           value: action.value,
           url: action.url,
           timeout: action.timeout,
@@ -1788,4 +1903,18 @@ export class IntelligentTestOrchestrator {
     };
     return emojiMap[actionType] || '🔄';
   }
+
+  /**
+   * ✅ FIX 2: Use centralized selector normalization (removed duplication)
+   */
+  // Removed: normalizeSelector() - now using utils/selector-utils.ts
+
+  /**
+   * ✅ FIX 2: Use centralized locator creation (removed duplication)
+   */
+  private getLocatorWrapper(selector: string): import('playwright').Locator {
+    return getLocator(this.page, selector);
+  }
+
+  // ✅ FIX 2: Old implementations removed - now using centralized selector-utils.ts
 }

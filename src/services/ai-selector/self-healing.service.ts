@@ -109,69 +109,70 @@ export class SelfHealingService {
         };
       }
 
-      // Step 6: Test new selector
+      // Step 6: Test new selector with dry-run validation
       const newSelector = resolveResult.selectedNode.primarySelector;
-      const isWorking = await this.testSelector(page, newSelector);
+      const testResult = await this.testSelectorWithDryRun(page, newSelector);
 
-      if (!isWorking) {
+      if (!testResult.works) {
         logger.warn('[SELF_HEALING] New selector does not work', {
           oldSelector,
           newSelector,
+          count: testResult.count,
+          isVisible: testResult.isVisible,
+          error: testResult.error,
         });
+
+        // ✅ NEW: Try fallback selectors if primary fails
+        if (resolveResult.fallbackSelectors && resolveResult.fallbackSelectors.length > 0) {
+          logger.info('[SELF_HEALING] Trying fallback selectors', {
+            count: resolveResult.fallbackSelectors.length,
+          });
+
+          for (const fallback of resolveResult.fallbackSelectors) {
+            const fallbackTest = await this.testSelectorWithDryRun(page, fallback.selector);
+            if (fallbackTest.works) {
+              logger.info('[SELF_HEALING] Fallback selector works!', {
+                selector: fallback.selector,
+                type: fallback.type,
+              });
+
+              // Use fallback selector instead
+              const fallbackDuration = Date.now() - startTime;
+              return this.buildSuccessResult(
+                oldSelector,
+                fallback.selector,
+                fallback.type,
+                fallback.confidence,
+                fallbackDuration
+              );
+            }
+          }
+        }
 
         return {
           success: false,
           oldSelector,
           newSelector,
           diff: {
-            what_changed: 'Found selector but it does not work',
+            what_changed: `Found selector but validation failed: ${testResult.error || 'not visible or not unique'}`,
             old_strategy: this.detectSelectorType(oldSelector),
             new_strategy: resolveResult.selectedNode.selectorType,
             confidence: resolveResult.selectedNode.confidence,
           },
-          suggestion: `Tried ${newSelector} but it failed validation`,
+          suggestion: `Tried ${newSelector} but it failed validation (count: ${testResult.count}, visible: ${testResult.isVisible})`,
           autoApplied: false,
         };
       }
 
       // Step 7: Build success result
-      const oldStrategy = this.detectSelectorType(oldSelector);
-      const newStrategy = resolveResult.selectedNode.selectorType;
-
-      const whatChanged = this.describeWhatChanged(
-        oldSelector,
-        newSelector,
-        oldStrategy,
-        newStrategy
-      );
-
       const duration = Date.now() - startTime;
-
-      logger.info('[SELF_HEALING] Successfully healed selector', {
+      return this.buildSuccessResult(
         oldSelector,
         newSelector,
-        duration: `${duration}ms`,
-        confidence: resolveResult.selectedNode.confidence,
-      });
-
-      // Auto-apply if confidence is high
-      const autoApplied = resolveResult.selectedNode.confidence >= 0.85;
-
-      return {
-        success: true,
-        oldSelector,
-        newSelector,
-        diff: {
-          what_changed: whatChanged,
-          old_strategy: oldStrategy,
-          new_strategy: newStrategy,
-          confidence: resolveResult.selectedNode.confidence,
-        },
-        suggestion: autoApplied
-          ? `Auto-applied: ${newSelector}`
-          : `Suggestion: Use ${newSelector} (confidence: ${(resolveResult.selectedNode.confidence * 100).toFixed(0)}%)`,
-        autoApplied,
-      };
+        resolveResult.selectedNode.selectorType,
+        resolveResult.selectedNode.confidence,
+        duration
+      );
     } catch (error) {
       logger.error('[SELF_HEALING] Healing failed', {
         error,
@@ -195,21 +196,164 @@ export class SelfHealingService {
   }
 
   /**
-   * Test if a selector works on the page
+   * ✅ DEPRECATED: Use testSelectorWithDryRun() instead
+   * Kept for backwards compatibility
    */
   private static async testSelector(page: Page, selector: string): Promise<boolean> {
-    try {
-      // Try to find element
-      const count = await page.locator(selector).count();
-      if (count === 0) return false;
+    const result = await this.testSelectorWithDryRun(page, selector);
+    return result.works;
+  }
 
-      // Check if element is visible
-      const isVisible = await page.locator(selector).first().isVisible();
-      return isVisible;
+  /**
+   * ✅ NEW: Test selector with dry-run validation
+   * Returns detailed information about why selector works or doesn't work
+   * Uses getLocator() helper to support all Playwright formats (text=, role=, label=)
+   */
+  private static async testSelectorWithDryRun(page: Page, selector: string): Promise<{
+    works: boolean;
+    count: number;
+    isVisible: boolean;
+    error?: string;
+  }> {
+    try {
+      // ✅ CRITICAL FIX: Use getLocator() helper instead of page.locator()
+      // This ensures we support text=, role=, label= formats
+      const locator = this.getLocatorForPage(page, selector);
+      const count = await locator.count();
+
+      if (count === 0) {
+        return {
+          works: false,
+          count: 0,
+          isVisible: false,
+          error: 'No elements found',
+        };
+      }
+
+      // Check if element is visible (with short timeout)
+      const isVisible = await locator.first().isVisible({ timeout: 2000 }).catch(() => false);
+
+      // ✅ STRICT: Only works if exactly 1 element and visible
+      // Multiple elements = ambiguous selector
+      return {
+        works: count === 1 && isVisible,
+        count,
+        isVisible,
+        error: count > 1 ? `Multiple elements found (${count})` : !isVisible ? 'Element not visible' : undefined,
+      };
     } catch (error) {
       logger.debug('[SELF_HEALING] Selector test failed', { selector, error });
-      return false;
+      return {
+        works: false,
+        count: 0,
+        isVisible: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
+  }
+
+  /**
+   * ✅ NEW: Get Playwright locator for a page (duplicated from CommandExecutor)
+   * This is needed because SelfHealingService doesn't have access to CommandExecutor instance
+   * TODO: Extract to shared utility if this grows
+   * @returns Locator - all Playwright methods return Locator type
+   */
+  private static getLocatorForPage(page: Page, selector: string): import('playwright').Locator {
+    if (!selector) {
+      throw new Error('Selector is required');
+    }
+
+    const s = selector.trim();
+
+    // 1. Handle text= format
+    const textMatch = s.match(/^text\s*=\s*(.+)$/i);
+    if (textMatch) {
+      let payload = textMatch[1].trim();
+      const regexMatch = payload.match(/^\/(.+?)\/([gimsuy]*)$/);
+      if (regexMatch) {
+        return page.getByText(new RegExp(regexMatch[1], regexMatch[2]));
+      }
+      payload = payload.replace(/^["']|["']$/g, '');
+      const isExact = textMatch[1].includes('"') || textMatch[1].includes("'");
+      return page.getByText(payload, { exact: isExact });
+    }
+
+    // 2. Handle label= format
+    const labelMatch = s.match(/^label\s*=\s*(.+)$/i);
+    if (labelMatch) {
+      const label = labelMatch[1].trim().replace(/^["']|["']$/g, '');
+      return page.getByLabel(label);
+    }
+
+    // 3. Handle role= format
+    const roleMatch = s.match(/^role\s*=\s*([^\[\s]+)(?:\s*\[name\s*=\s*(.+?)\])?$/i);
+    if (roleMatch) {
+      const role = roleMatch[1].trim() as any;
+      let name = roleMatch[2]?.trim();
+      if (name) {
+        const nameRegexMatch = name.match(/^\/(.+?)\/([gimsuy]*)$/);
+        if (nameRegexMatch) {
+          return page.getByRole(role, { name: new RegExp(nameRegexMatch[1], nameRegexMatch[2]) });
+        }
+        name = name.replace(/^["']|["']$/g, '');
+        return page.getByRole(role, { name });
+      }
+      return page.getByRole(role);
+    }
+
+    // 4. Handle contextual locators
+    if (s.includes('>>') || s.includes(':has-text(') || s.includes(':has(') || s.includes(':scope')) {
+      return page.locator(s);
+    }
+
+    // 5. Handle XPath
+    if (s.match(/^(xpath\s*=\s*)?\/{1,2}/i)) {
+      const xpath = s.startsWith('xpath=') ? s.slice(6).trim() : s;
+      return page.locator(`xpath=${xpath}`);
+    }
+
+    // 6. CSS selector (default)
+    return page.locator(s);
+  }
+
+  /**
+   * ✅ NEW: Build success result (extracted for reuse with fallback selectors)
+   */
+  private static buildSuccessResult(
+    oldSelector: string,
+    newSelector: string,
+    newStrategy: SelectorType,
+    confidence: number,
+    duration: number
+  ): SelfHealingResult {
+    const oldStrategy = this.detectSelectorType(oldSelector);
+    const whatChanged = this.describeWhatChanged(oldSelector, newSelector, oldStrategy, newStrategy);
+    const autoApplied = confidence >= 0.8;
+
+    logger.info('[SELF_HEALING] Successfully healed selector', {
+      oldSelector,
+      newSelector,
+      whatChanged,
+      confidence,
+      autoApplied,
+      duration: `${duration}ms`,
+    });
+
+    return {
+      success: true,
+      oldSelector,
+      newSelector,
+      diff: {
+        what_changed: whatChanged,
+        old_strategy: oldStrategy,
+        new_strategy: newStrategy,
+        confidence,
+      },
+      suggestion: autoApplied
+        ? `Auto-applied: ${newSelector}`
+        : `Suggestion: Use ${newSelector} (confidence: ${(confidence * 100).toFixed(0)}%)`,
+      autoApplied,
+    };
   }
 
   /**

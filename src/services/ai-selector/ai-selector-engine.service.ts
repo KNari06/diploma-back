@@ -402,18 +402,20 @@ export class AISelectorEngine {
 
   /**
    * Generate Playwright getByRole selector
+   * ✅ FIX: Convert to Playwright locator format (role=button or role=button[name='Login'])
    */
   private static generateRoleSelector(node: DOMNode): SelectorCandidate | null {
     if (!node.role) return null;
 
-    let selector = `getByRole('${node.role}'`;
+    // ✅ FIX: Use Playwright locator format
+    let selector = `role=${node.role}`;
 
     // Add name filter if has text
     if (node.text && node.text.length > 0 && node.text.length < 50) {
-      selector += `, {name: '${node.text.replace(/'/g, "\\'")}'}`;
+      // Escape quotes in text
+      const escapedText = node.text.replace(/'/g, "\\'").replace(/"/g, '\\"');
+      selector += `[name="${escapedText}"]`;
     }
-
-    selector += ')';
 
     return {
       type: 'getByRole',
@@ -426,14 +428,19 @@ export class AISelectorEngine {
 
   /**
    * Generate Playwright getByLabel selector
+   * ✅ FIX: Convert to Playwright locator format (label=Email)
    */
   private static generateLabelSelector(node: DOMNode): SelectorCandidate | null {
     const label = node.attributes['aria-label'] || node.attributes.placeholder;
     if (!label) return null;
 
+    // ✅ FIX: Use Playwright locator format
+    const escapedLabel = label.replace(/"/g, '\\"');
+    const selector = `label="${escapedLabel}"`;
+
     return {
       type: 'getByLabel',
-      selector: `getByLabel('${label.replace(/'/g, "\\'")}')`,
+      selector,
       confidence: 0.85,
       reasoning: 'Accessibility label selector',
       stability: 0.85,
@@ -442,13 +449,18 @@ export class AISelectorEngine {
 
   /**
    * Generate Playwright getByText selector
+   * ✅ FIX: Convert to Playwright locator format (text=Login)
    */
   private static generateTextSelector(node: DOMNode): SelectorCandidate | null {
     if (!node.text || node.text.length === 0 || node.text.length > 100) return null;
 
+    // ✅ FIX: Use Playwright locator format (text=...)
+    const escapedText = node.text.replace(/"/g, '\\"');
+    const selector = `text="${escapedText}"`;
+
     return {
       type: 'getByText',
-      selector: `getByText('${node.text.replace(/'/g, "\\'")}')`,
+      selector,
       confidence: 0.75,
       reasoning: 'Text content selector',
       stability: 0.70, // Text can change

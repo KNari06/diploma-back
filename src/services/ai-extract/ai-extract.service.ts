@@ -12,8 +12,8 @@ import type {
   AIExtractRequest,
   AIExtractResponse,
   JSONSchema,
-  ValidationResult,
-  SchemaGenerationResult
+  SchemaGenerationResult,
+  ValidationResult
 } from './types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -90,11 +90,13 @@ export class AIExtractService {
    * Extract structured data from page element using AI + JSON schema
    * @param page - Playwright page
    * @param request - Extract request with selector and schema
+   * @param costManager - Optional cost manager for budget control
    * @returns Extracted data matching schema
    */
   static async extract(
     page: Page,
-    request: AIExtractRequest
+    request: AIExtractRequest,
+    costManager?: import('@/services/ai-cost-manager.service').AICostManager
   ): Promise<AIExtractResponse> {
     const startTime = Date.now();
 
@@ -102,6 +104,7 @@ export class AIExtractService {
       selector: request.selector,
       mode: request.mode || 'auto',
       hasSchema: !!request.schema,
+      hasCostManager: !!costManager,
     });
 
     try {
