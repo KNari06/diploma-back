@@ -355,9 +355,42 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // MODE DETECTION: Priority order
+    // 1. If commands exist → Standard Mode (execute commands)
+    // 2. If no commands + intelligentMode + testGoal → Intelligent Mode
+    // 3. Otherwise → Legacy Mode (simple navigation)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const hasCommands = !!(testData.commands && testData.commands.length > 0);
+    const hasIntelligentGoal = !!(testData.intelligentMode && (testData.testGoal || testData.intent));
+
+    // ✅ FIX: Check commands FIRST (highest priority)
+    // If commands exist, use Standard Mode regardless of intelligentMode flag
+    if (hasCommands) {
+      logger.info('[PLAYWRIGHT] Standard Mode detected (commands provided)', {
+        testId: testData.testId,
+        commandsCount: testData.commands?.length || 0,
+        intelligentModeFlag: testData.intelligentMode, // Log original flag for debugging
+      });
+      // Will execute commands below (line ~746)
+    } else if (hasIntelligentGoal) {
+      // ✅ FIX: Intelligent Mode only if NO commands AND has goal
+      logger.info('[PLAYWRIGHT] Intelligent Mode detected (no commands, goal provided)', {
+        testId: testData.testId,
+        goal: testData.testGoal || testData.intent,
+        mode: 'balanced',
+      });
+    } else {
+      logger.info('[PLAYWRIGHT] Legacy Mode detected (no commands, no goal)', {
+        testId: testData.testId,
+        intelligentModeFlag: testData.intelligentMode,
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // INTELLIGENT MODE: Use IntelligentTestOrchestrator
     // ═══════════════════════════════════════════════════════════════════════
-    if (testData.intelligentMode) {
+    if (hasIntelligentGoal && !hasCommands) {
       logger.info('[PLAYWRIGHT] Intelligent mode activated', {
         testId: testData.testId,
         goal: testData.testGoal || testData.intent || 'General testing',
@@ -742,8 +775,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     const timeout = testData.options?.timeout || 30000;
     page.setDefaultTimeout(timeout);
 
-    // Execute Playwright commands if provided
-    if (testData.commands && testData.commands.length > 0) {
+    // ═══════════════════════════════════════════════════════════════════════
+    // STANDARD MODE: Execute predefined commands
+    // ═══════════════════════════════════════════════════════════════════════
+    // ✅ FIX: Only execute commands if NOT in Intelligent Mode
+    if (hasCommands && !hasIntelligentGoal && testData.commands) {
       logger.info(`Executing ${testData.commands.length} Playwright commands`, {
         testId: testData.testId,
         commandCount: testData.commands.length,

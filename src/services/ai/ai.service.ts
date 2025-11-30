@@ -6,10 +6,16 @@ import OpenAI from 'openai';
 
 // Constants
 const AI_TIMEOUT = 30000; // 30 seconds
-const MAX_DOM_LENGTH = 10000;
+const MAX_DOM_LENGTH = 5000; // Reduced from 10000 to save tokens
 const MAX_TOKENS_ANALYSIS = env.OPENAI_MAX_TOKENS || 2000;
 const ANALYSIS_TEMPERATURE = 0.3; // Lower for consistency
 const SUMMARY_TEMPERATURE = 0.5;
+
+// ✅ NEW: Token management for context
+const MAX_LOGS_COUNT = 20; // Only send last 20 logs
+const MAX_NETWORK_LOGS_COUNT = 10; // Only send last 10 network requests
+const MAX_ERRORS_COUNT = 10; // Only send last 10 errors
+const MAX_NETWORK_LOG_BODY_LENGTH = 500; // Truncate response bodies to 500 chars
 
 export class AIService {
   private openai: OpenAI;
@@ -76,27 +82,55 @@ export class AIService {
 
   /**
    * Prepare context for AI analysis
+   * ✅ FIXED: Aggressive truncation to prevent context length exceeded errors
    */
   private prepareAnalysisContext(testResult: TestResult): string {
     // Note: URL should be passed from the job handler when fetching from DB
     // The job handler includes tests.url via JOIN query
+
+    // ✅ Log original sizes for debugging
+    logger.debug('[AI_SERVICE] Context sizes before truncation', {
+      testId: testResult.testId,
+      errorsCount: (testResult.errors || []).length,
+      logsCount: (testResult.logs || []).length,
+      networkLogsCount: (testResult.networkLogs || []).length,
+      domLength: testResult.dom?.length || 0,
+    });
+
     const context = {
       testId: testResult.testId,
       // URL is not directly in TestResult - must be provided by caller from tests table
       // This is handled in ai-analysis.job.ts via JOIN: tests(url)
       browser: testResult.browser,
       status: testResult.status,
-      errors: testResult.errors || [],
-      logs: testResult.logs || [],
-      networkLogs: testResult.networkLogs || [],
+      // ✅ Truncate errors (only last N)
+      errors: this.truncateArray(testResult.errors || [], MAX_ERRORS_COUNT),
+      // ✅ Truncate logs (only last N)
+      logs: this.truncateArray(testResult.logs || [], MAX_LOGS_COUNT),
+      // ✅ Truncate network logs (only last N) and truncate response bodies
+      networkLogs: this.truncateNetworkLogs(testResult.networkLogs || []),
       performance: testResult.performance || null,
+      // ✅ Truncate DOM
       dom: testResult.dom ? this.truncateDOM(testResult.dom) : null,
       screenshot: testResult.screenshot ? 'Screenshot available' : 'No screenshot',
       videoUrl: testResult.videoUrl || null,
       traceUrl: testResult.traceUrl || null,
     };
 
-    return JSON.stringify(context, null, 2);
+    const contextString = JSON.stringify(context, null, 2);
+
+    // ✅ Log final context size
+    logger.info('[AI_SERVICE] Context prepared for AI analysis', {
+      testId: testResult.testId,
+      contextLength: contextString.length,
+      estimatedTokens: Math.ceil(contextString.length / 4), // Rough estimate: 1 token ≈ 4 chars
+      errorsIncluded: context.errors.length,
+      logsIncluded: context.logs.length,
+      networkLogsIncluded: context.networkLogs.length,
+      domLength: context.dom?.length || 0,
+    });
+
+    return contextString;
   }
 
   /**
@@ -121,6 +155,58 @@ export class AIService {
     }
 
     return truncated + '\n... [DOM truncated]';
+  }
+
+  /**
+   * ✅ NEW: Truncate array to max count (keep last N items)
+   */
+  private truncateArray<T>(array: T[], maxCount: number): T[] {
+    if (!Array.isArray(array)) {
+      return [];
+    }
+
+    if (array.length <= maxCount) {
+      return array;
+    }
+
+    // Return last N items (most recent)
+    return array.slice(-maxCount);
+  }
+
+  /**
+   * ✅ NEW: Truncate network logs and their response bodies
+   */
+  private truncateNetworkLogs(networkLogs: any[]): any[] {
+    if (!Array.isArray(networkLogs)) {
+      return [];
+    }
+
+    // Take only last N network logs
+    const truncatedLogs = this.truncateArray(networkLogs, MAX_NETWORK_LOGS_COUNT);
+
+    // Truncate response bodies in each log
+    return truncatedLogs.map(log => {
+      if (!log) return log;
+
+      const truncatedLog = { ...log };
+
+      // Remove or truncate large fields
+      if (truncatedLog.responseBody) {
+        const bodyStr = typeof truncatedLog.responseBody === 'string'
+          ? truncatedLog.responseBody
+          : JSON.stringify(truncatedLog.responseBody);
+
+        if (bodyStr.length > MAX_NETWORK_LOG_BODY_LENGTH) {
+          truncatedLog.responseBody = bodyStr.substring(0, MAX_NETWORK_LOG_BODY_LENGTH) + '... [truncated]';
+        }
+      }
+
+      // Remove headers to save tokens (not usually needed for analysis)
+      delete truncatedLog.requestHeaders;
+      delete truncatedLog.responseHeaders;
+
+      return truncatedLog;
+    });
   }
 
   /**

@@ -122,16 +122,23 @@ export class DOMNodeExtractor {
         }
 
         /**
+         * ✅ FIX: Create counter and visited set INSIDE page.evaluate() using closure
+         * This ensures they exist in browser context and are shared across all recursive calls
+         * Set and Map cannot be serialized when passed as parameters to page.evaluate()
+         */
+        let nodeCounter = 0;
+        const visited = new Set<any>(); // ✅ FIX: Create Set in closure, not as parameter
+
+        /**
          * ✅ NEW: Recursively traverse Shadow DOM to extract nodes
          * Handles nested Shadow DOM, closed Shadow DOM (skips), and visited set
+         * Uses closure to access nodeCounter and visited (no need to pass them as parameters)
          */
         function extractFromShadowDOM(
           root: any, // Document | ShadowRoot (browser context)
           shadowHost: any | undefined,
           depth: number,
-          maxDepth: number,
-          visited: Set<any>,
-          nodeCounter: { count: number } // ✅ FIX: Global counter passed by reference
+          maxDepth: number
         ): any[] {
           const nodes: any[] = [];
 
@@ -166,9 +173,7 @@ export class DOMNodeExtractor {
                 shadowRoot,
                 element, // Current element becomes shadow host for children
                 depth + 1,
-                maxDepth,
-                visited,
-                nodeCounter // ✅ FIX: Pass same counter
+                maxDepth
               );
               nodes.push(...shadowNodes);
             }
@@ -187,9 +192,10 @@ export class DOMNodeExtractor {
             const attributes = getAttributes(element);
             const role = element.getAttribute('role') || undefined;
 
-            // ✅ FIX: Use global counter to ensure unique nodeId
-            const nodeId = `node-${nodeCounter.count}`;
-            nodeCounter.count++;
+            // ✅ FIX: Use closure to access and increment counter
+            // This ensures unique nodeId across all recursive calls
+            const nodeId = `node-${nodeCounter}`;
+            nodeCounter++; // Increment for next node
 
             nodes.push({
               nodeId,
@@ -216,10 +222,9 @@ export class DOMNodeExtractor {
         }
 
         // ✅ NEW: Extract from regular DOM and Shadow DOM
-        // ✅ FIX: Use object for counter to pass by reference
-        const nodeCounter = { count: 0 };
+        // ✅ FIX: nodeCounter and visited are in closure, no need to pass them as parameters
         // @ts-ignore - browser context
-        const nodes = extractFromShadowDOM(document, undefined, 0, 5, new Set(), nodeCounter);
+        const nodes = extractFromShadowDOM(document, undefined, 0, 5);
 
         return nodes;
       },

@@ -4,8 +4,8 @@
  * Used by CommandExecutor, IntelligentTestOrchestrator, and other components
  */
 
-import { Page, Locator } from 'playwright';
 import { logger } from '@/utils/logger';
+import { Locator, Page } from 'playwright';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ARIA ROLES VALIDATION
@@ -293,6 +293,8 @@ export async function validateAndGetLocator(
   count?: number;
   isVisible?: boolean;
   isActionable?: boolean;
+  isDisabled?: boolean; // ✅ NEW
+  disabledReason?: string; // ✅ NEW
 }> {
   const { actionType = 'other', timeout = 2000 } = options;
 
@@ -326,6 +328,100 @@ export async function validateAndGetLocator(
         count,
         isVisible: false,
       };
+    }
+
+    // ✅ IMPROVED: Universal disabled check (context-aware)
+    // Checks both element and parent disabled state (fieldset, etc.)
+    let isDisabled = false;
+    let disabledReason: string | undefined;
+    if (actionType === 'click' || actionType === 'fill' || actionType === 'type') {
+      try {
+        const disabledInfo = await locator.evaluate((el: any, actionType: string) => {
+          const htmlEl = el;
+          const result: { disabled: boolean; reason: string | null } = { disabled: false, reason: null };
+
+          // ✅ UNIVERSAL: Check element's own disabled state
+          // 1. Standard disabled attribute (works for input, button, select, textarea, optgroup, option)
+          if ('disabled' in htmlEl && (htmlEl as any).disabled === true) {
+            result.disabled = true;
+            result.reason = 'disabled attribute';
+            return result;
+          }
+
+          // 2. ARIA disabled attribute (universal for all elements)
+          const ariaDisabled = htmlEl.getAttribute('aria-disabled');
+          if (ariaDisabled === 'true') {
+            result.disabled = true;
+            result.reason = 'aria-disabled="true"';
+            return result;
+          }
+
+          // 3. ✅ CONTEXT-AWARE: readonly only blocks fill/type, not click
+          // readonly inputs can be clicked (to view value) but not filled
+          if (actionType === 'fill' || actionType === 'type') {
+            if ('readOnly' in htmlEl && (htmlEl as any).readOnly === true) {
+              result.disabled = true;
+              result.reason = 'readonly attribute (blocks fill/type)';
+              return result;
+            }
+          }
+
+          // ✅ UNIVERSAL: Check parent disabled state (fieldset, form)
+          // If element is inside a disabled fieldset, it's also disabled
+          let parent = htmlEl.parentElement;
+          // @ts-ignore - browser context (document is available in page.evaluate)
+          while (parent && parent !== document.body) {
+            if (parent.tagName === 'FIELDSET' && (parent as any).disabled === true) {
+              result.disabled = true;
+              result.reason = 'parent fieldset is disabled';
+              return result;
+            }
+            parent = parent.parentElement;
+          }
+
+          // ✅ UNIVERSAL: Check CSS pointer-events (blocks all interactions)
+          // @ts-ignore - browser context
+          const computedStyle = (window as any).getComputedStyle(htmlEl);
+          if (computedStyle && computedStyle.pointerEvents === 'none') {
+            result.disabled = true;
+            result.reason = 'pointer-events: none (CSS)';
+            return result;
+          }
+
+          // ✅ REMOVED: cursor: not-allowed check (too unreliable)
+          // - Not all disabled elements have this cursor
+          // - Some enabled elements might have it for other reasons
+          // - It's a visual indicator, not a functional state
+
+          return result;
+        }, actionType).catch(() => ({ disabled: false, reason: null }));
+
+        isDisabled = disabledInfo.disabled;
+        disabledReason = disabledInfo.reason || undefined;
+
+        if (isDisabled) {
+          logger.warn('[SELECTOR_UTILS] Element is DISABLED', {
+            selector: normalizedSelector,
+            actionType,
+            reason: disabledReason,
+          });
+          // Return failure for disabled elements
+          return {
+            success: false,
+            locator,
+            error: `Element is disabled (${disabledReason}): ${normalizedSelector}`,
+            count,
+            isVisible,
+            isDisabled: true,
+            disabledReason,
+          };
+        }
+      } catch (disabledCheckError) {
+        logger.debug('[SELECTOR_UTILS] Disabled check failed', {
+          selector: normalizedSelector,
+          error: disabledCheckError instanceof Error ? disabledCheckError.message : String(disabledCheckError),
+        });
+      }
     }
 
     // Check actionability (for click actions)
@@ -363,11 +459,152 @@ export async function validateAndGetLocator(
       count,
       isVisible,
       isActionable,
+      isDisabled: false, // ✅ NEW: Element is enabled
     };
   } catch (error) {
     return {
       success: false,
       error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DISABLED ELEMENT DETECTION (for AI decision making)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ✅ NEW: Check if element is disabled and get context for AI
+ * Returns detailed information for AI to make intelligent decisions
+ */
+export async function getElementDisabledContext(
+  page: Page,
+  selector: string
+): Promise<{
+  isDisabled: boolean;
+  reason?: string;
+  alternatives?: string[]; // Suggested alternative selectors
+  context?: {
+    formValidation?: boolean; // Is this part of a form that needs validation?
+    authRequired?: boolean; // Does this require authentication?
+    dependsOn?: string[]; // What other elements must be filled first?
+  };
+}> {
+  try {
+    const normalizedSelector = normalizeSelector(selector);
+    const locator = getLocator(page, normalizedSelector).first();
+
+    // Check if element exists
+    const count = await locator.count();
+    if (count === 0) {
+      return {
+        isDisabled: false,
+        reason: 'Element not found',
+      };
+    }
+
+    // Get comprehensive disabled info
+    const info = await locator.evaluate((el: any) => {
+      const htmlEl = el;
+      const result: any = {
+        isDisabled: false,
+        reason: null,
+        alternatives: [],
+        context: {},
+      };
+
+      // Check disabled state
+      if ('disabled' in htmlEl && (htmlEl as any).disabled === true) {
+        result.isDisabled = true;
+        result.reason = 'disabled attribute';
+      } else if (htmlEl.getAttribute('aria-disabled') === 'true') {
+        result.isDisabled = true;
+        result.reason = 'aria-disabled="true"';
+      } else if ('readOnly' in htmlEl && (htmlEl as any).readOnly === true) {
+        result.isDisabled = true;
+        result.reason = 'readonly attribute';
+        } else {
+          // @ts-ignore - browser context
+          const computedStyle = (window as any).getComputedStyle(htmlEl);
+          if (computedStyle.pointerEvents === 'none') {
+          result.isDisabled = true;
+          result.reason = 'pointer-events: none';
+        } else if (computedStyle.cursor === 'not-allowed') {
+          result.isDisabled = true;
+          result.reason = 'cursor: not-allowed';
+        }
+      }
+
+      // If disabled, gather context for AI
+      if (result.isDisabled) {
+        // Check if part of a form
+        const form = htmlEl.closest('form');
+        if (form) {
+          result.context.formValidation = true;
+
+          // Find required inputs in the form
+          const requiredInputs = Array.from(form.querySelectorAll('input[required], select[required], textarea[required]'));
+          const emptyRequired = requiredInputs.filter((input: any) => {
+            if (input.type === 'checkbox' || input.type === 'radio') {
+              return !input.checked;
+            }
+            return !input.value || input.value.trim() === '';
+          });
+
+          if (emptyRequired.length > 0) {
+            result.context.dependsOn = emptyRequired.map((input: any) => {
+              return input.name || input.id || input.placeholder || input.type;
+            });
+          }
+        }
+
+        // Check for auth indicators
+        const authKeywords = ['login', 'sign in', 'authenticate', 'auth', 'unauthorized'];
+        // @ts-ignore - browser context
+        const bodyText = document.body.textContent?.toLowerCase() || '';
+        result.context.authRequired = authKeywords.some((keyword: string) => bodyText.includes(keyword));
+
+        // Find similar enabled elements (alternatives)
+        const tagName = htmlEl.tagName.toLowerCase();
+        const text = htmlEl.textContent?.trim() || '';
+
+        // Look for similar buttons/links that are NOT disabled
+        // @ts-ignore - browser context
+        const similarElements = Array.from(document.querySelectorAll(`${tagName}:not([disabled]):not([aria-disabled="true"])`));
+        result.alternatives = similarElements
+          .filter((el: any) => {
+            const elText = el.textContent?.trim() || '';
+            // Find elements with similar text
+            return elText && text && (
+              elText.includes(text) ||
+              text.includes(elText) ||
+              elText.toLowerCase() === text.toLowerCase()
+            );
+          })
+          .slice(0, 3) // Max 3 alternatives
+          .map((el: any) => {
+            // Generate selector for alternative
+            if (el.id) return `#${el.id}`;
+            if (el.className) return `.${el.className.split(' ')[0]}`;
+            return tagName;
+          });
+      }
+
+      return result;
+    }).catch(() => ({
+      isDisabled: false,
+      reason: 'Evaluation failed',
+    }));
+
+    return info;
+  } catch (error) {
+    logger.error('[SELECTOR_UTILS] Failed to get disabled context', {
+      selector,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      isDisabled: false,
+      reason: 'Check failed',
     };
   }
 }

@@ -78,17 +78,17 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
        */
       function isVisible(element: any): boolean {
         try {
-          // @ts-expect-error - browser context
-          const style = window.getComputedStyle(element);
-          return (
+        // @ts-expect-error - browser context
+        const style = window.getComputedStyle(element);
+        return (
             style &&
-            style.display !== 'none' &&
-            style.visibility !== 'hidden' &&
-            style.opacity !== '0' &&
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          style.opacity !== '0' &&
             element &&
-            element.offsetWidth > 0 &&
-            element.offsetHeight > 0
-          );
+          element.offsetWidth > 0 &&
+          element.offsetHeight > 0
+        );
         } catch (e) {
           // Element might be detached or not in DOM
           return false;
@@ -119,8 +119,9 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
        * ✅ CRITICAL FIX: Generate Playwright API selector (not CSS contextual locators)
        * Priority: getByRole > getByLabel > getByText > data-testid > CSS
        * Format: role=button[name="Login"], text="Login", label="Email", #id, .class
+        * Uses closure to access selectorCounts (no need to pass as parameter)
        */
-      function generateSelector(element: any, selectorCounts: Map<string, number>): string {
+      function generateSelector(element: any): string {
         // Try ID first (most reliable, use CSS)
         if (element.id && element.id.length > 0) {
           return `#${element.id}`;
@@ -144,7 +145,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
             return `role=${implicitRole}[name="${escapeSelector(text)}"]`;
           }
           // Use role without name (less specific, but still good)
-          return makeUnique(`role=${implicitRole}`, selectorCounts, element);
+          return makeUnique(`role=${implicitRole}`, element);
         }
 
         // ✅ NEW: Try getByLabel for inputs (accessibility-first)
@@ -170,7 +171,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
             const name = element.getAttribute('name');
             if (name && name.length > 0) {
               const selector = `${element.tagName.toLowerCase()}[name="${escapeSelector(name)}"]`;
-              return makeUnique(selector, selectorCounts, element);
+              return makeUnique(selector, element);
             }
           }
         }
@@ -191,7 +192,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
 
           if (classes.length > 0 && classes.length < 3) {
             const selector = `.${classes.join('.')}`;
-            return makeUnique(selector, selectorCounts, element);
+            return makeUnique(selector, element);
           }
         }
 
@@ -296,8 +297,9 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
        * Make selector unique by adding parent context if duplicate
        * ✅ FIX: Playwright doesn't support :nth() in CSS selector
        * Instead, we use more specific selector with parent context
+       * Uses closure to access selectorCounts (no need to pass as parameter)
        */
-      function makeUnique(selector: string, selectorCounts: Map<string, number>, element?: any): string {
+      function makeUnique(selector: string, element?: any): string {
         const count = selectorCounts.get(selector) || 0;
         selectorCounts.set(selector, count + 1);
 
@@ -338,30 +340,36 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
        */
       function generateShadowSelector(
         element: any,
-        shadowHost: any,
-        selectorCounts: Map<string, number>
+        shadowHost: any
       ): string {
         // First, generate selector for the shadow host (parent)
-        const hostSelector = generateSelector(shadowHost, selectorCounts);
+        const hostSelector = generateSelector(shadowHost);
 
         // Then, generate selector for the element inside shadow
-        const elementSelector = generateSelector(element, selectorCounts);
+        const elementSelector = generateSelector(element);
 
         // Use Playwright syntax for Shadow DOM: parent >> child
         return `${hostSelector} >> ${elementSelector}`;
       }
 
       /**
+       * ✅ FIX: Create visited Set and selectorCounts Map in closure
+       * Set and Map cannot be serialized when passed as parameters to page.evaluate()
+       * Using closure ensures they exist in browser context and are shared across recursive calls
+       */
+      const visited = new Set<any>();
+      const selectorCounts = new Map<string, number>();
+
+      /**
        * ✅ NEW: Recursively traverse Shadow DOM and collect elements
        * Handles nested Shadow DOM, closed Shadow DOM (skips), and performance
+       * Uses closure to access visited and selectorCounts (no need to pass them as parameters)
        */
       function traverseShadowDOM(
         root: any, // Document | ShadowRoot (browser context)
         shadowHost: any | undefined,
         depth: number,
-        maxDepth: number,
-        visited: Set<any>, // ✅ SAFETY: Set is available in all modern browsers
-        selectorCounts: Map<string, number> // ✅ SAFETY: Map is available in all modern browsers
+        maxDepth: number
       ): {
         buttons: any[];
         links: any[];
@@ -421,9 +429,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
               shadowRoot,
               element, // Pass current element as shadow host
               depth + 1,
-              maxDepth,
-              visited,
-              selectorCounts // ✅ FIX: Pass selectorCounts
+              maxDepth
             );
 
             // Merge results from Shadow DOM
@@ -448,8 +454,8 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
             result.buttons.push({
               text: element.textContent?.trim() || element.value || element.getAttribute('aria-label') || '',
               selector: shadowHost
-                ? generateShadowSelector(element, shadowHost, selectorCounts)
-                : generateSelector(element, selectorCounts),
+                ? generateShadowSelector(element, shadowHost)
+                : generateSelector(element),
               type: element.type || element.getAttribute('role') || 'button',
               inShadowDOM: !!shadowHost,
             });
@@ -464,8 +470,8 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
               text: element.textContent?.trim() || element.getAttribute('aria-label') || '',
               href: element.href,
               selector: shadowHost
-                ? generateShadowSelector(element, shadowHost, selectorCounts)
-                : generateSelector(element, selectorCounts),
+                ? generateShadowSelector(element, shadowHost)
+                : generateSelector(element),
               inShadowDOM: !!shadowHost,
             });
           }
@@ -490,8 +496,8 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
                 name: element.name || element.id || undefined,
                 label: label || element.getAttribute('aria-label') || undefined,
                 selector: shadowHost
-                  ? generateShadowSelector(element, shadowHost, selectorCounts)
-                  : generateSelector(element, selectorCounts),
+                  ? generateShadowSelector(element, shadowHost)
+                  : generateSelector(element),
                 checked: element.checked,
                 inShadowDOM: !!shadowHost,
               });
@@ -512,8 +518,8 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
                 name: element.name || undefined,
                 label: label || element.getAttribute('aria-label') || undefined,
                 selector: shadowHost
-                  ? generateShadowSelector(element, shadowHost, selectorCounts)
-                  : generateSelector(element, selectorCounts),
+                  ? generateShadowSelector(element, shadowHost)
+                  : generateSelector(element),
                 checked: element.checked,
                 value: element.value || undefined,
                 inShadowDOM: !!shadowHost,
@@ -525,8 +531,8 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
                 name: element.name || element.id || undefined,
                 placeholder: element.getAttribute('placeholder') || undefined,
                 selector: shadowHost
-                  ? generateShadowSelector(element, shadowHost, selectorCounts)
-                  : generateSelector(element, selectorCounts),
+                  ? generateShadowSelector(element, shadowHost)
+                  : generateSelector(element),
                 required: element.hasAttribute('required') || element.getAttribute('aria-required') === 'true',
                 inShadowDOM: !!shadowHost,
               });
@@ -577,8 +583,8 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
                 tag,
                 text,
                 selector: shadowHost
-                  ? generateShadowSelector(element, shadowHost, selectorCounts)
-                  : generateSelector(element, selectorCounts),
+                  ? generateShadowSelector(element, shadowHost)
+                  : generateSelector(element),
                 role: role || undefined,
                 tabindex: tabindex ? parseInt(tabindex) : undefined,
                 reason: reason as any,
@@ -591,13 +597,11 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
         return result;
       }
 
-      // ✅ FIX: Create selector count map to track duplicates
-      const selectorCounts = new Map<string, number>();
-
+      // ✅ FIX: visited and selectorCounts are now in closure (created above)
       // ✅ NEW: Traverse Shadow DOM and collect elements
       // Start from document root (depth 0)
       // @ts-expect-error - browser context
-      const shadowDOMResult = traverseShadowDOM(document, undefined, 0, 5, new Set(), selectorCounts);
+      const shadowDOMResult = traverseShadowDOM(document, undefined, 0, 5);
 
       // ✅ FIX: Analyze forms (only visible ones) - including Shadow DOM
       // @ts-expect-error - browser context
@@ -612,7 +616,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
                 name: input.name || input.id || '',
                 type: input.type || input.tagName.toLowerCase(),
                 required: input.hasAttribute('required') || input.getAttribute('aria-required') === 'true',
-                selector: generateSelector(field, selectorCounts),
+                selector: generateSelector(field),
                 placeholder: input.getAttribute('placeholder') || undefined,
                 value: input.value || undefined,
               };
@@ -634,7 +638,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           const button = btn;
           return {
             text: button.textContent?.trim() || button.value || button.getAttribute('aria-label') || '',
-            selector: generateSelector(btn, selectorCounts),
+            selector: generateSelector(btn),
             type: button.type || button.getAttribute('role') || 'button',
           };
         })
@@ -657,7 +661,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           return {
             text: anchor.textContent?.trim() || anchor.getAttribute('aria-label') || '',
             href: anchor.href,
-            selector: generateSelector(link, selectorCounts),
+            selector: generateSelector(link),
           };
         });
 
@@ -671,7 +675,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
             type: field.type || field.tagName.toLowerCase(),
             name: field.name || field.id || undefined,
             placeholder: field.getAttribute('placeholder') || undefined,
-            selector: generateSelector(input, selectorCounts),
+            selector: generateSelector(input),
             required: field.hasAttribute('required') || field.getAttribute('aria-required') === 'true',
           };
         });
@@ -698,7 +702,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           return {
             name: checkbox.name || checkbox.id || undefined,
             label: label || checkbox.getAttribute('aria-label') || undefined,
-            selector: generateSelector(checkbox, selectorCounts),
+            selector: generateSelector(checkbox),
             checked: checkbox.checked,
           };
         });
@@ -725,7 +729,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           return {
             name: radio.name || undefined,
             label: label || radio.getAttribute('aria-label') || undefined,
-            selector: generateSelector(radio, selectorCounts),
+            selector: generateSelector(radio),
             checked: radio.checked,
             value: radio.value || undefined,
           };
@@ -786,7 +790,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           interactiveElements.push({
             tag,
             text,
-            selector: generateSelector(element, selectorCounts),
+            selector: generateSelector(element),
             role: role || undefined,
             tabindex: tabindex ? parseInt(tabindex) : undefined,
             reason,

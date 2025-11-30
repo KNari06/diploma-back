@@ -4,7 +4,17 @@ import { OpenAI } from 'openai';
 import { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import { buildChatSystemPrompt } from '@/ai/prompts/index';
 
-const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+/**
+ * ✅ FIX: Configure OpenAI client with timeout and retry settings
+ * - timeout: 60s (prevents hanging requests)
+ * - maxRetries: 2 (retry failed requests)
+ * - Must be less than server.timeout (180s) to allow proper error handling
+ */
+const openai = new OpenAI({
+  apiKey: env.OPENAI_API_KEY,
+  timeout: 60000, // 60 seconds
+  maxRetries: 2, // Retry up to 2 times on failure
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES

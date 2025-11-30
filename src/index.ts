@@ -389,6 +389,21 @@ const startServer = async () => {
         logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
       });
 
+      /**
+       * ✅ FIX: Configure server timeouts to prevent premature connection closure
+       * - timeout: 180s (3 minutes) - allows long AI requests to complete
+       * - keepAliveTimeout: 65s - longer than typical load balancer timeout (60s)
+       * - headersTimeout: 66s - must be > keepAliveTimeout to avoid race conditions
+       *
+       * Why these values:
+       * - OpenAI requests can take 30-60s for large contexts
+       * - Load balancers (Nginx, Cloudflare) typically timeout at 60s
+       * - We need buffer time for retries and error handling
+       */
+      server.timeout = 180000; // 3 minutes (default is 120s)
+      server.keepAliveTimeout = 65000; // 65 seconds (default is 5s)
+      server.headersTimeout = 66000; // 66 seconds (must be > keepAliveTimeout)
+
       // Handle server errors
       server.on('error', (error: NodeJS.ErrnoException) => {
         if (error.code === 'EADDRINUSE') {

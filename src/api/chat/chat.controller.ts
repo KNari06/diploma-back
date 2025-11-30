@@ -58,7 +58,7 @@ const CONSTANTS = {
   // Timeouts
   FUZZING_TIMEOUT: 30000, // 30 seconds
   AUTO_EMBED_TIMEOUT: 30000, // 30 seconds (increased from 5s to allow more messages to embed)
-  CHAT_REQUEST_TIMEOUT: 30000, // 30 seconds max for entire chat request
+  CHAT_REQUEST_TIMEOUT: 180000, // 3 minutes (180 seconds) - increased from 30s to allow OpenAI retries
 
   // Test plan expiration
   TEST_PLAN_EXPIRY_HOURS: 24,

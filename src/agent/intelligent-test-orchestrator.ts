@@ -15,7 +15,7 @@ import { IntelligentPageAnalyzer } from './intelligent-page-analyzer';
 import { ResultValidator } from './result-validator';
 import { SafetyGuard } from './safety-guard';
 import { StateTracker } from './state-tracker';
-import { normalizeSelector, getLocator, validateAndGetLocator } from './utils/selector-utils';
+import { normalizeSelector, getLocator, validateAndGetLocator, getElementDisabledContext } from './utils/selector-utils';
 import {
   ActionResult,
   DynamicAction,
@@ -1187,6 +1187,49 @@ export class IntelligentTestOrchestrator {
             logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to capture before screenshot', {
               action: action.description
             });
+          }
+        }
+
+        // ✅ NEW: Check if element is disabled BEFORE attempting action
+        // If disabled, log detailed context for debugging
+        if (action.selector && (action.action === 'click' || action.action === 'fill')) {
+          const disabledContext = await getElementDisabledContext(this.page, action.selector);
+
+          if (disabledContext.isDisabled) {
+            logger.warn('[INTELLIGENT_ORCHESTRATOR] Element is DISABLED', {
+              testId: this.testId,
+              action: action.description,
+              selector: action.selector,
+              reason: disabledContext.reason,
+              formValidation: disabledContext.context?.formValidation,
+              authRequired: disabledContext.context?.authRequired,
+              dependsOn: disabledContext.context?.dependsOn,
+              alternatives: disabledContext.alternatives,
+            });
+
+            // ✅ STRATEGY: Instead of generating new actions mid-execution,
+            // let the action fail naturally and let the AI decide next steps
+            // in the next iteration (via decideNextStep)
+
+            // Add detailed context to action for better error reporting
+            action.description = `${action.description} [DISABLED: ${disabledContext.reason}]`;
+
+            // Log suggestions for next AI iteration
+            if (disabledContext.context?.dependsOn && disabledContext.context.dependsOn.length > 0) {
+              logger.info('[INTELLIGENT_ORCHESTRATOR] Suggestion: Fill these fields first', {
+                testId: this.testId,
+                dependsOn: disabledContext.context.dependsOn,
+              });
+            }
+
+            if (disabledContext.alternatives && disabledContext.alternatives.length > 0) {
+              logger.info('[INTELLIGENT_ORCHESTRATOR] Suggestion: Try alternative selectors', {
+                testId: this.testId,
+                alternatives: disabledContext.alternatives,
+              });
+            }
+
+            // Continue with execution - it will fail, and AI will adapt in next iteration
           }
         }
 
