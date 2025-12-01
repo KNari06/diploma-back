@@ -992,7 +992,49 @@ export function buildTestPlanPrompt(
   exploration: any,
   userRequest: { message: string; scope: string; additionalInfo?: any }
 ): string {
-  return `Generate a comprehensive test plan based on the following exploration data.
+  // Helper: safe access with defaults
+  const safe = (v: any, fallback: any) => (v === undefined || v === null ? fallback : v);
+
+  // Helper: truncate long strings to avoid token overflow
+  const truncate = (s: string, max = 4000) => {
+    if (typeof s !== 'string') return s;
+    return s.length > max ? s.slice(0, max) + '\n... (truncated)' : s;
+  };
+
+  const dom = safe(exploration?.domAnalysis, { buttons: [], inputs: [], forms: [], links: [] });
+  const visual = safe(exploration?.visualAnalysis, null);
+  const recs = Array.isArray(exploration?.recommendations) ? exploration.recommendations : [];
+
+  const mapList = (list: any[], mapper: (item: any, idx: number) => string, emptyText = '  (none)') =>
+    Array.isArray(list) && list.length > 0 ? list.map(mapper).join('\n') : emptyText;
+
+  const buttonsList = mapList(dom.buttons || [], (b: any, idx: number) =>
+    `${idx + 1}. Text: "${safe(b.text, b.type || '')}" → USE THIS SELECTOR: "${safe(b.selector, '(no selector)')}"`
+  );
+
+  const inputsList = mapList(dom.inputs || [], (i: any, idx: number) =>
+    `${idx + 1}. Type: ${safe(i.type, 'unknown')}, Name: ${safe(i.name, 'none')}, Placeholder: ${safe(i.placeholder, 'none')} → USE THIS SELECTOR: "${safe(i.selector, '(no selector)')}"`
+  );
+
+  const formsList = Array.isArray(dom.forms) && dom.forms.length > 0
+    ? dom.forms.map((f: any, i: number) => {
+        const fields = (f.fields || []).slice(0, 50).map((field: any) =>
+          `    - ${safe(field.name, field.type || 'field')} (${field.required ? 'required' : 'optional'}) → SELECTOR: "${safe(field.selector, '(no selector)')}"`
+        ).join('\n');
+        const more = (f.fields && f.fields.length > 50) ? `\n    ... and ${f.fields.length - 50} more fields (truncated)` : '';
+        return `  Form ${i + 1}:\n${fields}${more}`;
+      }).join('\n')
+    : '  (no forms found)';
+
+  const linksList = mapList(dom.links || [], (l: any, idx: number) =>
+    `${idx + 1}. Text: "${safe(l.text, '')}" → USE THIS SELECTOR: "${safe(l.selector, '(no selector)')}"`
+  );
+
+  const safeVisualString = visual ? truncate(typeof visual === 'string' ? visual : JSON.stringify(visual, null, 2)) : '(none)';
+  const recommendationsString = recs.length > 0 ? recs.slice(0, 20).map((r: any) => `- ${r}`).join('\n') : '  (no recommendations)';
+
+  // Prompt: strict JSON schema + clear rules
+  const prompt = `Generate a comprehensive test plan based on the following exploration data.
 
 USER REQUEST:
 "${userRequest.message}"
@@ -1001,133 +1043,77 @@ SCOPE:
 ${userRequest.scope}
 
 PAGE INFORMATION:
-- URL: ${exploration.url}
-- Title: ${exploration.pageInfo.title}
+- URL: ${safe(exploration?.url, '(unknown)')}
+- Title: ${safe(exploration?.pageInfo?.title, '(unknown)')}
 
-VISUAL ANALYSIS (from GPT-4o Vision):
-${JSON.stringify(exploration.visualAnalysis, null, 2)}
+VISUAL ANALYSIS (trimmed):
+${safeVisualString}
 
 DOM ANALYSIS (USE THESE EXACT SELECTORS - DO NOT INVENT NEW ONES):
 
-AVAILABLE BUTTONS (${exploration.domAnalysis.buttons.length}):
-${exploration.domAnalysis.buttons.length > 0
-  ? exploration.domAnalysis.buttons.map((b: any, idx: number) =>
-      `${idx + 1}. Text: "${b.text || b.type}" → USE THIS SELECTOR: "${b.selector}"`
-    ).join('\n')
-  : '  (no buttons found)'}
+AVAILABLE BUTTONS (${(dom.buttons || []).length}):
+${buttonsList}
 
-AVAILABLE INPUTS (${exploration.domAnalysis.inputs.length}):
-${exploration.domAnalysis.inputs.length > 0
-  ? exploration.domAnalysis.inputs.map((i: any, idx: number) =>
-      `${idx + 1}. Type: ${i.type}, Name: ${i.name || 'none'}, Placeholder: ${i.placeholder || 'none'} → USE THIS SELECTOR: "${i.selector}"`
-    ).join('\n')
-  : '  (no inputs found)'}
+AVAILABLE INPUTS (${(dom.inputs || []).length}):
+${inputsList}
 
-AVAILABLE FORMS (${exploration.domAnalysis.forms.length}):
-${exploration.domAnalysis.forms.map((f: any, i: number) => {
-  const fields = f.fields.map((field: any) =>
-    `    - ${field.name || field.type} (${field.required ? 'required' : 'optional'}) → SELECTOR: "${field.selector}"`
-  ).join('\n');
-  return `  Form ${i + 1}:\n${fields}`;
-}).join('\n')}
+AVAILABLE FORMS (${(dom.forms || []).length}):
+${formsList}
 
-AVAILABLE LINKS (${exploration.domAnalysis.links?.length || 0}):
-${exploration.domAnalysis.links && exploration.domAnalysis.links.length > 0
-  ? exploration.domAnalysis.links.map((l: any, idx: number) =>
-      `${idx + 1}. Text: "${l.text}" → USE THIS SELECTOR: "${l.selector}"`
-    ).join('\n')
-  : '  (no links found)'}
+AVAILABLE LINKS (${(dom.links || []).length}):
+${linksList}
 
 RECOMMENDATIONS:
-${exploration.recommendations.map((r: any) => `- ${r}`).join('\n')}
+${recommendationsString}
 
 ---
 
-Generate a test plan in this EXACT JSON format:
+IMPORTANT: You MUST return a single valid JSON object only. NO MARKDOWN, NO EXTRA TEXT, NO COMMENTS. The JSON must be parsable by JSON.parse. Follow schema EXACTLY.
 
+SCHEMA (EXACT):
 {
-  "summary": "Brief summary of what this test plan will do (2-3 sentences)",
-
+  "summary": string, // 2-3 sentence summary
   "steps": [
     {
-      "id": "step_1",
-      "description": "Human-readable step description",
-      "action": "goto|fill|click|assertVisible|etc",
-      "selector": "CSS selector if applicable",
-      "value": "Value to input if applicable",
-      "expectedOutcome": "What should happen after this step"
+      "id": string, // e.g. "step_1"
+      "description": string,
+      "action": "goto"|"fill"|"click"|"assertVisible"|"assertText"|"assertValue"|"select"|"wait"|"scroll"|"extract",
+      "selector": string | null, // MUST use selector from DOM ANALYSIS if interacting with element, otherwise null
+      "value": string | null,
+      "optional": boolean,
+      "confidence": number, // 0.0 - 1.0
+      "expectedOutcome": {
+        "type": "url_change"|"toast"|"element_visible"|"count_increase"|"form_submitted"|"other",
+        "selector": string | null,
+        "expectedValue": string | null,
+        "timeoutMs": number
+      }
     }
   ],
-
-  "commands": [
-    {
-      "action": "goto",
-      "url": "${exploration.url}",
-      "description": "Navigate to page"
-    },
-    {
-      "action": "fill",
-      "selector": "actual_selector_from_dom_analysis",
-      "value": "test@example.com",
-      "description": "Fill email field"
-    }
-  ],
-
-  "estimatedDuration": "~30 seconds",
-
-  "whatWillBeTested": [
-    "Specific functionality 1",
-    "Specific functionality 2"
-  ],
-
-  "whatWillNotBeTested": [
-    "Out of scope functionality 1",
-    "Out of scope functionality 2"
-  ],
-
-  "risks": [
-    "Potential issue or limitation of this test"
-  ]
+  "commands": [ { "action": string, "url"?: string, "selector"?: string, "value"?: string, "description"?: string } ],
+  "estimatedDuration": string,
+  "whatWillBeTested": string[],
+  "whatWillNotBeTested": string[],
+  "risks": string[],
+  "notes": string | null
 }
 
-🚨 CRITICAL SELECTOR RULES (MUST FOLLOW):
+RULES (MUST FOLLOW):
+1) Use ONLY selectors provided in the DOM ANALYSIS above. If a needed element is NOT present in DOM ANALYSIS, set "optional": true for that step and put a clear note in "notes".
+2) Limit steps to 5-10 focused steps. Steps should be logically connected and help achieve the user's scope.
+3) Include a numeric "confidence" (0-1) for each step and a structured "expectedOutcome" per step.
+4) If DOM_ANALYSIS is empty or insufficient, return "steps": [] and populate "notes" with what is missing (so the system can ask clarifying questions).
+5) Return valid JSON only. If you cannot produce a test plan due to missing data, return a valid JSON with an empty steps array and an explanatory "notes" field.
 
-1. **ONLY USE SELECTORS FROM DOM ANALYSIS ABOVE**
-   - ❌ NEVER invent selectors like "button:has-text('Войти')" or "button:has-text('Close')"
-   - ✅ ALWAYS use the EXACT selector from "USE THIS SELECTOR" above
-   - ✅ Example: If button shows "USE THIS SELECTOR: 'button.login-btn'" → use exactly that
+ADDITIONAL GUIDANCE:
+- Be specific: selectors must exactly match the "USE THIS SELECTOR" strings above.
+- Do NOT invent selectors like text=:has-text() or CSS not present. Use provided selectors even if they look verbose.
+- For fill/select steps, provide realistic test values (emails, names, phone formats). Avoid obviously disposable emails like "test@test.com".
+- For actions that could perform destructive operations (delete, pay), instead create a step with "action": "wait" and description: "requires manual approval" and mark optional=true.
 
-2. **SELECTOR MATCHING PROCESS**:
-   - Find the button/input by its TEXT in the DOM analysis list
-   - Copy the EXACT selector from "USE THIS SELECTOR" field
-   - Use that selector in your test plan
-   - If you can't find a matching element → mark that step as "optional: true" or skip it
+RETURN ONLY THE JSON OBJECT NOW (no explanations).`;
 
-3. **EXAMPLE (CORRECT)**:
-   - User wants to click "Войти" button
-   - DOM Analysis shows: "Text: 'Войти' → USE THIS SELECTOR: 'button.auth-btn'"
-   - ✅ CORRECT: Use selector "button.auth-btn"
-   - ❌ WRONG: Using "button:has-text('Войти')"
-
-4. **EXAMPLE (INCORRECT - DO NOT DO THIS)**:
-   - ❌ "selector": "button:has-text('Войти')" ← WRONG! Use selector from DOM analysis
-   - ❌ "selector": "button:has-text('Close')" ← WRONG! Use selector from DOM analysis
-   - ❌ "selector": "button:has-text('Далее')" ← WRONG! Use selector from DOM analysis
-
-5. **IF SELECTOR NOT FOUND**:
-   - If you need to interact with an element but it's NOT in the DOM analysis list
-   - Mark that step as "optional": true
-   - Add a note in description: "Element may not be available"
-
-OTHER REQUIREMENTS:
-- Create 5-10 specific test steps
-- Generate matching Playwright commands with REAL selectors from DOM analysis
-- Be specific about expected outcomes
-- Estimate realistic duration
-- List what WILL and WILL NOT be tested
-- Identify potential risks or limitations
-
-Focus on: ${userRequest.scope}`;
+  return prompt;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

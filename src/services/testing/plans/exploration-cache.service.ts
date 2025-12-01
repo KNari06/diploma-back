@@ -201,6 +201,7 @@ export async function saveTestPlan(
         what_will_be_tested: testPlan.whatWillBeTested || [],
         what_will_not_be_tested: testPlan.whatWillNotBeTested || [],
         risks: testPlan.risks || [],
+        notes: testPlan.notes || null, // NEW: Support notes field
         status: 'pending_confirmation',
         exploration_id: explorationId,
         expires_at: testPlan.expiresAt,
@@ -390,6 +391,7 @@ export async function getTestPlan(
       whatWillBeTested: data.what_will_be_tested || [],
       whatWillNotBeTested: data.what_will_not_be_tested || [],
       risks: data.risks || [],
+      notes: data.notes || null, // NEW: Support notes field
       createdAt: data.created_at,
       expiresAt: data.expires_at,
       // FIX #5: Add missing optional fields

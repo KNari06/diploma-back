@@ -281,8 +281,14 @@ export async function runAutonomousExploration(params: {
   const { userMessage, answers, userId, projectId, sessionId } = params;
 
   // ✅ FIX #4: Helper to emit WebSocket events (with fallback for missing sessionId)
+  // ✅ FIX: Added error handling to prevent WebSocket errors from breaking HTTP request
   const emitProgress = (step: string, message: string, progress: number) => {
-    if (sessionId) {
+    if (!sessionId) {
+      logger.warn('[AUTONOMOUS] No sessionId - skipping WebSocket event', { step, message });
+      return;
+    }
+
+    try {
       const stepPayload: ChatProcessingStepPayload = {
         sessionId,
         step: step as any,
@@ -291,8 +297,17 @@ export async function runAutonomousExploration(params: {
         timestamp: new Date().toISOString(),
       };
       webSocketService.emitChatProcessingStep(sessionId, stepPayload);
-    } else {
-      logger.warn('[AUTONOMOUS] No sessionId - skipping WebSocket event', { step, message });
+    } catch (error) {
+      // ✅ CRITICAL: Don't let WebSocket errors break the HTTP request
+      // Log error but continue processing
+      logger.warn('[AUTONOMOUS] Failed to emit WebSocket progress (non-critical)', {
+        step,
+        message,
+        progress,
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Continue execution - WebSocket is optional for progress updates
     }
   };
 

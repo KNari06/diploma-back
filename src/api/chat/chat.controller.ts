@@ -1125,6 +1125,15 @@ async function handlePlatformTest(
       });
     }
 
+    // ✅ FIX: Check if connection is still alive before sending response
+    if (req.aborted || req.socket?.destroyed) {
+      logger.warn('[PLATFORM_TEST] Client connection closed, cannot send response', {
+        planId: testPlan.id,
+        duration: Date.now() - flowStartTime,
+      });
+      return;
+    }
+
     // Send response with test plan
         res.json({
       success: true, // ← Frontend expects this!
@@ -2899,15 +2908,28 @@ function emitProcessingStep(
 ): void {
   if (!sessionId) return;
 
-  const payload: ChatProcessingStepPayload = {
-    sessionId,
-    step,
-    message,
-    progress,
-    timestamp: new Date().toISOString(),
-  };
+  try {
+    const payload: ChatProcessingStepPayload = {
+      sessionId,
+      step,
+      message,
+      progress,
+      timestamp: new Date().toISOString(),
+    };
 
-  webSocketService.emitChatProcessingStep(sessionId, payload);
+    webSocketService.emitChatProcessingStep(sessionId, payload);
+  } catch (error) {
+    // ✅ CRITICAL: Don't let WebSocket errors break the HTTP request
+    // Log error but continue processing - WebSocket is optional for progress updates
+    logger.warn('[CHAT] Failed to emit WebSocket progress (non-critical)', {
+      sessionId,
+      step,
+      message,
+      progress,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    // Continue execution - WebSocket errors should not break HTTP requests
+  }
 }
 
 /**
