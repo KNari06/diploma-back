@@ -148,8 +148,10 @@ export class ContextualActionGenerator {
     });
 
     // ✅ FIX 6: Check cache first (debounce rapid navigations)
+    // IMPORTANT: Never reuse cached result if it contained 0 actions
+    // We want the model to have another chance to propose actions instead of "sticking" to empty plan.
     const cached = getCachedGeneration(context, state.goal);
-    if (cached) {
+    if (cached && cached.actions.length > 0) {
       logger.info('[ACTION_GENERATOR] Using cached actions', {
         age: Date.now() - cached.timestamp,
         count: cached.actions.length,
@@ -293,10 +295,13 @@ export class ContextualActionGenerator {
       };
 
       // ✅ FIX 6: Cache result (timestamp will be added by setCachedGeneration)
-      setCachedGeneration(context, state.goal, {
-        ...result,
-        timestamp: Date.now(),
-      });
+      // IMPORTANT: Cache only non-empty action sets, so "empty" decisions can be retried.
+      if (actions.length > 0) {
+        setCachedGeneration(context, state.goal, {
+          ...result,
+          timestamp: Date.now(),
+        });
+      }
 
       return result;
     } catch (error) {
@@ -750,7 +755,7 @@ export class ContextualActionGenerator {
   private static generateFallbackActions(context: PageContext): DynamicAction[] {
     const actions: DynamicAction[] = [];
 
-    // Close modals if present
+    // 1) Close modals if present (safest first step)
     if (context.dom.modals && context.dom.modals.length > 0) {
       context.dom.modals.forEach(modal => {
         if (modal.closeSelector) {
@@ -766,7 +771,44 @@ export class ContextualActionGenerator {
       });
     }
 
-    // If no actions generated, wait
+    // 2) Heuristic actions based on DOM if page has interactive elements
+    // Even when AI planning fails, try a few obvious safe interactions.
+    if (actions.length === 0) {
+      const buttons = context.dom.buttons || [];
+      const inputs = context.dom.inputs || [];
+
+      // Click up to 3 top buttons
+      buttons.slice(0, 3).forEach(btn => {
+        if (!btn.selector) return;
+        actions.push({
+          action: 'click',
+          selector: btn.selector,
+          description: `Click button "${btn.text || 'button'}" (fallback)`,
+          optional: true,
+          timeout: 5000,
+          retry: 1,
+        });
+      });
+
+      // Fill the first input if available
+      if (inputs.length > 0 && inputs[0].selector) {
+        const input = inputs[0];
+        const label = input.name || input.placeholder || input.type || 'input';
+        const value = this.generateTestData(input.type || 'text', label);
+
+        actions.push({
+          action: 'fill',
+          selector: input.selector,
+          value,
+          description: `Fill "${label}" with test data (fallback)`,
+          optional: true,
+          timeout: 5000,
+          retry: 1,
+        });
+      }
+    }
+
+    // 3) If вообще ничего нет – хотя бы подождать
     if (actions.length === 0) {
       actions.push({
         action: 'wait',

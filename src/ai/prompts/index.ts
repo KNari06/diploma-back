@@ -727,6 +727,11 @@ Generate a sequence of actions to test this page based on the goal.
 If the goal mentions "registration", "signup", "register", or similar - prioritize finding and interacting with registration/signup elements.
 If the goal mentions a specific flow (e.g., "registration flow"), focus on navigating to and testing that flow.
 
+Even if the goal is vague or generic, as long as the page has interactive elements
+you MUST propose at least 1-3 concrete, safe actions (clicks, fills, scrolls, simple assertions)
+that explore the UI. Only return an empty "actions" array if the page is truly empty
+(no buttons, inputs, links, forms) or blocked (CAPTCHA, hard paywall, fatal error).
+
 RESPONSE FORMAT (JSON):
 {
   "reasoning": "Explain your thought process (2-3 sentences)",

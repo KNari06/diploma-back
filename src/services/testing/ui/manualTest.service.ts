@@ -853,16 +853,34 @@ export class ManualTestService {
       let screenshotUrl: string | undefined = undefined;
       if (resultData.screenshot) {
         try {
+          // Resolve user ID for storage path (tests table stores user_id)
+          let userIdForStorage: string | undefined;
+          try {
+            const testRecord = await dbAdminService.getTest(resultData.testId) as any;
+            userIdForStorage = testRecord?.user_id;
+          } catch (lookupError) {
+            logger.warn('[MANUAL_TEST_SERVICE] Failed to resolve user_id for screenshot storage', {
+              testId: resultData.testId,
+              error: lookupError instanceof Error ? lookupError.message : String(lookupError),
+            });
+          }
+
+          if (!userIdForStorage) {
+            logger.warn('[MANUAL_TEST_SERVICE] user_id is missing for test, falling back to testId for storage path', {
+              testId: resultData.testId,
+            });
+            userIdForStorage = resultData.testId;
+          }
+
           const { uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');
 
           // NOTE: For manual tests we always store screenshot as URL, not base64
           screenshotUrl = await uploadScreenshotToStorage(
             resultData.screenshot,
             resultData.testId,
-            // User ID is not available here, but storage path is user-scoped in other flows.
-            // For manual tests, testId is globally unique, so we can safely use it as folder.
-            // This keeps paths isolated per test and avoids leaking user data.
-            resultData.testId,
+            // Use real userId for storage path when available (preferred),
+            // fallback to testId only if user_id is missing.
+            userIdForStorage,
           );
         } catch (screenshotError) {
           logger.error('[MANUAL_TEST_SERVICE] Failed to upload screenshot to storage', {
