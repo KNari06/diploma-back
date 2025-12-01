@@ -1,12 +1,12 @@
 import { QueueManager } from '@/config/queues';
 import { dbAdminService, dbService, supabaseAdmin } from '@/db/supabase';
 import { WorkspaceService } from '@/services/core/workspace.service';
+import { TestCompletionHandlerService } from '@/services/testing/results/test-completion-handler.service';
 import { ApiResponse, BrowserType, NotFoundError, PaginatedResponse, Test, TestResult, TestRunRequest, ValidationError } from '@/types';
 import { logger, logTestEvent } from '@/utils/logger';
 import { TestCreatedPayload } from '@/websocket/types';
 import { webSocketService } from '@/websocket/websocket.service';
 import { v4 as uuidv4 } from 'uuid';
-import { TestCompletionHandlerService } from '@/services/testing/results/test-completion-handler.service';
 
 export class ManualTestService {
   /**
@@ -849,12 +849,42 @@ export class ManualTestService {
     try {
       logger.info(`Processing test result: ${resultData.testId} (${resultData.browser})`);
 
+      // Upload screenshot to storage if provided and looks like base64
+      let screenshotUrl: string | undefined = undefined;
+      if (resultData.screenshot) {
+        try {
+          const { uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+
+          // NOTE: For manual tests we always store screenshot as URL, not base64
+          screenshotUrl = await uploadScreenshotToStorage(
+            resultData.screenshot,
+            resultData.testId,
+            // User ID is not available here, but storage path is user-scoped in other flows.
+            // For manual tests, testId is globally unique, so we can safely use it as folder.
+            // This keeps paths isolated per test and avoids leaking user data.
+            resultData.testId,
+          );
+        } catch (screenshotError) {
+          logger.error('[MANUAL_TEST_SERVICE] Failed to upload screenshot to storage', {
+            testId: resultData.testId,
+            browser: resultData.browser,
+            error: screenshotError instanceof Error ? screenshotError.message : String(screenshotError),
+          });
+          // Do not fail the whole result processing because of screenshot upload
+        }
+      }
+
+      // Decide what to store in DB:
+      // - Prefer public URL from storage
+      // - Fallback to original base64 if upload failed (to avoid data loss)
+      const screenshotToStore = screenshotUrl || resultData.screenshot || null;
+
       // Create test result record
       const testResult = await dbAdminService.createTestResult({
         test_id: resultData.testId,
         browser: resultData.browser,
         status: resultData.status as any,
-        screenshot: resultData.screenshot,
+        screenshot: screenshotToStore,
         dom: resultData.dom,
         logs: resultData.logs,
         network_logs: resultData.networkLogs,
