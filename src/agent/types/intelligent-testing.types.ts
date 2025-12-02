@@ -318,6 +318,49 @@ export interface IntelligentTestConfig {
   };
   userContext?: Record<string, any>; // Additional user-provided context
   spaLoadConfig?: SPALoadConfig; // ✅ NEW: Configurable SPA loading settings
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ✅ NEW: Migrated from Standard Mode - now AI uses these as hints
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Test steps/hints from plan - AI will use these as guidance, not strict commands
+   * Example: ["Click login button", "Fill email field", "Submit form"]
+   */
+  hints?: TestHint[];
+
+  /**
+   * Initial wait for specific selector before starting test
+   * Migrated from Standard Mode options.waitForSelector
+   */
+  waitForSelector?: string;
+
+  /**
+   * Custom JavaScript scripts to execute before testing
+   * Migrated from Standard Mode options.customScripts
+   */
+  customScripts?: string[];
+
+  /**
+   * Legacy commands from plan - will be converted to hints
+   * @deprecated Use hints instead
+   */
+  commands?: any[];
+}
+
+/**
+ * Test hint - guidance for AI on what to test
+ * AI will adapt these to actual page elements
+ */
+export interface TestHint {
+  id: string;
+  description: string;
+  action?: string; // Suggested action type (click, fill, etc.)
+  target?: string; // What to interact with (e.g., "login button", "email field")
+  value?: string; // Value to use (for fill actions)
+  expectedOutcome?: string;
+  priority?: 'high' | 'medium' | 'low';
+  optional?: boolean; // If true, skip if element not found
 }
 
 /**

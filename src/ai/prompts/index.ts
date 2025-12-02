@@ -701,14 +701,29 @@ export function buildActionGenerationPrompt(params: {
   history: string; // What has been done so far
   domSummary: string; // DOM analysis summary
   actualHTML?: string; // ✅ NEW: Actual HTML from page (limited)
+  hints?: Array<{ description: string; action?: string; target?: string; value?: string; priority?: string }>; // ✅ NEW: Test hints from plan
 }): string {
+  // Build hints section if provided
+  const hintsSection = params.hints && params.hints.length > 0
+    ? `
+--- TEST HINTS (User's requested steps) ---
+The user wants to test the following steps. Use these as GUIDANCE but ADAPT to actual page elements:
+${params.hints.map((h, i) => `${i + 1}. ${h.description}${h.action ? ` (suggested action: ${h.action})` : ''}${h.target ? ` (target: ${h.target})` : ''}${h.value ? ` (value: ${h.value})` : ''}${h.priority === 'high' ? ' ⚠️ HIGH PRIORITY' : ''}`).join('\n')}
+
+IMPORTANT: These hints describe WHAT the user wants to test, not exact commands.
+- Find the ACTUAL elements on the page that match these hints
+- Use REAL selectors from "Available Elements" section
+- If a hint cannot be matched to any element, skip it and continue with others
+`
+    : '';
+
   return `You are an expert QA automation engineer deciding what actions to take next.
 
 --- CONTEXT ---
 Page Type: ${params.pageType}
 Description: ${params.pageDescription}
 Testing Goal: ${params.goal}
-
+${hintsSection}
 History (what we've done):
 ${params.history}
 

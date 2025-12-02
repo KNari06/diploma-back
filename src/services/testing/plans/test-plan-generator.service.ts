@@ -365,6 +365,10 @@ export type ExpectedOutcome =
 
 /**
  * Test plan with user confirmation
+ *
+ * ✅ IMPORTANT: Steps and commands are now used as HINTS for AI guidance
+ * The Intelligent Mode AI will use these as suggestions but adapt to actual page elements.
+ * This provides self-healing and better test reliability.
  */
 export interface TestPlan {
   id: string;
@@ -372,29 +376,37 @@ export interface TestPlan {
   url: string;
   scope: string;
   summary: string;
+  /**
+   * Test steps - used as HINTS for AI guidance
+   * AI will adapt these to actual page elements, not execute them literally
+   */
   steps: Array<{
     id: string;
     description: string;
     action: string;
-    selector?: string;
+    selector?: string; // Suggested selector - AI will find actual element
     value?: string;
-    optional?: boolean; // NEW: Step is optional if element not found
-    confidence?: number; // NEW: Confidence level 0.0-1.0
+    optional?: boolean; // Step is optional if element not found
+    confidence?: number; // Confidence level 0.0-1.0
     expectedOutcome: ExpectedOutcome; // Supports both string and structured format
   }>;
+  /**
+   * Playwright commands - converted to hints for AI guidance
+   * @deprecated Commands are now used as hints, not strict commands
+   */
   commands: PlaywrightCommand[];
   estimatedDuration: string;
   whatWillBeTested: string[];
   whatWillNotBeTested: string[];
   risks: string[];
-  notes?: string | null; // NEW: Additional notes about the plan
+  notes?: string | null; // Additional notes about the plan
   createdAt: string;
   expiresAt: string; // Plan expires after 1 hour
 
-  // Intelligent testing mode
-  intelligentMode?: boolean; // NEW: Flag for intelligent testing
-  estimatedPages?: string; // NEW: Estimated pages for intelligent mode
-  estimatedCost?: string; // NEW: Estimated cost for intelligent mode
+  // Intelligent testing mode (now always true - Standard Mode removed)
+  intelligentMode?: boolean; // Flag for intelligent testing
+  estimatedPages?: string; // Estimated pages for intelligent mode
+  estimatedCost?: string; // Estimated cost for intelligent mode
 }
 
 /**

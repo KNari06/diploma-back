@@ -4,7 +4,6 @@ import { logger } from '@/utils/logger';
 import { webSocketService } from '@/websocket/websocket.service';
 import { BrowserContext, BrowserContextOptions, devices, Page } from 'playwright';
 import { browserPool } from './browser-pool';
-import { CommandExecutor } from './command-executor';
 import { IntelligentTestOrchestrator } from './intelligent-test-orchestrator';
 import { ResultCollector } from './result-collector';
 import { DEFAULT_SAFETY_CONFIG } from './safety-guard';
@@ -35,176 +34,283 @@ async function checkTestCancelled(testId: string): Promise<void> {
  * ✅ FIX: Uses Map with counters to track duplicate requests to the same URL
  */
 class RequestTracker {
-  // ✅ FIX: Use Map<URL, count> to track multiple requests to same URL
-  private pendingRequests = new Map<string, number>();
-  private completedRequests = new Map<string, number>();
-  private page: Page;
+  private page: import('playwright').Page;
+  // Active requests tracked by Request object (most reliable)
+  private pendingRequests: Set<import('playwright').Request> = new Set();
+  // Counters per URL for metrics/logging
+  private pendingCountsByUrl: Map<string, number> = new Map();
+  private completedCountsByUrl: Map<string, number> = new Map();
 
-  constructor(page: Page) {
+  // Patterns for external services we want to ignore
+  private readonly externalServicePatterns = [
+    'google-analytics.com',
+    'googletagmanager.com',
+    'facebook.net',
+    'sentry.io',
+    'browserstack',
+    'rollbar',
+    'hotjar',
+  ];
+
+  constructor(page: import('playwright').Page) {
     this.page = page;
     this.setupListeners();
   }
 
-  private setupListeners() {
-    // Track all requests
-    this.page.on('request', (request) => {
-      const url = request.url();
-
-      // ✅ FIX: Ignore external services (Google Analytics, Firebase, etc.)
-      // These are third-party services used by the user's website, not part of the platform
-      const externalServicePatterns = [
-        'google-analytics.com',
-        'googleapis.com',
-        'firebase.googleapis.com',
-        'googletagmanager.com',
-        'doubleclick.net',
-        'googleadservices.com',
-        'facebook.com',
-        'facebook.net',
-        'analytics.js',
-        'gtag.js',
-        'ga.js',
-        'adservice',
-        'adsystem',
-      ];
-
-      const isExternalService = externalServicePatterns.some(pattern => url.includes(pattern));
-      if (isExternalService) {
-        return; // Skip tracking external services
-      }
-
-      // Filter: only track API requests (not static assets, not websockets, not long-polling)
-      if (
-        url.includes('/api/') ||
-        url.includes('/graphql') ||
-        url.includes('/rest/') ||
-        (request.resourceType() === 'xhr' || request.resourceType() === 'fetch')
-      ) {
-        // Ignore websockets and long-polling patterns
-        if (
-          !url.includes('ws://') &&
-          !url.includes('wss://') &&
-          !url.includes('/poll') &&
-          !url.includes('/stream') &&
-          !url.includes('/events') &&
-          !url.includes('/sse')
-        ) {
-          // ✅ FIX: Increment counter for this URL (supports duplicate requests)
-          const currentCount = this.pendingRequests.get(url) || 0;
-          this.pendingRequests.set(url, currentCount + 1);
-          // ✅ IMPORTANT: These logs are valuable for debugging SPA loading issues
-          // Shows which API requests are being made and their status
-          logger.debug('[PLAYWRIGHT] Tracking API request', {
-            url: url.substring(0, 100),
-            requestCount: currentCount + 1,
-            totalPending: this.pendingRequests.size, // Total unique URLs pending
-          });
-        }
-      }
-    });
-
-    // Track completed requests
-    this.page.on('response', (response) => {
-      const url = response.url();
-
-      // ✅ FIX: Ignore external services (Google Analytics, Firebase, etc.)
-      const externalServicePatterns = [
-        'google-analytics.com',
-        'googleapis.com',
-        'firebase.googleapis.com',
-        'googletagmanager.com',
-        'doubleclick.net',
-        'googleadservices.com',
-        'facebook.com',
-        'facebook.net',
-        'analytics.js',
-        'gtag.js',
-        'ga.js',
-        'adservice',
-        'adsystem',
-      ];
-
-      const isExternalService = externalServicePatterns.some(pattern => url.includes(pattern));
-      if (isExternalService) {
-        return; // Skip tracking external services
-      }
-
-      const pendingCount = this.pendingRequests.get(url);
-
-      if (pendingCount !== undefined && pendingCount > 0) {
-        // ✅ FIX: Decrement counter instead of deleting immediately
-        const newCount = pendingCount - 1;
-
-        if (newCount === 0) {
-          // All requests to this URL completed
-          this.pendingRequests.delete(url);
-          const completedCount = this.completedRequests.get(url) || 0;
-          this.completedRequests.set(url, completedCount + 1);
-        } else {
-          // Still have pending requests to this URL
-          this.pendingRequests.set(url, newCount);
-        }
-
-        // ✅ IMPORTANT: These logs are valuable for debugging SPA loading issues
-        // Shows request completion status and remaining pending requests
-        logger.debug('[PLAYWRIGHT] API request completed', {
-          url: url.substring(0, 100),
-          status: response.status(),
-          remainingPending: newCount, // Requests to this specific URL still pending
-          totalPendingUrls: this.pendingRequests.size, // Total unique URLs still pending
-        });
-      }
-    });
+  private isPotentialApiRequest(url: string, resourceType?: string) {
+    if (!url) return false;
+    const lower = url.toLowerCase();
+    if (this.externalServicePatterns.some(p => lower.includes(p))) return false;
+    // Heuristic: treat XHR/fetch and URLs with /api/ /graphql/ /rest/ as important
+    if (resourceType === 'xhr' || resourceType === 'fetch') return true;
+    if (lower.includes('/api/') || lower.includes('/graphql') || lower.includes('/rest/')) return true;
+    // otherwise skip noisy assets
+    return false;
   }
 
-  async waitForCompletion(timeout: number = 15000): Promise<void> {
-    const startTime = Date.now();
-    const checkInterval = 500; // Check every 500ms
+  private setupListeners() {
+    this.page.on('request', (request) => {
+      try {
+        const url = request.url();
+        const rt = request.resourceType();
+        if (!this.isPotentialApiRequest(url, rt)) return;
 
-    // ✅ FIX: Wait for all tracked requests to complete (using Map.size which counts all pending)
-    while (this.pendingRequests.size > 0 && (Date.now() - startTime) < timeout) {
-      await this.page.waitForTimeout(checkInterval);
-    }
+        this.pendingRequests.add(request);
+        const prev = this.pendingCountsByUrl.get(url) || 0;
+        this.pendingCountsByUrl.set(url, prev + 1);
 
-    const duration = Date.now() - startTime;
+        // debug log
+        // eslint-disable-next-line no-console
+        console.debug('[RequestTracker] request added', { url: url.slice(0, 200), totalPending: this.pendingRequests.size });
+      } catch (e) {
+        // ignore listener errors
+      }
+    });
 
-    // Calculate total completed requests
-    const totalCompleted = Array.from(this.completedRequests.values()).reduce((sum, count) => sum + count, 0);
+    // Use requestfinished and requestfailed to reliably remove pending requests
+    this.page.on('requestfinished', (request) => this.markCompleted(request, 'finished'));
+    this.page.on('requestfailed', (request) => this.markCompleted(request, 'failed'));
+  }
 
-    if (this.pendingRequests.size > 0) {
-      // Calculate total pending requests
-      const totalPending = Array.from(this.pendingRequests.values()).reduce((sum, count) => sum + count, 0);
-
-      logger.warn('[PLAYWRIGHT] Some API requests did not complete within timeout', {
-        pendingUrlCount: this.pendingRequests.size, // Unique URLs
-        pendingRequestCount: totalPending, // Total requests
-        completedUrlCount: this.completedRequests.size,
-        completedRequestCount: totalCompleted,
-        duration: `${duration}ms`,
-        pendingUrls: Array.from(this.pendingRequests.keys()).slice(0, 3).map(url => url.substring(0, 100)),
-      });
-    } else {
-      logger.info('[PLAYWRIGHT] All important API requests completed', {
-        completedUrlCount: this.completedRequests.size,
-        completedRequestCount: totalCompleted,
-        duration: `${duration}ms`,
-      });
-    }
-
-    // Additional wait for DOM to render API data (common patterns)
+  private markCompleted(request: import('playwright').Request, reason: string) {
     try {
-      // Wait for common content indicators to appear
-      await Promise.race([
-        this.page.waitForSelector('[data-loaded], .content-loaded, [class*="list"], [class*="grid"]', { timeout: 3000 }).catch(() => null),
-        this.page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => null),
-        this.page.waitForTimeout(2000), // Fallback: wait 2 seconds for rendering
-      ]);
-    } catch (error) {
-      // Continue anyway - data might already be rendered
-      logger.debug('[PLAYWRIGHT] Content rendering wait completed or timed out');
+      if (!this.pendingRequests.has(request)) return;
+      this.pendingRequests.delete(request);
+      const url = request.url();
+      const prev = this.pendingCountsByUrl.get(url) || 1;
+      if (prev <= 1) {
+        this.pendingCountsByUrl.delete(url);
+        this.completedCountsByUrl.set(url, (this.completedCountsByUrl.get(url) || 0) + 1);
+      } else {
+        this.pendingCountsByUrl.set(url, prev - 1);
+      }
+
+      // eslint-disable-next-line no-console
+      console.debug('[RequestTracker] request completed', { url: url.slice(0,200), reason, remaining: this.pendingRequests.size });
+    } catch (e) {
+      // ignore
     }
+  }
+
+  /**
+   * Wait for outstanding tracked requests to settle or until timeout.
+   * Returns true if all tracked requests completed, false if timed out.
+   */
+  async waitForNetworkIdle(timeout = 15000, checkInterval = 200) {
+    const start = Date.now();
+    while (this.pendingRequests.size > 0 && (Date.now() - start) < timeout) {
+      await new Promise(r => setTimeout(r, checkInterval));
+    }
+
+    const completed = this.pendingRequests.size === 0;
+    if (!completed) {
+      // Log details about remaining requests for debugging
+      const leftoverUrls = Array.from(this.pendingCountsByUrl.keys()).slice(0, 10);
+      // eslint-disable-next-line no-console
+      console.warn('[RequestTracker] network idle wait timed out', { remaining: this.pendingRequests.size, leftoverUrls });
+    }
+    return completed;
+  }
+
+  getPendingCount() {
+    return this.pendingRequests.size;
+  }
+
+  getPendingCountsByUrl() {
+    return new Map(this.pendingCountsByUrl);
   }
 }
+// class RequestTracker {
+//   // ✅ FIX: Use Map<URL, count> to track multiple requests to same URL
+//   private pendingRequests = new Map<string, number>();
+//   private completedRequests = new Map<string, number>();
+//   private page: Page;
+
+//   constructor(page: Page) {
+//     this.page = page;
+//     this.setupListeners();
+//   }
+
+//   private setupListeners() {
+//     // Track all requests
+//     this.page.on('request', (request) => {
+//       const url = request.url();
+
+//       // ✅ FIX: Ignore external services (Google Analytics, Firebase, etc.)
+//       // These are third-party services used by the user's website, not part of the platform
+//       const externalServicePatterns = [
+//         'google-analytics.com',
+//         'googleapis.com',
+//         'firebase.googleapis.com',
+//         'googletagmanager.com',
+//         'doubleclick.net',
+//         'googleadservices.com',
+//         'facebook.com',
+//         'facebook.net',
+//         'analytics.js',
+//         'gtag.js',
+//         'ga.js',
+//         'adservice',
+//         'adsystem',
+//       ];
+
+//       const isExternalService = externalServicePatterns.some(pattern => url.includes(pattern));
+//       if (isExternalService) {
+//         return; // Skip tracking external services
+//       }
+
+//       // Filter: only track API requests (not static assets, not websockets, not long-polling)
+//       if (
+//         url.includes('/api/') ||
+//         url.includes('/graphql') ||
+//         url.includes('/rest/') ||
+//         (request.resourceType() === 'xhr' || request.resourceType() === 'fetch')
+//       ) {
+//         // Ignore websockets and long-polling patterns
+//         if (
+//           !url.includes('ws://') &&
+//           !url.includes('wss://') &&
+//           !url.includes('/poll') &&
+//           !url.includes('/stream') &&
+//           !url.includes('/events') &&
+//           !url.includes('/sse')
+//         ) {
+//           // ✅ FIX: Increment counter for this URL (supports duplicate requests)
+//           const currentCount = this.pendingRequests.get(url) || 0;
+//           this.pendingRequests.set(url, currentCount + 1);
+//           // ✅ IMPORTANT: These logs are valuable for debugging SPA loading issues
+//           // Shows which API requests are being made and their status
+//           logger.debug('[PLAYWRIGHT] Tracking API request', {
+//             url: url.substring(0, 100),
+//             requestCount: currentCount + 1,
+//             totalPending: this.pendingRequests.size, // Total unique URLs pending
+//           });
+//         }
+//       }
+//     });
+
+//     // Track completed requests
+//     this.page.on('response', (response) => {
+//       const url = response.url();
+
+//       // ✅ FIX: Ignore external services (Google Analytics, Firebase, etc.)
+//       const externalServicePatterns = [
+//         'google-analytics.com',
+//         'googleapis.com',
+//         'firebase.googleapis.com',
+//         'googletagmanager.com',
+//         'doubleclick.net',
+//         'googleadservices.com',
+//         'facebook.com',
+//         'facebook.net',
+//         'analytics.js',
+//         'gtag.js',
+//         'ga.js',
+//         'adservice',
+//         'adsystem',
+//       ];
+
+//       const isExternalService = externalServicePatterns.some(pattern => url.includes(pattern));
+//       if (isExternalService) {
+//         return; // Skip tracking external services
+//       }
+
+//       const pendingCount = this.pendingRequests.get(url);
+
+//       if (pendingCount !== undefined && pendingCount > 0) {
+//         // ✅ FIX: Decrement counter instead of deleting immediately
+//         const newCount = pendingCount - 1;
+
+//         if (newCount === 0) {
+//           // All requests to this URL completed
+//           this.pendingRequests.delete(url);
+//           const completedCount = this.completedRequests.get(url) || 0;
+//           this.completedRequests.set(url, completedCount + 1);
+//         } else {
+//           // Still have pending requests to this URL
+//           this.pendingRequests.set(url, newCount);
+//         }
+
+//         // ✅ IMPORTANT: These logs are valuable for debugging SPA loading issues
+//         // Shows request completion status and remaining pending requests
+//         logger.debug('[PLAYWRIGHT] API request completed', {
+//           url: url.substring(0, 100),
+//           status: response.status(),
+//           remainingPending: newCount, // Requests to this specific URL still pending
+//           totalPendingUrls: this.pendingRequests.size, // Total unique URLs still pending
+//         });
+//       }
+//     });
+//   }
+
+//   async waitForCompletion(timeout: number = 15000): Promise<void> {
+//     const startTime = Date.now();
+//     const checkInterval = 500; // Check every 500ms
+
+//     // ✅ FIX: Wait for all tracked requests to complete (using Map.size which counts all pending)
+//     while (this.pendingRequests.size > 0 && (Date.now() - startTime) < timeout) {
+//       await this.page.waitForTimeout(checkInterval);
+//     }
+
+//     const duration = Date.now() - startTime;
+
+//     // Calculate total completed requests
+//     const totalCompleted = Array.from(this.completedRequests.values()).reduce((sum, count) => sum + count, 0);
+
+//     if (this.pendingRequests.size > 0) {
+//       // Calculate total pending requests
+//       const totalPending = Array.from(this.pendingRequests.values()).reduce((sum, count) => sum + count, 0);
+
+//       logger.warn('[PLAYWRIGHT] Some API requests did not complete within timeout', {
+//         pendingUrlCount: this.pendingRequests.size, // Unique URLs
+//         pendingRequestCount: totalPending, // Total requests
+//         completedUrlCount: this.completedRequests.size,
+//         completedRequestCount: totalCompleted,
+//         duration: `${duration}ms`,
+//         pendingUrls: Array.from(this.pendingRequests.keys()).slice(0, 3).map(url => url.substring(0, 100)),
+//       });
+//     } else {
+//       logger.info('[PLAYWRIGHT] All important API requests completed', {
+//         completedUrlCount: this.completedRequests.size,
+//         completedRequestCount: totalCompleted,
+//         duration: `${duration}ms`,
+//       });
+//     }
+
+//     // Additional wait for DOM to render API data (common patterns)
+//     try {
+//       // Wait for common content indicators to appear
+//       await Promise.race([
+//         this.page.waitForSelector('[data-loaded], .content-loaded, [class*="list"], [class*="grid"]', { timeout: 3000 }).catch(() => null),
+//         this.page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => null),
+//         this.page.waitForTimeout(2000), // Fallback: wait 2 seconds for rendering
+//       ]);
+//     } catch (error) {
+//       // Continue anyway - data might already be rendered
+//       logger.debug('[PLAYWRIGHT] Content rendering wait completed or timed out');
+//     }
+//   }
+// }
 
 /**
  * Execute Playwright test
@@ -355,46 +461,43 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // MODE DETECTION: Priority order
-    // 1. If commands exist → Standard Mode (execute commands)
-    // 2. If no commands + intelligentMode + testGoal → Intelligent Mode
-    // 3. Otherwise → Legacy Mode (simple navigation)
+    // ✅ UNIFIED MODE: Always use Intelligent Mode (Standard Mode removed)
+    // - Commands from plan are converted to "hints" for AI guidance
+    // - AI adapts to actual page elements instead of failing on broken selectors
+    // - Self-healing, Vision AI, and adaptive testing always enabled
     // ═══════════════════════════════════════════════════════════════════════
 
     const hasCommands = !!(testData.commands && testData.commands.length > 0);
-    const hasIntelligentGoal = !!(testData.intelligentMode && (testData.testGoal || testData.intent));
+    const goal = testData.testGoal || testData.intent || 'Test the application';
 
-    // ✅ FIX: Check commands FIRST (highest priority)
-    // If commands exist, use Standard Mode regardless of intelligentMode flag
-    if (hasCommands) {
-      logger.info('[PLAYWRIGHT] Standard Mode detected (commands provided)', {
-        testId: testData.testId,
-        commandsCount: testData.commands?.length || 0,
-        intelligentModeFlag: testData.intelligentMode, // Log original flag for debugging
-      });
-      // Will execute commands below (line ~746)
-    } else if (hasIntelligentGoal) {
-      // ✅ FIX: Intelligent Mode only if NO commands AND has goal
-      logger.info('[PLAYWRIGHT] Intelligent Mode detected (no commands, goal provided)', {
-        testId: testData.testId,
-        goal: testData.testGoal || testData.intent,
-        mode: 'balanced',
-      });
-    } else {
-      logger.info('[PLAYWRIGHT] Legacy Mode detected (no commands, no goal)', {
-        testId: testData.testId,
-        intelligentModeFlag: testData.intelligentMode,
-      });
-    }
+    // ✅ NEW: Convert commands to hints for AI guidance
+    const hintsFromCommands = hasCommands && testData.commands
+      ? testData.commands.map((cmd, i) => ({
+          id: `cmd_${i}`,
+          description: cmd.description || `${cmd.action} on ${cmd.selector || 'page'}`,
+          action: cmd.action,
+          target: cmd.selector,
+          value: cmd.value !== undefined ? String(cmd.value) : undefined, // Convert to string
+          priority: 'medium' as const,
+        }))
+      : [];
+
+    logger.info('[PLAYWRIGHT] Unified Intelligent Mode activated', {
+      testId: testData.testId,
+      goal,
+      hasCommands,
+      hintsCount: hintsFromCommands.length,
+      mode: 'balanced',
+    });
 
     // ═══════════════════════════════════════════════════════════════════════
-    // INTELLIGENT MODE: Use IntelligentTestOrchestrator
+    // INTELLIGENT MODE: Use IntelligentTestOrchestrator for ALL tests
     // ═══════════════════════════════════════════════════════════════════════
-    if (hasIntelligentGoal && !hasCommands) {
-      logger.info('[PLAYWRIGHT] Intelligent mode activated', {
+    {
+      logger.info('[PLAYWRIGHT] Starting intelligent test execution', {
         testId: testData.testId,
-        goal: testData.testGoal || testData.intent || 'General testing',
-        mode: 'balanced',
+        goal,
+        hintsCount: hintsFromCommands.length,
       });
 
       // Emit progress: Navigating to page (20%)
@@ -534,8 +637,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         throw new Error(`Failed to navigate to ${testData.url}: ${navError instanceof Error ? navError.message : 'Unknown error'}`);
       }
 
-      // ✅ FIX: Wait for important API requests to complete
-      await requestTracker.waitForCompletion(15000);
+      // ✅ FIX: Wait for important API requests to complete (network idle heuristic)
+      await requestTracker.waitForNetworkIdle(15000);
 
       // Check if test was cancelled after navigation
       await checkTestCancelled(testData.testId);
@@ -558,14 +661,14 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         url: finalUrl,
       });
 
-      // Build intelligent test config
+      // Build intelligent test config with hints from commands (if any)
       const intelligentConfig: IntelligentTestConfig = {
         mode: 'balanced', // Use balanced mode by default
         safety: {
           ...DEFAULT_SAFETY_CONFIG,
           level: 'normal',
         },
-        goal: testData.testGoal || testData.intent || 'Test the application',
+        goal,
         startUrl: testData.url,
         browser: testData.browser, // Add browser for progress tracking
         credentials: testData.options?.credentials,
@@ -573,6 +676,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           projectId: testData.projectId,
           testId: testData.testId,
         },
+        // ✅ NEW: Features migrated from Standard Mode
+        hints: hintsFromCommands.length > 0 ? hintsFromCommands : undefined,
+        waitForSelector: testData.options?.waitForSelector,
+        customScripts: testData.options?.customScripts,
+        commands: testData.commands, // Keep original commands for reference
       };
 
       // Create orchestrator (with testId for cancellation checks)
@@ -765,191 +873,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STANDARD MODE: Execute commands or legacy flow
+    // ✅ REMOVED: Standard Mode code - now all tests use Intelligent Mode
+    // Commands are converted to hints and AI adapts to actual page elements
+    // This provides self-healing, better accuracy, and adaptive testing
     // ═══════════════════════════════════════════════════════════════════════
 
-    // Setup result collectors
-    collector.setupListeners(page);
-
-    // Set timeout
-    const timeout = testData.options?.timeout || 30000;
-    page.setDefaultTimeout(timeout);
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // STANDARD MODE: Execute predefined commands
-    // ═══════════════════════════════════════════════════════════════════════
-    // ✅ FIX: Only execute commands if NOT in Intelligent Mode
-    if (hasCommands && !hasIntelligentGoal && testData.commands) {
-      logger.info(`Executing ${testData.commands.length} Playwright commands`, {
-        testId: testData.testId,
-        commandCount: testData.commands.length,
-      });
-
-      const executor = new CommandExecutor(page);
-      const commandResults = await executor.executeCommands(testData.commands);
-
-      if (!commandResults.success) {
-        logger.warn('Some commands failed during execution', {
-          failedCount: commandResults.errors.length,
-          errors: commandResults.errors,
-        });
-
-        // Add command errors to collector
-        for (const { error } of commandResults.errors) {
-          collector.errors.push({
-            type: 'other',
-            message: `Command execution error: ${error}`,
-            timestamp: new Date(),
-          });
-        }
-      } else {
-        logger.info('All commands executed successfully', {
-          successCount: commandResults.results.length,
-        });
-      }
-    } else {
-      // Legacy flow: Navigate to URL if no commands provided
-      logger.info('No commands provided, using legacy navigation flow');
-      logger.info('Navigating to URL', { url: testData.url });
-      await page.goto(testData.url, {
-        waitUntil: 'domcontentloaded',
-        timeout,
-      });
-
-      // Wait for selector if specified
-      if (testData.options?.waitForSelector) {
-        logger.info('Waiting for selector', { selector: testData.options.waitForSelector });
-        await page.waitForSelector(testData.options.waitForSelector, { timeout });
-      } else {
-        // Default wait for network idle
-        await page.waitForLoadState('networkidle', { timeout: Math.min(timeout, 10000) });
-      }
-
-      // Execute custom scripts if provided
-      if (testData.options?.customScripts && testData.options.customScripts.length > 0) {
-        for (const script of testData.options.customScripts) {
-          try {
-            logger.info('Executing custom script');
-            await page.evaluate(script);
-          } catch (scriptError) {
-            logger.warn('Custom script failed', { error: scriptError });
-            collector.errors.push({
-              type: 'other',
-              message: `Custom script failed: ${scriptError instanceof Error ? scriptError.message : 'Unknown'}`,
-              timestamp: new Date(),
-            });
-          }
-        }
-      }
-
-      // Small delay to let page settle
-      await page.waitForTimeout(1000);
-    }
-
-    // Collect results
-    const results = await collector.collect(page, true);
-
-    // ✅ NEW: Stop tracing before closing
-    if (context && tracePath) {
-      try {
-    await context.tracing.stop({ path: tracePath });
-    logger.info('[PLAYWRIGHT] Trace saved', { tracePath });
-      } catch (traceError) {
-        logger.warn('[PLAYWRIGHT] Failed to stop tracing', { error: traceError });
-      }
-    }
-
-    // ✅ NEW: Get video path before closing page
-    if (page) {
-      try {
-    const video = page.video();
-    await page.close();
-
-    if (video) {
-      videoPath = await video.path();
-      logger.info('[PLAYWRIGHT] Video saved', { videoPath });
-        }
-      } catch (pageError) {
-        logger.warn('[PLAYWRIGHT] Failed to close page', { error: pageError });
-      }
-    }
-
-    // Close context
-    if (context) {
-      try {
-    await context.close();
-      } catch (contextError) {
-        logger.warn('[PLAYWRIGHT] Failed to close context', { error: contextError });
-      }
-    }
-
-    // ✅ NEW: Upload video, trace, and screenshots to Supabase Storage
-    let videoUrl: string | undefined;
-    let traceUrl: string | undefined;
-    let screenshotUrl: string | undefined;
-
-    try {
-      const { uploadVideoToStorage, uploadTraceToStorage, uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-
-      if (videoPath) {
-        videoUrl = await uploadVideoToStorage(videoPath, testData.testId, testData.userId || 'anonymous');
-        logger.info('[PLAYWRIGHT] Video uploaded to storage', { videoUrl });
-      }
-
-      if (tracePath) {
-        traceUrl = await uploadTraceToStorage(tracePath, testData.testId, testData.userId || 'anonymous');
-        logger.info('[PLAYWRIGHT] Trace uploaded to storage', { traceUrl });
-      }
-
-      // ✅ CRITICAL FIX: Upload screenshot to Supabase Storage
-      if (results.screenshot) {
-        try {
-          screenshotUrl = await uploadScreenshotToStorage(
-            results.screenshot,
-            testData.testId,
-            testData.userId || 'anonymous',
-            0
-          );
-          logger.info('[PLAYWRIGHT] Screenshot uploaded to storage', { screenshotUrl });
-        } catch (screenshotError) {
-          logger.error('[PLAYWRIGHT] Failed to upload screenshot', {
-            error: screenshotError instanceof Error ? screenshotError.message : String(screenshotError),
-          });
-          // Don't fail the test if screenshot upload fails
-        }
-      }
-    } catch (uploadError) {
-      logger.error('[PLAYWRIGHT] Failed to upload artifacts', {
-        error: uploadError instanceof Error ? uploadError.message : String(uploadError),
-      });
-      // Don't fail the test if upload fails
-    }
-
-    logger.info('Playwright test completed successfully', {
-      testId: testData.testId,
-      browser: testData.browser,
-      logsCount: results.logs.length,
-      networkLogsCount: results.networkLogs.length,
-      errorsCount: results.errors.length,
-      hasVideo: !!videoUrl,
-      hasTrace: !!traceUrl,
-    });
-
-    return {
-      success: true,
-      status: 'completed',
-      screenshot: results.screenshot,
-      dom: results.dom,
-      logs: results.logs,
-      networkLogs: results.networkLogs,
-      errors: results.errors,
-      performance: results.performance,
-      // ✅ NEW: Return video & trace paths/URLs
-      videoUrl,
-      videoPath,
-      traceUrl,
-      tracePath,
-    };
   } catch (error) {
     // Check if error is about cancellation
     const isCancelled = error instanceof Error && error.message.includes('cancelled');

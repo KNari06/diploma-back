@@ -9,13 +9,15 @@ import { AICostManager, getCostManager, removeCostManager } from '@/services/ai-
 import { logger } from '@/utils/logger';
 import { webSocketService } from '@/websocket/websocket.service';
 import { Browser, Page } from 'playwright';
+import { AdaptiveConfigService } from './adaptive-config.service'; // ✅ NEW: Adaptive configuration
 import { CommandExecutor } from './command-executor';
 import { ContextualActionGenerator } from './contextual-action-generator';
+import { FormIntelligenceService } from './form-intelligence.service'; // ✅ NEW: Smart form handling
 import { IntelligentPageAnalyzer } from './intelligent-page-analyzer';
+import { PreActionAnalyzer } from './pre-action-analyzer'; // ✅ NEW: Pre-action analysis for smart action execution
 import { ResultValidator } from './result-validator';
 import { SafetyGuard } from './safety-guard';
 import { StateTracker } from './state-tracker';
-import { normalizeSelector, getLocator, validateAndGetLocator, getElementDisabledContext } from './utils/selector-utils';
 import {
   ActionResult,
   DynamicAction,
@@ -28,6 +30,11 @@ import {
 import { ActionPattern, ActionPatternDetector } from './utils/action-pattern-detector'; // ✅ NEW
 import { GraphBuilder } from './utils/graph-builder.service'; // ✅ NEW
 import { TestProgressEmitter } from './utils/progress-emitter';
+import { getElementDisabledContext, getLocator, normalizeSelector } from './utils/selector-utils';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONSTANTS - AI Cost Estimation
+// ═══════════════════════════════════════════════════════════════════════════
 
 // AI cost estimation (updated with accurate pricing Nov 2024)
 // Based on: GPT-4o $0.005 input / $0.015 output per 1K tokens
@@ -36,6 +43,16 @@ const COST_VISION_ANALYSIS = 0.0055; // GPT-4o Vision (1 screenshot)
 const COST_DOM_ANALYSIS = 0.0001; // GPT-4o-mini (400 input + 100 output)
 const COST_ACTION_GENERATION = 0.0002; // GPT-4o-mini (500 input + 150 output)
 const COST_DECISION = 0.0001; // GPT-4o-mini (300 input + 100 output)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTE: All hardcoded values moved to AdaptiveConfigService
+// Values are now determined dynamically based on context:
+// - Page type (checkout, dashboard, etc.)
+// - Network speed (fast, medium, slow)
+// - Error rate (adaptive thresholds)
+// - Test mode (fast, balanced, full)
+// - Page complexity (heavy JS, many selectors, etc.)
+// ═══════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INTELLIGENT TEST ORCHESTRATOR
@@ -69,7 +86,6 @@ export class IntelligentTestOrchestrator {
 
   // ✅ NEW: Track selector failures to prevent infinite loops
   private selectorFailures = new Map<string, number>(); // selector -> failure count
-  private readonly MAX_SELECTOR_FAILURES = 3; // Stop trying after 3 failures
 
   constructor(config: IntelligentTestConfig, userId?: string, testId?: string) {
     this.config = config;
@@ -151,9 +167,10 @@ export class IntelligentTestOrchestrator {
           testId: this.testId,
           startUrl: this.config.startUrl,
         });
+        // Note: this.state is not initialized yet, use default timeout
         await page.goto(this.config.startUrl, {
           waitUntil: 'load',
-          timeout: 30000,
+          timeout: AdaptiveConfigService.getTimeout('NAVIGATION', {}), // Default timeout before state init
         });
 
         const newUrl = page.url();
@@ -225,6 +242,65 @@ export class IntelligentTestOrchestrator {
     if (this.testId && this.userId) {
       const startUpdate = this.graphBuilder.addStartNode();
       this.emitGraphUpdate(startUpdate);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ✅ NEW: Execute pre-test setup (migrated from Standard Mode)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // Execute custom scripts if provided (from Standard Mode)
+    if (this.config.customScripts && this.config.customScripts.length > 0) {
+      logger.info('[INTELLIGENT_ORCHESTRATOR] Executing custom scripts', {
+        testId: this.testId,
+        scriptsCount: this.config.customScripts.length,
+      });
+
+      for (const script of this.config.customScripts) {
+        try {
+          await this.page.evaluate(script);
+          logger.debug('[INTELLIGENT_ORCHESTRATOR] Custom script executed successfully');
+        } catch (scriptError) {
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] Custom script failed', {
+            error: scriptError instanceof Error ? scriptError.message : String(scriptError),
+          });
+          // Don't fail test - just warn
+        }
+      }
+    }
+
+    // Wait for specific selector if provided (from Standard Mode)
+    if (this.config.waitForSelector) {
+      logger.info('[INTELLIGENT_ORCHESTRATOR] Waiting for selector before starting', {
+        testId: this.testId,
+        selector: this.config.waitForSelector,
+      });
+
+      try {
+        const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
+        await this.page.waitForSelector(this.config.waitForSelector, {
+          state: 'visible',
+          timeout: AdaptiveConfigService.getTimeout('SELECTOR_WAIT', {
+            networkSpeed: pageContext.networkSpeed,
+            isSlowPage: pageContext.isSlowPage,
+          }),
+        });
+        logger.debug('[INTELLIGENT_ORCHESTRATOR] Selector found, proceeding with test');
+      } catch (waitError) {
+        logger.warn('[INTELLIGENT_ORCHESTRATOR] Initial selector not found, proceeding anyway', {
+          selector: this.config.waitForSelector,
+          error: waitError instanceof Error ? waitError.message : String(waitError),
+        });
+        // Don't fail - AI will adapt to actual page state
+      }
+    }
+
+    // Log hints if provided (for debugging)
+    if (this.config.hints && this.config.hints.length > 0) {
+      logger.info('[INTELLIGENT_ORCHESTRATOR] Test hints provided', {
+        testId: this.testId,
+        hintsCount: this.config.hints.length,
+        hints: this.config.hints.map(h => h.description),
+      });
     }
 
     // Emit progress: Analysis phase starting
@@ -502,9 +578,13 @@ export class IntelligentTestOrchestrator {
             message: cycleCheck.suggestion,
           });
 
-          // ✅ FIX: More aggressive stopping - if cycle detected 3+ times, stop immediately
-          // Changed from 5 to 3 to prevent wasting time on stuck pages
-          if (cycleCheck.visitCount && cycleCheck.visitCount >= 3) {
+          // ✅ FIX: More aggressive stopping - if cycle detected, stop immediately
+          const pageContext = AdaptiveConfigService.analyzePageContext(this.state, context.pageType);
+          const cycleThreshold = AdaptiveConfigService.getThreshold('CYCLE_DETECTION_THRESHOLD', {
+            testMode: this.config.mode,
+            errorRate: pageContext.errorRate,
+          });
+          if (cycleCheck.visitCount && cycleCheck.visitCount >= cycleThreshold) {
             logger.warn('[INTELLIGENT_ORCHESTRATOR] Stopping due to excessive URL cycles', {
               visitCount: cycleCheck.visitCount,
               url: context.url,
@@ -580,8 +660,13 @@ export class IntelligentTestOrchestrator {
             elementsCount: context.vision.elements.length,
           });
 
-          // Stop if 2+ consecutive empty pages
-          if (this.consecutiveEmptyPages >= 2) {
+          // Stop if threshold reached
+          const pageContext = AdaptiveConfigService.analyzePageContext(this.state, context.pageType);
+          const emptyPagesThreshold = AdaptiveConfigService.getThreshold('CONSECUTIVE_EMPTY_PAGES_THRESHOLD', {
+            testMode: this.config.mode,
+            isComplexPage: pageContext.isComplexPage,
+          });
+          if (this.consecutiveEmptyPages >= emptyPagesThreshold) {
             logger.warn('[INTELLIGENT_ORCHESTRATOR] Stopping due to consecutive empty pages', {
               consecutiveCount: this.consecutiveEmptyPages,
               url: context.url,
@@ -685,7 +770,12 @@ export class IntelligentTestOrchestrator {
             logger.info('[INTELLIGENT_ORCHESTRATOR] Skipping: ' + decision.reason);
             // Go back if possible
             try {
-              await this.page.goBack({ timeout: 5000 });
+              const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
+              await this.page.goBack({
+                timeout: AdaptiveConfigService.getTimeout('GO_BACK', {
+                  networkSpeed: pageContext.networkSpeed,
+                }),
+              });
             } catch {
               continueLoop = false;
             }
@@ -735,12 +825,19 @@ export class IntelligentTestOrchestrator {
         });
 
         // ✅ IMPROVED: Check for repeated selector errors (infinite loop detection)
+        const errorPageContext = AdaptiveConfigService.analyzePageContext(this.state);
+        const recentErrorsCheckCount = AdaptiveConfigService.getThreshold('RECENT_ERRORS_CHECK_COUNT', {
+          errorRate: errorPageContext.errorRate,
+        });
         const recentSelectorErrors = this.state.errors
-          .slice(-5)
+          .slice(-recentErrorsCheckCount)
           .filter(e => e.message.includes('Selector not found') || e.message.includes('not found'))
           .length;
 
-        if (recentSelectorErrors >= 3) {
+        const selectorErrorsThreshold = AdaptiveConfigService.getThreshold('RECENT_SELECTOR_ERRORS_THRESHOLD', {
+          errorRate: errorPageContext.errorRate,
+        });
+        if (recentSelectorErrors >= selectorErrorsThreshold) {
           logger.error('[INTELLIGENT_ORCHESTRATOR] Too many selector errors in a row, possible infinite loop', {
             testId: this.testId,
             recentSelectorErrors,
@@ -754,7 +851,12 @@ export class IntelligentTestOrchestrator {
         }
 
         // Too many errors? Stop
-        if (this.state.errors.length > 10) {
+        const maxErrors = AdaptiveConfigService.getThreshold('MAX_ERRORS_BEFORE_STOP', {
+          testMode: this.config.mode,
+          errorRate: errorPageContext.errorRate,
+          isComplexPage: errorPageContext.isComplexPage,
+        });
+        if (this.state.errors.length > maxErrors) {
           logger.error('[INTELLIGENT_ORCHESTRATOR] Too many errors, stopping', {
             testId: this.testId,
             totalErrors: this.state.errors.length,
@@ -820,7 +922,8 @@ export class IntelligentTestOrchestrator {
       const location = headers['location'] || headers['Location'];
 
       // Log redirects (3xx status codes)
-      if (status >= 300 && status < 400 && location) {
+      const redirectRange = AdaptiveConfigService.getHttpStatusRange('redirect');
+      if (status >= redirectRange.start && status < redirectRange.end && location) {
         logger.info('[NAVIGATION_TRACKER] Redirect detected', {
           testId: this.testId,
           from: url,
@@ -881,7 +984,12 @@ export class IntelligentTestOrchestrator {
 
       // Try to go back to previous page
       try {
-        await this.page.goBack({ timeout: 5000 });
+        const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
+        await this.page.goBack({
+          timeout: AdaptiveConfigService.getTimeout('GO_BACK', {
+            networkSpeed: pageContext.networkSpeed,
+          }),
+        });
         const newUrl = this.page.url();
 
         if (newUrl === 'about:blank' || newUrl.startsWith('about:')) {
@@ -889,9 +997,13 @@ export class IntelligentTestOrchestrator {
           logger.warn('[INTELLIGENT_ORCHESTRATOR] Still on about:blank after goBack, navigating to start URL', {
             startUrl: this.config.startUrl,
           });
+          const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
           await this.page.goto(this.config.startUrl, {
             waitUntil: 'domcontentloaded',
-            timeout: 30000,
+            timeout: AdaptiveConfigService.getTimeout('NAVIGATION', {
+              networkSpeed: pageContext.networkSpeed,
+              hasHeavyJS: pageContext.hasHeavyJS,
+            }),
           });
         }
 
@@ -940,22 +1052,36 @@ export class IntelligentTestOrchestrator {
 
   /**
    * STEP 3: Generate actions
+   * Uses hints from config to guide action generation
    */
   private async generateActions(context: PageContext): Promise<{
     actions: DynamicAction[];
     reasoning: string;
     confidence: number;
   }> {
-    logger.info('[INTELLIGENT_ORCHESTRATOR] Generating actions');
+    logger.info('[INTELLIGENT_ORCHESTRATOR] Generating actions', {
+      hasHints: !!(this.config.hints && this.config.hints.length > 0),
+      hintsCount: this.config.hints?.length || 0,
+    });
 
     this.emitEvent('actions_generating', {});
 
-    // ✅ FIX 9: Pass cost manager to action generator
+    // ✅ NEW: Convert TestHint[] to simpler format for ContextualActionGenerator
+    const hints = this.config.hints?.map(h => ({
+      description: h.description,
+      action: h.action,
+      target: h.target,
+      value: h.value,
+      priority: h.priority,
+    }));
+
+    // ✅ FIX 9: Pass cost manager and hints to action generator
     const result = await ContextualActionGenerator.generateActions(
       context,
       this.state,
-      this.page,  // ✅ NEW: Pass page for HTML extraction
-      this.costManager  // ✅ FIX 9: Pass cost manager for budget control
+      this.page,
+      this.costManager,
+      hints  // ✅ NEW: Pass hints for AI guidance
     );
 
     // Update cost
@@ -1052,8 +1178,119 @@ export class IntelligentTestOrchestrator {
           actionType: action.action,
         });
 
+        // ═══════════════════════════════════════════════════════════════════════════
+        // ✅ NEW: PRE-ACTION ANALYSIS (Phase 1 - UI Tester Intelligence)
+        // Analyzes page state BEFORE action to prevent failures
+        // ═══════════════════════════════════════════════════════════════════════════
+        const pageContext = AdaptiveConfigService.analyzePageContext(this.state, context.pageType);
+        if (action.selector && AdaptiveConfigService.requiresPreActionAnalysis(action, {
+          pageType: context.pageType,
+          hasForm: (context.dom?.forms?.length || 0) > 0,
+          isSlowPage: pageContext.isSlowPage,
+        })) {
+          const preAnalysis = await PreActionAnalyzer.analyzeBeforeAction(this.page, action);
+
+          // If there are blocking factors, try to resolve them first
+          if (!preAnalysis.canProceed && preAnalysis.suggestedActions.length > 0) {
+            logger.info('[INTELLIGENT_ORCHESTRATOR] Pre-action analysis found blocking factors', {
+              testId: this.testId,
+              action: action.description,
+              blockingFactors: preAnalysis.blockingFactors.map(bf => bf.description),
+              suggestedActionsCount: preAnalysis.suggestedActions.length,
+            });
+
+            // Execute suggested prerequisite actions (e.g., fill required fields)
+            for (const prereqAction of preAnalysis.suggestedActions) {
+              try {
+                logger.info('[INTELLIGENT_ORCHESTRATOR] Executing prerequisite action', {
+                  testId: this.testId,
+                  prereqAction: prereqAction.description,
+                  forAction: action.description,
+                });
+
+                // Convert to PlaywrightCommand and execute
+                const prereqCommand = this.convertActionToCommand(prereqAction);
+                const prereqResult = await this.commandExecutor.executeCommand(prereqCommand);
+
+                if (prereqResult.success) {
+                  logger.info('[INTELLIGENT_ORCHESTRATOR] Prerequisite action succeeded', {
+                    prereqAction: prereqAction.description,
+                  });
+
+                  // Record prerequisite action
+                  completedActions.push({
+                    action: prereqAction,
+                    success: true,
+                    urlChanged: false,
+                    urlBefore,
+                    urlAfter: this.page.url(),
+                    timestamp: Date.now(),
+                  });
+                } else {
+                  logger.warn('[INTELLIGENT_ORCHESTRATOR] Prerequisite action failed', {
+                    prereqAction: prereqAction.description,
+                    error: prereqResult.error,
+                  });
+                }
+
+                // Small delay between prerequisite actions (reuse outer pageContext)
+                await this.page.waitForTimeout(
+                  AdaptiveConfigService.getTimeout('PREREQUISITE_ACTION_DELAY', {
+                    isSlowPage: pageContext.isSlowPage,
+                  })
+                );
+              } catch (prereqError) {
+                logger.warn('[INTELLIGENT_ORCHESTRATOR] Failed to execute prerequisite action', {
+                  prereqAction: prereqAction.description,
+                  error: prereqError instanceof Error ? prereqError.message : String(prereqError),
+                });
+              }
+            }
+
+            // Re-analyze after prerequisite actions
+            const reAnalysis = await PreActionAnalyzer.analyzeBeforeAction(this.page, action);
+            if (!reAnalysis.canProceed) {
+              logger.warn('[INTELLIGENT_ORCHESTRATOR] Still cannot proceed after prerequisites', {
+                testId: this.testId,
+                action: action.description,
+                remainingBlockers: reAnalysis.blockingFactors.map(bf => bf.description),
+              });
+
+              // If still blocked and action is not optional, skip it
+              if (!action.optional) {
+                completedActions.push({
+                  action,
+                  success: false,
+                  error: `Blocked: ${reAnalysis.blockingFactors.map(bf => bf.description).join(', ')}`,
+                  urlChanged: false,
+                  urlBefore,
+                  urlAfter: urlBefore,
+                  timestamp: Date.now(),
+                });
+                continue; // Skip to next action
+              }
+            }
+          }
+
+          // Log validation errors if any
+          if (preAnalysis.validationErrors.length > 0) {
+            logger.warn('[INTELLIGENT_ORCHESTRATOR] Validation errors detected before action', {
+              testId: this.testId,
+              action: action.description,
+              errors: preAnalysis.validationErrors,
+            });
+          }
+        }
+
         // ✅ IMPROVED: Validate selector exists AND is visible/actionable before execution
-        if (action.selector && ['click', 'fill', 'type', 'select', 'check', 'uncheck', 'hover'].includes(action.action)) {
+        const normalizedSelectorForReliability = action.selector ? normalizeSelector(action.selector) : '';
+        const selectorReliability = normalizedSelectorForReliability && this.selectorFailures.has(normalizedSelectorForReliability)
+          ? 'low' as const
+          : 'high' as const;
+        if (action.selector && AdaptiveConfigService.requiresSelectorValidation(action, {
+          pageType: context.pageType,
+          selectorReliability,
+        })) {
           try {
             // ✅ FIX: Normalize selector format before using (convert getByText('text') → text="text")
             const normalizedSelector = normalizeSelector(action.selector);
@@ -1072,11 +1309,19 @@ export class IntelligentTestOrchestrator {
                 selector: action.selector,
                 normalizedSelector,
                 failureCount,
-                maxFailures: this.MAX_SELECTOR_FAILURES,
+                maxFailures: AdaptiveConfigService.getThreshold('MAX_SELECTOR_FAILURES', {
+                  testMode: this.config.mode,
+                  hasManySelectors: AdaptiveConfigService.analyzePageContext(this.state).hasManySelectors,
+                }),
               });
 
-              // If selector failed too many times, skip permanently
-              if (failureCount >= this.MAX_SELECTOR_FAILURES) {
+              // If selector failed too many times, skip permanently (reuse outer pageContext)
+              const maxFailures = AdaptiveConfigService.getThreshold('MAX_SELECTOR_FAILURES', {
+                testMode: this.config.mode,
+                hasManySelectors: pageContext.hasManySelectors,
+                errorRate: pageContext.errorRate,
+              });
+              if (failureCount >= maxFailures) {
                 logger.error('[INTELLIGENT_ORCHESTRATOR] Selector failed too many times, skipping permanently', {
                   testId: this.testId,
                   selector: normalizedSelector,
@@ -1109,8 +1354,14 @@ export class IntelligentTestOrchestrator {
             // ✅ NEW: For click actions, also check if element is visible and actionable
             if (action.action === 'click') {
               try {
-                // Wait for element to be visible and actionable (with shorter timeout for validation)
-                await locator.waitFor({ state: 'visible', timeout: 2000 }).catch(() => {
+                // Wait for element to be visible and actionable (reuse outer pageContext)
+                await locator.waitFor({
+                  state: 'visible',
+                  timeout: AdaptiveConfigService.getTimeout('ELEMENT_VISIBILITY', {
+                    isSlowPage: pageContext.isSlowPage,
+                    networkSpeed: pageContext.networkSpeed,
+                  }),
+                }).catch(() => {
                   throw new Error('Element not visible');
                 });
 
@@ -1258,7 +1509,11 @@ export class IntelligentTestOrchestrator {
         // Wait only if page navigation occurred (new page needs to stabilize)
         if (urlChanged) {
           // Wait for new page to stabilize
-          await this.page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => {
+          const stabilizeTimeout = AdaptiveConfigService.getTimeout('ELEMENT_VISIBILITY', {
+            isSlowPage: pageContext.isSlowPage,
+            networkSpeed: pageContext.networkSpeed,
+          });
+          await this.page.waitForLoadState('domcontentloaded', { timeout: stabilizeTimeout }).catch(() => {
             logger.debug('[INTELLIGENT_ORCHESTRATOR] DOM not fully loaded after navigation, continuing anyway');
           });
         }
@@ -1324,7 +1579,11 @@ export class IntelligentTestOrchestrator {
 
           // Try to go back
           try {
-            await this.page.goBack({ timeout: 5000 });
+            await this.page.goBack({
+              timeout: AdaptiveConfigService.getTimeout('GO_BACK', {
+                networkSpeed: pageContext.networkSpeed,
+              }),
+            });
             logger.info('[INTELLIGENT_ORCHESTRATOR] Successfully navigated back from about:blank');
           } catch (backError) {
             logger.error('[INTELLIGENT_ORCHESTRATOR] Failed to navigate back from about:blank', {
@@ -1441,6 +1700,68 @@ export class IntelligentTestOrchestrator {
           });
         }
 
+        // ═══════════════════════════════════════════════════════════════════════════
+        // ✅ NEW: POST-ACTION ANALYSIS - Check for errors after action
+        // ═══════════════════════════════════════════════════════════════════════════
+        const isSubmitAction = action.action === 'click' && action.description?.toLowerCase().includes('submit');
+        if (AdaptiveConfigService.requiresPostActionAnalysis(action, {
+          pageType: context.pageType,
+          hasForm: (context.dom?.forms?.length || 0) > 0,
+          isSubmitAction,
+        })) {
+          const postAnalysis = await PreActionAnalyzer.analyzeAfterAction(
+            this.page,
+            action,
+            actionResult.success
+          );
+
+          if (postAnalysis.hasNewErrors) {
+            logger.warn('[INTELLIGENT_ORCHESTRATOR] Post-action analysis detected errors', {
+              testId: this.testId,
+              action: action.description,
+              errors: postAnalysis.errors,
+              suggestions: postAnalysis.suggestions,
+            });
+
+            // ═══════════════════════════════════════════════════════════════════════════
+            // ✅ PHASE 2: FORM INTELLIGENCE - Try to fix validation errors
+            // ═══════════════════════════════════════════════════════════════════════════
+            if (action.selector && postAnalysis.errors.length > 0) {
+              await this.tryFixValidationErrors(action, postAnalysis.errors);
+            }
+
+            // If action seemed successful but page shows errors, mark it as failed
+            if (actionResult.success) {
+              actionResult.success = false;
+              actionResult.error = `Validation error after action: ${postAnalysis.errors.join(', ')}`;
+
+              // Update state
+              this.state = StateTracker.recordActionResult(this.state, actionResult);
+
+              this.emitEvent('action_failed', {
+                action: action.description,
+                error: actionResult.error,
+              });
+            }
+          }
+
+          // ═══════════════════════════════════════════════════════════════════════════
+          // ✅ PHASE 2: FORM INTELLIGENCE - Wait for conditional fields after fill/select
+          // ═══════════════════════════════════════════════════════════════════════════
+          const formAnalysis = await PreActionAnalyzer.analyzeFormBeforeSubmit(
+            this.page,
+            action.selector || '',
+            { useIntelligence: true, url: this.page.url() }
+          ).catch(() => null);
+          if (AdaptiveConfigService.triggersConditionalFields(action, {
+            pageType: context.pageType,
+            hasForm: (context.dom?.forms?.length || 0) > 0,
+            formType: formAnalysis ? 'unknown' : undefined, // Could be enhanced with FormIntelligence
+          }) && actionResult.success) {
+            await this.handleConditionalFieldsAfterAction(action);
+          }
+        }
+
         // If URL changed significantly, we're on a new page - stop current batch
         if (urlChanged) {
           logger.info('[INTELLIGENT_ORCHESTRATOR] Page changed, ending action batch');
@@ -1489,6 +1810,199 @@ export class IntelligentTestOrchestrator {
       actionResults: completedActions, // Actual execution results
       success,
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HELPER METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Convert DynamicAction to PlaywrightCommand for execution
+   */
+  private convertActionToCommand(action: DynamicAction): import('@/types').PlaywrightCommand {
+    return {
+      action: action.action as import('@/types').PlaywrightActionType,
+      selector: action.selector ? normalizeSelector(action.selector) : undefined,
+      value: action.value,
+      url: action.url,
+      description: action.description,
+      timeout: action.timeout || AdaptiveConfigService.getTimeout('NAVIGATION', {
+        networkSpeed: AdaptiveConfigService.analyzePageContext(this.state).networkSpeed,
+      }),
+      continueOnError: action.optional || false,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 2: FORM INTELLIGENCE METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Try to fix validation errors using Form Intelligence
+   */
+  private async tryFixValidationErrors(
+    action: DynamicAction,
+    errors: string[]
+  ): Promise<void> {
+    try {
+      // Get the form analysis
+      const formAnalysis = action.selector
+        ? await PreActionAnalyzer.analyzeFormBeforeSubmit(this.page, action.selector, {
+            useIntelligence: false,
+            url: this.page.url(),
+          })
+        : null;
+
+      if (!formAnalysis || formAnalysis.fields.length === 0) {
+        return;
+      }
+
+      // Try to fix each error
+      const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
+      const maxErrorsToFix = AdaptiveConfigService.getThreshold('MAX_VALIDATION_ERRORS_TO_FIX', {
+        errorRate: pageContext.errorRate,
+      });
+      for (const error of errors.slice(0, maxErrorsToFix)) {
+        // Find the field that might be causing this error
+        const relatedField = formAnalysis.fields.find(f =>
+          f.hasError || error.toLowerCase().includes(f.label.toLowerCase())
+        );
+
+        if (relatedField) {
+          const fix = await FormIntelligenceService.fixValidationError(
+            error,
+            relatedField,
+            formAnalysis.fields
+          );
+
+          // Reuse pageContext from above
+          const confidenceThreshold = AdaptiveConfigService.getThreshold('VALIDATION_FIX_CONFIDENCE_THRESHOLD', {
+            errorRate: pageContext.errorRate,
+          });
+          if (fix && fix.confidence >= confidenceThreshold) {
+            logger.info('[INTELLIGENT_ORCHESTRATOR] Attempting to fix validation error', {
+              testId: this.testId,
+              error,
+              field: relatedField.label,
+              newValue: fix.value.substring(0, 20) + '...', // Log partial value for privacy
+              confidence: fix.confidence,
+            });
+
+            // Apply the fix
+            try {
+              const fixCommand = this.convertActionToCommand({
+                action: 'fill',
+                selector: relatedField.selector,
+                value: fix.value,
+                description: `Fix: ${relatedField.label}`,
+              });
+
+              const fixResult = await this.commandExecutor.executeCommand(fixCommand);
+
+              if (fixResult.success) {
+                logger.info('[INTELLIGENT_ORCHESTRATOR] Successfully fixed validation error', {
+                  testId: this.testId,
+                  field: relatedField.label,
+                });
+
+                // Small delay for validation to run (reuse pageContext)
+                await this.page.waitForTimeout(
+                  AdaptiveConfigService.getTimeout('VALIDATION_DELAY', {
+                    isSlowPage: pageContext.isSlowPage,
+                  })
+                );
+              }
+            } catch (fixError) {
+              logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to apply fix', {
+                error: fixError instanceof Error ? fixError.message : String(fixError),
+              });
+            }
+          }
+        }
+      }
+    } catch (error) {
+      logger.debug('[INTELLIGENT_ORCHESTRATOR] tryFixValidationErrors failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Handle conditional fields that may appear after fill/select actions
+   */
+  private async handleConditionalFieldsAfterAction(action: DynamicAction): Promise<void> {
+    if (!action.selector) return;
+
+    try {
+      // Get form analysis to find dependencies
+      const formAnalysis = await PreActionAnalyzer.analyzeFormBeforeSubmit(
+        this.page,
+        action.selector,
+        { useIntelligence: true, url: this.page.url() }
+      );
+
+      if (!formAnalysis || formAnalysis.fields.length === 0) {
+        return;
+      }
+
+      // Wait a bit for any conditional fields to appear
+      const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
+      await this.page.waitForTimeout(
+        AdaptiveConfigService.getTimeout('CONDITIONAL_FIELD_WAIT', {
+          isSlowPage: pageContext.isSlowPage,
+          hasHeavyJS: pageContext.hasHeavyJS,
+        })
+      );
+
+      // Check for new visible fields
+      const newVisibleFields = await this.page.evaluate(() => {
+        // @ts-expect-error - browser context
+        const allInputs = Array.from(document.querySelectorAll('input:not([type="hidden"]), select, textarea')) as any[];
+        const visibleNew: string[] = [];
+
+        for (const input of allInputs) {
+          const rect = input.getBoundingClientRect();
+          // @ts-expect-error - browser context
+          const style = window.getComputedStyle(input);
+
+          // Check if element is newly visible (appeared recently, not hidden)
+          if (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            style.opacity !== '0'
+          ) {
+            // Check if it's empty (likely new)
+            if (!input.value || input.value === '') {
+              const selector = input.id
+                ? `#${input.id}`
+                : input.getAttribute('name')
+                  ? `[name="${input.getAttribute('name')}"]`
+                  : null;
+
+              if (selector) {
+                visibleNew.push(selector);
+              }
+            }
+          }
+        }
+
+        return visibleNew;
+      });
+
+      if (newVisibleFields.length > 0) {
+        logger.debug('[INTELLIGENT_ORCHESTRATOR] Detected new visible fields after action', {
+          testId: this.testId,
+          triggerAction: action.description,
+          newFieldsCount: newVisibleFields.length,
+        });
+      }
+    } catch (error) {
+      logger.debug('[INTELLIGENT_ORCHESTRATOR] handleConditionalFieldsAfterAction failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1591,7 +2105,15 @@ export class IntelligentTestOrchestrator {
         }
 
         // Warn if success rate is very low
-        if (successRate < 0.2 && allActionResults.length >= 3) {
+        const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
+        const lowSuccessRateThreshold = AdaptiveConfigService.getThreshold('LOW_SUCCESS_RATE_THRESHOLD', {
+          testMode: this.config.mode,
+          errorRate: pageContext.errorRate,
+        });
+        const minActionsForRate = AdaptiveConfigService.getThreshold('MIN_ACTIONS_FOR_SUCCESS_RATE', {
+          testMode: this.config.mode,
+        });
+        if (successRate < lowSuccessRateThreshold && allActionResults.length >= minActionsForRate) {
           logger.warn('[INTELLIGENT_ORCHESTRATOR] Very low success rate', {
             testId: this.testId,
             successRate: `${Math.round(successRate * 100)}%`,
@@ -1871,20 +2393,29 @@ export class IntelligentTestOrchestrator {
     }
 
     // ✅ OPTIMIZATION: Deduplicate rapid-fire identical events
-    // Skip if same event was emitted less than 500ms ago
+    // Skip if same event was emitted less than threshold ago
     const now = Date.now();
+    const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
+    const dedupWindow = AdaptiveConfigService.getThreshold('EVENT_DEDUPLICATION_WINDOW', {
+      errorRate: pageContext.errorRate,
+    });
     if (this.lastEmittedEvent &&
         this.lastEmittedEvent.event === event &&
-        now - this.lastEmittedEvent.timestamp < 500) {
+        now - this.lastEmittedEvent.timestamp < dedupWindow) {
       return; // Skip duplicate
     }
 
     // ✅ OPTIMIZATION: Filter out noisy events
     // These are redundant as graph updates already show action progress
-    const noisyEvents = ['action_executing', 'action_completed', 'action_failed'];
-    if (noisyEvents.includes(event)) {
-      // Only emit on failures or every 3rd action
-      if (!event.includes('failed') && this.state.completedActions.length % 3 !== 0) {
+    const isCritical = this.state.completedActions.length > 0 &&
+                       !this.state.completedActions[this.state.completedActions.length - 1].success;
+    if (AdaptiveConfigService.isNoisyEvent(event, { isCritical })) {
+      // Only emit on failures or every N actions
+      const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
+      const emitInterval = AdaptiveConfigService.getThreshold('NOISY_EVENT_EMIT_INTERVAL', {
+        errorRate: pageContext.errorRate,
+      });
+      if (!event.includes('failed') && this.state.completedActions.length % emitInterval !== 0) {
         return; // Skip
       }
     }

@@ -115,13 +115,17 @@ export class ContextualActionGenerator {
    * Generate actions based on current page context
    * @param context - Current page context
    * @param state - Current test state
+   * @param page - Optional page for getting HTML
+   * @param costManager - Cost manager for budget control
+   * @param hints - Test hints from plan (user's requested steps)
    * @returns Array of dynamic actions to execute
    */
   static async generateActions(
     context: PageContext,
     state: TestState,
-    page?: Page,  // ✅ NEW: Optional page for getting HTML
-    costManager?: AICostManager  // ✅ FIX 9: Cost manager for budget control
+    page?: Page,
+    costManager?: AICostManager,
+    hints?: Array<{ description: string; action?: string; target?: string; value?: string; priority?: string }>  // ✅ NEW: Test hints from plan
   ): Promise<{
     actions: DynamicAction[];
     reasoning: string;
@@ -206,6 +210,7 @@ export class ContextualActionGenerator {
         history: historySummary,
         domSummary,
         actualHTML: sanitizedHTML,
+        hints, // ✅ NEW: Pass hints to prompt for AI guidance
       });
 
       // ✅ FIX 2: Dynamic token budget based on prompt length
