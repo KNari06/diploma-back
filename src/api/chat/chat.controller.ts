@@ -264,27 +264,65 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     emitProcessingStep(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', PROGRESS.INTENT_PARSING);
 
-    // Get chat history for context
-    const chatHistory = await getChatHistoryForIntent(chatSessionId, userId); // SECURITY: Pass userId for verification
-
-    checkRequestTimeout();
-
-    // Parse intent with error handling (FIX #5)
+    // ═══════════════════════════════════════════════════════════════════════
+    // FAST PATH: Check for explicit API test keywords from frontend
+    // This bypasses AI intent parsing when frontend explicitly specifies action
+    // ═══════════════════════════════════════════════════════════════════════
     let parsedIntent: any;
-    try {
-      parsedIntent = await parseUserIntent(
-      message,
-        { chatHistory },
-      workspace_id
-    );
-    } catch (intentError) {
-      logger.error('[CHAT] parseUserIntent failed', {
-        error: intentError instanceof Error ? intentError.message : String(intentError),
-        userId,
-        messageLength: message.length,
+
+    // Type guard for context object
+    const contextObj = typeof context === 'object' && context !== null ? context : null;
+
+    const isExplicitApiTest =
+      message.startsWith('RUN_API_TEST:') ||
+      contextObj?.action === 'run_api_test';
+
+    if (isExplicitApiTest) {
+      logger.info('[CHAT] Fast path: Explicit API test request detected', {
+        hasKeyword: message.startsWith('RUN_API_TEST:'),
+        hasContextAction: contextObj?.action === 'run_api_test',
+        hasApiTestData: !!contextObj?.apiTest,
       });
-      // Fallback to general_chat if intent parsing fails
-      parsedIntent = { intent: 'general_chat', confidence: 0 };
+
+      // Extract API test data from context if provided
+      const apiTestData = contextObj?.apiTest;
+
+      parsedIntent = {
+        intent: 'api_test',
+        confidence: 100,
+        apiMethod: apiTestData?.method || 'GET',
+        apiUrl: apiTestData?.url,
+        apiBody: apiTestData?.body,
+        apiHeaders: apiTestData?.headers,
+        assertions: apiTestData?.assertions,
+        metadata: {
+          source: 'explicit_keyword',
+          parsedAt: new Date().toISOString(),
+        },
+      };
+    } else {
+      // Normal path: Use AI to parse intent
+      // Get chat history for context
+      const chatHistory = await getChatHistoryForIntent(chatSessionId, userId); // SECURITY: Pass userId for verification
+
+      checkRequestTimeout();
+
+      // Parse intent with error handling (FIX #5)
+      try {
+        parsedIntent = await parseUserIntent(
+        message,
+          { chatHistory },
+        workspace_id
+      );
+      } catch (intentError) {
+        logger.error('[CHAT] parseUserIntent failed', {
+          error: intentError instanceof Error ? intentError.message : String(intentError),
+          userId,
+          messageLength: message.length,
+        });
+        // Fallback to general_chat if intent parsing fails
+        parsedIntent = { intent: 'general_chat', confidence: 0 };
+      }
     }
 
     // Emit detailed intent information

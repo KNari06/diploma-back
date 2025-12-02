@@ -1,8 +1,23 @@
 import { IntentResult } from '@/types';
 
+export interface ApiTestContext {
+  method?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  body?: any;
+  assertions?: any[];
+}
+
+export interface ChatRequestContext {
+  projectId?: string;
+  action?: 'run_api_test' | string; // Explicit action keyword for fast path
+  apiTest?: ApiTestContext; // API test data when action is 'run_api_test'
+  [key: string]: any;
+}
+
 export interface ChatRequest {
   message: string;
-  context?: string | { projectId?: string; [key: string]: any }; // For RAG integration with projectId
+  context?: string | ChatRequestContext; // For RAG integration with projectId and API test data
   sessionId?: string; // Existing chat session ID
   conversationId?: string; // For multi-turn conversations (questions/answers)
   answers?: Record<string, any>; // Answers to clarifying questions
@@ -27,5 +42,5 @@ export interface ChatMessage {
 export interface ChatContext {
   userId?: string;
   message: string;
-  context?: string | { projectId?: string; [key: string]: any };
+  context?: string | ChatRequestContext;
 }
