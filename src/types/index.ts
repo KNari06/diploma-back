@@ -173,6 +173,31 @@ export interface WorkspaceCreateRequest {
   prodBaseUrl?: string;
 }
 
+export type BrowserTypeEnum = 'chrome' | 'firefox' | 'safari' | 'edge';
+
+export interface WorkspaceOnboardingRequest {
+  name: string; // Project/Workspace name
+  baseUrls: string[]; // Array of base URLs
+  environments: {
+    dev?: string;
+    predprod?: string;
+    prod?: string;
+  };
+  browserType: BrowserTypeEnum; // Default: 'chrome'
+}
+
+export interface WorkspaceOnboardingResponse {
+  name: string;
+  baseUrls: string[];
+  environments: {
+    dev?: string;
+    predprod?: string;
+    prod?: string;
+  };
+  browserType: BrowserTypeEnum;
+  completed: boolean; // Whether onboarding was completed
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -182,6 +207,19 @@ export interface Project {
   settings: ProjectSettings;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface ProjectCreateRequest {
+  name: string;
+  description?: string;
+  workspace_id: string;
+  settings?: Partial<ProjectSettings> & {
+    main_url?: string;
+    tested_pages?: string[];
+    common_elements?: Record<string, string>;
+    common_scope?: string;
+    defaultBrowsers?: BrowserType[];
+  };
 }
 
 export interface ProjectSettings {

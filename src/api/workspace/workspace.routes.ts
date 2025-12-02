@@ -1,12 +1,16 @@
-import { Router } from 'express';
 import { requireAuth } from '@/middleware/auth.middleware';
 import { asyncHandler } from '@/utils/error-handler';
+import { Router } from 'express';
+import {
+  getOnboarding,
+  saveOnboarding,
+} from './onboarding.controller';
 import {
   createWorkspace,
-  getWorkspaces,
-  getWorkspace,
-  updateWorkspace,
   deleteWorkspace,
+  getWorkspace,
+  getWorkspaces,
+  updateWorkspace,
 } from './workspace.controller';
 
 const router = Router();
@@ -75,6 +79,127 @@ router.get(
   '/',
   requireAuth,
   asyncHandler(getWorkspaces)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/onboarding:
+ *   post:
+ *     summary: Save onboarding data
+ *     description: Saves onboarding data (project name, base URLs, environments, browser type) for the user's workspace
+ *     tags: [Workspaces]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - name
+ *               - baseUrls
+ *               - environments
+ *               - browserType
+ *             properties:
+ *               name:
+ *                 type: string
+ *                 example: "My Test Project"
+ *               baseUrls:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                 example: ["https://dev.example.com", "https://staging.example.com"]
+ *               environments:
+ *                 type: object
+ *                 properties:
+ *                   dev:
+ *                     type: string
+ *                     example: "https://dev.example.com"
+ *                   predprod:
+ *                     type: string
+ *                     example: "https://staging.example.com"
+ *                   prod:
+ *                     type: string
+ *                     example: "https://prod.example.com"
+ *               browserType:
+ *                 type: string
+ *                 enum: [chrome, firefox, safari, edge]
+ *                 default: chrome
+ *                 example: "chrome"
+ *     responses:
+ *       200:
+ *         description: Onboarding data saved successfully
+ *       400:
+ *         description: Invalid request
+ *       401:
+ *         description: Unauthorized
+ */
+router.post(
+  '/onboarding',
+  requireAuth,
+  asyncHandler(saveOnboarding)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/onboarding:
+ *   get:
+ *     summary: Get onboarding data
+ *     description: Returns onboarding data if already completed, or completed: false if not
+ *     tags: [Workspaces]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Onboarding data or completed: false
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   oneOf:
+ *                     - type: object
+ *                       properties:
+ *                         completed:
+ *                           type: boolean
+ *                           example: false
+ *                     - type: object
+ *                       properties:
+ *                         name:
+ *                           type: string
+ *                           example: "My Test Project"
+ *                         baseUrls:
+ *                           type: array
+ *                           items:
+ *                             type: string
+ *                           example: ["https://dev.example.com", "https://prod.example.com"]
+ *                         environments:
+ *                           type: object
+ *                           properties:
+ *                             dev:
+ *                               type: string
+ *                             predprod:
+ *                               type: string
+ *                             prod:
+ *                               type: string
+ *                         browserType:
+ *                           type: string
+ *                           enum: [chrome, firefox, safari, edge]
+ *                         completed:
+ *                           type: boolean
+ *                           example: true
+ *       401:
+ *         description: Unauthorized
+ */
+router.get(
+  '/onboarding',
+  requireAuth,
+  asyncHandler(getOnboarding)
 );
 
 /**

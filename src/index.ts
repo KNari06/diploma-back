@@ -11,6 +11,7 @@ import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import notificationsRoutes from '@/api/notifications/notifications.routes';
 import playwrightRoutes from '@/api/playwright/playwright.route';
+import projectRoutes from '@/api/project/project.routes';
 import reportsRoutes from '@/api/reports/reports.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
@@ -246,6 +247,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 // API routes
 app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
 app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes);
+app.use(`/api/${env.API_VERSION}/projects`, projectRoutes);
 app.use(`/api/${env.API_VERSION}/manual-test`, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/intelligent-test`, intelligentTestRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
@@ -274,6 +276,7 @@ app.get('/', (req: express.Request, res: express.Response) => {
       health: '/health',
       auth: `/api/${env.API_VERSION}/auth`,
       workspaces: `/api/${env.API_VERSION}/workspaces`,
+      projects: `/api/${env.API_VERSION}/projects`,
       manualTest: `/api/${env.API_VERSION}/manual-test`,
       chat: `/api/${env.API_VERSION}/chat`,
       apiTest: `/api/${env.API_VERSION}/api-test`,
