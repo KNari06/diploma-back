@@ -52,12 +52,31 @@ export class TestCompletionHandlerService {
       // Format results as chat message
       const formattedMessage = TestResultsFormatterService.formatTestResults(test, results || []);
 
+      // ✅ FIX: Include test results in metadata so AI can see them
+      const testResultMetadata = {
+        testId: testId,
+        testType: 'ui',
+        testResult: {
+          status: test.status,
+          url: test.url,
+          browsers: test.browsers,
+          completedAt: test.completed_at,
+          results: results.map(r => ({
+            browser: r.browser,
+            status: r.status,
+            errors: r.errors,
+            completedAt: r.completed_at,
+          })),
+        },
+      };
+
       // Send to all linked chat sessions
       for (const chatSessionId of chatSessions) {
         await ChatService.saveChatMessages(chatSessionId, [
           {
             role: 'ai',
             content: formattedMessage,
+            metadata: testResultMetadata,
           },
         ]);
 

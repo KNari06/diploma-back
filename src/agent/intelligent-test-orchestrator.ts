@@ -14,6 +14,7 @@ import { CommandExecutor } from './command-executor';
 import { ContextualActionGenerator } from './contextual-action-generator';
 import { FormIntelligenceService } from './form-intelligence.service'; // ✅ NEW: Smart form handling
 import { IntelligentPageAnalyzer } from './intelligent-page-analyzer';
+import { PostActionAnalyzer, DOMSnapshot } from './post-action-analyzer'; // ✅ NEW: AI-driven post-action analysis
 import { PreActionAnalyzer } from './pre-action-analyzer'; // ✅ NEW: Pre-action analysis for smart action execution
 import { ResultValidator } from './result-validator';
 import { SafetyGuard } from './safety-guard';
@@ -729,8 +730,27 @@ export class IntelligentTestOrchestrator {
           totalScreenshots: this.screenshotMetrics.totalCaptured
         });
 
-        // STEP 5: Record visit
-        this.state = StateTracker.recordPageVisit(this.state, pageVisit);
+        // ✅ FIX: Only record visit if URL changed OR actions were successful
+        // This prevents counting failed attempts on same page as new visits
+        const urlChanged = this.state.currentUrl !== context.url;
+        const hasSuccessfulActions = pageVisit.actionResults?.some(r => r.success) || false;
+        const shouldRecordVisit = urlChanged || hasSuccessfulActions;
+
+        if (shouldRecordVisit) {
+          // STEP 5: Record visit
+          this.state = StateTracker.recordPageVisit(this.state, pageVisit);
+          logger.debug('[INTELLIGENT_ORCHESTRATOR] Page visit recorded', {
+            url: context.url,
+            urlChanged,
+            hasSuccessfulActions,
+            actionsCount: pageVisit.actionResults?.length || 0,
+          });
+        } else {
+          logger.debug('[INTELLIGENT_ORCHESTRATOR] Skipping visit record - same URL and no successful actions', {
+            url: context.url,
+            failedActions: pageVisit.actionResults?.filter(r => !r.success).length || 0,
+          });
+        }
 
         // STEP 6: Decide next step
         const decision = await ContextualActionGenerator.decideNextStep(
@@ -1484,6 +1504,13 @@ export class IntelligentTestOrchestrator {
           }
         }
 
+        // ✅ NEW: Capture DOM snapshot BEFORE action for post-action analysis
+        let snapshotBefore: DOMSnapshot | undefined;
+        const shouldDoPostAnalysis = ['fill', 'type', 'click', 'select'].includes(action.action);
+        if (shouldDoPostAnalysis) {
+          snapshotBefore = await PostActionAnalyzer.captureSnapshot(this.page).catch(() => undefined);
+        }
+
         // Execute action using CommandExecutor
         // ✅ FIX: Normalize selector before passing to CommandExecutor (it will normalize again, but this ensures consistency)
         const selectorForExecution = action.selector ? normalizeSelector(action.selector) : action.selector;
@@ -1741,6 +1768,74 @@ export class IntelligentTestOrchestrator {
               this.emitEvent('action_failed', {
                 action: action.description,
                 error: actionResult.error,
+              });
+            }
+          }
+
+          // ═══════════════════════════════════════════════════════════════════════════
+          // ✅ NEW: AI-DRIVEN POST-ACTION ANALYSIS
+          // Analyzes what changed and decides if follow-up actions are needed
+          // ═══════════════════════════════════════════════════════════════════════════
+          if (shouldDoPostAnalysis && actionResult.success && !urlChanged) {
+            try {
+              const postActionDecision = await PostActionAnalyzer.analyze(
+                this.page,
+                {
+                  action,
+                  actionResult,
+                  inputValue: action.value?.toString(),
+                  goal: this.state.goal,
+                },
+                snapshotBefore,
+                this.costManager
+              );
+
+              // Execute follow-up actions if AI decided they're needed
+              if (postActionDecision.needsFollowUp && postActionDecision.followUpActions.length > 0) {
+                logger.info('[INTELLIGENT_ORCHESTRATOR] Executing AI-decided follow-up actions', {
+                  testId: this.testId,
+                  reason: postActionDecision.reason,
+                  stateChange: postActionDecision.stateChange,
+                  followUpCount: postActionDecision.followUpActions.length,
+                });
+
+                for (const followUpAction of postActionDecision.followUpActions) {
+                  try {
+                    const followUpResult = await this.commandExecutor.executeCommand({
+                      action: followUpAction.action as any,
+                      selector: followUpAction.selector,
+                      value: followUpAction.value,
+                      timeout: followUpAction.timeout || 3000,
+                      description: followUpAction.description,
+                    });
+
+                    logger.debug('[INTELLIGENT_ORCHESTRATOR] Follow-up action result', {
+                      description: followUpAction.description,
+                      success: followUpResult.success,
+                    });
+
+                    // Record follow-up action
+                    const followUpUrlAfter = this.page.url();
+                    completedActions.push({
+                      action: followUpAction,
+                      success: followUpResult.success,
+                      error: followUpResult.error,
+                      urlChanged: false, // Follow-up actions don't cause navigation
+                      urlBefore: followUpUrlAfter,
+                      urlAfter: followUpUrlAfter,
+                      timestamp: Date.now(),
+                    });
+                  } catch (followUpError) {
+                    logger.debug('[INTELLIGENT_ORCHESTRATOR] Follow-up action failed', {
+                      description: followUpAction.description,
+                      error: followUpError instanceof Error ? followUpError.message : String(followUpError),
+                    });
+                  }
+                }
+              }
+            } catch (postAnalysisError) {
+              logger.debug('[INTELLIGENT_ORCHESTRATOR] Post-action analysis failed', {
+                error: postAnalysisError instanceof Error ? postAnalysisError.message : String(postAnalysisError),
               });
             }
           }

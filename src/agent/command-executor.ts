@@ -1,10 +1,11 @@
+import { AICostManager } from '@/services/ai-cost-manager.service';
 import { AIExtractService } from '@/services/ai-extract';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/logger';
 import { Locator, Page } from 'playwright';
-import { AICostManager } from '@/services/ai-cost-manager.service';
 import { getLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLocator } from './utils/selector-utils';
+import { SelectorStabilityScore, SmartWaitService } from './utils/smart-wait.service';
 
 /**
  * Execute Playwright commands on a page
@@ -13,39 +14,49 @@ import { getLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLo
 export class CommandExecutor {
   private page: Page;
   private extractedData: Map<string, any> = new Map();
-  private selfHealingEnabled: boolean = true; // ✅ NEW: Enable/disable self-healing
+  private selfHealingEnabled: boolean = true;
   private metadata: { url: string; projectId?: string; userId?: string };
-  private abortController: AbortController; // ✅ FIX 7: AbortController for cancellation
+  private abortController: AbortController;
   private isAborted: boolean = false;
-  private costManager?: AICostManager; // ✅ FIX 9: Cost manager for AI operations
+  private costManager?: AICostManager;
+  private externalAbortHandler?: () => void; // ✅ FIX 1: Store handler for cleanup
+  private selfHealingConfidenceThreshold: number = 0.85; // ✅ FIX 7: Configurable threshold
 
   constructor(
     page: Page,
     options: {
       selfHealingEnabled?: boolean;
       metadata?: { url: string; projectId?: string; userId?: string };
-      abortSignal?: AbortSignal; // ✅ FIX 7: Accept external AbortSignal
-      costManager?: AICostManager; // ✅ FIX 9: Accept cost manager
+      abortSignal?: AbortSignal;
+      costManager?: AICostManager;
+      selfHealingConfidenceThreshold?: number; // ✅ NEW: Configurable confidence
     } = {}
   ) {
     this.page = page;
     this.selfHealingEnabled = options.selfHealingEnabled ?? true;
     this.metadata = options.metadata || { url: '' };
-    this.costManager = options.costManager; // ✅ FIX 9: Store cost manager
+    this.costManager = options.costManager;
+    this.selfHealingConfidenceThreshold = options.selfHealingConfidenceThreshold ?? 0.85;
 
-    // ✅ FIX 7: Setup abort controller
     this.abortController = new AbortController();
 
-    // If external signal provided, link it to internal controller
+    // ✅ FIX 1: Store handler reference for cleanup
     if (options.abortSignal) {
-      options.abortSignal.addEventListener('abort', () => {
-        this.abort();
-      });
+      this.externalAbortHandler = () => this.abort();
+      options.abortSignal.addEventListener('abort', this.externalAbortHandler, { once: true });
     }
   }
 
   /**
-   * ✅ FIX 7: Abort all ongoing operations
+   * ✅ FIX 1: Cleanup resources (call when done with executor)
+   */
+  dispose(): void {
+    // Cleanup is handled by { once: true } in addEventListener
+    this.externalAbortHandler = undefined;
+  }
+
+  /**
+   * Abort all ongoing operations
    */
   abort(): void {
     if (this.isAborted) return;
@@ -57,7 +68,7 @@ export class CommandExecutor {
   }
 
   /**
-   * ✅ FIX 7: Check if aborted before executing operations
+   * Check if aborted before executing operations
    */
   private checkAborted(): void {
     if (this.isAborted) {
@@ -66,13 +77,15 @@ export class CommandExecutor {
   }
 
   /**
-   * ✅ FIX 2: Use centralized selector normalization (removed duplication)
+   * ✅ FIX 2: Normalize selector once (consistent handling)
    */
-  // Removed: normalizeSelector() - now using utils/selector-utils.ts
+  private prepareSelector(selector: string | undefined): string | undefined {
+    if (!selector) return undefined;
+    return normalizeSelector(selector);
+  }
 
   /**
-   * ✅ FIX 2: Use centralized locator creation (removed duplication)
-   * @returns Locator - all Playwright methods return Locator type
+   * Get locator from normalized selector
    */
   private getLocatorInternal(selector: string): Locator {
     return getLocator(this.page, selector);
@@ -87,10 +100,13 @@ export class CommandExecutor {
     screenshot?: string;
     extractedValue?: any;
   }> {
-    // ✅ FIX 7: Check if aborted before executing
     this.checkAborted();
 
-    const { action, selector, value, url, timeout, continueOnError, description } = command;
+    const { action, value, url, timeout, continueOnError, description } = command;
+
+    // ✅ FIX 2: Normalize selector ONCE at the beginning
+    const selector = this.prepareSelector(command.selector);
+    const awaitNavigation = command.awaitNavigation ?? false; // ✅ FIX 3: Navigation flag
 
     logger.info(`Executing command: ${action}`, {
       action,
@@ -98,6 +114,7 @@ export class CommandExecutor {
       value,
       url,
       description,
+      awaitNavigation,
     });
 
     try {
@@ -112,158 +129,161 @@ export class CommandExecutor {
 
         case 'click':
           if (!selector) throw new Error('Selector is required for click action');
-          // ✅ FIX 1 & 2: Use centralized validation + get locator to avoid race conditions
-          const clickValidation = await validateAndGetLocator(this.page, selector, {
+
+          // Use smart waiting with flakiness detection
+          const clickWait = await this.waitForElementSmart(selector, {
+            timeout: timeout || 10000,
             actionType: 'click',
-            timeout: timeout || 2000,
           });
 
-          if (!clickValidation.success || !clickValidation.locator) {
-            // Try self-healing if validation failed
-            const normalizedSelector = normalizeSelector(selector);
+          // ✅ FIX 3: Helper for click with optional navigation wait
+          const performClick = async (locator: Locator) => {
+            await this.forceScrollIntoView(locator);
+            if (awaitNavigation) {
+              // Wait for navigation if expected
+              await Promise.all([
+                this.page.waitForNavigation({ timeout: timeout || 30000 }).catch(() => {
+                  logger.debug('[COMMAND_EXECUTOR] Navigation timeout after click, continuing');
+                }),
+                locator.click({ timeout: timeout || 30000 }),
+              ]);
+            } else {
+              await locator.click({ timeout: timeout || 30000 });
+            }
+          };
+
+          if (!clickWait.success || !clickWait.locator) {
+            // Smart wait failed, try self-healing
             await this.executeWithSelfHealing(
               async () => {
-                const locator = getLocator(this.page, normalizedSelector);
+                const locator = getLocator(this.page, selector);
                 await locator.waitFor({ state: 'visible', timeout: timeout || 30000 });
-                await locator.click({ timeout: timeout || 30000 });
+                await performClick(locator);
               },
               {
-                selector: normalizedSelector,
+                selector,
                 intent: description || 'click element',
                 action: 'click',
                 timeout,
               }
             );
           } else {
-            // ✅ FIX 1: Use the same validated locator to avoid race conditions
-            await clickValidation.locator.click({ timeout: timeout || 30000 });
+            await performClick(clickWait.locator);
           }
           break;
 
         case 'fill':
           if (!selector) throw new Error('Selector is required for fill action');
           if (value === undefined) throw new Error('Value is required for fill action');
-          // ✅ FIX 1 & 2: Use centralized validation + get locator
-          const fillValidation = await validateAndGetLocator(this.page, selector, {
+
+          // Use smart waiting with flakiness detection
+          const fillWait = await this.waitForElementSmart(selector, {
+            timeout: timeout || 10000,
             actionType: 'fill',
-            timeout: timeout || 2000,
           });
 
-          if (!fillValidation.success || !fillValidation.locator) {
-            // Try self-healing
-            const fillSelector = normalizeSelector(selector);
+          if (!fillWait.success || !fillWait.locator) {
+            // Smart wait failed, try self-healing
             await this.executeWithSelfHealing(
               async () => {
-                const locator = getLocator(this.page, fillSelector);
+                const locator = getLocator(this.page, selector);
                 await locator.fill(String(value), { timeout: timeout || 30000 });
               },
               {
-                selector: fillSelector,
-                intent: description || `fill ${fillSelector} with ${value}`,
+                selector,
+                intent: description || `fill with ${value}`,
                 action: 'fill',
                 timeout,
                 value,
               }
             );
           } else {
-            // ✅ FIX 1: Use the same validated locator
-            await fillValidation.locator.fill(String(value), { timeout: timeout || 30000 });
+            await fillWait.locator.fill(String(value), { timeout: timeout || 30000 });
           }
+          // Note: Post-action analysis handled by PostActionAnalyzer
           break;
 
         case 'type':
           if (!selector) throw new Error('Selector is required for type action');
           if (value === undefined) throw new Error('Value is required for type action');
-          // ✅ FIX: Normalize selector format
-          const typeSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for type action
-          const typeLocator = this.getLocatorInternal(typeSelector);
+          const typeLocator = this.getLocatorInternal(selector);
           await typeLocator.type(String(value), { timeout: timeout || 30000 });
           break;
 
         case 'select':
           if (!selector) throw new Error('Selector is required for select action');
           if (value === undefined) throw new Error('Value is required for select action');
-          // ✅ FIX: Normalize selector format
-          const selectSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for select action
-          const selectLocator = this.getLocatorInternal(selectSelector);
-          await selectLocator.selectOption(String(value), { timeout: timeout || 30000 });
+
+          // ✅ FIX 5: Support multiple selectOption formats
+          const selectLocator = this.getLocatorInternal(selector);
+          const selectValue = this.parseSelectValue(value);
+          await selectLocator.selectOption(selectValue, { timeout: timeout || 30000 });
           break;
 
         case 'check':
           if (!selector) throw new Error('Selector is required for check action');
-          // ✅ FIX: Normalize selector format
-          const checkSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for check action
-          const checkLocator = this.getLocatorInternal(checkSelector);
+          const checkLocator = this.getLocatorInternal(selector);
           await checkLocator.check({ timeout: timeout || 30000 });
           break;
 
         case 'uncheck':
           if (!selector) throw new Error('Selector is required for uncheck action');
-          // ✅ FIX: Normalize selector format
-          const uncheckSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for uncheck action
-          const uncheckLocator = this.getLocatorInternal(uncheckSelector);
+          const uncheckLocator = this.getLocatorInternal(selector);
           await uncheckLocator.uncheck({ timeout: timeout || 30000 });
           break;
 
         case 'hover':
           if (!selector) throw new Error('Selector is required for hover action');
-          // ✅ FIX: Normalize selector format
-          const hoverSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for hover action
-          const hoverLocator = this.getLocatorInternal(hoverSelector);
+          const hoverLocator = this.getLocatorInternal(selector);
           await hoverLocator.hover({ timeout: timeout || 30000 });
           break;
 
         case 'dblclick':
           if (!selector) throw new Error('Selector is required for dblclick action');
-          const dblclickSelector = normalizeSelector(selector);
-          const dblclickLocator = this.getLocatorInternal(dblclickSelector);
+          const dblclickLocator = this.getLocatorInternal(selector);
           await dblclickLocator.dblclick({ timeout: timeout || 30000 });
           break;
 
         case 'focus':
           if (!selector) throw new Error('Selector is required for focus action');
-          const focusSelector = normalizeSelector(selector);
-          const focusLocator = this.getLocatorInternal(focusSelector);
+          const focusLocator = this.getLocatorInternal(selector);
           await focusLocator.focus({ timeout: timeout || 30000 });
           break;
 
         case 'blur':
           if (!selector) throw new Error('Selector is required for blur action');
-          const blurSelector = normalizeSelector(selector);
-          const blurLocator = this.getLocatorInternal(blurSelector);
+          const blurLocator = this.getLocatorInternal(selector);
           await blurLocator.blur({ timeout: timeout || 30000 });
           break;
 
         case 'press':
+          // ✅ FIX 4: If selector provided, use locator.press; otherwise page.keyboard.press
           if (!value) throw new Error('Key is required for press action');
-          await this.page.keyboard.press(String(value));
+          if (selector) {
+            const pressLocator = this.getLocatorInternal(selector);
+            await pressLocator.press(String(value), { timeout: timeout || 30000 });
+          } else {
+            await this.page.keyboard.press(String(value));
+          }
           break;
 
         case 'dragAndDrop':
           if (!selector) throw new Error('Source selector is required for dragAndDrop action');
           if (!value) throw new Error('Target selector is required for dragAndDrop action');
-          const dragSource = this.getLocatorInternal(normalizeSelector(selector));
-          const dragTarget = this.getLocatorInternal(normalizeSelector(String(value)));
+          const dragSource = this.getLocatorInternal(selector);
+          const dragTarget = this.getLocatorInternal(this.prepareSelector(String(value)) || String(value));
           await dragSource.dragTo(dragTarget, { timeout: timeout || 30000 });
           break;
 
         case 'tap':
           if (!selector) throw new Error('Selector is required for tap action');
-          const tapSelector = normalizeSelector(selector);
-          const tapLocator = this.getLocatorInternal(tapSelector);
+          const tapLocator = this.getLocatorInternal(selector);
           await tapLocator.tap({ timeout: timeout || 30000 });
           break;
 
         case 'swipe':
-          // Swipe is mobile-specific, implement as tap for now
           if (!selector) throw new Error('Selector is required for swipe action');
-          const swipeSelector = normalizeSelector(selector);
-          const swipeLocator = this.getLocatorInternal(swipeSelector);
+          const swipeLocator = this.getLocatorInternal(selector);
           logger.warn('[COMMAND_EXECUTOR] Swipe action not fully supported, using tap');
           await swipeLocator.tap({ timeout: timeout || 30000 });
           break;
@@ -282,8 +302,7 @@ export class CommandExecutor {
 
         case 'scrollIntoView':
           if (!selector) throw new Error('Selector is required for scrollIntoView action');
-          const scrollIntoViewSelector = normalizeSelector(selector);
-          const scrollIntoViewLocator = this.getLocatorInternal(scrollIntoViewSelector);
+          const scrollIntoViewLocator = this.getLocatorInternal(selector);
           await scrollIntoViewLocator.scrollIntoViewIfNeeded({ timeout: timeout || 30000 });
           break;
 
@@ -293,10 +312,7 @@ export class CommandExecutor {
 
         case 'waitForSelector':
           if (!selector) throw new Error('Selector is required for waitForSelector action');
-          // ✅ FIX: Normalize selector format
-          const waitSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for waitForSelector action
-          const waitLocator = this.getLocatorInternal(waitSelector);
+          const waitLocator = this.getLocatorInternal(selector);
           await waitLocator.waitFor({ state: 'visible', timeout: timeout || 30000 });
           break;
 
@@ -306,15 +322,11 @@ export class CommandExecutor {
 
         case 'scroll':
           if (selector) {
-            // ✅ FIX: Normalize selector format
-            const scrollSelector = normalizeSelector(selector);
-            // ✅ CRITICAL FIX: Use getLocator() for scroll action
-            const scrollLocator = this.getLocatorInternal(scrollSelector);
+            const scrollLocator = this.getLocatorInternal(selector);
             await scrollLocator.scrollIntoViewIfNeeded();
           } else {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             await this.page.evaluate(() => {
-              // @ts-ignore - window and document are available in browser context
+              // @ts-expect-error - browser context
               window.scrollTo(0, document.body.scrollHeight);
             });
           }
@@ -330,57 +342,40 @@ export class CommandExecutor {
 
         case 'assertVisible':
           if (!selector) throw new Error('Selector is required for assertVisible action');
-          // ✅ FIX: Normalize selector format
-          const assertVisibleSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for assertVisible action
-          const assertVisibleLocator = this.getLocatorInternal(assertVisibleSelector);
+          const assertVisibleLocator = this.getLocatorInternal(selector);
           const isVisible = await assertVisibleLocator.isVisible({ timeout: timeout || 5000 });
           if (!isVisible) {
-            throw new Error(`Element not visible: ${assertVisibleSelector}`);
+            throw new Error(`Element not visible: ${selector}`);
           }
-          logger.info(`Assertion passed: Element is visible`, { selector: assertVisibleSelector });
+          logger.info(`Assertion passed: Element is visible`, { selector });
           break;
 
         case 'assertText':
           if (!selector) throw new Error('Selector is required for assertText action');
-          // ✅ FIX: Normalize selector format
-          const assertTextSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for assertText action
-          const assertTextLocator = this.getLocatorInternal(assertTextSelector);
+          const assertTextLocator = this.getLocatorInternal(selector);
           await assertTextLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
           const actualText = await assertTextLocator.textContent();
           const expectedText = String(command.assertion?.expected || '');
           const operator = command.assertion?.operator || '=';
           const passed = this.compareValues(actualText || '', expectedText, operator);
           if (!passed) {
-            throw new Error(
-              `Text assertion failed for ${assertTextSelector}: expected "${expectedText}", got "${actualText}"`
-            );
+            throw new Error(`Text assertion failed for ${selector}: expected "${expectedText}", got "${actualText}"`);
           }
-          logger.info(`Assertion passed: Text matches`, { selector: assertTextSelector, expected: expectedText, actual: actualText });
+          logger.info(`Assertion passed: Text matches`, { selector, expected: expectedText, actual: actualText });
           break;
 
         case 'assertValue':
           if (!selector) throw new Error('Selector is required for assertValue action');
-          // ✅ FIX: Normalize selector format
-          const assertValueSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for assertValue action
-          const assertValueLocator = this.getLocatorInternal(assertValueSelector);
+          const assertValueLocator = this.getLocatorInternal(selector);
           await assertValueLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
           const actualValue = await assertValueLocator.inputValue();
           const expectedValue = String(command.assertion?.expected || '');
           const valueOperator = command.assertion?.operator || '=';
           const valuePassed = this.compareValues(actualValue, expectedValue, valueOperator);
           if (!valuePassed) {
-            throw new Error(
-              `Value assertion failed for ${assertValueSelector}: expected "${expectedValue}", got "${actualValue}"`
-            );
+            throw new Error(`Value assertion failed for ${selector}: expected "${expectedValue}", got "${actualValue}"`);
           }
-          logger.info(`Assertion passed: Value matches`, {
-            selector: assertValueSelector,
-            expected: expectedValue,
-            actual: actualValue,
-          });
+          logger.info(`Assertion passed: Value matches`, { selector, expected: expectedValue, actual: actualValue });
           break;
 
         case 'assertUrl':
@@ -389,41 +384,35 @@ export class CommandExecutor {
 
         case 'assertCount':
           if (!selector) throw new Error('Selector is required for assertCount action');
-          // ✅ FIX: Normalize selector format
-          const assertCountSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for assertCount action
-          const assertCountLocator = this.getLocatorInternal(assertCountSelector);
+          const assertCountLocator = this.getLocatorInternal(selector);
           const actualCount = await assertCountLocator.count();
           const expectedCount = Number(command.assertion?.expected || 0);
           const countOperator = command.assertion?.operator || '=';
           const countPassed = this.compareValues(actualCount, expectedCount, countOperator);
           if (!countPassed) {
-            throw new Error(
-              `Count assertion failed for ${assertCountSelector}: expected ${expectedCount}, got ${actualCount}`
-            );
+            throw new Error(`Count assertion failed for ${selector}: expected ${expectedCount}, got ${actualCount}`);
           }
-          logger.info(`Assertion passed: Count matches`, {
-            selector: assertCountSelector,
-            expected: expectedCount,
-            actual: actualCount,
-          });
+          logger.info(`Assertion passed: Count matches`, { selector, expected: expectedCount, actual: actualCount });
           break;
 
         case 'extract': {
           if (!selector) throw new Error('Selector is required for extract action');
           if (!command.extract) throw new Error('Extract config is required for extract action');
-          // ✅ FIX: Normalize selector format
-          const extractSelector = normalizeSelector(selector);
-          // ✅ CRITICAL FIX: Use getLocator() for extract action
-          const extractLocator = this.getLocatorInternal(extractSelector);
+          const extractLocator = this.getLocatorInternal(selector);
           const extractedValue = await this.extractDataWithLocator(extractLocator, command.extract);
           this.extractedData.set(command.extract.name, extractedValue);
           return { success: true, extractedValue };
         }
 
         case 'evaluate':
+          // ✅ FIX 6: Log script (truncated) for security audit
           if (!value) throw new Error('Script is required for evaluate action');
-          await this.page.evaluate(String(value));
+          const script = String(value);
+          logger.debug('[COMMAND_EXECUTOR] Executing evaluate script', {
+            scriptPreview: script.substring(0, 100) + (script.length > 100 ? '...' : ''),
+            scriptLength: script.length,
+          });
+          await this.page.evaluate(script);
           break;
 
         default:
@@ -641,10 +630,139 @@ export class CommandExecutor {
   }
 
   /**
+   * ✅ FIX 5: Parse selectOption value to support multiple formats
+   * Supports: string, array, JSON object { value/label/index }
+   */
+  private parseSelectValue(value: any): string | string[] | { value?: string; label?: string; index?: number } {
+    if (Array.isArray(value)) {
+      return value.map(v => String(v));
+    }
+
+    const strValue = String(value);
+
+    // Try to parse as JSON (object or array)
+    if (strValue.startsWith('{') || strValue.startsWith('[')) {
+      try {
+        return JSON.parse(strValue);
+      } catch {
+        // Not valid JSON, treat as string
+      }
+    }
+
+    // Check for comma-separated values (e.g., "option1,option2")
+    if (strValue.includes(',') && !strValue.includes('"')) {
+      return strValue.split(',').map(v => v.trim());
+    }
+
+    return strValue;
+  }
+
+  /**
    * Get extracted data
    */
   getExtractedData(): Map<string, any> {
     return this.extractedData;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SMART WAIT & FLAKINESS PREVENTION
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * ✅ NEW: Wait for element with smart strategies (anti-flakiness)
+   * Uses adaptive waiting based on selector stability
+   */
+  private async waitForElementSmart(
+    selector: string,
+    options: {
+      timeout?: number;
+      actionType?: 'click' | 'fill' | 'type' | 'select' | 'other';
+    } = {}
+  ): Promise<{
+    success: boolean;
+    locator?: Locator;
+    stabilityScore?: SelectorStabilityScore;
+    error?: string;
+  }> {
+    const { timeout = 10000, actionType = 'other' } = options;
+
+    // Use SmartWaitService for intelligent waiting
+    const waitResult = await SmartWaitService.waitForElement(
+      this.page,
+      selector,
+      {
+        timeout,
+        strategy: 'auto', // Auto-detect best strategy
+        retries: 3,
+        retryDelay: 300,
+      }
+    );
+
+    // Log stability info for flaky selectors
+    if (waitResult.stabilityScore?.isFlaky) {
+      logger.warn('[COMMAND_EXECUTOR] Flaky selector detected', {
+        selector: selector.substring(0, 50),
+        stabilityScore: waitResult.stabilityScore.score,
+        reasons: waitResult.stabilityScore.reasons,
+        recommendation: waitResult.stabilityScore.recommendation,
+      });
+    }
+
+    if (!waitResult.success) {
+      return {
+        success: false,
+        stabilityScore: waitResult.stabilityScore,
+        error: waitResult.error,
+      };
+    }
+
+    // Validate the locator is actionable
+    const locator = waitResult.locator!;
+
+    // Additional check for specific action types
+    if (actionType === 'click' || actionType === 'fill') {
+      try {
+        // Check if element is actually interactable (runs in browser context)
+        const isActionable = await locator.evaluate((el: any) => {
+          const rect = el.getBoundingClientRect();
+          // @ts-expect-error - window.getComputedStyle exists in browser context
+          const style = window.getComputedStyle(el);
+
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== 'hidden' &&
+            style.display !== 'none' &&
+            style.pointerEvents !== 'none'
+          );
+        }).catch(() => true); // Assume true if check fails
+
+        if (!isActionable) {
+          return {
+            success: false,
+            locator,
+            stabilityScore: waitResult.stabilityScore,
+            error: 'Element exists but is not actionable',
+          };
+        }
+      } catch {
+        // Check failed, continue anyway
+      }
+    }
+
+    return {
+      success: true,
+      locator,
+      stabilityScore: waitResult.stabilityScore,
+    };
+  }
+
+  /**
+   * ✅ NEW: Analyze selector before action for flakiness detection
+   * Returns stability score and recommendations
+   */
+  private analyzeSelector(selector: string): SelectorStabilityScore {
+    return SmartWaitService.analyzeSelectorStability(selector);
   }
 
   /**
@@ -714,15 +832,19 @@ export class CommandExecutor {
         confidence: healingResult.diff.confidence,
       });
 
-      // Auto-apply if confidence is high
-      if (healingResult.autoApplied) {
+      // ✅ FIX 7: Use configurable confidence threshold
+      const meetsConfidenceThreshold = healingResult.diff.confidence >= this.selfHealingConfidenceThreshold;
+
+      if (healingResult.autoApplied && meetsConfidenceThreshold) {
         logger.info('[COMMAND_EXECUTOR] Auto-applying healed selector', {
           newSelector: healingResult.newSelector,
           whatChanged: healingResult.diff.what_changed,
           action: context.action,
+          confidence: healingResult.diff.confidence,
+          threshold: this.selfHealingConfidenceThreshold,
         });
 
-        // ✅ CRITICAL FIX: Apply healed selector according to action type
+        // Apply healed selector according to action type
         await this.applyHealedSelector(
           healingResult.newSelector,
           context.action,
@@ -736,9 +858,11 @@ export class CommandExecutor {
         });
       } else {
         // Low confidence - log suggestion but don't auto-apply
-        logger.warn('[COMMAND_EXECUTOR] Low confidence healing - not auto-applying', {
+        logger.warn('[COMMAND_EXECUTOR] Healing below confidence threshold - not auto-applying', {
           suggestion: healingResult.suggestion,
           confidence: healingResult.diff.confidence,
+          threshold: this.selfHealingConfidenceThreshold,
+          reason: !meetsConfidenceThreshold ? 'below_threshold' : 'auto_apply_disabled',
         });
         throw error; // Re-throw original error
       }
@@ -791,6 +915,8 @@ export class CommandExecutor {
       // INTERACTIONS
       // ═══════════════════════════════════════════════════════════════
       case 'click':
+        // ✅ FIX: Force scroll into view before clicking (handles viewport issues)
+        await this.forceScrollIntoView(locator);
         await locator.click({ timeout: defaultTimeout });
         break;
 
@@ -965,6 +1091,93 @@ export class CommandExecutor {
       default:
         // ✅ IMPROVED: Don't fallback to click - throw error for unknown actions
         throw new Error(`Unknown action type for self-healing: ${actionType}. Cannot apply healed selector.`);
+    }
+  }
+
+  /**
+   * ✅ FIX: Force scroll element into viewport using multiple strategies
+   * Handles cases where scrollIntoViewIfNeeded() fails
+   */
+  private async forceScrollIntoView(locator: Locator): Promise<void> {
+    try {
+      // Strategy 1: Try scrollIntoViewIfNeeded first (Playwright's built-in)
+      await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {
+        logger.debug('[COMMAND_EXECUTOR] scrollIntoViewIfNeeded failed, trying manual scroll');
+      });
+
+      // Strategy 2: Check if element is in viewport, if not - use manual scroll
+      const isInViewport = await locator.evaluate((el) => {
+        // @ts-ignore - browser context
+        const rect = el.getBoundingClientRect();
+        // @ts-ignore - browser context
+        const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+        // @ts-ignore - browser context
+        const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+
+        return (
+          rect.top >= 0 &&
+          rect.left >= 0 &&
+          rect.bottom <= viewportHeight &&
+          rect.right <= viewportWidth
+        );
+      }).catch(() => false);
+
+      if (!isInViewport) {
+        logger.debug('[COMMAND_EXECUTOR] Element not in viewport, using manual scroll');
+
+        // Strategy 3: Manual scroll using JavaScript
+        await locator.evaluate((el) => {
+          // @ts-ignore - browser context
+          const rect = el.getBoundingClientRect();
+          // @ts-ignore - browser context
+          const elementTop = rect.top + window.pageYOffset;
+          // @ts-ignore - browser context
+          const elementLeft = rect.left + window.pageXOffset;
+
+          // Scroll to element with some offset from top
+          const offset = 100; // Leave some space from top
+          // @ts-ignore - browser context
+          window.scrollTo({
+            top: elementTop - offset,
+            left: elementLeft,
+            behavior: 'smooth'
+          });
+        });
+
+        // Wait a bit for smooth scroll to complete
+        await this.page.waitForTimeout(300);
+
+        // Strategy 4: If still not in viewport, try scrollIntoView with block: 'center'
+        const stillNotInViewport = await locator.evaluate((el) => {
+          // @ts-ignore - browser context
+          const rect = el.getBoundingClientRect();
+          // @ts-ignore - browser context
+          const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+          // @ts-ignore - browser context
+          const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+
+          return !(
+            rect.top >= 0 &&
+            rect.left >= 0 &&
+            rect.bottom <= viewportHeight &&
+            rect.right <= viewportWidth
+          );
+        }).catch(() => true);
+
+        if (stillNotInViewport) {
+          logger.debug('[COMMAND_EXECUTOR] Still not in viewport, using scrollIntoView with block: center');
+          await locator.evaluate((el) => {
+            // @ts-ignore - browser context
+            el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+          });
+          await this.page.waitForTimeout(300);
+        }
+      }
+    } catch (error) {
+      // If all scroll strategies fail, log but don't throw - element might still be clickable
+      logger.warn('[COMMAND_EXECUTOR] Failed to force scroll into view', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 }

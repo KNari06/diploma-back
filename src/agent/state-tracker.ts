@@ -162,8 +162,20 @@ export class StateTracker {
     const normalizedCurrent = this.normalizeUrl(currentUrl);
 
     // Count how many times we've visited this URL (normalized)
+    // ✅ IMPROVED: Only count visits with successful actions or URL changes
     const visitCount = state.visitedPages.filter(
-      page => this.normalizeUrl(page.url) === normalizedCurrent
+      page => {
+        const normalizedPageUrl = this.normalizeUrl(page.url);
+        if (normalizedPageUrl !== normalizedCurrent) return false;
+
+        // Only count as "real" visit if:
+        // 1. Has successful actions, OR
+        // 2. Is the first visit (no previous visits to compare)
+        const hasSuccessfulActions = page.actionResults?.some(r => r.success) || false;
+        const isFirstVisit = state.visitedPages.indexOf(page) === 0;
+
+        return hasSuccessfulActions || isFirstVisit;
+      }
     ).length;
 
     if (visitCount >= maxVisits) {

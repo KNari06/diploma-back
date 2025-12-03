@@ -546,11 +546,11 @@ export function formatTestPlanForConfirmation(
   markdown += `**URL:** ${plan.url}\n`;
   markdown += `**Scope:** ${plan.scope}\n`;
 
-  if (isAiGenerated) {
-    markdown += `**Mode:** 🤖 **AI-Generated Testing**\n`;
-  }
+  // if (isAiGenerated) {
+  //   markdown += `**Mode:** 🤖 **AI-Generated Testing**\n`;
+  // }
 
-  markdown += `**Estimated Duration:** ${plan.estimatedDuration}\n`;
+  // markdown += `**Estimated Duration:** ${plan.estimatedDuration}\n`;
 
   // Summary
   markdown += `## 📋 Summary\n${plan.summary}\n`;

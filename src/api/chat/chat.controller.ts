@@ -451,10 +451,33 @@ async function getChatHistoryForIntent(
       CONSTANTS.RECENT_MESSAGES_LIMIT
     );
     // Convert 'ai' role to 'assistant' for OpenAI compatibility
-    const chatHistory = recentMessages.map(msg => ({
-      role: convertRoleForOpenAI(msg.role),
-      content: msg.content,
-    }));
+    // ✅ FIX: Include test results from metadata so AI can see them in intent parsing
+    const chatHistory = recentMessages.map(msg => {
+      let content = msg.content;
+
+      // ✅ FIX: If message has test results in metadata, append them to content
+      if (msg.metadata?.testResult) {
+        const testResult = msg.metadata.testResult;
+        const testId = msg.metadata.testId;
+        const testType = msg.metadata.testType || 'unknown';
+
+        // Format test results for AI context (shorter for intent parsing)
+        let testResultsText = '\n[TEST RESULTS: ';
+        testResultsText += `ID: ${testId}, Type: ${testType}`;
+        if (testResult.status) testResultsText += `, Status: ${testResult.status}`;
+        if (testResult.statusCode) testResultsText += `, HTTP: ${testResult.statusCode}`;
+        if (testResult.responseTime !== undefined) testResultsText += `, Time: ${testResult.responseTime}ms`;
+        if (testResult.url) testResultsText += `, URL: ${testResult.url}`;
+        testResultsText += ']';
+
+        content += testResultsText;
+      }
+
+      return {
+        role: convertRoleForOpenAI(msg.role),
+        content,
+      };
+    });
 
     logger.debug('[CHAT] Retrieved chat history for intent parsing', {
       historyLength: chatHistory.length,
@@ -1599,10 +1622,85 @@ async function handleGeneralChat(
     }
 
     // Build conversation history with compressed content (use helper for role conversion)
-    conversationHistory = recentMessages.map(msg => ({
-      role: convertRoleForOpenAI(msg.role) as 'user' | 'assistant',
-      content: compressMessageContent(msg.content),
-    })) as Array<{ role: 'user' | 'assistant'; content: string }>;
+    // ✅ FIX: Include test results from metadata so AI can see them
+    conversationHistory = recentMessages.map(msg => {
+      let content = compressMessageContent(msg.content);
+
+      // ✅ FIX: If message has test results in metadata, append them to content
+      if (msg.metadata?.testResult) {
+        const testResult = msg.metadata.testResult;
+        const testId = msg.metadata.testId;
+        const testType = msg.metadata.testType || 'unknown';
+
+        // Format test results for AI context
+        let testResultsText = '\n\n--- TEST RESULTS ---\n';
+        testResultsText += `Test ID: ${testId}\n`;
+        testResultsText += `Test Type: ${testType}\n`;
+
+        // API Test Results
+        if (testResult.statusCode) {
+          testResultsText += `HTTP Status: ${testResult.statusCode}\n`;
+        }
+        if (testResult.responseTime !== undefined) {
+          testResultsText += `Response Time: ${testResult.responseTime}ms\n`;
+        }
+        if (testResult.method) {
+          testResultsText += `Method: ${testResult.method}\n`;
+        }
+        if (testResult.responseBody) {
+          // Truncate very long response bodies
+          const bodyStr = typeof testResult.responseBody === 'string'
+            ? testResult.responseBody
+            : JSON.stringify(testResult.responseBody, null, 2);
+          const truncatedBody = bodyStr.length > 2000
+            ? bodyStr.substring(0, 2000) + '... [truncated]'
+            : bodyStr;
+          testResultsText += `Response Body: ${truncatedBody}\n`;
+        }
+        if (testResult.headers) {
+          testResultsText += `Headers: ${JSON.stringify(testResult.headers)}\n`;
+        }
+
+        // UI Test Results
+        if (testResult.status) {
+          testResultsText += `Status: ${testResult.status}\n`;
+        }
+        if (testResult.browsers) {
+          testResultsText += `Browsers: ${Array.isArray(testResult.browsers) ? testResult.browsers.join(', ') : testResult.browsers}\n`;
+        }
+        if (testResult.results && Array.isArray(testResult.results)) {
+          testResultsText += `Browser Results:\n`;
+          testResult.results.forEach((r: any) => {
+            testResultsText += `  - ${r.browser}: ${r.status}`;
+            if (r.errors && Array.isArray(r.errors) && r.errors.length > 0) {
+              testResultsText += ` (${r.errors.length} errors)`;
+            }
+            testResultsText += '\n';
+          });
+        }
+
+        if (testResult.url) {
+          testResultsText += `URL: ${testResult.url}\n`;
+        }
+        if (testResult.error) {
+          testResultsText += `Error: ${testResult.error}\n`;
+        }
+        if (testResult.completedAt) {
+          testResultsText += `Completed At: ${testResult.completedAt}\n`;
+        }
+        if (msg.metadata.fuzzingReport) {
+          const fuzz = msg.metadata.fuzzingReport;
+          testResultsText += `\nFuzzing Report: ${fuzz.totalTests} tests, ${fuzz.passed} passed, ${fuzz.failed} failed, ${fuzz.issuesFound} issues found, Security Score: ${fuzz.securityScore}\n`;
+        }
+
+        content += testResultsText;
+      }
+
+      return {
+        role: convertRoleForOpenAI(msg.role) as 'user' | 'assistant',
+        content,
+      };
+    }) as Array<{ role: 'user' | 'assistant'; content: string }>;
   }
 
   // ═══════════════════════════════════════════════════════════════════════

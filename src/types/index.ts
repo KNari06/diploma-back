@@ -839,13 +839,14 @@ export type PlaywrightActionType =
 export interface PlaywrightCommand {
   action: PlaywrightActionType;
   selector?: string;        // CSS selector, text selector, or xpath
-  value?: string | number;  // Value for fill, type, select, etc.
+  value?: string | number | string[]; // Value for fill, type, select (supports array for multi-select)
   url?: string;             // For goto action
   timeout?: number;         // Timeout in ms (default: 30000)
   waitFor?: 'load' | 'domcontentloaded' | 'networkidle'; // Wait strategy for goto
   description?: string;     // Human-readable description of what this does
   screenshot?: boolean;     // Take screenshot after this action
   continueOnError?: boolean; // Continue test even if this step fails
+  awaitNavigation?: boolean; // Wait for navigation after click/submit actions
   assertion?: {             // For assert actions
     type: 'visible' | 'hidden' | 'text' | 'value' | 'count' | 'url' | 'enabled' | 'disabled';
     expected: string | number | boolean;
@@ -855,7 +856,6 @@ export interface PlaywrightCommand {
     name: string;           // Variable name to store extracted value
     attribute?: string;     // Attribute to extract (e.g., 'href', 'src')
     property?: 'text' | 'value' | 'innerHTML'; // Property to extract
-    // ✅ NEW: AI Extract with JSON schema
     useAI?: boolean;        // Use AI extraction with schema validation
     schema?: any;           // JSON schema for AI extraction (JSONSchema type)
     mode?: 'html' | 'text' | 'auto'; // Extraction mode for AI
