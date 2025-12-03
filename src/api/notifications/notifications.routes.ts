@@ -23,7 +23,8 @@ const router = Router();
  *         schema:
  *           type: string
  *           enum: [personal, general, system, all]
- *         description: Filter by notification type (default: all)
+ *         description: |
+ *           Filter by notification type (default: all)
  *       - in: query
  *         name: category
  *         schema:

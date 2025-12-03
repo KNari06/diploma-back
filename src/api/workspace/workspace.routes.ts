@@ -146,13 +146,15 @@ router.post(
  * /api/v1/workspaces/onboarding:
  *   get:
  *     summary: Get onboarding data
- *     description: Returns onboarding data if already completed, or completed: false if not
+ *     description: |
+ *       Returns onboarding data if already completed, or completed: false if not
  *     tags: [Workspaces]
  *     security:
  *       - bearerAuth: []
  *     responses:
  *       200:
- *         description: Onboarding data or completed: false
+ *         description: |
+ *           Onboarding data or completed: false
  *         content:
  *           application/json:
  *             schema:

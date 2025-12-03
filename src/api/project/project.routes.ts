@@ -130,7 +130,8 @@ router.get(
  * /api/v1/projects/{id}:
  *   put:
  *     summary: Update project
- *     description: Updates an existing project. Note: workspace_id cannot be changed.
+ *     description: |
+ *       Updates an existing project. Note: workspace_id cannot be changed.
  *     tags: [Projects]
  *     security:
  *       - bearerAuth: []
