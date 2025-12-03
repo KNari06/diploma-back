@@ -33,6 +33,9 @@ export class IntelligentTestStorageService {
         testId,
         pagesVisited: result.pagesVisited,
         actionsTaken: result.actionsTaken,
+        hasGraphData: !!params.graphData,
+        graphNodes: params.graphData?.nodes?.length || 0,
+        graphEdges: params.graphData?.edges?.length || 0,
       });
 
       // ✅ FIX #2: Validate required fields before insert

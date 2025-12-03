@@ -218,9 +218,22 @@ export async function getTestVisualization(req: Request, res: Response): Promise
     let stepsSource = 'unknown';
     let steps: PlaywrightStep[] | undefined;
 
+    logger.info('[TEST_VISUALIZATION] Checking for graph_data', {
+      testId,
+      hasIntelligentSession: !!testData.intelligentSession,
+      hasSession: !!testData.intelligentSession?.session,
+      hasGraphData: !!testData.intelligentSession?.session?.graph_data,
+      graphDataNodes: testData.intelligentSession?.session?.graph_data?.nodes?.length || 0,
+      graphDataEdges: testData.intelligentSession?.session?.graph_data?.edges?.length || 0,
+    });
+
     if (testData.intelligentSession?.session?.graph_data) {
       // Use saved graph directly (no conversion needed)
-      logger.info('[TEST_VISUALIZATION] Using saved graph_data from intelligent session');
+      logger.info('[TEST_VISUALIZATION] Using saved graph_data from intelligent session', {
+        testId,
+        nodesCount: testData.intelligentSession.session.graph_data.nodes?.length || 0,
+        edgesCount: testData.intelligentSession.session.graph_data.edges?.length || 0,
+      });
       graph = testData.intelligentSession.session.graph_data;
       stepsSource = 'saved_graph';
     } else {
@@ -565,14 +578,42 @@ async function getComprehensiveTestData(testId: string, userId?: string): Promis
         .limit(1);
 
       if (!sessionError && sessions && sessions.length > 0) {
+        logger.info('[TEST_VISUALIZATION] Found intelligent session', {
+          testId,
+          sessionId: sessions[0].id,
+          hasGraphData: !!sessions[0].graph_data,
+          graphDataType: typeof sessions[0].graph_data,
+          graphDataIsObject: sessions[0].graph_data && typeof sessions[0].graph_data === 'object',
+          graphDataNodes: sessions[0].graph_data?.nodes?.length || 0,
+          graphDataEdges: sessions[0].graph_data?.edges?.length || 0,
+        });
+
         intelligentSession = await IntelligentTestStorageService.getTestSession(sessions[0].id);
+
         // ✅ NEW: Attach graph_data to session if available
         if (intelligentSession && sessions[0].graph_data) {
           intelligentSession.session = {
             ...intelligentSession.session,
             graph_data: sessions[0].graph_data,
           };
+          logger.info('[TEST_VISUALIZATION] Graph data attached to session', {
+            testId,
+            nodesCount: sessions[0].graph_data?.nodes?.length || 0,
+            edgesCount: sessions[0].graph_data?.edges?.length || 0,
+          });
+        } else {
+          logger.warn('[TEST_VISUALIZATION] Graph data not attached', {
+            testId,
+            hasIntelligentSession: !!intelligentSession,
+            hasGraphData: !!sessions[0].graph_data,
+          });
         }
+      } else {
+        logger.warn('[TEST_VISUALIZATION] No intelligent session found', {
+          testId,
+          sessionError: sessionError?.message,
+          sessionsCount: sessions?.length || 0,
+        });
       }
     } catch (error) {
       logger.warn('[TEST_VISUALIZATION] Error getting intelligent session', { error, testId });

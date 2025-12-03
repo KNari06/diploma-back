@@ -2193,6 +2193,21 @@ export class IntelligentTestOrchestrator {
     // ✅ NEW: Get final graph for storage
     let graphData = this.graphBuilder ? this.graphBuilder.getFullGraph() : undefined;
 
+    // ✅ NEW: Log graph data for debugging
+    if (graphData) {
+      logger.info('[INTELLIGENT_ORCHESTRATOR] Graph data prepared for storage', {
+        testId: this.testId,
+        nodesCount: graphData.nodes?.length || 0,
+        edgesCount: graphData.edges?.length || 0,
+        hasMetadata: !!graphData.metadata,
+      });
+    } else {
+      logger.warn('[INTELLIGENT_ORCHESTRATOR] No graph data available for storage', {
+        testId: this.testId,
+        hasGraphBuilder: !!this.graphBuilder,
+      });
+    }
+
     // ✅ NEW: Upload screenshots from graph to storage and replace base64 with public URLs
     if (graphData && this.testId && this.userId) {
       try {

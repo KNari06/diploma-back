@@ -708,6 +708,13 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       try {
         const { IntelligentTestStorageService } = await import('@/services/testing/results/intelligent-test-storage.service');
 
+        logger.info('[PLAYWRIGHT] Saving test session with graph data', {
+          testId: testData.testId,
+          hasGraphData: !!intelligentResult.graphData,
+          graphNodes: intelligentResult.graphData?.nodes?.length || 0,
+          graphEdges: intelligentResult.graphData?.edges?.length || 0,
+        });
+
         await IntelligentTestStorageService.saveTestSession({
           testId: testData.testId,
           userId: testData.userId || 'anonymous',
@@ -727,6 +734,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         logger.info('[PLAYWRIGHT] Test data saved to database', {
           testId: testData.testId,
           tables: ['intelligent_test_sessions', 'intelligent_page_visits', 'intelligent_test_actions'],
+          graphDataSaved: !!intelligentResult.graphData,
         });
       } catch (storageError) {
         logger.error('[PLAYWRIGHT] Failed to save test data', {

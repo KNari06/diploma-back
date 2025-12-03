@@ -369,6 +369,7 @@ router.get('/', requireAuth, asyncHandler(async (req: Request, res: Response) =>
 /**
  * GET /manual-test/:id
  * Get manual test by ID
+ * ✅ FIX: Converts base64 screenshots to URLs in test results
  */
 router.get('/:id', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -376,18 +377,53 @@ router.get('/:id', requireAuth, asyncHandler(async (req: Request, res: Response)
 
   const result = await ManualTestService.getTest(id, userId);
 
+  // ✅ FIX: Convert base64 screenshots to URLs in test results
+  if (result.success && result.data) {
+    const test = result.data;
+    // Check if test has results with screenshots
+    if (test.results && Array.isArray(test.results) && test.results.length > 0) {
+      const screenshotUrlMap = await convertScreenshotsToUrls(
+        test.results.map((r: any) => ({ id: r.id, screenshot: r.screenshot, browser: r.browser })),
+        id,
+        userId
+      );
+
+      // Update results with converted URLs
+      test.results = test.results.map((r: any) => ({
+        ...r,
+        screenshot: screenshotUrlMap.get(r.id) || undefined,
+      }));
+    }
+  }
+
   res.status(200).json(result);
 }));
 
 /**
  * GET /manual-test/:id/result
  * Get manual test results
+ * ✅ FIX: Converts base64 screenshots to URLs
  */
 router.get('/:id/result', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = req.user!.id;
 
   const result = await ManualTestService.getTestResults(id, userId);
+
+  // ✅ FIX: Convert base64 screenshots to URLs
+  if (result.success && result.data && Array.isArray(result.data)) {
+    const screenshotUrlMap = await convertScreenshotsToUrls(
+      result.data.map(r => ({ id: r.id, screenshot: r.screenshot, browser: r.browser })),
+      id,
+      userId
+    );
+
+    // Update results with converted URLs
+    result.data = result.data.map(r => ({
+      ...r,
+      screenshot: screenshotUrlMap.get(r.id) || undefined,
+    }));
+  }
 
   res.status(200).json(result);
 }));
@@ -722,6 +758,125 @@ router.get('/:id/status', requireAuth, asyncHandler(async (req: Request, res: Re
  *       401:
  *         description: Unauthorized
  */
+/**
+ * ✅ OPTIMIZED: Helper to convert base64 screenshots to URLs
+ * - Converts once and caches result
+ * - Updates DB to avoid re-conversion on next request
+ * - Uses parallel uploads for speed
+ */
+function isBase64Screenshot(screenshot: string): boolean {
+  // Check for data URL format
+  if (screenshot.startsWith('data:image/')) return true;
+  // Check for raw base64 (PNG signature in base64 is "iVBORw0K")
+  if (screenshot.startsWith('iVBORw0K')) return true;
+  // Check for raw base64 (JPEG signature is "/9j/")
+  if (screenshot.startsWith('/9j/')) return true;
+  return false;
+}
+
+async function convertScreenshotsToUrls(
+  results: Array<{ id: string; screenshot?: string | null; browser: string }>,
+  testId: string,
+  userId: string
+): Promise<Map<string, string | null>> {
+  const urlMap = new Map<string, string | null>();
+  const conversionsNeeded: Array<{ resultId: string; screenshot: string; index: number }> = [];
+
+  // First pass: identify what needs conversion
+  results.forEach((r, index) => {
+    if (!r.screenshot) {
+      urlMap.set(r.id, null);
+    } else if (r.screenshot.startsWith('http://') || r.screenshot.startsWith('https://')) {
+      // Already a URL
+      urlMap.set(r.id, r.screenshot);
+    } else if (isBase64Screenshot(r.screenshot)) {
+      // Needs conversion
+      conversionsNeeded.push({ resultId: r.id, screenshot: r.screenshot, index });
+    } else {
+      // Unknown format, skip
+      urlMap.set(r.id, null);
+    }
+  });
+
+  if (conversionsNeeded.length === 0) {
+    return urlMap;
+  }
+
+  logger.info('[MANUAL_TEST] Converting base64 screenshots to URLs', {
+    testId,
+    count: conversionsNeeded.length,
+  });
+
+  const startTime = Date.now();
+
+  try {
+    const { uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+
+    // Convert in parallel for speed
+    const uploadResults = await Promise.allSettled(
+      conversionsNeeded.map(async ({ resultId, screenshot, index }) => {
+        const url = await uploadScreenshotToStorage(screenshot, testId, userId, index);
+        return { resultId, url };
+      })
+    );
+
+    // Process results and update DB
+    for (const result of uploadResults) {
+      if (result.status === 'fulfilled') {
+        const { resultId, url } = result.value;
+        urlMap.set(resultId, url);
+
+        // Update DB to store URL instead of base64 (async, don't wait)
+        // This ensures next request returns URL directly without conversion
+        (async () => {
+          try {
+            await supabaseAdmin
+              .from('test_results')
+              .update({ screenshot: url })
+              .eq('id', resultId);
+            logger.debug('[MANUAL_TEST] Updated DB with screenshot URL', { resultId });
+          } catch (err) {
+            logger.warn('[MANUAL_TEST] Failed to update DB with screenshot URL', {
+              resultId,
+              error: err,
+            });
+          }
+        })();
+      } else {
+        // Find the resultId from the failed promise
+        const failedIndex = uploadResults.indexOf(result);
+        const failedConversion = conversionsNeeded[failedIndex];
+        if (failedConversion) {
+          urlMap.set(failedConversion.resultId, null);
+          logger.error('[MANUAL_TEST] Screenshot upload failed', {
+            resultId: failedConversion.resultId,
+            error: result.reason,
+          });
+        }
+      }
+    }
+
+    logger.info('[MANUAL_TEST] Screenshot conversion completed', {
+      testId,
+      count: conversionsNeeded.length,
+      duration: `${Date.now() - startTime}ms`,
+    });
+  } catch (error) {
+    logger.error('[MANUAL_TEST] Screenshot conversion failed', {
+      testId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    // Set all pending to null
+    conversionsNeeded.forEach(({ resultId }) => {
+      if (!urlMap.has(resultId)) {
+        urlMap.set(resultId, null);
+      }
+    });
+  }
+
+  return urlMap;
+}
+
 router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = req.user!.id;
@@ -790,15 +945,24 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
       });
     }
 
-    // 6. Collect all screenshots from results
+    // 6. Convert all screenshots ONCE (avoid duplicate conversions)
+    // ✅ OPTIMIZED: Convert once and reuse, update DB for future requests
+    const screenshotUrlMap = await convertScreenshotsToUrls(
+      results.map(r => ({ id: r.id, screenshot: r.screenshot, browser: r.browser })),
+      id,
+      userId
+    );
+
+    // Collect all screenshots from results using pre-converted URLs
     const screenshots = results
       .filter(r => r.screenshot)
       .map(r => ({
         browser: r.browser,
-        screenshot: r.screenshot,
+        screenshot: screenshotUrlMap.get(r.id) || null,
         status: r.status,
         completed_at: r.completedAt,
-      }));
+      }))
+      .filter(s => s.screenshot !== null);
 
     // 7. Collect all videos from results and trace files
     const videos = [
@@ -862,12 +1026,13 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
         intelligent_mode: test.intelligentMode,
         test_goal: test.testGoal,
       },
+      // ✅ OPTIMIZED: Use pre-converted URLs (no duplicate conversion)
       results: results.map(r => ({
         id: r.id,
         test_id: r.testId,
         browser: r.browser,
         status: r.status,
-        screenshot: r.screenshot,
+        screenshot: screenshotUrlMap.get(r.id) || null,
         dom: r.dom,
         video_url: r.videoUrl,
         trace_url: r.traceUrl,
