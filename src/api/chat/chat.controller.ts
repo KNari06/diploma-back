@@ -1854,7 +1854,7 @@ Use this knowledge to provide more accurate and helpful responses.`,
   // STEP 5: RESPOND (NO CREDIT DEDUCTION FOR CHAT!)
   // ═══════════════════════════════════════════════════════════════════════
   // IMPORTANT: Chat messages are FREE
-  // Credits are only deducted for TESTS (intelligent, standard, api)
+  // Credits are only deducted for TESTS (intelligent, api)
 
   // Check if client connection is still alive before sending response
   if (req.aborted || req.socket?.destroyed) {
@@ -1923,11 +1923,12 @@ async function validateTestPlan(
  * ═══════════════════════════════════════════════════════════════════════════
  * HELPER: DETERMINE TEST TYPE
  * ═══════════════════════════════════════════════════════════════════════════
+ * ✅ UPDATED: Standard mode removed - only API and Intelligent modes supported
  */
-function determineTestType(plan: any): 'api' | 'intelligent' | 'standard' {
+function determineTestType(plan: any): 'api' | 'intelligent' {
   if (!plan) {
-    logger.warn('[DETERMINE_TYPE] Plan is null/undefined');
-    return 'standard';
+    logger.warn('[DETERMINE_TYPE] Plan is null/undefined, defaulting to intelligent');
+    return 'intelligent';
   }
 
   // Check if API test (priority 1)
@@ -1941,15 +1942,9 @@ function determineTestType(plan: any): 'api' | 'intelligent' | 'standard' {
     return 'api';
   }
 
-  // Check intelligent mode (priority 2)
-  if (plan.intelligentMode) {
-    logger.debug('[DETERMINE_TYPE] Detected intelligent test');
-    return 'intelligent';
-  }
-
-  // Default to standard
-  logger.debug('[DETERMINE_TYPE] Defaulting to standard test');
-  return 'standard';
+  // All UI tests are intelligent mode (Standard mode removed)
+  logger.debug('[DETERMINE_TYPE] Detected intelligent test (default for UI tests)');
+  return 'intelligent';
 }
 
 /**
@@ -1959,7 +1954,7 @@ function determineTestType(plan: any): 'api' | 'intelligent' | 'standard' {
  */
 async function checkCreditsBeforeTest(
   userId: string,
-  testType: 'api' | 'intelligent' | 'standard',
+  testType: 'api' | 'intelligent',
   res: Response
 ): Promise<boolean> {
     const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, testType);
@@ -2462,82 +2457,15 @@ async function executeUiTestFlow(
       throw new Error(`Failed to confirm test plan: ${confirmResult.message || 'Unknown error'}`);
     }
 
-    // ✅ NEW: Additional validation for STANDARD mode plans before running the test
-    // We want to catch obviously broken commands early (missing selectors/actions)
-    // and avoid launching a test that cannot interact with the real page at all.
-    if (!plan.intelligentMode) {
-      const issues: string[] = [];
-      let validCommandCount = 0;
-
-      if (!Array.isArray(plan.commands) || plan.commands.length === 0) {
-        issues.push('Plan has no executable commands for standard mode.');
-      } else {
-        const interactiveActions = new Set([
-          'click', 'dblclick', 'fill', 'type', 'select', 'selectOption',
-          'check', 'uncheck', 'hover', 'focus', 'blur', 'press',
-          'dragAndDrop', 'tap', 'swipe',
-          'waitForSelector', 'scroll', 'scrollIntoView',
-          'assertVisible', 'assertHidden', 'assertEnabled', 'assertDisabled',
-          'assertText', 'assertValue', 'assertUrl', 'assertCount',
-          'screenshot',
-        ]);
-
-        for (let i = 0; i < plan.commands.length; i++) {
-          const cmd = plan.commands[i] || {};
-          const action = cmd.action;
-          const selector = cmd.selector;
-          const url = cmd.url;
-
-          if (!action || typeof action !== 'string') {
-            issues.push(`Command ${i + 1}: missing or invalid "action" field`);
-            continue;
-          }
-
-          // Navigation actions can work without selector but require URL
-          const isNavigationAction = ['goto', 'goBack', 'goForward', 'reload', 'waitForNavigation'].includes(action);
-          const requiresSelector = interactiveActions.has(action);
-
-          if (isNavigationAction) {
-            if (!url || typeof url !== 'string') {
-              issues.push(`Command ${i + 1} (${action}): missing or invalid "url" field`);
-              continue;
-            }
-            validCommandCount++;
-            continue;
-          }
-
-          if (requiresSelector) {
-            if (!selector || typeof selector !== 'string') {
-              issues.push(`Command ${i + 1} (${action}): missing or invalid "selector" field`);
-              continue;
-            }
-          }
-
-          // If we reached here - command is structurally valid
-          validCommandCount++;
-        }
-      }
-
-      if (issues.length > 0) {
-        logger.warn('[UI_TEST] Standard mode plan validation issues', {
-          planId,
-          issues: issues.slice(0, 10), // avoid huge logs
-          totalIssues: issues.length,
-          validCommandCount,
-        });
-      }
-
-      // If no valid commands at all - abort early to avoid running a useless test
-      if (validCommandCount === 0) {
-        throw new Error('Standard UI test plan has no valid executable commands. Please review and fix the test plan steps.');
-      }
-    }
+    // ✅ REMOVED: Standard mode validation - all UI tests now use intelligent mode
+    // Intelligent mode doesn't require commands validation as AI generates actions dynamically
 
     emitProcessingStep(chatSessionId, 'executing_test', '💳 Checking credits...', 10);
     checkTimeout();
 
     // FIX #10: Deduct credits BEFORE test execution (not after)
-    const uiTestType = plan.intelligentMode ? 'intelligent' : 'standard';
+    // ✅ UPDATED: All UI tests are intelligent mode (Standard mode removed)
+    const uiTestType = 'intelligent';
     const testId = `ui_${planId}_${Date.now()}`;
 
     try {
@@ -2680,7 +2608,7 @@ async function executeUiTestFlow(
               content: successMessage,
               metadata: {
             testId: testCreated.data.id,
-                testMode: plan.intelligentMode ? 'intelligent' : 'standard',
+                testMode: 'intelligent', // ✅ UPDATED: All UI tests are intelligent mode
                 is_test_runned: isTestRunned, // ✅ NEW: Flag indicating if test is completed/failed
               },
             },

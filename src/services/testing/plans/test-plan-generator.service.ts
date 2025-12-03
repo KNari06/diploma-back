@@ -487,6 +487,7 @@ export async function generateTestPlan(
     }));
 
     // Create structured test plan
+    // ✅ FIX: Always use intelligent mode - Standard Mode was removed
     const testPlan: TestPlan = {
       id: planId,
       status: 'pending_confirmation',
@@ -494,17 +495,19 @@ export async function generateTestPlan(
       scope: userRequest.scope,
       summary: aiPlan.summary || 'Automated test plan',
       steps: normalizedSteps,
-      commands: aiPlan.commands || [],
+      commands: aiPlan.commands || [], // Commands are hints for intelligent mode
       estimatedDuration: aiPlan.estimatedDuration || 'Unknown',
       whatWillBeTested: aiPlan.whatWillBeTested || [],
       whatWillNotBeTested: aiPlan.whatWillNotBeTested || [],
       risks: aiPlan.risks || [],
-      notes: aiPlan.notes || null, // NEW: Support notes field
+      notes: aiPlan.notes || null,
       createdAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), // 1 hour
+      // ✅ CRITICAL: Always intelligent mode - Standard Mode removed
+      intelligentMode: true,
     };
 
-    logger.info('Test plan generated', {
+    logger.info('Test plan generated (intelligent mode)', {
       planId,
       stepsCount: testPlan.steps.length,
       commandsCount: testPlan.commands.length,

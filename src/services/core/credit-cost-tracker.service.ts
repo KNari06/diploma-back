@@ -7,7 +7,8 @@ import { UserCreditsService } from './user-credits.service';
  * Tracks token usage and deducts credits accurately
  *
  * IMPORTANT:
- * - Only deduct credits for TESTS (intelligent, standard, api)
+ * - Only deduct credits for TESTS (intelligent, api)
+ * - Standard mode removed - all UI tests use intelligent mode
  * - NEVER deduct credits for chat messages
  */
 
@@ -153,10 +154,16 @@ export class CreditCostTrackerService {
     breakdown: TestCostBreakdown;
   } {
     // Validate testType
-    const validTestTypes = ['intelligent', 'standard', 'api'];
+    // ✅ UPDATED: Standard mode removed - map to intelligent for backward compatibility
+    if (testType === 'standard') {
+      logger.debug('[CREDIT_COST_TRACKER] Standard mode deprecated, mapping to intelligent', { testType });
+      testType = 'intelligent';
+    }
+
+    const validTestTypes = ['intelligent', 'api'];
     if (!validTestTypes.includes(testType)) {
-      logger.warn('[CREDIT_COST_TRACKER] Invalid test type, using standard', { testType });
-      testType = 'standard';
+      logger.warn('[CREDIT_COST_TRACKER] Invalid test type, using intelligent', { testType });
+      testType = 'intelligent';
     }
 
     // Use fixed costs for predictability
@@ -444,10 +451,16 @@ export class CreditCostTrackerService {
     description: string;
   } {
     // Validate testType
-    const validTestTypes = ['intelligent', 'standard', 'api'];
+    // ✅ UPDATED: Standard mode removed - map to intelligent for backward compatibility
+    if (testType === 'standard') {
+      logger.debug('[CREDIT_COST_TRACKER] Standard mode deprecated, mapping to intelligent', { testType });
+      testType = 'intelligent';
+    }
+
+    const validTestTypes = ['intelligent', 'api'];
     if (!validTestTypes.includes(testType)) {
-      logger.warn('[CREDIT_COST_TRACKER] Invalid test type in estimateTestCost', { testType });
-      testType = 'standard';
+      logger.warn('[CREDIT_COST_TRACKER] Invalid test type in estimateTestCost, using intelligent', { testType });
+      testType = 'intelligent';
     }
 
     if (testType === 'intelligent' && Number.isFinite(estimatedPages) && estimatedPages !== undefined) {
@@ -462,7 +475,7 @@ export class CreditCostTrackerService {
     const credits = TokenCalculatorService.getTestCreditCost(testType);
     return {
       credits,
-      description: testType === 'standard' ? 'No AI usage' : 'Lightweight AI',
+      description: 'Lightweight AI', // All UI tests use intelligent mode
     };
   }
 }
