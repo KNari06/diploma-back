@@ -556,16 +556,16 @@ export function formatTestPlanForConfirmation(
   markdown += `## 📋 Summary\n${plan.summary}\n`;
 
   // AI-specific estimates (if available)
-  if (isAiGenerated && (plan.estimatedPages || plan.estimatedCost)) {
-    markdown += `## 📊 AI Estimates\n`;
-    if (plan.estimatedPages) {
-      markdown += `- **Pages to Test:** ${plan.estimatedPages}\n`;
-    }
-    // if (plan.estimatedCost) {
-    //   markdown += `- **Estimated Cost:** ${plan.estimatedCost}\n`;
-    // }
-    markdown += '';
-  }
+  // if (isAiGenerated && (plan.estimatedPages || plan.estimatedCost)) {
+  //   markdown += `## 📊 AI Estimates\n`;
+  //   if (plan.estimatedPages) {
+  //     markdown += `- **Pages to Test:** ${plan.estimatedPages}\n`;
+  //   }
+  //   // if (plan.estimatedCost) {
+  //   //   markdown += `- **Estimated Cost:** ${plan.estimatedCost}\n`;
+  //   // }
+  //   markdown += '';
+  // }
 
   // AI explanation (for AI-generated plans)
   if (isAiGenerated) {
@@ -601,9 +601,9 @@ export function formatTestPlanForConfirmation(
       if (step.optional) {
         markdown += `   - ⚠️ Optional: This step may not be available\n`;
       }
-      if (step.confidence !== undefined && step.confidence < 1.0) {
-        markdown += `   - Confidence: ${(step.confidence * 100).toFixed(0)}%\n`;
-      }
+      // if (step.confidence !== undefined && step.confidence < 1.0) {
+      //   markdown += `   - Confidence: ${(step.confidence * 100).toFixed(0)}%\n`;
+      // }
       markdown += `   - Action: \`${step.action}\`\n`;
       if (step.selector) {
         markdown += `   - Selector: \`${step.selector}\`\n`;
