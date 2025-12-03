@@ -5,8 +5,15 @@ import winston from 'winston';
 
 // Ensure logs directory exists
 const logsDir = path.join(process.cwd(), 'logs');
-if (!fs.existsSync(logsDir)) {
-  fs.mkdirSync(logsDir, { recursive: true });
+try {
+  if (!fs.existsSync(logsDir)) {
+    fs.mkdirSync(logsDir, { recursive: true });
+  }
+} catch (error) {
+  // If we can't create logs directory, log to console and continue
+  // This prevents app crash if there are permission issues
+  console.error('Failed to create logs directory:', error);
+  console.warn('Logging to files will be disabled. Logs will only go to console.');
 }
 
 // Define log levels
@@ -59,45 +66,72 @@ const transports: winston.transport[] = [
   }),
 ];
 
-// Add file transports in production
-if (env.NODE_ENV === 'production') {
-  const fileTransports: winston.transport[] = [
-    // Errors only (critical)
-    new winston.transports.File({
-      filename: path.join(logsDir, 'error.log'),
-      level: 'error',
-      maxsize: 10 * 1024 * 1024, // 10MB
-      maxFiles: 5, // Keep last 5 files
-      format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.errors({ stack: true }),
-        winston.format.json()
-      ),
-    }),
-    // Warnings and errors
-    new winston.transports.File({
-      filename: path.join(logsDir, 'warn.log'),
-      level: 'warn',
-      maxsize: 10 * 1024 * 1024, // 10MB
-      maxFiles: 5,
-      format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.json()
-      ),
-    }),
-    // All logs (combined)
-    new winston.transports.File({
-      filename: path.join(logsDir, 'combined.log'),
-      maxsize: 20 * 1024 * 1024, // 20MB
-      maxFiles: 10, // Keep last 10 files
-      format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.json()
-      ),
-    }),
-  ];
+// Always create error.log file (critical for production monitoring)
+// Other log files only in production to save disk space in development
+// Wrap in try-catch to handle permission errors gracefully
+try {
+  const errorLogTransport = new winston.transports.File({
+    filename: path.join(logsDir, 'error.log'),
+    level: 'error',
+    maxsize: 10 * 1024 * 1024, // 10MB
+    maxFiles: 5, // Keep last 5 files
+    format: winston.format.combine(
+      winston.format.timestamp(),
+      winston.format.errors({ stack: true }),
+      winston.format.json()
+    ),
+  });
 
-  transports.push(...fileTransports);
+  // Handle file transport errors (permissions, disk full, etc.)
+  errorLogTransport.on('error', (error) => {
+    console.error('Error writing to error.log:', error);
+  });
+
+  transports.push(errorLogTransport);
+} catch (error) {
+  console.error('Failed to create error.log transport:', error);
+  console.warn('Error logging to file will be disabled. Errors will only go to console.');
+}
+
+// Add additional file transports in production
+if (env.NODE_ENV === 'production') {
+  try {
+    const fileTransports: winston.transport[] = [
+      // Warnings and errors
+      new winston.transports.File({
+        filename: path.join(logsDir, 'warn.log'),
+        level: 'warn',
+        maxsize: 10 * 1024 * 1024, // 10MB
+        maxFiles: 5,
+        format: winston.format.combine(
+          winston.format.timestamp(),
+          winston.format.json()
+        ),
+      }),
+      // All logs (combined)
+      new winston.transports.File({
+        filename: path.join(logsDir, 'combined.log'),
+        maxsize: 20 * 1024 * 1024, // 20MB
+        maxFiles: 10, // Keep last 10 files
+        format: winston.format.combine(
+          winston.format.timestamp(),
+          winston.format.json()
+        ),
+      }),
+    ];
+
+    // Add error handlers for each transport
+    fileTransports.forEach(transport => {
+      transport.on('error', (error) => {
+        console.error(`Error writing to ${(transport as any).filename}:`, error);
+      });
+    });
+
+    transports.push(...fileTransports);
+  } catch (error) {
+    console.error('Failed to create production log transports:', error);
+    console.warn('Production file logging will be disabled. Logs will only go to console.');
+  }
 }
 
 // Create the logger
@@ -109,6 +143,12 @@ export const logger = winston.createLogger({
   exitOnError: false,
 });
 
+// Handle logger errors (e.g., when file transport fails)
+logger.on('error', (error) => {
+  // Fallback to console if logger itself fails
+  console.error('Logger error:', error);
+});
+
 // Create a stream object with a 'write' function that will be used by Morgan
 export const morganStream = {
   write: (message: string) => {
@@ -118,7 +158,8 @@ export const morganStream = {
 
 // Log unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', {
+  logger.error({
+    message: 'Unhandled Rejection at',
     promise: String(promise),
     reason: reason instanceof Error ? {
       message: reason.message,
@@ -129,7 +170,8 @@ process.on('unhandledRejection', (reason, promise) => {
 
   // Don't exit - log and continue
   // Only exit in production for critical errors
-  if (process.env.NODE_ENV === 'production' && reason instanceof Error) {
+  // Use env.NODE_ENV for consistency
+  if (env.NODE_ENV === 'production' && reason instanceof Error) {
     // Check if it's a critical error that should crash the app
     const criticalErrors = ['ECONNREFUSED', 'ENOTFOUND', 'EADDRINUSE'];
     const isCritical = criticalErrors.some(code =>
@@ -145,15 +187,19 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // Log uncaught exceptions
 process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception:', {
-    message: error.message,
-    stack: error.stack,
-    name: error.name,
+  logger.error({
+    message: 'Uncaught Exception',
+    error: {
+      message: error.message,
+      stack: error.stack,
+      name: error.name,
+    },
   });
 
   // Only exit for critical errors in production
   // In development, log and continue to help debugging
-  if (process.env.NODE_ENV === 'production') {
+  // Use env.NODE_ENV for consistency
+  if (env.NODE_ENV === 'production') {
     const criticalErrors = ['ECONNREFUSED', 'ENOTFOUND', 'EADDRINUSE', 'EACCES'];
     const isCritical = criticalErrors.some(code =>
       error.message.includes(code) || (error as any).code === code

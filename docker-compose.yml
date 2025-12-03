@@ -9,6 +9,11 @@ services:
       - "3000:3000"
     env_file:
       - .env
+    volumes:
+      # Mount logs directory to persist error.log
+      # Docker will create the directory if it doesn't exist
+      # If you have permission issues, ensure ./logs exists and is writable on host
+      - ./logs:/app/logs
     restart: always
 
   worker:
@@ -20,4 +25,9 @@ services:
     command: ["node", "-r", "tsconfig-paths/register", "dist/worker/index.js"]
     env_file:
       - .env
+    volumes:
+      # Mount logs directory to persist error.log
+      # Docker will create the directory if it doesn't exist
+      # If you have permission issues, ensure ./logs exists and is writable on host
+      - ./logs:/app/logs
     restart: always
