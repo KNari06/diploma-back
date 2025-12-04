@@ -1042,6 +1042,26 @@ export class IntelligentTestOrchestrator {
       url: this.page.url(),
     });
 
+    // ✅ FIX: Emit test:progress when analyzing page
+    if (this.progressEmitter) {
+      this.progressEmitter.emit({
+        progress: 40,
+        phase: 'analysis',
+        currentStep: `🔍 Analyzing page: ${this.page.url()}`,
+      });
+    }
+    if (this.testId) {
+      webSocketService.emitTestProgress(this.testId, {
+        testId: this.testId,
+        browser: this.config.browser || 'chrome',
+        progress: 40,
+        phase: 'analysis',
+        currentStep: `🔍 Analyzing page: ${this.page.url()}`,
+        status: 'running',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     const previousContext = this.state.visitedPages.length > 0
       ? `Previous page: ${this.state.visitedPages[this.state.visitedPages.length - 1].pageType}`
       : undefined;
@@ -1067,6 +1087,26 @@ export class IntelligentTestOrchestrator {
       elementsFound: context.vision.elements.length,
     });
 
+    // ✅ FIX: Emit test:progress after page analysis
+    if (this.progressEmitter) {
+      this.progressEmitter.emit({
+        progress: 50,
+        phase: 'analysis',
+        currentStep: `✅ Page analyzed: ${context.pageType} (${context.vision.elements.length} elements found)`,
+      });
+    }
+    if (this.testId) {
+      webSocketService.emitTestProgress(this.testId, {
+        testId: this.testId,
+        browser: this.config.browser || 'chrome',
+        progress: 50,
+        phase: 'analysis',
+        currentStep: `✅ Page analyzed: ${context.pageType} (${context.vision.elements.length} elements found)`,
+        status: 'running',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     return context;
   }
 
@@ -1085,6 +1125,26 @@ export class IntelligentTestOrchestrator {
     });
 
     this.emitEvent('actions_generating', {});
+
+    // ✅ FIX: Emit test:progress when generating actions
+    if (this.progressEmitter) {
+      this.progressEmitter.emit({
+        progress: 55,
+        phase: 'generation',
+        currentStep: '🤖 Generating actions with AI...',
+      });
+    }
+    if (this.testId) {
+      webSocketService.emitTestProgress(this.testId, {
+        testId: this.testId,
+        browser: this.config.browser || 'chrome',
+        progress: 55,
+        phase: 'generation',
+        currentStep: '🤖 Generating actions with AI...',
+        status: 'running',
+        timestamp: new Date().toISOString(),
+      });
+    }
 
     // ✅ NEW: Convert TestHint[] to simpler format for ContextualActionGenerator
     const hints = this.config.hints?.map(h => ({
@@ -1133,6 +1193,26 @@ export class IntelligentTestOrchestrator {
       }
 
       safeActions.push(action);
+    }
+
+    // ✅ FIX: Emit test:progress after actions generated
+    if (this.progressEmitter) {
+      this.progressEmitter.emit({
+        progress: 60,
+        phase: 'generation',
+        currentStep: `✅ Generated ${safeActions.length} action(s)`,
+      });
+    }
+    if (this.testId) {
+      webSocketService.emitTestProgress(this.testId, {
+        testId: this.testId,
+        browser: this.config.browser || 'chrome',
+        progress: 60,
+        phase: 'generation',
+        currentStep: `✅ Generated ${safeActions.length} action(s)`,
+        status: 'running',
+        timestamp: new Date().toISOString(),
+      });
     }
 
     return {
@@ -1675,6 +1755,47 @@ export class IntelligentTestOrchestrator {
 
         completedActions.push(actionResult);
         this.state = StateTracker.recordActionResult(this.state, actionResult);
+
+        // ✅ FIX: Emit test:progress update after each action completion
+        if (this.progressEmitter) {
+          const progress = 60 + Math.round(((i + 1) / actions.length) * 30);
+          this.progressEmitter.emit({
+            progress,
+            phase: 'execution',
+            currentStep: actionResult.success
+              ? `✅ ${this.getActionEmoji(action.action)} ${action.description}`
+              : `❌ ${this.getActionEmoji(action.action)} ${action.description} (failed)`,
+            action: {
+              type: action.action,
+              description: action.description,
+              target: action.selector,
+            },
+            completedSteps: i + 1,
+            status: actionResult.success ? 'running' : 'error',
+          });
+        }
+
+        // ✅ FIX: Also emit via WebSocket for test:update compatibility
+        if (this.testId) {
+          webSocketService.emitTestProgress(this.testId, {
+            testId: this.testId,
+            browser: this.config.browser || 'chrome',
+            progress: 60 + Math.round(((i + 1) / actions.length) * 30),
+            phase: 'execution',
+            currentStep: actionResult.success
+              ? `✅ ${action.description}`
+              : `❌ ${action.description} (failed)`,
+            action: {
+              type: action.action,
+              description: action.description,
+              target: action.selector,
+            },
+            totalSteps: actions.length,
+            completedSteps: i + 1,
+            status: actionResult.success ? 'running' : 'error',
+            timestamp: new Date().toISOString(),
+          });
+        }
 
         // ✅ NEW: Add action to graph and emit real-time update
         if (this.testId && this.userId && this.graphBuilder) {
