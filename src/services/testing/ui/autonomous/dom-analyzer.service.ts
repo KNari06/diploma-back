@@ -78,7 +78,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
        */
       function isVisible(element: any): boolean {
         try {
-        // @ts-expect-error - browser context
+        // @ts-expect-error - browser context (window is available in page.evaluate)
         const style = window.getComputedStyle(element);
         return (
             style &&
@@ -116,18 +116,14 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
       }
 
       /**
-       * ✅ CRITICAL FIX: Generate Playwright API selector (not CSS contextual locators)
-       * Priority: getByRole > getByLabel > getByText > data-testid > CSS
-       * Format: role=button[name="Login"], text="Login", label="Email", #id, .class
-        * Uses closure to access selectorCounts (no need to pass as parameter)
+       * ✅ Generate Playwright API selector (no CSS except data-testid)
+       * Priority: data-testid > getByRole > getByLabel > getByText > ID (via role=)
+       * Format: role=button[name="Login"], text="Login", label="Email", [data-testid="..."]
+       * ✅ REMOVED: CSS class selectors, nth-of-type, tag-only (unstable)
+       * Uses closure to access selectorCounts (no need to pass as parameter)
        */
       function generateSelector(element: any): string {
-        // Try ID first (most reliable, use CSS)
-        if (element.id && element.id.length > 0) {
-          return `#${element.id}`;
-        }
-
-        // Try data-testid or data-cy (test-friendly, use CSS)
+        // Try data-testid or data-cy first (test-friendly, keep CSS for this)
         if (element.hasAttribute('data-testid')) {
           return `[data-testid="${escapeSelector(element.getAttribute('data-testid'))}"]`;
         }
@@ -148,6 +144,13 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           return makeUnique(`role=${implicitRole}`, element);
         }
 
+        // Try ID - convert to role= if element has implicit role (better than CSS)
+        // Note: implicitRole already checked above, so if we're here, element has no implicit role
+        if (element.id && element.id.length > 0) {
+          // If no implicit role, fallback to ID (CSS, but stable)
+          return `#${element.id}`;
+        }
+
         // ✅ NEW: Try getByLabel for inputs (accessibility-first)
         if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
           // Try aria-label first
@@ -166,12 +169,12 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
             }
           }
 
-          // Try name attribute (fallback to CSS)
+          // Try name attribute - use as label (Playwright, not CSS)
           if (element.hasAttribute('name')) {
             const name = element.getAttribute('name');
             if (name && name.length > 0) {
-              const selector = `${element.tagName.toLowerCase()}[name="${escapeSelector(name)}"]`;
-              return makeUnique(selector, element);
+              // Use label= instead of input[name="..."] for better stability
+              return `label="${escapeSelector(name)}"`;
             }
           }
         }
@@ -184,27 +187,16 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
           }
         }
 
-        // Try meaningful classes (filter out dynamic ones)
-        if (element.className && typeof element.className === 'string') {
-          const classes = element.className
-            .split(' ')
-            .filter((c: string) => c && !isDynamicClass(c));
+        // ✅ REMOVED: Class-based CSS selectors (unstable)
+        // ✅ REMOVED: nth-of-type CSS selectors (unstable)
+        // ✅ REMOVED: Tag-only selectors (too generic)
 
-          if (classes.length > 0 && classes.length < 3) {
-            const selector = `.${classes.join('.')}`;
-            return makeUnique(selector, element);
-          }
-        }
+        // Final fallback: implicitRole already checked above, so if we're here, element has no role
+        // Return empty - element cannot be reliably selected
 
-        // Fallback to nth-of-type with parent context
-        const parent = element.parentElement;
-        if (parent) {
-          const siblings = Array.from(parent.children).filter((e: any) => e.tagName === element.tagName);
-          const index = siblings.indexOf(element);
-          return `${element.tagName.toLowerCase()}:nth-of-type(${index + 1})`;
-        }
-
-        return element.tagName.toLowerCase();
+        // Last resort: return empty (element cannot be reliably selected)
+        // This will be handled by the caller
+        return '';
       }
 
       /**
@@ -600,11 +592,11 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
       // ✅ FIX: visited and selectorCounts are now in closure (created above)
       // ✅ NEW: Traverse Shadow DOM and collect elements
       // Start from document root (depth 0)
-      // @ts-expect-error - browser context
+      // @ts-expect-error - browser context (document is available in page.evaluate)
       const shadowDOMResult = traverseShadowDOM(document, undefined, 0, 5);
 
       // ✅ FIX: Analyze forms (only visible ones) - including Shadow DOM
-      // @ts-expect-error - browser context
+      // @ts-expect-error - browser context (document is available in page.evaluate)
       const forms = Array.from(document.querySelectorAll('form'))
         .filter((form: any) => isVisible(form))
         .map((form: any) => {
@@ -631,7 +623,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
         });
 
       // ✅ FIX: Analyze buttons (including role="button", only visible)
-      // @ts-expect-error - browser context
+      // @ts-expect-error - browser context (document is available in page.evaluate)
       const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]'))
         .filter((btn: any) => isVisible(btn))
         .map((btn: any) => {
@@ -645,7 +637,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
         .filter((btn: any) => btn.text.length > 0); // Only buttons with text/label
 
       // ✅ FIX: Analyze links (only visible, exclude anchors and javascript:)
-      // @ts-expect-error - browser context
+      // @ts-expect-error - browser context (document is available in page.evaluate)
       const links = Array.from(document.querySelectorAll('a[href]'))
         .filter((link: any) => {
           const anchor = link;
@@ -666,7 +658,7 @@ export async function analyzeDOMStructure(page: Page): Promise<DOMAnalysisResult
         });
 
       // ✅ FIX: Analyze all inputs (including those outside forms, only visible)
-      // @ts-expect-error - browser context
+      // @ts-expect-error - browser context (document is available in page.evaluate)
       const inputs = Array.from(document.querySelectorAll('input, select, textarea'))
         .filter((input: any) => isVisible(input))
         .map((input: any) => {

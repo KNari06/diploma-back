@@ -355,7 +355,9 @@ export class AISelectorEngine {
 
   /**
    * Generate multiple selector strategies for a node
-   * Priority: getByRole > getByLabel > getByText > data-testid > CSS > XPath
+   * Priority: getByRole > getByLabel > getByText > data-testid > ID (via role=)
+   * ✅ REMOVED: CSS class selectors, XPath (unstable)
+   * Only Playwright selectors and data-testid are used now
    */
   private static generateSelectorsForNode(node: DOMNode): SelectorCandidate[] {
     const selectors: SelectorCandidate[] = [];
@@ -378,7 +380,7 @@ export class AISelectorEngine {
       if (textSelector) selectors.push(textSelector);
     }
 
-    // Strategy 4: data-testid
+    // Strategy 4: data-testid (keep - stable test attribute)
     if (node.attributes['data-testid']) {
       selectors.push({
         type: 'data-testid',
@@ -389,13 +391,18 @@ export class AISelectorEngine {
       });
     }
 
-    // Strategy 5: CSS selector
-    const cssSelector = this.generateCSSSelector(node);
-    if (cssSelector) selectors.push(cssSelector);
+    // Strategy 5: ID as role= (convert ID to Playwright if element has implicit role)
+    if (node.attributes.id && node.role) {
+      // Use role= instead of #id for better stability
+      const roleSelector = this.generateRoleSelector(node);
+      if (roleSelector && !selectors.find(s => s.type === 'getByRole')) {
+        selectors.push(roleSelector);
+      }
+    }
 
-    // Strategy 6: XPath (fallback)
-    const xpathSelector = this.generateXPathSelector(node);
-    if (xpathSelector) selectors.push(xpathSelector);
+    // ✅ REMOVED: CSS selector generation (class-based, tag-based)
+    // ✅ REMOVED: XPath selector (unstable fallback)
+    // Only data-testid and ID (via role=) are kept as fallbacks
 
     return selectors;
   }
@@ -467,65 +474,9 @@ export class AISelectorEngine {
     };
   }
 
-  /**
-   * Generate CSS selector
-   */
-  private static generateCSSSelector(node: DOMNode): SelectorCandidate | null {
-    // Priority: ID > class > tag
-    if (node.attributes.id) {
-      return {
-        type: 'css',
-        selector: `#${node.attributes.id}`,
-        confidence: 0.85,
-        reasoning: 'ID-based CSS selector',
-        stability: 0.80,
-      };
-    }
-
-    if (node.attributes.class) {
-      const classes = node.attributes.class.split(' ').filter(c => c && !c.match(/^(css-|sc-|jsx-)/));
-      if (classes.length > 0 && classes.length < 3) {
-        return {
-          type: 'css',
-          selector: `.${classes.join('.')}`,
-          confidence: 0.65,
-          reasoning: 'Class-based CSS selector',
-          stability: 0.60, // Classes can change
-        };
-      }
-    }
-
-    // Fallback: tag + text
-    if (node.text && node.text.length < 50) {
-      return {
-        type: 'css',
-        selector: `${node.tag}:has-text("${node.text.replace(/"/g, '\\"')}")`,
-        confidence: 0.60,
-        reasoning: 'Tag + text CSS selector',
-        stability: 0.55,
-      };
-    }
-
-    return null;
-  }
-
-  /**
-   * Generate XPath selector (fallback)
-   */
-  private static generateXPathSelector(node: DOMNode): SelectorCandidate | null {
-    // Simple XPath by tag and text
-    if (node.text && node.text.length < 50) {
-      return {
-        type: 'xpath',
-        selector: `//${node.tag}[contains(text(), "${node.text.replace(/"/g, '\\"')}")]`,
-        confidence: 0.50,
-        reasoning: 'XPath fallback selector',
-        stability: 0.45,
-      };
-    }
-
-    return null;
-  }
+  // ✅ REMOVED: generateCSSSelector() - no longer generating class-based CSS selectors
+  // ✅ REMOVED: generateXPathSelector() - no longer using XPath fallback
+  // Only Playwright selectors (role=, label=, text=) and data-testid are used now
 
   /**
    * Build final response

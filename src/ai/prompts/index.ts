@@ -810,6 +810,17 @@ CRITICAL RULES:
    - ❌ NEVER use button:has-text() - use role=button[name=] instead
    - ❌ NEVER invent selectors - only use ones provided in the context
    - ❌ NEVER use single quotes in selectors - ALWAYS use double quotes
+   - ❌ NEVER mix CSS and Playwright syntax! Examples of INVALID selectors:
+     * ".class > role=textbox" ❌ (CSS + Playwright mixed)
+     * "div role=button" ❌ (CSS + Playwright mixed)
+     * ".relative > text=Login" ❌ (CSS + Playwright mixed)
+   - ✅ VALID selector formats:
+     * role=textbox - pure Playwright role
+     * text="Login" - pure Playwright text
+     * label="Email" - pure Playwright label
+     * .class-name - pure CSS selector
+     * #element-id - pure CSS selector
+     * [data-testid="value"] - pure CSS attribute
    - Example: If DOM shows Selector: "role=button[name=\"Login\"]" → use exactly that
    - Example: If DOM shows Selector: "label=\"Email\"" → use exactly that for fill
 

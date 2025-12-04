@@ -126,6 +126,47 @@ export function normalizeSelector(selector: string): string {
     return `text="${hasTextMatch[2]}"`;
   }
 
+  // ✅ FIX: Handle invalid mixed selectors like ".relative > role=textbox"
+  // AI sometimes generates CSS + Playwright syntax mixed - need to fix
+  // Pattern: .selector > role=something OR .selector > text=something
+  const mixedSelectorMatch = s.match(/^(.+?)\s*>\s*(role|text|label)\s*=\s*(.+)$/);
+  if (mixedSelectorMatch) {
+    const cssPrefix = mixedSelectorMatch[1].trim();
+    const playwrightType = mixedSelectorMatch[2];
+    const playwrightValue = mixedSelectorMatch[3].trim();
+
+    logger.warn('[SELECTOR_UTILS] Fixing invalid mixed selector (CSS + Playwright)', {
+      original: s,
+      cssPrefix,
+      playwrightType,
+      playwrightValue,
+    });
+
+    // Convert to Playwright chained selector: .relative >> role=textbox
+    return `${cssPrefix} >> ${playwrightType}=${playwrightValue}`;
+  }
+
+  // ✅ FIX: Handle another pattern: ".selector role=something" (missing >)
+  const mixedWithSpaceMatch = s.match(/^(.+?)\s+(role|text|label)\s*=\s*(.+)$/);
+  if (mixedWithSpaceMatch) {
+    const potentialCss = mixedWithSpaceMatch[1].trim();
+    const playwrightType = mixedWithSpaceMatch[2];
+    const playwrightValue = mixedWithSpaceMatch[3].trim();
+
+    // Only fix if first part looks like CSS selector
+    if (/^[.#\[]|^[a-z]/i.test(potentialCss)) {
+      logger.warn('[SELECTOR_UTILS] Fixing invalid mixed selector (space separated)', {
+        original: s,
+        cssPrefix: potentialCss,
+        playwrightType,
+        playwrightValue,
+      });
+
+      // Convert to Playwright chained selector
+      return `${potentialCss} >> ${playwrightType}=${playwrightValue}`;
+    }
+  }
+
   // Already in correct format or CSS/XPath selector
   return s;
 }
@@ -257,6 +298,46 @@ export function getLocator(page: Page, selector: string): Locator {
   // 4. Handle contextual locators (has-text, >>, :has, :scope)
   // These are Playwright-specific CSS extensions
   if (s.includes('>>') || s.includes(':has-text(') || s.includes(':has(') || s.includes(':scope')) {
+    // ✅ FIX: Handle chained selectors with role=/text=/label= after >>
+    // Example: ".relative >> role=textbox" → ".relative >> [role="textbox"]" or use proper chaining
+    if (s.includes('>>')) {
+      const parts = s.split('>>').map(p => p.trim());
+      const processedParts = parts.map(part => {
+        // Convert role=value to [role="value"] for CSS compatibility
+        const roleMatch = part.match(/^role\s*=\s*(.+?)(?:\[name\s*=\s*["']?(.+?)["']?\])?$/);
+        if (roleMatch) {
+          const role = roleMatch[1].trim();
+          const name = roleMatch[2];
+          if (name) {
+            // For role with name, use CSS attribute selector
+            return `[role="${role}"][aria-label="${name}"], [role="${role}"]:has-text("${name}")`;
+          }
+          return `[role="${role}"]`;
+        }
+
+        // Convert text="value" to :text("value") or :has-text("value")
+        const textMatch = part.match(/^text\s*=\s*["']?(.+?)["']?$/);
+        if (textMatch) {
+          return `:has-text("${textMatch[1]}")`;
+        }
+
+        // Convert label="value" to label CSS
+        const labelMatch = part.match(/^label\s*=\s*["']?(.+?)["']?$/);
+        if (labelMatch) {
+          return `[aria-label="${labelMatch[1]}"], label:has-text("${labelMatch[1]}")`;
+        }
+
+        return part;
+      });
+
+      const processedSelector = processedParts.join(' >> ');
+      logger.debug('[SELECTOR_UTILS] Processed chained selector', {
+        original: s,
+        processed: processedSelector,
+      });
+      return page.locator(processedSelector);
+    }
+
     return page.locator(s);
   }
 

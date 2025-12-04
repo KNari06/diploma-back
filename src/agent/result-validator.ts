@@ -11,6 +11,7 @@ import {
   DynamicAction,
   ValidationResult,
 } from './types/intelligent-testing.types';
+import { getLocator } from './utils/selector-utils';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RESULT VALIDATOR
@@ -138,7 +139,8 @@ export class ResultValidator {
       const expectedValue = String(action.value);
 
       // Check if element exists and is input/textarea
-      const element = page.locator(selector).first();
+      // ✅ FIX: Use getLocator() to handle mixed selectors (e.g., ".class > role=textbox")
+      const element = getLocator(page, selector).first();
       const elementCount = await element.count();
 
       if (elementCount === 0) {
@@ -174,7 +176,7 @@ export class ResultValidator {
 
       // If element is not an input (e.g., contenteditable), check textContent instead
       try {
-        const textContent = await page.locator(action.selector!).first().textContent({ timeout: 2000 });
+        const textContent = await getLocator(page, action.selector!).first().textContent({ timeout: 2000 });
         const expectedValue = String(action.value);
         const isMatch = textContent?.includes(expectedValue) || false;
 
@@ -209,7 +211,7 @@ export class ResultValidator {
   ): Promise<ValidationResult> {
     try {
       const selector = action.selector!;
-      const element = page.locator(selector).first();
+      const element = getLocator(page, selector).first();
       const elementCount = await element.count();
 
       if (elementCount === 0) {
@@ -255,7 +257,7 @@ export class ResultValidator {
     try {
       const selector = action.selector!;
       const expectedValue = String(action.value);
-      const element = page.locator(selector).first();
+      const element = getLocator(page, selector).first();
       const elementCount = await element.count();
 
       if (elementCount === 0) {
@@ -344,7 +346,7 @@ export class ResultValidator {
 
       for (const selector of selectors) {
         try {
-          const element = await page.locator(selector).first();
+          const element = await getLocator(page, selector).first();
           const isVisible = await element.isVisible({ timeout: 2000 });
 
           if (isVisible) {
@@ -394,7 +396,7 @@ export class ResultValidator {
 
       for (const selector of selectors) {
         try {
-          const element = await page.locator(selector).first();
+          const element = await getLocator(page, selector).first();
           const isVisible = await element.isVisible({ timeout: 2000 }).catch(() => false);
 
           if (!isVisible) {
@@ -448,7 +450,7 @@ export class ResultValidator {
 
       for (const selector of countSelectors) {
         try {
-          const element = await page.locator(selector).first();
+          const element = await getLocator(page, selector).first();
           const text = await element.textContent({ timeout: 2000 });
           const count = parseInt(text || '0', 10);
 
@@ -523,7 +525,7 @@ export class ResultValidator {
 
       for (const selector of messageSelectors) {
         try {
-          const element = await page.locator(selector).first();
+          const element = await getLocator(page, selector).first();
           const isVisible = await element.isVisible({ timeout: 2000 });
 
           if (isVisible) {
@@ -574,7 +576,7 @@ export class ResultValidator {
 
       for (const selector of errorSelectors) {
         try {
-          const element = await page.locator(selector).first();
+          const element = await getLocator(page, selector).first();
           const isVisible = await element.isVisible({ timeout: 2000 });
 
           if (isVisible) {
