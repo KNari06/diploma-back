@@ -1262,11 +1262,22 @@ export class IntelligentTestOrchestrator {
           completedSteps: i,
         });
 
-        // Log every action execution
-        logger.info('[INTELLIGENT_ORCHESTRATOR] Executing action', {
+        // ✅ NEW: Log detailed action information before execution
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Executing action (FINAL COMMAND)', {
           testId: this.testId,
-          action: action.action,
-          description: action.description,
+          actionIndex: i + 1,
+          totalActions: actions.length,
+          action: {
+            type: action.action,
+            selector: action.selector,
+            normalizedSelector: action.selector ? normalizeSelector(action.selector) : undefined,
+            value: action.value,
+            description: action.description,
+            expectedResult: action.expectedResult,
+            optional: action.optional,
+            timeout: action.timeout,
+            retry: action.retry,
+          },
           progress: `${i + 1}/${actions.length}`,
         });
 
@@ -1676,7 +1687,15 @@ export class IntelligentTestOrchestrator {
         // Execute action using CommandExecutor
         // ✅ FIX: Pass original selector - CommandExecutor will normalize it ONCE via prepareSelector()
         // DON'T normalize here to avoid double-processing!
-        const executionResult = await this.commandExecutor.executeCommand({
+        // Determine assertion type based on action type
+        let assertionType: 'visible' | 'hidden' | 'text' | 'value' | 'count' | 'url' | 'enabled' | 'disabled' = 'text';
+        if (action.action === 'assertVisible') assertionType = 'visible';
+        else if (action.action === 'assertText') assertionType = 'text';
+        else if (action.action === 'assertValue') assertionType = 'value';
+        else if (action.action === 'assertUrl') assertionType = 'url';
+        else if (action.action === 'assertCount') assertionType = 'count';
+
+        const finalCommand: import('@/types').PlaywrightCommand = {
           action: action.action as any,
           selector: action.selector,
           value: action.value,
@@ -1685,11 +1704,31 @@ export class IntelligentTestOrchestrator {
           description: action.description,
           extract: action.extract,
           assertion: action.assertion ? {
-            type: 'text', // Default type for intelligent testing assertions
+            type: assertionType,
             expected: action.assertion.expected,
             operator: action.assertion.operator,
           } : undefined,
+        };
+
+        // ✅ NEW: Log final command before execution
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Final Playwright command to execute', {
+          testId: this.testId,
+          command: {
+            action: finalCommand.action,
+            selector: {
+              original: finalCommand.selector,
+              normalized: finalCommand.selector ? normalizeSelector(finalCommand.selector) : undefined,
+            },
+            value: finalCommand.value,
+            url: finalCommand.url,
+            timeout: finalCommand.timeout,
+            description: finalCommand.description,
+            extract: finalCommand.extract,
+            assertion: finalCommand.assertion,
+          },
         });
+
+        const executionResult = await this.commandExecutor.executeCommand(finalCommand);
 
         // ✅ OPTIMIZED: Smart waiting - only wait if URL changed (page navigation)
         const urlAfter = this.page.url();
@@ -1821,6 +1860,20 @@ export class IntelligentTestOrchestrator {
           preliminaryResult,
           this.page
         );
+
+        // ✅ NEW: Log validation details
+        logger.info('[INTELLIGENT_ORCHESTRATOR] Validation result', {
+          testId: this.testId,
+          action: action.description,
+          validation: {
+            passed: validation.passed,
+            valid: validation.valid,
+            expected: validation.expected,
+            actual: validation.actual,
+            message: validation.message,
+          },
+          actionExpectedResult: action.expectedResult,
+        });
 
         const validationPassed = validation.passed;
         const validationMessage = validation.message || (!validation.passed ? 'Validation failed' : undefined);

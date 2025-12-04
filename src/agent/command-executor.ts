@@ -108,13 +108,25 @@ export class CommandExecutor {
     const selector = this.prepareSelector(command.selector);
     const awaitNavigation = command.awaitNavigation ?? false; // ✅ FIX 3: Navigation flag
 
-    logger.info(`Executing command: ${action}`, {
+    // ✅ NEW: Log detailed command information before execution
+    logger.info('[COMMAND_EXECUTOR] Executing command (FINAL)', {
       action,
-      selector,
+      selector: {
+        original: command.selector,
+        normalized: selector,
+      },
       value,
       url,
       description,
       awaitNavigation,
+      timeout,
+      continueOnError,
+      waitFor: command.waitFor,
+      assertion: command.assertion ? {
+        type: command.assertion.type,
+        expected: command.assertion.expected,
+        operator: command.assertion.operator,
+      } : undefined,
     });
 
     try {

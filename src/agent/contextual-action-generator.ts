@@ -293,6 +293,20 @@ export class ContextualActionGenerator {
         model: response.model,
       });
 
+      // ✅ NEW: Log detailed action information for debugging
+      logger.info('[ACTION_GENERATOR] Generated actions details', {
+        actions: actions.map(a => ({
+          action: a.action,
+          selector: a.selector,
+          value: a.value,
+          description: a.description,
+          expectedResult: a.expectedResult,
+          optional: a.optional,
+          timeout: a.timeout,
+        })),
+        reasoning: parsed.reasoning,
+      });
+
       const result = {
         actions,
         reasoning: parsed.reasoning || 'No reasoning provided',
