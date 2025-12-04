@@ -358,7 +358,7 @@ class WebSocketService {
     );
   }
 
-  public emitTestProgress(testId: string, payload: TestProgressPayload): void {
+  public emitTestProgress(testId: string, payload: TestProgressPayload & { userId?: string }): void {
     this.emitWithFallback(
       'test:progress',
       payload,
@@ -369,10 +369,16 @@ class WebSocketService {
           phase: payload.phase,
           currentStep: payload.currentStep,
           action: payload.action?.type,
+          userId: payload.userId,
         });
+        // ✅ FIX: Emit to test room
         this.emitToTest(testId, 'test:progress', payload);
+        // ✅ FIX: Also emit to user room if userId is provided (client may only be subscribed to user room)
+        if (payload.userId) {
+          this.emitToUser(payload.userId, 'test:progress', payload);
+        }
       },
-      { testId }
+      { testId, userId: payload.userId }
     );
   }
 

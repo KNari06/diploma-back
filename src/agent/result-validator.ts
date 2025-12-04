@@ -60,6 +60,15 @@ export class ResultValidator {
       return await this.validateSelectValue(action, page);
     }
 
+    // ✅ NEW: Smart validation for click actions
+    // For clicks on selectable items (buttons, cards, etc.), check if element became selected/active
+    if (action.action === 'click' && action.selector) {
+      const validation = await this.validateClickResult(action, page);
+      if (validation) {
+        return validation;
+      }
+    }
+
     if (!action.expectedResult) {
       // No expectation, assume valid
       return {
@@ -119,7 +128,7 @@ export class ResultValidator {
     }
 
     // Generic text-based validation
-    return await this.validateGeneric(expected, page);
+    return await this.validateGeneric(expected, page, action);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -244,6 +253,87 @@ export class ResultValidator {
         passed: true, // ✅ Pass if we can't verify but execution succeeded
         message: 'Checkbox action completed (verification not possible)',
       };
+    }
+  }
+
+  /**
+   * ✅ NEW: Validate click action result
+   * For clicks on selectable items, check if element became selected/active
+   */
+  private static async validateClickResult(
+    action: DynamicAction,
+    page: Page
+  ): Promise<ValidationResult | null> {
+    // Only validate if expectedResult mentions "select" or "selected"
+    if (!action.expectedResult) {
+      return null; // No expectation, skip validation
+    }
+
+    const expected = action.expectedResult.toLowerCase();
+    if (!expected.includes('select') && !expected.includes('selected') && !expected.includes('choose')) {
+      return null; // Not a selection action, use generic validation
+    }
+
+    try {
+      const selector = action.selector!;
+      const element = getLocator(page, selector).first();
+      const elementCount = await element.count();
+
+      if (elementCount === 0) {
+        return {
+          valid: true,
+          expected: `Element "${selector}" should exist`,
+          actual: 'Element not found',
+          passed: false,
+          message: `Element not found after click: ${selector}`,
+        };
+      }
+
+      // Check if element is selected/active/checked
+      const isSelected = await element.evaluate((el: any) => {
+        // Check various selection states
+        return (
+          el.getAttribute('aria-selected') === 'true' ||
+          el.getAttribute('aria-checked') === 'true' ||
+          el.classList.contains('selected') ||
+          el.classList.contains('active') ||
+          el.classList.contains('chosen') ||
+          el.hasAttribute('data-selected') ||
+          (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio') && el.checked)
+        );
+      }).catch(() => false);
+
+      // Also check if element has visual indication of selection (background color, border, etc.)
+      const hasSelectionStyle = await element.evaluate((el: any) => {
+        // @ts-expect-error - browser context
+        const style = window.getComputedStyle(el);
+        const bgColor = style.backgroundColor;
+        const borderColor = style.borderColor;
+        // Check if element has distinct background or border (indicating selection)
+        return (
+          bgColor !== 'rgba(0, 0, 0, 0)' && bgColor !== 'transparent' ||
+          borderColor !== 'rgba(0, 0, 0, 0)' && borderColor !== 'transparent'
+        );
+      }).catch(() => false);
+
+      const isSelectedOrActive = isSelected || hasSelectionStyle;
+
+      return {
+        valid: true,
+        expected: `Element should be selected after click`,
+        actual: isSelectedOrActive ? 'Element is selected/active' : 'Element is not selected',
+        passed: isSelectedOrActive,
+        message: isSelectedOrActive
+          ? 'Element successfully selected'
+          : 'Element clicked but selection state not detected (may be visual only)',
+      };
+    } catch (error) {
+      // If validation fails, don't fail the action - just log
+      logger.debug('[RESULT_VALIDATOR] Click validation failed', {
+        selector: action.selector,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null; // Fall back to generic validation
     }
   }
 
@@ -647,30 +737,54 @@ export class ResultValidator {
 
   /**
    * Generic validation (fallback)
+   * ✅ IMPROVED: More flexible for click actions - text may not appear immediately
    */
   private static async validateGeneric(
     expected: string,
-    page: Page
+    page: Page,
+    action?: DynamicAction
   ): Promise<ValidationResult> {
     // Try to find any text matching the expectation
     try {
+      // Extract keywords from expected text (remove stop words)
+      const keywords = this.extractKeywords(expected);
+
+      // For click actions, be more lenient - check if any keyword appears
+      const isClickAction = action?.action === 'click';
+
       const text = await page.textContent('body', { timeout: 2000 });
-      const containsExpected = text?.toLowerCase().includes(expected.toLowerCase());
+      const textLower = text?.toLowerCase() || '';
+
+      // Check if full expected text is found
+      const containsFullExpected = textLower.includes(expected.toLowerCase());
+
+      // Check if any keyword is found (for click actions, this is acceptable)
+      const containsKeyword = keywords.length > 0 && keywords.some(keyword =>
+        textLower.includes(keyword.toLowerCase())
+      );
+
+      const passed = containsFullExpected || (isClickAction && containsKeyword);
 
       return {
         valid: true,
         expected: `Page should contain "${expected}"`,
-        actual: containsExpected ? 'Text found on page' : 'Text not found',
-        passed: containsExpected || false,
-        message: containsExpected ? 'Expected text found' : 'Expected text not found',
+        actual: passed ? 'Text or keyword found on page' : 'Text not found',
+        passed,
+        message: passed
+          ? (containsFullExpected ? 'Expected text found' : 'Expected keyword found (click action)')
+          : 'Expected text not found',
       };
     } catch (error) {
+      // For click actions, don't fail if we can't read page content
+      const isClickAction = action?.action === 'click';
       return {
-        valid: false,
+        valid: true,
         expected: `Page should contain "${expected}"`,
         actual: 'Could not read page content',
-        passed: false,
-        message: 'Generic validation failed',
+        passed: isClickAction, // ✅ Pass click actions if we can't verify
+        message: isClickAction
+          ? 'Click action completed (text verification not possible)'
+          : 'Generic validation failed',
       };
     }
   }

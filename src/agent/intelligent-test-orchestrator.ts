@@ -1059,6 +1059,7 @@ export class IntelligentTestOrchestrator {
         currentStep: `🔍 Analyzing page: ${this.page.url()}`,
         status: 'running',
         timestamp: new Date().toISOString(),
+        userId: this.userId, // ✅ FIX: Include userId for user room broadcast
       });
     }
 
@@ -1104,6 +1105,7 @@ export class IntelligentTestOrchestrator {
         currentStep: `✅ Page analyzed: ${context.pageType} (${context.vision.elements.length} elements found)`,
         status: 'running',
         timestamp: new Date().toISOString(),
+        userId: this.userId, // ✅ FIX: Include userId for user room broadcast
       });
     }
 
@@ -1143,6 +1145,7 @@ export class IntelligentTestOrchestrator {
         currentStep: '🤖 Generating actions with AI...',
         status: 'running',
         timestamp: new Date().toISOString(),
+        userId: this.userId, // ✅ FIX: Include userId for user room broadcast
       });
     }
 
@@ -1212,6 +1215,7 @@ export class IntelligentTestOrchestrator {
         currentStep: `✅ Generated ${safeActions.length} action(s)`,
         status: 'running',
         timestamp: new Date().toISOString(),
+        userId: this.userId, // ✅ FIX: Include userId for user room broadcast
       });
     }
 
@@ -1794,6 +1798,7 @@ export class IntelligentTestOrchestrator {
             completedSteps: i + 1,
             status: actionResult.success ? 'running' : 'error',
             timestamp: new Date().toISOString(),
+            userId: this.userId, // ✅ FIX: Include userId for user room broadcast
           });
         }
 

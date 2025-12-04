@@ -128,7 +128,7 @@ export class TestProgressEmitter {
           phase: params.phase,
           status: params.status,
           elapsed: `${Math.round(elapsedTime / 1000)}s`,
-          estimated: `${Math.round(estimatedRemaining / 1000)}s`,
+          // estimated: `${Math.round(estimatedRemaining / 1000)}s`,
         });
         this.lastLoggedPhase = params.phase;
       }
