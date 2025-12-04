@@ -61,19 +61,97 @@ function validateAriaRole(role: string): boolean {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SELECTOR VALIDATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if selector is valid Playwright format
+ * Returns validation result with details
+ */
+export function validateSelectorFormat(selector: string): {
+  isValid: boolean;
+  format: 'playwright' | 'css' | 'xpath' | 'mixed' | 'unknown';
+  issue?: string;
+} {
+  if (!selector) {
+    return { isValid: false, format: 'unknown', issue: 'Empty selector' };
+  }
+
+  const s = selector.trim();
+
+  // Check for mixed CSS + Playwright (INVALID)
+  if (s.match(/^[.#\[].*\s*>\s*(role|text|label)\s*=/)) {
+    return {
+      isValid: false,
+      format: 'mixed',
+      issue: 'Mixed CSS + Playwright format (e.g., ".class > role=button"). Use pure Playwright or pure CSS.',
+    };
+  }
+
+  // Check for space-separated mixed (INVALID)
+  if (s.match(/^[.#\[].*\s+(role|text|label)\s*=/)) {
+    return {
+      isValid: false,
+      format: 'mixed',
+      issue: 'Mixed CSS + Playwright format. Use pure Playwright or pure CSS.',
+    };
+  }
+
+  // Valid Playwright formats
+  if (s.match(/^(role|text|label)\s*=/i)) {
+    return { isValid: true, format: 'playwright' };
+  }
+
+  // Valid XPath
+  if (s.match(/^(xpath\s*=)?\/{1,2}/i)) {
+    return { isValid: true, format: 'xpath' };
+  }
+
+  // Valid CSS (starts with #, ., [, or tag name)
+  if (s.match(/^[#.\[]/) || s.match(/^[a-z][a-z0-9]*(\[|$)/i)) {
+    return { isValid: true, format: 'css' };
+  }
+
+  // Chained selector (>>) - valid for Shadow DOM
+  if (s.includes('>>')) {
+    return { isValid: true, format: 'playwright' };
+  }
+
+  return { isValid: true, format: 'unknown' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SELECTOR NORMALIZATION
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * ✅ FIX 2: Centralized normalizeSelector to avoid code duplication
  * Normalize selector to Playwright locator format
  * Handles: getByText(), getByRole(), getByLabel(), text=, role=, label=, contextual, CSS, XPath
- * Converts all formats to consistent format that getLocator() can parse
+ *
+ * ⚠️ IMPORTANT: This function now EXTRACTS Playwright part from mixed selectors
+ * instead of creating chained selectors (which caused issues)
  */
 export function normalizeSelector(selector: string): string {
   if (!selector) return selector;
 
   const s = selector.trim();
+
+  // ✅ EARLY RETURN: If selector is already normalized (contains >>), return as-is
+  // This prevents double-processing and corruption like ".relative > >> role=textbox"
+  if (s.includes('>>')) {
+    // ✅ FIX: Clean up corrupted selectors like ".relative > >> role=textbox"
+    // This can happen if selector was double-processed by old code
+    if (s.includes(' > >>')) {
+      const cleaned = s.replace(/ > >>/g, ' >>');
+      logger.warn('[SELECTOR_UTILS] Cleaning corrupted selector (> >>)', {
+        original: s,
+        cleaned,
+      });
+      return cleaned;
+    }
+    // Already normalized - return without further processing
+    return s;
+  }
 
   // 1. Convert getByText('text') → text="text"
   const getByTextMatch = s.match(/^getByText\(['"](.+?)['"]\)$/);
@@ -127,43 +205,48 @@ export function normalizeSelector(selector: string): string {
   }
 
   // ✅ FIX: Handle invalid mixed selectors like ".relative > role=textbox"
-  // AI sometimes generates CSS + Playwright syntax mixed - need to fix
+  // AI sometimes generates CSS + Playwright syntax mixed
+  // SOLUTION: Extract ONLY the Playwright part (more reliable than chaining)
   // Pattern: .selector > role=something OR .selector > text=something
-  const mixedSelectorMatch = s.match(/^(.+?)\s*>\s*(role|text|label)\s*=\s*(.+)$/);
-  if (mixedSelectorMatch) {
-    const cssPrefix = mixedSelectorMatch[1].trim();
-    const playwrightType = mixedSelectorMatch[2];
-    const playwrightValue = mixedSelectorMatch[3].trim();
+  if (!s.includes('>>')) {
+    const mixedSelectorMatch = s.match(/^.+?\s*>\s*(role|text|label)\s*=\s*(.+)$/);
+    if (mixedSelectorMatch) {
+      const playwrightType = mixedSelectorMatch[1];
+      const playwrightValue = mixedSelectorMatch[2].trim();
+      const extracted = `${playwrightType}=${playwrightValue}`;
 
-    logger.warn('[SELECTOR_UTILS] Fixing invalid mixed selector (CSS + Playwright)', {
-      original: s,
-      cssPrefix,
-      playwrightType,
-      playwrightValue,
-    });
-
-    // Convert to Playwright chained selector: .relative >> role=textbox
-    return `${cssPrefix} >> ${playwrightType}=${playwrightValue}`;
-  }
-
-  // ✅ FIX: Handle another pattern: ".selector role=something" (missing >)
-  const mixedWithSpaceMatch = s.match(/^(.+?)\s+(role|text|label)\s*=\s*(.+)$/);
-  if (mixedWithSpaceMatch) {
-    const potentialCss = mixedWithSpaceMatch[1].trim();
-    const playwrightType = mixedWithSpaceMatch[2];
-    const playwrightValue = mixedWithSpaceMatch[3].trim();
-
-    // Only fix if first part looks like CSS selector
-    if (/^[.#\[]|^[a-z]/i.test(potentialCss)) {
-      logger.warn('[SELECTOR_UTILS] Fixing invalid mixed selector (space separated)', {
+      logger.warn('[SELECTOR_UTILS] Extracted Playwright selector from mixed format', {
         original: s,
-        cssPrefix: potentialCss,
-        playwrightType,
-        playwrightValue,
+        extracted,
+        reason: 'Mixed CSS + Playwright selectors are not supported',
       });
 
-      // Convert to Playwright chained selector
-      return `${potentialCss} >> ${playwrightType}=${playwrightValue}`;
+      // Return ONLY the Playwright part (ignore CSS prefix)
+      return extracted;
+    }
+  }
+
+  // ✅ FIX: Handle pattern: ".selector role=something" (space separated, no >)
+  if (!s.includes('>>')) {
+    const mixedWithSpaceMatch = s.match(/^.+?\s+(role|text|label)\s*=\s*(.+)$/);
+    if (mixedWithSpaceMatch) {
+      const potentialCss = s.split(/\s+(role|text|label)\s*=/)[0].trim();
+      const playwrightType = mixedWithSpaceMatch[1];
+      const playwrightValue = mixedWithSpaceMatch[2].trim();
+
+      // Only fix if first part looks like CSS selector
+      if (/^[.#\[]|^[a-z]/i.test(potentialCss)) {
+        const extracted = `${playwrightType}=${playwrightValue}`;
+
+        logger.warn('[SELECTOR_UTILS] Extracted Playwright selector from mixed format', {
+          original: s,
+          extracted,
+          reason: 'Mixed CSS + Playwright selectors are not supported',
+        });
+
+        // Return ONLY the Playwright part
+        return extracted;
+      }
     }
   }
 

@@ -735,6 +735,32 @@ export class ContextualActionGenerator {
         continue;
       }
 
+      // ✅ NEW: Validate selector format to catch AI mistakes early
+      if (action.selector) {
+        const { validateSelectorFormat } = require('./utils/selector-utils');
+        const validation = validateSelectorFormat(action.selector);
+
+        if (!validation.isValid) {
+          logger.warn('[ACTION_GENERATOR] Invalid selector format from AI, attempting fix', {
+            selector: action.selector,
+            issue: validation.issue,
+            format: validation.format,
+          });
+
+          // Try to extract Playwright part from mixed selector
+          if (validation.format === 'mixed') {
+            const playwrightMatch = action.selector.match(/(role|text|label)\s*=\s*(.+)$/);
+            if (playwrightMatch) {
+              action.selector = `${playwrightMatch[1]}=${playwrightMatch[2].trim()}`;
+              logger.info('[ACTION_GENERATOR] Extracted Playwright selector', {
+                original: action.selector,
+                extracted: action.selector,
+              });
+            }
+          }
+        }
+      }
+
       // Build sanitized action
       const sanitizedAction: DynamicAction = {
         action: action.action,
@@ -743,7 +769,7 @@ export class ContextualActionGenerator {
         url: action.url,
         description: action.description,
         expectedResult: action.expectedResult,
-         timeout: action.timeout || 10000, // ✅ FIX: Increased default timeout from 5s to 10s
+        timeout: action.timeout || 10000,
         optional: action.optional || false,
         retry: action.retry || 3,
       };

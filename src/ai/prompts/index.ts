@@ -806,23 +806,37 @@ CRITICAL RULES:
    - text="Login" → finds <span> (WRONG for click!)
    - role=button[name="Login"] → finds <button> (CORRECT!)
 
-   - ❌ NEVER use jQuery syntax like ":contains()" - NOT supported
-   - ❌ NEVER use button:has-text() - use role=button[name=] instead
-   - ❌ NEVER invent selectors - only use ones provided in the context
-   - ❌ NEVER use single quotes in selectors - ALWAYS use double quotes
-   - ❌ NEVER mix CSS and Playwright syntax! Examples of INVALID selectors:
-     * ".class > role=textbox" ❌ (CSS + Playwright mixed)
-     * "div role=button" ❌ (CSS + Playwright mixed)
-     * ".relative > text=Login" ❌ (CSS + Playwright mixed)
-   - ✅ VALID selector formats:
-     * role=textbox - pure Playwright role
-     * text="Login" - pure Playwright text
-     * label="Email" - pure Playwright label
-     * .class-name - pure CSS selector
-     * #element-id - pure CSS selector
-     * [data-testid="value"] - pure CSS attribute
-   - Example: If DOM shows Selector: "role=button[name=\"Login\"]" → use exactly that
-   - Example: If DOM shows Selector: "label=\"Email\"" → use exactly that for fill
+   🚫 **INVALID SELECTOR FORMATS (WILL CAUSE ERRORS):**
+   - ❌ ".class > role=textbox" - MIXING CSS with Playwright = BROKEN
+   - ❌ "div role=button" - MIXING CSS with Playwright = BROKEN
+   - ❌ ".relative > text=Login" - MIXING CSS with Playwright = BROKEN
+   - ❌ "button:has-text()" - NOT SUPPORTED
+   - ❌ ":contains()" - NOT SUPPORTED (jQuery syntax)
+   - ❌ Single quotes 'text' - use double quotes "text"
+
+   ✅ **VALID SELECTOR FORMATS (USE ONLY THESE):**
+
+   **Playwright Locators (PREFERRED):**
+   - role=button[name="Login"] - ARIA role with name
+   - role=textbox - ARIA role without name
+   - role=link[name="Sign up"] - link by accessible name
+   - text="Login" - exact text match
+   - label="Email" - input by label text
+
+   **CSS Selectors (ALSO VALID):**
+   - #element-id - by ID
+   - .class-name - by class
+   - [data-testid="value"] - by data attribute
+   - [name="email"] - by name attribute
+   - input[type="email"] - by tag + attribute
+
+   **⚠️ CRITICAL: NEVER COMBINE CSS + PLAYWRIGHT IN ONE SELECTOR!**
+   If you need element inside container, use ONLY the inner element's selector.
+   Example: For input inside .relative div, use: role=textbox (NOT .relative > role=textbox)
+
+   - ❌ NEVER invent selectors - ONLY use ones from "Available Elements" or "DOM Summary"
+   - Example: If DOM shows Selector: "role=button[name=\"Login\"]" → use EXACTLY that
+   - Example: If DOM shows Selector: "label=\"Email\"" → use EXACTLY that
 
 1. **Logical Dependencies**:
    - On product page: MUST select size/color BEFORE "add to cart"

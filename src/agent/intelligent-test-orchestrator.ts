@@ -1674,11 +1674,11 @@ export class IntelligentTestOrchestrator {
         }
 
         // Execute action using CommandExecutor
-        // ✅ FIX: Normalize selector before passing to CommandExecutor (it will normalize again, but this ensures consistency)
-        const selectorForExecution = action.selector ? normalizeSelector(action.selector) : action.selector;
+        // ✅ FIX: Pass original selector - CommandExecutor will normalize it ONCE via prepareSelector()
+        // DON'T normalize here to avoid double-processing!
         const executionResult = await this.commandExecutor.executeCommand({
           action: action.action as any,
-          selector: selectorForExecution,
+          selector: action.selector,
           value: action.value,
           url: action.url,
           timeout: action.timeout,
@@ -2119,9 +2119,10 @@ export class IntelligentTestOrchestrator {
    * Convert DynamicAction to PlaywrightCommand for execution
    */
   private convertActionToCommand(action: DynamicAction): import('@/types').PlaywrightCommand {
+    // ✅ FIX: Don't normalize selector here - CommandExecutor.prepareSelector() will do it ONCE
     return {
       action: action.action as import('@/types').PlaywrightActionType,
-      selector: action.selector ? normalizeSelector(action.selector) : undefined,
+      selector: action.selector,
       value: action.value,
       url: action.url,
       description: action.description,
