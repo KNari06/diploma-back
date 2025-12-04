@@ -301,8 +301,71 @@ export class SelfHealingService {
       return page.getByRole(role);
     }
 
-    // 4. Handle contextual locators
+    // 4. Handle contextual locators (has-text, >>, :has, :scope)
+    // These are Playwright-specific CSS extensions
     if (s.includes('>>') || s.includes(':has-text(') || s.includes(':has(') || s.includes(':scope')) {
+      // ✅ FIX: Handle chained selectors with role=/text=/label= after >>
+      // Example: ".relative >> role=textbox" → use proper Playwright chaining
+      if (s.includes('>>')) {
+        const parts = s.split('>>').map(p => p.trim());
+
+        // Start with first part (usually CSS selector)
+        let locator = page.locator(parts[0]);
+
+        // Chain remaining parts using proper Playwright methods
+        for (let i = 1; i < parts.length; i++) {
+          const part = parts[i];
+
+          // Handle role=value
+          const roleMatch = part.match(/^role\s*=\s*(.+?)(?:\[name\s*=\s*["']?(.+?)["']?\])?$/);
+          if (roleMatch) {
+            const role = roleMatch[1].trim() as any;
+            const name = roleMatch[2]?.trim();
+
+            if (name) {
+              // Remove quotes if present
+              const cleanName = name.replace(/^["']|["']$/g, '');
+              locator = locator.getByRole(role, { name: cleanName });
+            } else {
+              locator = locator.getByRole(role);
+            }
+            continue;
+          }
+
+          // Handle text="value"
+          const textMatch = part.match(/^text\s*=\s*["']?(.+?)["']?$/);
+          if (textMatch) {
+            const text = textMatch[1];
+            // Check if it's a regex
+            const regexMatch = text.match(/^\/(.+?)\/([gimsuy]*)$/);
+            if (regexMatch) {
+              try {
+                const regex = new RegExp(regexMatch[1], regexMatch[2]);
+                locator = locator.getByText(regex);
+              } catch {
+                locator = locator.getByText(text);
+              }
+            } else {
+              locator = locator.getByText(text);
+            }
+            continue;
+          }
+
+          // Handle label="value"
+          const labelMatch = part.match(/^label\s*=\s*["']?(.+?)["']?$/);
+          if (labelMatch) {
+            const label = labelMatch[1];
+            locator = locator.getByLabel(label);
+            continue;
+          }
+
+          // Fallback: treat as CSS selector
+          locator = locator.locator(part);
+        }
+
+        return locator;
+      }
+
       return page.locator(s);
     }
 

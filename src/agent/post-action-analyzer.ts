@@ -379,6 +379,9 @@ export class PostActionAnalyzer {
         .map((el, i) => `[${i}] ${el.type}: "${el.text}" (${el.selector})`)
         .join('\n');
 
+      // Extract text from the action that was just executed to avoid duplicate clicks
+      const executedActionText = this.extractActionText(context.action);
+
       const prompt = `You are a QA automation expert analyzing a web page after an action was executed.
 
 ACTION EXECUTED:
@@ -387,6 +390,7 @@ ACTION EXECUTED:
 - Value: ${context.inputValue || context.action.value || 'N/A'}
 - Description: ${context.action.description}
 - Result: ${context.actionResult.success ? 'Success' : 'Failed: ' + context.actionResult.error}
+${executedActionText ? `- Action text: "${executedActionText}"` : ''}
 
 TESTING GOAL: ${context.goal}
 
@@ -425,7 +429,9 @@ RULES:
 - Only suggest follow-up if NECESSARY to complete the current step
 - Use selectorIndex from the visible elements list above
 - Maximum 2 follow-up actions
-- If action succeeded and no interaction needed → needsFollowUp: false`;
+- If action succeeded and no interaction needed → needsFollowUp: false
+- CRITICAL: Do NOT suggest clicking on the same element that was just clicked (check action description and text)
+- If the executed action was a click and succeeded, do NOT suggest clicking the same button/element again`;
 
       const response = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -464,9 +470,20 @@ RULES:
       // Convert AI response to DynamicActions
       const followUpActions: DynamicAction[] = [];
       if (decision.needsFollowUp && decision.followUpActions) {
+        const executedActionText = this.extractActionText(context.action);
+
         for (const aiAction of decision.followUpActions.slice(0, 2)) {
           const targetElement = snapshot.visibleElements[aiAction.selectorIndex];
           if (targetElement) {
+            // ✅ FIX: Skip if this is a duplicate of the action we just executed
+            if (this.isDuplicateAction(context.action, targetElement, executedActionText)) {
+              logger.debug('[POST_ACTION] Skipping duplicate follow-up action', {
+                executedAction: context.action.description,
+                followUpAction: targetElement.text,
+              });
+              continue;
+            }
+
             followUpActions.push({
               action: aiAction.action || 'click',
               selector: `${targetElement.selector}:nth-of-type(${(targetElement as any).selectorIndex + 1})`,
@@ -534,6 +551,58 @@ RULES:
   }
 
   /**
+   * Extract text from action description/selector to identify what was clicked
+   */
+  private static extractActionText(action: DynamicAction): string | null {
+    if (!action.description) return null;
+
+    // Try to extract button/element text from description
+    // Examples: "Click the 'Найти репетитора' button" → "Найти репетитора"
+    const match = action.description.match(/['"]([^'"]+)['"]/);
+    if (match) return match[1].toLowerCase();
+
+    // Fallback: extract from selector if it's a text selector
+    if (action.selector?.includes('text=')) {
+      const textMatch = action.selector.match(/text=["']([^"']+)["']/);
+      if (textMatch) return textMatch[1].toLowerCase();
+    }
+
+    return null;
+  }
+
+  /**
+   * Check if follow-up action is a duplicate of the executed action
+   */
+  private static isDuplicateAction(
+    executedAction: DynamicAction,
+    targetElement: VisibleElement,
+    executedActionText: string | null
+  ): boolean {
+    // If executed action was a click, check if we're trying to click the same element
+    if (executedAction.action === 'click' && targetElement.type === 'button') {
+      // Compare by text if we have it
+      if (executedActionText) {
+        const targetText = targetElement.text.toLowerCase();
+        if (targetText.includes(executedActionText) || executedActionText.includes(targetText)) {
+          return true;
+        }
+      }
+
+      // Compare by description
+      if (executedAction.description && targetElement.text) {
+        const descLower = executedAction.description.toLowerCase();
+        const elementTextLower = targetElement.text.toLowerCase();
+        // If description mentions the element text, it's likely the same element
+        if (descLower.includes(elementTextLower) || elementTextLower.includes(descLower.split("'")[1] || '')) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
    * Fallback decision when AI fails
    */
   private static fallbackDecision(
@@ -547,6 +616,7 @@ RULES:
     snapshot: DOMSnapshot
   ): PostActionDecision {
     const followUpActions: DynamicAction[] = [];
+    const executedActionText = this.extractActionText(context.action);
 
     // Rule 1: If new chips/options appeared after fill/type, click matching one
     if (
@@ -560,7 +630,7 @@ RULES:
         inputLower.includes(el.text.toLowerCase())
       );
 
-      if (matchingElement) {
+      if (matchingElement && !this.isDuplicateAction(context.action, matchingElement, executedActionText)) {
         followUpActions.push({
           action: 'click',
           selector: `${matchingElement.selector}:has-text("${matchingElement.text}")`,
@@ -582,6 +652,29 @@ RULES:
           optional: true,
           timeout: 2000,
         });
+      }
+    }
+
+    // ✅ FIX: Don't suggest clicking on a button that was just clicked
+    // Rule 3: Button became enabled - only suggest if it wasn't just clicked
+    if (changes.buttonStateChanges.length > 0 && context.action.action !== 'click') {
+      const enabledButton = changes.buttonStateChanges.find(b => b.becameEnabled);
+      if (enabledButton) {
+        // Find the button in snapshot
+        const buttonElement = snapshot.visibleElements.find(
+          el => el.text.toLowerCase() === enabledButton.text.toLowerCase() && el.type === 'button'
+        );
+
+        if (buttonElement && !this.isDuplicateAction(context.action, buttonElement, executedActionText)) {
+          // Only suggest if it's a different button than what was clicked
+          followUpActions.push({
+            action: 'click',
+            selector: enabledButton.selector,
+            description: `Click enabled button: ${enabledButton.text}`,
+            optional: true,
+            timeout: 3000,
+          });
+        }
       }
     }
 

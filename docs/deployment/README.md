@@ -7,20 +7,22 @@
 ### SSH команда:
 
 ```bash
-ssh -i /Users/yerassylospanov/Desktop/QAI-BackEnd/gcp root@34.172.156.158
+ssh -i ${DEPLOY_SSH_KEY_PATH} ${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST}
 ```
 
 **Детали подключения:**
 
-- **SSH ключ**: `/Users/yerassylospanov/Desktop/QAI-BackEnd/gcp` (в корне проекта)
-- **Пользователь**: `root`
-- **IP адрес**: `34.172.156.158`
+- ⚠️ **SECURITY**: SSH credentials хранятся в переменных окружения (`.env` файл, НЕ коммитится в репозиторий)
+- Используй переменные: `DEPLOY_SSH_KEY_PATH`, `DEPLOY_SSH_USER`, `DEPLOY_SSH_HOST`
+- Эти переменные должны быть настроены локально в `.env` файле (см. `env.example`)
 
-**Альтернативный вариант (из корня проекта):**
+**Настройка переменных окружения:**
 
+Добавь в свой локальный `.env` файл (не коммитится):
 ```bash
-cd /Users/yerassylospanov/Desktop/QAI-BackEnd
-ssh -i ./gcp root@34.172.156.158
+DEPLOY_SSH_HOST=your_production_server_ip
+DEPLOY_SSH_USER=your_ssh_username
+DEPLOY_SSH_KEY_PATH=/path/to/your/ssh/private/key
 ```
 
 ## 🔍 Pre-Deployment Checklist
@@ -42,9 +44,15 @@ ssh -i ./gcp root@34.172.156.158
 
 ## 🔐 Безопасность
 
-- SSH ключ (`gcp`) находится в `.gitignore` и не должен попадать в репозиторий
-- Используйте правильные права доступа для ключа: `chmod 600 gcp`
-- Никогда не коммитьте секреты и ключи
+- ⚠️ **CRITICAL**: SSH credentials и production server details НЕ должны быть в репозитории
+- SSH ключ должен быть в `.gitignore` и не должен попадать в репозиторий
+- Используйте правильные права доступа для ключа: `chmod 600 <ssh-key-path>`
+- Никогда не коммитьте:
+  - `.env` файл с реальными credentials
+  - SSH private keys
+  - Production server IP addresses
+  - Usernames и другие чувствительные данные
+- Все production credentials должны храниться только в локальном `.env` файле или секретах CI/CD
 
 ## 📝 Дополнительная информация
 

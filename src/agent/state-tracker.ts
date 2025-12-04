@@ -6,11 +6,11 @@
 
 import { logger } from '@/utils/logger';
 import {
-  TestState,
-  PageVisit,
-  ActionResult,
-  CycleDetectionResult,
-  PageType,
+    ActionResult,
+    CycleDetectionResult,
+    PageType,
+    PageVisit,
+    TestState,
 } from './types/intelligent-testing.types';
 
 // ═══════════════════════════════════════════════════════════════════════════

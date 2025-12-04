@@ -32,8 +32,10 @@ export async function detectUserApproval(
     return { approved: null, confidence: 0.0, reasoning: 'Empty message' };
   }
 
+  // ✅ AI-FIRST APPROACH: Always use AI to understand user intent
+  // No hardcoded lists - AI understands natural language, context, and intent
   try {
-    logger.info('🔍 [APPROVAL_DETECT] Starting detection', {
+    logger.info('🔍 [APPROVAL_DETECT] Starting AI detection', {
       message: trimmedMessage,
       length: trimmedMessage.length,
     });
@@ -51,7 +53,7 @@ export async function detectUserApproval(
         content: prompt,
       },
     ], {
-      model: 'gpt-4o-mini', // Better context understanding than gpt-3.5-turbo, cheaper too!
+      model: 'gpt-3.5-turbo', // Cost-effective AI for intent detection
       temperature: 0.2, // Low temp for consistent results
       max_tokens: 100,
     });
@@ -94,35 +96,14 @@ export async function detectUserApproval(
       reasoning: parsed.reasoning,
     };
   } catch (error) {
-    logger.error('❌ [APPROVAL_DETECT] AI detection failed, using fallback', { error });
+    logger.error('❌ [APPROVAL_DETECT] AI detection failed', {
+      error: error instanceof Error ? error.message : String(error),
+      message: trimmedMessage,
+    });
 
-    // Fallback: simple keyword matching
-    const message = trimmedMessage.toLowerCase();
-
-    const approvalKeywords = ['да', 'yes', 'ok', 'ок', 'го', 'давай', 'запускай', 'погнали', 'валим', 'sure', 'run', 'execute', 'start', 'согласен', 'одобряю', 'approve', 'confirm', 'good', 'fine', 'хорошо', 'делай', 'начинай', 'тестируй', '+', '✅', '👍'];
-    const rejectionKeywords = ['нет', 'no', 'не надо', "don't", 'stop', 'cancel', 'отмена', 'потом', 'later', 'not now', 'maybe', 'подожди', 'отклоняю', 'reject', 'пас', 'skip', 'нет спасибо', '-', '❌', '👎'];
-
-    // Check approval
-    if (approvalKeywords.some(k => message.includes(k))) {
-      logger.info('✅ [APPROVAL_DETECT] Keyword match found (approval)', {
-        message,
-        matchedKeyword: approvalKeywords.find(k => message.includes(k)),
-      });
-      return { approved: true, confidence: 0.8, reasoning: 'Keyword matching (fallback)' };
-    }
-
-    // Check rejection
-    if (rejectionKeywords.some(k => message.includes(k))) {
-      logger.info('❌ [APPROVAL_DETECT] Keyword match found (rejection)', {
-        message,
-        matchedKeyword: rejectionKeywords.find(k => message.includes(k)),
-      });
-      return { approved: false, confidence: 0.8, reasoning: 'Keyword matching (fallback)' };
-    }
-
-    // Unclear
-    logger.warn('⚠️ [APPROVAL_DETECT] No clear intent detected', { message });
-    return { approved: null, confidence: 0.1, reasoning: 'No clear intent (fallback)' };
+    // Fallback: return unclear if AI fails (better than guessing with hardcoded keywords)
+    // This ensures we don't accidentally approve/reject based on keyword matching
+    return { approved: null, confidence: 0.0, reasoning: 'AI detection failed - unable to determine intent' };
   }
 }
 

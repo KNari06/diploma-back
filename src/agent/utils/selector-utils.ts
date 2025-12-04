@@ -299,43 +299,71 @@ export function getLocator(page: Page, selector: string): Locator {
   // These are Playwright-specific CSS extensions
   if (s.includes('>>') || s.includes(':has-text(') || s.includes(':has(') || s.includes(':scope')) {
     // ✅ FIX: Handle chained selectors with role=/text=/label= after >>
-    // Example: ".relative >> role=textbox" → ".relative >> [role="textbox"]" or use proper chaining
+    // Example: ".relative >> role=textbox" → use proper Playwright chaining
     if (s.includes('>>')) {
       const parts = s.split('>>').map(p => p.trim());
-      const processedParts = parts.map(part => {
-        // Convert role=value to [role="value"] for CSS compatibility
+
+      // Start with first part (usually CSS selector)
+      let locator = page.locator(parts[0]);
+
+      // Chain remaining parts using proper Playwright methods
+      for (let i = 1; i < parts.length; i++) {
+        const part = parts[i];
+
+        // Handle role=value
         const roleMatch = part.match(/^role\s*=\s*(.+?)(?:\[name\s*=\s*["']?(.+?)["']?\])?$/);
         if (roleMatch) {
-          const role = roleMatch[1].trim();
-          const name = roleMatch[2];
+          const role = roleMatch[1].trim() as any;
+          const name = roleMatch[2]?.trim();
+          validateAriaRole(role);
+
           if (name) {
-            // For role with name, use CSS attribute selector
-            return `[role="${role}"][aria-label="${name}"], [role="${role}"]:has-text("${name}")`;
+            // Remove quotes if present
+            const cleanName = name.replace(/^["']|["']$/g, '');
+            locator = locator.getByRole(role, { name: cleanName });
+          } else {
+            locator = locator.getByRole(role);
           }
-          return `[role="${role}"]`;
+          continue;
         }
 
-        // Convert text="value" to :text("value") or :has-text("value")
+        // Handle text="value"
         const textMatch = part.match(/^text\s*=\s*["']?(.+?)["']?$/);
         if (textMatch) {
-          return `:has-text("${textMatch[1]}")`;
+          const text = textMatch[1];
+          // Check if it's a regex
+          const regexMatch = text.match(/^\/(.+?)\/([gimsuy]*)$/);
+          if (regexMatch) {
+            try {
+              const regex = new RegExp(regexMatch[1], regexMatch[2]);
+              locator = locator.getByText(regex);
+            } catch {
+              locator = locator.getByText(text);
+            }
+          } else {
+            locator = locator.getByText(text);
+          }
+          continue;
         }
 
-        // Convert label="value" to label CSS
+        // Handle label="value"
         const labelMatch = part.match(/^label\s*=\s*["']?(.+?)["']?$/);
         if (labelMatch) {
-          return `[aria-label="${labelMatch[1]}"], label:has-text("${labelMatch[1]}")`;
+          const label = labelMatch[1];
+          locator = locator.getByLabel(label);
+          continue;
         }
 
-        return part;
-      });
+        // Fallback: treat as CSS selector
+        locator = locator.locator(part);
+      }
 
-      const processedSelector = processedParts.join(' >> ');
       logger.debug('[SELECTOR_UTILS] Processed chained selector', {
         original: s,
-        processed: processedSelector,
+        parts: parts.length,
+        method: 'chained_locator',
       });
-      return page.locator(processedSelector);
+      return locator;
     }
 
     return page.locator(s);

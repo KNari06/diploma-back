@@ -85,15 +85,16 @@ git status --short
 ### SSH команда для подключения:
 
 ```bash
-ssh -i /Users/yerassylospanov/Desktop/QAI-BackEnd/gcp root@34.172.156.158
+ssh -i ${DEPLOY_SSH_KEY_PATH} ${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST}
 ```
 
 **Важно:**
 
-- SSH ключ находится в корне проекта: `./gcp`
-- Полный путь: `/Users/yerassylospanov/Desktop/QAI-BackEnd/gcp`
-- Пользователь: `root`
-- IP сервера: `34.172.156.158`
+- ⚠️ **SECURITY**: SSH credentials хранятся в переменных окружения (`.env` файл, НЕ коммитится в репозиторий)
+- Используй переменные: `DEPLOY_SSH_KEY_PATH`, `DEPLOY_SSH_USER`, `DEPLOY_SSH_HOST`
+- Эти переменные должны быть настроены локально в `.env` файле (см. `env.example`)
+- **НИКОГДА** не коммить `.env` файл с реальными credentials
+- Production server details должны храниться только в приватной документации или секретах
 
 ## Deployment Process
 
@@ -110,14 +111,14 @@ ssh -i /Users/yerassylospanov/Desktop/QAI-BackEnd/gcp root@34.172.156.158
 curl https://api.hrgpt.kz/health
 
 # 2. PM2 статус
-ssh user@server "pm2 status"
+ssh -i ${DEPLOY_SSH_KEY_PATH} ${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST} "pm2 status"
 # Должно быть: mode=fork, status=online
 
 # 3. Тестируй измененные эндпоинты
 curl "https://api.hrgpt.kz/api/v1/измененный-эндпоинт"
 
 # 4. Проверь логи
-ssh user@server "pm2 logs aiapply-parser --lines 50"
+ssh -i ${DEPLOY_SSH_KEY_PATH} ${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST} "pm2 logs aiapply-parser --lines 50"
 ```
 
 ## Если нашел ошибку на production
@@ -152,7 +153,7 @@ curl https://api.hrgpt.kz/проблемный-эндпоинт
 ## Rollback если что-то пошло не так
 
 ```bash
-ssh user@server
+ssh -i ${DEPLOY_SSH_KEY_PATH} ${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST}
 cd ~/aiapply-parser
 
 # Посмотри последние коммиты
@@ -222,11 +223,11 @@ module.exports = {
 
 ```bash
 # PM2 mode должен быть fork
-ssh user@server "pm2 list"
+ssh -i ${DEPLOY_SSH_KEY_PATH} ${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST} "pm2 list"
 # Должно показать: mode │ fork
 
 # Порты должны слушаться
-ssh user@server "netstat -tlnp | grep node"
+ssh -i ${DEPLOY_SSH_KEY_PATH} ${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST} "netstat -tlnp | grep node"
 # Должно показать :443 и :5000
 ```
 
@@ -236,10 +237,10 @@ ssh user@server "netstat -tlnp | grep node"
 
 ```bash
 # Следи за логами
-ssh user@server "pm2 logs aiapply-parser --lines 100"
+ssh -i ${DEPLOY_SSH_KEY_PATH} ${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST} "pm2 logs aiapply-parser --lines 100"
 
 # Проверяй memory/cpu
-ssh user@server "pm2 monit"
+ssh -i ${DEPLOY_SSH_KEY_PATH} ${DEPLOY_SSH_USER}@${DEPLOY_SSH_HOST} "pm2 monit"
 
 # Тестируй основные эндпоинты
 curl https://api.hrgpt.kz/api/v1/jobs/search?q=test

@@ -6,6 +6,7 @@
 
 import { dbAdminService } from '@/db/supabase';
 import { AICostManager, getCostManager, removeCostManager } from '@/services/ai-cost-manager.service';
+import { SelfHealingService } from '@/services/ai-selector/self-healing.service'; // ✅ NEW: Self-healing for selectors
 import { logger } from '@/utils/logger';
 import { webSocketService } from '@/websocket/websocket.service';
 import { Browser, Page } from 'playwright';
@@ -14,7 +15,7 @@ import { CommandExecutor } from './command-executor';
 import { ContextualActionGenerator } from './contextual-action-generator';
 import { FormIntelligenceService } from './form-intelligence.service'; // ✅ NEW: Smart form handling
 import { IntelligentPageAnalyzer } from './intelligent-page-analyzer';
-import { PostActionAnalyzer, DOMSnapshot } from './post-action-analyzer'; // ✅ NEW: AI-driven post-action analysis
+import { DOMSnapshot, PostActionAnalyzer } from './post-action-analyzer'; // ✅ NEW: AI-driven post-action analysis
 import { PreActionAnalyzer } from './pre-action-analyzer'; // ✅ NEW: Pre-action analysis for smart action execution
 import { ResultValidator } from './result-validator';
 import { SafetyGuard } from './safety-guard';
@@ -145,7 +146,7 @@ export class IntelligentTestOrchestrator {
       costManager: this.costManager, // ✅ FIX 9: Pass cost manager
       metadata: {
         url: this.config.startUrl,
-        projectId: this.testId,
+        projectId: this.config.userContext?.projectId as string | undefined,
         userId: this.userId,
       },
     });
@@ -1407,49 +1408,126 @@ export class IntelligentTestOrchestrator {
               const failureCount = (this.selectorFailures.get(normalizedSelector) || 0) + 1;
               this.selectorFailures.set(normalizedSelector, failureCount);
 
-              logger.warn('[INTELLIGENT_ORCHESTRATOR] Selector not found, marking action as optional', {
-                testId: this.testId,
-                action: action.description,
-                selector: action.selector,
-                normalizedSelector,
-                failureCount,
-                maxFailures: AdaptiveConfigService.getThreshold('MAX_SELECTOR_FAILURES', {
-                  testMode: this.config.mode,
-                  hasManySelectors: AdaptiveConfigService.analyzePageContext(this.state).hasManySelectors,
-                }),
-              });
+              let healingSuccessful = false;
 
-              // If selector failed too many times, skip permanently (reuse outer pageContext)
-              const maxFailures = AdaptiveConfigService.getThreshold('MAX_SELECTOR_FAILURES', {
-                testMode: this.config.mode,
-                hasManySelectors: pageContext.hasManySelectors,
-                errorRate: pageContext.errorRate,
-              });
-              if (failureCount >= maxFailures) {
-                logger.error('[INTELLIGENT_ORCHESTRATOR] Selector failed too many times, skipping permanently', {
-                  testId: this.testId,
-                  selector: normalizedSelector,
-                  failureCount,
-                });
+              // ✅ NEW: Try self-healing before giving up (only on first failure)
+              if (failureCount === 1) {
+                try {
+                  logger.info('[INTELLIGENT_ORCHESTRATOR] Selector not found, attempting self-healing', {
+                    testId: this.testId,
+                    action: action.description,
+                    selector: normalizedSelector,
+                  });
+
+                  const healingResult = await SelfHealingService.healSelector({
+                    oldSelector: normalizedSelector,
+                    intent: action.description || `${action.action} element`,
+                    page: this.page,
+                    errorMessage: `Selector not found: ${normalizedSelector}`,
+                    metadata: {
+                      url: this.page.url(),
+                      projectId: this.config.userContext?.projectId as string | undefined,
+                      userId: this.userId,
+                    },
+                    mode: 'fast',
+                  });
+
+                  if (healingResult.success && healingResult.newSelector && healingResult.autoApplied) {
+                    // Try with healed selector
+                    const healedNormalized = normalizeSelector(healingResult.newSelector);
+                    const healedLocator = getLocator(this.page, healedNormalized);
+                    const healedCount = await healedLocator.count();
+
+                    if (healedCount > 0) {
+                      logger.info('[INTELLIGENT_ORCHESTRATOR] Self-healing successful, using healed selector', {
+                        testId: this.testId,
+                        oldSelector: normalizedSelector,
+                        newSelector: healingResult.newSelector,
+                        normalizedNewSelector: healedNormalized,
+                        confidence: healingResult.diff.confidence,
+                      });
+
+                      // Update action with healed selector
+                      action.selector = healingResult.newSelector;
+                      // Reset failure count for healed selector
+                      this.selectorFailures.delete(normalizedSelector);
+                      healingSuccessful = true;
+                      // Continue with execution using healed selector
+                    } else {
+                      logger.warn('[INTELLIGENT_ORCHESTRATOR] Healed selector also not found', {
+                        testId: this.testId,
+                        healedSelector: healingResult.newSelector,
+                      });
+                    }
+                  }
+                } catch (healingError) {
+                  logger.debug('[INTELLIGENT_ORCHESTRATOR] Self-healing failed', {
+                    testId: this.testId,
+                    error: healingError instanceof Error ? healingError.message : String(healingError),
+                  });
+                }
               }
 
-              // Mark as optional and skip
-              const actionResult: ActionResult = {
-                action: { ...action, selector: normalizedSelector }, // Update with normalized selector
-                success: false,
-                error: `Selector not found: ${normalizedSelector} (failed ${failureCount} times)`,
-                urlChanged: false,
-                urlBefore,
-                urlAfter: urlBefore,
-                timestamp: Date.now(),
-              };
+              // If healing was successful, continue with execution (skip error handling)
+              if (healingSuccessful) {
+                // Action selector has been updated, continue to execution
+              } else {
+                // If still not found (or healing failed), check failure threshold
+                const maxFailures = AdaptiveConfigService.getThreshold('MAX_SELECTOR_FAILURES', {
+                  testMode: this.config.mode,
+                  hasManySelectors: pageContext.hasManySelectors,
+                  errorRate: pageContext.errorRate,
+                });
 
-              completedActions.push(actionResult);
-              this.state = StateTracker.recordActionResult(this.state, actionResult);
+                if (failureCount >= maxFailures) {
+                  logger.error('[INTELLIGENT_ORCHESTRATOR] Selector failed too many times, skipping permanently', {
+                    testId: this.testId,
+                    selector: normalizedSelector,
+                    failureCount,
+                  });
 
-              // Mark action as optional to continue
-              action.optional = true;
-              continue; // Skip this action
+                  // Mark as optional and skip
+                  const actionResult: ActionResult = {
+                    action: { ...action, selector: normalizedSelector },
+                    success: false,
+                    error: `Selector not found: ${normalizedSelector} (failed ${failureCount} times)`,
+                    urlChanged: false,
+                    urlBefore,
+                    urlAfter: urlBefore,
+                    timestamp: Date.now(),
+                  };
+
+                  completedActions.push(actionResult);
+                  this.state = StateTracker.recordActionResult(this.state, actionResult);
+                  action.optional = true;
+                  continue;
+                }
+
+                // First failure and healing didn't work - mark as optional and skip
+                logger.warn('[INTELLIGENT_ORCHESTRATOR] Selector not found, marking action as optional', {
+                  testId: this.testId,
+                  action: action.description,
+                  selector: action.selector,
+                  normalizedSelector,
+                  failureCount,
+                  maxFailures,
+                });
+
+                const actionResult: ActionResult = {
+                  action: { ...action, selector: normalizedSelector },
+                  success: false,
+                  error: `Selector not found: ${normalizedSelector} (failed ${failureCount} times)`,
+                  urlChanged: false,
+                  urlBefore,
+                  urlAfter: urlBefore,
+                  timestamp: Date.now(),
+                };
+
+                completedActions.push(actionResult);
+                this.state = StateTracker.recordActionResult(this.state, actionResult);
+                action.optional = true;
+                continue; // Skip this action
+              }
             } else {
               // ✅ NEW: Reset failure count if selector works
               this.selectorFailures.delete(normalizedSelector);

@@ -5,8 +5,8 @@
  */
 
 import {
-  buildActionGenerationPrompt,
-  buildNextStepPrompt,
+    buildActionGenerationPrompt,
+    buildNextStepPrompt,
 } from '@/ai/prompts/index';
 import { env } from '@/config/env';
 import { AICostManager, AIModel } from '@/services/ai-cost-manager.service';
@@ -15,10 +15,10 @@ import { OpenAI } from 'openai';
 import { Page } from 'playwright';
 import { z } from 'zod';
 import {
-  DynamicAction,
-  NextStepDecision,
-  PageContext,
-  TestState,
+    DynamicAction,
+    NextStepDecision,
+    PageContext,
+    TestState,
 } from './types/intelligent-testing.types';
 
 // ✅ FIX: Add timeout to prevent hanging requests
