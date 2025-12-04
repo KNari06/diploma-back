@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Intelligent Mode: Полная Архитектура</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+
+        header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+
+        header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        h2 {
+            color: #667eea;
+            font-size: 2em;
+            margin: 40px 0 20px 0;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #667eea;
+        }
+
+        h3 {
+            color: #764ba2;
+            font-size: 1.5em;
+            margin: 30px 0 15px 0;
+        }
+
+        h4 {
+            color: #555;
+            font-size: 1.2em;
+            margin: 20px 0 10px 0;
+        }
+
+        .diagram {
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            white-space: pre-wrap;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        th {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+        }
+
+        td {
+            padding: 12px 15px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        tr:hover {
+            background: #f5f5f5;
+        }
+
+        tr:nth-child(even) {
+            background: #fafafa;
+        }
+
+        .code-block {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 20px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 20px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+
+        .code-block code {
+            color: #f8f8f2;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+            margin: 2px;
+        }
+
+        .badge-success {
+            background: #4caf50;
+            color: white;
+        }
+
+        .badge-warning {
+            background: #ff9800;
+            color: white;
+        }
+
+        .badge-danger {
+            background: #f44336;
+            color: white;
+        }
+
+        .badge-info {
+            background: #2196f3;
+            color: white;
+        }
+
+        .flow-step {
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+
+        .flow-step h4 {
+            color: #667eea;
+            margin-top: 0;
+        }
+
+        .component-card {
+            background: white;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .component-card h3 {
+            margin-top: 0;
+            color: #667eea;
+        }
+
+        ul, ol {
+            margin: 15px 0 15px 30px;
+        }
+
+        li {
+            margin: 8px 0;
+        }
+
+        .highlight {
+            background: #fff3cd;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 600;
+        }
+
+        .toc {
+            background: #f8f9fa;
+            border: 2px solid #667eea;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 30px 0;
+        }
+
+        .toc h3 {
+            margin-top: 0;
+            color: #667eea;
+        }
+
+        .toc ul {
+            list-style: none;
+            margin-left: 0;
+        }
+
+        .toc a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .toc a:hover {
+            text-decoration: underline;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-card h4 {
+            color: white;
+            margin: 0 0 10px 0;
+        }
+
+        .stat-card .value {
+            font-size: 2em;
+            font-weight: bold;
+        }
+
+        footer {
+            background: #2d2d2d;
+            color: white;
+            padding: 20px;
+            text-align: center;
+            margin-top: 40px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🧠 Intelligent Mode</h1>
+            <p>Полная Архитектура и Документация</p>
+        </header>
+
+        <div class="content">
+            <div class="toc">
+                <h3>📑 Содержание</h3>
+                <ul>
+                    <li><a href="#overview">1. Обзор системы</a></li>
+                    <li><a href="#files">2. Файлы и их роли</a></li>
+                    <li><a href="#flow">3. Полный Flow тестирования</a></li>
+                    <li><a href="#ai-models">4. AI модели и стоимость</a></li>
+                    <li><a href="#config">5. Конфигурация</a></li>
+                </ul>
+            </div>
+
+            <section id="overview">
+                <h2>1. Обзор системы</h2>
+                <p>Intelligent Mode — это полностью автоматизированная система тестирования веб-приложений, использующая AI для анализа страниц, генерации действий и принятия решений.</p>
+
+                <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         INTELLIGENT TEST ORCHESTRATOR                            │
+│                    (Главный координатор всего процесса)                          │
+└─────────────────────────────────────────┬───────────────────────────────────────┘
+                                          │
+        ┌─────────────────────────────────┼─────────────────────────────────┐
+        │                                 │                                 │
+        ▼                                 ▼                                 ▼
+┌───────────────────┐  ┌───────────────────────────┐  ┌────────────────────────┐
+│ IntelligentPage   │  │ ContextualAction          │  │ CommandExecutor        │
+│ Analyzer          │  │ Generator                 │  │ (Исполнитель команд)   │
+│ (Анализ страницы) │  │ (Генератор действий)      │  │                        │
+└─────────┬─────────┘  └───────────┬───────────────┘  └────────────┬───────────┘
+          │                        │                               │
+          ▼                        ▼                               ▼
+┌───────────────────┐  ┌───────────────────────────┐  ┌────────────────────────┐
+│ DOM Analysis      │  │ AI (GPT-4o / GPT-4o-mini) │  │ getSmartLocator()      │
+│ Vision Analysis   │  │ Action Generation         │  │ Self-Healing           │
+│ SPA Load Wait     │  │ Decision Making           │  │ Smart Wait             │
+└───────────────────┘  └───────────────────────────┘  └────────────────────────┘
+                </div>
+
+                <h3>Основной цикл работы:</h3>
+                <div class="code-block">
+<code>analyze → understand → generate → execute → validate → decide → repeat</code>
+                </div>
+            </section>
+
+            <section id="files">
+                <h2>2. Файлы и их роли</h2>
+
+                <div class="component-card">
+                    <h3>1. IntelligentTestOrchestrator</h3>
+                    <p><strong>Файл:</strong> <code>intelligent-test-orchestrator.ts</code></p>
+                    <p><strong>Роль:</strong> Главный координатор всего процесса тестирования</p>
+                    <h4>Ключевые методы:</h4>
+                    <ul>
+                        <li><code>execute()</code> — запуск теста</li>
+                        <li><code>mainLoop()</code> — основной цикл тестирования</li>
+                        <li><code>analyzeCurrentPage()</code> — анализ текущей страницы</li>
+                        <li><code>generateAndExecuteActions()</code> — генерация и выполнение действий</li>
+                        <li><code>makeDecision()</code> — решение о продолжении/остановке</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>2. IntelligentPageAnalyzer</h3>
+                    <p><strong>Файл:</strong> <code>intelligent-page-analyzer.ts</code></p>
+                    <p><strong>Роль:</strong> Анализ веб-страниц с помощью AI</p>
+
+                    <h4>Режимы анализа:</h4>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Режим</th>
+                                <th>Vision</th>
+                                <th>DOM</th>
+                                <th>Скорость</th>
+                                <th>Точность</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span class="badge badge-info">fast</span></td>
+                                <td>❌</td>
+                                <td>✅</td>
+                                <td>Быстро</td>
+                                <td>Средняя</td>
+                            </tr>
+                            <tr>
+                                <td><span class="badge badge-success">balanced</span></td>
+                                <td>✅ (1 раз)</td>
+                                <td>✅</td>
+                                <td>Средне</td>
+                                <td>Высокая</td>
+                            </tr>
+                            <tr>
+                                <td><span class="badge badge-warning">full</span></td>
+                                <td>✅ (всегда)</td>
+                                <td>✅</td>
+                                <td>Медленно</td>
+                                <td>Максимальная</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Что анализирует:</h4>
+                    <ul>
+                        <li>Тип страницы (login, dashboard, checkout, etc.)</li>
+                        <li>Доступные элементы (кнопки, формы, ссылки)</li>
+                        <li>Модальные окна (cookie banners, popups)</li>
+                        <li>Состояние SPA (ждёт полную загрузку)</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>3. ContextualActionGenerator</h3>
+                    <p><strong>Файл:</strong> <code>contextual-action-generator.ts</code></p>
+                    <p><strong>Роль:</strong> Генерация действий на основе контекста</p>
+
+                    <h4>Входные данные:</h4>
+                    <ul>
+                        <li><code>PageContext</code> — контекст страницы (URL, тип, элементы)</li>
+                        <li><code>TestState</code> — состояние теста (история, ошибки)</li>
+                        <li><code>goal</code> — цель тестирования</li>
+                    </ul>
+
+                    <h4>Выходные данные:</h4>
+                    <div class="code-block">
+<code>{
+  actions: DynamicAction[],  // Массив действий
+  reasoning: string,         // Почему выбраны эти действия
+  confidence: number,        // Уверенность (0-1)
+  nextExpectedPage: string   // Ожидаемая следующая страница
+}</code>
+                    </div>
+
+                    <h4>AI модели:</h4>
+                    <ul>
+                        <li><span class="badge badge-info">gpt-4o-mini</span> — быстрая генерация (по умолчанию)</li>
+                        <li><span class="badge badge-success">gpt-4o</span> — точная генерация (для сложных случаев)</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>4. CommandExecutor</h3>
+                    <p><strong>Файл:</strong> <code>command-executor.ts</code></p>
+                    <p><strong>Роль:</strong> Выполнение Playwright команд</p>
+
+                    <h4>Поддерживаемые действия с Smart Locator:</h4>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Действие</th>
+                                <th>Smart Locator</th>
+                                <th>Self-Healing</th>
+                                <th>Smart Wait</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>click</code></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                            </tr>
+                            <tr>
+                                <td><code>fill</code></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                            </tr>
+                            <tr>
+                                <td><code>type</code></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                            </tr>
+                            <tr>
+                                <td><code>select</code></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                            </tr>
+                            <tr>
+                                <td><code>check/uncheck</code></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                            </tr>
+                            <tr>
+                                <td><code>hover</code></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                            </tr>
+                            <tr>
+                                <td><code>dblclick</code></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                                <td><span class="badge badge-success">✅</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Flow выполнения команды:</h4>
+                    <div class="flow-step">
+                        <h4>1. getSmartLocator()</h4>
+                        <p>Анализирует элементы, выбирает лучший</p>
+                    </div>
+                    <div class="flow-step">
+                        <h4>2. waitFor({ state: 'visible' })</h4>
+                        <p>Ждёт видимости элемента</p>
+                    </div>
+                    <div class="flow-step">
+                        <h4>3. action.click/fill/etc()</h4>
+                        <p>Выполняет действие</p>
+                    </div>
+                    <div class="flow-step">
+                        <h4>4. При ошибке → Self-Healing</h4>
+                        <p>Повторяет с новым селектором</p>
+                    </div>
+                </div>
+
+                <div class="component-card">
+                    <h3>5. Selector Utils</h3>
+                    <p><strong>Файл:</strong> <code>utils/selector-utils.ts</code></p>
+                    <p><strong>Роль:</strong> Умная работа с селекторами</p>
+
+                    <h4>getSmartLocator()</h4>
+                    <div class="code-block">
+<code>// Анализирует все элементы, выбирает лучший по score
+const result = await getSmartLocator(page, selector, actionType, intent);
+// result.locator — лучший элемент
+// result.wasSmartSelected — использован ли smart selection
+// result.usedAI — использован ли AI для disambiguation</code>
+                    </div>
+
+                    <h4>Система scoring:</h4>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Критерий</th>
+                                <th>Баллы</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Preferred tag (button, input)</td>
+                                <td><span class="badge badge-success">+50</span></td>
+                            </tr>
+                            <tr>
+                                <td>Preferred role (button, textbox)</td>
+                                <td><span class="badge badge-success">+40</span></td>
+                            </tr>
+                            <tr>
+                                <td>Interactive</td>
+                                <td><span class="badge badge-success">+30</span></td>
+                            </tr>
+                            <tr>
+                                <td>Visible</td>
+                                <td><span class="badge badge-info">+20</span></td>
+                            </tr>
+                            <tr>
+                                <td>In viewport</td>
+                                <td><span class="badge badge-info">+10</span></td>
+                            </tr>
+                            <tr>
+                                <td>cursor: pointer</td>
+                                <td><span class="badge badge-info">+5</span></td>
+                            </tr>
+                            <tr>
+                                <td>Non-interactive (штраф)</td>
+                                <td><span class="badge badge-danger">-50</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="component-card">
+                    <h3>6. SmartWaitService</h3>
+                    <p><strong>Файл:</strong> <code>utils/smart-wait.service.ts</code></p>
+                    <p><strong>Роль:</strong> Адаптивное ожидание элементов</p>
+
+                    <h4>Стратегии ожидания:</h4>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Стратегия</th>
+                                <th>Описание</th>
+                                <th>Когда использовать</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span class="badge badge-info">fast</span></td>
+                                <td>Только visibility</td>
+                                <td>Стабильные селекторы</td>
+                            </tr>
+                            <tr>
+                                <td><span class="badge badge-success">stable</span></td>
+                                <td>visibility + стабильность позиции</td>
+                                <td>Анимации</td>
+                            </tr>
+                            <tr>
+                                <td><span class="badge badge-warning">network_idle</span></td>
+                                <td>network idle + element</td>
+                                <td>SPA страницы</td>
+                            </tr>
+                            <tr>
+                                <td><span class="badge badge-danger">full</span></td>
+                                <td>network + DOM + animations</td>
+                                <td>Сложные SPA</td>
+                            </tr>
+                            <tr>
+                                <td><span class="badge badge-info">auto</span></td>
+                                <td>Автовыбор</td>
+                                <td>По умолчанию</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="component-card">
+                    <h3>7-12. Дополнительные компоненты</h3>
+                    <ul>
+                        <li><strong>PreActionAnalyzer</strong> — анализ ПЕРЕД выполнением действия</li>
+                        <li><strong>PostActionAnalyzer</strong> — анализ ПОСЛЕ выполнения действия</li>
+                        <li><strong>SelfHealingService</strong> — автоматическое восстановление сломанных селекторов</li>
+                        <li><strong>SafetyGuard</strong> — защита от опасных действий</li>
+                        <li><strong>StateTracker</strong> — отслеживание состояния теста</li>
+                        <li><strong>FormIntelligenceService</strong> — умная работа с формами</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="flow">
+                <h2>3. Полный Flow тестирования</h2>
+
+                <div class="flow-step">
+                    <h4>1. ИНИЦИАЛИЗАЦИЯ</h4>
+                    <ul>
+                        <li>Создание browser context</li>
+                        <li>Настройка abort controller</li>
+                        <li>Инициализация cost manager</li>
+                    </ul>
+                </div>
+
+                <div class="flow-step">
+                    <h4>2. НАВИГАЦИЯ</h4>
+                    <ul>
+                        <li><code>goto(url, { waitUntil: 'domcontentloaded' })</code></li>
+                        <li><code>waitForSPALoad()</code> — ждёт network idle + interactive elements</li>
+                        <li>Проверка статуса ответа</li>
+                    </ul>
+                </div>
+
+                <div class="flow-step">
+                    <h4>3. АНАЛИЗ СТРАНИЦЫ (IntelligentPageAnalyzer)</h4>
+                    <ul>
+                        <li><strong>Vision Analysis</strong> (GPT-4o) — скриншот → понимание UI</li>
+                        <li><strong>DOM Analysis</strong> — структура, элементы, формы</li>
+                        <li><strong>Modal Detection</strong> — cookie banners, popups</li>
+                        <li><strong>Результат:</strong> <code>PageContext { url, pageType, elements, forms, warnings }</code></li>
+                    </ul>
+                </div>
+
+                <div class="flow-step">
+                    <h4>4. ГЕНЕРАЦИЯ ДЕЙСТВИЙ (ContextualActionGenerator)</h4>
+                    <ul>
+                        <li>AI (GPT-4o-mini) анализирует контекст</li>
+                        <li>Генерирует действия для достижения цели</li>
+                        <li><strong>Результат:</strong> <code>DynamicAction[] + reasoning + confidence</code></li>
+                    </ul>
+                </div>
+
+                <div class="flow-step">
+                    <h4>5. PRE-ACTION ANALYSIS (PreActionAnalyzer)</h4>
+                    <ul>
+                        <li>Проверка: элемент enabled/visible?</li>
+                        <li>Нужны ли prerequisite actions?</li>
+                        <li><strong>Результат:</strong> <code>canProceed + prerequisiteActions</code></li>
+                    </ul>
+                </div>
+
+                <div class="flow-step">
+                    <h4>6. ВЫПОЛНЕНИЕ ДЕЙСТВИЯ (CommandExecutor)</h4>
+                    <div class="code-block">
+<code>a) getSmartLocator() — находит лучший элемент
+   • Находит все элементы по селектору
+   • Анализирует: tag, role, interactivity, visibility
+   • Рассчитывает score для каждого
+   • При неоднозначности → AI disambiguation
+   • Возвращает лучший locator
+
+b) SmartWaitService — ждёт готовности
+   • waitFor({ state: 'visible' })
+   • Адаптивная стратегия (fast/stable/network_idle/full)
+
+c) Выполнение: click/fill/select/etc
+
+d) При ошибке → Self-Healing
+   • SelfHealingService.healSelector()
+   • AI находит новый селектор
+   • Повторяет действие</code>
+                    </div>
+                </div>
+
+                <div class="flow-step">
+                    <h4>7. POST-ACTION ANALYSIS (PostActionAnalyzer)</h4>
+                    <ul>
+                        <li>Что изменилось в DOM?</li>
+                        <li>Появились ли autocomplete/suggestions?</li>
+                        <li>Появились ли модальные окна?</li>
+                        <li>Нужны ли follow-up actions?</li>
+                    </ul>
+                </div>
+
+                <div class="flow-step">
+                    <h4>8. VALIDATION (ResultValidator)</h4>
+                    <ul>
+                        <li>Проверка expectedResult</li>
+                        <li>Для fill/type: проверка input value</li>
+                        <li>Для check: проверка checkbox state</li>
+                        <li>Для select: проверка selected option</li>
+                    </ul>
+                </div>
+
+                <div class="flow-step">
+                    <h4>9. DECISION (ContextualActionGenerator.decideNextStep)</h4>
+                    <ul>
+                        <li><span class="badge badge-success">continue</span> — продолжить тестирование</li>
+                        <li><span class="badge badge-danger">stop</span> — цель достигнута или лимиты</li>
+                        <li><span class="badge badge-warning">wait_for_user</span> — нужен input пользователя</li>
+                        <li><span class="badge badge-info">retry</span> — повторить действие</li>
+                        <li><span class="badge badge-info">skip</span> — пропустить и продолжить</li>
+                    </ul>
+                </div>
+
+                <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 1. ИНИЦИАЛИЗАЦИЯ                                                                 │
+│    • Создание browser context                                                    │
+│    • Настройка abort controller                                                  │
+│    • Инициализация cost manager                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 2. НАВИГАЦИЯ                                                                     │
+│    • goto(url, { waitUntil: 'domcontentloaded' })                               │
+│    • waitForSPALoad() — ждёт network idle + interactive elements                │
+│    • Проверка статуса ответа                                                    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 3. АНАЛИЗ СТРАНИЦЫ (IntelligentPageAnalyzer)                                    │
+│    • Vision Analysis (GPT-4o) — скриншот → понимание UI                         │
+│    • DOM Analysis — структура, элементы, формы                                  │
+│    • Modal Detection — cookie banners, popups                                    │
+│    • Результат: PageContext { url, pageType, elements, forms, warnings }        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 4. ГЕНЕРАЦИЯ ДЕЙСТВИЙ (ContextualActionGenerator)                               │
+│    • AI (GPT-4o-mini) анализирует контекст                                      │
+│    • Генерирует действия для достижения цели                                    │
+│    • Результат: DynamicAction[] + reasoning + confidence                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 5. PRE-ACTION ANALYSIS (PreActionAnalyzer)                                      │
+│    • Проверка: элемент enabled/visible?                                         │
+│    • Нужны ли prerequisite actions?                                            │
+│    • Результат: canProceed + prerequisiteActions                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 6. ВЫПОЛНЕНИЕ ДЕЙСТВИЯ (CommandExecutor)                                       │
+│    ┌──────────────────────────────────────────────────────────────────────┐     │
+│    │ a) getSmartLocator() — находит лучший элемент                        │     │
+│    │    • Находит все элементы по селектору                               │     │
+│    │    • Анализирует: tag, role, interactivity, visibility               │     │
+│    │    • Рассчитывает score для каждого                                  │     │
+│    │    • При неоднозначности → AI disambiguation                         │     │
+│    │    • Возвращает лучший locator                                       │     │
+│    └──────────────────────────────────────────────────────────────────────┘     │
+│    ┌──────────────────────────────────────────────────────────────────────┐     │
+│    │ b) SmartWaitService — ждёт готовности                                │     │
+│    │    • waitFor({ state: 'visible' })                                   │     │
+│    │    • Адаптивная стратегия (fast/stable/network_idle/full)            │     │
+│    └──────────────────────────────────────────────────────────────────────┘     │
+│    ┌──────────────────────────────────────────────────────────────────────┐     │
+│    │ c) Выполнение: click/fill/select/etc                                 │     │
+│    └──────────────────────────────────────────────────────────────────────┘     │
+│    ┌──────────────────────────────────────────────────────────────────────┐     │
+│    │ d) При ошибке → Self-Healing                                         │     │
+│    │    • SelfHealingService.healSelector()                               │     │
+│    │    • AI находит новый селектор                                       │     │
+│    │    • Повторяет действие                                              │     │
+│    └──────────────────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 7. POST-ACTION ANALYSIS (PostActionAnalyzer)                                    │
+│    • Что изменилось в DOM?                                                      │
+│    • Появились ли autocomplete/suggestions?                                     │
+│    • Появились ли модальные окна?                                               │
+│    • Нужны ли follow-up actions?                                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 8. VALIDATION (ResultValidator)                                                 │
+│    • Проверка expectedResult                                                    │
+│    • Для fill/type: проверка input value                                        │
+│    • Для check: проверка checkbox state                                         │
+│    • Для select: проверка selected option                                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 9. DECISION (ContextualActionGenerator.decideNextStep)                          │
+│    • continue — продолжить тестирование                                         │
+│    • stop — цель достигнута или лимиты                                          │
+│    • wait_for_user — нужен input пользователя                                    │
+│    • retry — повторить действие                                                 │
+│    • skip — пропустить и продолжить                                             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+                              ┌───────────┴───────────┐
+                              │                       │
+                         continue                   stop
+                              │                       │
+                              ▼                       ▼
+                     ↩️ Обратно к шагу 3      ✅ Завершение теста
+                </div>
+            </section>
+
+            <section id="ai-models">
+                <h2>4. AI модели и стоимость</h2>
+
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Компонент</th>
+                            <th>Модель</th>
+                            <th>Стоимость за вызов</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Vision Analysis</td>
+                            <td><span class="badge badge-success">GPT-4o</span></td>
+                            <td>~$0.0055</td>
+                        </tr>
+                        <tr>
+                            <td>DOM Analysis</td>
+                            <td><span class="badge badge-info">GPT-4o-mini</span></td>
+                            <td>~$0.0001</td>
+                        </tr>
+                        <tr>
+                            <td>Action Generation</td>
+                            <td><span class="badge badge-info">GPT-4o-mini</span></td>
+                            <td>~$0.0002</td>
+                        </tr>
+                        <tr>
+                            <td>Decision Making</td>
+                            <td><span class="badge badge-info">GPT-4o-mini</span></td>
+                            <td>~$0.0001</td>
+                        </tr>
+                        <tr>
+                            <td>Self-Healing</td>
+                            <td><span class="badge badge-success">GPT-4o</span></td>
+                            <td>~$0.001-0.003</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <h4>Max Cost per Test</h4>
+                        <div class="value">$1.00</div>
+                    </div>
+                    <div class="stat-card">
+                        <h4>Warning Threshold</h4>
+                        <div class="value">70%</div>
+                    </div>
+                    <div class="stat-card">
+                        <h4>Fallback Model</h4>
+                        <div class="value">gpt-4o-mini</div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="config">
+                <h2>5. Конфигурация</h2>
+
+                <div class="code-block">
+<code>interface IntelligentTestConfig {
+  goal: string;              // Цель тестирования
+  startUrl: string;          // URL для начала
+  mode: 'full' | 'fast' | 'balanced';  // Режим анализа
+  maxPages?: number;         // Макс. страниц (default: 10)
+  maxDuration?: number;      // Макс. время (default: 5 мин)
+  safetyLevel?: 'strict' | 'normal' | 'permissive';
+  hints?: TestHint[];        // Подсказки от пользователя
+  credentials?: {            // Для авторизации
+    email?: string;
+    password?: string;
+  };
+}</code>
+                </div>
+
+                <h3>Пример использования:</h3>
+                <div class="code-block">
+<code>const config: IntelligentTestConfig = {
+  goal: "Зарегистрировать нового пользователя",
+  startUrl: "https://example.com/register",
+  mode: "balanced",
+  maxPages: 10,
+  maxDuration: 5 * 60 * 1000, // 5 минут
+  safetyLevel: "normal",
+  credentials: {
+    email: "test@example.com",
+    password: "securePassword123"
+  }
+};
+
+const orchestrator = new IntelligentTestOrchestrator(config, userId, testId);
+const result = await orchestrator.execute(browser, page);</code>
+                </div>
+            </section>
+        </div>
+
+        <footer>
+            <p>📚 Intelligent Mode Architecture Documentation | QAI Backend</p>
+            <p>Generated: <span id="date"></span></p>
+        </footer>
+    </div>
+
+    <script>
+        document.getElementById('date').textContent = new Date().toLocaleDateString('ru-RU', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric'
+        });
+    </script>
+</body>
+</html>

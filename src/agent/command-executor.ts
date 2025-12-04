@@ -4,7 +4,7 @@ import { SelfHealingService } from '@/services/ai-selector/self-healing.service'
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/logger';
 import { Locator, Page } from 'playwright';
-import { getLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLocator } from './utils/selector-utils';
+import { getLocator, getSmartLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLocator } from './utils/selector-utils';
 import { SelectorStabilityScore, SmartWaitService } from './utils/smart-wait.service';
 
 /**
@@ -130,11 +130,23 @@ export class CommandExecutor {
         case 'click':
           if (!selector) throw new Error('Selector is required for click action');
 
-          // Use smart waiting with flakiness detection
-          const clickWait = await this.waitForElementSmart(selector, {
-            timeout: timeout || 10000,
-            actionType: 'click',
-          });
+          // ✅ NEW: Use smart locator to select the right element based on action context
+          // This fixes the issue where text="Математика" finds <span> instead of <button>
+          // Pass description as intent for AI disambiguation if needed
+          const smartResult = await getSmartLocator(
+            this.page,
+            selector,
+            'click',
+            description // Intent for AI context
+          );
+
+          if (smartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used', {
+              selector: selector.substring(0, 50),
+              totalMatches: smartResult.totalMatches,
+              selectedIndex: smartResult.selectedIndex,
+            });
+          }
 
           // ✅ FIX 3: Helper for click with optional navigation wait
           const performClick = async (locator: Locator) => {
@@ -152,8 +164,17 @@ export class CommandExecutor {
             }
           };
 
-          if (!clickWait.success || !clickWait.locator) {
-            // Smart wait failed, try self-healing
+          // Wait for element to be visible first
+          try {
+            await smartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await performClick(smartResult.locator);
+          } catch (clickError) {
+            // Smart locator failed, try self-healing
+            logger.warn('[COMMAND_EXECUTOR] Smart locator click failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: clickError instanceof Error ? clickError.message : String(clickError),
+            });
+
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
@@ -167,8 +188,6 @@ export class CommandExecutor {
                 timeout,
               }
             );
-          } else {
-            await performClick(clickWait.locator);
           }
           break;
 
@@ -176,14 +195,32 @@ export class CommandExecutor {
           if (!selector) throw new Error('Selector is required for fill action');
           if (value === undefined) throw new Error('Value is required for fill action');
 
-          // Use smart waiting with flakiness detection
-          const fillWait = await this.waitForElementSmart(selector, {
-            timeout: timeout || 10000,
-            actionType: 'fill',
-          });
+          // ✅ NEW: Use smart locator to select the right input element
+          const fillSmartResult = await getSmartLocator(
+            this.page,
+            selector,
+            'fill',
+            description // Intent for AI context
+          );
 
-          if (!fillWait.success || !fillWait.locator) {
-            // Smart wait failed, try self-healing
+          if (fillSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for fill', {
+              selector: selector.substring(0, 50),
+              totalMatches: fillSmartResult.totalMatches,
+              selectedIndex: fillSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            await fillSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await fillSmartResult.locator.fill(String(value), { timeout: timeout || 30000 });
+          } catch (fillError) {
+            // Smart locator failed, try self-healing
+            logger.warn('[COMMAND_EXECUTOR] Smart locator fill failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: fillError instanceof Error ? fillError.message : String(fillError),
+            });
+
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
@@ -197,8 +234,6 @@ export class CommandExecutor {
                 value,
               }
             );
-          } else {
-            await fillWait.locator.fill(String(value), { timeout: timeout || 30000 });
           }
           // Note: Post-action analysis handled by PostActionAnalyzer
           break;
@@ -206,42 +241,267 @@ export class CommandExecutor {
         case 'type':
           if (!selector) throw new Error('Selector is required for type action');
           if (value === undefined) throw new Error('Value is required for type action');
-          const typeLocator = this.getLocatorInternal(selector);
-          await typeLocator.type(String(value), { timeout: timeout || 30000 });
+
+          // ✅ NEW: Use smart locator for type action
+          const typeSmartResult = await getSmartLocator(
+            this.page,
+            selector,
+            'fill', // Type is similar to fill - targets input elements
+            description
+          );
+
+          if (typeSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for type', {
+              selector: selector.substring(0, 50),
+              totalMatches: typeSmartResult.totalMatches,
+              selectedIndex: typeSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            await typeSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await typeSmartResult.locator.type(String(value), { timeout: timeout || 30000 });
+          } catch (typeError) {
+            logger.warn('[COMMAND_EXECUTOR] Smart locator type failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: typeError instanceof Error ? typeError.message : String(typeError),
+            });
+
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.type(String(value), { timeout: timeout || 30000 });
+              },
+              {
+                selector,
+                intent: description || `type ${value}`,
+                action: 'type',
+                timeout,
+                value,
+              }
+            );
+          }
           break;
 
         case 'select':
           if (!selector) throw new Error('Selector is required for select action');
           if (value === undefined) throw new Error('Value is required for select action');
 
+          // ✅ NEW: Use smart locator to select the right select element
+          const selectSmartResult = await getSmartLocator(
+            this.page,
+            selector,
+            'select',
+            description // Intent for AI context
+          );
+
+          if (selectSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for select', {
+              selector: selector.substring(0, 50),
+              totalMatches: selectSmartResult.totalMatches,
+              selectedIndex: selectSmartResult.selectedIndex,
+            });
+          }
+
           // ✅ FIX 5: Support multiple selectOption formats
-          const selectLocator = this.getLocatorInternal(selector);
           const selectValue = this.parseSelectValue(value);
-          await selectLocator.selectOption(selectValue, { timeout: timeout || 30000 });
+
+          try {
+            await selectSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await selectSmartResult.locator.selectOption(selectValue, { timeout: timeout || 30000 });
+          } catch (selectError) {
+            // Smart locator failed, try self-healing
+            logger.warn('[COMMAND_EXECUTOR] Smart locator select failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: selectError instanceof Error ? selectError.message : String(selectError),
+            });
+
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.selectOption(selectValue, { timeout: timeout || 30000 });
+              },
+              {
+                selector,
+                intent: description || `select ${value}`,
+                action: 'select',
+                timeout,
+                value,
+              }
+            );
+          }
           break;
 
         case 'check':
           if (!selector) throw new Error('Selector is required for check action');
-          const checkLocator = this.getLocatorInternal(selector);
-          await checkLocator.check({ timeout: timeout || 30000 });
+
+          // ✅ NEW: Use smart locator for check action
+          const checkSmartResult = await getSmartLocator(
+            this.page,
+            selector,
+            'check', // Uses checkbox preferences
+            description
+          );
+
+          if (checkSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for check', {
+              selector: selector.substring(0, 50),
+              totalMatches: checkSmartResult.totalMatches,
+              selectedIndex: checkSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            await checkSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await checkSmartResult.locator.check({ timeout: timeout || 30000 });
+          } catch (checkError) {
+            logger.warn('[COMMAND_EXECUTOR] Smart locator check failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: checkError instanceof Error ? checkError.message : String(checkError),
+            });
+
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.check({ timeout: timeout || 30000 });
+              },
+              {
+                selector,
+                intent: description || 'check checkbox',
+                action: 'check',
+                timeout,
+              }
+            );
+          }
           break;
 
         case 'uncheck':
           if (!selector) throw new Error('Selector is required for uncheck action');
-          const uncheckLocator = this.getLocatorInternal(selector);
-          await uncheckLocator.uncheck({ timeout: timeout || 30000 });
+
+          // ✅ NEW: Use smart locator for uncheck action
+          const uncheckSmartResult = await getSmartLocator(
+            this.page,
+            selector,
+            'check', // Same preferences as check
+            description
+          );
+
+          if (uncheckSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for uncheck', {
+              selector: selector.substring(0, 50),
+              totalMatches: uncheckSmartResult.totalMatches,
+              selectedIndex: uncheckSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            await uncheckSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await uncheckSmartResult.locator.uncheck({ timeout: timeout || 30000 });
+          } catch (uncheckError) {
+            logger.warn('[COMMAND_EXECUTOR] Smart locator uncheck failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: uncheckError instanceof Error ? uncheckError.message : String(uncheckError),
+            });
+
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.uncheck({ timeout: timeout || 30000 });
+              },
+              {
+                selector,
+                intent: description || 'uncheck checkbox',
+                action: 'uncheck',
+                timeout,
+              }
+            );
+          }
           break;
 
         case 'hover':
           if (!selector) throw new Error('Selector is required for hover action');
-          const hoverLocator = this.getLocatorInternal(selector);
-          await hoverLocator.hover({ timeout: timeout || 30000 });
+
+          // ✅ NEW: Use smart locator for hover action
+          const hoverSmartResult = await getSmartLocator(
+            this.page,
+            selector,
+            'hover',
+            description
+          );
+
+          if (hoverSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for hover', {
+              selector: selector.substring(0, 50),
+              totalMatches: hoverSmartResult.totalMatches,
+              selectedIndex: hoverSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            await hoverSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await hoverSmartResult.locator.hover({ timeout: timeout || 30000 });
+          } catch (hoverError) {
+            logger.warn('[COMMAND_EXECUTOR] Smart locator hover failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: hoverError instanceof Error ? hoverError.message : String(hoverError),
+            });
+
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.hover({ timeout: timeout || 30000 });
+              },
+              {
+                selector,
+                intent: description || 'hover element',
+                action: 'hover',
+                timeout,
+              }
+            );
+          }
           break;
 
         case 'dblclick':
           if (!selector) throw new Error('Selector is required for dblclick action');
-          const dblclickLocator = this.getLocatorInternal(selector);
-          await dblclickLocator.dblclick({ timeout: timeout || 30000 });
+
+          // ✅ NEW: Use smart locator for dblclick action
+          const dblclickSmartResult = await getSmartLocator(
+            this.page,
+            selector,
+            'click', // Same preferences as click
+            description
+          );
+
+          if (dblclickSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for dblclick', {
+              selector: selector.substring(0, 50),
+              totalMatches: dblclickSmartResult.totalMatches,
+              selectedIndex: dblclickSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            await dblclickSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await dblclickSmartResult.locator.dblclick({ timeout: timeout || 30000 });
+          } catch (dblclickError) {
+            logger.warn('[COMMAND_EXECUTOR] Smart locator dblclick failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: dblclickError instanceof Error ? dblclickError.message : String(dblclickError),
+            });
+
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.dblclick({ timeout: timeout || 30000 });
+              },
+              {
+                selector,
+                intent: description || 'double click element',
+                action: 'dblclick',
+                timeout,
+              }
+            );
+          }
           break;
 
         case 'focus':

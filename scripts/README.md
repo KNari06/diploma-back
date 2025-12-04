@@ -61,3 +61,39 @@ curl -X POST http://localhost:3000/api/v1/auth/login \
 - If user already exists, script will update existing user
 - Script is idempotent (safe to run multiple times)
 - All users have email confirmed (no verification needed)
+
+## analyze-playwright-selector.ts
+
+Analyzes how Playwright finds elements on a page. Helps debug selector issues like finding `<span>` instead of `<button>`.
+
+### Usage
+
+```bash
+npm run analyze-selector
+```
+
+### What it does
+
+1. Opens the target page (`https://repetino.kz/onboarding`)
+2. Analyzes DOM structure around target text ("Математика")
+3. Tests different selector methods:
+   - `getByText()` - what element does it find?
+   - `getByRole('button')` - does it find the button?
+   - CSS selector `button:has-text()` - alternative approach
+4. Compares viewport positions of found elements
+5. Tests click attempts and viewport checks
+
+### Output
+
+The script shows:
+- Which elements contain the target text
+- HTML structure (tag, parent, classes, role)
+- What `getByText()` finds vs `getByRole()`
+- Viewport positions and visibility
+- Why clicks might fail
+
+### Configuration
+
+Edit the script to change:
+- `URL` - target page URL
+- `TARGET_TEXT` - text to search for

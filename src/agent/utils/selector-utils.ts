@@ -4,6 +4,7 @@
  * Used by CommandExecutor, IntelligentTestOrchestrator, and other components
  */
 
+import { AISelectorEngine } from '@/services/ai-selector/ai-selector-engine.service';
 import { logger } from '@/utils/logger';
 import { Locator, Page } from 'playwright';
 
@@ -645,4 +646,593 @@ export function isSelectorRelatedError(error: any): boolean {
   ];
 
   return selectorErrorPatterns.some(pattern => pattern.test(message));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SMART LOCATOR - ACTION-AWARE ELEMENT SELECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Action types and their preferred element types
+ * This defines what kind of elements are expected for each action
+ */
+const ACTION_ELEMENT_PREFERENCES: Record<string, {
+  preferredTags: string[];
+  preferredRoles: string[];
+  requiresInteractive: boolean;
+}> = {
+  // Click actions - need interactive elements
+  click: {
+    preferredTags: ['button', 'a', 'input', 'select', 'label'],
+    preferredRoles: ['button', 'link', 'menuitem', 'tab', 'checkbox', 'radio', 'switch', 'option'],
+    requiresInteractive: true,
+  },
+  dblclick: {
+    preferredTags: ['button', 'a', 'input', 'div', 'span'],
+    preferredRoles: ['button', 'link', 'menuitem'],
+    requiresInteractive: true,
+  },
+
+  // Input actions - need input elements
+  fill: {
+    preferredTags: ['input', 'textarea'],
+    preferredRoles: ['textbox', 'searchbox', 'spinbutton'],
+    requiresInteractive: true,
+  },
+  type: {
+    preferredTags: ['input', 'textarea'],
+    preferredRoles: ['textbox', 'searchbox'],
+    requiresInteractive: true,
+  },
+
+  // Selection actions
+  select: {
+    preferredTags: ['select'],
+    preferredRoles: ['combobox', 'listbox'],
+    requiresInteractive: true,
+  },
+  check: {
+    preferredTags: ['input'],
+    preferredRoles: ['checkbox', 'switch'],
+    requiresInteractive: true,
+  },
+  uncheck: {
+    preferredTags: ['input'],
+    preferredRoles: ['checkbox', 'switch'],
+    requiresInteractive: true,
+  },
+
+  // Hover/Focus - any visible element
+  hover: {
+    preferredTags: ['button', 'a', 'div', 'span', 'img'],
+    preferredRoles: ['button', 'link', 'img', 'menuitem'],
+    requiresInteractive: false,
+  },
+  focus: {
+    preferredTags: ['input', 'textarea', 'button', 'a', 'select'],
+    preferredRoles: ['textbox', 'button', 'link', 'combobox'],
+    requiresInteractive: true,
+  },
+
+  // Scroll - any element
+  scroll: {
+    preferredTags: [],
+    preferredRoles: [],
+    requiresInteractive: false,
+  },
+  scrollIntoView: {
+    preferredTags: [],
+    preferredRoles: [],
+    requiresInteractive: false,
+  },
+
+  // Assertions - any element with text
+  assertVisible: {
+    preferredTags: [],
+    preferredRoles: [],
+    requiresInteractive: false,
+  },
+  assertText: {
+    preferredTags: [],
+    preferredRoles: [],
+    requiresInteractive: false,
+  },
+  assertValue: {
+    preferredTags: ['input', 'textarea', 'select'],
+    preferredRoles: ['textbox', 'combobox'],
+    requiresInteractive: false,
+  },
+
+  // Default for unknown actions
+  default: {
+    preferredTags: [],
+    preferredRoles: [],
+    requiresInteractive: false,
+  },
+};
+
+/**
+ * Element analysis result from browser context
+ */
+interface ElementAnalysis {
+  index: number;
+  tag: string;
+  role: string | null;
+  isInteractive: boolean;
+  isVisible: boolean;
+  isInViewport: boolean;
+  hasClickHandler: boolean;
+  cursorPointer: boolean;
+  text: string;
+  score: number; // Calculated preference score
+}
+
+/**
+ * ✅ NEW: Smart locator that selects the right element based on action context
+ *
+ * This solves the problem where text="Математика" finds <span> instead of <button>
+ * by analyzing all matching elements and selecting the most appropriate one
+ * based on the action type.
+ *
+ * Uses hybrid approach:
+ * 1. Static rules first (fast, cheap) - tag, role, interactivity
+ * 2. AI fallback if ambiguous (when multiple elements have similar scores)
+ *
+ * @param page - Playwright page
+ * @param selector - Original selector (e.g., text="Математика")
+ * @param actionType - The action to perform (click, fill, select, etc.)
+ * @param intent - Optional: action description for AI context (e.g., "Click on the 'Математика' button to select this subject")
+ * @param useAI - Optional: force AI usage even if not ambiguous (default: auto-detect)
+ * @returns The most appropriate locator for the action
+ */
+export async function getSmartLocator(
+  page: Page,
+  selector: string,
+  actionType: string,
+  intent?: string,
+  useAI: boolean | 'auto' = 'auto'
+): Promise<{
+  locator: Locator;
+  wasSmartSelected: boolean;
+  selectedIndex: number;
+  totalMatches: number;
+  usedAI: boolean;
+  analysis?: ElementAnalysis[];
+}> {
+  const normalizedSelector = normalizeSelector(selector);
+  const preferences = ACTION_ELEMENT_PREFERENCES[actionType] || ACTION_ELEMENT_PREFERENCES.default;
+
+  // Get base locator
+  const baseLocator = getLocator(page, normalizedSelector);
+
+  // Check how many elements match
+  const count = await baseLocator.count().catch(() => 0);
+
+  // If 0 or 1 element, no smart selection needed
+  if (count <= 1) {
+    return {
+      locator: baseLocator.first(),
+      wasSmartSelected: false,
+      selectedIndex: 0,
+      totalMatches: count,
+      usedAI: false,
+    };
+  }
+
+  logger.debug('[SELECTOR_UTILS] Multiple elements found, using smart selection', {
+    selector: normalizedSelector.substring(0, 50),
+    count,
+    actionType,
+  });
+
+  // Analyze all matching elements
+  const analysisResults: ElementAnalysis[] = [];
+
+  for (let i = 0; i < Math.min(count, 10); i++) { // Limit to 10 elements for performance
+    const element = baseLocator.nth(i);
+
+    try {
+      const analysis = await element.evaluate((el, prefs) => {
+        // @ts-ignore - browser context
+        const tag = el.tagName.toLowerCase();
+        // @ts-ignore - browser context
+        const explicitRole = el.getAttribute('role');
+
+        // ✅ FIX: Get implicit ARIA role based on HTML element
+        // HTML elements have implicit roles even without role="" attribute
+        const implicitRoleMap: Record<string, string> = {
+          'button': 'button',
+          'a': 'link',
+          'input': 'textbox', // simplified, depends on type
+          'textarea': 'textbox',
+          'select': 'combobox',
+          'option': 'option',
+          'img': 'img',
+          'nav': 'navigation',
+          'main': 'main',
+          'header': 'banner',
+          'footer': 'contentinfo',
+          'aside': 'complementary',
+          'form': 'form',
+          'article': 'article',
+          'section': 'region',
+          'ul': 'list',
+          'ol': 'list',
+          'li': 'listitem',
+          'table': 'table',
+          'tr': 'row',
+          'td': 'cell',
+          'th': 'columnheader',
+          'h1': 'heading',
+          'h2': 'heading',
+          'h3': 'heading',
+          'h4': 'heading',
+          'h5': 'heading',
+          'h6': 'heading',
+        };
+
+        // Special case for input types
+        // @ts-ignore - browser context
+        const inputType = el.type?.toLowerCase();
+        let implicitRole = implicitRoleMap[tag] || null;
+        if (tag === 'input') {
+          const inputRoleMap: Record<string, string> = {
+            'text': 'textbox',
+            'email': 'textbox',
+            'password': 'textbox',
+            'search': 'searchbox',
+            'tel': 'textbox',
+            'url': 'textbox',
+            'number': 'spinbutton',
+            'range': 'slider',
+            'checkbox': 'checkbox',
+            'radio': 'radio',
+            'button': 'button',
+            'submit': 'button',
+            'reset': 'button',
+          };
+          implicitRole = inputRoleMap[inputType] || 'textbox';
+        }
+
+        // Use explicit role if set, otherwise implicit
+        const role = explicitRole || implicitRole;
+        // @ts-ignore - browser context
+        const style = window.getComputedStyle(el);
+        // @ts-ignore - browser context
+        const rect = el.getBoundingClientRect();
+        // @ts-ignore - browser context
+        const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+        // @ts-ignore - browser context
+        const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+
+        // Check interactivity
+        const isInteractive = (
+          ['button', 'a', 'input', 'select', 'textarea', 'label'].includes(tag) ||
+          ['button', 'link', 'menuitem', 'tab', 'checkbox', 'radio', 'switch', 'option', 'combobox', 'textbox'].includes(role || '') ||
+          // @ts-ignore - browser context
+          el.onclick !== null ||
+          // @ts-ignore - browser context
+          el.hasAttribute('onclick') ||
+          style.cursor === 'pointer' ||
+          // @ts-ignore - browser context
+          el.tabIndex >= 0
+        );
+
+        // Check visibility
+        const isVisible = (
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          style.opacity !== '0' &&
+          rect.width > 0 &&
+          rect.height > 0
+        );
+
+        // Check viewport
+        const isInViewport = (
+          rect.top >= 0 &&
+          rect.left >= 0 &&
+          rect.bottom <= viewportHeight &&
+          rect.right <= viewportWidth
+        );
+
+        // Calculate score
+        let score = 0;
+
+        // Preferred tag match (+50)
+        if (prefs.preferredTags.includes(tag)) {
+          score += 50;
+        }
+
+        // Preferred role match (+40)
+        if (role && prefs.preferredRoles.includes(role)) {
+          score += 40;
+        }
+
+        // Interactive bonus (+30 if required, +10 otherwise)
+        if (isInteractive) {
+          score += prefs.requiresInteractive ? 30 : 10;
+        } else if (prefs.requiresInteractive) {
+          score -= 50; // Penalty for non-interactive when required
+        }
+
+        // Visibility bonus (+20)
+        if (isVisible) {
+          score += 20;
+        }
+
+        // Viewport bonus (+10)
+        if (isInViewport) {
+          score += 10;
+        }
+
+        // Cursor pointer bonus (+5)
+        if (style.cursor === 'pointer') {
+          score += 5;
+        }
+
+        return {
+          tag,
+          role,
+          isInteractive,
+          isVisible,
+          isInViewport,
+          // @ts-ignore - browser context
+          hasClickHandler: el.onclick !== null || el.hasAttribute('onclick'),
+          cursorPointer: style.cursor === 'pointer',
+          // @ts-ignore - browser context
+          text: (el.textContent || '').trim().substring(0, 50),
+          score,
+        };
+      }, preferences);
+
+      analysisResults.push({
+        index: i,
+        ...analysis,
+      });
+    } catch (error) {
+      // Element might be detached, skip it
+      logger.debug('[SELECTOR_UTILS] Failed to analyze element', {
+        index: i,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  // Sort by score (highest first)
+  analysisResults.sort((a, b) => b.score - a.score);
+
+  // Log analysis results
+  logger.info('[SELECTOR_UTILS] Smart element selection', {
+    selector: normalizedSelector.substring(0, 50),
+    actionType,
+    totalMatches: count,
+    analyzed: analysisResults.length,
+    topCandidate: analysisResults[0] ? {
+      index: analysisResults[0].index,
+      tag: analysisResults[0].tag,
+      role: analysisResults[0].role,
+      isInteractive: analysisResults[0].isInteractive,
+      score: analysisResults[0].score,
+    } : null,
+  });
+
+  // Select the best element
+  const bestMatch = analysisResults[0];
+  if (!bestMatch) {
+    // Fallback to first element
+    return {
+      locator: baseLocator.first(),
+      wasSmartSelected: false,
+      selectedIndex: 0,
+      totalMatches: count,
+      usedAI: false,
+    };
+  }
+
+  // ✅ NEW: Check if we need AI for disambiguation
+  const needsAI = useAI === true || (
+    useAI === 'auto' &&
+    analysisResults.length >= 2 &&
+    intent && // Only use AI if we have intent
+    (
+      // Case 1: Top 2 elements have very close scores (difference < 10)
+      (analysisResults[0].score - analysisResults[1].score < 10) ||
+      // Case 2: Multiple elements with high scores (> 50) - all are good candidates
+      (analysisResults.filter(a => a.score > 50).length >= 2) ||
+      // Case 3: Top element score is low (< 30) - static rules didn't help much
+      (analysisResults[0].score < 30)
+    )
+  );
+
+  let finalIndex = bestMatch.index;
+  let usedAI = false;
+
+  if (needsAI && intent) {
+    logger.info('[SELECTOR_UTILS] Ambiguous selection, using AI for disambiguation', {
+      selector: normalizedSelector.substring(0, 50),
+      topScore: analysisResults[0].score,
+      secondScore: analysisResults[1]?.score,
+      intent: intent.substring(0, 100),
+    });
+
+    try {
+      // Get top candidates (score > 50 or top 3)
+      const topCandidates = analysisResults
+        .filter(a => a.score > 50 || analysisResults.indexOf(a) < 3)
+        .slice(0, 5); // Limit to 5 for AI
+
+      if (topCandidates.length >= 2) {
+        // Extract DOM nodes for top candidates
+        const nodes = await Promise.all(
+          topCandidates.map(async (candidate) => {
+            const element = baseLocator.nth(candidate.index);
+            try {
+              const nodeData = await element.evaluate((el) => {
+                // @ts-ignore - browser context
+                const rect = el.getBoundingClientRect();
+                // @ts-ignore - browser context
+                const tag = el.tagName.toLowerCase();
+                // @ts-ignore - browser context
+                const explicitRole = el.getAttribute('role');
+
+                // ✅ FIX: Calculate implicit ARIA role (same logic as static analysis)
+                const implicitRoleMap: Record<string, string> = {
+                  'button': 'button',
+                  'a': 'link',
+                  'input': 'textbox',
+                  'textarea': 'textbox',
+                  'select': 'combobox',
+                  'option': 'option',
+                  'img': 'img',
+                  'nav': 'navigation',
+                  'main': 'main',
+                  'header': 'banner',
+                  'footer': 'contentinfo',
+                  'aside': 'complementary',
+                  'form': 'form',
+                  'article': 'article',
+                  'section': 'region',
+                  'ul': 'list',
+                  'ol': 'list',
+                  'li': 'listitem',
+                  'table': 'table',
+                  'tr': 'row',
+                  'td': 'cell',
+                  'th': 'columnheader',
+                  'h1': 'heading',
+                  'h2': 'heading',
+                  'h3': 'heading',
+                  'h4': 'heading',
+                  'h5': 'heading',
+                  'h6': 'heading',
+                };
+
+                // Special case for input types
+                // @ts-ignore - browser context
+                const inputType = el.type?.toLowerCase();
+                let implicitRole = implicitRoleMap[tag] || null;
+                if (tag === 'input') {
+                  const inputRoleMap: Record<string, string> = {
+                    'text': 'textbox',
+                    'email': 'textbox',
+                    'password': 'textbox',
+                    'search': 'searchbox',
+                    'tel': 'textbox',
+                    'url': 'textbox',
+                    'number': 'spinbutton',
+                    'range': 'slider',
+                    'checkbox': 'checkbox',
+                    'radio': 'radio',
+                    'button': 'button',
+                    'submit': 'button',
+                    'reset': 'button',
+                  };
+                  implicitRole = inputRoleMap[inputType] || 'textbox';
+                }
+
+                // Use explicit role if set, otherwise implicit
+                const role = explicitRole || implicitRole;
+
+                return {
+                  tag,
+                  // @ts-ignore
+                  text: (el.textContent || '').trim().substring(0, 200),
+                  // @ts-ignore
+                  html: el.outerHTML.substring(0, 500),
+                  // @ts-ignore
+                  attributes: Array.from(el.attributes).reduce((acc: Record<string, string>, attr: any) => {
+                    acc[attr.name] = attr.value;
+                    return acc;
+                  }, {} as Record<string, string>),
+                  role, // ✅ FIX: Include role (explicit or implicit)
+                  boundingBox: {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                  },
+                };
+              });
+              return {
+                ...nodeData,
+                index: candidate.index,
+                score: candidate.score,
+              };
+            } catch {
+              return null;
+            }
+          })
+        );
+
+        const validNodes = nodes.filter((n): n is NonNullable<typeof n> => n !== null);
+
+        if (validNodes.length >= 2) {
+          // Get page DOM and viewport
+          const [dom, viewport] = await Promise.all([
+            page.content().catch(() => ''),
+            page.viewportSize() || { width: 1920, height: 1080 },
+          ]);
+
+          // Use AI to select the best candidate
+          const aiResult = await AISelectorEngine.resolve({
+            intent: `${intent} (selector: ${normalizedSelector})`,
+            dom: dom.substring(0, 50000), // Limit DOM size
+            nodes: validNodes.map(n => ({
+              nodeId: `candidate-${n.index}`,
+              tag: n.tag as string,
+              text: n.text as string,
+              attributes: n.attributes as Record<string, string>,
+              role: (n.role as string) || undefined, // ✅ FIX: Include role for AI scoring
+              boundingBox: n.boundingBox,
+              isVisible: true,
+            })),
+            metadata: {
+              url: page.url(),
+              viewport,
+            },
+            mode: 'fast', // Fast mode for performance
+          });
+
+          if (aiResult.success && aiResult.selectedNode) {
+            // Find which candidate matches AI's choice
+            const aiSelectedNodeId = aiResult.selectedNode.nodeId;
+            const matchedCandidate = validNodes.find(n => `candidate-${n.index}` === aiSelectedNodeId);
+
+            if (matchedCandidate) {
+              finalIndex = matchedCandidate.index;
+              usedAI = true;
+
+              logger.info('[SELECTOR_UTILS] AI selected element', {
+                selector: normalizedSelector.substring(0, 50),
+                aiSelectedIndex: finalIndex,
+                aiConfidence: aiResult.selectedNode.confidence,
+                aiSelector: aiResult.selectedNode.primarySelector,
+              });
+            } else {
+              logger.warn('[SELECTOR_UTILS] AI selected element not in candidates, using static result', {
+                aiNodeId: aiSelectedNodeId,
+              });
+            }
+          } else {
+            logger.warn('[SELECTOR_UTILS] AI resolution failed, using static result', {
+              error: aiResult.explanation,
+            });
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn('[SELECTOR_UTILS] AI disambiguation failed, using static result', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return {
+    locator: baseLocator.nth(finalIndex),
+    wasSmartSelected: true,
+    selectedIndex: finalIndex,
+    totalMatches: count,
+    usedAI,
+    analysis: analysisResults,
+  };
 }

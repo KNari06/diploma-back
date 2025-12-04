@@ -779,19 +779,39 @@ CRITICAL RULES:
 0. **SELECTOR USAGE (MOST IMPORTANT)**:
    - ✅ ALWAYS use the EXACT selector from "Available Elements" or "DOM Summary" sections
    - ✅ If selector is provided: use it EXACTLY as shown (e.g., role=button[name="Login"], text="Login")
-   - ✅ Selector formats supported:
-     * role=button[name="Login"] - ARIA role with name (BEST - most stable)
-     * text="Login" - Text content selector
-     * label="Email" - Label selector (for inputs)
-     * #id - ID selector
-     * .class - Class selector
-     * [data-testid="value"] - Test ID selector
+
+   **🎯 SELECTOR FORMAT BY ACTION TYPE (CRITICAL!):**
+
+   For **click** actions on buttons:
+   - ✅ BEST: role=button[name="Login"] - finds actual <button> elements
+   - ✅ GOOD: #button-id, [data-testid="login-btn"] - unique identifiers
+   - ⚠️ AVOID: text="Login" - may find <span> inside button instead of button itself!
+
+   For **fill/type** actions on inputs:
+   - ✅ BEST: label="Email" - finds input by its label
+   - ✅ GOOD: #email-input, [data-testid="email"], [name="email"]
+   - ✅ OK: role=textbox[name="Email"], role=searchbox
+   - ⚠️ AVOID: text="Email" - may find label text, not the input!
+
+   For **select** actions on dropdowns:
+   - ✅ BEST: role=combobox[name="Country"], #country-select
+   - ✅ GOOD: [data-testid="country-dropdown"], [name="country"]
+   - ⚠️ AVOID: text="Select country" - may find placeholder text!
+
+   For **assertText/assertVisible** (any element is fine):
+   - ✅ OK: text="Welcome", role=heading[name="Title"]
+
+   **⚠️ WARNING: text="..." selector finds ANY element with that text!**
+   If page has: <button><span>Login</span></button>
+   - text="Login" → finds <span> (WRONG for click!)
+   - role=button[name="Login"] → finds <button> (CORRECT!)
+
    - ❌ NEVER use jQuery syntax like ":contains()" - NOT supported
-   - ❌ NEVER use button:has-text() - use text= or role= instead
+   - ❌ NEVER use button:has-text() - use role=button[name=] instead
    - ❌ NEVER invent selectors - only use ones provided in the context
    - ❌ NEVER use single quotes in selectors - ALWAYS use double quotes
    - Example: If DOM shows Selector: "role=button[name=\"Login\"]" → use exactly that
-   - Example: If DOM shows Selector: "text=\"Login\"" → use exactly that
+   - Example: If DOM shows Selector: "label=\"Email\"" → use exactly that for fill
 
 1. **Logical Dependencies**:
    - On product page: MUST select size/color BEFORE "add to cart"

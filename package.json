@@ -13,6 +13,7 @@
     "build-kb": "ts-node -r tsconfig-paths/register src/scripts/build-global-kb.ts",
     "create-test-users": "ts-node -r tsconfig-paths/register scripts/create-test-users.ts",
     "create-admin-user": "ts-node -r tsconfig-paths/register scripts/create-admin-user.ts",
+    "analyze-selector": "ts-node -r tsconfig-paths/register scripts/analyze-playwright-selector.ts",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
