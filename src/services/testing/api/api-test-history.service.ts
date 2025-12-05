@@ -196,53 +196,31 @@ export class ApiTestHistoryService {
     data: ApiTestDetails | null;
   }> {
     try {
-      // Find test-chat mapping
-      const { data: mapping, error: mappingError } = await supabaseAdmin
-        .from('test_chat_mappings')
-        .select('chat_session_id, user_id')
-        .eq('test_id', testId)
-        .eq('user_id', userId)
-        .maybeSingle();
+      // ✅ FIX: API test IDs are strings (api_xxx_xxx), not UUIDs
+      // So we search directly in chat_messages, not in test_chat_mappings
+      // (test_chat_mappings.test_id is UUID type, which won't match string IDs)
 
-      if (mappingError && mappingError.code !== 'PGRST116') {
-        throw new Error(`Failed to find test mapping: ${mappingError.message}`);
+      // Get all chat sessions for user
+      const { data: sessions, error: sessionsError } = await supabaseAdmin
+        .from('chat_sessions')
+        .select('id')
+        .eq('user_id', userId);
+
+      if (sessionsError) {
+        throw new Error(`Failed to get chat sessions: ${sessionsError.message}`);
       }
 
-      if (!mapping) {
-        // Fallback: search in chat_messages directly
-        const { data: sessions } = await supabaseAdmin
-          .from('chat_sessions')
-          .select('id')
-          .eq('user_id', userId);
-
-        if (!sessions || sessions.length === 0) {
-          return { success: true, data: null };
-        }
-
-        const sessionIds = sessions.map(s => s.id);
-
-        const { data: messages } = await supabaseAdmin
-          .from('chat_messages')
-          .select('id, session_id, content, metadata, created_at')
-          .in('session_id', sessionIds)
-          .eq('role', 'ai')
-          .eq('metadata->>testId', testId)
-          .eq('metadata->>testType', 'api')
-          .limit(1)
-          .maybeSingle();
-
-        if (!messages) {
-          return { success: true, data: null };
-        }
-
-        return this.formatTestDetails(messages, userId);
+      if (!sessions || sessions.length === 0) {
+        return { success: true, data: null };
       }
 
-      // Get message from chat session
+      const sessionIds = sessions.map(s => s.id);
+
+      // Search for API test message by testId in metadata
       const { data: message, error: messageError } = await supabaseAdmin
         .from('chat_messages')
         .select('id, session_id, content, metadata, created_at')
-        .eq('session_id', mapping.chat_session_id)
+        .in('session_id', sessionIds)
         .eq('role', 'ai')
         .eq('metadata->>testId', testId)
         .eq('metadata->>testType', 'api')
