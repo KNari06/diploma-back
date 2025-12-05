@@ -151,21 +151,47 @@ export class ContextualActionGenerator {
       goal: state.goal,
     });
 
-    // ✅ FIX 6: Check cache first (debounce rapid navigations)
-    // IMPORTANT: Never reuse cached result if it contained 0 actions
-    // We want the model to have another chance to propose actions instead of "sticking" to empty plan.
-    const cached = getCachedGeneration(context, state.goal);
-    if (cached && cached.actions.length > 0) {
-      logger.info('[ACTION_GENERATOR] Using cached actions', {
-        age: Date.now() - cached.timestamp,
-        count: cached.actions.length,
-      });
-      return {
-        actions: cached.actions,
-        reasoning: `[CACHED] ${cached.reasoning}`,
-        confidence: cached.confidence,
-      };
-    }
+    // ✅ DISABLED: Cache is temporarily disabled
+    // const cached = getCachedGeneration(context, state.goal);
+    // if (cached && cached.actions.length > 0) {
+    //   // ✅ NEW: Validate cached actions before using them
+    //   // Check if elements referenced in cached actions still exist on the page
+    //   const isValidCache = await this.validateCachedActions(cached.actions, context, page);
+    //
+    //   if (isValidCache) {
+    //     logger.info('[ACTION_GENERATOR] Using cached actions', {
+    //       age: Date.now() - cached.timestamp,
+    //       count: cached.actions.length,
+    //     });
+    //     return {
+    //       actions: cached.actions,
+    //       reasoning: `[CACHED] ${cached.reasoning}`,
+    //       confidence: cached.confidence,
+    //     };
+    //   } else {
+    //     // ✅ NEW: Invalidate cache if actions are invalid
+    //     logger.warn('[ACTION_GENERATOR] Cached actions invalid, invalidating cache', {
+    //       reason: 'Elements referenced in cached actions do not exist on current page',
+    //       cachedActionsCount: cached.actions.length,
+    //     });
+    //     const key = getCacheKey(context, state.goal);
+    //     generationCache.delete(key);
+    //   }
+    // }
+
+    // ✅ DISABLED: Cache invalidation on failures
+    // const recentFailures = state.completedActions
+    //   .slice(-5)
+    //   .filter(a => !a.success && a.action.selector);
+    //
+    // if (recentFailures.length > 0 && cached) {
+    //   logger.warn('[ACTION_GENERATOR] Recent failures detected, invalidating cache', {
+    //     failuresCount: recentFailures.length,
+    //     failedSelectors: recentFailures.map(f => f.action.selector).filter(Boolean),
+    //   });
+    //   const key = getCacheKey(context, state.goal);
+    //   generationCache.delete(key);
+    // }
 
     // Early exit: Check for empty/invalid pages before generating actions
     const isEmptyPage = this.isPageEmpty(context);
@@ -201,6 +227,40 @@ export class ContextualActionGenerator {
       // ✅ FIX 5: Mask PII before sending to LLM
       const actualHTML = page ? await this.getPageHTML(page) : '';
       const sanitizedHTML = this.maskPII(actualHTML);
+
+      // ✅ NEW: Log what AI will see in context
+      logger.info('[ACTION_GENERATOR] Context sent to AI', {
+        pageType: context.pageType,
+        url: context.url,
+        goal: state.goal.substring(0, 100) + '...',
+        availableElements: {
+          visionElementsCount: context.vision.elements.length,
+          visionElements: context.vision.elements.map(el => ({
+            type: el.type,
+            text: el.text?.substring(0, 30),
+            selector: el.selector,
+            priority: el.priority,
+          })),
+        },
+        domElements: {
+          buttonsCount: context.dom.buttons?.length || 0,
+          buttons: (context.dom.buttons || []).map(btn => ({
+            text: btn.text?.substring(0, 30),
+            selector: btn.selector,
+          })),
+          inputsCount: context.dom.inputs?.length || 0,
+          inputs: (context.dom.inputs || []).map(input => ({
+            type: input.type,
+            name: input.name,
+            selector: input.selector,
+          })),
+          linksCount: context.dom.links?.length || 0,
+          formsCount: context.dom.forms?.length || 0,
+        },
+        historySummary: historySummary.substring(0, 200),
+        domSummary: domSummary.substring(0, 500),
+        hasHTML: !!sanitizedHTML,
+      });
 
       const prompt = buildActionGenerationPrompt({
         pageType: context.pageType,
@@ -313,14 +373,13 @@ export class ContextualActionGenerator {
         confidence: parsed.confidence || 0.5,
       };
 
-      // ✅ FIX 6: Cache result (timestamp will be added by setCachedGeneration)
-      // IMPORTANT: Cache only non-empty action sets, so "empty" decisions can be retried.
-      if (actions.length > 0) {
-        setCachedGeneration(context, state.goal, {
-          ...result,
-          timestamp: Date.now(),
-        });
-      }
+      // ✅ DISABLED: Cache is temporarily disabled
+      // if (actions.length > 0) {
+      //   setCachedGeneration(context, state.goal, {
+      //     ...result,
+      //     timestamp: Date.now(),
+      //   });
+      // }
 
       return result;
     } catch (error) {
@@ -343,6 +402,109 @@ export class ContextualActionGenerator {
         confidence: 0.3,
       };
     }
+  }
+
+  /**
+   * ✅ NEW: Validate cached actions by checking if their selectors still exist on the page
+   * @param cachedActions - Actions from cache
+   * @param context - Current page context
+   * @param page - Optional page for DOM checks
+   * @returns true if all actions are valid, false otherwise
+   */
+  private static async validateCachedActions(
+    cachedActions: DynamicAction[],
+    context: PageContext,
+    page?: Page
+  ): Promise<boolean> {
+    if (!page) {
+      // If no page provided, validate against DOM summary
+      return this.validateCachedActionsAgainstDOM(cachedActions, context);
+    }
+
+    // Validate against actual DOM
+    try {
+      const { getLocator, normalizeSelector } = await import('./utils/selector-utils');
+
+      for (const action of cachedActions) {
+        if (!action.selector) continue;
+
+        try {
+          const normalizedSelector = normalizeSelector(action.selector);
+          const locator = getLocator(page, normalizedSelector);
+          const count = await locator.count();
+
+          if (count === 0) {
+            logger.debug('[ACTION_GENERATOR] Cached action selector not found', {
+              action: action.description,
+              selector: action.selector,
+            });
+            return false;
+          }
+        } catch (error) {
+          logger.debug('[ACTION_GENERATOR] Error validating cached action selector', {
+            action: action.description,
+            selector: action.selector,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return false;
+        }
+      }
+
+      return true;
+    } catch (error) {
+      logger.warn('[ACTION_GENERATOR] Failed to validate cached actions', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * ✅ NEW: Validate cached actions against DOM summary (when page is not available)
+   * @param cachedActions - Actions from cache
+   * @param context - Current page context
+   * @returns true if actions seem valid, false otherwise
+   */
+  private static validateCachedActionsAgainstDOM(
+    cachedActions: DynamicAction[],
+    context: PageContext
+  ): boolean {
+    const dom = context.dom;
+    const availableSelectors = new Set<string>();
+
+    // Collect available selectors from DOM
+    (dom.buttons || []).forEach(btn => {
+      if (btn.selector) availableSelectors.add(btn.selector);
+    });
+    (dom.inputs || []).forEach(input => {
+      if (input.selector) availableSelectors.add(input.selector);
+    });
+    (dom.links || []).forEach(link => {
+      if (link.selector) availableSelectors.add(link.selector);
+    });
+
+    // Check if cached action selectors exist
+    for (const action of cachedActions) {
+      if (!action.selector) continue;
+
+      // Simple check: if selector is not in available selectors, it might be invalid
+      // But this is not 100% accurate, so we'll be lenient
+      const normalizedSelector = action.selector.toLowerCase();
+      const hasMatch = Array.from(availableSelectors).some(sel =>
+        sel.toLowerCase().includes(normalizedSelector) ||
+        normalizedSelector.includes(sel.toLowerCase())
+      );
+
+      if (!hasMatch && action.action !== 'goto' && action.action !== 'wait') {
+        logger.debug('[ACTION_GENERATOR] Cached action selector not found in DOM summary', {
+          action: action.description,
+          selector: action.selector,
+        });
+        // Don't fail immediately - might be a dynamic selector
+      }
+    }
+
+    return true; // Be lenient when page is not available
   }
 
   /**

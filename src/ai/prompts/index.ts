@@ -737,10 +737,23 @@ ${params.actualHTML ? `\n--- ACTUAL HTML (for reference) ---\n${params.actualHTM
 --- TASK ---
 Generate a sequence of actions to test this page based on the goal.
 
-⚠️ **CRITICAL**: The goal is "${params.goal}". Prioritize actions that help achieve this goal.
-///improvement: Added explicit goal prioritization in prompt to ensure registration flow is found
-If the goal mentions "registration", "signup", "register", or similar - prioritize finding and interacting with registration/signup elements.
-If the goal mentions a specific flow (e.g., "registration flow"), focus on navigating to and testing that flow.
+🚨🚨🚨 **MOST IMPORTANT RULE - READ THIS FIRST** 🚨🚨🚨
+You can ONLY use elements that exist in "Available Elements" or "DOM Summary" sections above!
+- ❌ NEVER invent or imagine elements that are not listed
+- ❌ NEVER use selectors that are not shown in the context
+- ❌ If you need "search input" but no input is listed → you CANNOT use it
+- ❌ If you need button "Математика" but it's not listed → you CANNOT click it
+- ✅ If the goal requires elements that don't exist on THIS page → navigate to find them (click "Continue", "Next", etc.)
+- ✅ ALWAYS check "Available Elements" and "DOM Summary" BEFORE generating any action
+
+**If elements needed for the goal are NOT on this page:**
+1. Look for navigation buttons: "Next", "Continue", "Skip", "Продолжить", "Далее"
+2. Click them to navigate to the page with needed elements
+3. DO NOT try to interact with non-existent elements!
+
+⚠️ **Goal**: "${params.goal}"
+If the goal mentions specific elements (like "search", "registration form") but they are NOT in the context above,
+you should navigate first to find those elements.
 
 Even if the goal is vague or generic, as long as the page has interactive elements
 you MUST propose at least 1-3 concrete, safe actions (clicks, fills, scrolls, simple assertions)
@@ -835,8 +848,11 @@ CRITICAL RULES:
    Example: For input inside .relative div, use: role=textbox (NOT .relative > role=textbox)
 
    - ❌ NEVER invent selectors - ONLY use ones from "Available Elements" or "DOM Summary"
+   - ❌ If element is NOT in context → DO NOT generate action for it (navigate to find it instead)
+   - ❌ DO NOT assume elements exist based on goal - CHECK THE CONTEXT FIRST!
    - Example: If DOM shows Selector: "role=button[name=\"Login\"]" → use EXACTLY that
    - Example: If DOM shows Selector: "label=\"Email\"" → use EXACTLY that
+   - Example: If goal says "search for products" but NO search input in context → click navigation button first!
 
 1. **Logical Dependencies**:
    - On product page: MUST select size/color BEFORE "add to cart"

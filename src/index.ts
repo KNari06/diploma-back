@@ -87,12 +87,66 @@ const getCorsOrigins = (): boolean | string[] => {
   }
 };
 
+// ✅ FIX: CORS middleware with guaranteed headers on all responses
 app.use(cors({
   origin: getCorsOrigins(),
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID'],
 }));
+
+// ✅ FIX: Helper function to check if origin is allowed
+const isOriginAllowed = (origin: string | undefined): boolean => {
+  if (!origin) return false;
+
+  const corsOrigins = getCorsOrigins();
+  if (corsOrigins === true) return true; // Development mode - allow all
+  if (corsOrigins === false) return false; // CORS disabled
+
+  return Array.isArray(corsOrigins) && corsOrigins.includes(origin);
+};
+
+// ✅ FIX: Additional middleware to ensure CORS headers on all responses (including errors)
+// This prevents CORS errors when backend returns 502/503 during deployment
+app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const origin = req.headers.origin;
+  const allowedOrigin = isOriginAllowed(origin);
+
+  if (allowedOrigin && origin) {
+    // Store original send/end methods
+    const originalSend = res.send;
+    const originalJson = res.json;
+    const originalStatus = res.status;
+
+    // Override res.status to ensure CORS headers are set
+    res.status = function(code: number) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+      return originalStatus.call(this, code);
+    };
+
+    // Override res.json to ensure CORS headers
+    res.json = function(body: any) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+      return originalJson.call(this, body);
+    };
+
+    // Override res.send to ensure CORS headers
+    res.send = function(body?: any) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+      return originalSend.call(this, body);
+    };
+  }
+  next();
+});
 
 // Rate limiting - disable express-rate-limit since we use custom rate limiter
 // const limiter = rateLimit({
@@ -167,6 +221,16 @@ app.get('/api/docs.json', (req: express.Request, res: express.Response) => {
  */
 // Health check endpoint
 app.get('/health', async (req: express.Request, res: express.Response) => {
+  // ✅ FIX: Ensure CORS headers are set for health check (important for frontend monitoring)
+  // Only for allowed origins to avoid security issues
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+  }
+
   try {
     // Use Promise.allSettled with timeout to handle individual service failures gracefully
     const healthCheckPromise = Promise.allSettled([
@@ -301,6 +365,30 @@ app.use(errorHandler);
 const startServer = async () => {
   let server: ReturnType<typeof app.listen> | null = null;
   let isShuttingDown = false;
+
+  // ✅ FIX: Middleware to handle requests during deployment/shutdown
+  // Returns 503 Service Unavailable with CORS headers when server is shutting down
+  app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (isShuttingDown) {
+      // Server is shutting down - return 503 with CORS headers
+      const origin = req.headers.origin;
+      if (origin && isOriginAllowed(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+      }
+      res.status(503).json({
+        success: false,
+        error: 'Service temporarily unavailable',
+        code: 'SERVICE_UNAVAILABLE',
+        details: 'The service is currently being updated. Please try again in a few moments.',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    next();
+  });
 
   try {
     // Validate PORT

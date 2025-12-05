@@ -25,12 +25,43 @@ export const errorResponse = (res: Response, message: string, statusCode: number
   });
 };
 
+// ✅ FIX: Helper to check if origin is allowed (same logic as in index.ts)
+const isOriginAllowed = (origin: string | undefined): boolean => {
+  if (!origin) return false;
+
+  const isDevelopment = process.env.NODE_ENV === 'development';
+  if (isDevelopment) return true; // Development mode - allow all
+
+  const allowedOrigins = process.env.ALLOWED_ORIGINS;
+  if (!allowedOrigins || typeof allowedOrigins !== 'string') {
+    return false;
+  }
+
+  try {
+    const origins = allowedOrigins.split(',').map(o => o.trim()).filter(Boolean);
+    return origins.includes(origin);
+  } catch {
+    return false;
+  }
+};
+
 // Error handler middleware
 export const errorHandler = (
   error: Error,
   req: Request,
   res: Response
 ): void => {
+  // ✅ FIX: Ensure CORS headers are always set, even on errors
+  // This prevents CORS errors when backend is unavailable (502/503)
+  // BUT only for allowed origins to avoid security issues
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+  }
+
   // Log the error
   logger.error({
     message: error.message,
@@ -133,6 +164,35 @@ export const errorHandler = (
     return;
   }
 
+  // ✅ FIX: Handle connection errors that indicate backend is unavailable/restarting
+  // These should return 502 (Bad Gateway) - backend is down, not just temporarily unavailable
+  const errorCode = (error as any).code;
+  if (errorCode === 'ECONNREFUSED' || errorCode === 'ETIMEDOUT' || errorCode === 'ENOTFOUND' || errorCode === 'ECONNRESET') {
+    res.status(502).json({
+      success: false,
+      error: 'Bad Gateway',
+      code: 'BAD_GATEWAY',
+      details: 'The service is temporarily unavailable. Please try again in a few moments.',
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
+  // ✅ FIX: Handle 502 Bad Gateway errors (from proxy/load balancer or error messages)
+  if (error.message && typeof error.message === 'string' && (
+    error.message.includes('502') ||
+    error.message.includes('Bad Gateway')
+  )) {
+    res.status(502).json({
+      success: false,
+      error: 'Bad Gateway',
+      code: 'BAD_GATEWAY',
+      details: 'The service is temporarily unavailable. Please try again in a few moments.',
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
   // Default error response
   const statusCode = 500;
   const message = process.env.NODE_ENV === 'production'
@@ -149,6 +209,15 @@ export const errorHandler = (
 
 // 404 handler
 export const notFoundHandler = (req: Request, res: Response) => {
+  // ✅ FIX: Ensure CORS headers are set for 404 responses (only for allowed origins)
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+  }
+
   res.status(404).json({
     success: false,
     error: `Route ${req.originalUrl} not found`,
