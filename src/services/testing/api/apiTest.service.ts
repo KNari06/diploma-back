@@ -174,6 +174,29 @@ function categorizeError(error: any): {
     };
   }
 
+  // ✅ FIX: Better error message for "fetch failed" (DNS/network issues)
+  if (error.message === 'fetch failed' || error.cause) {
+    // Check the cause for more details
+    const cause = error.cause;
+    if (cause?.code === 'ENOTFOUND' || cause?.syscall === 'getaddrinfo') {
+      return {
+        type: 'dns',
+        message: 'DNS resolution failed - hostname not found',
+      };
+    }
+    if (cause?.code === 'ECONNREFUSED') {
+      return {
+        type: 'network',
+        message: 'Connection refused - server may be down',
+      };
+    }
+    // Generic network error
+    return {
+      type: 'network',
+      message: 'Network error - unable to reach server',
+    };
+  }
+
   return {
     type: 'unknown',
     message: error.message || 'Request failed',

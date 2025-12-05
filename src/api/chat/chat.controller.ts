@@ -2249,7 +2249,14 @@ async function executeApiTestFlow(
           role: 'ai',
           content: finalMessage,
           metadata: {
-            testResult: apiTestResult,
+            testResult: {
+              ...apiTestResult,
+              // ✅ FIX: Add request details to testResult for history retrieval
+              method: apiDetails.method || 'GET',
+              url: plan.url,
+              requestHeaders: apiDetails.headers || {},
+              requestBody: apiDetails.body,
+            },
             testId: apiTestId,
         testType: 'api',
             is_test_runned: isTestRunned, // ✅ NEW: Flag indicating if test is completed/failed

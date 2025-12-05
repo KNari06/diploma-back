@@ -1,0 +1,710 @@
+╔═══════════════════════════════════════════════════════════════════╗
+║                                                                   ║
+║     📋 STEP-BY-STEP: ЧТО ПРОИСХОДИТ КОГДА ЮЗЕР ПИШЕТ            ║
+║        "протестируй API https://api.example.com/users"           ║
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝
+
+═══════════════════════════════════════════════════════════════════
+📥 PHASE 1: ВХОДЯЩИЙ ЗАПРОС
+═══════════════════════════════════════════════════════════════════
+
+STEP 1.1: POST /api/v1/chat
+───────────────────────────────────────────────────────────────────
+📍 Файл: src/api/chat/chat.controller.ts → handleChat()
+📥 Request Body:
+   {
+     "message": "протестируй API https://api.example.com/users",
+     "sessionId": "uuid-here",
+     "context": null,
+     "conversationId": null,
+     "answers": null
+   }
+
+STEP 1.2: Валидация запроса
+───────────────────────────────────────────────────────────────────
+✅ Проверка req.user.id (authentication)
+✅ Проверка req.body (должен быть object)
+✅ Проверка message (должен быть непустой string)
+✅ Проверка connection (не закрыт ли клиент)
+⏱️  Timeout check (макс 60 секунд)
+
+STEP 1.3: Workspace Management
+───────────────────────────────────────────────────────────────────
+📍 WorkspaceService.checkOrCreateWorkspace(userId)
+   → Находит или создает workspace для пользователя
+   → Возвращает workspace_id
+
+STEP 1.4: Chat Session Management
+───────────────────────────────────────────────────────────────────
+📍 getOrCreateChatSession(userId, sessionId, workspace_id)
+   → Если sessionId передан → использует его
+   → Если нет → создает новую сессию
+   → Возвращает chatSessionId
+
+WebSocket: 🔍 Analyzing your request... (10%)
+
+
+═══════════════════════════════════════════════════════════════════
+🔍 PHASE 2: ПРОВЕРКА PENDING TEST PLAN
+═══════════════════════════════════════════════════════════════════
+
+STEP 2.1: Проверка на одобрение плана
+───────────────────────────────────────────────────────────────────
+📍 handlePendingTestPlanApproval()
+   → Проверяет последнее AI сообщение
+   → Если было test plan → проверяет одобрение
+   → Если нет → продолжает дальше
+
+В нашем случае: НЕТ pending plan → продолжаем
+
+
+═══════════════════════════════════════════════════════════════════
+🧠 PHASE 3: ПАРСИНГ INTENT (ПОНИМАНИЕ ЧТО ХОЧЕТ ЮЗЕР)
+═══════════════════════════════════════════════════════════════════
+
+STEP 3.1: Fast Path Check
+───────────────────────────────────────────────────────────────────
+📍 Проверка на explicit API test:
+   - message.startsWith('RUN_API_TEST:')
+   - context?.action === 'run_api_test'
+
+В нашем случае: НЕТ → идем в Normal Path
+
+STEP 3.2: Normal Path - AI Intent Parsing
+───────────────────────────────────────────────────────────────────
+📍 parseUserIntent(message, { chatHistory }, workspace_id)
+
+📋 Что делает:
+   1. Получает chat history (последние сообщения)
+   2. Строит prompt через buildIntentPrompt()
+   3. Вызывает OpenAI GPT-4o-mini
+   4. Парсит JSON ответ
+
+📝 Prompt включает:
+   - Примеры intent classification
+   - Правила определения intent (context > keywords)
+   - Chat history для контекста
+
+🎯 Результат:
+   {
+     "intent": "api_test",
+     "confidence": 0.95,
+     "apiMethod": null,  // Не указан явно
+     "apiUrl": "https://api.example.com/users",
+     "apiBody": null,
+     "apiHeaders": null,
+     "scope": null
+   }
+
+WebSocket: 🧠 Understanding what you need... (20%)
+WebSocket: 🔍 Got it! Testing API endpoint https://api.example.com/users (30%)
+
+
+═══════════════════════════════════════════════════════════════════
+🚀 PHASE 4: РОУТИНГ К HANDLER
+═══════════════════════════════════════════════════════════════════
+
+STEP 4.1: Определение handler
+───────────────────────────────────────────────────────────────────
+📍 if (intent === 'api_test') → handleApiTest()
+📍 if (intent === 'platform_test') → handlePlatformTest()
+📍 else → handleGeneralChat()
+
+В нашем случае: intent === 'api_test' → handleApiTest()
+
+WebSocket: 🚀 Processing your request... (40%)
+
+
+═══════════════════════════════════════════════════════════════════
+📋 PHASE 5: ОБРАБОТКА API TEST REQUEST
+═══════════════════════════════════════════════════════════════════
+
+STEP 5.1: Валидация API данных
+───────────────────────────────────────────────────────────────────
+📍 handleApiTest() → проверяет parsedIntent
+
+✅ hasMethod = !!parsedIntent?.apiMethod  → false (не указан)
+✅ hasUrl = !!parsedIntent?.apiUrl        → true (есть URL)
+
+STEP 5.2: Проверка на недостающие данные
+───────────────────────────────────────────────────────────────────
+📍 Если !hasMethod || !hasUrl → задает вопросы
+
+В нашем случае:
+   - URL есть ✅
+   - Method нет ❌ → НО! Система может использовать GET по умолчанию
+   - Или спросить у пользователя
+
+📝 Если бы не хватало данных:
+   → Отправляет questions array:
+   [
+     {
+       id: 'apiMethod',
+       question: '📡 Which HTTP method should I use?',
+       type: 'select',
+       options: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
+     }
+   ]
+   → Сохраняет в chat history
+   → Возвращает response с needsMoreInfo: true
+   → ЖДЕТ ответа пользователя
+
+В нашем случае: URL есть, method можно определить → продолжаем
+
+STEP 5.3: Find or Create Project
+───────────────────────────────────────────────────────────────────
+📍 ProjectContextService.findOrCreateProject(workspace_id, apiUrl, userId)
+
+📋 Что делает:
+   1. Ищет проект по URL в БД
+   2. Если нет → создает новый проект
+   3. Возвращает project_id
+
+💾 Сохраняет в таблицу projects:
+   {
+     id: "uuid",
+     user_id: userId,
+     workspace_id: workspace_id,
+     name: "api.example.com",
+     url: "https://api.example.com",
+     ...
+   }
+
+WebSocket: 🔍 Analyzing API request... (50%)
+
+
+═══════════════════════════════════════════════════════════════════
+📝 PHASE 6: ГЕНЕРАЦИЯ TEST PLAN
+═══════════════════════════════════════════════════════════════════
+
+STEP 6.1: Генерация API Test Plan
+───────────────────────────────────────────────────────────────────
+📍 ApiTestPlanService.generateApiTestPlan({
+     method: 'GET',  // По умолчанию или из parsedIntent
+     url: 'https://api.example.com/users',
+     body: null,
+     headers: null,
+     userMessage: 'протестируй API https://api.example.com/users'
+   })
+
+📋 Что делает:
+   1. Строит prompt через buildApiTestPlanPrompt()
+   2. Вызывает OpenAI GPT-4o-mini с response_format: 'json_object'
+   3. Парсит JSON ответ
+   4. Валидирует и нормализует план
+
+🎯 Результат (ApiTestPlan):
+   {
+     id: "9a6255b8-2d36-4e21-9773-45979bcdaf27",
+     summary: "API Test: GET https://api.example.com/users",
+     method: "GET",
+     url: "https://api.example.com/users",
+     headers: {},
+     body: null,
+     expected_status: 200,
+     validation_steps: [
+       "Verify status code is 200",
+       "Verify response is valid JSON",
+       "Verify response time is under 5 seconds",
+       ...
+     ],
+     what_will_be_tested: [
+       "Endpoint availability",
+       "Response structure",
+       ...
+     ],
+     potential_issues: [
+       "Authentication might be required",
+       "CORS might block request",
+       ...
+     ],
+     estimated_duration: "< 5 seconds"
+   }
+
+WebSocket: 📋 Creating test plan... (60%)
+
+
+═══════════════════════════════════════════════════════════════════
+💾 PHASE 7: СОХРАНЕНИЕ TEST PLAN
+═══════════════════════════════════════════════════════════════════
+
+STEP 7.1: Конвертация в унифицированный формат
+───────────────────────────────────────────────────────────────────
+📍 convertApiTestPlanToTestPlan(apiTestPlan)
+
+📋 Конвертирует ApiTestPlan → TestPlan:
+   {
+     id: "9a6255b8-2d36-4e21-9773-45979bcdaf27",
+     status: "pending_confirmation",  ← КЛЮЧЕВОЕ!
+     url: "https://api.example.com/users",
+     scope: "api_test",
+     summary: "...",
+     steps: [],  // Для API тестов пусто
+     metadata: {
+       type: "api_test",
+       method: "GET",
+       body: null,
+       headers: {},
+       expectedStatus: 200
+     },
+     createdAt: "2025-12-05T21:08:00Z",
+     expiresAt: "2025-12-05T22:08:00Z"  // 1 час
+   }
+
+STEP 7.2: Сохранение в БД
+───────────────────────────────────────────────────────────────────
+📍 saveTestPlan(testPlan, userId, project_id)
+
+💾 Сохраняет в таблицу test_plans:
+   {
+     id: "9a6255b8-2d36-4e21-9773-45979bcdaf27",
+     user_id: userId,
+     project_id: project_id,
+     status: "pending_confirmation",
+     scope: "api_test",
+     url: "https://api.example.com/users",
+     summary: "...",
+     metadata: { ... },
+     created_at: "2025-12-05T21:08:00Z",
+     expires_at: "2025-12-05T22:08:00Z"
+   }
+
+📝 Логи:
+   [API_TEST] Saving test plan to database
+   [API_TEST] Test plan save result: success
+
+
+═══════════════════════════════════════════════════════════════════
+👤 PHASE 8: ПОКАЗ ПЛАНА ПОЛЬЗОВАТЕЛЮ
+═══════════════════════════════════════════════════════════════════
+
+STEP 8.1: Форматирование плана
+───────────────────────────────────────────────────────────────────
+📍 ApiTestPlanService.formatApiTestPlanForConfirmation(apiTestPlan)
+
+📝 Форматирует в читаемый вид:
+   📋 **API Test Plan**
+
+   This API test verifies the functionality...
+
+   **Request:** `GET` https://api.example.com/users
+   **Expected Status:** 200
+   **Duration:** < 5 seconds
+   **Tests:** Endpoint availability, Response structure...
+   **Risks:** 401 Unauthorized, CORS issues...
+
+   ---
+   If this looks good, just reply and I'll start testing.
+
+STEP 8.2: Сохранение в chat history
+───────────────────────────────────────────────────────────────────
+📍 ChatService.saveChatMessages(chatSessionId, [
+     { role: 'user', content: 'протестируй API...' },
+     {
+       role: 'ai',
+       content: formattedPlan,
+       metadata: {
+         testPlan: apiTestPlan,
+         requiresApproval: true  ← КЛЮЧЕВОЕ!
+       }
+     }
+   ])
+
+💾 Сохраняет в таблицу chat_messages:
+   [
+     {
+       id: "msg-1",
+       session_id: chatSessionId,
+       role: "user",
+       content: "протестируй API https://api.example.com/users",
+       created_at: "2025-12-05T21:08:00Z"
+     },
+     {
+       id: "msg-2",
+       session_id: chatSessionId,
+       role: "ai",
+       content: "📋 **API Test Plan**\n\n...",
+       metadata: {
+         testPlan: { ... },
+         requiresApproval: true
+       },
+       created_at: "2025-12-05T21:08:01Z"
+     }
+   ]
+
+STEP 8.3: Отправка ответа пользователю
+───────────────────────────────────────────────────────────────────
+📍 res.json({
+     success: true,
+     reply: formattedPlan,
+     testPlan: apiTestPlan,
+     conversationId: testPlan.id,  ← КЛЮЧЕВОЕ! Для отслеживания одобрения
+     requiresApproval: true,
+     timestamp: "2025-12-05T21:08:01Z",
+     sessionId: chatSessionId
+   })
+
+📤 HTTP Response отправлен
+⏸️  ЖДЕМ ОДОБРЕНИЯ ПОЛЬЗОВАТЕЛЯ
+
+
+═══════════════════════════════════════════════════════════════════
+⏸️  PHASE 9: ОЖИДАНИЕ ОДОБРЕНИЯ (ПОЛЬЗОВАТЕЛЬ ЧИТАЕТ ПЛАН)
+═══════════════════════════════════════════════════════════════════
+
+Пользователь видит план и решает:
+   ✅ "да" / "начинай" / "go" → одобряет
+   ❌ "нет" / "отмена" → отклоняет
+   ❓ "а что будет тестироваться?" → вопрос (не одобрение)
+
+
+═══════════════════════════════════════════════════════════════════
+✅ PHASE 10: ОДОБРЕНИЕ ПЛАНА
+═══════════════════════════════════════════════════════════════════
+
+STEP 10.1: Пользователь пишет "да"
+───────────────────────────────────────────────────────────────────
+📥 Request:
+   {
+     "message": "да",
+     "sessionId": chatSessionId,
+     "conversationId": "9a6255b8-2d36-4e21-9773-45979bcdaf27"  ← ID плана!
+   }
+
+STEP 10.2: Проверка pending plan
+───────────────────────────────────────────────────────────────────
+📍 handlePendingTestPlanApproval()
+
+   1. Проверяет последнее AI сообщение
+      → metadata.requiresApproval === true ✅
+
+   2. Ищет pending plan:
+      → findPendingTestPlan(conversationId, userId)
+      → Находит план по conversationId (это plan.id)
+      → Проверяет status === 'pending_confirmation' ✅
+
+   3. Детектирует одобрение:
+      → detectUserApproval("да")
+      → AI анализирует: "да" = approval
+      → confidence: 0.95 ✅
+
+STEP 10.3: Роутинг на выполнение
+───────────────────────────────────────────────────────────────────
+📍 executeApprovedTestPlan(req, res, {
+     planId: pendingPlan.id,
+     userId,
+     chatSessionId,
+     workspace_id,
+     userMessage: "да"
+   })
+
+
+═══════════════════════════════════════════════════════════════════
+🚀 PHASE 11: ВЫПОЛНЕНИЕ ТЕСТА
+═══════════════════════════════════════════════════════════════════
+
+STEP 11.1: Валидация плана
+───────────────────────────────────────────────────────────────────
+📍 validateTestPlan(planId, userId, res)
+   → Загружает план из БД
+   → Проверяет что план принадлежит userId
+   → Проверяет что status === 'pending_confirmation'
+   → Возвращает plan
+
+STEP 11.2: Определение типа теста
+───────────────────────────────────────────────────────────────────
+📍 determineTestType(plan)
+   → plan.scope === 'api_test' → 'api'
+   → Возвращает 'api'
+
+STEP 11.3: Проверка кредитов
+───────────────────────────────────────────────────────────────────
+📍 checkCreditsBeforeTest(userId, 'api', res)
+   → Проверяет баланс кредитов
+   → Если недостаточно → возвращает 402 Payment Required
+   → Если достаточно → продолжаем
+
+WebSocket: 💳 Checking credits... (10%)
+
+STEP 11.4: Роутинг на API test flow
+───────────────────────────────────────────────────────────────────
+📍 executeApiTestFlow(res, {
+     plan,
+     planId,
+     userId,
+     chatSessionId,
+     userMessage: "да"
+   })
+
+
+═══════════════════════════════════════════════════════════════════
+⚙️  PHASE 12: API TEST EXECUTION FLOW
+═══════════════════════════════════════════════════════════════════
+
+STEP 12.1: Подтверждение плана в БД
+───────────────────────────────────────────────────────────────────
+📍 confirmTestPlan(planId, userId)
+   → Обновляет status: 'pending_confirmation' → 'approved'
+   → Сохраняет в БД
+
+WebSocket: 📋 Confirming test plan... (5%)
+
+STEP 12.2: Списывание кредитов
+───────────────────────────────────────────────────────────────────
+📍 CreditCostTrackerService.deductCreditsForTest({
+     userId,
+     testType: 'api',
+     credits: TokenCalculatorService.getTestCreditCost('api'),
+     costUSD: 0.0011,
+     testId: `api_${planId}_${Date.now()}`,
+     description: 'API test: GET https://api.example.com/users'
+   })
+
+💾 Сохраняет в таблицу credit_transactions:
+   {
+     id: "uuid",
+     user_id: userId,
+     test_id: "api_9a6255b8-2d36-4e21-9773-45979bcdaf27_1733428800000",
+     test_type: "api",
+     credits: 1,
+     cost_usd: 0.0011,
+     description: "API test: GET https://api.example.com/users",
+     created_at: "2025-12-05T21:08:05Z"
+   }
+
+WebSocket: 💳 Checking credits... (10%)
+
+STEP 12.3: Подготовка запроса
+───────────────────────────────────────────────────────────────────
+📍 Подготовка данных для executeApiTest():
+   {
+     method: 'GET',
+     url: 'https://api.example.com/users',
+     body: null,
+     headers: {},
+     expectedStatus: 200,
+     timeout: 10000
+   }
+
+WebSocket: 🔧 Preparing API request... (15%)
+
+STEP 12.4: Выполнение HTTP запроса
+───────────────────────────────────────────────────────────────────
+📍 executeApiTest(request, chatSessionId)
+
+📋 Что делает (apiTest.service.ts):
+
+   1. Валидация URL
+      → Проверяет формат URL
+      → Блокирует localhost, private IPs
+
+   2. Подготовка fetch options
+      → method: 'GET'
+      → headers: { 'Content-Type': 'application/json', 'User-Agent': 'QAIT-Backend/1.0' }
+      → signal: AbortSignal.timeout(10000)
+
+   3. Выполнение запроса
+      → fetch('https://api.example.com/users', options)
+      → Ожидание ответа
+
+   4. Парсинг ответа
+      → Читает response.text()
+      → Парсит JSON если Content-Type: application/json
+      → Ограничивает размер (макс 10MB)
+
+   5. Формирование результата
+      → ApiTestResponse:
+        {
+          success: true,
+          status: 200,
+          statusText: "OK",
+          durationMs: 363,
+          responseHeaders: { ... },
+          responseBody: [ { id: 1, name: "..." }, ... ],
+          matchesExpected: true
+        }
+
+WebSocket прогресс:
+   🔍 Validating request... (40%)
+   📦 Building GET request... (50%)
+   📡 Sending GET request to api.example.com... (60%)
+   📥 Response received: 200 OK (65%)
+   🔍 Validating response... (90%)
+   ✅ Test completed! Status: 200 | Duration: 363ms (100%)
+
+STEP 12.5: Опциональный Fuzzing
+───────────────────────────────────────────────────────────────────
+📍 runApiFuzzing(apiTestResult, apiDetails, url, chatSessionId)
+
+📋 Что делает (если основной тест успешен):
+
+   1. Генерация fuzzing scenarios
+      → IntelligentApiFuzzerService.generateFuzzingScenarios()
+      → Создает сценарии для security testing
+
+   2. Выполнение fuzzing
+      → ApiFuzzingExecutorService.executeFuzzingScenarios()
+      → Тестирует с разными payloads
+      → Таймаут: 30 секунд
+
+   3. Формирование отчета
+      → FuzzingReport:
+        {
+          summary: {
+            totalTests: 15,
+            passed: 12,
+            failed: 3
+          },
+          issues: [ ... ],
+          securityScore: 80
+        }
+
+WebSocket: 🔍 Generating security test scenarios... (70%)
+WebSocket: 🎯 Testing 15 security scenarios... (75%)
+WebSocket: 🔒 Testing security (12/15 scenarios)... (85%)
+WebSocket: ✅ Security analysis complete! Found 3 issue(s) (100%)
+
+STEP 12.6: Сохранение test-chat mapping
+───────────────────────────────────────────────────────────────────
+📍 TestChatMappingService.saveTestChatMapping({
+     testId: apiTestId,
+     chatSessionId,
+     userId
+   })
+
+💾 Сохраняет в таблицу test_chat_mappings:
+   {
+     id: "uuid",
+     test_id: "api_9a6255b8-2d36-4e21-9773-45979bcdaf27_1733428800000",
+     chat_session_id: chatSessionId,
+     user_id: userId,
+     created_at: "2025-12-05T21:08:06Z"
+   }
+
+STEP 12.7: Форматирование ответа
+───────────────────────────────────────────────────────────────────
+📍 formatApiResponse(apiTestResult, fuzzingReport, plan, apiDetails)
+
+📝 Форматирует в читаемый вид:
+   ✅ **API Test Results**
+
+   **Request:** GET https://api.example.com/users
+   **Status:** 200 OK
+   **Duration:** 363ms
+   **Response Size:** 2.5 KB
+
+   **Response Body:**
+   [
+     {
+       "id": 1,
+       "name": "Leanne Graham",
+       ...
+     },
+     ...
+   ]
+
+   **Security Analysis:**
+   - Total Tests: 15
+   - Passed: 12
+   - Failed: 3
+   - Security Score: 80/100
+
+   **Issues Found:**
+   1. Missing rate limiting headers
+   2. ...
+
+STEP 12.8: Сохранение результатов в chat
+───────────────────────────────────────────────────────────────────
+📍 ChatService.saveChatMessages(chatSessionId, [
+     { role: 'user', content: 'да' },
+     {
+       role: 'ai',
+       content: finalMessage,
+       metadata: {
+         testResult: apiTestResult,
+         testId: apiTestId,
+         testType: 'api',
+         is_test_runned: true,
+         fuzzingReport: { ... }
+       }
+     }
+   ])
+
+💾 Сохраняет в таблицу chat_messages:
+   [
+     {
+       id: "msg-3",
+       session_id: chatSessionId,
+       role: "user",
+       content: "да",
+       created_at: "2025-12-05T21:08:05Z"
+     },
+     {
+       id: "msg-4",
+       session_id: chatSessionId,
+       role: "ai",
+       content: "✅ **API Test Results**\n\n...",
+       metadata: {
+         testResult: { ... },
+         testId: "api_9a6255b8-2d36-4e21-9773-45979bcdaf27_1733428800000",
+         testType: "api",
+         is_test_runned: true,
+         fuzzingReport: { ... }
+       },
+       created_at: "2025-12-05T21:08:06Z"
+     }
+   ]
+
+STEP 12.9: Отправка финального ответа
+───────────────────────────────────────────────────────────────────
+📍 res.json({
+     success: true,
+     reply: finalMessage,
+     testResult: apiTestResult,
+     fuzzingReport: fuzzingReport || undefined,
+     testId: apiTestId,
+     timestamp: "2025-12-05T21:08:06Z",
+     sessionId: chatSessionId
+   })
+
+📤 HTTP Response отправлен
+✅ ТЕСТ ЗАВЕРШЕН!
+
+
+═══════════════════════════════════════════════════════════════════
+📊 SUMMARY: ВСЕ ШАГИ
+═══════════════════════════════════════════════════════════════════
+
+1.  📥 Входящий запрос → валидация
+2.  🔍 Проверка pending plan → нет
+3.  🧠 Парсинг intent → api_test
+4.  🚀 Роутинг → handleApiTest()
+5.  📋 Валидация данных → URL есть, method по умолчанию GET
+6.  📁 Find/Create project → создан проект
+7.  📝 Генерация test plan → AI создал план
+8.  💾 Сохранение плана → status: pending_confirmation
+9.  👤 Показ плана → пользователь видит план
+10. ⏸️  Ожидание → пользователь читает
+11. ✅ Одобрение → пользователь пишет "да"
+12. 🚀 Выполнение:
+    - Подтверждение плана
+    - Списывание кредитов
+    - HTTP запрос
+    - Опциональный fuzzing
+    - Сохранение результатов
+    - Отправка ответа
+
+═══════════════════════════════════════════════════════════════════
+🔑 КЛЮЧЕВЫЕ МОМЕНТЫ
+═══════════════════════════════════════════════════════════════════
+
+1. Test Plan требует одобрения (status: pending_confirmation)
+2. conversationId = plan.id (для отслеживания одобрения)
+3. Кредиты списываются ПЕРЕД выполнением
+4. Результаты сохраняются в chat_messages с metadata
+5. Fuzzing опционален (не блокирует основной тест)
+6. WebSocket прогресс отправляется на каждом этапе
+7. Все ошибки логируются и обрабатываются gracefully
+
+═══════════════════════════════════════════════════════════════════

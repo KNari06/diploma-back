@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
-import { runApiTest } from './apiTest.controller';
+import { runApiTest, getApiTests, getApiTestById, getApiTestsByProject } from './apiTest.controller';
 import { asyncHandler, handleValidationError } from '@/utils/error-handler';
 import { requireAuth } from '@/middleware/auth.middleware';
 
@@ -126,6 +126,166 @@ router.post('/run', requireAuth, asyncHandler(async (req: Request, res: Response
   } catch (error) {
     handleValidationError(error);
   }
+}));
+
+/**
+ * @swagger
+ * /api/v1/api-test:
+ *   get:
+ *     summary: Get all API tests for current user
+ *     description: |
+ *       Returns a paginated list of all API tests executed by the authenticated user.
+ *       Tests are retrieved from chat messages where testType = 'api'.
+ *     tags: [API Test]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           default: 1
+ *         description: Page number for pagination
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 20
+ *         description: Number of tests per page
+ *     responses:
+ *       200:
+ *         description: List of API tests retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                       testId:
+ *                         type: string
+ *                       method:
+ *                         type: string
+ *                       url:
+ *                         type: string
+ *                       status:
+ *                         type: integer
+ *                       statusText:
+ *                         type: string
+ *                       durationMs:
+ *                         type: integer
+ *                       success:
+ *                         type: boolean
+ *                       executedAt:
+ *                         type: string
+ *                         format: date-time
+ *                       chatSessionId:
+ *                         type: string
+ *                       fuzzingReport:
+ *                         type: object
+ *                         nullable: true
+ *                 pagination:
+ *                   type: object
+ *       401:
+ *         description: Unauthorized
+ */
+/**
+ * GET /api-test
+ * Get all API tests for current user
+ */
+router.get('/', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  await getApiTests(req, res);
+}));
+
+/**
+ * @swagger
+ * /api/v1/api-test/{id}:
+ *   get:
+ *     summary: Get API test details by ID
+ *     description: |
+ *       Returns detailed information about a specific API test including:
+ *       - Request details (method, URL, headers, body)
+ *       - Response details (status, headers, body)
+ *       - Execution metadata
+ *       - Fuzzing report (if available)
+ *     tags: [API Test]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Test ID
+ *     responses:
+ *       200:
+ *         description: API test details retrieved successfully
+ *       404:
+ *         description: API test not found
+ *       401:
+ *         description: Unauthorized
+ */
+/**
+ * GET /api-test/:id
+ * Get API test by ID
+ */
+router.get('/:id', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  await getApiTestById(req, res);
+}));
+
+/**
+ * @swagger
+ * /api/v1/api-test/project/{projectId}:
+ *   get:
+ *     summary: Get API tests by project
+ *     description: Returns a paginated list of API tests for a specific project
+ *     tags: [API Test]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Project ID
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           default: 1
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 20
+ *     responses:
+ *       200:
+ *         description: List of API tests for project
+ *       401:
+ *         description: Unauthorized
+ */
+/**
+ * GET /api-test/project/:projectId
+ * Get API tests by project
+ */
+router.get('/project/:projectId', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  await getApiTestsByProject(req, res);
 }));
 
 export default router;
