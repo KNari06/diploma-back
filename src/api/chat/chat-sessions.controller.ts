@@ -158,30 +158,81 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Get messages
-    const { data: messages, error: messagesError } = await supabaseAdmin
+    // ✅ NEW: Pagination support (backward compatible - if not specified, returns all)
+    const limitParam = req.query.limit;
+    const offsetParam = req.query.offset;
+    const usePagination = limitParam !== undefined || offsetParam !== undefined;
+
+    const limit = usePagination ? Math.min(Number(limitParam) || 50, 100) : undefined;
+    const offset = usePagination ? Math.max(Number(offsetParam) || 0, 0) : undefined;
+
+    // Get total count if pagination is used
+    let totalCount: number | undefined;
+    if (usePagination) {
+      const { count } = await supabaseAdmin
+        .from('chat_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('session_id', sessionId);
+      totalCount = count || 0;
+    }
+
+    // Get messages in chronological order
+    // Sort by created_at, then by id for messages with same timestamp
+    let query = supabaseAdmin
       .from('chat_messages')
       .select('id, role, content, metadata, created_at')
       .eq('session_id', sessionId)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true }); // Secondary sort for messages with same timestamp
+
+    // Apply pagination if specified
+    if (usePagination && limit !== undefined && offset !== undefined) {
+      query = query.range(offset, offset + limit - 1);
+    }
+
+    const { data: messages, error: messagesError } = await query;
 
     if (messagesError) {
       throw messagesError;
     }
 
+    // Ensure messages are sorted correctly (in case of same timestamps)
+    const sortedMessages = (messages || []).sort((a, b) => {
+      const timeA = new Date(a.created_at).getTime();
+      const timeB = new Date(b.created_at).getTime();
+      if (timeA !== timeB) {
+        return timeA - timeB;
+      }
+      // If timestamps are equal, sort by id (UUID comparison)
+      return a.id.localeCompare(b.id);
+    });
+
     logger.info('[CHAT_SESSIONS] Chat session retrieved', {
       sessionId,
       userId,
-      messageCount: messages?.length || 0,
+      messageCount: sortedMessages.length,
+      pagination: usePagination ? { limit, offset, total: totalCount } : 'all',
     });
 
-    res.json({
+    const response: any = {
       success: true,
       data: {
         session,
-        messages: messages || [],
+        messages: sortedMessages,
       },
-    });
+    };
+
+    // Add pagination info if pagination was used
+    if (usePagination && totalCount !== undefined && limit !== undefined && offset !== undefined) {
+      response.data.pagination = {
+        limit,
+        offset,
+        total: totalCount,
+        has_more: (offset + limit) < totalCount,
+      };
+    }
+
+    res.json(response);
   } catch (error) {
     logger.error('[CHAT_SESSIONS] Error getting chat session', { error });
 

@@ -354,10 +354,12 @@ router.get('/sessions', requireAuth, asyncHandler(listUserChatSessions)); // Upd
  *   get:
  *     summary: Получить историю чата по ID сессии (legacy endpoint)
  *     description: |
- *       Возвращает все сообщения в указанной чат-сессии.
+ *       Возвращает сообщения в указанной чат-сессии с поддержкой пагинации.
  *
  *       **DEPRECATED:** Используйте `/api/v1/chat/sessions/{sessionId}` вместо этого.
  *       Этот endpoint сохранен для backward compatibility.
+ *
+ *       **Пагинация:** Если `limit` или `offset` не указаны, возвращаются все сообщения (для обратной совместимости).
  *     tags: [Chat]
  *     deprecated: true
  *     parameters:
@@ -368,6 +370,20 @@ router.get('/sessions', requireAuth, asyncHandler(listUserChatSessions)); // Upd
  *           type: string
  *           format: uuid
  *         description: ID чат-сессии
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *         description: Количество сообщений для возврата (опционально, по умолчанию - все)
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *           default: 0
+ *         description: Смещение для пагинации (опционально)
  *     responses:
  *       200:
  *         description: История чата
@@ -395,6 +411,7 @@ router.get('/sessions', requireAuth, asyncHandler(listUserChatSessions)); // Upd
  *                           format: date-time
  *                     messages:
  *                       type: array
+ *                       description: Сообщения в хронологическом порядке (старые → новые)
  *                       items:
  *                         type: object
  *                         properties:
@@ -411,6 +428,22 @@ router.get('/sessions', requireAuth, asyncHandler(listUserChatSessions)); // Upd
  *                           created_at:
  *                             type: string
  *                             format: date-time
+ *                     pagination:
+ *                       type: object
+ *                       description: Информация о пагинации (только если указаны limit/offset)
+ *                       properties:
+ *                         limit:
+ *                           type: integer
+ *                           example: 50
+ *                         offset:
+ *                           type: integer
+ *                           example: 0
+ *                         total:
+ *                           type: integer
+ *                           example: 150
+ *                         has_more:
+ *                           type: boolean
+ *                           example: true
  *       400:
  *         description: Неверный ID сессии
  *       401:
@@ -477,8 +510,12 @@ router.post('/sessions/new', requireAuth, asyncHandler(createNewChatSession));
  * @swagger
  * /api/v1/chat/sessions/{sessionId}:
  *   get:
- *     summary: Получить чат-сессию со всеми сообщениями
- *     description: Возвращает детали чат-сессии включая все сообщения
+ *     summary: Получить чат-сессию с сообщениями (с поддержкой пагинации)
+ *     description: |
+ *       Возвращает детали чат-сессии включая сообщения с поддержкой пагинации.
+ *
+ *       **Пагинация:** Если `limit` или `offset` не указаны, возвращаются все сообщения (для обратной совместимости).
+ *       Сообщения отсортированы в хронологическом порядке (старые → новые).
  *     tags: [Chat Sessions]
  *     security:
  *       - bearerAuth: []
@@ -490,6 +527,20 @@ router.post('/sessions/new', requireAuth, asyncHandler(createNewChatSession));
  *           type: string
  *           format: uuid
  *         description: ID чат-сессии
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *         description: Количество сообщений для возврата (опционально, по умолчанию - все)
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *           default: 0
+ *         description: Смещение для пагинации (опционально)
  *     responses:
  *       200:
  *         description: Чат-сессия с сообщениями
@@ -520,6 +571,7 @@ router.post('/sessions/new', requireAuth, asyncHandler(createNewChatSession));
  *                           format: date-time
  *                     messages:
  *                       type: array
+ *                       description: Сообщения в хронологическом порядке (старые → новые)
  *                       items:
  *                         type: object
  *                         properties:
@@ -536,6 +588,22 @@ router.post('/sessions/new', requireAuth, asyncHandler(createNewChatSession));
  *                           created_at:
  *                             type: string
  *                             format: date-time
+ *                     pagination:
+ *                       type: object
+ *                       description: Информация о пагинации (только если указаны limit/offset)
+ *                       properties:
+ *                         limit:
+ *                           type: integer
+ *                           example: 50
+ *                         offset:
+ *                           type: integer
+ *                           example: 0
+ *                         total:
+ *                           type: integer
+ *                           example: 150
+ *                         has_more:
+ *                           type: boolean
+ *                           example: true
  *       404:
  *         description: Чат-сессия не найдена
  *       401:

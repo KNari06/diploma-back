@@ -49,12 +49,16 @@ export class ChatService {
         });
       }
 
-      const records = validMessages.map((msg) => ({
+      // ✅ FIX: Ensure messages have incrementing timestamps
+      // When saving multiple messages (user + AI), they should have different timestamps
+      // to maintain correct order. Add 1ms between each message.
+      const baseTime = Date.now();
+      const records = validMessages.map((msg, index) => ({
         session_id: sessionId,
         role: msg.role,
         content: msg.content.trim(),
         metadata: msg.metadata && typeof msg.metadata === 'object' ? msg.metadata : {},
-        created_at: new Date().toISOString(),
+        created_at: new Date(baseTime + index).toISOString(), // Increment by 1ms per message
       }));
 
       const { error } = await supabaseAdmin
@@ -126,9 +130,10 @@ export class ChatService {
 
       const { data, error } = await supabaseAdmin
         .from('chat_messages')
-        .select('role, content, created_at, metadata')
+        .select('id, role, content, created_at, metadata')
         .eq('session_id', sessionId)
         .order('created_at', { ascending: false })
+        .order('id', { ascending: false }) // Secondary sort for messages with same timestamp
         .limit(validLimit);
 
       if (error) {
@@ -142,7 +147,20 @@ export class ChatService {
 
       // Validate data is array
       const validData = Array.isArray(data) ? data : [];
-      const messages = validData.reverse(); // Reverse to get chronological order
+
+      // Sort messages: first by created_at (descending), then by id (descending)
+      // Then reverse to get chronological order (oldest first)
+      const sortedData = validData.sort((a, b) => {
+        const timeA = new Date(a.created_at).getTime();
+        const timeB = new Date(b.created_at).getTime();
+        if (timeA !== timeB) {
+          return timeB - timeA; // Descending by time
+        }
+        // If timestamps are equal, sort by id (UUID comparison, descending)
+        return b.id.localeCompare(a.id);
+      });
+
+      const messages = sortedData.reverse(); // Reverse to get chronological order (oldest first)
 
       // Filter out invalid messages
       const validMessages = messages.filter(
@@ -241,10 +259,12 @@ export class ChatService {
    * Update project_id in chat session
    * @param sessionId - Chat session ID
    * @param projectId - Project ID
+   * @param userId - User ID (optional, for security verification)
    */
   static async updateSessionProject(
     sessionId: string,
-    projectId: string
+    projectId: string,
+    userId?: string
   ): Promise<void> {
     // Validate inputs
     if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
@@ -258,10 +278,35 @@ export class ChatService {
     }
 
     try {
-      const { error } = await supabaseAdmin
+      // ✅ SECURITY: Verify session belongs to user if userId provided
+      if (userId) {
+        const { data: session } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('id')
+          .eq('id', sessionId)
+          .eq('user_id', userId)
+          .maybeSingle();
+
+        if (!session) {
+          logger.warn('[CHAT_SERVICE] Session access denied in updateSessionProject', {
+            sessionId,
+            userId: userId.substring(0, 8) + '...',
+          });
+          return;
+        }
+      }
+
+      let query = supabaseAdmin
         .from('chat_sessions')
         .update({ project_id: projectId })
         .eq('id', sessionId);
+
+      // Add user_id filter if provided for additional security
+      if (userId) {
+        query = query.eq('user_id', userId);
+      }
+
+      const { error } = await query;
 
       if (error) {
         logger.error('[CHAT_SERVICE] Failed to update session project', {
@@ -483,13 +528,22 @@ export class ChatService {
         .filter((session: any) => session && session.id)
         .map((session: any) => {
           const messages = Array.isArray(session.chat_messages) ? session.chat_messages : [];
+
+          // ✅ FIX: Sort messages by created_at DESC to get the most recent message
+          // Nested queries in Supabase don't guarantee order, so we sort in JavaScript
+          const sortedMessages = messages.sort((a: any, b: any) => {
+            const timeA = new Date(a.created_at || 0).getTime();
+            const timeB = new Date(b.created_at || 0).getTime();
+            return timeB - timeA; // Descending (newest first)
+          });
+
           const lastMessage =
-            messages.length > 0 &&
-            messages[0] &&
-            messages[0].role &&
-            messages[0].content &&
-            messages[0].created_at
-              ? messages[0]
+            sortedMessages.length > 0 &&
+            sortedMessages[0] &&
+            sortedMessages[0].role &&
+            sortedMessages[0].content &&
+            sortedMessages[0].created_at
+              ? sortedMessages[0]
               : null;
 
           return {

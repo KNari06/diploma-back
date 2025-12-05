@@ -1003,7 +1003,7 @@ async function handlePlatformTest(
 
       // Update session with project (non-blocking)
       if (chatSessionId) {
-        ChatService.updateSessionProject(chatSessionId, project_id).catch(updateError => {
+        ChatService.updateSessionProject(chatSessionId, project_id, userId).catch(updateError => {
           logger.warn('[PLATFORM_TEST] Failed to update session project', {
             error: updateError instanceof Error ? updateError.message : String(updateError),
           });
@@ -3110,19 +3110,32 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
       .select('id', { count: 'exact', head: true })
       .eq('session_id', session.id);
 
-    // Get messages (newest first when offset=0)
+    // Get messages in chronological order (oldest first)
+    // Use ascending order and sort by created_at, then by id for messages with same timestamp
     const { data: messages } = await supabaseAdmin
       .from('chat_messages')
       .select('id, role, content, metadata, created_at')
       .eq('session_id', session.id)
-      .order('created_at', { ascending: false })
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true }) // Secondary sort for messages with same timestamp
       .range(offset, offset + limit - 1);
+
+    // Ensure messages are sorted correctly (in case of same timestamps)
+    const sortedMessages = (messages || []).sort((a, b) => {
+      const timeA = new Date(a.created_at).getTime();
+      const timeB = new Date(b.created_at).getTime();
+      if (timeA !== timeB) {
+        return timeA - timeB;
+      }
+      // If timestamps are equal, sort by id (UUID comparison)
+      return a.id.localeCompare(b.id);
+    });
 
     res.json({
       success: true,
       data: {
         session,
-        messages: messages || [],
+        messages: sortedMessages,
         pagination: {
           limit,
           offset,
@@ -3197,6 +3210,14 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
     const userId = req.user!.id;
     const { sessionId } = req.params;
 
+    // ✅ NEW: Pagination support (backward compatible - if not specified, returns all)
+    const limitParam = req.query.limit;
+    const offsetParam = req.query.offset;
+    const usePagination = limitParam !== undefined || offsetParam !== undefined;
+
+    const limit = usePagination ? Math.min(Number(limitParam) || 50, 100) : undefined;
+    const offset = usePagination ? Math.max(Number(offsetParam) || 0, 0) : undefined;
+
     // Verify session belongs to user
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
@@ -3210,20 +3231,62 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Get all messages for this session
-    const { data: messages } = await supabaseAdmin
+    // Get total count if pagination is used
+    let totalCount: number | undefined;
+    if (usePagination) {
+      const { count } = await supabaseAdmin
+        .from('chat_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('session_id', sessionId);
+      totalCount = count || 0;
+    }
+
+    // Get messages for this session in chronological order
+    // Sort by created_at, then by id for messages with same timestamp
+    let query = supabaseAdmin
       .from('chat_messages')
       .select('id, role, content, metadata, created_at')
       .eq('session_id', sessionId)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true }); // Secondary sort for messages with same timestamp
 
-    res.json({
+    // Apply pagination if specified
+    if (usePagination && limit !== undefined && offset !== undefined) {
+      query = query.range(offset, offset + limit - 1);
+    }
+
+    const { data: messages } = await query;
+
+    // Ensure messages are sorted correctly (in case of same timestamps)
+    const sortedMessages = (messages || []).sort((a, b) => {
+      const timeA = new Date(a.created_at).getTime();
+      const timeB = new Date(b.created_at).getTime();
+      if (timeA !== timeB) {
+        return timeA - timeB;
+      }
+      // If timestamps are equal, sort by id (UUID comparison)
+      return a.id.localeCompare(b.id);
+    });
+
+    const response: any = {
       success: true,
       data: {
         session,
-        messages: messages || [],
+        messages: sortedMessages,
       },
-    });
+    };
+
+    // Add pagination info if pagination was used
+    if (usePagination && totalCount !== undefined && limit !== undefined && offset !== undefined) {
+      response.data.pagination = {
+        limit,
+        offset,
+        total: totalCount,
+        has_more: (offset + limit) < totalCount,
+      };
+    }
+
+    res.json(response);
   } catch (error) {
     logger.error('[CHAT_HISTORY] Error getting history', { error, sessionId: req.params.sessionId });
     res.status(500).json({ error: 'Failed to get chat history' });
