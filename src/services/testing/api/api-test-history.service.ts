@@ -139,7 +139,20 @@ export class ApiTestHistoryService {
 
           // Extract request details from testResult
           const method = testResult.method || 'GET';
-          const url = testResult.url || '';
+
+          // ✅ FIX: Extract URL from testResult, or fallback to parsing from content
+          let url = testResult.url || '';
+          if (!url && msg.content) {
+            const urlMatch = msg.content.match(/(?:URL|url):\s*(https?:\/\/[^\s\n]+)/i);
+            if (urlMatch && urlMatch[1]) {
+              url = urlMatch[1].trim();
+            } else {
+              const anyUrlMatch = msg.content.match(/(https?:\/\/[^\s\n\)]+)/i);
+              if (anyUrlMatch && anyUrlMatch[1]) {
+                url = anyUrlMatch[1].trim();
+              }
+            }
+          }
 
           return {
             id: testId,
@@ -265,7 +278,24 @@ export class ApiTestHistoryService {
 
     // Extract request details
     const method = testResult.method || 'GET';
-    const url = testResult.url || '';
+
+    // ✅ FIX: Extract URL from testResult, or fallback to parsing from chatMessage.content
+    let url = testResult.url || '';
+
+    // If URL is empty, try to extract from chatMessage.content
+    if (!url && message.content) {
+      // Look for URL pattern in content (e.g., "• URL: https://example.com" or "**URL:** https://example.com")
+      const urlMatch = message.content.match(/(?:URL|url):\s*(https?:\/\/[^\s\n]+)/i);
+      if (urlMatch && urlMatch[1]) {
+        url = urlMatch[1].trim();
+      } else {
+        // Try to find any URL in the content
+        const anyUrlMatch = message.content.match(/(https?:\/\/[^\s\n\)]+)/i);
+        if (anyUrlMatch && anyUrlMatch[1]) {
+          url = anyUrlMatch[1].trim();
+        }
+      }
+    }
 
     const details: ApiTestDetails = {
       id: testId,
@@ -396,7 +426,20 @@ export class ApiTestHistoryService {
           const testResult = msg.metadata.testResult;
           const testId = msg.metadata.testId || `api_${msg.id}`;
           const method = testResult.method || 'GET';
-          const url = testResult.url || '';
+
+          // ✅ FIX: Extract URL from testResult, or fallback to parsing from content
+          let url = testResult.url || '';
+          if (!url && msg.content) {
+            const urlMatch = msg.content.match(/(?:URL|url):\s*(https?:\/\/[^\s\n]+)/i);
+            if (urlMatch && urlMatch[1]) {
+              url = urlMatch[1].trim();
+            } else {
+              const anyUrlMatch = msg.content.match(/(https?:\/\/[^\s\n\)]+)/i);
+              if (anyUrlMatch && anyUrlMatch[1]) {
+                url = anyUrlMatch[1].trim();
+              }
+            }
+          }
 
           return {
             id: testId,
