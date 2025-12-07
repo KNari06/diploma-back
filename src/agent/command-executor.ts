@@ -4,6 +4,7 @@ import { SelfHealingService } from '@/services/ai-selector/self-healing.service'
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/logger';
 import { Locator, Page } from 'playwright';
+import { shouldPressEnterAfterFill } from './utils/enter-detection-ai';
 import { getLocator, getSmartLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLocator } from './utils/selector-utils';
 import { SelectorStabilityScore, SmartWaitService } from './utils/smart-wait.service';
 
@@ -226,6 +227,20 @@ export class CommandExecutor {
           try {
             await fillSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
             await fillSmartResult.locator.fill(String(value), { timeout: timeout || 30000 });
+
+            // ✅ AI-powered Enter key detection
+            const shouldPress = await shouldPressEnterAfterFill(
+              fillSmartResult.locator,
+              this.page,
+              description
+            );
+
+            if (shouldPress) {
+              logger.info('[COMMAND_EXECUTOR] AI decided to press Enter after fill', {
+                selector: selector.substring(0, 50),
+              });
+              await fillSmartResult.locator.press('Enter', { timeout: timeout || 5000 });
+            }
           } catch (fillError) {
             // Smart locator failed, try self-healing
             logger.warn('[COMMAND_EXECUTOR] Smart locator fill failed, trying self-healing', {
@@ -237,6 +252,13 @@ export class CommandExecutor {
               async () => {
                 const locator = getLocator(this.page, selector);
                 await locator.fill(String(value), { timeout: timeout || 30000 });
+
+                // ✅ AI-powered Enter key detection (self-healing path)
+                const shouldPress = await shouldPressEnterAfterFill(locator, this.page, description);
+                if (shouldPress) {
+                  logger.info('[COMMAND_EXECUTOR] AI decided to press Enter after fill (self-healing)');
+                  await locator.press('Enter', { timeout: timeout || 5000 });
+                }
               },
               {
                 selector,

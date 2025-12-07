@@ -787,6 +787,14 @@ AVAILABLE ACTIONS (choose appropriate one):
 - **Assertions**: assertVisible, assertText, assertValue, assertUrl, assertCount
 - **Data**: extract, screenshot
 
+**📝 IMPORTANT: Using press action:**
+- ✅ Use press with value="Enter" when there's NO submit button visible
+- ✅ After filling a search input → if no "Search" button exists → use press Enter on the input
+- ✅ After filling a form field → if no submit button → use press Enter on the input
+- ✅ Example: {"action": "press", "selector": "role=textbox[name='Search']", "value": "Enter"}
+- ✅ This is equivalent to user pressing Enter key on keyboard
+- ⚠️ If a submit button EXISTS → prefer clicking the button instead of press Enter
+
 CRITICAL RULES:
 
 0. **SELECTOR USAGE (MOST IMPORTANT)**:
@@ -805,6 +813,11 @@ CRITICAL RULES:
    - ✅ GOOD: #email-input, [data-testid="email"], [name="email"]
    - ✅ OK: role=textbox[name="Email"], role=searchbox
    - ⚠️ AVOID: text="Email" - may find label text, not the input!
+
+   **After fill/type, if NO submit button exists:**
+   - ✅ Use press action with value="Enter" on the same input selector
+   - ✅ Example: fill input → then press Enter (if no button to click)
+   - ⚠️ If submit button EXISTS → click the button instead
 
    For **select** actions on dropdowns:
    - ✅ BEST: role=combobox[name="Country"], #country-select
@@ -858,6 +871,12 @@ CRITICAL RULES:
    - On product page: MUST select size/color BEFORE "add to cart"
    - On login: MUST fill credentials BEFORE clicking login
    - On checkout: MUST fill required fields BEFORE submit
+   - **After fill**: If no submit button exists → use press with Enter on the same input
+     Example sequence:
+     [
+       {"action": "fill", "selector": "role=searchbox", "value": "Математика", "description": "Fill search input"},
+       {"action": "press", "selector": "role=searchbox", "value": "Enter", "description": "Press Enter to submit search"}
+     ]
 
 2. **Realistic Actions**:
    - Use realistic test data (real email format, valid phone numbers)
