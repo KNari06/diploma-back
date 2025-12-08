@@ -1,0 +1,268 @@
+import { Response } from 'express';
+import { logger } from '@/utils/logger';
+import { confirmTestPlan } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { ProjectContextService } from '@/services/utils/project-context.service';
+import { ManualTestService } from '@/services/testing/ui/manualTest.service';
+import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
+import { ChatService } from '@/services/utils/chat.service';
+import { webSocketService } from '@/websocket/websocket.service';
+import { ChatTestUpdatePayload } from '@/websocket/types';
+import { emitProcessingStep } from '../shared/utils';
+import { normalizeUrl } from '../shared/utils';
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HELPER: EXECUTE UI TEST FLOW (REFACTORED - CRITICAL FIXES)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * FIX #6-11: Error handling, validation, non-blocking chat save
+ * FIX #12: Global timeout for entire flow (90s)
+ * FIX #13: Consistent WebSocket progress (0-100%)
+ */
+export async function executeUiTestFlow(
+  res: Response,
+  params: {
+    plan: any;
+    planId: string;
+    userId: string;
+    chatSessionId?: string;
+    workspace_id: string;
+    userMessage?: string; // FIX #14: Actual user message
+  }
+): Promise<void> {
+  const { plan, planId, userId, chatSessionId, workspace_id, userMessage = 'Approved test execution' } = params;
+
+  // FIX #12: Global timeout for UI test flow (longer than API because browser tests are slower)
+  const flowTimeout = 90000; // 90 seconds
+  const flowStartTime = Date.now();
+
+  const checkTimeout = () => {
+    if (Date.now() - flowStartTime > flowTimeout) {
+      throw new Error(`UI test flow timeout after ${flowTimeout / 1000}s`);
+    }
+  };
+
+  logger.info('🔵 [UI_TEST] Starting UI test execution', {
+    planId,
+    userId,
+    url: plan.url,
+    intelligentMode: plan.intelligentMode,
+    timeout: flowTimeout,
+  });
+
+  try {
+    // FIX #13: Consistent progress starting from 0%
+    emitProcessingStep(chatSessionId, 'executing_test', '🚀 Starting UI test execution...', 0);
+    emitProcessingStep(chatSessionId, 'executing_test', '📋 Confirming test plan...', 5);
+
+    // Validate plan.url
+    if (!plan.url || typeof plan.url !== 'string') {
+      throw new Error('Invalid plan URL - URL is required for UI testing');
+    }
+
+    checkTimeout();
+
+    // FIX #6 & #7: Confirm plan and check result properly
+    const confirmResult = await confirmTestPlan(planId, userId);
+
+    if (!confirmResult.success) {
+      throw new Error(`Failed to confirm test plan: ${confirmResult.message || 'Unknown error'}`);
+    }
+
+    // ✅ REMOVED: Standard mode validation - all UI tests now use intelligent mode
+    // Intelligent mode doesn't require commands validation as AI generates actions dynamically
+
+    emitProcessingStep(chatSessionId, 'executing_test', '💳 Checking credits...', 10);
+    checkTimeout();
+
+    // FIX #10: Deduct credits BEFORE test execution (not after)
+    // ✅ UPDATED: All UI tests are intelligent mode (Standard mode removed)
+    const uiTestType = 'intelligent';
+    const testId = `ui_${planId}_${Date.now()}`;
+
+    try {
+      await CreditCostTrackerService.deductCreditsForTest({
+        userId,
+        testType: uiTestType,
+        credits: TokenCalculatorService.getTestCreditCost(uiTestType),
+        costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001,
+        testId,
+        description: `${uiTestType} UI test: ${plan.url}`,
+      });
+    } catch (creditError) {
+      logger.error('[UI_TEST] Failed to deduct credits', {
+        error: creditError instanceof Error ? creditError.message : String(creditError),
+        userId,
+      });
+      throw new Error('Insufficient credits or payment error');
+    }
+
+    emitProcessingStep(chatSessionId, 'executing_test', '🔍 Finding project context...', 20);
+    checkTimeout();
+
+    // FIX #8: Wrap ProjectContextService in try-catch
+    let project_id: string;
+    try {
+      const projectResult = await ProjectContextService.findOrCreateProject(
+        workspace_id,
+        normalizeUrl(plan.url),
+        userId
+      );
+      project_id = projectResult.project_id;
+
+      if (!project_id) {
+        throw new Error('Failed to get project_id from ProjectContextService');
+      }
+    } catch (projectError) {
+      logger.error('[UI_TEST] ProjectContextService failed', {
+        error: projectError instanceof Error ? projectError.message : String(projectError),
+        workspace_id,
+        url: plan.url,
+      });
+      throw new Error(`Failed to initialize project: ${projectError instanceof Error ? projectError.message : 'Unknown error'}`);
+    }
+
+    emitProcessingStep(chatSessionId, 'executing_test', '⚙️ Launching browser test...', 30);
+    checkTimeout();
+
+    // FIX #9: Wrap ManualTestService.runTest in try-catch
+    let testCreated: any;
+    try {
+      const testRequest = {
+        url: plan.url,
+        browsers: ['chrome' as const],
+        projectId: project_id,
+        userId,
+        options: {},
+        commands: plan.commands,
+        intent: plan.scope,
+        intelligentMode: plan.intelligentMode,
+        testGoal: plan.intelligentMode ? plan.summary : undefined,
+        estimatedCost: plan.estimatedCost, // For dynamic credit calculation
+      };
+      /// Here we run the main UI/UX manual test
+      testCreated = await ManualTestService.runTest(testRequest);
+
+      if (!testCreated.success || !testCreated.data?.id) {
+        throw new Error('Test creation failed - no test ID returned');
+      }
+    } catch (testError) {
+      logger.error('[UI_TEST] ManualTestService.runTest failed', {
+        error: testError instanceof Error ? testError.message : String(testError),
+        url: plan.url,
+      });
+      throw new Error(`Failed to start test: ${testError instanceof Error ? testError.message : 'Unknown error'}`);
+    }
+
+    logger.info('✅ [UI_TEST] Test created successfully', {
+      testId: testCreated.data.id,
+      intelligentMode: plan.intelligentMode,
+    });
+
+    emitProcessingStep(chatSessionId, 'executing_test', '✅ Test started successfully!', 100);
+
+    // Save test-chat mapping (non-blocking)
+    if (chatSessionId && userId) {
+      TestChatMappingService.saveTestChatMapping({
+        testId: testCreated.data.id,
+        chatSessionId,
+        userId,
+      }).catch(mappingError => {
+        logger.error('[UI_TEST] Failed to save test-chat mapping', {
+          error: mappingError instanceof Error ? mappingError.message : String(mappingError),
+          testId: testCreated.data.id,
+        });
+      });
+    }
+
+    // Emit WebSocket event (non-blocking)
+    if (chatSessionId) {
+      try {
+        const testModeMessage = plan.intelligentMode
+          ? '🤖 Intelligent test started! AI will autonomously explore and adapt to your site.'
+          : '✅ Test started! Monitor progress in real-time.';
+
+        const chatTestUpdatePayload: ChatTestUpdatePayload = {
+          sessionId: chatSessionId,
+          testId: testCreated.data.id,
+          message: testModeMessage,
+          status: 'created',
+          links: {
+            fullReport: `/api/v1/manual-test/${testCreated.data.id}/summary`,
+          },
+          timestamp: new Date().toISOString(),
+        };
+        webSocketService.emitChatTestUpdate(chatSessionId, chatTestUpdatePayload);
+      } catch (wsError) {
+        logger.warn('[UI_TEST] Failed to emit WebSocket event', {
+          error: wsError instanceof Error ? wsError.message : String(wsError),
+        });
+      }
+    }
+
+    // Build success message
+    const testModeInfo = plan.intelligentMode
+      ? `\n\n🤖 **Mode:** Intelligent/Adaptive Testing\n📊 **Estimated:** ${plan.estimatedPages || '5-10 pages'}`
+      : '';
+
+    const successMessage = `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${testCreated.data.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data.id}/status`;
+
+    // ✅ FIX: Test is considered "runned" if it was successfully created and added to queue
+    // If testCreated.data.id exists, the test was launched (added to queue), even if not yet completed
+    const isTestRunned = !!testCreated.data.id;
+
+    // FIX #11: Make chat save non-blocking (fire-and-forget)
+    if (chatSessionId) {
+      ChatService.saveChatMessages(chatSessionId, [
+        { role: 'user', content: userMessage }, // FIX #14: Use actual user message
+        {
+          role: 'ai',
+          content: successMessage,
+          metadata: {
+            testId: testCreated.data.id,
+            testMode: 'intelligent', // ✅ UPDATED: All UI tests are intelligent mode
+            is_test_runned: isTestRunned, // ✅ NEW: Flag indicating if test is completed/failed
+          },
+        },
+      ]).catch(saveError => {
+        logger.error('[UI_TEST] Failed to save chat messages', {
+          error: saveError instanceof Error ? saveError.message : String(saveError),
+          sessionId: chatSessionId,
+        });
+      });
+    }
+
+    // Send response immediately (don't wait for chat save)
+    res.json({
+      success: true, // ← Frontend expects this!
+      reply: successMessage,
+      testId: testCreated.data.id,
+      timestamp: new Date().toISOString(),
+      sessionId: chatSessionId,
+    });
+
+    logger.info('✅ [UI_TEST] HTTP response sent successfully', {
+      testId: testCreated.data.id,
+      duration: Date.now() - flowStartTime,
+    });
+  } catch (error) {
+    logger.error('❌ [UI_TEST] Critical error in UI test flow', {
+      error: error instanceof Error ? error.message : String(error),
+      planId,
+      userId,
+    });
+
+    // If response not sent yet, send error
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: 'UI test failed',
+        message: error instanceof Error ? error.message : 'Unknown error',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    throw error; // Re-throw for handleExecutionError
+  }
+}

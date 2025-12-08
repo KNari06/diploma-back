@@ -1,0 +1,81 @@
+import { Request, Response } from 'express';
+import { logger } from '@/utils/logger';
+import { ChatService } from '@/services/utils/chat.service';
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HANDLER: CLARIFICATION REQUEST
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * When AI is uncertain about user's intent (confidence < 0.7),
+ * ask user for clarification instead of guessing
+ */
+export async function handleClarificationRequest(
+  req: Request,
+  res: Response,
+  params: {
+    parsedIntent: any;
+    userId: string;
+    chatSessionId?: string;
+  }
+): Promise<void> {
+  const { parsedIntent, userId, chatSessionId } = params;
+
+  logger.info('[CLARIFICATION] Requesting clarification from user', {
+    confidence: parsedIntent.confidence,
+    possibleIntents: parsedIntent.possibleIntents,
+    reason: parsedIntent.clarificationReason,
+  });
+
+  // Build clarification message
+  const clarificationMessage = buildClarificationMessage(parsedIntent);
+
+  // Save messages to chat history (with metadata for detection)
+  if (chatSessionId) {
+    await ChatService.saveChatMessages(chatSessionId, [
+      { role: 'user', content: parsedIntent.rawText || 'No message' },
+      {
+        role: 'ai',
+        content: clarificationMessage,
+        metadata: {
+          requiresAnswers: true, // Key flag for intent parser detection
+          needsMoreInfo: true,
+          clarificationReason: parsedIntent.clarificationReason,
+          possibleIntents: parsedIntent.possibleIntents,
+        },
+      },
+    ]);
+  }
+
+  // Send clarification question to user
+  res.json({
+    response: clarificationMessage,
+    intent: 'needs_clarification',
+    confidence: parsedIntent.confidence,
+    possibleIntents: parsedIntent.possibleIntents,
+    metadata: {
+      clarificationReason: parsedIntent.clarificationReason,
+      originalIntent: parsedIntent.metadata?.originalIntent,
+    },
+  });
+
+  logger.info('[CLARIFICATION] Sent clarification request to user', {
+    chatSessionId,
+    userId,
+  });
+}
+
+/**
+ * Build user-friendly clarification message
+ * Uses GPT-generated clarificationQuestion (no hardcoded suggestions)
+ */
+export function buildClarificationMessage(parsedIntent: any): string {
+  // GPT should generate complete clarificationQuestion with suggestions
+  // If GPT didn't provide it, use fallback
+  const question = parsedIntent.clarificationQuestion ||
+    "I'm not entirely sure what you'd like me to do. Could you provide more details?";
+
+  // Just return GPT's question - it should already include suggestions
+  // No need to add hardcoded suggestions here
+  return question.trim();
+}
