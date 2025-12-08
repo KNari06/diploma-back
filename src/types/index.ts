@@ -696,6 +696,7 @@ export const KNOWN_INTENTS = [
   'platform_test',           // UI testing (replaces check_element, fill_form, login_flow, assert_ui, navigate)
   'api_test',                // API testing (single request)
   'general_chat',            // General conversation
+  'needs_clarification',     // When AI is uncertain and needs user to clarify intent
   // LEGACY: Keep for backward compatibility (will be migrated to platform_test)
   'check_element',
   'fill_form',
@@ -761,6 +762,11 @@ export interface IntentResult {
   selector?: string; // For UI testing intents
   // Playwright commands generated from intent
   commands?: PlaywrightCommand[];
+
+  // Clarification fields (for needs_clarification intent)
+  clarificationQuestion?: string; // Question to ask user when intent is unclear
+  possibleIntents?: IntentType[]; // List of possible intents AI is considering
+  clarificationReason?: string; // Why clarification is needed (for debugging)
 }
 
 // Playwright Command types

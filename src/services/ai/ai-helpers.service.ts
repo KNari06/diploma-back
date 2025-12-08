@@ -53,8 +53,8 @@ export async function detectUserApproval(
         content: prompt,
       },
     ], {
-      model: 'gpt-3.5-turbo', // Cost-effective AI for intent detection
-      temperature: 0.2, // Low temp for consistent results
+      model: 'gpt-4o-mini', // Cost-effective AI for intent detection
+      temperature: 0.1, // Low temp for consistent results
       max_tokens: 100,
     });
 

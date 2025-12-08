@@ -2,23 +2,14 @@ import { supabaseAdmin } from '@/db/supabase';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { logger } from '@/utils/logger';
+import { isValidUUID } from '@/utils/validation';
 import { Request, Response } from 'express';
-
-// UUID validation regex
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Maximum credit amount to prevent DoS/integer overflow
 const MAX_CREDIT_AMOUNT = 1000000;
 
 // Maximum limit for history query
 const MAX_HISTORY_LIMIT = 500;
-
-/**
- * Check if user ID is a valid UUID (authenticated user)
- */
-function isValidUUID(userId: string): boolean {
-  return UUID_REGEX.test(userId);
-}
 
 /**
  * Check if user is admin

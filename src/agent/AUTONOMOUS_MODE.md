@@ -305,7 +305,7 @@ const questions = await generateClarifyingQuestions(
 - status: TEXT (pending_confirmation | confirmed | rejected | expired)
 - exploration_id: UUID (FK to exploration_cache)
 - created_at: TIMESTAMP
-- expires_at: TIMESTAMP (1 hour)
+- expires_at: TIMESTAMP (3 days)
 ```
 
 ### Table: `test_credentials`
@@ -547,7 +547,7 @@ Total: ~1900+ lines of code
 - Encrypted credentials
 - RLS policies
 - Only owner access
-- Auto-expire plans (1 hour)
+- Auto-expire plans (3 days)
 
 ✅ **Performance:**
 - Cache hits = instant (~100ms)

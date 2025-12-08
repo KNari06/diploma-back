@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/logger';
+import { isValidUUID } from '@/utils/validation';
 import { generateEmbedding } from './ai/embedding.service';
 
 /**
@@ -37,9 +38,38 @@ export async function embedChatMessage(
   role: 'user' | 'ai',
   content: string
 ): Promise<boolean> {
+  // ✅ FIX: Validate input parameters
+  if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+    logger.error('[CHAT_EMBEDDINGS] Invalid sessionId in embedChatMessage', { sessionId, messageId });
+    return false;
+  }
+
+  if (!messageId || typeof messageId !== 'string' || messageId.trim().length === 0) {
+    logger.error('[CHAT_EMBEDDINGS] Invalid messageId in embedChatMessage', { sessionId, messageId });
+    return false;
+  }
+
+  // ✅ FIX: Validate UUID format
+  if (!isValidUUID(sessionId)) {
+    logger.error('[CHAT_EMBEDDINGS] Invalid UUID format for sessionId', { sessionId, messageId });
+    return false;
+  }
+
+  if (!isValidUUID(messageId)) {
+    logger.error('[CHAT_EMBEDDINGS] Invalid UUID format for messageId', { sessionId, messageId });
+    return false;
+  }
+
+  // ✅ FIX: Validate role
+  if (role !== 'user' && role !== 'ai') {
+    logger.error('[CHAT_EMBEDDINGS] Invalid role in embedChatMessage', { sessionId, messageId, role });
+    return false;
+  }
+
   try {
     // Skip empty messages
-    if (!content || content.trim().length === 0) {
+    if (!content || typeof content !== 'string' || content.trim().length === 0) {
+      logger.debug('[CHAT_EMBEDDINGS] Skipping empty message', { messageId, sessionId });
       return false;
     }
 
@@ -59,7 +89,28 @@ export async function embedChatMessage(
     }
 
     // Generate embedding
+    // ✅ generateEmbedding already validates input and throws on error
     const embedding = await generateEmbedding(truncatedContent);
+
+    // ✅ FIX: Validate embedding before storing (defensive check)
+    if (!embedding || !Array.isArray(embedding) || embedding.length !== 1536) {
+      logger.error('[CHAT_EMBEDDINGS] Invalid embedding dimensions', {
+        messageId,
+        sessionId,
+        dimensions: embedding?.length,
+        expected: 1536
+      });
+      return false;
+    }
+
+    // Check if embedding already exists (for logging)
+    const { data: existing } = await supabaseAdmin
+      .from('chat_message_embeddings')
+      .select('id')
+      .eq('message_id', messageId)
+      .maybeSingle();
+
+    const isUpdate = !!existing;
 
     // Store in database (upsert to handle duplicates)
     const { error } = await supabaseAdmin
@@ -90,7 +141,12 @@ export async function embedChatMessage(
       return false;
     }
 
-    logger.debug('[CHAT_EMBEDDINGS] Embedding stored', { messageId, sessionId });
+    // ✅ FIX: Improved logging (info level for production visibility)
+    if (isUpdate) {
+      logger.info('[CHAT_EMBEDDINGS] Embedding updated', { messageId, sessionId });
+    } else {
+      logger.info('[CHAT_EMBEDDINGS] Embedding stored', { messageId, sessionId });
+    }
     return true;
 
   } catch (error) {
@@ -110,15 +166,40 @@ export async function embedMultipleMessages(
   sessionId: string,
   messages: ChatMessage[]
 ): Promise<{ success: number; failed: number }> {
+  // ✅ FIX: Validate input
+  if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+    logger.error('[CHAT_EMBEDDINGS] Invalid sessionId in embedMultipleMessages', { sessionId });
+    return { success: 0, failed: 0 };
+  }
+
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    logger.warn('[CHAT_EMBEDDINGS] Empty messages array in embedMultipleMessages', { sessionId });
+    return { success: 0, failed: 0 };
+  }
+
+  // ✅ FIX: Limit batch size to prevent timeout and memory issues
+  const MAX_MESSAGES_PER_BATCH = 50;
+  let messagesToProcess = messages;
+
+  if (messages.length > MAX_MESSAGES_PER_BATCH) {
+    logger.warn('[CHAT_EMBEDDINGS] Too many messages, limiting batch', {
+      sessionId,
+      total: messages.length,
+      limit: MAX_MESSAGES_PER_BATCH
+    });
+    messagesToProcess = messages.slice(0, MAX_MESSAGES_PER_BATCH);
+  }
+
   let success = 0;
   let failed = 0;
 
   logger.info('[CHAT_EMBEDDINGS] Batch embedding messages', {
     sessionId,
-    messageCount: messages.length,
+    messageCount: messagesToProcess.length,
+    totalAvailable: messages.length,
   });
 
-  for (const message of messages) {
+  for (const message of messagesToProcess) {
     const result = await embedChatMessage(
       sessionId,
       message.id,
@@ -132,9 +213,11 @@ export async function embedMultipleMessages(
       failed++;
     }
 
-    // Rate limit: OpenAI allows ~3000 RPM (requests/min) for embeddings
-    // 600ms = 100 requests/min (conservative to avoid rate limits)
-    await new Promise(resolve => setTimeout(resolve, 600));
+    // ✅ FIX: Optimized rate limit
+    // OpenAI allows ~3000 RPM (requests/min) = 50 RPS
+    // 50ms between requests = 20 RPS = 1200 RPM (safe margin)
+    // Previous: 600ms = 100 RPM (too slow)
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
 
   logger.info('[CHAT_EMBEDDINGS] Batch embedding complete', {
@@ -160,6 +243,23 @@ export async function searchChatHistory(
 ): Promise<ChatEmbeddingResult[]> {
   const { matchCount = 5, matchThreshold = 0.5 } = options;
 
+  // ✅ FIX: Validate input parameters
+  if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+    logger.error('[CHAT_EMBEDDINGS] Invalid sessionId in searchChatHistory', { sessionId });
+    return [];
+  }
+
+  if (!queryText || typeof queryText !== 'string' || queryText.trim().length === 0) {
+    logger.warn('[CHAT_EMBEDDINGS] Empty queryText in searchChatHistory', { sessionId });
+    return [];
+  }
+
+  // Validate UUID format (basic check)
+  if (!isValidUUID(sessionId)) {
+    logger.error('[CHAT_EMBEDDINGS] Invalid UUID format for sessionId', { sessionId });
+    return [];
+  }
+
   try {
     logger.info('[CHAT_EMBEDDINGS] Searching chat history', {
       sessionId,
@@ -184,10 +284,20 @@ export async function searchChatHistory(
       return [];
     }
 
-    logger.info('[CHAT_EMBEDDINGS] Search complete', {
-      sessionId,
-      resultsCount: data?.length || 0,
-    });
+    const resultsCount = data?.length || 0;
+
+    if (resultsCount === 0) {
+      logger.info('[CHAT_EMBEDDINGS] Search returned no results', {
+        sessionId,
+        queryLength: queryText.length,
+        matchThreshold,
+      });
+    } else {
+      logger.info('[CHAT_EMBEDDINGS] Search complete', {
+        sessionId,
+        resultsCount,
+      });
+    }
 
     return data || [];
 
@@ -276,6 +386,12 @@ export async function deleteSessionEmbeddings(sessionId: string): Promise<boolea
 export async function getMessagesNeedingEmbedding(
   sessionId: string
 ): Promise<ChatMessage[]> {
+  // ✅ FIX: Validate sessionId
+  if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+    logger.error('[CHAT_EMBEDDINGS] Invalid sessionId in getMessagesNeedingEmbedding', { sessionId });
+    return [];
+  }
+
   try {
     // Get all messages older than the last 20
     const { data: allMessages, error: messagesError } = await supabaseAdmin
@@ -319,7 +435,10 @@ export async function getMessagesNeedingEmbedding(
         error: embeddingsError,
         sessionId
       });
-      // Continue anyway, will just re-embed some messages
+      // ✅ FIX: Return empty array to prevent re-embedding all messages
+      // This is safer than continuing and potentially re-embedding everything
+      // The next call will retry getting embeddings
+      return [];
     }
 
     const embeddedIds = new Set(
@@ -355,8 +474,19 @@ export async function getMessagesNeedingEmbedding(
 export async function autoEmbedOldMessages(
   sessionId: string
 ): Promise<{ success: number; failed: number }> {
+  // ✅ FIX: Validate sessionId
+  if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+    logger.error('[CHAT_EMBEDDINGS] Invalid sessionId in autoEmbedOldMessages', { sessionId });
+    return { success: 0, failed: 0 };
+  }
+
   try {
     const messagesNeedingEmbedding = await getMessagesNeedingEmbedding(sessionId);
+
+    logger.info('[CHAT_EMBEDDINGS] Starting auto-embed', {
+      sessionId,
+      messageCount: messagesNeedingEmbedding.length
+    });
 
     if (messagesNeedingEmbedding.length === 0) {
       logger.info('[CHAT_EMBEDDINGS] No messages need embedding', { sessionId });

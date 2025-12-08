@@ -1,20 +1,12 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { ExplorationResult } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { TestPlan } from '@/services/testing/plans/test-plan-generator.service';
+import { ExplorationResult } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { logger } from '@/utils/logger';
+import { isValidUUID } from '@/utils/validation';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Validate UUID format (consistent with other services)
- */
-function isValidUUID(str: string): boolean {
-  if (!str || typeof str !== 'string') return false;
-  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  return UUID_REGEX.test(str);
-}
 
 /**
  * Save exploration result to cache
@@ -276,8 +268,45 @@ export async function getLatestPendingTestPlan(
 
     const { data, error } = await query.maybeSingle();
 
-    if (error || !data) {
-      logger.info('[PENDING_PLAN] No pending test plan found', { userId });
+    // ✅ FIX: Better error handling - distinguish between "not found" and "database error"
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // Record not found - this is normal
+        logger.info('[GET_LATEST_PENDING] No pending plan found', { userId });
+        return null;
+      }
+      // Other database error
+      logger.error('[GET_LATEST_PENDING] Database error', {
+        error: error instanceof Error ? error.message : String(error),
+        errorCode: error.code,
+        userId,
+      });
+      return null;
+    }
+
+    if (!data) {
+      logger.info('[GET_LATEST_PENDING] No pending plan found', { userId });
+      return null;
+    }
+
+    // ✅ FIX: Check status after retrieval (race condition protection)
+    if (data.status !== 'pending_confirmation') {
+      logger.warn('[GET_LATEST_PENDING] Plan status changed', {
+        planId: data.id,
+        status: data.status,
+        userId,
+      });
+      return null;
+    }
+
+    // ✅ FIX: Check expires_at after retrieval (defensive check)
+    if (data.expires_at && new Date(data.expires_at) <= new Date()) {
+      logger.warn('[GET_LATEST_PENDING] Plan expired', {
+        planId: data.id,
+        userId,
+        expiresAt: data.expires_at,
+        now: new Date().toISOString(),
+      });
       return null;
     }
 
@@ -287,20 +316,26 @@ export async function getLatestPendingTestPlan(
       createdAt: data.created_at,
     });
 
+    // ✅ FIX: Return complete TestPlan with all fields (matching getTestPlan)
     return {
       id: data.id,
       status: data.status,
       url: data.url,
       scope: data.scope,
       summary: data.summary,
-      steps: data.steps,
-      commands: data.commands,
+      steps: data.steps || [],
+      commands: data.commands || [],
       estimatedDuration: data.estimated_duration,
-      whatWillBeTested: data.what_will_be_tested,
-      whatWillNotBeTested: data.what_will_not_be_tested,
-      risks: data.risks,
+      whatWillBeTested: data.what_will_be_tested || [],
+      whatWillNotBeTested: data.what_will_not_be_tested || [],
+      risks: data.risks || [],
+      notes: data.notes || null, // ✅ Added: Support notes field
       createdAt: data.created_at,
       expiresAt: data.expires_at,
+      // ✅ Added: Missing optional fields
+      intelligentMode: data.intelligent_mode || false,
+      estimatedPages: data.estimated_pages,
+      estimatedCost: data.estimated_cost,
     };
   } catch (error) {
     logger.error('Error getting latest pending test plan', { error });
@@ -375,6 +410,35 @@ export async function getTestPlan(
         planId,
         userId,
       });
+      return null;
+    }
+
+    // ✅ FIX: Check expires_at to prevent using expired plans
+    if (data.expires_at && new Date(data.expires_at) <= new Date()) {
+      logger.warn('[GET_TEST_PLAN] Test plan expired', {
+        planId,
+        userId,
+        expiresAt: data.expires_at,
+        now: new Date().toISOString(),
+      });
+      // Optionally update status to expired (non-blocking)
+      // ✅ FIX: Convert PromiseLike to Promise and add proper error typing
+      Promise.resolve(
+        supabaseAdmin
+          .from('test_plans')
+          .update({ status: 'expired' })
+          .eq('id', planId)
+          .eq('user_id', userId)
+      )
+        .then(() => {
+          logger.info('[GET_TEST_PLAN] Plan status updated to expired', { planId });
+        })
+        .catch((error: unknown) => {
+          logger.warn('[GET_TEST_PLAN] Failed to update plan status', {
+            error: error instanceof Error ? error.message : String(error),
+            planId
+          });
+        });
       return null;
     }
 

@@ -11,6 +11,7 @@ import { formatTestPlanForConfirmation, generateIntelligentTestPlan, generateTes
 import { exploreProduct } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { generateClarifyingQuestions, parseAnswers } from '@/services/utils/question-generator.service';
 import { logger } from '@/utils/logger';
+import { isValidUUID } from '@/utils/validation';
 import { ChatProcessingStepPayload } from '@/websocket/types';
 import { webSocketService } from '@/websocket/websocket.service';
 
@@ -617,14 +618,7 @@ export async function confirmTestPlan(
   }
 }
 
-/**
- * UUID validation helper (centralized)
- */
-function isValidUUID(uuid: string): boolean {
-  if (!uuid || typeof uuid !== 'string') return false;
-  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  return UUID_REGEX.test(uuid);
-}
+// UUID validation is now centralized in @/utils/validation
 
 /**
  * Reject test plan

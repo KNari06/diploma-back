@@ -11,9 +11,9 @@ function getEncoder() {
   try {
     return encoding_for_model('gpt-4');
   } catch (error) {
-    logger.warn('Failed to get gpt-4 encoder, falling back to gpt-3.5-turbo', { error });
+    logger.warn('Failed to get gpt-4 encoder, falling back to gpt-4o-mini', { error });
     try {
-      return encoding_for_model('gpt-3.5-turbo');
+      return encoding_for_model('gpt-4o-mini');
     } catch (fallbackError) {
       logger.error('Failed to get any encoder', { fallbackError });
       throw new Error('Tiktoken encoder unavailable');

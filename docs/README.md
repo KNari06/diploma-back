@@ -38,6 +38,7 @@
 - [**Руководство разработчика**](./development/README.md) - как разрабатывать
 - [**Стандарты кодирования**](./development/coding-standards.md) - правила написания кода
 - [**🤖 Intent Parsing Guide**](./development/INTENT_PARSING_GUIDE.md) - ✨ Context-First AI подход и трекинг изменений
+- [**❓ Needs Clarification Flow**](./development/needs-clarification-flow.md) - ✨ NEW! Как система спрашивает уточнения при низком confidence
 - [**🔍 Playwright Logging Improvements**](./development/PLAYWRIGHT_LOGGING_IMPROVEMENTS.md) - Детальное логирование всего testing flow
 - [**⚡ Intelligent Mode Optimization**](./development/INTELLIGENT_MODE_OPTIMIZATION.md) - Network & data collection оптимизация
 - [**🔌 WebSocket Worker Bridge Plan**](./development/WEBSOCKET_WORKER_BRIDGE_PLAN.md) - План передачи этапов тестирования через WebSocket из Worker

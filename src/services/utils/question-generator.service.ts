@@ -327,7 +327,7 @@ Guidelines:
     ], {
       temperature: 0.1,
       response_format: { type: 'json_object' },
-      model: 'gpt-3.5-turbo',
+      model: 'gpt-4o-mini',
     });
 
     if (!response || !response.content || typeof response.content !== 'string') {

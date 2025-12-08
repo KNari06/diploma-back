@@ -7,6 +7,19 @@ export const uuidSchema = z.string().uuid('Invalid UUID format');
 export const urlSchema = z.string().url('Invalid URL format');
 export const emailSchema = z.string().email('Invalid email format');
 
+// UUID validation regex (centralized)
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Validate UUID format
+ * @param uuid - UUID string to validate
+ * @returns true if valid UUID, false otherwise
+ */
+export function isValidUUID(uuid: string | undefined | null): boolean {
+  if (!uuid || typeof uuid !== 'string') return false;
+  return UUID_REGEX.test(uuid);
+}
+
 // Browser type validation
 export const browserTypeSchema = z.enum([
   'chrome',

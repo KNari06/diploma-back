@@ -1,6 +1,7 @@
 /**
  * Centralized Fuzzing Configuration
  * FIX #3: All fuzzing-related constants in one place
+ * NEW: Follow-on scenario limits and safety checks
  */
 export const FUZZING_CONFIG = {
   // Timeouts
@@ -16,6 +17,15 @@ export const FUZZING_CONFIG = {
 
   // Progress reporting
   PROGRESS_UPDATE_INTERVAL: 1, // Report progress every N scenarios
+
+  // Follow-on scenario limits (NEW)
+  FOLLOW_ON: {
+    MAX_SCENARIOS: 10,          // Max follow-on scenarios to generate
+    MIN_SCENARIOS: 3,           // Min follow-on scenarios expected from GPT
+    MIN_CRITICAL_ISSUES: 1,     // Min critical issues needed to trigger follow-on
+    ALLOWED_SEVERITIES: ['critical', 'high'] as const, // Only these severities trigger follow-on
+    MAX_RETRIES: 2,             // Max retries if follow-on generation fails
+  },
 } as const;
 
 export type FuzzingConfig = typeof FUZZING_CONFIG;

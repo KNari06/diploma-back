@@ -318,7 +318,7 @@ export class CreditCostTrackerService {
    */
   static async checkCreditsForTest(
     userId: string,
-    testType: 'intelligent' | 'standard' | 'api' | 'chat'
+    testType: 'intelligent' | 'api' | 'chat'
   ): Promise<CreditCheck> {
     try {
       // Validate inputs

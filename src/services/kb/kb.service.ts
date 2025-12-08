@@ -358,7 +358,7 @@ RETURN ONLY: ru, en, or neutral`;
         },
       ],
       {
-        model: 'gpt-3.5-turbo',
+        model: 'gpt-4o-mini',
         temperature: 0.1, // Very low for consistent results
         max_tokens: 10, // Just need 1-2 tokens
       }
