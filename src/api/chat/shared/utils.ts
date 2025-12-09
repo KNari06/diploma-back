@@ -2,9 +2,11 @@ import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/logger';
 import { isValidUUID } from '@/utils/validation';
 import { ChatService } from '@/services/utils/chat.service';
+import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { ChatProcessingStepPayload } from '@/websocket/types';
 import { webSocketService } from '@/websocket/websocket.service';
 import { PROGRESS } from './constants';
+import { Response } from 'express';
 
 /**
  * Normalize URL by adding protocol if missing
@@ -149,6 +151,116 @@ export function emitProcessingStep(
       error: error instanceof Error ? error.message : String(error),
     });
     // Continue execution - WebSocket errors should not break HTTP requests
+  }
+}
+
+/**
+ * Check if user has enough credits for chat message
+ * Returns false and sends 402 response if insufficient credits
+ * @param userId - User ID
+ * @param res - Express response object
+ * @returns True if user has enough credits, false otherwise
+ */
+export async function checkChatCredits(
+  userId: string,
+  res: Response
+): Promise<boolean> {
+  try {
+    const creditCheck = await PricingPlansService.checkUserCredits(userId, 1);
+
+    if (!creditCheck.can_use_credits) {
+      logger.warn('[CHAT_CREDITS] Insufficient credits', {
+        userId: userId.substring(0, 8) + '...',
+        reason: creditCheck.reason,
+        daily_remaining: creditCheck.daily_remaining,
+        monthly_remaining: creditCheck.monthly_remaining,
+      });
+
+      // Check if response already sent
+      if (res.headersSent) {
+        return false;
+      }
+
+      res.status(402).json({
+        success: false,
+        error: 'Insufficient credits',
+        message: creditCheck.reason || 'You have reached your credit limit. Please upgrade your plan or wait for daily reset.',
+        daily_remaining: creditCheck.daily_remaining,
+        monthly_remaining: creditCheck.monthly_remaining,
+        timestamp: new Date().toISOString(),
+      });
+      return false;
+    }
+
+    logger.info('[CHAT_CREDITS] Credit check passed', {
+      userId: userId.substring(0, 8) + '...',
+      daily_remaining: creditCheck.daily_remaining,
+      monthly_remaining: creditCheck.monthly_remaining,
+    });
+
+    return true;
+  } catch (error) {
+    logger.error('[CHAT_CREDITS] Exception checking credits', {
+      error: error instanceof Error ? error.message : String(error),
+      userId: userId.substring(0, 8) + '...',
+    });
+
+    // On error, don't block the request (graceful degradation)
+    // But log the error for investigation
+    return true; // Allow request to proceed
+  }
+}
+
+/**
+ * Deduct credits for chat message after successful OpenAI response
+ * @param userId - User ID
+ * @param shouldDeduct - Whether to deduct credits (false for fallback responses)
+ * @returns Credit deduction result
+ */
+export async function deductChatCredits(
+  userId: string,
+  shouldDeduct: boolean
+): Promise<{
+  success: boolean;
+  daily_remaining?: number;
+  monthly_remaining?: number;
+}> {
+  if (!shouldDeduct) {
+    return { success: true };
+  }
+
+  try {
+    const creditResult = await PricingPlansService.useUserCredits(userId, 1);
+
+    if (creditResult.success) {
+      logger.info('[CHAT_CREDITS] Credits deducted successfully', {
+        userId: userId.substring(0, 8) + '...',
+        daily_remaining: creditResult.daily_remaining,
+        monthly_remaining: creditResult.monthly_remaining,
+      });
+    } else {
+      // Log error but don't interrupt response (we already checked balance above)
+      logger.error('[CHAT_CREDITS] Failed to deduct credits after successful response', {
+        userId: userId.substring(0, 8) + '...',
+        reason: creditResult.message,
+        daily_remaining: creditResult.daily_remaining,
+        monthly_remaining: creditResult.monthly_remaining,
+      });
+    }
+
+    return {
+      success: creditResult.success,
+      daily_remaining: creditResult.daily_remaining,
+      monthly_remaining: creditResult.monthly_remaining,
+    };
+  } catch (creditError) {
+    // Log error but don't interrupt response
+    logger.error('[CHAT_CREDITS] Exception deducting credits', {
+      error: creditError instanceof Error ? creditError.message : String(creditError),
+      userId: userId.substring(0, 8) + '...',
+    });
+
+    return { success: false };
   }
 }
 

@@ -122,6 +122,52 @@ export class UserCreditsService {
       throw new Error('Failed to create user credits: no data returned');
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Give initial 5 credits to new free plan users
+    // ═══════════════════════════════════════════════════════════════════════
+    try {
+      // Check user's plan
+      const { data: userData } = await supabaseAdmin
+        .from('users')
+        .select('plan_id, pricing_plans!plan_id(slug)')
+        .eq('id', userId)
+        .maybeSingle();
+
+      // Get plan slug (handle both array and object responses)
+      let planSlug: string | null = null;
+      if (userData?.pricing_plans) {
+        const plan = Array.isArray(userData.pricing_plans)
+          ? userData.pricing_plans[0]
+          : userData.pricing_plans;
+        planSlug = plan?.slug || null;
+      }
+
+      // If user has no plan or has free plan, give initial 5 credits
+      const isFreePlan = !planSlug || planSlug === 'free';
+
+      if (isFreePlan && data.credits_balance === 0) {
+        logger.info('[USER_CREDITS] Giving initial 5 credits to new free plan user', { userId });
+        await this.addCredits(
+          userId,
+          5,
+          'bonus',
+          'Welcome bonus: Initial free credits for new user',
+          { is_initial_bonus: true }
+        );
+        // Return updated credits
+        const updatedCredits = await this.getUserCredits(userId);
+        if (updatedCredits) {
+          return updatedCredits;
+        }
+      }
+    } catch (initialCreditsError) {
+      // Log error but don't fail user creation if initial credits fail
+      logger.warn('[USER_CREDITS] Failed to give initial credits (non-critical)', {
+        error: initialCreditsError instanceof Error ? initialCreditsError.message : String(initialCreditsError),
+        userId,
+      });
+    }
+
     logger.info('[USER_CREDITS] Created new user credits', { userId });
     return data;
   }

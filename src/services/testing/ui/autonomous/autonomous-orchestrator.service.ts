@@ -129,8 +129,11 @@ function getScopeStrategy(scope: string): {
         'Accessibility compliance',
         'Performance on key pages',
         'Cross-browser compatibility',
+        'Core platform functionality',
+        'Integration points',
+        'Platform stability',
       ],
-      testTypes: ['functional', 'visual', 'accessibility', 'performance'],
+      testTypes: ['functional', 'visual', 'accessibility', 'performance', 'integration', 'smoke'],
     },
     'flow': {
       description: 'Specific user journey testing',
@@ -143,18 +146,6 @@ function getScopeStrategy(scope: string): {
         'Flow interruption and recovery',
       ],
       testTypes: ['functional', 'integration', 'error-handling'],
-    },
-    'platform': {
-      description: 'Platform-level testing with intelligent exploration',
-      estimatedDuration: '10-20 minutes',
-      focusAreas: [
-        'Core platform functionality',
-        'Critical user workflows',
-        'Platform-specific features',
-        'Integration points',
-        'Platform stability',
-      ],
-      testTypes: ['functional', 'integration', 'smoke'],
     },
     'page': {
       description: 'Single page deep testing',
@@ -447,10 +438,10 @@ export async function runAutonomousExploration(params: {
     });
 
     // Check if this should be intelligent test (for platform_test with scope 'full' or 'flow')
+    // Note: 'platform' scope was merged into 'full' as they were identical
     const shouldUseIntelligentMode =
       parsedAnswers.scope === 'full' ||
-      parsedAnswers.scope === 'flow' ||
-      parsedAnswers.scope === 'platform';
+      parsedAnswers.scope === 'flow';
 
       emitProgress(
       'generating_plan',

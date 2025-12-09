@@ -330,6 +330,13 @@ export class PricingPlansService {
 
   /**
    * Reset daily credits for all users (should be called daily via cron)
+   *
+   * For FREE plan users:
+   * - If user used 0 credits yesterday → no credits added
+   * - If user used 1-5 credits yesterday → adds back what they used (to restore to 5)
+   *
+   * For other plans (pro, ultra):
+   * - Just resets the daily usage counter
    */
   static async resetDailyCredits(): Promise<void> {
     try {
@@ -340,7 +347,7 @@ export class PricingPlansService {
         throw new Error(`Failed to reset daily credits: ${error.message}`);
       }
 
-      logger.info('[PRICING_PLANS] Daily credits reset completed');
+      logger.info('[PRICING_PLANS] Daily credits reset and replenishment completed');
     } catch (error) {
       logger.error('[PRICING_PLANS] Exception in resetDailyCredits', {
         error: error instanceof Error ? error.message : String(error),

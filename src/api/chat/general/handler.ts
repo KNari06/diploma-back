@@ -2,6 +2,7 @@ import { buildChatSystemPrompt } from '@/ai/prompts';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { autoEmbedOldMessages, searchChatHistory } from '@/services/chat-embeddings.service';
+import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { convertRoleForOpenAI } from '@/utils/chat-helpers';
@@ -9,7 +10,7 @@ import { logger } from '@/utils/logger';
 import { isValidUUID } from '@/utils/validation';
 import { Request, Response } from 'express';
 import { CONSTANTS } from '../shared/constants';
-import { compressMessageContent, emitProcessingStep } from '../shared/utils';
+import { compressMessageContent, emitProcessingStep, checkChatCredits, deductChatCredits } from '../shared/utils';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -249,15 +250,31 @@ export async function handleGeneralChat(
   });
 
   // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2.5: CHECK CREDITS BEFORE OPENAI REQUEST
+  // ═══════════════════════════════════════════════════════════════════════
+  // Check user has enough credits (1 credit per chat message)
+  // This prevents wasting OpenAI API calls if user has no credits
+
+  const hasEnoughCredits = await checkChatCredits(userId, res);
+  if (!hasEnoughCredits) {
+    return; // Response already sent in checkChatCredits
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: GET AI RESPONSE
   // ═══════════════════════════════════════════════════════════════════════
 
   let gptResponse: { content: string; usage?: any };
+  let shouldDeductCredits = false; // Track if we should deduct credits
+
   try {
     gptResponse = await getChatCompletionWithMessages(messages, {
       temperature: 0.3, // Lowered from 0.5 for more consistent responses
       max_tokens: 1000,
     });
+
+    // Mark that we should deduct credits (only if we got a real response, not fallback)
+    shouldDeductCredits = true;
   } catch (openaiError: any) {
     // Check if request was aborted (client closed connection)
     if (openaiError?.message?.includes('cancelled') ||
@@ -310,6 +327,18 @@ export async function handleGeneralChat(
         model: 'fallback',
       },
     };
+    // Don't deduct credits for fallback responses
+    shouldDeductCredits = false;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3.5: DEDUCT CREDITS AFTER SUCCESSFUL RESPONSE
+  // ═══════════════════════════════════════════════════════════════════════
+  // Deduct 1 credit for chat message (fixed cost per message)
+  // Only deduct if we got a real OpenAI response (not fallback)
+
+  if (shouldDeductCredits && gptResponse && gptResponse.content) {
+    await deductChatCredits(userId, shouldDeductCredits);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -365,10 +394,9 @@ export async function handleGeneralChat(
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 5: RESPOND (NO CREDIT DEDUCTION FOR CHAT!)
+  // STEP 5: RESPOND
   // ═══════════════════════════════════════════════════════════════════════
-  // IMPORTANT: Chat messages are FREE
-  // Credits are only deducted for TESTS (intelligent, api)
+  // Credits are deducted above (1 credit per chat message)
 
   // Check if client connection is still alive before sending response
   if (req.aborted || req.socket?.destroyed) {
@@ -392,17 +420,20 @@ export async function handleGeneralChat(
     sessionId: chatSessionId,
   };
 
-  // Show user's current credit balance (but don't deduct)
-  if (userId && userId !== 'anonymous') {
+  // Show user's current credit balance and remaining daily/monthly limits
+  if (userId && isValidUUID(userId)) {
     try {
-      // FIX #7: Use centralized UUID validation
-      if (isValidUUID(userId)) {
-        const credits = await UserCreditsService.getUserCredits(userId);
-        response.creditsRemaining = credits?.credits_balance || 0;
-        response.chatIsFree = true; // Indicate that chat is free
+      const credits = await UserCreditsService.getUserCredits(userId);
+      const planInfo = await PricingPlansService.getUserPlanInfo(userId);
+
+      response.creditsRemaining = credits?.credits_balance || 0;
+
+      if (planInfo) {
+        response.dailyRemaining = planInfo.daily_remaining;
+        response.monthlyRemaining = planInfo.monthly_remaining;
       }
     } catch (error) {
-      logger.warn('[GENERAL_CHAT] Failed to get credits', { error, userId });
+      logger.warn('[GENERAL_CHAT] Failed to get credits info', { error, userId });
     }
   }
 
