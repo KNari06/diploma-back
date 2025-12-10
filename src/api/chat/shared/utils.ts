@@ -1,15 +1,19 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { PricingPlansService } from '@/services/core/pricing-plans.service';
+import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/logger';
 import { isValidUUID } from '@/utils/validation';
-import { ChatService } from '@/services/utils/chat.service';
-import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { ChatProcessingStepPayload } from '@/websocket/types';
 import { webSocketService } from '@/websocket/websocket.service';
-import { PROGRESS } from './constants';
 import { Response } from 'express';
+import { PROGRESS } from './constants';
 
 /**
  * Normalize URL by adding protocol if missing
+ * - Adds https:// for public URLs
+ * - Adds http:// for localhost/127.0.0.1 (development)
+ * - Preserves existing protocol
+ * - Validates result
  */
 export function normalizeUrl(url: string): string {
   if (typeof url !== 'string' || url.trim().length === 0) {
@@ -18,12 +22,35 @@ export function normalizeUrl(url: string): string {
 
   const trimmedUrl = url.trim();
 
-  // If URL doesn't have protocol, add https://
-  if (!trimmedUrl.includes('://')) {
-    return `https://${trimmedUrl}`;
+  // If URL already has protocol, return as-is
+  if (trimmedUrl.includes('://')) {
+    return trimmedUrl;
   }
 
-  return trimmedUrl;
+  // Determine if this is localhost (use http:// for development)
+  // Note: Private IPs (192.168.x, 10.x, 172.16-31.x) will get https://
+  // and be validated/blocked at a higher level if needed
+  const isLocalhost =
+    trimmedUrl.startsWith('localhost') ||
+    trimmedUrl.startsWith('127.0.0.1') ||
+    trimmedUrl.startsWith('0.0.0.0');
+
+  // Use http:// for localhost, https:// for public URLs
+  const protocol = isLocalhost ? 'http://' : 'https://';
+  const normalized = `${protocol}${trimmedUrl}`;
+
+  // Basic validation: try to parse as URL
+  try {
+    new URL(normalized);
+    return normalized;
+  } catch {
+    // If validation fails, return original (let caller handle error)
+    logger.warn('[NORMALIZE_URL] Failed to validate normalized URL', {
+      original: url.substring(0, 100),
+      normalized: normalized.substring(0, 100),
+    });
+    return normalized; // Still return normalized, but log warning
+  }
 }
 
 /**

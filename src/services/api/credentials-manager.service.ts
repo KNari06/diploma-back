@@ -1,7 +1,7 @@
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
+import { env } from '@/config/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/logger';
-import { env } from '@/config/env';
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
 
 /**
  * Encryption key derived from environment secret
@@ -77,6 +77,32 @@ export async function storeCredentials(params: {
       notes,
     } = params;
 
+    // ✅ VALIDATION: Validate required inputs
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new Error('userId is required and must be a non-empty string');
+    }
+
+    if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+      throw new Error('projectId is required and must be a non-empty string');
+    }
+
+    if (!password || typeof password !== 'string' || password.trim().length === 0) {
+      throw new Error('password is required and must be a non-empty string');
+    }
+
+    // ✅ VALIDATION: At least one identifier (email or username) must be provided
+    if (!email && !username) {
+      throw new Error('Either email or username must be provided');
+    }
+
+    // ✅ VALIDATION: Validate email format if provided
+    if (email && typeof email === 'string' && email.trim().length > 0) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email.trim())) {
+        throw new Error('Invalid email format');
+      }
+    }
+
     logger.info('Storing credentials', {
       userId,
       projectId,
@@ -86,9 +112,9 @@ export async function storeCredentials(params: {
 
     // Encrypt sensitive data
     const encrypted = {
-      email_encrypted: email ? encrypt(email) : null,
-      username_encrypted: username ? encrypt(username) : null,
-      password_encrypted: encrypt(password),
+      email_encrypted: email && email.trim().length > 0 ? encrypt(email.trim()) : null,
+      username_encrypted: username && username.trim().length > 0 ? encrypt(username.trim()) : null,
+      password_encrypted: encrypt(password.trim()),
     };
 
     // Insert into database
@@ -135,6 +161,17 @@ export async function retrieveCredentials(
   label?: string;
 } | null> {
   try {
+    // ✅ VALIDATION: Validate inputs
+    if (!credentialId || typeof credentialId !== 'string' || credentialId.trim().length === 0) {
+      logger.warn('Invalid credentialId', { credentialId });
+      return null;
+    }
+
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      logger.warn('Invalid userId', { userId });
+      return null;
+    }
+
     const { data, error } = await supabaseAdmin
       .from('test_credentials')
       .select('*')
@@ -147,21 +184,70 @@ export async function retrieveCredentials(
       return null;
     }
 
-    // Update last_used_at
-    await supabaseAdmin
-      .from('test_credentials')
-      .update({ last_used_at: new Date().toISOString() })
-      .eq('id', credentialId);
+    // ✅ VALIDATION: Check encrypted data exists
+    if (!data.password_encrypted || typeof data.password_encrypted !== 'string' || data.password_encrypted.trim().length === 0) {
+      logger.error('Invalid password_encrypted in database', { credentialId });
+      return null;
+    }
 
-    // Decrypt
-    return {
-      email: data.email_encrypted ? decrypt(data.email_encrypted) : undefined,
-      username: data.username_encrypted ? decrypt(data.username_encrypted) : undefined,
-      password: decrypt(data.password_encrypted),
-      label: data.label || undefined,
-    };
+    // ✅ VALIDATION: At least one identifier must exist
+    if (!data.email_encrypted && !data.username_encrypted) {
+      logger.error('No identifier (email or username) found in credentials', { credentialId });
+      return null;
+    }
+
+    // Update last_used_at (non-blocking, fire-and-forget)
+    Promise.resolve(
+      supabaseAdmin
+        .from('test_credentials')
+        .update({ last_used_at: new Date().toISOString() })
+        .eq('id', credentialId)
+    ).catch((updateError: unknown) => {
+      logger.warn('Failed to update last_used_at', {
+        error: updateError instanceof Error ? updateError.message : String(updateError),
+        credentialId,
+      });
+    });
+
+    // Decrypt with error handling
+    try {
+      const decrypted = {
+        email: data.email_encrypted && data.email_encrypted.trim().length > 0
+          ? decrypt(data.email_encrypted)
+          : undefined,
+        username: data.username_encrypted && data.username_encrypted.trim().length > 0
+          ? decrypt(data.username_encrypted)
+          : undefined,
+        password: decrypt(data.password_encrypted),
+        label: data.label || undefined,
+      };
+
+      // ✅ VALIDATION: Validate decryption result
+      if (!decrypted.password || decrypted.password.trim().length === 0) {
+        logger.error('Decrypted password is empty', { credentialId });
+        return null;
+      }
+
+      // ✅ VALIDATION: At least one identifier must be decrypted successfully
+      if (!decrypted.email && !decrypted.username) {
+        logger.error('Failed to decrypt identifier (email or username)', { credentialId });
+        return null;
+      }
+
+      return decrypted;
+    } catch (decryptError) {
+      logger.error('Decryption failed', {
+        error: decryptError instanceof Error ? decryptError.message : String(decryptError),
+        credentialId,
+      });
+      return null;
+    }
   } catch (error) {
-    logger.error('Error retrieving credentials', { error, credentialId });
+    logger.error('Error retrieving credentials', {
+      error: error instanceof Error ? error.message : String(error),
+      credentialId,
+      userId,
+    });
     return null;
   }
 }

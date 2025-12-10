@@ -8,6 +8,7 @@
  * - UI test plan generation
  * - API fuzzing scenarios
  * - Dynamic question generation
+ * - URL context analysis
  */
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -242,6 +243,37 @@ export function buildTestPlanPrompt(
   const safeVisualString = visual ? truncate(typeof visual === 'string' ? visual : JSON.stringify(visual, null, 2)) : '(none)';
   const recommendationsString = recs.length > 0 ? recs.slice(0, 20).map((r: any) => `- ${r}`).join('\n') : '  (no recommendations)';
 
+  // Extract additional context if provided
+  const additionalInfo = userRequest.additionalInfo || {};
+  const scopeDescription = additionalInfo.scopeDescription || '';
+  const focusAreas = Array.isArray(additionalInfo.focusAreas) ? additionalInfo.focusAreas : [];
+  const testTypes = Array.isArray(additionalInfo.testTypes) ? additionalInfo.testTypes : [];
+  const estimatedDuration = additionalInfo.estimatedDuration || '';
+  const urlInsights = Array.isArray(additionalInfo.urlInsights) ? additionalInfo.urlInsights : [];
+  const urlWarnings = Array.isArray(additionalInfo.urlWarnings) ? additionalInfo.urlWarnings : [];
+  const urlRecommendations = Array.isArray(additionalInfo.recommendations) ? additionalInfo.recommendations : [];
+
+  // Build scope guidance section
+  const scopeGuidance = scopeDescription || focusAreas.length > 0
+    ? `
+TESTING SCOPE GUIDANCE:
+${scopeDescription ? `Strategy: ${scopeDescription}` : ''}
+${estimatedDuration ? `Estimated Duration: ${estimatedDuration}` : ''}
+${focusAreas.length > 0 ? `Focus Areas:\n${focusAreas.map((area: string) => `  - ${area}`).join('\n')}` : ''}
+${testTypes.length > 0 ? `Test Types: ${testTypes.join(', ')}` : ''}
+`
+    : '';
+
+  // Build URL context section
+  const urlContextSection = urlInsights.length > 0 || urlWarnings.length > 0 || urlRecommendations.length > 0
+    ? `
+URL CONTEXT ANALYSIS:
+${urlInsights.length > 0 ? `Insights:\n${urlInsights.map((i: string) => `  - ${i}`).join('\n')}` : ''}
+${urlWarnings.length > 0 ? `Warnings:\n${urlWarnings.map((w: string) => `  ⚠️ ${w}`).join('\n')}` : ''}
+${urlRecommendations.length > 0 ? `Recommendations:\n${urlRecommendations.map((r: string) => `  ✅ ${r}`).join('\n')}` : ''}
+`
+    : '';
+
   // Prompt: strict JSON schema + clear rules
   const prompt = `Generate a comprehensive test plan based on the following exploration data.
 
@@ -250,7 +282,7 @@ USER REQUEST:
 
 SCOPE:
 ${userRequest.scope}
-
+${scopeGuidance}${urlContextSection}
 PAGE INFORMATION:
 - URL: ${safe(exploration?.url, '(unknown)')}
 - Title: ${safe(exploration?.pageInfo?.title, '(unknown)')}
@@ -367,4 +399,195 @@ Return ONLY a JSON array of questions in this format:
 ]
 
 If no additional questions needed, return empty array: []`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// URL CONTEXT ANALYSIS PROMPTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Build prompt for URL context analysis
+ * Used to analyze URLs and provide testing insights before test plan generation
+ */
+export function buildUrlAnalysisPrompt(params: {
+  url: string;
+  hostname: string;
+  pathname: string;
+  searchParams?: string;
+}): string {
+  return `Analyze this URL and provide testing insights:
+
+URL: ${params.url}
+Hostname: ${params.hostname}
+Path: ${params.pathname}
+${params.searchParams ? `Query params: ${params.searchParams}` : ''}
+
+**REQUIREMENTS:**
+1. You MUST respond with valid JSON only. No markdown, no explanations, no code blocks.
+2. The JSON must contain exactly these three fields: "insights", "warnings", "recommendations"
+3. Each field must be an array of strings (never null, never objects, never numbers)
+4. Maximum 4 items per array. Keep it concise and actionable.
+
+**JSON Structure (REQUIRED FORMAT):**
+{
+  "insights": ["string 1", "string 2"],
+  "warnings": ["string 1"],
+  "recommendations": ["string 1", "string 2", "string 3"]
+}
+
+**Field Definitions:**
+- **insights**: What type of page/functionality is this? (e.g., "Admin dashboard", "E-commerce checkout", "Authentication page")
+- **warnings**: Potential issues or concerns for testing (e.g., "Financial transactions - use test credentials", "API endpoint - UI testing may not be suitable")
+- **recommendations**: Specific testing focus areas (e.g., "Test form validation", "Verify role-based access control", "Test search filters and pagination")
+
+**Example of CORRECT response:**
+{
+  "insights": ["Admin interface detected", "User management page"],
+  "warnings": ["Requires authentication", "Data may change between test runs"],
+  "recommendations": ["Test role-based access control", "Verify CRUD operations", "Test pagination"]
+}
+
+**CRITICAL: Return ONLY the JSON object. No other text before or after.**`;
+}
+
+/**
+ * System prompt for URL analysis
+ */
+export function buildUrlAnalysisSystemPrompt(): string {
+  return 'You are a QA testing expert. You MUST respond with valid JSON only. Analyze URLs and provide concise, actionable testing insights in the exact format specified. Never include markdown, code blocks, or explanations - only pure JSON.';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SCOPE STRATEGY GENERATION PROMPTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Build prompt for generating custom scope strategy via AI
+ * Used when user provides a scope that's not in VALID_SCOPES
+ */
+export function buildCustomScopeStrategyPrompt(params: {
+  customScope: string;
+  urlContext?: { insights: string[]; warnings: string[]; recommendations: string[] };
+}): string {
+  const urlContextSection = params.urlContext
+    ? `
+URL CONTEXT:
+- Insights: ${params.urlContext.insights.join(', ')}
+- Warnings: ${params.urlContext.warnings.join(', ')}
+- Recommendations: ${params.urlContext.recommendations.join(', ')}
+`
+    : '';
+
+  return `Generate a testing strategy for a custom scope: "${params.customScope}"
+
+${urlContextSection}
+**REQUIREMENTS:**
+1. You MUST respond with valid JSON only. No markdown, no explanations, no code blocks.
+2. The JSON must contain exactly these fields: "description", "estimatedDuration", "focusAreas", "testTypes"
+3. "focusAreas" and "testTypes" must be arrays of strings
+4. Keep it concise and actionable (3-6 focus areas, 2-4 test types)
+
+**JSON Structure (REQUIRED FORMAT):**
+{
+  "description": "Brief description of what this scope tests",
+  "estimatedDuration": "X-Y minutes",
+  "focusAreas": ["area 1", "area 2", "area 3"],
+  "testTypes": ["type1", "type2"]
+}
+
+**Guidelines:**
+- Base the strategy on the scope name and context
+- Consider what "custom scope" typically means for testing
+- Make focus areas specific and actionable
+- Choose appropriate test types (functional, visual, accessibility, performance, integration, smoke, security, validation, error-handling, unit)
+- Estimate duration based on scope complexity
+
+**Example for scope "checkout":**
+{
+  "description": "E-commerce checkout process testing",
+  "estimatedDuration": "5-8 minutes",
+  "focusAreas": [
+    "Payment form validation",
+    "Cart calculations",
+    "Shipping options",
+    "Order confirmation flow"
+  ],
+  "testTypes": ["functional", "validation", "security"]
+}
+
+**CRITICAL: Return ONLY the JSON object. No other text before or after.**`;
+}
+
+/**
+ * System prompt for custom scope strategy generation
+ */
+export function buildCustomScopeStrategySystemPrompt(): string {
+  return 'You are a QA testing expert. You MUST respond with valid JSON only. Generate testing strategies for custom scopes based on their meaning and context. Never include markdown, code blocks, or explanations - only pure JSON.';
+}
+
+/**
+ * Build prompt for AI-guided page navigation
+ * Analyzes user's goal and selects best link to navigate to target page
+ */
+export function buildPageNavigationPrompt(params: {
+  userMessage: string;
+  availableLinks: Array<{ text: string; href: string; selector: string }>;
+  currentUrl: string;
+}): string {
+  const linksSection = params.availableLinks.length > 0
+    ? params.availableLinks
+        .map((link, i) => `${i + 1}. Text: "${link.text}" | Href: "${link.href}" | Selector: ${link.selector}`)
+        .join('\n')
+    : 'No links/buttons found on this page';
+
+  return `Analyze the user's testing goal and select the best link to navigate to the target page.
+
+USER'S GOAL:
+"${params.userMessage}"
+
+CURRENT PAGE:
+${params.currentUrl}
+
+AVAILABLE LINKS AND BUTTONS:
+${linksSection}
+
+TASK:
+Based on the user's goal, determine if navigation is needed and select the best link to reach the target page.
+
+EXAMPLES:
+- If goal mentions "registration" or "sign up" → select link with "Register", "Sign Up", "Create Account"
+- If goal mentions "login" or "sign in" → select link with "Login", "Sign In", "Log In"
+- If goal mentions "checkout" or "cart" → select link with "Cart", "Checkout", "Shopping Bag"
+- If goal mentions "search" → select link with "Search" or search icon
+- If goal mentions "homepage" or current page matches goal → no navigation needed
+
+CRITICAL RULES:
+1. ONLY select from the available links above - do NOT invent links
+2. Match user's intent (registration, login, etc.) with link text/href
+3. If NO suitable link found → set shouldNavigate: false
+4. If current page already matches goal → set shouldNavigate: false
+5. Prefer exact matches (e.g., "Register" for registration) over partial matches
+
+RESPONSE FORMAT (JSON):
+{
+  "shouldNavigate": true/false,
+  "targetSelector": "CSS selector from available links (if shouldNavigate: true)",
+  "targetText": "Text of selected link",
+  "reasoning": "1-2 sentences explaining why this link was selected or why navigation is not needed",
+  "confidence": 0.0-1.0
+}`;
+}
+
+/**
+ * System prompt for page navigation
+ */
+export function buildPageNavigationSystemPrompt(): string {
+  return `You are a web navigation expert. Your task is to analyze user goals and select the best navigation path.
+
+CRITICAL RULES:
+- Return ONLY valid JSON
+- NEVER invent links - only use links provided in the context
+- If no suitable link exists, set shouldNavigate: false
+- Match user intent precisely (e.g., "registration" requires registration-related links)
+- No markdown, no explanations outside JSON`;
 }

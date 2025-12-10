@@ -11,6 +11,7 @@ import { webSocketService } from '@/websocket/websocket.service';
 import { ChatTestUpdatePayload } from '@/websocket/types';
 import { emitProcessingStep } from '../shared/utils';
 import { normalizeUrl } from '../shared/utils';
+import { supabaseAdmin } from '@/db/supabase';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -101,26 +102,59 @@ export async function executeUiTestFlow(
     emitProcessingStep(chatSessionId, 'executing_test', '🔍 Finding project context...', 20);
     checkTimeout();
 
-    // FIX #8: Wrap ProjectContextService in try-catch
-    let project_id: string;
-    try {
-      const projectResult = await ProjectContextService.findOrCreateProject(
-        workspace_id,
-        normalizeUrl(plan.url),
-        userId
-      );
-      project_id = projectResult.project_id;
-
-      if (!project_id) {
-        throw new Error('Failed to get project_id from ProjectContextService');
+    // ✅ OPTIMIZATION: Try to get project_id from chat session first (avoid duplicate findOrCreateProject)
+    // Project is already created in handlePlatformTest and saved to session
+    let project_id: string | undefined;
+    if (chatSessionId) {
+      try {
+        const { data: session } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('project_id')
+          .eq('id', chatSessionId)
+          .single();
+        if (session?.project_id) {
+          project_id = session.project_id;
+          logger.info('[UI_TEST] Using project_id from chat session', { project_id });
+        }
+      } catch (sessionError) {
+        logger.warn('[UI_TEST] Failed to get project_id from chat session, will create/find', {
+          error: sessionError instanceof Error ? sessionError.message : String(sessionError),
+          chatSessionId,
+        });
       }
-    } catch (projectError) {
-      logger.error('[UI_TEST] ProjectContextService failed', {
-        error: projectError instanceof Error ? projectError.message : String(projectError),
-        workspace_id,
-        url: plan.url,
-      });
-      throw new Error(`Failed to initialize project: ${projectError instanceof Error ? projectError.message : 'Unknown error'}`);
+    }
+
+    // If not found in session, find or create project (fallback)
+    if (!project_id) {
+      try {
+        const projectResult = await ProjectContextService.findOrCreateProject(
+          workspace_id,
+          normalizeUrl(plan.url),
+          userId
+        );
+        project_id = projectResult.project_id;
+
+        if (!project_id) {
+          throw new Error('Failed to get project_id from ProjectContextService');
+        }
+
+        logger.info('[UI_TEST] Created/found project', {
+          project_id,
+          is_new: projectResult.is_new,
+        });
+      } catch (projectError) {
+        logger.error('[UI_TEST] ProjectContextService failed', {
+          error: projectError instanceof Error ? projectError.message : String(projectError),
+          workspace_id,
+          url: plan.url,
+        });
+        throw new Error(`Failed to initialize project: ${projectError instanceof Error ? projectError.message : 'Unknown error'}`);
+      }
+    }
+
+    // Ensure project_id is defined (should never be undefined at this point)
+    if (!project_id) {
+      throw new Error('project_id is required but was not found or created');
     }
 
     emitProcessingStep(chatSessionId, 'executing_test', '⚙️ Launching browser test...', 30);

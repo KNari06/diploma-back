@@ -1,5 +1,6 @@
 import { buildDynamicQuestionPrompt } from '@/ai/prompts/index';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { VALID_SCOPES } from '@/types';
 import { logger } from '@/utils/logger';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -618,21 +619,50 @@ export function parseAnswers(
   additionalInfo?: Record<string, any>;
 } {
   // Validate input
-  if (!answers || typeof answers !== 'object') {
-    logger.warn('[PARSE_ANSWERS] Invalid answers input', { answers: typeof answers });
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
+    logger.warn('[PARSE_ANSWERS] Invalid answers input', {
+      answers: typeof answers,
+      isArray: Array.isArray(answers),
+    });
     return {};
   }
 
-  const parsed: any = {};
+  // ✅ IMPROVEMENT: Use proper type instead of 'any'
+  const parsed: {
+    url?: string;
+    scope?: string;
+    needsAuth?: boolean;
+    credentials?: { email?: string; username?: string; password: string };
+    additionalInfo?: Record<string, any>;
+  } = {};
 
   // Parse URL
-  if (answers.url && typeof answers.url === 'string' && answers.url.trim().length > 0) {
-    parsed.url = answers.url.trim();
+  if (answers.url && typeof answers.url === 'string') {
+    const trimmed = answers.url.trim();
+    if (trimmed.length > 0) {
+      parsed.url = trimmed;
+    }
   }
 
-  // Parse scope
-  if (answers.scope && typeof answers.scope === 'string' && answers.scope.trim().length > 0) {
-    parsed.scope = answers.scope.trim();
+  // Parse scope with validation
+  if (answers.scope && typeof answers.scope === 'string') {
+    const trimmed = answers.scope.trim();
+    if (trimmed.length > 0) {
+      // ✅ FIX: Validate scope against VALID_SCOPES
+      const normalizedScope = trimmed.toLowerCase();
+
+      if (VALID_SCOPES.includes(normalizedScope as any)) {
+        parsed.scope = normalizedScope;
+      } else {
+        logger.warn('[PARSE_ANSWERS] Invalid scope provided, will use fallback', {
+          provided: trimmed,
+          normalized: normalizedScope,
+          validScopes: VALID_SCOPES,
+        });
+        // Don't set invalid scope - let system use default or ask again
+        // parsed.scope will remain undefined, system will handle fallback
+      }
+    }
   }
 
   // Parse auth requirement
@@ -640,24 +670,24 @@ export function parseAnswers(
     parsed.needsAuth = answers.needs_auth === true || answers.needs_auth === 'true';
   }
 
-  // FIX #4: Safer credentials parsing with validation
+  // ✅ IMPROVEMENT: Safer credentials parsing with validation
   if (answers.credentials) {
     try {
       const creds = typeof answers.credentials === 'string'
         ? JSON.parse(answers.credentials)
         : answers.credentials;
 
-      // Validate structure before assigning
-      if (creds && typeof creds === 'object') {
-        const hasIdentifier = (creds.email && typeof creds.email === 'string') ||
-                             (creds.username && typeof creds.username === 'string');
-        const hasPassword = creds.password && typeof creds.password === 'string';
+      // ✅ FIX: Check for null explicitly (null is typeof 'object' in JS!)
+      if (creds && typeof creds === 'object' && !Array.isArray(creds) && creds !== null) {
+        const hasIdentifier = (creds.email && typeof creds.email === 'string' && creds.email.trim().length > 0) ||
+                             (creds.username && typeof creds.username === 'string' && creds.username.trim().length > 0);
+        const hasPassword = creds.password && typeof creds.password === 'string' && creds.password.trim().length > 0;
 
         if (hasIdentifier && hasPassword) {
           parsed.credentials = {
-            email: creds.email || undefined,
-            username: creds.username || undefined,
-            password: creds.password,
+            email: creds.email?.trim() || undefined,
+            username: creds.username?.trim() || undefined,
+            password: creds.password.trim(), // Required, so no optional chaining
           };
         } else {
           logger.error('[PARSE_ANSWERS] Invalid credentials structure', {
@@ -667,8 +697,10 @@ export function parseAnswers(
           });
         }
       } else {
-        logger.error('[PARSE_ANSWERS] Credentials is not an object', {
+        logger.error('[PARSE_ANSWERS] Credentials is not a valid object', {
           type: typeof creds,
+          isArray: Array.isArray(creds),
+          isNull: creds === null,
         });
       }
     } catch (parseError) {
@@ -681,12 +713,12 @@ export function parseAnswers(
     }
   }
 
-  // Collect any additional answers
-  const knownFields = ['url', 'scope', 'needs_auth', 'credentials'];
+  // ✅ IMPROVEMENT: Use Set for O(1) lookup instead of O(n) array.includes()
+  const knownFields = new Set(['url', 'scope', 'needs_auth', 'credentials']);
   const additionalInfo: Record<string, any> = {};
 
   for (const [key, value] of Object.entries(answers)) {
-    if (!knownFields.includes(key) && value !== undefined && value !== null) {
+    if (!knownFields.has(key) && value !== undefined && value !== null) {
       additionalInfo[key] = value;
     }
   }

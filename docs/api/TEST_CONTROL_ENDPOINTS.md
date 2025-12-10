@@ -26,9 +26,9 @@ POST /api/v1/manual-test/{id}/cancel
 
 ### Path Parameters
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | UUID | Yes | ID теста для отмены |
+| Parameter | Type | Required | Description         |
+| --------- | ---- | -------- | ------------------- |
+| `id`      | UUID | Yes      | ID теста для отмены |
 
 ### Response
 
@@ -168,10 +168,10 @@ curl -X POST "https://api.qai.so/api/v1/manual-test/{test-id}/cancel" \
 
 ```javascript
 const response = await fetch(`/api/v1/manual-test/${testId}/cancel`, {
-  method: 'POST',
+  method: "POST",
   headers: {
-    'Authorization': `Bearer ${token}`
-  }
+    Authorization: `Bearer ${token}`,
+  },
 });
 
 const result = await response.json();
@@ -198,14 +198,14 @@ POST /api/v1/manual-test/{id}/retry
 
 ### Path Parameters
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | UUID | Yes | ID теста для повтора |
+| Parameter | Type | Required | Description          |
+| --------- | ---- | -------- | -------------------- |
+| `id`      | UUID | Yes      | ID теста для повтора |
 
 ### Credits
 
 **Списание кредитов:**
-- Standard mode: **1 кредит**
+
 - Intelligent mode: **20 кредитов** (зависит от исходного режима теста)
 
 ### Response
@@ -266,10 +266,10 @@ curl -X POST "https://api.qai.so/api/v1/manual-test/{test-id}/retry" \
 
 ```javascript
 const response = await fetch(`/api/v1/manual-test/${testId}/retry`, {
-  method: 'POST',
+  method: "POST",
   headers: {
-    'Authorization': `Bearer ${token}`
-  }
+    Authorization: `Bearer ${token}`,
+  },
 });
 
 const result = await response.json();
@@ -297,8 +297,8 @@ GET /api/v1/manual-test/{id}/status
 ### Path Parameters
 
 | Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | UUID | Yes | ID теста |
+| --------- | ---- | -------- | ----------- |
+| `id`      | UUID | Yes      | ID теста    |
 
 ### Response
 
@@ -319,12 +319,12 @@ GET /api/v1/manual-test/{id}/status
 
 ### Fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | UUID | ID теста |
-| `status` | string | `pending`, `running`, `completed`, `failed`, `cancelled` |
-| `progress` | number | Количество завершенных браузеров |
-| `totalBrowsers` | number | Общее количество браузеров в тесте |
+| Field           | Type   | Description                                              |
+| --------------- | ------ | -------------------------------------------------------- |
+| `id`            | UUID   | ID теста                                                 |
+| `status`        | string | `pending`, `running`, `completed`, `failed`, `cancelled` |
+| `progress`      | number | Количество завершенных браузеров                         |
+| `totalBrowsers` | number | Общее количество браузеров в тесте                       |
 
 ### Использование
 
@@ -335,17 +335,23 @@ GET /api/v1/manual-test/{id}/status
 const pollInterval = setInterval(async () => {
   const response = await fetch(`/api/v1/manual-test/${testId}/status`, {
     headers: {
-      'Authorization': `Bearer ${token}`
-    }
+      Authorization: `Bearer ${token}`,
+    },
   });
 
   const { data } = await response.json();
 
-  console.log(`Status: ${data.status} (${data.progress}/${data.totalBrowsers})`);
+  console.log(
+    `Status: ${data.status} (${data.progress}/${data.totalBrowsers})`
+  );
 
-  if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
+  if (
+    data.status === "completed" ||
+    data.status === "failed" ||
+    data.status === "cancelled"
+  ) {
     clearInterval(pollInterval);
-    console.log('Test finished!');
+    console.log("Test finished!");
   }
 }, 2000);
 ```
@@ -354,18 +360,18 @@ const pollInterval = setInterval(async () => {
 
 ```javascript
 // Better alternative: Use WebSocket instead of polling
-const ws = new WebSocket('wss://api.qai.so');
+const ws = new WebSocket("wss://api.qai.so");
 
-ws.on('test:progress', (data) => {
+ws.on("test:progress", (data) => {
   console.log(`Progress: ${data.progress}%`);
 });
 
-ws.on('test:completed', (data) => {
-  console.log('Test completed!');
+ws.on("test:completed", (data) => {
+  console.log("Test completed!");
 });
 
-ws.on('test:cancelled', (data) => {
-  console.log('Test cancelled');
+ws.on("test:cancelled", (data) => {
+  console.log("Test cancelled");
 });
 ```
 
@@ -410,11 +416,11 @@ ws.on('test:cancelled', (data) => {
 
 ## ✅ Status Summary
 
-| Endpoint | Method | Auth | Credits | Swagger | Implemented | Working |
-|----------|--------|------|---------|---------|-------------|---------|
-| `/:id/cancel` | POST | ✅ | No | ✅ | ✅ | ✅ |
-| `/:id/retry` | POST | ✅ | Yes (1-20) | ✅ | ✅ | ✅ |
-| `/:id/status` | GET | ✅ | No | ✅ | ✅ | ✅ |
+| Endpoint      | Method | Auth | Credits    | Swagger | Implemented | Working |
+| ------------- | ------ | ---- | ---------- | ------- | ----------- | ------- |
+| `/:id/cancel` | POST   | ✅   | No         | ✅      | ✅          | ✅      |
+| `/:id/retry`  | POST   | ✅   | Yes (1-20) | ✅      | ✅          | ✅      |
+| `/:id/status` | GET    | ✅   | No         | ✅      | ✅          | ✅      |
 
 ### Integration Points
 

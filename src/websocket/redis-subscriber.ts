@@ -71,10 +71,6 @@ class WebSocketRedisSubscriber {
           wsService.emitTestProgress(payload.testId, payload);
           break;
 
-        case 'test:graph-update': // ✅ NEW: Real-time graph streaming
-          wsService.emitTestGraphUpdate(payload.testId, payload);
-          break;
-
         case 'test:step:completed':
           wsService.emitTestStepCompleted(payload.testId, payload);
           break;
@@ -156,11 +152,27 @@ class WebSocketRedisSubscriber {
           }
           break;
 
-        case 'test:graph-update': // ✅ NEW
+        case 'test:graph-update': // ✅ NEW: Real-time graph streaming
+          // Check for userId first (from emitToUser fallback)
           if (target?.userId) {
             wsService.emitToUser(target.userId, 'test:graph-update', payload);
-          } else if (payload.testId) {
+          } else if (payload?.testId) {
+            // Validate payload structure before emitting
+            if (!payload.type || !payload.data || !payload.timestamp) {
+              logger.warn('[WS_REDIS_SUB] Invalid test:graph-update payload structure', {
+                testId: payload?.testId,
+                hasType: !!payload?.type,
+                hasData: !!payload?.data,
+                hasTimestamp: !!payload?.timestamp,
+              });
+              break;
+            }
             wsService.emitTestGraphUpdate(payload.testId, payload);
+          } else {
+            logger.warn('[WS_REDIS_SUB] test:graph-update missing testId', {
+              target,
+              payloadKeys: payload ? Object.keys(payload) : [],
+            });
           }
           break;
 

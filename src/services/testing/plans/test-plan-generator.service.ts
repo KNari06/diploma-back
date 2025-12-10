@@ -763,7 +763,7 @@ export async function generateIntelligentTestPlan(
       },
     ], {
       temperature: 0.4,
-      max_tokens: 3000,
+      max_tokens: 4000,
       response_format: { type: 'json_object' },
     });
 

@@ -63,43 +63,90 @@ export async function getCachedExploration(
   projectId: string
 ): Promise<ExplorationResult | null> {
   try {
-    const { data, error } = await supabaseAdmin
-      .from('exploration_cache')
-      .select('*')
-      .eq('url', url)
-      .eq('project_id', projectId)
-      .gt('expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (error || !data) {
+    // ✅ VALIDATION: Validate inputs
+    if (!url || typeof url !== 'string' || url.trim().length === 0) {
+      logger.warn('Invalid URL provided to getCachedExploration', { url });
       return null;
     }
 
-    // Increment hit count
-    await supabaseAdmin
+    if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+      logger.warn('Invalid projectId provided to getCachedExploration', { projectId });
+      return null;
+    }
+
+    const { data, error } = await supabaseAdmin
       .from('exploration_cache')
-      .update({ hit_count: (data.hit_count || 0) + 1 })
-      .eq('id', data.id);
+      .select('*')
+      .eq('url', url.trim())
+      .eq('project_id', projectId.trim())
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      // Handle "not found" as normal case (not an error)
+      if (error.code === 'PGRST116') {
+        logger.debug('No cached exploration found', { url, projectId });
+        return null;
+      }
+      logger.error('Database error getting cached exploration', {
+        error: error instanceof Error ? error.message : String(error),
+        errorCode: error.code,
+        url,
+        projectId,
+      });
+      return null;
+    }
+
+    if (!data) {
+      return null;
+    }
+
+    // ✅ VALIDATION: Check required fields exist
+    if (!data.url || !data.created_at) {
+      logger.error('Invalid cached exploration data structure', {
+        id: data.id,
+        hasUrl: !!data.url,
+        hasCreatedAt: !!data.created_at,
+      });
+      return null;
+    }
+
+    // Increment hit count (non-blocking, don't fail if this errors)
+    Promise.resolve(
+      supabaseAdmin
+        .from('exploration_cache')
+        .update({ hit_count: (data.hit_count || 0) + 1 })
+        .eq('id', data.id)
+    ).catch((updateError: unknown) => {
+      logger.warn('Failed to increment hit_count', {
+        error: updateError instanceof Error ? updateError.message : String(updateError),
+        id: data.id,
+      });
+    });
 
     logger.info('Retrieved cached exploration', {
       id: data.id,
       url,
-      hitCount: data.hit_count + 1,
+      hitCount: (data.hit_count || 0) + 1,
     });
 
     return {
       url: data.url,
       timestamp: data.created_at,
-      screenshot: data.screenshot,
-      visualAnalysis: data.visual_analysis,
-      domAnalysis: data.dom_analysis,
-      pageInfo: data.page_info,
-      recommendations: data.recommendations,
+      screenshot: data.screenshot || null,
+      visualAnalysis: data.visual_analysis || null,
+      domAnalysis: data.dom_analysis || null,
+      pageInfo: data.page_info || null,
+      recommendations: data.recommendations || [],
     };
   } catch (error) {
-    logger.warn('Failed to get cached exploration', { error });
+    logger.warn('Failed to get cached exploration', {
+      error: error instanceof Error ? error.message : String(error),
+      url,
+      projectId,
+    });
     return null;
   }
 }

@@ -384,6 +384,37 @@ class WebSocketService {
 
   // ✅ NEW: Emit real-time graph update
   public emitTestGraphUpdate(testId: string, payload: TestGraphUpdatePayload): void {
+    // Validate payload structure
+    if (!payload || typeof payload !== 'object') {
+      logger.warn('[WebSocketService] Invalid test:graph-update payload', { testId });
+      return;
+    }
+
+    if (!payload.type || !['full', 'incremental'].includes(payload.type)) {
+      logger.warn('[WebSocketService] Invalid test:graph-update type', {
+        testId,
+        type: payload.type,
+      });
+      return;
+    }
+
+    if (!payload.data || typeof payload.data !== 'object') {
+      logger.warn('[WebSocketService] Invalid test:graph-update data', { testId });
+      return;
+    }
+
+    // Validate that payload has at least one of the required data fields
+    const hasIncrementalData = payload.data.newNode || payload.data.newEdge || payload.data.updatedNode;
+    const hasFullData = payload.data.fullGraph;
+
+    if (!hasIncrementalData && !hasFullData) {
+      logger.warn('[WebSocketService] test:graph-update missing graph data', {
+        testId,
+        type: payload.type,
+      });
+      return;
+    }
+
     this.emitWithFallback(
       'test:graph-update',
       payload,

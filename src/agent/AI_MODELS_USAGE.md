@@ -34,6 +34,9 @@ src/services/intentParser.service.ts
 src/services/test-plan-generator.service.ts
 └── generateTestPlan()       → GPT-4o-mini ✅
 
+src/services/testing/ui/autonomous/autonomous-orchestrator.service.ts
+└── analyzeUrlContext()      → GPT-4o-mini ✅
+
 src/services/vision-analyzer.service.ts
 └── analyzeScreenshotWithVision() → GPT-4o ✅ (Vision required)
 
@@ -49,13 +52,14 @@ src/services/question-generator.service.ts
 1. Intent parsing           $0.001  (GPT-4o-mini)
 2. Context enrichment       $0      (embeddings cached)
 3. Dynamic questions        $0.001  (GPT-3.5-turbo)
-4. Login detection          $0.001* (GPT-3.5, 10% cases only)
-5. Screenshot analysis      $0.010  (GPT-4o Vision)
-6. Test plan generation     $0.005  (GPT-4o-mini)
-7. Natural answer parsing   $0.002* (GPT-3.5, if used)
-8. Selector validation      $0.001* (GPT-3.5, optional)
+4. URL context analysis     $0.0002 (GPT-4o-mini, always used)
+5. Login detection          $0.001* (GPT-3.5, 10% cases only)
+6. Screenshot analysis      $0.010  (GPT-4o Vision)
+7. Test plan generation     $0.005  (GPT-4o-mini)
+8. Natural answer parsing   $0.002* (GPT-3.5, if used)
+9. Selector validation      $0.001* (GPT-3.5, optional)
 
-Total: ~$0.020-0.025 per exploration
+Total: ~$0.020-0.026 per exploration
 
 * = conditional (not always used)
 ```

@@ -336,7 +336,7 @@ export interface ChatProcessingStepPayload {
         'generating_scenarios' | 'executing_tests' |
         // NEW: Added for better clarity
         'preparing_workspace' | 'checking_project' | 'validating_credentials' |
-        'creating_test_plan' | 'waiting_approval';
+        'creating_test_plan' | 'waiting_approval' ;
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;

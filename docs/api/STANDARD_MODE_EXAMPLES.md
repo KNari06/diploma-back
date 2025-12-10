@@ -1,11 +1,3 @@
-# Standard Mode - Примеры команд от пользователя
-
-## 📋 Что такое Standard Mode?
-
-**Standard Mode** = Выполнение **предопределенных команд** (Playwright commands)
-
-Пользователь (или AI) создает список команд **до** запуска теста, и система выполняет их последовательно.
-
 ---
 
 ## 🎯 Способ 1: Прямой API вызов
@@ -13,6 +5,7 @@
 ### Пример 1: Простой тест (Login flow)
 
 **Запрос:**
+
 ```bash
 POST /api/v1/manual-test/run
 Authorization: Bearer <token>
@@ -22,7 +15,7 @@ Content-Type: application/json
   "url": "https://example.com",
   "browsers": ["chrome"],
   "projectId": "b8ff4957-252e-4ea1-81de-6ef43638b802",
-  "intelligentMode": false,  // ← Standard Mode
+  "intelligentMode": false,
   "commands": [               // ← Команды предопределены
     {
       "action": "goto",
@@ -62,6 +55,7 @@ Content-Type: application/json
 ```
 
 **Ответ:**
+
 ```json
 {
   "success": true,
@@ -82,6 +76,7 @@ Content-Type: application/json
 ### Пример 2: E-commerce тест (Add to cart)
 
 **Запрос:**
+
 ```bash
 POST /api/v1/manual-test/run
 Authorization: Bearer <token>
@@ -131,6 +126,7 @@ Authorization: Bearer <token>
 ### Пример 3: Форма с валидацией
 
 **Запрос:**
+
 ```bash
 POST /api/v1/manual-test/run
 Authorization: Bearer <token>
@@ -190,6 +186,7 @@ Authorization: Bearer <token>
 ### ⚠️ ВАЖНО: AI делает ПОЛНЫЙ АНАЛИЗ реальной страницы
 
 Когда пользователь пишет:
+
 ```
 "Протестируй login flow на https://example.com"
 ```
@@ -212,6 +209,7 @@ Authorization: Bearer <token>
    - AI создает commands используя **только реальные селекторы**
 
 **Пример exploration result:**
+
 ```json
 {
   "domAnalysis": {
@@ -240,12 +238,13 @@ Authorization: Bearer <token>
 ```
 
 **AI генерирует testPlan с commands используя РЕАЛЬНЫЕ селекторы:**
+
 ```json
 {
   "id": "plan-123",
   "url": "https://example.com",
   "scope": "Test login flow",
-  "intelligentMode": false,  // ← Standard Mode (т.к. есть commands)
+  "intelligentMode": false, // ← Standard Mode (т.к. есть commands)
   "commands": [
     {
       "action": "goto",
@@ -301,19 +300,21 @@ Authorization: Bearer <token>
 ```
 
 **Пользователь одобряет:**
+
 ```
 "Да, запускай"
 ```
 
 **Система запускает тест:**
+
 ```typescript
 // В chat.controller.ts
 const testRequest = {
   url: plan.url,
-  browsers: ['chrome'],
+  browsers: ["chrome"],
   projectId: project_id,
-  intelligentMode: false,  // ← Standard Mode
-  commands: plan.commands,  // ← Команды из плана (с РЕАЛЬНЫМИ селекторами)
+  intelligentMode: false, // ← Standard Mode
+  commands: plan.commands, // ← Команды из плана (с РЕАЛЬНЫМИ селекторами)
   intent: plan.scope,
 };
 
@@ -325,14 +326,16 @@ await ManualTestService.runTest(testRequest);
 ## 🔍 Как работает анализ страницы (exploration)
 
 ### Шаг 1: Запуск браузера
+
 ```typescript
 // autonomous-explorer.service.ts
-const browser = await browserPool.getBrowser('chrome');
+const browser = await browserPool.getBrowser("chrome");
 const page = await browser.newPage();
-await page.goto(url, { waitUntil: 'domcontentloaded' });
+await page.goto(url, { waitUntil: "domcontentloaded" });
 ```
 
 ### Шаг 2: Сбор данных
+
 ```typescript
 // 1. Скриншот
 const screenshot = await page.screenshot({ fullPage: true });
@@ -347,7 +350,10 @@ const domAnalysis = await analyzeDOMStructure(page);
 // }
 
 // 3. Визуальный анализ (ПАРАЛЛЕЛЬНО)
-const visualAnalysis = await analyzeScreenshotWithVision(screenshot, { scope, url });
+const visualAnalysis = await analyzeScreenshotWithVision(screenshot, {
+  scope,
+  url,
+});
 // Результат:
 // {
 //   elements: [{ type: "button", purpose: "login", location: "center" }],
@@ -357,6 +363,7 @@ const visualAnalysis = await analyzeScreenshotWithVision(screenshot, { scope, ur
 ```
 
 ### Шаг 3: Генерация test plan
+
 ```typescript
 // test-plan-generator.service.ts
 const prompt = buildTestPlanPrompt(explorationResult, userRequest);
@@ -374,6 +381,7 @@ validateSelectorsInPlan(aiPlan, explorationResult);
 ```
 
 ### Шаг 4: Результат
+
 ```json
 {
   "commands": [
@@ -383,12 +391,12 @@ validateSelectorsInPlan(aiPlan, explorationResult);
     },
     {
       "action": "click",
-      "selector": "button.auth-btn",  // ← РЕАЛЬНЫЙ селектор из DOM анализа
+      "selector": "button.auth-btn", // ← РЕАЛЬНЫЙ селектор из DOM анализа
       "description": "Click Sign In button"
     },
     {
       "action": "fill",
-      "selector": "input[name='email']",  // ← РЕАЛЬНЫЙ селектор из DOM анализа
+      "selector": "input[name='email']", // ← РЕАЛЬНЫЙ селектор из DOM анализа
       "value": "test@example.com"
     }
   ]
@@ -409,6 +417,7 @@ validateSelectorsInPlan(aiPlan, explorationResult);
 ## 📝 Поддерживаемые действия (Playwright commands)
 
 ### Navigation:
+
 ```typescript
 {
   "action": "goto",
@@ -419,6 +428,7 @@ validateSelectorsInPlan(aiPlan, explorationResult);
 ```
 
 ### Interactions:
+
 ```typescript
 // Click
 {
@@ -470,6 +480,7 @@ validateSelectorsInPlan(aiPlan, explorationResult);
 ```
 
 ### Wait:
+
 ```typescript
 // Wait for selector
 {
@@ -494,6 +505,7 @@ validateSelectorsInPlan(aiPlan, explorationResult);
 ```
 
 ### Assertions:
+
 ```typescript
 // Assert element is visible
 {
@@ -533,6 +545,7 @@ validateSelectorsInPlan(aiPlan, explorationResult);
 ```
 
 ### Data Extraction:
+
 ```typescript
 // Extract text
 {
@@ -568,6 +581,7 @@ validateSelectorsInPlan(aiPlan, explorationResult);
 ```
 
 ### Screenshots:
+
 ```typescript
 {
   "action": "screenshot",
@@ -581,30 +595,31 @@ validateSelectorsInPlan(aiPlan, explorationResult);
 ## 🔍 Примеры селекторов
 
 ### Playwright API селекторы (рекомендуется):
+
 ```typescript
 // Text selector
-"text=\"Login\""
-"text=/Login/i"  // Case insensitive regex
+"text=\"Login\"";
+"text=/Login/i"; // Case insensitive regex
 
 // Role selector
-"role=button[name=\"Submit\"]"
-"role=textbox[name=\"Email\"]"
+"role=button[name=\"Submit\"]";
+"role=textbox[name=\"Email\"]";
 
 // Label selector
-"label=\"Email address\""
-"label=/email/i"
+"label=\"Email address\"";
+"label=/email/i";
 
 // CSS selector
-".submit-button"
-"#login-form"
-"button[type='submit']"
+".submit-button";
+"#login-form";
+"button[type='submit']";
 
 // XPath
-"xpath=//button[contains(text(), 'Login')]"
+"xpath=//button[contains(text(), 'Login')]";
 
 // Contextual (has-text)
-"button:has-text('Login')"
-".form:has-text('Sign In') >> button"
+"button:has-text('Login')";
+".form:has-text('Sign In') >> button";
 ```
 
 ---
@@ -612,6 +627,7 @@ validateSelectorsInPlan(aiPlan, explorationResult);
 ## 📊 Полный пример (из реального теста)
 
 **Из логов (repetino.kz):**
+
 ```json
 {
   "url": "https://repetino.kz",
@@ -684,57 +700,57 @@ curl -X POST https://api.qai.so/api/v1/manual-test/run \
 ## 🎯 JavaScript пример
 
 ```javascript
-const response = await fetch('https://api.qai.so/api/v1/manual-test/run', {
-  method: 'POST',
+const response = await fetch("https://api.qai.so/api/v1/manual-test/run", {
+  method: "POST",
   headers: {
-    'Authorization': `Bearer ${token}`,
-    'Content-Type': 'application/json',
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    url: 'https://example.com',
-    browsers: ['chrome'],
-    projectId: 'b8ff4957-252e-4ea1-81de-6ef43638b802',
-    intelligentMode: false,  // ← Standard Mode
+    url: "https://example.com",
+    browsers: ["chrome"],
+    projectId: "b8ff4957-252e-4ea1-81de-6ef43638b802",
+    intelligentMode: false, // ← Standard Mode
     commands: [
       {
-        action: 'goto',
-        url: 'https://example.com',
-        description: 'Navigate to homepage'
+        action: "goto",
+        url: "https://example.com",
+        description: "Navigate to homepage",
       },
       {
-        action: 'click',
+        action: "click",
         selector: 'text="Sign In"',
-        description: 'Click Sign In button'
+        description: "Click Sign In button",
       },
       {
-        action: 'fill',
+        action: "fill",
         selector: 'input[name="email"]',
-        value: 'test@example.com',
-        description: 'Fill email field'
+        value: "test@example.com",
+        description: "Fill email field",
       },
       {
-        action: 'fill',
+        action: "fill",
         selector: 'input[name="password"]',
-        value: 'password123',
-        description: 'Fill password field'
+        value: "password123",
+        description: "Fill password field",
       },
       {
-        action: 'click',
+        action: "click",
         selector: 'button[type="submit"]',
-        description: 'Click login button'
+        description: "Click login button",
       },
       {
-        action: 'waitForSelector',
+        action: "waitForSelector",
         selector: 'text="Welcome"',
         timeout: 5000,
-        description: 'Wait for welcome message'
-      }
-    ]
-  })
+        description: "Wait for welcome message",
+      },
+    ],
+  }),
 });
 
 const result = await response.json();
-console.log('Test ID:', result.data.id);
+console.log("Test ID:", result.data.id);
 ```
 
 ---

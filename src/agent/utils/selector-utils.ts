@@ -160,14 +160,21 @@ export function normalizeSelector(selector: string): string {
     return `text="${text}"`;
   }
 
-  // 2. Convert getByLabel('label') → label="label"
+  // 2. Convert getByTestId('id') → testid="id"
+  const getByTestIdMatch = s.match(/^getByTestId\(['"](.+?)['"]\)$/);
+  if (getByTestIdMatch) {
+    const testId = getByTestIdMatch[1].replace(/\\'/g, "'").replace(/\\"/g, '"');
+    return `testid="${testId}"`;
+  }
+
+  // 3. Convert getByLabel('label') → label="label"
   const getByLabelMatch = s.match(/^getByLabel\(['"](.+?)['"]\)$/);
   if (getByLabelMatch) {
     const label = getByLabelMatch[1].replace(/\\'/g, "'").replace(/\\"/g, '"');
     return `label="${label}"`;
   }
 
-  // 3. Convert getByRole('role'[, {name: 'text'}]) → role=role[name="text"]
+  // 4. Convert getByRole('role'[, {name: 'text'}]) → role=role[name="text"]
   const getByRoleMatch = s.match(/^getByRole\(['"](.+?)['"]\s*(?:,\s*\{name:\s*['"](.+?)['"]\})?\)$/);
   if (getByRoleMatch) {
     const role = getByRoleMatch[1];
@@ -185,13 +192,19 @@ export function normalizeSelector(selector: string): string {
     return `text="${textSingleQuoteMatch[1]}"`;
   }
 
-  // 5. Normalize role= format: role=button[name='...'] → role=button[name="..."]
+  // 5. Normalize testid= format: testid='...' → testid="..."
+  const testidSingleQuoteMatch = s.match(/^testid\s*=\s*'(.+?)'$/);
+  if (testidSingleQuoteMatch) {
+    return `testid="${testidSingleQuoteMatch[1]}"`;
+  }
+
+  // 6. Normalize role= format: role=button[name='...'] → role=button[name="..."]
   const roleSingleQuoteMatch = s.match(/^role\s*=\s*([^\[\s]+)\[name\s*=\s*'(.+?)'\]$/);
   if (roleSingleQuoteMatch) {
     return `role=${roleSingleQuoteMatch[1]}[name="${roleSingleQuoteMatch[2]}"]`;
   }
 
-  // 6. Normalize label= format: label='...' → label="..."
+  // 7. Normalize label= format: label='...' → label="..."
   const labelSingleQuoteMatch = s.match(/^label\s*=\s*'(.+?)'$/);
   if (labelSingleQuoteMatch) {
     return `label="${labelSingleQuoteMatch[1]}"`;
@@ -319,7 +332,15 @@ export function getLocator(page: Page, selector: string): Locator {
     return page.getByText(payload, { exact: isExact });
   }
 
-  // 2. Handle label= format (with or without quotes)
+  // 2. Handle testid= format (Playwright API for data-testid)
+  // Formats: testid="login-button", testid=login-button
+  const testidMatch = s.match(/^testid\s*=\s*(.+)$/i);
+  if (testidMatch) {
+    let testId = testidMatch[1].trim().replace(/^["']|["']$/g, '');
+    return page.getByTestId(testId);
+  }
+
+  // 3. Handle label= format (with or without quotes)
   // Formats: label="Email", label=Email
   const labelMatch = s.match(/^label\s*=\s*(.+)$/i);
   if (labelMatch) {
@@ -327,7 +348,7 @@ export function getLocator(page: Page, selector: string): Locator {
     return page.getByLabel(label);
   }
 
-  // 3. Handle role= format (with or without name, with or without regex)
+  // 4. Handle role= format (with or without name, with or without regex)
   // Formats: role=button, role=button[name="Login"], role=button[name=/Login/i]
   const roleMatch = s.match(/^role\s*=\s*([^\[\s]+)(?:\s*\[name\s*=\s*(.+?)\])?$/i);
   if (roleMatch) {
@@ -437,6 +458,14 @@ export function getLocator(page: Page, selector: string): Locator {
           continue;
         }
 
+        // Handle testid="value"
+        const testidMatch = part.match(/^testid\s*=\s*["']?(.+?)["']?$/);
+        if (testidMatch) {
+          const testId = testidMatch[1];
+          locator = locator.getByTestId(testId);
+          continue;
+        }
+
         // Fallback: treat as CSS selector
         locator = locator.locator(part);
       }
@@ -534,7 +563,6 @@ export async function validateAndGetLocator(
           const result: { disabled: boolean; reason: string | null } = { disabled: false, reason: null };
 
           // ✅ UNIVERSAL: Check element's own disabled state
-          // 1. Standard disabled attribute (works for input, button, select, textarea, optgroup, option)
           if ('disabled' in htmlEl && (htmlEl as any).disabled === true) {
             result.disabled = true;
             result.reason = 'disabled attribute';

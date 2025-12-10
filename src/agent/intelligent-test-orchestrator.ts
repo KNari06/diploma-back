@@ -246,9 +246,6 @@ export class IntelligentTestOrchestrator {
       this.emitGraphUpdate(startUpdate);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // ✅ NEW: Execute pre-test setup (migrated from Standard Mode)
-    // ═══════════════════════════════════════════════════════════════════════════
 
     // Execute custom scripts if provided (from Standard Mode)
     if (this.config.customScripts && this.config.customScripts.length > 0) {
@@ -2808,8 +2805,36 @@ export class IntelligentTestOrchestrator {
       return;
     }
 
+    // Validate update structure
+    if (!update || typeof update !== 'object') {
+      logger.warn('[INTELLIGENT_ORCHESTRATOR] Invalid graph update structure', {
+        testId: this.testId,
+      });
+      return;
+    }
+
+    if (!update.type || !['full', 'incremental'].includes(update.type)) {
+      logger.warn('[INTELLIGENT_ORCHESTRATOR] Invalid graph update type', {
+        testId: this.testId,
+        type: update.type,
+      });
+      return;
+    }
+
+    // Validate that update has at least one data field
+    const hasIncrementalData = update.newNode || update.newEdge || update.updatedNode;
+    const hasFullData = update.fullGraph;
+
+    if (!hasIncrementalData && !hasFullData) {
+      logger.warn('[INTELLIGENT_ORCHESTRATOR] Graph update missing data', {
+        testId: this.testId,
+        type: update.type,
+      });
+      return;
+    }
+
     try {
-      webSocketService.emitToUser(this.userId, 'test:graph-update', {
+      const payload = {
         testId: this.testId,
         type: update.type,
         data: {
@@ -2819,12 +2844,14 @@ export class IntelligentTestOrchestrator {
           fullGraph: update.fullGraph,
         },
         timestamp: new Date().toISOString(),
-      });
+      };
+
+      webSocketService.emitToUser(this.userId, 'test:graph-update', payload);
     } catch (error) {
-      // Silent fail - don't log WebSocket errors
       logger.error('[INTELLIGENT_ORCHESTRATOR] Failed to emit graph update', {
         testId: this.testId,
         error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
       });
     }
   }

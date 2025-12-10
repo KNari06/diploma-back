@@ -730,11 +730,27 @@ export type ActionType =
   | 'navigate'
   | string; // Allow custom actions
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TESTING SCOPE CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Valid testing scopes for platform_test
+ * Used for validation and type safety across the codebase
+ */
+export const VALID_SCOPES = ['full', 'page', 'element', 'flow', 'form', 'auth', 'navigation'] as const;
+
+export type TestScope = typeof VALID_SCOPES[number] | 'general' | null;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTENT TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
 export interface IntentResult {
   intent: IntentType;
 
   // NEW: Scope and target for platform_test
-  scope?: 'full' | 'page' | 'element' | 'flow' | 'form' | 'auth' | 'navigation' | null;
+  scope?: TestScope;
   target?: string | null; // What exactly to test (e.g., "registration form", "Buy button")
 
   // Legacy fields (for backward compatibility)

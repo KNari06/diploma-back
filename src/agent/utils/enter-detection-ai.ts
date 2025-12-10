@@ -4,7 +4,7 @@ import { Locator, Page } from 'playwright';
 
 /**
  * AI-powered Enter key detection after fill action
- * Uses GPT-3.5-turbo to intelligently decide based on context
+ * Uses GPT-4o-mini to intelligently decide based on context
  */
 
 interface InputContext {
@@ -204,7 +204,7 @@ export async function shouldPressEnterAfterFill(
     // Build AI prompt
     const prompt = buildEnterDetectionPrompt(inputContext, description, totalInputs);
 
-    // Call GPT-3.5-turbo
+    // Call GPT-4o-mini
     const response = await getChatCompletionWithMessages([
       {
         role: 'system',
@@ -215,7 +215,7 @@ export async function shouldPressEnterAfterFill(
         content: prompt,
       },
     ], {
-      model: 'gpt-3.5-turbo',
+      model: 'gpt-4o-mini',
       temperature: 0.2,
       max_tokens: 150,
     });

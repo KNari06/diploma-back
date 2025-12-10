@@ -319,10 +319,6 @@ export interface IntelligentTestConfig {
   userContext?: Record<string, any>; // Additional user-provided context
   spaLoadConfig?: SPALoadConfig; // ✅ NEW: Configurable SPA loading settings
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ✅ NEW: Migrated from Standard Mode - now AI uses these as hints
-  // ═══════════════════════════════════════════════════════════════════════════
-
   /**
    * Test steps/hints from plan - AI will use these as guidance, not strict commands
    * Example: ["Click login button", "Fill email field", "Submit form"]
@@ -331,13 +327,11 @@ export interface IntelligentTestConfig {
 
   /**
    * Initial wait for specific selector before starting test
-   * Migrated from Standard Mode options.waitForSelector
    */
   waitForSelector?: string;
 
   /**
    * Custom JavaScript scripts to execute before testing
-   * Migrated from Standard Mode options.customScripts
    */
   customScripts?: string[];
 

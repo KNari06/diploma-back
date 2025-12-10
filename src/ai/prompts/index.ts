@@ -18,7 +18,16 @@ export {
 
 // Re-export from test-plan-prompts.ts
 export {
-  buildApiFuzzingPrompt, buildApiTestPlanPrompt, buildDynamicQuestionPrompt, buildTestPlanPrompt
+  buildApiFuzzingPrompt,
+  buildApiTestPlanPrompt,
+  buildCustomScopeStrategyPrompt,
+  buildCustomScopeStrategySystemPrompt,
+  buildDynamicQuestionPrompt,
+  buildPageNavigationPrompt,
+  buildPageNavigationSystemPrompt,
+  buildTestPlanPrompt,
+  buildUrlAnalysisPrompt,
+  buildUrlAnalysisSystemPrompt,
 } from './test-plan-prompts';
 
 // Re-export from intelligent-testing-prompts.ts
@@ -65,7 +74,16 @@ export {
 
 import { buildActionGenerationPrompt, buildLogicAnalysisPrompt, buildNextStepPrompt, buildPageAnalysisPrompt, buildVisionPrompt } from './intelligent-testing-prompts';
 import { buildApprovalDetectionPrompt, buildChatSystemPrompt, buildIntentPrompt } from './intent-and-chat-prompts';
-import { buildApiFuzzingPrompt, buildApiTestPlanPrompt, buildDynamicQuestionPrompt, buildTestPlanPrompt } from './test-plan-prompts';
+import {
+  buildApiFuzzingPrompt,
+  buildApiTestPlanPrompt,
+  buildCustomScopeStrategyPrompt,
+  buildCustomScopeStrategySystemPrompt,
+  buildDynamicQuestionPrompt,
+  buildTestPlanPrompt,
+  buildUrlAnalysisPrompt,
+  buildUrlAnalysisSystemPrompt,
+} from './test-plan-prompts';
 
 export const Prompts = {
   // 1. Intent parsing
@@ -98,6 +116,14 @@ export const Prompts = {
   // 9. Dynamic questions
   buildDynamicQuestionPrompt,
 
-  // 10. Utilities
+  // 10. URL analysis
+  buildUrlAnalysisPrompt,
+  buildUrlAnalysisSystemPrompt,
+
+  // 11. Custom scope strategy
+  buildCustomScopeStrategyPrompt,
+  buildCustomScopeStrategySystemPrompt,
+
+  // 12. Utilities
   // buildContextString, // TODO: Temporarily disabled (KB disabled)
 };

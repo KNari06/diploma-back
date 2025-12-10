@@ -1,7 +1,7 @@
-import { OpenAI } from 'openai';
+import { buildVisionPrompt } from '@/ai/prompts/index';
 import { env } from '@/config/env';
 import { logger } from '@/utils/logger';
-import { buildVisionPrompt } from '@/ai/prompts/index';
+import { OpenAI } from 'openai';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
@@ -57,7 +57,7 @@ export async function analyzeScreenshotWithVision(
         },
       ],
       max_tokens: 2000,
-      temperature: 0.3, // Lower temperature for more consistent analysis
+      temperature: 0.2, // Lower temperature for more consistent analysis
       response_format: { type: 'json_object' },
     });
 

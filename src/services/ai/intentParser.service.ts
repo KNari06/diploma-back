@@ -4,7 +4,7 @@ import { detectUserApproval, extractUrlWithGPT } from '@/services/ai/ai-helpers.
 // TODO: KB Search temporarily disabled - will be re-enabled later
 // import { detectLanguage, searchKB } from '@/services/kb/kb.service';
 // import { RulesCacheService } from '@/services/kb/rules-cache.service';
-import { IntentResult, IntentType, KNOWN_INTENTS } from '@/types';
+import { IntentResult, IntentType, KNOWN_INTENTS, VALID_SCOPES } from '@/types';
 import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
 
@@ -16,7 +16,7 @@ const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
 // FIX #2: Centralized validation constants
 const VALID_HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'] as const;
-const VALID_SCOPES = ['full', 'page', 'element', 'flow', 'form', 'auth', 'navigation'] as const;
+// ✅ VALID_SCOPES now imported from @/types
 const VALID_INTENTS = ['platform_test', 'api_test', 'general_chat', 'needs_clarification'] as const;
 
 // Cache configuration
@@ -1363,10 +1363,13 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
       if (VALID_SCOPES.includes(trimmedScope as any)) {
         parsed.scope = trimmedScope as any;
       } else {
-        logger.debug('[INTENT_PARSER] Unknown scope, keeping as-is', {
-          scope: trimmedScope,
+        logger.warn('[INTENT_PARSER] Invalid scope provided, will use fallback', {
+          provided: parsed.scope,
+          normalized: trimmedScope,
           validScopes: VALID_SCOPES,
         });
+        // ✅ FIX: Don't keep invalid scope - set to null so system can use default
+        parsed.scope = null;
       }
     }
 

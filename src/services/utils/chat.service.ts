@@ -406,34 +406,66 @@ export class ChatService {
         };
       } = {
         id: data.id,
+        // user_id can be null for anonymous users, but we require it in return type
+        // If null, this indicates a data integrity issue (should not happen for authenticated users)
         user_id: data.user_id || '',
+        // workspace_id can be null, but return type requires string
+        // Use empty string as fallback (should be set during session creation)
         workspace_id: data.workspace_id || '',
         project_id: data.project_id || undefined,
       };
 
+      // Log warning if critical fields are missing (for debugging)
+      if (!data.user_id && userId) {
+        logger.warn('[CHAT_SERVICE] Session found but user_id is null', {
+          sessionId,
+          providedUserId: userId,
+        });
+      }
+      if (!data.workspace_id) {
+        logger.debug('[CHAT_SERVICE] Session found but workspace_id is null', {
+          sessionId,
+          hasProjectId: !!data.project_id,
+        });
+      }
+
       // Safely extract project data
+      // Supabase can return projects as array or single object depending on join type
       if (data.projects) {
         if (Array.isArray(data.projects) && data.projects.length > 0) {
           const project = data.projects[0];
+          // Validate project has required fields (id and name are required)
           if (project && typeof project === 'object' && project.id && project.name) {
             result.project = {
-              id: project.id,
-              name: project.name,
+              id: String(project.id), // Ensure string type
+              name: String(project.name), // Ensure string type
               settings: project.settings && typeof project.settings === 'object' ? project.settings : undefined,
             };
+          } else {
+            logger.warn('[CHAT_SERVICE] Invalid project data in array', {
+              sessionId,
+              hasId: !!project?.id,
+              hasName: !!project?.name,
+            });
           }
         } else if (!Array.isArray(data.projects) && typeof data.projects === 'object') {
           // Handle single project object (not array)
           const projectObj = data.projects as any;
           if (projectObj.id && projectObj.name) {
             result.project = {
-              id: projectObj.id,
-              name: projectObj.name,
+              id: String(projectObj.id), // Ensure string type
+              name: String(projectObj.name), // Ensure string type
               settings:
                 projectObj.settings && typeof projectObj.settings === 'object'
                   ? projectObj.settings
                   : undefined,
             };
+          } else {
+            logger.warn('[CHAT_SERVICE] Invalid project data (single object)', {
+              sessionId,
+              hasId: !!projectObj?.id,
+              hasName: !!projectObj?.name,
+            });
           }
         }
       }

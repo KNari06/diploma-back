@@ -1,11 +1,12 @@
-import { Request, Response } from 'express';
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
-import { ProjectContextService } from '@/services/utils/project-context.service';
 import { requestMissingInformation, runAutonomousExploration } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
+import { NavigationRequiresClarificationError } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { emitProcessingStep } from '../shared/utils';
-import { normalizeUrl } from '../shared/utils';
+import { ProjectContextService } from '@/services/utils/project-context.service';
+import { parseAnswers } from '@/services/utils/question-generator.service';
+import { logger } from '@/utils/logger';
+import { Request, Response } from 'express';
+import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -68,20 +69,32 @@ export async function handlePlatformTest(
     // STEP 0: LOAD CHAT SESSION CONTEXT (FIX #1: Error handling)
     // ═══════════════════════════════════════════════════════════════════════
 
-    let sessionProject = null;
+    let sessionProject: { id: string; name: string; settings?: { main_url?: string } } | null = null;
     if (chatSessionId) {
       try {
         const sessionData = await ChatService.getSessionWithProject(chatSessionId, userId); // SECURITY: Pass userId for verification
-        sessionProject = sessionData?.project;
 
-        if (sessionProject?.settings?.main_url) {
-          logger.info('[PLATFORM_TEST] Found project in session', {
-            projectId: sessionProject.id,
-            projectName: sessionProject.name,
-            projectUrl: sessionProject.settings.main_url,
-          });
+        // Explicitly handle null/undefined cases for consistency
+        if (sessionData?.project) {
+          sessionProject = sessionData.project;
+
+          if (sessionProject.settings?.main_url) {
+            logger.info('[PLATFORM_TEST] Found project in session', {
+              projectId: sessionProject.id,
+              projectName: sessionProject.name,
+              projectUrl: sessionProject.settings.main_url,
+            });
+          } else {
+            logger.debug('[PLATFORM_TEST] Project in session but no main_url', {
+              projectId: sessionProject.id,
+              projectName: sessionProject.name,
+            });
+          }
         } else {
-          logger.debug('[PLATFORM_TEST] No project in session yet');
+          logger.debug('[PLATFORM_TEST] No project in session yet', {
+            sessionId: chatSessionId,
+            hasSessionData: !!sessionData,
+          });
         }
       } catch (error) {
         logger.warn('[PLATFORM_TEST] Failed to get session project', {
@@ -95,42 +108,23 @@ export async function handlePlatformTest(
 
     checkTimeout();
 
-    // Load user projects (FIX #1: Error handling)
-    let userProjects: any[] = [];
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('projects')
-        .select('id, name, settings')
-        .eq('user_id', userId)
-        .eq('workspace_id', workspace_id)
-        .order('created_at', { ascending: false })
-        .limit(10);
-
-      if (error) {
-        logger.error('[PLATFORM_TEST] Failed to load user projects', { error });
-      } else {
-        userProjects = data || [];
-      }
-
-      logger.info('[PLATFORM_TEST] Loaded user projects', {
-        projectCount: userProjects.length,
-      });
-    } catch (error) {
-      logger.warn('[PLATFORM_TEST] Error loading projects, continuing without them', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      userProjects = [];
-    }
-
-    checkTimeout();
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 1: PROCESS ANSWERS (if user provided them)
+    // ═══════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 1: PROCESS ANSWERS (if user provided them)
     // ═══════════════════════════════════════════════════════════════════════
 
-    let parsedAnswers: any = null;
+    let parsedAnswers: {
+      url?: string;
+      scope?: string;
+      needsAuth?: boolean;
+      credentials?: { email?: string; username?: string; password: string };
+      additionalInfo?: Record<string, any>;
+    } | null = null;
 
-    // ✅ FIX: Parse user answers if they were provided
+    // Parse user answers if they were provided
     if (answers && typeof answers === 'object' && !Array.isArray(answers)) {
       logger.info('[PLATFORM_TEST] Processing user answers', {
         answerKeys: Object.keys(answers),
@@ -139,15 +133,19 @@ export async function handlePlatformTest(
       });
 
       try {
-        // Import parseAnswers from question-generator
-        const { parseAnswers } = await import('@/services/utils/question-generator.service');
-        parsedAnswers = parseAnswers(answers);
+        const parsed = parseAnswers(answers);
+
+        // Only set parsedAnswers if we got meaningful data (not empty object)
+        // This helps distinguish between "no answers" (null) and "empty answers" (empty object)
+        const hasData = parsed.url || parsed.scope || parsed.credentials || parsed.needsAuth !== undefined;
+        parsedAnswers = hasData ? parsed : null;
 
         logger.info('[PLATFORM_TEST] Parsed answers successfully', {
-          hasUrl: !!parsedAnswers.url,
-          hasScope: !!parsedAnswers.scope,
-          needsAuth: parsedAnswers.needsAuth,
-          hasCredentials: !!parsedAnswers.credentials,
+          hasUrl: !!parsedAnswers?.url,
+          hasScope: !!parsedAnswers?.scope,
+          needsAuth: parsedAnswers?.needsAuth,
+          hasCredentials: !!parsedAnswers?.credentials,
+          hasData,
         });
       } catch (parseError) {
         logger.error('[PLATFORM_TEST] Failed to parse answers', {
@@ -187,6 +185,33 @@ export async function handlePlatformTest(
     // If missing info, ask questions
     if (!hasUrl || !hasScope) {
       logger.info('[PLATFORM_TEST] Missing required information', { hasUrl, hasScope });
+
+      // ✅ OPTIMIZATION: Load user projects only when needed (for showing project options)
+      let userProjects: any[] = [];
+      try {
+        const { data, error } = await supabaseAdmin
+          .from('projects')
+          .select('id, name, settings')
+          .eq('user_id', userId)
+          .eq('workspace_id', workspace_id)
+          .order('created_at', { ascending: false })
+          .limit(10);
+
+        if (error) {
+          logger.error('[PLATFORM_TEST] Failed to load user projects', { error });
+        } else {
+          userProjects = data || [];
+        }
+
+        logger.info('[PLATFORM_TEST] Loaded user projects', {
+          projectCount: userProjects.length,
+        });
+      } catch (error) {
+        logger.warn('[PLATFORM_TEST] Error loading projects, continuing without them', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        userProjects = [];
+      }
 
       try {
         const result = await requestMissingInformation(message, {
@@ -285,6 +310,8 @@ export async function handlePlatformTest(
     // Priority 2: Saved credentials from DB
     else {
       try {
+        emitProcessingStep(chatSessionId, 'validating_credentials', '🔍 Getting saved credentials...', 45);
+
         const savedCredentials = await ProjectContextService.getProjectCredentials(project_id, userId);
 
         if (savedCredentials) {
@@ -351,6 +378,66 @@ export async function handlePlatformTest(
     } catch (explorationError) {
       const errorMsg = explorationError instanceof Error ? explorationError.message : String(explorationError);
 
+      // ✅ NEW: Check if error is about navigation requiring clarification
+      if (explorationError instanceof NavigationRequiresClarificationError) {
+        logger.info('[PLATFORM_TEST] Navigation requires clarification, asking user', {
+          url: explorationError.currentUrl,
+          goal: explorationError.attemptedGoal,
+          reason: explorationError.reason,
+        });
+
+        const clarificationMsg = explorationError.reason === 'no_links_found'
+          ? `🤔 I couldn't find any navigation links on ${explorationError.currentUrl}.\n\nCould you provide the direct URL to the page you want to test?\n\nFor example:\n• Registration page: https://site.com/register\n• Login page: https://site.com/login\n• Specific feature: https://site.com/feature`
+          : `🤔 I tried to navigate to the target page but couldn't find it after 3 attempts.\n\nCould you provide the direct URL to the page you want to test?`;
+
+        // Generate clarifying question for URL
+        const clarifyingQuestion = {
+          id: 'target_url',
+          question: 'Please provide the direct URL to the page you want to test:',
+          required: true,
+          type: 'url' as const,
+          placeholder: 'https://example.com/specific-page',
+          validation: {
+            pattern: '^https?://.+',
+            minLength: 10,
+          },
+        };
+
+        // Save to history
+        if (chatSessionId) {
+          ChatService.saveChatMessages(chatSessionId, [
+            { role: 'user', content: message },
+            {
+              role: 'ai',
+              content: clarificationMsg,
+              metadata: {
+                questions: [clarifyingQuestion],
+                conversationId: 'nav_clarification_' + Date.now(),
+                requiresAnswers: true,
+                navigationError: {
+                  currentUrl: explorationError.currentUrl,
+                  attemptedGoal: explorationError.attemptedGoal,
+                  reason: explorationError.reason,
+                },
+              },
+            },
+          ]).catch(saveError => {
+            logger.error('[PLATFORM_TEST] Failed to save navigation clarification', {
+              error: saveError instanceof Error ? saveError.message : String(saveError),
+            });
+          });
+        }
+
+        res.json({
+          reply: clarificationMsg,
+          questions: [clarifyingQuestion],
+          conversationId: 'nav_clarification_' + Date.now(),
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+        return;
+      }
+
       // ✅ FIX: Check if error is about missing credentials
       if (errorMsg.includes('Authentication required') || errorMsg.includes('credentials')) {
         logger.info('[PLATFORM_TEST] Auth required, asking for credentials', {
@@ -359,13 +446,14 @@ export async function handlePlatformTest(
         });
 
         // Re-ask with credentials question
+        // Note: userProjects not needed here (only credentials question)
         try {
           const result = await requestMissingInformation(message, {
             hasUrl: true,
             hasScope: true,
             hasCredentials: false, // ← Force credentials question
             intent: 'platform_test',
-            userProjects,
+            userProjects: [], // Not needed for credentials question
           });
 
           // Save to history
