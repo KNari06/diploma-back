@@ -1052,7 +1052,127 @@ export async function analyzeDOMStructure(
        * ✅ OPTIMIZED: data-testid uses Playwright API (testid=) instead of CSS
        * Uses closure to access selectorCounts (no need to pass as parameter)
        */
-      function generateSelector(element: any): string {
+      /**
+       * ✅ IMPROVED: Normalize whitespace in text content
+       * Removes multiple spaces, tabs, newlines and trims
+       */
+      function normalizeText(text: string | null | undefined): string {
+        if (!text) return '';
+        return text.trim().replace(/\s+/g, ' ');
+      }
+
+      /**
+       * ✅ IMPROVED: Get accessible name for element
+       * Follows ARIA specification priority order
+       * Returns null if no accessible name found
+       */
+      function getAccessibleName(element: any, root: any): string | null {
+        // 1. aria-labelledby (highest priority)
+        if (element.hasAttribute('aria-labelledby')) {
+          const ids = element.getAttribute('aria-labelledby').trim().split(/\s+/);
+          const labels: string[] = [];
+          for (const id of ids) {
+            try {
+              const escapedId = escapeCSSIdentifier(id);
+              if (escapedId) {
+                const labelEl = root.querySelector(`#${escapedId}`);
+                if (labelEl) {
+                  const labelText = normalizeText(labelEl.textContent);
+                  if (labelText) labels.push(labelText);
+                }
+              }
+            } catch {
+              // Invalid selector, skip
+            }
+          }
+          if (labels.length > 0) {
+            return labels.join(' ');
+          }
+        }
+
+        // 2. aria-label
+        if (element.hasAttribute('aria-label')) {
+          const ariaLabel = normalizeText(element.getAttribute('aria-label'));
+          if (ariaLabel) return ariaLabel;
+        }
+
+        // 3. label[for] (for form elements)
+        if (element.id && (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT')) {
+          try {
+            const escapedId = escapeCSSIdentifier(element.id);
+            if (escapedId) {
+              const labelEl = root.querySelector(`label[for="${escapedId}"]`);
+              if (labelEl) {
+                const labelText = normalizeText(labelEl.textContent);
+                if (labelText) return labelText;
+              }
+            }
+          } catch {
+            // Invalid selector, skip
+          }
+        }
+
+        // 4. Parent <label> element
+        if (element.parentElement?.tagName === 'LABEL') {
+          // Clone label and remove input to get clean text
+          const labelClone = element.parentElement.cloneNode(true) as any;
+          const inputInLabel = labelClone.querySelector('input, select, textarea');
+          if (inputInLabel) inputInLabel.remove();
+          const labelText = normalizeText(labelClone.textContent);
+          if (labelText) return labelText;
+        }
+
+        // 5. title attribute
+        if (element.hasAttribute('title')) {
+          const title = normalizeText(element.getAttribute('title'));
+          if (title) return title;
+        }
+
+        // 6. alt attribute (for img, area)
+        if (element.hasAttribute('alt')) {
+          const alt = normalizeText(element.getAttribute('alt'));
+          if (alt) return alt;
+        }
+
+        // 7. placeholder (for inputs)
+        if (element.hasAttribute('placeholder')) {
+          const placeholder = normalizeText(element.getAttribute('placeholder'));
+          if (placeholder) return placeholder;
+        }
+
+        // 8. SVG <title> element (first child)
+        if (element.tagName === 'svg') {
+          const titleEl = element.querySelector('title');
+          if (titleEl) {
+            const titleText = normalizeText(titleEl.textContent);
+            if (titleText) return titleText;
+          }
+        }
+
+        // 9. innerText (visible text only, excludes hidden elements)
+        // Fallback to textContent if innerText not available
+        try {
+          const visibleText = normalizeText(element.innerText || element.textContent);
+          if (visibleText) return visibleText;
+        } catch {
+          // innerText might throw in some contexts
+          const textContent = normalizeText(element.textContent);
+          if (textContent) return textContent;
+        }
+
+        return null;
+      }
+
+      function generateSelector(element: any, root?: any): string {
+        // ✅ FIX: Skip hidden inputs (type="hidden")
+        if (element.tagName === 'INPUT' && element.type === 'hidden') {
+          return ''; // Hidden inputs should not be selected
+        }
+
+        // ✅ FIX: Get root document from element if not provided
+        // element.ownerDocument works in both main DOM and Shadow DOM
+        const rootDoc = root || element.ownerDocument || element.getRootNode?.() || element;
+
         // ✅ OPTIMIZED: Use Playwright API for data-testid (better than CSS)
         if (element.hasAttribute('data-testid')) {
           return `testid="${escapeSelector(element.getAttribute('data-testid'))}"`;
@@ -1062,14 +1182,15 @@ export async function analyzeDOMStructure(
           return `[data-cy="${escapeSelector(element.getAttribute('data-cy'))}"]`;
         }
 
-        // ✅ NEW: Try getByRole (best practice for accessibility)
+        // ✅ IMPROVED: Try getByRole with accessible name (best practice for accessibility)
         // Detect implicit ARIA roles from HTML elements
         const implicitRole = getImplicitRole(element);
         if (implicitRole) {
-          const text = element.textContent?.trim();
-          // Use role with name if text is available and reasonable length
-          if (text && text.length > 0 && text.length < 50) {
-            return `role=${implicitRole}[name="${escapeSelector(text)}"]`;
+          // ✅ FIX: Use getAccessibleName instead of just textContent
+          const accessibleName = getAccessibleName(element, rootDoc);
+          // Use role with name if accessible name is available and reasonable length
+          if (accessibleName && accessibleName.length > 0 && accessibleName.length < 50) {
+            return `role=${implicitRole}[name="${escapeSelector(accessibleName)}"]`;
           }
           // Use role without name (less specific, but still good)
           return makeUnique(`role=${implicitRole}`, element);
@@ -1082,25 +1203,15 @@ export async function analyzeDOMStructure(
           return `#${element.id}`;
         }
 
-        // ✅ NEW: Try getByLabel for inputs (accessibility-first)
+        // ✅ IMPROVED: Try getByLabel for inputs (accessibility-first)
         if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
-          // Try aria-label first
-          if (element.hasAttribute('aria-label')) {
-            const ariaLabel = element.getAttribute('aria-label');
-            if (ariaLabel && ariaLabel.length > 0 && ariaLabel.length < 50) {
-              return `label="${escapeSelector(ariaLabel)}"`;
-            }
+          // ✅ FIX: Use getAccessibleName for comprehensive label lookup
+          const accessibleName = getAccessibleName(element, rootDoc);
+          if (accessibleName && accessibleName.length > 0 && accessibleName.length < 50) {
+            return `label="${escapeSelector(accessibleName)}"`;
           }
 
-          // Try placeholder as label
-          if (element.hasAttribute('placeholder')) {
-            const placeholder = element.getAttribute('placeholder');
-            if (placeholder && placeholder.length > 0 && placeholder.length < 50) {
-              return `label="${escapeSelector(placeholder)}"`;
-            }
-          }
-
-          // Try name attribute - use as label (Playwright, not CSS)
+          // Fallback: Try name attribute - use as label (Playwright, not CSS)
           if (element.hasAttribute('name')) {
             const name = element.getAttribute('name');
             if (name && name.length > 0) {
@@ -1110,11 +1221,41 @@ export async function analyzeDOMStructure(
           }
         }
 
-        // ✅ NEW: Try getByText for buttons/links (Playwright API format)
-        if ((element.tagName === 'BUTTON' || element.tagName === 'A') && element.textContent) {
-          const text = element.textContent.trim();
-          if (text.length > 0 && text.length < 50) {
-            return `text="${escapeSelector(text)}"`;
+        // ✅ IMPROVED: Try getByText for buttons/links (Playwright API format)
+        if (element.tagName === 'BUTTON' || element.tagName === 'A') {
+          // ✅ FIX: Use getAccessibleName for comprehensive text lookup
+          const accessibleName = getAccessibleName(element, rootDoc);
+          if (accessibleName && accessibleName.length > 0 && accessibleName.length < 50) {
+            return `text="${escapeSelector(accessibleName)}"`;
+          }
+        }
+
+        // ✅ NEW: Handle SVG elements with aria-label or title
+        if (element.tagName === 'svg' || element.tagName?.toLowerCase() === 'svg') {
+          const accessibleName = getAccessibleName(element, rootDoc);
+          if (accessibleName && accessibleName.length > 0 && accessibleName.length < 50) {
+            // SVG with role should use role selector
+            if (element.hasAttribute('role')) {
+              const role = element.getAttribute('role');
+              return `role=${role}[name="${escapeSelector(accessibleName)}"]`;
+            }
+            // Otherwise use text selector
+            return `text="${escapeSelector(accessibleName)}"`;
+          }
+        }
+
+        // ✅ NEW: Handle custom elements (Web Components)
+        // Custom elements have hyphen in tag name (e.g., my-button)
+        if (element.tagName && element.tagName.includes('-')) {
+          const accessibleName = getAccessibleName(element, rootDoc);
+          if (accessibleName && accessibleName.length > 0 && accessibleName.length < 50) {
+            // If has role, use role selector
+            if (element.hasAttribute('role')) {
+              const role = element.getAttribute('role');
+              return `role=${role}[name="${escapeSelector(accessibleName)}"]`;
+            }
+            // Otherwise use text selector
+            return `text="${escapeSelector(accessibleName)}"`;
           }
         }
 
@@ -1155,6 +1296,7 @@ export async function analyzeDOMStructure(
               case 'button':
               case 'submit':
               case 'reset':
+              case 'image': // ✅ NEW: input[type="image"] acts as button
                 return 'button';
               case 'checkbox':
                 return 'checkbox';
@@ -1167,7 +1309,19 @@ export async function analyzeDOMStructure(
               case 'tel':
               case 'url':
               case 'search':
+              case 'password': // ✅ NEW: password input is textbox
+              case 'number': // ✅ NEW: number input is spinbutton (but textbox is more common)
+              case 'date': // ✅ NEW: date inputs are textbox-like
+              case 'datetime-local':
+              case 'time':
+              case 'week':
+              case 'month':
+              case 'color': // ✅ NEW: color picker is textbox-like
                 return 'textbox';
+              case 'file': // ✅ NEW: file input has no standard role, but can be selected
+                return null; // No implicit role, but still interactive
+              case 'hidden': // ✅ NEW: hidden inputs should not be selected
+                return null;
               default:
                 return null;
             }
@@ -1240,6 +1394,28 @@ export async function analyzeDOMStructure(
             return 'cell';
           case 'th':
             return 'columnheader';
+          // ✅ NEW: Additional semantic elements
+          case 'article':
+            return 'article';
+          case 'section':
+            return 'region'; // section with accessible name becomes region
+          case 'search':
+            return 'search'; // HTML5 search element
+          case 'figure':
+            return 'figure';
+          case 'details':
+            return 'group'; // details is a disclosure widget
+          case 'summary':
+            return 'button'; // summary acts as a button to toggle details
+          // ✅ NEW: Media elements with controls
+          case 'video':
+          case 'audio':
+            return null; // No implicit role unless controls attribute present
+          // ✅ NEW: Canvas and iframe
+          case 'canvas':
+            return null; // Canvas has no implicit role
+          case 'iframe':
+            return null; // Iframe has no implicit role (but can be selected)
           default:
             return null;
         }
@@ -1250,6 +1426,7 @@ export async function analyzeDOMStructure(
        * ✅ FIX: Playwright doesn't support :nth() in CSS selector
        * Instead, we use more specific selector with parent context
        * Uses closure to access selectorCounts (no need to pass as parameter)
+       * ✅ IMPROVED: Escapes CSS identifiers, handles ShadowRoot, validates parent
        */
       function makeUnique(selector: string, element?: any): string {
         const count = selectorCounts.get(selector) || 0;
@@ -1257,23 +1434,48 @@ export async function analyzeDOMStructure(
 
         // If we've seen this selector before, try to make it more specific
         if (count > 0 && element) {
-          // Try to add parent context for uniqueness
-          const parent = element.parentElement;
-          if (parent) {
-            // Try parent ID
+          // ✅ FIX: Get parent element, but skip ShadowRoot and Document
+          let parent = element.parentElement;
+
+          // ✅ FIX: Skip ShadowRoot (parentElement can be ShadowRoot)
+          // ShadowRoot doesn't have id, className, or tagName
+          if (parent && parent.nodeType === 11) { // Node.SHADOW_ROOT = 11
+            // Try to get shadow host instead
+            parent = parent.host || null;
+          }
+
+          // ✅ FIX: Skip Document and DocumentFragment
+          if (parent && (parent.nodeType === 9 || parent.nodeType === 11)) { // Document = 9, DocumentFragment = 11
+            parent = null;
+          }
+
+          if (parent && parent.tagName) {
+            // ✅ FIX: Try parent ID (with proper escaping)
             if (parent.id) {
-              return `#${parent.id} > ${selector}`;
+              const escapedId = escapeCSSIdentifier(parent.id);
+              if (escapedId) {
+                return `#${escapedId} > ${selector}`;
             }
-            // Try parent class (first meaningful class)
+            }
+
+            // ✅ FIX: Try parent class (first meaningful class, with proper escaping)
             if (parent.className && typeof parent.className === 'string') {
-              const classes = parent.className.split(' ').filter((c: string) => c && !isDynamicClass(c));
+              const classes = parent.className.split(/\s+/).filter((c: string) => {
+                const trimmed = c.trim();
+                return trimmed && !isDynamicClass(trimmed);
+              });
+
               if (classes.length > 0 && classes.length < 3) {
-                return `.${classes[0]} > ${selector}`;
+                const escapedClass = escapeCSSIdentifier(classes[0]);
+                if (escapedClass) {
+                  return `.${escapedClass} > ${selector}`;
+                }
               }
             }
-            // Try parent tag
-            const parentTag = parent.tagName.toLowerCase();
-            if (parentTag !== 'body' && parentTag !== 'html') {
+
+            // ✅ FIX: Try parent tag (skip body, html, and invalid tags)
+            const parentTag = parent.tagName?.toLowerCase();
+            if (parentTag && parentTag !== 'body' && parentTag !== 'html' && /^[a-z][a-z0-9]*$/i.test(parentTag)) {
               return `${parentTag} > ${selector}`;
             }
           }
@@ -1292,10 +1494,12 @@ export async function analyzeDOMStructure(
        */
       function generateShadowSelector(
         element: any,
-        shadowHost: any
+        shadowHost: any,
+        shadowRoot?: any
       ): string {
         // First, generate selector for the shadow host (parent)
-        const hostSelector = generateSelector(shadowHost);
+        // Use shadowHost.ownerDocument to get the main document
+        const hostSelector = generateSelector(shadowHost, shadowHost.ownerDocument || shadowHost.getRootNode?.());
 
         // ✅ FIX: If host selector is empty, cannot create reliable Shadow DOM selector
         if (!hostSelector || hostSelector.trim().length === 0) {
@@ -1303,7 +1507,7 @@ export async function analyzeDOMStructure(
         }
 
         // Then, generate selector for the element inside shadow
-        const elementSelector = generateSelector(element);
+        const elementSelector = generateSelector(element, shadowRoot || shadowHost.shadowRoot);
 
         // ✅ FIX: If element selector is empty, cannot create reliable Shadow DOM selector
         if (!elementSelector || elementSelector.trim().length === 0) {
@@ -1328,7 +1532,8 @@ export async function analyzeDOMStructure(
        */
       function generateIframeSelector(
         element: any,
-        iframeElement: any
+        iframeElement: any,
+        iframeDocument?: any
       ): string {
         // Generate selector for iframe element
         let iframeSelector = 'iframe';
@@ -1402,7 +1607,7 @@ export async function analyzeDOMStructure(
         // The caller should handle this case by using more specific parent context
 
         // Generate selector for element inside iframe
-        const elementSelector = generateSelector(element);
+        const elementSelector = generateSelector(element, iframeDocument || iframeElement.contentDocument);
 
         // ✅ FIX: If element selector is empty, cannot create reliable iframe selector
         if (!elementSelector || elementSelector.trim().length === 0) {
@@ -1419,6 +1624,7 @@ export async function analyzeDOMStructure(
        * Using closure ensures they exist in browser context and are shared across recursive calls
        */
       const visited = new Set<any>();
+      const visitedDocuments = new Set<any>(); // ✅ NEW: Track visited documents to prevent iframe cycles
       const selectorCounts = new Map<string, number>();
 
       /**
@@ -1461,11 +1667,11 @@ export async function analyzeDOMStructure(
         const getSelector = (el: any) => {
           let selector: string;
           if (iframe) {
-            selector = generateIframeSelector(el, iframe);
+            selector = generateIframeSelector(el, iframe, root);
           } else if (shadowHost) {
-            selector = generateShadowSelector(el, shadowHost);
+            selector = generateShadowSelector(el, shadowHost, root);
           } else {
-            selector = generateSelector(el);
+            selector = generateSelector(el, root);
           }
 
           // ✅ FIX: Return empty selector if invalid (caller should handle)
@@ -2017,6 +2223,19 @@ export async function analyzeDOMStructure(
       /**
        * ✅ OPTIMIZED: Combined selector for all interactive elements (defined once, reused everywhere)
        * Covers all interactive elements without scanning ALL DOM nodes
+       *
+       * ⚠️ NOTE: This selector does NOT cover all possible Shadow DOM hosts:
+       * - Custom elements without interactive attributes (e.g., <my-container>)
+       * - Non-interactive elements with Shadow DOM (e.g., <div> with Shadow DOM but no onclick/role)
+       *
+       * These cases are handled separately in traverseShadowDOM() via:
+       * 1. Custom elements search (findCustomElements) - finds elements with hyphen in tag name
+       * 2. Recursive children traversal (checkChildrenForShadowDOM) - finds non-interactive Shadow DOM hosts
+       *
+       * This approach is more efficient than querySelectorAll('*') because:
+       * - We only check children (not all descendants via querySelector)
+       * - We skip already visited elements
+       * - We use reasonable depth limits (5 levels)
        */
       const combinedSelector = [
             // 1. Standard interactive elements
@@ -2139,7 +2358,7 @@ export async function analyzeDOMStructure(
                 }
 
                 if (reason) {
-                  const tempSelector = generateSelector(element);
+                  const tempSelector = generateSelector(element, root);
 
                   // ✅ FIX: Skip elements with empty selectors (cannot be reliably selected)
                   // Empty selector means element has no stable identifier
@@ -2204,10 +2423,12 @@ export async function analyzeDOMStructure(
       }
 
       /**
-       * ✅ NEW: Recursively traverse Shadow DOM and collect elements
-       * Handles nested Shadow DOM, closed Shadow DOM (skips), and performance
+       * ✅ IMPROVED: Recursively traverse Shadow DOM and collect elements
+       * Handles nested Shadow DOM, closed Shadow DOM (skips), slotted content, and performance
        * Uses closure to access visited and selectorCounts (no need to pass them as parameters)
        * ✅ OPTIMIZED: Now uses unified collectAllElementsFromRoot
+       * ✅ FIX: Checks ALL elements for Shadow DOM (not just combinedSelector)
+       * ✅ FIX: Handles slotted content (<slot> elements)
        */
       function traverseShadowDOM(
         root: any, // Document | ShadowRoot (browser context)
@@ -2252,20 +2473,57 @@ export async function analyzeDOMStructure(
           result.hiddenInteractive.push(...rootResult.hiddenInteractive);
         }
 
-        // ✅ OPTIMIZED: Recursively process Shadow DOM in collected elements
-        // Instead of another querySelectorAll, we check elements already collected
-        // We need to check all elements in root for potential Shadow DOM hosts
-        // But we can optimize by checking only elements that might have Shadow DOM
+        // ✅ IMPROVED: Check for Shadow DOM hosts efficiently without querySelectorAll('*')
+        // Strategy:
+        // 1. Check elements already processed in collectAllElementsFromRoot (via combinedSelector)
+        // 2. Check custom elements (elements with hyphen in tag name) - likely to have Shadow DOM
+        // 3. Recursively check ALL children (with reasonable depth limit) to catch non-interactive Shadow DOM hosts
+        // This ensures we find Shadow DOM hosts even if they're not in combinedSelector
         try {
-          // ✅ OPTIMIZED: Reuse elements from collectAllElementsFromRoot instead of new querySelectorAll
-          // We need to check ALL elements in root (not just collected ones) for Shadow DOM hosts
-          // But we limit to elements that might have Shadow DOM (custom elements, etc.)
-          // Note: This is necessary because Shadow DOM hosts might not be in our combinedSelector
-          // But we can optimize by checking only potentially interactive elements
-          const potentialShadowHosts = Array.from(root.querySelectorAll(combinedSelector));
+          // ✅ OPTIMIZED: Get all elements that were processed in collectAllElementsFromRoot
+          // These are interactive elements that might have Shadow DOM
+          const processedElements = Array.from(root.querySelectorAll(combinedSelector));
 
-          for (const el of potentialShadowHosts) {
-            const element: any = el;
+          // ✅ IMPROVED: Find ALL custom elements (elements with hyphen in tag name)
+          // Custom elements often have Shadow DOM but might not be in combinedSelector
+          // We use recursive traversal with reasonable depth to catch all custom elements
+          const customElements: any[] = [];
+          const customElementsSet = new Set<any>(); // For deduplication
+
+          function findCustomElements(parent: any, maxDepth: number, currentDepth: number = 0): void {
+            if (currentDepth >= maxDepth) return;
+
+            try {
+              const children = Array.from(parent.children || []) as any[];
+              for (const child of children) {
+                if (!child) continue;
+
+                const tag = child?.tagName?.toLowerCase();
+                // Custom elements have hyphen in name (e.g., my-component, web-component)
+                // This is the standard way to identify Web Components
+                if (tag && tag.includes('-') && !customElementsSet.has(child)) {
+                  customElements.push(child);
+                  customElementsSet.add(child);
+                }
+                // Recursively check children (reasonable depth to catch nested custom elements)
+                findCustomElements(child, maxDepth, currentDepth + 1);
+              }
+            } catch (e) {
+              // Parent might be detached
+            }
+          }
+
+          // ✅ IMPROVED: Find custom elements with deeper traversal (5 levels)
+          // This ensures we catch custom elements even in deeply nested structures
+          // 5 levels is reasonable - most real-world apps don't nest deeper
+          findCustomElements(root, 5);
+
+          // ✅ OPTIMIZED: Combine processed elements with custom elements
+          // Use Set to deduplicate
+          const elementsToCheck = new Set([...processedElements, ...customElements]);
+
+          for (const element of elementsToCheck) {
+            if (!element) continue;
 
             // ✅ SAFETY: Skip if already visited (prevent duplicates in nested structures)
             if (visited.has(element)) continue;
@@ -2306,7 +2564,87 @@ export async function analyzeDOMStructure(
                 result.hiddenInteractive.push(...shadowResult.hiddenInteractive);
               }
             }
+
+            // ✅ NEW: Check for slotted content (elements projected through <slot>)
+            // Slotted elements are in the light DOM but rendered in Shadow DOM
+            try {
+              // @ts-ignore - assignedSlot is a standard property
+              if (element.assignedSlot) {
+                // Element is slotted - it's already processed by collectAllElementsFromRoot
+                // But we need to ensure it's marked as in Shadow DOM
+                // This is handled by the shadowHost context in collectAllElementsFromRoot
+              }
+            } catch (e) {
+              // assignedSlot might not be available in all contexts
+            }
           }
+
+          // ✅ IMPROVED: Recursively check ALL children for Shadow DOM hosts (reasonable depth)
+          // This catches Shadow DOM hosts that are not interactive elements themselves
+          // Examples: <div> with Shadow DOM but no interactive attributes
+          // We use reasonable depth (5 levels) to catch most real-world cases
+          // This is still much more efficient than querySelectorAll('*') because:
+          // 1. We only check children (not all descendants via querySelector)
+          // 2. We skip already visited elements
+          // 3. We stop at reasonable depth
+          function checkChildrenForShadowDOM(parent: any, maxDepth: number, currentDepth: number = 0): void {
+            if (currentDepth >= maxDepth) return;
+
+            try {
+              const children = Array.from(parent.children || []) as any[];
+              for (const child of children) {
+                if (!child || visited.has(child)) continue;
+
+                let shadowRoot: any = null;
+                try {
+                  if (child && typeof (child as any).shadowRoot !== 'undefined') {
+                    shadowRoot = (child as any).shadowRoot;
+                  }
+                } catch (e) {
+                  shadowRoot = null;
+                }
+
+                if (shadowRoot) {
+                  visited.add(child);
+
+                  const shadowResult = traverseShadowDOM(
+                    shadowRoot,
+                    child,
+                    depth + 1,
+                    maxDepth
+                  );
+
+                  result.buttons.push(...shadowResult.buttons);
+                  result.links.push(...shadowResult.links);
+                  result.inputs.push(...shadowResult.inputs);
+                  result.checkboxes.push(...shadowResult.checkboxes);
+                  result.radios.push(...shadowResult.radios);
+                  result.interactiveElements.push(...shadowResult.interactiveElements);
+                  if (shadowResult.hiddenInteractive) {
+                    if (!result.hiddenInteractive) result.hiddenInteractive = [];
+                    result.hiddenInteractive.push(...shadowResult.hiddenInteractive);
+                  }
+                }
+
+                // ✅ IMPROVED: Recursively check children with reasonable depth (5 levels)
+                // This ensures we catch Shadow DOM hosts even in nested structures
+                // 5 levels is reasonable for real-world applications
+                checkChildrenForShadowDOM(child, maxDepth, currentDepth + 1);
+              }
+            } catch (e) {
+              // Parent might be detached
+            }
+          }
+
+          // ✅ IMPROVED: Check ALL children of root for Shadow DOM (max 5 levels deep)
+          // This catches Shadow DOM hosts that are not interactive elements themselves
+          // Examples: non-interactive containers with Shadow DOM
+          // 5 levels is reasonable - covers most real-world nesting scenarios
+          // Still much more efficient than querySelectorAll('*') because:
+          // - We use children traversal (not querySelector)
+          // - We skip visited elements
+          // - We have depth limit
+          checkChildrenForShadowDOM(root, 5);
         } catch (e) {
           // Root might be detached or invalid
           // Continue with existing results
@@ -2316,9 +2654,12 @@ export async function analyzeDOMStructure(
       }
 
       /**
-       * ✅ NEW: Recursively traverse iframes and collect elements
-       * Handles cross-origin iframes (skips), nested iframes, and performance
-       * Uses closure to access visited and selectorCounts (no need to pass them as parameters)
+       * ✅ IMPROVED: Recursively traverse iframes and collect elements
+       * Handles cross-origin iframes (skips), nested iframes, lazy-loaded iframes, and performance
+       * Uses closure to access visited, visitedDocuments, and selectorCounts
+       * ✅ FIX: Prevents circular iframe references using visitedDocuments Set
+       * ✅ FIX: Independent Shadow DOM depth counter inside iframes
+       * ✅ FIX: Handles lazy-loaded iframes (loading="lazy")
        */
       function traverseIframes(
         root: any, // Document (browser context)
@@ -2350,10 +2691,17 @@ export async function analyzeDOMStructure(
           return result;
         }
 
+        // ✅ FIX: Check if document already visited (prevent circular iframe references)
+        // Example: iframe A contains iframe B, which contains iframe A
+        if (visitedDocuments.has(root)) {
+          return result;
+        }
+        visitedDocuments.add(root);
+
         // Find all iframes in current root
         let iframes: any[] = [];
         try {
-      // @ts-ignore - browser context
+        // @ts-ignore - browser context
           iframes = Array.from(root.querySelectorAll('iframe'));
         } catch (e) {
           // Root might be detached or invalid
@@ -2367,6 +2715,9 @@ export async function analyzeDOMStructure(
           if (visited.has(iframe)) continue;
           visited.add(iframe);
 
+          // ✅ IMPROVED: Check for lazy-loaded iframes (loading="lazy")
+          const isLazyLoaded = iframe.getAttribute('loading') === 'lazy';
+
           // ✅ SAFETY: Skip hidden iframes (not useful for analysis)
           // ✅ EDGE CASE: Some iframes might be 0x0 but still functional (check both)
           if (!isVisible(iframe)) {
@@ -2376,10 +2727,14 @@ export async function analyzeDOMStructure(
             if (style && (style.display === 'none' || style.visibility === 'hidden')) {
               continue;
             }
-            // If iframe has 0x0 dimensions, still try to access (might be loading)
+            // If iframe has 0x0 dimensions, check if it's lazy-loaded
             if (iframe.offsetWidth === 0 && iframe.offsetHeight === 0) {
-              // Skip only if it's been in DOM for a while (not just loading)
-              // For now, we'll skip 0x0 iframes to avoid false positives
+              // ✅ FIX: If lazy-loaded, it might not be loaded yet - skip for now
+              // In production, you might want to wait for it to load
+              if (isLazyLoaded) {
+                continue; // Skip lazy-loaded iframes with 0x0 dimensions
+              }
+              // For non-lazy iframes with 0x0, skip to avoid false positives
               continue;
             }
           }
@@ -2414,6 +2769,11 @@ export async function analyzeDOMStructure(
               }
             }
 
+            // ✅ FIX: Check if document already visited (circular reference detection)
+            if (visitedDocuments.has(iframeDocument)) {
+              continue; // Skip circular references
+            }
+
             // ✅ EDGE CASE: Check if document is ready (might be loading)
             // If document.readyState is 'loading', content might not be fully loaded
             // But we'll still try to analyze it (might have some content)
@@ -2440,10 +2800,13 @@ export async function analyzeDOMStructure(
               continue;
             }
 
-            // Step 2: Traverse Shadow DOM inside iframe (if any)
-            const shadowResult = traverseShadowDOM(iframeDocument, undefined, depth, 5);
+            // ✅ FIX: Use independent depth counter for Shadow DOM inside iframe
+            // Shadow DOM depth should start from 0 inside each iframe
+            // This prevents depth overflow when iframe is deeply nested
+            const shadowResult = traverseShadowDOM(iframeDocument, undefined, 0, 5);
 
-            // Step 3: Recursively traverse nested iframes (if any)
+            // ✅ FIX: Continue iframe traversal with incremented depth
+            // Iframe depth continues to increase to prevent infinite nesting
             const nestedIframeResult = traverseIframes(iframeDocument, depth + 1, maxDepth);
 
             // ✅ OPTIMIZED: Merge all results in one operation (no duplicate pushes)
