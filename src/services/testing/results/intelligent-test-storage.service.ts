@@ -84,17 +84,21 @@ export class IntelligentTestStorageService {
       logger.info('[INTELLIGENT_STORAGE] Session created', { sessionId });
 
       // 2. Save page visits with actions
-      await this.savePageVisits(sessionId, result.pageVisits);
+      if (result.pageVisits && Array.isArray(result.pageVisits)) {
+        await this.savePageVisits(sessionId, result.pageVisits);
+      } else {
+        logger.warn('[INTELLIGENT_STORAGE] No page visits to save', { testId });
+      }
 
       // 3. Save errors as findings
-      if (result.errors.length > 0) {
+      if (result.errors && Array.isArray(result.errors) && result.errors.length > 0) {
         await this.saveFindings(sessionId, result.errors);
       }
 
       logger.info('[INTELLIGENT_STORAGE] Test session saved successfully', {
         sessionId,
-        pages: result.pageVisits.length,
-        actions: result.actionsTaken,
+        pages: result.pageVisits?.length || 0,
+        actions: result.actionsTaken || 0,
       });
 
       return { sessionId, success: true };
@@ -115,27 +119,31 @@ export class IntelligentTestStorageService {
     pageVisits: PageVisit[]
   ): Promise<void> {
     try {
+      // ✅ FIX: Track actual saved visits for correct ordering
+      let savedVisitCount = 0;
+
       for (let i = 0; i < pageVisits.length; i++) {
         const visit = pageVisits[i];
 
         // ✅ FIX #4: Validate required fields
-        if (!visit.url || !visit.pageType) {
+        if (!visit || !visit.url || !visit.pageType) {
           logger.warn('[INTELLIGENT_STORAGE] Skipping page visit with missing data', {
-            url: visit.url,
-            pageType: visit.pageType,
-            visitOrder: i + 1,
+            url: visit?.url,
+            pageType: visit?.pageType,
+            visitIndex: i,
           });
           continue;
         }
 
         // Create page visit record
+        savedVisitCount += 1; // ✅ FIX: Increment only for valid visits
         const { data: pageVisit, error: visitError } = await supabaseAdmin
           .from('intelligent_page_visits')
           .insert({
             session_id: sessionId,
             url: visit.url,
             page_type: visit.pageType,
-            visit_order: i + 1,
+            visit_order: savedVisitCount, // ✅ FIX: Use saved count, not index
             success: visit.success ?? true, // ✅ Default to true if not specified
             visited_at: visit.timestamp
               ? new Date(visit.timestamp).toISOString()
@@ -181,12 +189,16 @@ export class IntelligentTestStorageService {
   ): Promise<void> {
     try {
       // ✅ FIX #5: Validate and map action results safely
+      // ✅ FIX: Track actual saved actions for correct ordering
+      let savedActionCount = 0;
       const actionRecords = actionResults
-        .filter((result) => result.action && result.action.action) // ✅ Filter invalid actions
-        .map((result, index) => ({
-          page_visit_id: pageVisitId,
-          session_id: sessionId,
-          action_order: index + 1,
+        .filter((result) => result && result.action && result.action.action) // ✅ Filter invalid actions
+        .map((result) => {
+          savedActionCount += 1; // ✅ FIX: Increment only for valid actions
+          return {
+            page_visit_id: pageVisitId,
+            session_id: sessionId,
+            action_order: savedActionCount, // ✅ FIX: Use saved count, not index
           action_type: result.action.action,
           selector: result.action.selector || null,
           value: result.action.value || null,
@@ -203,11 +215,12 @@ export class IntelligentTestStorageService {
           url_before: result.urlBefore || null,
           url_after: result.urlAfter || null,
           screenshot_before: result.screenshot || null,
-          screenshot_after: result.screenshot || null, // ✅ FIX #6: Should be different screenshot_after
-          executed_at: result.timestamp
+          screenshot_after: result.screenshot || null, // ✅ FIX #6: ActionResult only has one screenshot field
+          executed_at: result.timestamp && typeof result.timestamp === 'number'
             ? new Date(result.timestamp).toISOString()
             : new Date().toISOString(), // ✅ Fallback timestamp
-        }));
+          };
+        });
 
       const { error } = await supabaseAdmin
         .from('intelligent_test_actions')
@@ -285,15 +298,18 @@ export class IntelligentTestStorageService {
     try {
       // ✅ FIX #7: Validate and map errors safely
       const findingRecords = errors
-        .filter((error) => error && error.message) // ✅ Filter invalid errors
-        .map((error) => ({
-          session_id: sessionId,
-          finding_type: 'bug' as const, // ✅ Schema constraint
-          severity: 'high' as const, // ✅ Schema constraint (can be improved to detect severity)
-          title: error.message.substring(0, 200) || 'Test Error', // ✅ Limit title length
-          description: error.message || 'No description available',
-          found_at: new Date().toISOString(),
-        }));
+        .filter((error) => error && error.message && typeof error.message === 'string') // ✅ Filter invalid errors
+        .map((error) => {
+          const message = String(error.message || 'Test Error');
+          return {
+            session_id: sessionId,
+            finding_type: 'bug' as const, // ✅ Schema constraint
+            severity: 'high' as const, // ✅ Schema constraint (can be improved to detect severity)
+            title: message.substring(0, 200) || 'Test Error', // ✅ Limit title length, safe substring
+            description: message || 'No description available',
+            found_at: new Date().toISOString(),
+          };
+        });
 
       const { error } = await supabaseAdmin
         .from('intelligent_test_findings')

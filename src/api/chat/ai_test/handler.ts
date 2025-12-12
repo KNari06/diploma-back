@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { requestMissingInformation, runAutonomousExploration } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
 import { NavigationRequiresClarificationError } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
+import { requestMissingInformation, runAutonomousExploration } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
 import { parseAnswers } from '@/services/utils/question-generator.service';
@@ -47,18 +47,48 @@ export async function handlePlatformTest(
   // FIX #3: Setup timeout for entire platform test flow
   const flowStartTime = Date.now();
   const flowTimeout = 60000; // 60 seconds
-  const checkTimeout = () => {
-    if (Date.now() - flowStartTime > flowTimeout) {
-      throw new Error(`Platform test flow timeout after ${flowTimeout / 1000}s`);
+  const checkTimeout = (step?: string) => {
+    const elapsed = Date.now() - flowStartTime;
+
+    // ✅ IMPROVEMENT: Validate elapsed time (protect against system time changes)
+    if (elapsed < 0) {
+      logger.warn('[PLATFORM_TEST] Negative elapsed time detected (system time changed?)', {
+        elapsed,
+        flowStartTime,
+        currentTime: Date.now(),
+      });
+      // Don't throw, just log - system time change is rare and shouldn't break flow
+      return;
+    }
+
+    if (elapsed > flowTimeout) {
+      const elapsedSeconds = Math.round(elapsed / 1000);
+      const timeoutMessage = `Platform test flow timeout after ${flowTimeout / 1000}s (elapsed: ${elapsedSeconds}s)${step ? ` at step: ${step}` : ''}`;
+
+      logger.error('[PLATFORM_TEST] Flow timeout exceeded', {
+        timeout: flowTimeout,
+        elapsed,
+        elapsedSeconds,
+        step: step || 'unknown',
+        userId,
+        chatSessionId,
+      });
+
+      throw new Error(timeoutMessage);
     }
   };
 
   try {
     logger.info('[PLATFORM_TEST] Starting UI test flow', {
+      userId,
+      workspace_id,
+      chatSessionId,
+      conversationId,
       scope: parsedIntent?.scope,
       target: parsedIntent?.target,
       hasUrl: !!parsedIntent?.page,
       hasAnswers: !!answers,
+      messageLength: message?.length || 0,
       timeout: flowTimeout,
     });
 
@@ -106,7 +136,7 @@ export async function handlePlatformTest(
       }
     }
 
-    checkTimeout();
+    checkTimeout('load_session_context');
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 1: PROCESS ANSWERS (if user provided them)
@@ -223,11 +253,18 @@ export async function handlePlatformTest(
 
         // Save to history (non-blocking)
         if (chatSessionId) {
+          // ✅ IMPROVEMENT: Include questions in content so AI can see them in history
+          const questionsText = result.questions
+            .map((q: any, idx: number) => `${idx + 1}. ${q.question || q.id}`)
+            .join('\n');
+
+          const fullContent = `📝 I need some more information to set up the test:\n\n${questionsText}`;
+
           ChatService.saveChatMessages(chatSessionId, [
             { role: 'user', content: message },
             {
               role: 'ai',
-              content: '📝 I need some more information to set up the test:',
+              content: fullContent,
               metadata: {
                 questions: result.questions,
                 conversationId: result.conversationId,
@@ -257,7 +294,7 @@ export async function handlePlatformTest(
       }
     }
 
-    checkTimeout();
+    checkTimeout('process_answers');
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 2: FIND OR CREATE PROJECT (FIX #1: Error handling)
@@ -294,7 +331,7 @@ export async function handlePlatformTest(
       throw new Error(`Failed to initialize project: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
 
-    checkTimeout();
+    checkTimeout('find_or_create_project');
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 3: HANDLE CREDENTIALS (from answers OR saved in DB)
@@ -304,11 +341,27 @@ export async function handlePlatformTest(
 
     // Priority 1: Credentials from user answers (fresh input)
     if (parsedAnswers?.credentials) {
-      logger.info('[PLATFORM_TEST] Using credentials from user answers');
-      finalCredentials = parsedAnswers.credentials;
+      // ✅ IMPROVEMENT: Validate credentials structure before use
+      const creds = parsedAnswers.credentials;
+      const hasIdentifier = (creds.email && typeof creds.email === 'string' && creds.email.trim().length > 0) ||
+                           (creds.username && typeof creds.username === 'string' && creds.username.trim().length > 0);
+      const hasPassword = creds.password && typeof creds.password === 'string' && creds.password.trim().length > 0;
+
+      if (hasIdentifier && hasPassword) {
+        logger.info('[PLATFORM_TEST] Using credentials from user answers');
+        finalCredentials = parsedAnswers.credentials;
+      } else {
+        logger.warn('[PLATFORM_TEST] Invalid credentials structure in parsedAnswers, will try DB', {
+          hasEmail: !!creds.email,
+          hasUsername: !!creds.username,
+          hasPassword: !!creds.password,
+        });
+        // Fall through to Priority 2 (DB lookup)
+      }
     }
-    // Priority 2: Saved credentials from DB
-    else {
+
+    // Priority 2: Saved credentials from DB (if not found in answers or invalid)
+    if (!finalCredentials) {
       try {
         emitProcessingStep(chatSessionId, 'validating_credentials', '🔍 Getting saved credentials...', 45);
 
@@ -317,6 +370,8 @@ export async function handlePlatformTest(
         if (savedCredentials) {
           logger.info('[PLATFORM_TEST] Found saved credentials in DB', { project_id });
           finalCredentials = savedCredentials;
+        } else {
+          logger.debug('[PLATFORM_TEST] No saved credentials found in DB', { project_id });
         }
       } catch (error) {
         logger.warn('[PLATFORM_TEST] Failed to get saved credentials', {
@@ -329,7 +384,7 @@ export async function handlePlatformTest(
     // Determine if authentication is needed
     const needsAuth = parsedAnswers?.needsAuth ?? !!finalCredentials;
 
-    checkTimeout();
+    checkTimeout('handle_credentials');
 
     // ═══════════════════════════════════════════════════════════════════════
     // ✅ NEW STEP 4: RUN AUTONOMOUS EXPLORATION + GENERATE REAL TEST PLAN
@@ -350,7 +405,7 @@ export async function handlePlatformTest(
     });
 
     // ✅ Run autonomous exploration: Launch browser → Analyze real page → Generate accurate plan
-    let exploration, testPlan, formattedPlan;
+    let testPlan, formattedPlan;
 
     try {
       const result = await runAutonomousExploration({
@@ -371,7 +426,6 @@ export async function handlePlatformTest(
         sessionId: chatSessionId,
       });
 
-      exploration = result.exploration;
       testPlan = result.testPlan;
       formattedPlan = result.message;
 
@@ -458,11 +512,18 @@ export async function handlePlatformTest(
 
           // Save to history
           if (chatSessionId) {
+            // ✅ IMPROVEMENT: Include questions in content so AI can see them in history
+            const questionsText = result.questions
+              .map((q: any, idx: number) => `${idx + 1}. ${q.question || q.id}`)
+              .join('\n');
+
+            const fullContent = `🔐 This site requires authentication. Please provide your credentials:\n\n${questionsText}`;
+
             ChatService.saveChatMessages(chatSessionId, [
               { role: 'user', content: message },
               {
                 role: 'ai',
-                content: '🔐 This site requires authentication. Please provide your credentials:',
+                content: fullContent,
                 metadata: {
                   questions: result.questions,
                   conversationId: result.conversationId,
@@ -499,13 +560,12 @@ export async function handlePlatformTest(
 
     logger.info('[PLATFORM_TEST] Autonomous exploration completed', {
       planId: testPlan.id,
-      explorationId: exploration.timestamp,
       stepsCount: testPlan.steps.length,
       commandsCount: testPlan.commands.length,
       intelligentMode: testPlan.intelligentMode || false,
     });
 
-    checkTimeout();
+    checkTimeout('autonomous_exploration');
 
     // Save to history (non-blocking)
     if (chatSessionId) {

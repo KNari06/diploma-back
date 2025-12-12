@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { PricingPlansService } from '@/services/core/pricing-plans.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/logger';
 import { isValidUUID } from '@/utils/validation';
@@ -193,14 +193,14 @@ export async function checkChatCredits(
   res: Response
 ): Promise<boolean> {
   try {
-    const creditCheck = await PricingPlansService.checkUserCredits(userId, 1);
+    const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'chat');
 
-    if (!creditCheck.can_use_credits) {
+    if (!creditCheck.hasEnough) {
       logger.warn('[CHAT_CREDITS] Insufficient credits', {
         userId: userId.substring(0, 8) + '...',
-        reason: creditCheck.reason,
-        daily_remaining: creditCheck.daily_remaining,
-        monthly_remaining: creditCheck.monthly_remaining,
+        required: creditCheck.required,
+        available: creditCheck.available,
+        shortage: creditCheck.shortage,
       });
 
       // Check if response already sent
@@ -211,9 +211,10 @@ export async function checkChatCredits(
       res.status(402).json({
         success: false,
         error: 'Insufficient credits',
-        message: creditCheck.reason || 'You have reached your credit limit. Please upgrade your plan or wait for daily reset.',
-        daily_remaining: creditCheck.daily_remaining,
-        monthly_remaining: creditCheck.monthly_remaining,
+        message: `You need ${creditCheck.required} credits to send a chat message. You have ${creditCheck.available} credits. Please purchase ${creditCheck.shortage} more credits.`,
+        required: creditCheck.required,
+        available: creditCheck.available,
+        shortage: creditCheck.shortage,
         timestamp: new Date().toISOString(),
       });
       return false;
@@ -221,8 +222,8 @@ export async function checkChatCredits(
 
     logger.info('[CHAT_CREDITS] Credit check passed', {
       userId: userId.substring(0, 8) + '...',
-      daily_remaining: creditCheck.daily_remaining,
-      monthly_remaining: creditCheck.monthly_remaining,
+      required: creditCheck.required,
+      available: creditCheck.available,
     });
 
     return true;
@@ -249,36 +250,39 @@ export async function deductChatCredits(
   shouldDeduct: boolean
 ): Promise<{
   success: boolean;
-  daily_remaining?: number;
-  monthly_remaining?: number;
+  newBalance?: number;
 }> {
   if (!shouldDeduct) {
     return { success: true };
   }
 
   try {
-    const creditResult = await PricingPlansService.useUserCredits(userId, 1);
+    const chatMessageId = `chat_${Date.now()}`;
+    const creditResult = await CreditCostTrackerService.deductCreditsForTest({
+      userId,
+      testType: 'chat',
+      credits: 1,
+      costUSD: 0.001,
+      testId: chatMessageId,
+      description: 'Chat message',
+    });
 
     if (creditResult.success) {
       logger.info('[CHAT_CREDITS] Credits deducted successfully', {
         userId: userId.substring(0, 8) + '...',
-        daily_remaining: creditResult.daily_remaining,
-        monthly_remaining: creditResult.monthly_remaining,
+        newBalance: creditResult.newBalance,
       });
     } else {
       // Log error but don't interrupt response (we already checked balance above)
       logger.error('[CHAT_CREDITS] Failed to deduct credits after successful response', {
         userId: userId.substring(0, 8) + '...',
-        reason: creditResult.message,
-        daily_remaining: creditResult.daily_remaining,
-        monthly_remaining: creditResult.monthly_remaining,
+        error: creditResult.error,
       });
     }
 
     return {
       success: creditResult.success,
-      daily_remaining: creditResult.daily_remaining,
-      monthly_remaining: creditResult.monthly_remaining,
+      newBalance: creditResult.newBalance,
     };
   } catch (creditError) {
     // Log error but don't interrupt response

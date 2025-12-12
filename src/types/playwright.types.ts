@@ -118,6 +118,11 @@ export interface GraphNode {
     // Visual properties
     position?: { x: number; y: number };
     icon?: string;
+    /**
+     * Icon name used by frontend (same mapping as WebSocket getActionIcon()).
+     * Example: 'click', 'fill', 'navigate', 'analysis', 'execution', etc.
+     */
+    iconName?: string;
     color?: string;
     buttons?: NodeButton[];
 

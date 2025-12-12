@@ -8,6 +8,7 @@ import { dbAdminService } from '@/db/supabase';
 import { AICostManager, getCostManager, removeCostManager } from '@/services/ai-cost-manager.service';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service'; // ✅ NEW: Self-healing for selectors
 import { logger } from '@/utils/logger';
+import { getActionEmoji, getActionIcon } from '@/websocket/types';
 import { webSocketService } from '@/websocket/websocket.service';
 import { Browser, Page } from 'playwright';
 import { AdaptiveConfigService } from './adaptive-config.service'; // ✅ NEW: Adaptive configuration
@@ -15,6 +16,7 @@ import { CommandExecutor } from './command-executor';
 import { ContextualActionGenerator } from './contextual-action-generator';
 import { FormIntelligenceService } from './form-intelligence.service'; // ✅ NEW: Smart form handling
 import { IntelligentPageAnalyzer } from './intelligent-page-analyzer';
+import { MainLoopService } from './main-loop.service'; // ✅ NEW: Main loop extracted to separate service
 import { DOMSnapshot, PostActionAnalyzer } from './post-action-analyzer'; // ✅ NEW: AI-driven post-action analysis
 import { PreActionAnalyzer } from './pre-action-analyzer'; // ✅ NEW: Pre-action analysis for smart action execution
 import { ResultValidator } from './result-validator';
@@ -29,7 +31,6 @@ import {
   PageVisit,
   TestState,
 } from './types/intelligent-testing.types';
-import { ActionPattern, ActionPatternDetector } from './utils/action-pattern-detector'; // ✅ NEW
 import { GraphBuilder } from './utils/graph-builder.service'; // ✅ NEW
 import { TestProgressEmitter } from './utils/progress-emitter';
 import { getElementDisabledContext, getLocator, normalizeSelector } from './utils/selector-utils';
@@ -72,6 +73,7 @@ export class IntelligentTestOrchestrator {
   private graphBuilder!: GraphBuilder; // ✅ NEW: Graph builder for real-time visualization
   private abortController: AbortController; // ✅ FIX 7: AbortController for cancellation
   private costManager?: AICostManager; // ✅ FIX 9: AI cost manager for budget control
+  private navigationListenersAttached = false;
 
   // ✅ OPTIMIZED: Screenshot metrics for monitoring
   private screenshotMetrics = {
@@ -88,6 +90,34 @@ export class IntelligentTestOrchestrator {
 
   // ✅ NEW: Track selector failures to prevent infinite loops
   private selectorFailures = new Map<string, number>(); // selector -> failure count
+
+  private async buildCancelledResult(): Promise<IntelligentTestResult> {
+    const result = await this.buildResult(false);
+    result.summary = 'Test was cancelled by user';
+    result.errors.push({
+      message: 'Test was cancelled by user',
+      page: (this.state?.currentUrl) || this.config.startUrl,
+    });
+
+    logger.info('[INTELLIGENT_ORCHESTRATOR] Test cancelled', {
+      pagesVisited: result.pagesVisited,
+      actionsTaken: result.actionsTaken,
+      duration: `${Math.round(result.duration / 1000)}s`,
+    });
+
+    this.progressEmitter?.emit({
+      progress: 100,
+      phase: 'finalization',
+      currentStep: '❌ Test cancelled',
+      status: 'cancelled',
+    });
+
+    this.emitEvent('test_cancelled', {
+      message: 'Test was cancelled by user',
+    });
+
+    return result;
+  }
 
   constructor(config: IntelligentTestConfig, userId?: string, testId?: string) {
     this.config = config;
@@ -110,7 +140,7 @@ export class IntelligentTestOrchestrator {
     // Initialize progress emitter if testId is provided
     if (this.testId) {
       const browser = this.config.browser || 'chrome';
-      this.progressEmitter = new TestProgressEmitter(this.testId, browser);
+      this.progressEmitter = new TestProgressEmitter(this.testId, browser, this.userId);
     }
   }
 
@@ -139,6 +169,41 @@ export class IntelligentTestOrchestrator {
     this.browser = browser;
     this.page = page;
 
+    const isAboutUrl = (url: string): boolean => url === 'about:blank' || url.startsWith('about:');
+    const isCancelledOrAborted = async (): Promise<boolean> => {
+      if (this.abortController.signal.aborted) return true;
+      return await this.checkTestCancelled();
+    };
+
+    const raceWithAbort = async <T>(promise: Promise<T>): Promise<T> => {
+      if (this.abortController.signal.aborted) {
+        throw new Error('cancelled');
+      }
+
+      const abortPromise = new Promise<never>((_, reject) => {
+        this.abortController.signal.addEventListener(
+          'abort',
+          () => reject(new Error('cancelled')),
+          { once: true }
+        );
+      });
+
+      return await Promise.race([promise, abortPromise]);
+    };
+
+    const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+      let timer: NodeJS.Timeout | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      });
+
+      try {
+        return await Promise.race([promise, timeoutPromise]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
     // ✅ FIX 7: Pass AbortSignal to CommandExecutor
     // ✅ FIX 9: Pass cost manager to CommandExecutor
     this.commandExecutor = new CommandExecutor(page, {
@@ -156,7 +221,7 @@ export class IntelligentTestOrchestrator {
 
     // ✅ CRITICAL FIX: Verify we're on the correct URL before starting
     const initialUrl = page.url();
-    if (initialUrl === 'about:blank' || !initialUrl || initialUrl.includes('about:')) {
+    if (!initialUrl || isAboutUrl(initialUrl)) {
       logger.error('[INTELLIGENT_ORCHESTRATOR] Page is on about:blank - navigation failed', {
         testId: this.testId,
         expectedUrl: this.config.startUrl,
@@ -165,18 +230,23 @@ export class IntelligentTestOrchestrator {
 
       // Try to navigate again
       try {
+        if (this.abortController.signal.aborted) {
+          throw new Error('cancelled');
+        }
+
         logger.info('[INTELLIGENT_ORCHESTRATOR] Attempting to navigate to start URL', {
           testId: this.testId,
           startUrl: this.config.startUrl,
         });
         // Note: this.state is not initialized yet, use default timeout
         await page.goto(this.config.startUrl, {
-          waitUntil: 'load',
+          // More reliable for SPAs and heavy pages than waiting for full 'load'
+          waitUntil: 'domcontentloaded',
           timeout: AdaptiveConfigService.getTimeout('NAVIGATION', {}), // Default timeout before state init
         });
 
         const newUrl = page.url();
-        if (newUrl === 'about:blank' || !newUrl || newUrl.includes('about:')) {
+        if (!newUrl || isAboutUrl(newUrl)) {
           throw new Error(`Navigation failed: page is at "${newUrl}"`);
         }
 
@@ -256,7 +326,14 @@ export class IntelligentTestOrchestrator {
 
       for (const script of this.config.customScripts) {
         try {
-          await this.page.evaluate(script);
+          if (await isCancelledOrAborted()) {
+            return await this.buildCancelledResult();
+          }
+
+          // Best-effort: don't let a bad script hang the whole run.
+          // Also respects abort signal.
+          const SCRIPT_TIMEOUT_MS = 10000;
+          await raceWithAbort(withTimeout(this.page.evaluate(script), SCRIPT_TIMEOUT_MS, 'customScript'));
           logger.debug('[INTELLIGENT_ORCHESTRATOR] Custom script executed successfully');
         } catch (scriptError) {
           logger.warn('[INTELLIGENT_ORCHESTRATOR] Custom script failed', {
@@ -275,14 +352,32 @@ export class IntelligentTestOrchestrator {
       });
 
       try {
+        if (await isCancelledOrAborted()) {
+          return await this.buildCancelledResult();
+        }
+
         const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
-        await this.page.waitForSelector(this.config.waitForSelector, {
-          state: 'visible',
-          timeout: AdaptiveConfigService.getTimeout('SELECTOR_WAIT', {
-            networkSpeed: pageContext.networkSpeed,
-            isSlowPage: pageContext.isSlowPage,
-          }),
+        const totalTimeout = AdaptiveConfigService.getTimeout('SELECTOR_WAIT', {
+          networkSpeed: pageContext.networkSpeed,
+          isSlowPage: pageContext.isSlowPage,
         });
+
+        // Prefer visible (stable UX), fallback to attached for cases where element exists
+        // but becomes visible only after a user-triggered action.
+        const visibleTimeout = Math.max(1000, Math.round(totalTimeout * 0.7));
+        const attachedTimeout = Math.max(1000, totalTimeout - visibleTimeout);
+
+        try {
+          await raceWithAbort(this.page.waitForSelector(this.config.waitForSelector, {
+            state: 'visible',
+            timeout: visibleTimeout,
+          }));
+        } catch {
+          await raceWithAbort(this.page.waitForSelector(this.config.waitForSelector, {
+            state: 'attached',
+            timeout: attachedTimeout,
+          }));
+        }
         logger.debug('[INTELLIGENT_ORCHESTRATOR] Selector found, proceeding with test');
       } catch (waitError) {
         logger.warn('[INTELLIGENT_ORCHESTRATOR] Initial selector not found, proceeding anyway', {
@@ -311,36 +406,30 @@ export class IntelligentTestOrchestrator {
 
     try {
       // Main testing loop (returns true if cancelled)
-      const wasCancelled = await this.mainLoop();
+      const consecutiveEmptyPagesRef = { value: this.consecutiveEmptyPages };
+      const wasCancelled = await MainLoopService.execute({
+        page: this.page,
+        state: this.state,
+        config: this.config,
+        testId: this.testId,
+        userId: this.userId,
+        graphBuilder: this.graphBuilder,
+        costManager: this.costManager,
+        consecutiveEmptyPages: consecutiveEmptyPagesRef,
+        checkTestCancelled: () => this.checkTestCancelled(),
+        analyzePage: () => this.analyzePage(),
+        generateActions: (context) => this.generateActions(context),
+        executeActions: (context, actions) => this.executeActions(context, actions),
+        emitEvent: (event, data) => this.emitEvent(event, data),
+        emitGraphUpdate: (update) => this.emitGraphUpdate(update),
+      });
+
+      // Update consecutiveEmptyPages from the mutable object
+      this.consecutiveEmptyPages = consecutiveEmptyPagesRef.value;
 
       // If cancelled, build result with cancellation info
       if (wasCancelled) {
-        const result = await this.buildResult(false);
-        result.summary = 'Test was cancelled by user';
-        // Add cancellation error (errors array has { message, page } structure)
-        result.errors.push({
-          message: 'Test was cancelled by user',
-          page: this.state.currentUrl || this.config.startUrl,
-        });
-
-        logger.info('[INTELLIGENT_ORCHESTRATOR] Test cancelled', {
-          pagesVisited: result.pagesVisited,
-          actionsTaken: result.actionsTaken,
-          duration: `${Math.round(result.duration / 1000)}s`,
-        });
-
-        this.progressEmitter?.emit({
-          progress: 100,
-          phase: 'finalization',
-          currentStep: '❌ Test cancelled',
-          status: 'cancelled',
-        });
-
-        this.emitEvent('test_cancelled', {
-          message: 'Test was cancelled by user',
-        });
-
-        return result;
+        return await this.buildCancelledResult();
       }
 
       // Build result and validate it
@@ -350,13 +439,20 @@ export class IntelligentTestOrchestrator {
       const isValidTest = this.validateTestResult(result);
 
       if (!isValidTest.isValid) {
+        // Calculate actual success rate from action results (not from general errors)
+        const allActionResults = result.pageVisits.flatMap(pv => pv.actionResults || []);
+        const successfulActions = allActionResults.filter(ar => ar.success).length;
+        const actualSuccessRate = allActionResults.length > 0
+          ? Math.round((successfulActions / allActionResults.length) * 100)
+          : 0;
+
         logger.warn('[INTELLIGENT_ORCHESTRATOR] Test completed but result is invalid', {
           testId: this.testId,
           reason: isValidTest.reason,
           stats: {
             pagesVisited: result.pagesVisited,
             actionsTaken: result.actionsTaken,
-            successRate: `${Math.round((result.actionsTaken - result.errors.length) / Math.max(result.actionsTaken, 1) * 100)}%`,
+            successRate: `${actualSuccessRate}%`,
           },
         });
 
@@ -376,12 +472,19 @@ export class IntelligentTestOrchestrator {
           errors: result.errors.length,
         });
       } else {
+        // Calculate actual success rate from action results
+        const allActionResults = result.pageVisits.flatMap(pv => pv.actionResults || []);
+        const successfulActions = allActionResults.filter(ar => ar.success).length;
+        const actualSuccessRate = allActionResults.length > 0
+          ? Math.round((successfulActions / allActionResults.length) * 100)
+          : 100; // If no actions, consider it 100% (nothing to fail)
+
         logger.info('[INTELLIGENT_ORCHESTRATOR] Test completed successfully', {
           pagesVisited: result.pagesVisited,
           actionsTaken: result.actionsTaken,
           duration: `${Math.round(result.duration / 1000)}s`,
           cost: `$${result.cost.toFixed(3)}`,
-          successRate: `${Math.round((result.actionsTaken - result.errors.length) / Math.max(result.actionsTaken, 1) * 100)}%`,
+          successRate: `${actualSuccessRate}%`,
         });
       }
 
@@ -402,8 +505,15 @@ export class IntelligentTestOrchestrator {
           summary: result.summary,
         });
       } else {
+        // Determine failure reason: validation issue or general failure
+        const failureReason = !isValidTest.isValid
+          ? (isValidTest.reason || 'Test failed validation')
+          : (result.errors.length > 0
+              ? result.errors[0].message
+              : 'Test completed with errors');
+
         this.emitEvent('test_failed', {
-          error: isValidTest.reason || 'Test failed validation',
+          error: failureReason,
           summary: result.summary,
         });
       }
@@ -411,19 +521,39 @@ export class IntelligentTestOrchestrator {
       return result;
     } catch (error) {
       // ✅ FIX: Explicitly extract error details for debugging
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorStack = error instanceof Error ? error.stack : undefined;
+
       logger.error('[INTELLIGENT_ORCHESTRATOR] Test failed', {
         testId: this.testId,
         userId: this.userId,
         goal: this.config.goal,
         error: error instanceof Error ? {
-          message: error.message,
+          message: errorMessage,
           name: error.name,
-          stack: error.stack,
+          stack: errorStack,
         } : String(error),
       });
 
+      // ✅ FIX: Ensure state is initialized and error is recorded
+      if (!this.state) {
+        const safetyConfig = SafetyGuard.getConfigForLevel(this.config.safety.level);
+        this.state = StateTracker.createInitialState(
+          this.config.goal,
+          this.config.startUrl,
+          safetyConfig.maxPages,
+          safetyConfig.maxDuration
+        );
+      }
+
+      // Record error in state so it appears in result
+      this.state.errors.push({
+        message: errorMessage,
+        timestamp: Date.now(),
+      });
+
       this.emitEvent('test_failed', {
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: errorMessage,
       });
 
       return await this.buildResult(false);
@@ -446,7 +576,7 @@ export class IntelligentTestOrchestrator {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MAIN TESTING LOOP
+  // TEST CANCELLATION CHECK
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
@@ -466,440 +596,10 @@ export class IntelligentTestOrchestrator {
     }
   }
 
-  private async mainLoop(): Promise<boolean> {
-    let continueLoop = true;
-    let iteration = 0; // Track iteration count
-
-    logger.info('[INTELLIGENT_ORCHESTRATOR] Starting main test loop', {
-      testId: this.testId,
-      goal: this.config.goal,
-      mode: this.config.mode,
-    });
-
-    while (continueLoop) {
-      iteration++;
-      logger.info(`[INTELLIGENT_ORCHESTRATOR] Loop iteration ${iteration}`, {
-        testId: this.testId,
-        pagesVisited: this.state.pagesAnalyzed,
-        actionsCompleted: this.state.completedActions.length,
-        currentUrl: this.page.url(),
-      });
-
-      // Check if test was cancelled before each iteration
-      if (await this.checkTestCancelled()) {
-        logger.info('[INTELLIGENT_ORCHESTRATOR] Test was cancelled, stopping execution', {
-          testId: this.testId,
-          iteration,
-          pagesVisited: this.state.pagesAnalyzed,
-          actionsCompleted: this.state.completedActions.length,
-        });
-
-        // ✅ FIX: Don't emit event here - it will be emitted in execute() when handling cancellation
-        // This prevents duplicate test_cancelled events
-
-        return true; // Return true to indicate cancellation
-      }
-
-      // Check limits before each iteration
-      const limitsCheck = SafetyGuard.checkLimits(this.state, this.config.safety);
-      if (!limitsCheck.safe) {
-        logger.warn('[INTELLIGENT_ORCHESTRATOR] Limits exceeded', {
-          testId: this.testId,
-          iteration,
-          reason: limitsCheck.reason,
-          stats: {
-            pagesVisited: this.state.pagesAnalyzed,
-            actionsCompleted: this.state.completedActions.length,
-            duration: Date.now() - this.state.startTime,
-          },
-        });
-
-        this.emitEvent('test_warning', {
-          message: limitsCheck.reason || 'Limits exceeded',
-        });
-
-        break;
-      }
-
-      try {
-        // STEP 1: Analyze current page
-        const context = await this.analyzePage();
-
-        // ✅ NEW: Add page node to graph when analyzing new page
-        if (this.testId && this.userId && this.graphBuilder) {
-          // Get page title and metadata from page
-          let pageTitle: string | undefined;
-          let metaDescription: string | undefined;
-          try {
-            pageTitle = await this.page.title();
-            metaDescription = await this.page.$eval('meta[name="description"]', (el) => el.getAttribute('content') || '').catch(() => undefined);
-          } catch (error) {
-            logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to get page metadata', { error });
-          }
-
-          const pageUpdate = this.graphBuilder.addPageNode(
-            context.url,
-            context.pageType,
-            {
-              screenshot: context.screenshot, // Base64 screenshot
-              title: pageTitle,
-              metaDescription: metaDescription,
-              dom: {
-                formsCount: context.dom.forms?.length || 0,
-                buttonsCount: context.dom.buttons?.length || 0,
-                linksCount: context.dom.links?.length || 0,
-                inputsCount: context.dom.inputs?.length || 0,
-              },
-              // Network requests count not available in PageContext, skip for now
-            }
-          );
-          this.emitGraphUpdate(pageUpdate);
-        }
-
-        // Check if test was cancelled after analysis (before expensive operations)
-        if (await this.checkTestCancelled()) {
-          logger.info('[INTELLIGENT_ORCHESTRATOR] Test was cancelled after page analysis', {
-            testId: this.testId,
-            iteration,
-          });
-          return true; // Return true to indicate cancellation
-        }
-
-        // STEP 2: Check for cycles (URL-based)
-        const cycleCheck = StateTracker.detectCycle(this.state, context.url);
-        if (cycleCheck.cycleDetected) {
-          logger.warn('[INTELLIGENT_ORCHESTRATOR] URL cycle detected', {
-            suggestion: cycleCheck.suggestion,
-            visitCount: cycleCheck.visitCount,
-          });
-
-          this.emitEvent('test_warning', {
-            message: cycleCheck.suggestion,
-          });
-
-          // ✅ FIX: More aggressive stopping - if cycle detected, stop immediately
-          const pageContext = AdaptiveConfigService.analyzePageContext(this.state, context.pageType);
-          const cycleThreshold = AdaptiveConfigService.getThreshold('CYCLE_DETECTION_THRESHOLD', {
-            testMode: this.config.mode,
-            errorRate: pageContext.errorRate,
-          });
-          if (cycleCheck.visitCount && cycleCheck.visitCount >= cycleThreshold) {
-            logger.warn('[INTELLIGENT_ORCHESTRATOR] Stopping due to excessive URL cycles', {
-              visitCount: cycleCheck.visitCount,
-              url: context.url,
-            });
-            break;
-          }
-
-          // Try to decide next step despite cycle
-          const decision = await ContextualActionGenerator.decideNextStep(
-            this.state,
-            context,
-            this.costManager  // ✅ FIX 9: Pass cost manager
-          );
-
-          if (decision.action === 'stop' || decision.action === 'skip') {
-            break;
-          }
-        }
-
-        // ✅ NEW: STEP 2.5: Check for action patterns (repeated actions, failed chains, etc.)
-        const patternCheck = ActionPatternDetector.detectPatterns(this.state);
-        if (patternCheck.hasPattern) {
-          logger.warn('[INTELLIGENT_ORCHESTRATOR] Problematic action patterns detected', {
-            patternsCount: patternCheck.patterns.length,
-            shouldStop: patternCheck.shouldStop,
-            patterns: patternCheck.patterns.map((p: ActionPattern) => ({
-              type: p.type,
-              severity: p.severity,
-              description: p.description,
-            })),
-          });
-
-          // Emit warnings for each pattern
-          patternCheck.patterns.forEach((pattern: ActionPattern) => {
-            this.emitEvent('test_warning', {
-              message: `⚠️ ${pattern.type}: ${pattern.description}`,
-              severity: pattern.severity,
-            });
-          });
-
-          // If critical pattern detected → stop test
-          if (patternCheck.shouldStop) {
-            logger.error('[INTELLIGENT_ORCHESTRATOR] Critical pattern detected - stopping test', {
-              reason: patternCheck.reason,
-            });
-
-            this.emitEvent('test_stopped', {
-              reason: patternCheck.reason,
-            });
-
-            break; // Stop test execution
-          }
-        }
-
-        // STEP 3: Generate actions
-        const { actions, reasoning, confidence } = await this.generateActions(context);
-
-        // ✅ NEW: Track empty pages and stop if 2+ consecutive empty pages
-        const isEmptyPage = actions.length === 0 && (
-          (context.vision.elements.length === 0 &&
-           (context.dom.forms?.length || 0) === 0 &&
-           (context.dom.buttons?.length || 0) === 0 &&
-           (context.dom.links?.length || 0) === 0 &&
-           (context.dom.inputs?.length || 0) === 0)
-        );
-
-        if (isEmptyPage) {
-          this.consecutiveEmptyPages++;
-          logger.warn('[INTELLIGENT_ORCHESTRATOR] Empty page detected', {
-            url: context.url,
-            consecutiveCount: this.consecutiveEmptyPages,
-            pageType: context.pageType,
-            elementsCount: context.vision.elements.length,
-          });
-
-          // Stop if threshold reached
-          const pageContext = AdaptiveConfigService.analyzePageContext(this.state, context.pageType);
-          const emptyPagesThreshold = AdaptiveConfigService.getThreshold('CONSECUTIVE_EMPTY_PAGES_THRESHOLD', {
-            testMode: this.config.mode,
-            isComplexPage: pageContext.isComplexPage,
-          });
-          if (this.consecutiveEmptyPages >= emptyPagesThreshold) {
-            logger.warn('[INTELLIGENT_ORCHESTRATOR] Stopping due to consecutive empty pages', {
-              consecutiveCount: this.consecutiveEmptyPages,
-              url: context.url,
-            });
-            this.emitEvent('test_warning', {
-              message: `Stopped: ${this.consecutiveEmptyPages} consecutive empty pages detected. No interactive elements found.`,
-            });
-            break;
-          }
-        } else {
-          // Reset counter if page has elements
-          this.consecutiveEmptyPages = 0;
-        }
-
-        if (actions.length === 0) {
-          logger.warn('[INTELLIGENT_ORCHESTRATOR] No actions generated', {
-            url: context.url,
-            reason: reasoning,
-            pageType: context.pageType,
-            elementsCount: context.vision.elements.length,
-          });
-
-          // Decide next step
-          const decision = await ContextualActionGenerator.decideNextStep(
-            this.state,
-            context,
-            this.costManager  // ✅ FIX 9: Pass cost manager
-          );
-
-          if (decision.action !== 'continue') {
-            break;
-          }
-
-          continue;
-        }
-
-        logger.info('[INTELLIGENT_ORCHESTRATOR] Generated actions', {
-          count: actions.length,
-          reasoning,
-          confidence,
-        });
-
-        // STEP 4: Execute actions
-        const pageVisit = await this.executeActions(context, actions);
-
-        // ✅ NEW: Add screenshot from context to page visit
-        pageVisit.screenshot = context.screenshot;
-
-        // ✅ OPTIMIZED: Track page analysis screenshots
-        if (context.screenshot) {
-          this.screenshotMetrics.onPageAnalysis++;
-          this.screenshotMetrics.totalCaptured++;
-        }
-
-        logger.debug('[INTELLIGENT_ORCHESTRATOR] Page screenshot captured during analysis', {
-          testId: this.testId,
-          url: context.url,
-          hasScreenshot: !!context.screenshot,
-          screenshotSize: context.screenshot ? `${Math.round(context.screenshot.length / 1024)}KB` : 'none',
-          totalScreenshots: this.screenshotMetrics.totalCaptured
-        });
-
-        // ✅ FIX: Only record visit if URL changed OR actions were successful
-        // This prevents counting failed attempts on same page as new visits
-        const urlChanged = this.state.currentUrl !== context.url;
-        const hasSuccessfulActions = pageVisit.actionResults?.some(r => r.success) || false;
-        const shouldRecordVisit = urlChanged || hasSuccessfulActions;
-
-        if (shouldRecordVisit) {
-          // STEP 5: Record visit
-          this.state = StateTracker.recordPageVisit(this.state, pageVisit);
-          logger.debug('[INTELLIGENT_ORCHESTRATOR] Page visit recorded', {
-            url: context.url,
-            urlChanged,
-            hasSuccessfulActions,
-            actionsCount: pageVisit.actionResults?.length || 0,
-          });
-        } else {
-          logger.debug('[INTELLIGENT_ORCHESTRATOR] Skipping visit record - same URL and no successful actions', {
-            url: context.url,
-            failedActions: pageVisit.actionResults?.filter(r => !r.success).length || 0,
-          });
-        }
-
-        // STEP 6: Decide next step
-        const decision = await ContextualActionGenerator.decideNextStep(
-          this.state,
-          context,
-          this.costManager  // ✅ FIX 9: Pass cost manager
-        );
-
-        logger.info('[INTELLIGENT_ORCHESTRATOR] Next step decision', {
-          action: decision.action,
-          reason: decision.reason,
-        });
-
-        this.emitEvent('test_progress', {
-          action: decision.action,
-          reason: decision.reason,
-          pagesVisited: this.state.pagesAnalyzed,
-          actionsCompleted: this.state.completedActions.length,
-        });
-
-        // Handle decision
-        switch (decision.action) {
-          case 'stop':
-            logger.info('[INTELLIGENT_ORCHESTRATOR] Stopping: ' + decision.reason);
-            continueLoop = false;
-            break;
-
-          case 'wait_for_user':
-            logger.info('[INTELLIGENT_ORCHESTRATOR] Waiting for user approval');
-            this.emitEvent('test_waiting', {
-              reason: decision.reason,
-            });
-            continueLoop = false;
-            break;
-
-          case 'skip':
-            logger.info('[INTELLIGENT_ORCHESTRATOR] Skipping: ' + decision.reason);
-            // Go back if possible
-            try {
-              const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
-              await this.page.goBack({
-                timeout: AdaptiveConfigService.getTimeout('GO_BACK', {
-                  networkSpeed: pageContext.networkSpeed,
-                }),
-              });
-            } catch {
-              continueLoop = false;
-            }
-            break;
-
-          case 'retry':
-            logger.info('[INTELLIGENT_ORCHESTRATOR] Retrying...');
-            // Continue with retry
-            break;
-
-          case 'continue':
-          default:
-            // Continue loop
-            break;
-        }
-
-        // ✅ OPTIMIZED: No delay between iterations - not needed
-        // Previous: await this.page.waitForTimeout(1000); // Removed - saves 1 second per iteration
-
-        // Check cancellation after iteration
-        if (await this.checkTestCancelled()) {
-          logger.info('[INTELLIGENT_ORCHESTRATOR] Test was cancelled after iteration', {
-            testId: this.testId,
-            iteration,
-          });
-          return true; // Return true to indicate cancellation
-        }
-      } catch (error) {
-        // ✅ FIX: Enhanced error logging with iteration context
-        logger.error('[INTELLIGENT_ORCHESTRATOR] Loop iteration failed', {
-          testId: this.testId,
-          iteration,
-          currentUrl: this.page.url(),
-          pagesVisited: this.state.pagesAnalyzed,
-          actionsCompleted: this.state.completedActions.length,
-          errorCount: this.state.errors.length,
-          error: error instanceof Error ? {
-            message: error.message,
-            name: error.name,
-            stack: error.stack,
-          } : String(error),
-        });
-
-        this.state.errors.push({
-          message: error instanceof Error ? error.message : 'Iteration failed',
-          timestamp: Date.now(),
-        });
-
-        // ✅ IMPROVED: Check for repeated selector errors (infinite loop detection)
-        const errorPageContext = AdaptiveConfigService.analyzePageContext(this.state);
-        const recentErrorsCheckCount = AdaptiveConfigService.getThreshold('RECENT_ERRORS_CHECK_COUNT', {
-          errorRate: errorPageContext.errorRate,
-        });
-        const recentSelectorErrors = this.state.errors
-          .slice(-recentErrorsCheckCount)
-          .filter(e => e.message.includes('Selector not found') || e.message.includes('not found'))
-          .length;
-
-        const selectorErrorsThreshold = AdaptiveConfigService.getThreshold('RECENT_SELECTOR_ERRORS_THRESHOLD', {
-          errorRate: errorPageContext.errorRate,
-        });
-        if (recentSelectorErrors >= selectorErrorsThreshold) {
-          logger.error('[INTELLIGENT_ORCHESTRATOR] Too many selector errors in a row, possible infinite loop', {
-            testId: this.testId,
-            recentSelectorErrors,
-            totalErrors: this.state.errors.length,
-            recentErrors: this.state.errors.slice(-3).map(e => e.message),
-          });
-          this.emitEvent('test_warning', {
-            message: 'Too many selector errors detected. Test may be stuck in a loop.',
-          });
-          // Don't break immediately - try one more iteration with different approach
-        }
-
-        // Too many errors? Stop
-        const maxErrors = AdaptiveConfigService.getThreshold('MAX_ERRORS_BEFORE_STOP', {
-          testMode: this.config.mode,
-          errorRate: errorPageContext.errorRate,
-          isComplexPage: errorPageContext.isComplexPage,
-        });
-        if (this.state.errors.length > maxErrors) {
-          logger.error('[INTELLIGENT_ORCHESTRATOR] Too many errors, stopping', {
-            testId: this.testId,
-            totalErrors: this.state.errors.length,
-            recentErrors: this.state.errors.slice(-3).map(e => e.message),
-          });
-          break;
-        }
-
-        // Continue despite error
-        logger.info('[INTELLIGENT_ORCHESTRATOR] Continuing despite error', {
-          testId: this.testId,
-          iteration,
-          errorCount: this.state.errors.length,
-        });
-        continue;
-      }
-    }
-
-    logger.info('[INTELLIGENT_ORCHESTRATOR] Main loop ended', {
-      testId: this.testId,
-      stats: StateTracker.formatStatistics(this.state),
-    });
-
-    return false; // ✅ FIX: Return false to indicate normal completion (not cancelled)
-  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NOTE: mainLoop() has been extracted to MainLoopService
+  // See: src/agent/main-loop.service.ts
+  // ═══════════════════════════════════════════════════════════════════════════
 
   // ═══════════════════════════════════════════════════════════════════════════
   // NAVIGATION TRACKING
@@ -910,6 +610,13 @@ export class IntelligentTestOrchestrator {
    * This helps detect when and why redirects to about:blank happen
    */
   private setupNavigationListeners(): void {
+    if (this.navigationListenersAttached) {
+      return;
+    }
+    this.navigationListenersAttached = true;
+
+    const isAboutUrl = (url: string): boolean => url === 'about:blank' || url.startsWith('about:');
+
     // Track all frame navigations (main frame + iframes)
     this.page.on('framenavigated', (frame) => {
       const url = frame.url();
@@ -923,13 +630,71 @@ export class IntelligentTestOrchestrator {
       });
 
       // Alert on about:blank redirects
-      if (isMainFrame && (url === 'about:blank' || url.startsWith('about:'))) {
+      if (isMainFrame && isAboutUrl(url)) {
         logger.warn('[NAVIGATION_TRACKER] ⚠️ Main frame redirected to about:blank', {
           testId: this.testId,
           url,
           stackTrace: new Error().stack?.split('\n').slice(0, 5).join('\n'), // Capture call stack
         });
       }
+    });
+
+    // Track failed requests (helps debug navigation stalls and blank pages)
+    this.page.on('requestfailed', (request) => {
+      try {
+        const failure = request.failure();
+        const isNav = request.isNavigationRequest?.() || request.resourceType() === 'document';
+        if (!isNav) return;
+
+        logger.warn('[NAVIGATION_TRACKER] Request failed', {
+          testId: this.testId,
+          url: request.url(),
+          method: request.method(),
+          resourceType: request.resourceType(),
+          failure: failure?.errorText,
+        });
+      } catch {
+        // ignore listener errors
+      }
+    });
+
+    // Track uncaught page errors (JS runtime)
+    this.page.on('pageerror', (error) => {
+      logger.warn('[NAVIGATION_TRACKER] Page error (uncaught exception)', {
+        testId: this.testId,
+        message: error?.message,
+        stack: error?.stack,
+      });
+    });
+
+    // Track and auto-dismiss dialogs (they can block automation)
+    this.page.on('dialog', async (dialog) => {
+      try {
+        logger.warn('[NAVIGATION_TRACKER] Dialog appeared', {
+          testId: this.testId,
+          type: dialog.type(),
+          message: dialog.message(),
+        });
+
+        // Strategy:
+        // - beforeunload: accept to allow navigation away
+        // - others: dismiss to avoid accidental destructive confirmations
+        if (dialog.type() === 'beforeunload') {
+          await dialog.accept();
+        } else {
+          await dialog.dismiss();
+        }
+      } catch (e) {
+        logger.debug('[NAVIGATION_TRACKER] Failed to handle dialog', {
+          testId: this.testId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    });
+
+    // Track page crashes (rare but important)
+    this.page.on('crash', () => {
+      logger.error('[NAVIGATION_TRACKER] Page crashed', { testId: this.testId });
     });
 
     // Track responses to detect redirects
@@ -950,7 +715,7 @@ export class IntelligentTestOrchestrator {
         });
 
         // Alert if redirecting to about:blank
-        if (location === 'about:blank' || location.startsWith('about:')) {
+        if (isAboutUrl(location)) {
           logger.error('[NAVIGATION_TRACKER] ⚠️ Redirect to about:blank detected', {
             testId: this.testId,
             from: url,
@@ -1045,6 +810,7 @@ export class IntelligentTestOrchestrator {
       this.progressEmitter.emit({
         progress: 40,
         phase: 'analysis',
+        icon: getActionIcon(undefined, 'analysis'),
         currentStep: `🔍 Analyzing page: ${this.page.url()}`,
       });
     }
@@ -1055,6 +821,7 @@ export class IntelligentTestOrchestrator {
         progress: 40,
         phase: 'analysis',
         currentStep: `🔍 Analyzing page: ${this.page.url()}`,
+        icon: getActionIcon(undefined, 'analysis'),
         status: 'running',
         timestamp: new Date().toISOString(),
         userId: this.userId, // ✅ FIX: Include userId for user room broadcast
@@ -1092,6 +859,7 @@ export class IntelligentTestOrchestrator {
         progress: 50,
         phase: 'analysis',
         currentStep: `✅ Page analyzed: ${context.pageType} (${context.vision.elements.length} elements found)`,
+        icon: getActionIcon(undefined, 'analysis'),
       });
     }
     if (this.testId) {
@@ -1101,6 +869,7 @@ export class IntelligentTestOrchestrator {
         progress: 50,
         phase: 'analysis',
         currentStep: `✅ Page analyzed: ${context.pageType} (${context.vision.elements.length} elements found)`,
+        icon: getActionIcon(undefined, 'analysis'),
         status: 'running',
         timestamp: new Date().toISOString(),
         userId: this.userId, // ✅ FIX: Include userId for user room broadcast
@@ -1132,6 +901,7 @@ export class IntelligentTestOrchestrator {
         progress: 55,
         phase: 'generation',
         currentStep: '🤖 Generating actions with AI...',
+        icon: getActionIcon(undefined, 'generation'),
       });
     }
     if (this.testId) {
@@ -1141,6 +911,7 @@ export class IntelligentTestOrchestrator {
         progress: 55,
         phase: 'generation',
         currentStep: '🤖 Generating actions with AI...',
+        icon: getActionIcon(undefined, 'generation'),
         status: 'running',
         timestamp: new Date().toISOString(),
         userId: this.userId, // ✅ FIX: Include userId for user room broadcast
@@ -1202,6 +973,7 @@ export class IntelligentTestOrchestrator {
         progress: 60,
         phase: 'generation',
         currentStep: `✅ Generated ${safeActions.length} action(s)`,
+        icon: getActionIcon(undefined, 'generation'),
       });
     }
     if (this.testId) {
@@ -1211,6 +983,7 @@ export class IntelligentTestOrchestrator {
         progress: 60,
         phase: 'generation',
         currentStep: `✅ Generated ${safeActions.length} action(s)`,
+        icon: getActionIcon(undefined, 'generation'),
         status: 'running',
         timestamp: new Date().toISOString(),
         userId: this.userId, // ✅ FIX: Include userId for user room broadcast
@@ -1250,7 +1023,8 @@ export class IntelligentTestOrchestrator {
         this.progressEmitter?.emit({
           progress,
           phase: 'execution',
-          currentStep: `${this.getActionEmoji(action.action)} ${action.description}...`,
+          currentStep: `${getActionEmoji(action.action)} ${action.description}...`,
+          icon: getActionIcon(action.action, 'execution'),
           action: {
             type: action.action,
             description: action.description,
@@ -1725,7 +1499,10 @@ export class IntelligentTestOrchestrator {
           },
         });
 
+        // ✅ NEW: Measure action execution duration
+        const actionStartTime = Date.now();
         const executionResult = await this.commandExecutor.executeCommand(finalCommand);
+        const actionDurationMs = Date.now() - actionStartTime;
 
         // ✅ OPTIMIZED: Smart waiting - only wait if URL changed (page navigation)
         const urlAfter = this.page.url();
@@ -1895,15 +1672,16 @@ export class IntelligentTestOrchestrator {
             progress,
             phase: 'execution',
             currentStep: actionResult.success
-              ? `✅ ${this.getActionEmoji(action.action)} ${action.description}`
-              : `❌ ${this.getActionEmoji(action.action)} ${action.description} (failed)`,
+              ? `✅ ${getActionEmoji(action.action)} ${action.description}`
+              : `❌ ${getActionEmoji(action.action)} ${action.description} (failed)`,
+            icon: getActionIcon(action.action, 'execution'),
             action: {
               type: action.action,
               description: action.description,
               target: action.selector,
             },
             completedSteps: i + 1,
-            status: actionResult.success ? 'running' : 'error',
+            status: actionResult.success ? 'running' : 'failed',
           });
         }
 
@@ -1917,6 +1695,7 @@ export class IntelligentTestOrchestrator {
             currentStep: actionResult.success
               ? `✅ ${action.description}`
               : `❌ ${action.description} (failed)`,
+            icon: getActionIcon(action.action, 'execution'),
             action: {
               type: action.action,
               description: action.description,
@@ -1924,7 +1703,7 @@ export class IntelligentTestOrchestrator {
             },
             totalSteps: actions.length,
             completedSteps: i + 1,
-            status: actionResult.success ? 'running' : 'error',
+            status: actionResult.success ? 'running' : 'failed',
             timestamp: new Date().toISOString(),
             userId: this.userId, // ✅ FIX: Include userId for user room broadcast
           });
@@ -1935,16 +1714,21 @@ export class IntelligentTestOrchestrator {
           const graphUpdate = this.graphBuilder.addActionNode(action, {
             success: actionResult.success,
             error: actionResult.error,
-            durationMs: undefined, // Duration not available in executionResult
+            durationMs: actionDurationMs, // ✅ FIX: Include actual execution duration
             urlChanged: actionResult.urlChanged,
             urlBefore: actionResult.urlBefore,
             urlAfter: actionResult.urlAfter,
             retryCount: actionResult.retryCount,
             isTimeout: (actionResult.error?.toLowerCase() ?? '').includes('timeout'),
-            // ✅ NEW: Include screenshots
-            screenshotBefore,
-            screenshotAfter,
-            screenshot: executionResult.screenshot, // From command executor if available
+            // ✅ NEW: Include validation data
+            validation: {
+              expected: validation.expected,
+              actual: validation.actual,
+              passed: validation.passed,
+              message: validation.message,
+            },
+            // ✅ REMOVED: Screenshots not included in real-time updates (too large)
+            // Screenshots will be uploaded after test completion and replaced with URLs
           });
           this.emitGraphUpdate(graphUpdate);
         }
@@ -2494,6 +2278,17 @@ export class IntelligentTestOrchestrator {
   }
 
   private async buildResult(success: boolean): Promise<IntelligentTestResult> {
+    // ✅ FIX: Handle case where state might not be initialized (early errors)
+    if (!this.state) {
+      const safetyConfig = SafetyGuard.getConfigForLevel(this.config.safety.level);
+      this.state = StateTracker.createInitialState(
+        this.config.goal,
+        this.config.startUrl,
+        safetyConfig.maxPages,
+        safetyConfig.maxDuration
+      );
+    }
+
     const stats = StateTracker.getStatistics(this.state);
 
     const summary = this.buildSummary(success, stats);
@@ -2856,22 +2651,6 @@ export class IntelligentTestOrchestrator {
     }
   }
 
-  /**
-   * Get emoji for action type
-   */
-  private getActionEmoji(actionType: string): string {
-    const emojiMap: Record<string, string> = {
-      click: '👆',
-      fill: '✍️',
-      select: '📋',
-      wait: '⏱️',
-      scroll: '📜',
-      press: '⌨️',
-      hover: '🖱️',
-      goto: '🌐',
-    };
-    return emojiMap[actionType] || '🔄';
-  }
 
   /**
    * ✅ FIX 2: Use centralized selector normalization (removed duplication)

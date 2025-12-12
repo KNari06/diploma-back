@@ -159,9 +159,24 @@ export class IntelligentPageAnalyzer {
         logger.info('[INTELLIGENT_ANALYZER] Using GPT-4 Vision for analysis', { url });
         const visionStartTime = Date.now();
 
+        // ✅ ENHANCED: Prepare DOM context for Vision analysis
+        const domContext = {
+          formsCount: domAnalysis.forms.length,
+          buttonsCount: domAnalysis.buttons.length,
+          inputsCount: domAnalysis.inputs.length,
+          linksCount: domAnalysis.links.length,
+          hasModals: (domAnalysis.modals?.length || 0) > 0,
+          interactiveElementsCount:
+            domAnalysis.buttons.length +
+            domAnalysis.inputs.length +
+            domAnalysis.links.length +
+            (domAnalysis.checkboxes?.length || 0) +
+            (domAnalysis.radios?.length || 0),
+        };
+
         // ✅ OPTIMIZED: Run Vision and Logic in parallel
         const [visionResult, logicResult] = await Promise.all([
-          this.analyzeWithVision(screenshot, url, goal, previousContext),
+          this.analyzeWithVision(screenshot, url, goal, previousContext, domContext),
           // Start Logic analysis early (can use DOM-only data initially)
           this.analyzeLogic('unknown', [], domAnalysis),
         ]);
@@ -187,23 +202,45 @@ export class IntelligentPageAnalyzer {
         );
       }
 
-      // ✅ OPTIMIZED: Match Vision-DOM and enhance DOM in parallel
-      const [matchedVision, enhancedDomWithModals] = await Promise.all([
-        this.matchVisionElementsWithDOMSelectors(page, visionAnalysis, enhancedDomAnalysis),
-        this.enhanceDOMWithVisionModals(page, enhancedDomAnalysis, visionAnalysis.modals),
-      ]);
+      // ✅ ENHANCED: Match Vision-DOM and enhance DOM in parallel with error handling
+      let matchedVision: VisionAnalysis;
+      let enhancedDomWithModals: DOMAnalysis;
+
+      try {
+        [matchedVision, enhancedDomWithModals] = await Promise.all([
+          this.matchVisionElementsWithDOMSelectors(page, visionAnalysis, enhancedDomAnalysis),
+          // ✅ FIX: Safe access to modals (may be undefined)
+          this.enhanceDOMWithVisionModals(page, enhancedDomAnalysis, visionAnalysis?.modals || []),
+        ]);
+      } catch (error) {
+        logger.error('[INTELLIGENT_ANALYZER] Vision-DOM matching failed', {
+          error: error instanceof Error ? error.message : String(error),
+          url,
+        });
+        // Fallback: use original data
+        matchedVision = visionAnalysis;
+        enhancedDomWithModals = enhancedDomAnalysis;
+      }
 
       visionAnalysis = matchedVision;
       const finalEnhancedDom = enhancedDomWithModals;
 
-      // ✅ OPTIMIZED: Update Logic analysis with Vision elements (if Vision was used)
-      if (shouldUseVisionResult && visionAnalysis.elements.length > 0) {
+      // ✅ ENHANCED: Update Logic analysis with Vision elements (if Vision was used)
+      // ✅ FIX: Validate visionAnalysis before using it
+      if (shouldUseVisionResult && visionAnalysis && visionAnalysis.elements && visionAnalysis.elements.length > 0) {
         // Re-run Logic with Vision elements for better accuracy
-        logicAnalysis = await this.analyzeLogic(
-        visionAnalysis.pageType,
-        visionAnalysis.elements,
-          finalEnhancedDom
-      );
+        try {
+          logicAnalysis = await this.analyzeLogic(
+            visionAnalysis.pageType || 'unknown',
+            visionAnalysis.elements.filter(el => el && el.type && el.purpose), // ✅ FIX: Filter invalid elements
+            finalEnhancedDom
+          );
+        } catch (error) {
+          logger.warn('[INTELLIGENT_ANALYZER] Logic analysis with Vision elements failed, using previous result', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          // Keep previous logicAnalysis
+        }
       }
 
       logger.info('[INTELLIGENT_ANALYZER] Logic analysis completed', {
@@ -212,18 +249,27 @@ export class IntelligentPageAnalyzer {
         possibleActions: logicAnalysis.possibleActions.length,
       });
 
-      // Build complete context
+      // ✅ ENHANCED: Build complete context with validation
       const context: PageContext = {
         url,
-        pageType: visionAnalysis.pageType,
+        pageType: visionAnalysis?.pageType || 'unknown',
         timestamp: Date.now(),
-        vision: visionAnalysis,
+        vision: visionAnalysis || {
+          pageType: 'unknown',
+          description: 'Vision analysis unavailable',
+          elements: [],
+          suggestions: [],
+          warnings: [],
+        },
         dom: finalEnhancedDom, // ✅ Use AI-enhanced DOM analysis
         screenshot: mode !== 'fast' ? screenshot : undefined,
-        requiredActions: logicAnalysis.requiredActions,
-        possibleActions: logicAnalysis.possibleActions,
-        criticalElements: visionAnalysis.elements.filter(el => el.priority === 'critical'),
-        warnings: visionAnalysis.warnings || [],
+        requiredActions: logicAnalysis?.requiredActions || [],
+        possibleActions: logicAnalysis?.possibleActions || [],
+        // ✅ FIX: Safe filter for critical elements (handle missing priority)
+        criticalElements: (visionAnalysis?.elements || []).filter(
+          el => el && el.priority === 'critical'
+        ),
+        warnings: visionAnalysis?.warnings || [],
       };
 
       const duration = Date.now() - startTime;
@@ -1062,10 +1108,10 @@ export class IntelligentPageAnalyzer {
   }
 
   /**
-   * ✅ CRITICAL FIX: Match Vision AI elements with real DOM selectors
+   * ✅ ENHANCED: Match Vision AI elements with real DOM selectors
    * Vision AI sees elements visually but doesn't know selectors
    * DOM analysis has selectors but doesn't know which element is which
-   * We match them by text, type, and purpose
+   * We match them using multiple strategies: text, purpose, aria-label, data-attributes, position
    */
   private static async matchVisionElementsWithDOMSelectors(
     page: Page,
@@ -1074,142 +1120,432 @@ export class IntelligentPageAnalyzer {
   ): Promise<VisionAnalysis> {
     // Import PageElement type
     type PageElement = import('./types/intelligent-testing.types').PageElement;
+
+    // ✅ FIX: Validate inputs
+    if (!visionAnalysis || !visionAnalysis.elements) {
+      logger.warn('[INTELLIGENT_ANALYZER] Invalid visionAnalysis, returning as-is', {
+        hasVisionAnalysis: !!visionAnalysis,
+        hasElements: !!(visionAnalysis?.elements),
+      });
+      return visionAnalysis || {
+        pageType: 'unknown',
+        description: 'Invalid Vision analysis',
+        elements: [],
+        suggestions: [],
+        warnings: [],
+      };
+    }
+
+    if (!domAnalysis) {
+      logger.warn('[INTELLIGENT_ANALYZER] Invalid domAnalysis, returning Vision as-is');
+      return visionAnalysis;
+    }
+
     logger.info('[INTELLIGENT_ANALYZER] Matching Vision elements with DOM selectors', {
       visionElements: visionAnalysis.elements.length,
-      domButtons: domAnalysis.buttons.length,
-      domInputs: domAnalysis.inputs.length,
-      domLinks: domAnalysis.links.length,
+      domButtons: domAnalysis.buttons?.length || 0,
+      domInputs: domAnalysis.inputs?.length || 0,
+      domLinks: domAnalysis.links?.length || 0,
     });
 
     const matchedElements: PageElement[] = [];
+    const usedSelectors = new Set<string>(); // ✅ NEW: Track used selectors to avoid duplicates
 
     for (const visionElement of visionAnalysis.elements) {
       let matchedSelector: string | undefined;
+      let matchConfidence: 'high' | 'medium' | 'low' = 'low';
+      const matchStrategies: string[] = [];
 
-      // Try to match by type and text
+      // ✅ ENHANCED: Strategy 1 - Match buttons by text (exact, contains, fuzzy)
       if (visionElement.type === 'button' && visionElement.text) {
-        // Find button in DOM with matching text
-        const matchingButton = domAnalysis.buttons.find(btn => {
-          const btnText = btn.text.toLowerCase().trim();
-          const visionText = visionElement.text?.toLowerCase().trim() || '';
-          // Exact match or contains
-          return btnText === visionText ||
-                 btnText.includes(visionText) ||
-                 visionText.includes(btnText);
-        });
+        const visionText = visionElement.text.toLowerCase().trim();
+        const candidates = domAnalysis.buttons
+          .filter(btn => !usedSelectors.has(btn.selector)) // ✅ NEW: Avoid duplicates
+          .map(btn => {
+            const btnText = btn.text.toLowerCase().trim();
+            let score = 0;
+            let strategy = '';
 
-        if (matchingButton) {
-          matchedSelector = matchingButton.selector;
-          logger.debug('[INTELLIGENT_ANALYZER] Matched button by text', {
+            // Exact match (highest confidence)
+            if (btnText === visionText) {
+              score = 100;
+              strategy = 'exact_text';
+            }
+            // Contains match (high confidence)
+            else if (btnText.includes(visionText) || visionText.includes(btnText)) {
+              score = 80;
+              strategy = 'contains_text';
+            }
+            // Fuzzy match (partial words)
+            else {
+              const visionWords = visionText.split(/\s+/);
+              const btnWords = btnText.split(/\s+/);
+              const commonWords = visionWords.filter(w => btnWords.includes(w));
+              if (commonWords.length > 0 && commonWords.length / Math.max(visionWords.length, btnWords.length) > 0.5) {
+                score = 60;
+                strategy = 'fuzzy_text';
+              }
+            }
+
+            return { button: btn, score, strategy };
+          })
+          .filter(c => c.score > 0)
+          .sort((a, b) => b.score - a.score);
+
+        if (candidates.length > 0) {
+          const bestMatch = candidates[0];
+          matchedSelector = bestMatch.button.selector;
+          matchConfidence = bestMatch.score >= 80 ? 'high' : bestMatch.score >= 60 ? 'medium' : 'low';
+          matchStrategies.push(bestMatch.strategy);
+          usedSelectors.add(matchedSelector);
+          logger.debug('[INTELLIGENT_ANALYZER] Matched button', {
             visionText: visionElement.text,
             selector: matchedSelector,
+            confidence: matchConfidence,
+            strategy: bestMatch.strategy,
           });
         }
       }
 
-      // Try to match input by type and purpose
-      if (visionElement.type === 'input') {
-        const matchingInput = domAnalysis.inputs.find(input => {
-          // Match by purpose (email, password, search, etc.)
-          const purpose = visionElement.purpose.toLowerCase();
-          const inputType = input.type.toLowerCase();
-          const inputName = (input.name || '').toLowerCase();
-          const inputPlaceholder = (input.placeholder || '').toLowerCase();
+      // ✅ ENHANCED: Strategy 2 - Match inputs by purpose, type, name, placeholder, aria-label
+      if (!matchedSelector && visionElement.type === 'input') {
+        const purpose = visionElement.purpose.toLowerCase();
+        const candidates = domAnalysis.inputs
+          .filter(input => !usedSelectors.has(input.selector))
+          .map(input => {
+            let score = 0;
+            let strategy = '';
 
-          return purpose.includes(inputType) ||
-                 inputType.includes(purpose) ||
-                 inputName.includes(purpose) ||
-                 inputPlaceholder.includes(purpose);
-        });
+            const inputType = (input.type || '').toLowerCase();
+            const inputName = (input.name || '').toLowerCase();
+            const inputPlaceholder = (input.placeholder || '').toLowerCase();
 
-        if (matchingInput) {
-          matchedSelector = matchingInput.selector;
-          logger.debug('[INTELLIGENT_ANALYZER] Matched input by purpose', {
+            // Exact purpose match
+            if (purpose === inputType || purpose === inputName) {
+              score = 100;
+              strategy = 'exact_purpose';
+            }
+            // Contains match
+            else if (
+              purpose.includes(inputType) || inputType.includes(purpose) ||
+              purpose.includes(inputName) || inputName.includes(purpose) ||
+              purpose.includes(inputPlaceholder) || inputPlaceholder.includes(purpose)
+            ) {
+              score = 80;
+              strategy = 'contains_purpose';
+            }
+            // Semantic match (email, password, search, etc.)
+            else {
+              const semanticMatches: Record<string, string[]> = {
+                email: ['email', 'e-mail', 'mail', 'username'],
+                password: ['password', 'pass', 'pwd', 'secret'],
+                search: ['search', 'query', 'find', 'lookup'],
+                phone: ['phone', 'tel', 'telephone', 'mobile'],
+                name: ['name', 'fullname', 'full_name', 'fname', 'lname'],
+              };
+
+              for (const [key, synonyms] of Object.entries(semanticMatches)) {
+                if (purpose.includes(key) || synonyms.some(s => purpose.includes(s))) {
+                  if (inputType.includes(key) || inputName.includes(key) || inputPlaceholder.includes(key)) {
+                    score = 70;
+                    strategy = 'semantic_match';
+                    break;
+                  }
+                }
+              }
+            }
+
+            return { input, score, strategy };
+          })
+          .filter(c => c.score > 0)
+          .sort((a, b) => b.score - a.score);
+
+        if (candidates.length > 0) {
+          const bestMatch = candidates[0];
+          matchedSelector = bestMatch.input.selector;
+          matchConfidence = bestMatch.score >= 80 ? 'high' : bestMatch.score >= 60 ? 'medium' : 'low';
+          matchStrategies.push(bestMatch.strategy);
+          usedSelectors.add(matchedSelector);
+          logger.debug('[INTELLIGENT_ANALYZER] Matched input', {
             purpose: visionElement.purpose,
             selector: matchedSelector,
+            confidence: matchConfidence,
+            strategy: bestMatch.strategy,
           });
         }
       }
 
-      // Try to match link by text
-      if (visionElement.type === 'link' && visionElement.text) {
-        const matchingLink = domAnalysis.links.find(link => {
-          const linkText = link.text.toLowerCase().trim();
-          const visionText = visionElement.text?.toLowerCase().trim() || '';
-          return linkText === visionText ||
-                 linkText.includes(visionText) ||
-                 visionText.includes(linkText);
-        });
+      // ✅ ENHANCED: Strategy 3 - Match links by text (exact, contains, fuzzy)
+      if (!matchedSelector && visionElement.type === 'link' && visionElement.text) {
+        const visionText = visionElement.text.toLowerCase().trim();
+        const candidates = domAnalysis.links
+          .filter(link => !usedSelectors.has(link.selector))
+          .map(link => {
+            const linkText = link.text.toLowerCase().trim();
+            let score = 0;
+            let strategy = '';
 
-        if (matchingLink) {
-          matchedSelector = matchingLink.selector;
-          logger.debug('[INTELLIGENT_ANALYZER] Matched link by text', {
+            if (linkText === visionText) {
+              score = 100;
+              strategy = 'exact_text';
+            } else if (linkText.includes(visionText) || visionText.includes(linkText)) {
+              score = 80;
+              strategy = 'contains_text';
+            } else {
+              const visionWords = visionText.split(/\s+/);
+              const linkWords = linkText.split(/\s+/);
+              const commonWords = visionWords.filter(w => linkWords.includes(w));
+              if (commonWords.length > 0 && commonWords.length / Math.max(visionWords.length, linkWords.length) > 0.5) {
+                score = 60;
+                strategy = 'fuzzy_text';
+              }
+            }
+
+            return { link, score, strategy };
+          })
+          .filter(c => c.score > 0)
+          .sort((a, b) => b.score - a.score);
+
+        if (candidates.length > 0) {
+          const bestMatch = candidates[0];
+          matchedSelector = bestMatch.link.selector;
+          matchConfidence = bestMatch.score >= 80 ? 'high' : bestMatch.score >= 60 ? 'medium' : 'low';
+          matchStrategies.push(bestMatch.strategy);
+          usedSelectors.add(matchedSelector);
+          logger.debug('[INTELLIGENT_ANALYZER] Matched link', {
             visionText: visionElement.text,
             selector: matchedSelector,
+            confidence: matchConfidence,
+            strategy: bestMatch.strategy,
           });
         }
       }
 
-      // ✅ OPTIMIZED: Collect text selectors for batch check (instead of checking one-by-one)
-      // Will be checked in batch after the loop
+      // ✅ NEW: Strategy 4 - Try aria-label and data-attributes matching via page.evaluate
+      if (!matchedSelector && visionElement.text) {
+        try {
+          const visionText = visionElement.text.toLowerCase().trim();
+          const elementType = visionElement.type;
+
+          const ariaMatches = await page.evaluate(
+            ({ text, type }) => {
+              const results: Array<{ selector: string; confidence: number }> = [];
+              const searchText = text.toLowerCase().trim();
+
+              // Search by aria-label
+              // @ts-ignore - browser context
+              const ariaElements = document.querySelectorAll(`[aria-label]`);
+              ariaElements.forEach((el: any) => {
+                const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase().trim();
+                if (ariaLabel === searchText || ariaLabel.includes(searchText) || searchText.includes(ariaLabel)) {
+                  // Generate selector
+                  let selector = '';
+                  if (el.id) selector = `#${el.id}`;
+                  else if (el.getAttribute('data-testid')) selector = `[data-testid="${el.getAttribute('data-testid')}"]`;
+                  else selector = `[aria-label="${el.getAttribute('aria-label')}"]`;
+
+                  if (selector) {
+                    results.push({
+                      selector,
+                      confidence: ariaLabel === searchText ? 90 : 70,
+                    });
+                  }
+                }
+              });
+
+              // Search by data-testid, data-cy, data-test
+              ['data-testid', 'data-cy', 'data-test'].forEach(attr => {
+                // @ts-ignore - browser context
+                const dataElements = document.querySelectorAll(`[${attr}]`);
+                dataElements.forEach((el: any) => {
+                  const dataValue = (el.getAttribute(attr) || '').toLowerCase().trim();
+                  if (dataValue.includes(searchText) || searchText.includes(dataValue)) {
+                    const selector = `[${attr}="${el.getAttribute(attr)}"]`;
+                    if (!results.some(r => r.selector === selector)) {
+                      results.push({ selector, confidence: 75 });
+                    }
+                  }
+                });
+              });
+
+              return results;
+            },
+            { text: visionElement.text, type: elementType }
+          );
+
+          if (ariaMatches.length > 0) {
+            // Sort by confidence and pick best match not already used
+            const bestAriaMatch = ariaMatches
+              .filter(m => !usedSelectors.has(m.selector))
+              .sort((a, b) => b.confidence - a.confidence)[0];
+
+            if (bestAriaMatch) {
+              matchedSelector = bestAriaMatch.selector;
+              matchConfidence = bestAriaMatch.confidence >= 80 ? 'high' : 'medium';
+              matchStrategies.push('aria_label_or_data_attr');
+              usedSelectors.add(matchedSelector);
+              logger.debug('[INTELLIGENT_ANALYZER] Matched by aria-label/data-attr', {
+                visionText: visionElement.text,
+                selector: matchedSelector,
+                confidence: matchConfidence,
+              });
+            }
+          }
+        } catch (error) {
+          logger.debug('[INTELLIGENT_ANALYZER] Aria-label matching failed', { error });
+        }
+      }
+
+      // ✅ OPTIMIZED: Strategy 5 - Fallback to text selector (batch check)
       if (!matchedSelector && visionElement.text) {
         // Store for batch processing
         (visionElement as any)._needsTextCheck = true;
-        (visionElement as any)._textSelector = `${visionElement.type}:has-text("${visionElement.text}")`;
+        (visionElement as any)._textSelector = `text="${visionElement.text}"`;
+        (visionElement as any)._typeSelector = visionElement.type === 'button'
+          ? `role=button[name="${visionElement.text}"]`
+          : visionElement.type === 'link'
+          ? `role=link[name="${visionElement.text}"]`
+          : `text="${visionElement.text}"`;
       }
 
-      // Add element with matched selector (will be updated after batch check if needed)
+      // Add element with matched selector
       matchedElements.push({
         ...visionElement,
         selector: matchedSelector || visionElement.selector || '',
+        // ✅ NEW: Store matching metadata for debugging
+        ...(matchStrategies.length > 0 && { _matchMetadata: { strategies: matchStrategies, confidence: matchConfidence } }),
       });
     }
 
-    // ✅ OPTIMIZED: Batch check all text selectors at once (one page.evaluate call)
-    const elementsNeedingTextCheck = visionAnalysis.elements
+    // ✅ ENHANCED: Batch check all text selectors at once (one page.evaluate call)
+    const elementsNeedingTextCheck = matchedElements
       .map((el, idx) => ({ element: el, index: idx }))
-      .filter((_, idx) => (visionAnalysis.elements[idx] as any)._needsTextCheck);
+      .filter((_, idx) => !matchedElements[idx].selector && (visionAnalysis.elements[idx] as any)?._needsTextCheck);
 
     if (elementsNeedingTextCheck.length > 0) {
       try {
-        const textSelectors = elementsNeedingTextCheck.map(
-          item => (visionAnalysis.elements[item.index] as any)._textSelector
-        );
+        const selectorsToCheck = elementsNeedingTextCheck.map(item => ({
+          textSelector: (visionAnalysis.elements[item.index] as any)?._textSelector,
+          typeSelector: (visionAnalysis.elements[item.index] as any)?._typeSelector,
+          text: visionAnalysis.elements[item.index].text,
+        }));
 
         const selectorResults = await page.evaluate((selectors) => {
-          const results: Record<string, number> = {};
+          const results: Array<{ textSelector: string; typeSelector: string; found: boolean; count: number }> = [];
+
           for (const sel of selectors) {
-            try {
-              // @ts-ignore - browser context
-              const count = document.querySelectorAll(sel).length;
-              results[sel] = count;
-            } catch {
-              results[sel] = 0;
+            let found = false;
+            let count = 0;
+            let workingSelector = '';
+
+            // Try type selector first (more specific)
+            if (sel.typeSelector) {
+              try {
+                // @ts-ignore - browser context
+                const elements = document.querySelectorAll(sel.typeSelector);
+                count = elements.length;
+                if (count > 0) {
+                  found = true;
+                  workingSelector = sel.typeSelector;
+                }
+              } catch {
+                // Invalid selector, skip
+              }
             }
+
+            // Fallback to text selector
+            if (!found && sel.textSelector) {
+              try {
+                // @ts-ignore - browser context
+                const elements = document.querySelectorAll(sel.textSelector);
+                count = elements.length;
+                if (count > 0) {
+                  found = true;
+                  workingSelector = sel.textSelector;
+                }
+              } catch {
+                // Invalid selector, skip
+              }
+            }
+
+            results.push({
+              textSelector: sel.textSelector || '',
+              typeSelector: sel.typeSelector || '',
+              found,
+              count,
+            });
           }
+
           return results;
-        }, textSelectors);
+        }, selectorsToCheck);
 
         // Update matched elements with batch results
-        for (const item of elementsNeedingTextCheck) {
-          const textSelector = (visionAnalysis.elements[item.index] as any)._textSelector;
-          if (selectorResults[textSelector] > 0) {
-            matchedElements[item.index].selector = textSelector;
-            logger.debug('[INTELLIGENT_ANALYZER] Found selector by batch text search', {
+        for (let i = 0; i < elementsNeedingTextCheck.length; i++) {
+          const item = elementsNeedingTextCheck[i];
+          const result = selectorResults[i];
+
+          if (result.found && result.count === 1 && !usedSelectors.has(result.typeSelector || result.textSelector)) {
+            // ✅ NEW: Prefer type selector, fallback to text selector
+            const finalSelector = result.typeSelector || result.textSelector;
+            matchedElements[item.index].selector = finalSelector;
+            usedSelectors.add(finalSelector);
+            logger.debug('[INTELLIGENT_ANALYZER] Found selector by batch check', {
               text: visionAnalysis.elements[item.index].text,
-              selector: textSelector,
+              selector: finalSelector,
+              count: result.count,
             });
+          } else if (result.found && result.count > 1) {
+            // ✅ NEW: Multiple matches - log warning but still use selector
+            logger.warn('[INTELLIGENT_ANALYZER] Multiple elements match text selector', {
+              text: visionAnalysis.elements[item.index].text,
+              selector: result.typeSelector || result.textSelector,
+              count: result.count,
+              note: 'Selector may match multiple elements - consider using more specific selector',
+            });
+            // Still use it but with lower confidence
+            if (!usedSelectors.has(result.typeSelector || result.textSelector)) {
+              matchedElements[item.index].selector = result.typeSelector || result.textSelector;
+              usedSelectors.add(result.typeSelector || result.textSelector);
+            }
           }
         }
       } catch (error) {
-        logger.debug('[INTELLIGENT_ANALYZER] Batch selector check failed', { error });
+        logger.debug('[INTELLIGENT_ANALYZER] Batch selector check failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 
+    // ✅ NEW: Final validation - check for duplicate selectors and log warnings
+    const selectorCounts = new Map<string, number>();
+    matchedElements.forEach((el, idx) => {
+      if (el.selector) {
+        selectorCounts.set(el.selector, (selectorCounts.get(el.selector) || 0) + 1);
+      }
+    });
+
+    const duplicates = Array.from(selectorCounts.entries()).filter(([_, count]) => count > 1);
+    if (duplicates.length > 0) {
+      logger.warn('[INTELLIGENT_ANALYZER] Duplicate selectors detected', {
+        duplicates: duplicates.map(([selector, count]) => ({ selector, count })),
+        note: 'Multiple Vision elements matched to the same DOM selector - may cause issues',
+      });
+    }
+
+    // ✅ NEW: Log matching statistics
+    const matchStats = {
+      total: matchedElements.length,
+      matched: matchedElements.filter(el => el.selector).length,
+      unmatched: matchedElements.filter(el => !el.selector).length,
+      highConfidence: matchedElements.filter(el => (el as any)?._matchMetadata?.confidence === 'high').length,
+      mediumConfidence: matchedElements.filter(el => (el as any)?._matchMetadata?.confidence === 'medium').length,
+      lowConfidence: matchedElements.filter(el => (el as any)?._matchMetadata?.confidence === 'low' || !(el as any)?._matchMetadata).length,
+    };
+
     logger.info('[INTELLIGENT_ANALYZER] Vision-DOM matching completed', {
-      totalElements: visionAnalysis.elements.length,
-      matchedElements: matchedElements.filter(el => el.selector).length,
-      unmatchedElements: matchedElements.filter(el => !el.selector).length,
+      ...matchStats,
+      matchRate: `${Math.round((matchStats.matched / matchStats.total) * 100)}%`,
+      duplicatesCount: duplicates.length,
     });
 
     return {
@@ -1471,10 +1807,18 @@ export class IntelligentPageAnalyzer {
     screenshotBase64: string,
     url: string,
     goal: string,
-    previousContext?: string
+    previousContext?: string,
+    domContext?: {
+      formsCount: number;
+      buttonsCount: number;
+      inputsCount: number;
+      linksCount: number;
+      hasModals: boolean;
+      interactiveElementsCount: number;
+    }
   ): Promise<VisionAnalysis> {
     try {
-      const prompt = buildPageAnalysisPrompt({ url, goal, previousContext });
+      const prompt = buildPageAnalysisPrompt({ url, goal, previousContext, domContext });
 
       const response = await openai.chat.completions.create({
         model: 'gpt-4o',
@@ -1509,13 +1853,26 @@ export class IntelligentPageAnalyzer {
 
       const parsed = JSON.parse(content);
 
+      // ✅ ENHANCED: Validate and sanitize Vision analysis response
+      const validatedElements = (parsed.elements || []).filter((el: any) => {
+        // Filter out invalid elements
+        return el && typeof el === 'object' && el.type && el.purpose;
+      }).map((el: any) => ({
+        type: el.type || 'other',
+        purpose: el.purpose || '',
+        text: el.text || '',
+        required: el.required || false,
+        priority: el.priority || 'medium',
+        selector: el.selector || '', // May be empty, will be matched later
+      }));
+
       return {
         pageType: parsed.pageType || 'unknown',
         description: parsed.description || 'No description',
-        elements: parsed.elements || [],
+        elements: validatedElements,
         suggestions: parsed.suggestions || [],
         warnings: parsed.warnings || [],
-        modals: parsed.modals || [], // ✅ NEW: Modals detected by Vision AI
+        modals: (parsed.modals || []).filter((modal: any) => modal && typeof modal === 'object'), // ✅ FIX: Validate modals
       };
     } catch (error) {
       logger.error('[INTELLIGENT_ANALYZER] Vision analysis failed', { error });

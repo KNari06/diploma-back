@@ -6,11 +6,11 @@
 
 import { logger } from '@/utils/logger';
 import {
-    ActionResult,
-    CycleDetectionResult,
-    PageType,
-    PageVisit,
-    TestState,
+  ActionResult,
+  CycleDetectionResult,
+  PageType,
+  PageVisit,
+  TestState,
 } from './types/intelligent-testing.types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -161,22 +161,29 @@ export class StateTracker {
     // ✅ FIX: Normalize URLs for comparison
     const normalizedCurrent = this.normalizeUrl(currentUrl);
 
-    // Count how many times we've visited this URL (normalized)
-    // ✅ IMPROVED: Only count visits with successful actions or URL changes
-    const visitCount = state.visitedPages.filter(
-      page => {
-        const normalizedPageUrl = this.normalizeUrl(page.url);
-        if (normalizedPageUrl !== normalizedCurrent) return false;
+    // Count how many times we've "meaningfully" visited this URL (normalized).
+    //
+    // We count a visit if:
+    // - it has at least one successful action, OR
+    // - it's the first time we ever saw this URL (even if actions failed),
+    //   to avoid undercounting cycles on pages where we keep failing to act.
+    let visitCount = 0;
+    const seenUrls = new Set<string>();
 
-        // Only count as "real" visit if:
-        // 1. Has successful actions, OR
-        // 2. Is the first visit (no previous visits to compare)
-        const hasSuccessfulActions = page.actionResults?.some(r => r.success) || false;
-        const isFirstVisit = state.visitedPages.indexOf(page) === 0;
+    for (const page of state.visitedPages) {
+      const normalizedPageUrl = this.normalizeUrl(page.url);
+      const isSameUrl = normalizedPageUrl === normalizedCurrent;
+      const firstTimeForThisUrl = !seenUrls.has(normalizedPageUrl);
 
-        return hasSuccessfulActions || isFirstVisit;
+      seenUrls.add(normalizedPageUrl);
+
+      if (!isSameUrl) continue;
+
+      const hasSuccessfulActions = page.actionResults?.some((r) => r.success) || false;
+      if (hasSuccessfulActions || firstTimeForThisUrl) {
+        visitCount += 1;
       }
-    ).length;
+    }
 
     if (visitCount >= maxVisits) {
       logger.warn('[STATE_TRACKER] Cycle detected', {
@@ -226,7 +233,8 @@ export class StateTracker {
     }
 
     // Check for A → B → A → B pattern
-    const urls = recentPages.map(p => p.url);
+    // ✅ FIX: Normalize URLs to avoid false negatives due to query/hash/protocol differences
+    const urls = recentPages.map((p) => this.normalizeUrl(p.url));
 
     for (let i = 0; i < urls.length - 3; i++) {
       if (

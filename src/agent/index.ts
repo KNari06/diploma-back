@@ -6,6 +6,6 @@
  */
 
 export { browserPool } from './browser-pool';
-export { executePlaywrightTest, executePlaywrightTestWithRetry, getAgentStatus } from './playwright.service';
-export { ResultCollector } from './result-collector';
 export { CommandExecutor } from './command-executor';
+export { executePlaywrightTest, executePlaywrightTestWithRetry, getAgentStatus } from './playwright/playwright.service';
+export { ResultCollector } from './result-collector';

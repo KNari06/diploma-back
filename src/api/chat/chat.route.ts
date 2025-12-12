@@ -34,7 +34,8 @@ const chatRequestSchema = z.object({
  *       - **API Testing** - тестирование API endpoints
  *       - **General Chat** - обычный разговор с AI
  *
- *       **Чат БЕСПЛАТНЫЙ (0 кредитов)**, кредиты списываются только за тесты:
+ *       **Стоимость:**
+ *       - Чат: 1 кредит за сообщение
  *       - Intelligent тест: 20 кредитов (~50 тестов/месяц за $39)
  *       - Standard тест: 1 кредит (~1000 тестов/месяц)
  *       - API тест: 2 кредита (~500 тестов/месяц)
@@ -144,9 +145,6 @@ const chatRequestSchema = z.object({
  *                 creditsRemaining:
  *                   type: number
  *                   description: Остаток кредитов после операции
- *                 chatIsFree:
- *                   type: boolean
- *                   description: Указывает что чат бесплатный
  *       400:
  *         description: Ошибка валидации
  *       402:

@@ -5,6 +5,7 @@
 
 import { GraphEdge, GraphNode, NodeType, PlaywrightStepType } from '@/types/playwright.types';
 import { logger } from '@/utils/logger';
+import { getActionIcon } from '@/websocket/types';
 import { DynamicAction } from '../types/intelligent-testing.types';
 
 /**
@@ -93,6 +94,10 @@ export class GraphBuilder {
     this.startTime = Date.now();
   }
 
+  private getIconName(stepType?: PlaywrightStepType, phase?: string): string | undefined {
+    return getActionIcon(stepType, phase);
+  }
+
   /**
    * Add start node and return initial graph
    */
@@ -105,6 +110,7 @@ export class GraphBuilder {
       meta: {
         color: '#4CAF50',
         icon: '▶️',
+        iconName: this.getIconName(undefined, 'initialization'),
         timestamp: Date.now(),
       },
     };
@@ -142,7 +148,10 @@ export class GraphBuilder {
     const isSuccess = result?.success !== false;
     const isFailed = result?.success === false;
     const isRetry = result?.retryCount && result.retryCount > 0;
-    const isTimeout = result?.isTimeout || result?.error?.toLowerCase().includes('timeout');
+    // ✅ FIX: More accurate timeout detection
+    const isTimeout = result?.isTimeout ||
+                      (result?.error?.toLowerCase().includes('timeout') ?? false) ||
+                      (result?.error?.toLowerCase().includes('timed out') ?? false);
 
     if (isSuccess) {
       this.completedSteps++;
@@ -200,10 +209,9 @@ export class GraphBuilder {
         isRepeated,
         warning: isRepeated ? 'Action repeated - possible cycle' : undefined,
 
-        // ✅ NEW: Rich metadata for modal display
-        screenshot: result?.screenshot,
-        screenshotBefore: result?.screenshotBefore,
-        screenshotAfter: result?.screenshotAfter,
+        // ✅ NEW: Rich metadata for modal display (without screenshots in real-time)
+        // Screenshots are excluded from real-time updates to reduce payload size
+        // They will be uploaded after test completion and replaced with public URLs
         domSnapshot: result?.domSnapshot,
         consoleLogs: result?.consoleLogs,
         networkRequests: result?.networkRequests,
@@ -276,6 +284,7 @@ export class GraphBuilder {
       value: url,
       meta: {
         icon: '🌐',
+        iconName: this.getIconName('goto', 'execution'),
         color: '#673AB7',
         pageType,
         timestamp: Date.now(),
@@ -348,6 +357,7 @@ export class GraphBuilder {
       meta: {
         color: success ? '#4CAF50' : '#F44336',
         icon: success ? '✅' : '❌',
+        iconName: this.getIconName(undefined, 'finalization'),
         success,
         summary,
         timestamp: Date.now(),

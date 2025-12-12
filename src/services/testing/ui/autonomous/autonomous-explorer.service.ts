@@ -140,7 +140,13 @@ export async function exploreProduct(options: {
     );
 
     // 8. Generate recommendations
-    const recommendations = generateTestRecommendations(visualAnalysis, domAnalysis, scope);
+    const recommendations = await generateTestRecommendations(
+      visualAnalysis,
+      domAnalysis,
+      scope,
+      finalUrl,
+      pageInfo.title
+    );
 
     // 9. Cleanup
     await cleanupBrowserResources(page, context);

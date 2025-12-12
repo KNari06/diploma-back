@@ -7,10 +7,10 @@
 import { logger } from '@/utils/logger';
 import {
   DynamicAction,
+  PageContext,
   SafetyCheckResult,
   SafetyConfig,
   TestState,
-  PageContext,
 } from './types/intelligent-testing.types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -52,6 +52,29 @@ export const DEFAULT_SAFETY_CONFIG: SafetyConfig = {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class SafetyGuard {
+  /**
+   * Check if target URL is within allowed domains.
+   * Uses hostname matching (exact or subdomain), not substring matching.
+   */
+  private static isAllowedDomain(targetUrl: string, allowedDomains: string[]): boolean {
+    try {
+      const urlObj = new URL(targetUrl);
+      let host = urlObj.hostname.toLowerCase();
+      if (host.startsWith('www.')) host = host.slice(4);
+
+      return allowedDomains.some((d) => {
+        let domain = String(d || '').toLowerCase().trim();
+        if (!domain) return false;
+        if (domain.startsWith('www.')) domain = domain.slice(4);
+        // exact match or subdomain match
+        return host === domain || host.endsWith(`.${domain}`);
+      });
+    } catch {
+      // If URL is malformed, be conservative
+      return false;
+    }
+  }
+
   /**
    * Check if action is safe to execute
    * @param action - Action to validate
@@ -325,9 +348,7 @@ export class SafetyGuard {
 
       // Check domain if allowedDomains is set
       if (config.allowedDomains.length > 0) {
-        const isAllowed = config.allowedDomains.some(domain =>
-          targetUrl.includes(domain.toLowerCase())
-        );
+        const isAllowed = this.isAllowedDomain(action.url, config.allowedDomains);
 
         if (!isAllowed) {
           logger.warn('[SAFETY_GUARD] Domain not in allowed list', {

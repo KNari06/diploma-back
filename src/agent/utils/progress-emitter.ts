@@ -4,6 +4,7 @@
  */
 
 import { logger } from '@/utils/logger';
+import { getActionIcon } from '@/websocket/types';
 import { webSocketService } from '@/websocket/websocket.service';
 
 interface EmitParams {
@@ -17,11 +18,13 @@ interface EmitParams {
   };
   completedSteps?: number;
   status?: string; // 'queued' | 'running' | 'completed' | 'failed'
+  icon?: string; // Icon name for frontend display
 }
 
 export class TestProgressEmitter {
   private testId: string;
   private browser: string;
+  private userId?: string;
   private startTime: number;
   private totalActions: number = 0;
   private lastLoggedPhase: string = '';
@@ -31,14 +34,16 @@ export class TestProgressEmitter {
   private lastEmitTime: number = 0;
   private EMIT_THROTTLE_MS: number = 300; // Min 300ms between emits
 
-  constructor(testId: string, browser: string) {
+  constructor(testId: string, browser: string, userId?: string) {
     this.testId = testId;
     this.browser = browser;
+    this.userId = userId;
     this.startTime = Date.now();
 
     logger.info('[PROGRESS] Test progress tracking started', {
       testId,
       browser,
+      userId,
     });
   }
 
@@ -107,6 +112,7 @@ export class TestProgressEmitter {
         progress,
         phase: params.phase,
         currentStep: params.currentStep,
+        icon: params.icon || getActionIcon(params.action?.type, params.phase),
         action: params.action,
         totalSteps: this.totalActions > 0 ? this.totalActions : undefined,
         completedSteps: params.completedSteps,
@@ -114,6 +120,7 @@ export class TestProgressEmitter {
         timestamp: new Date().toISOString(),
         elapsedTime,
         estimatedRemaining,
+        userId: this.userId,
       });
 
       // Update tracking state

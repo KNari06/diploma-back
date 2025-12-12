@@ -19,20 +19,42 @@ import { PageType } from '@/agent/types/intelligent-testing.types';
 
 /**
  * Build prompt for GPT-4 Vision to analyze page screenshot
+ * ✅ ENHANCED: Now includes DOM context for better understanding
  */
 export function buildPageAnalysisPrompt(params: {
   url: string;
   goal: string;
   previousContext?: string;
+  domContext?: {
+    formsCount: number;
+    buttonsCount: number;
+    inputsCount: number;
+    linksCount: number;
+    hasModals: boolean;
+    interactiveElementsCount: number;
+  };
 }): string {
+  const domContextSection = params.domContext
+    ? `
+- DOM STRUCTURE (for context) -
+Forms: ${params.domContext.formsCount}
+Buttons: ${params.domContext.buttonsCount}
+Inputs: ${params.domContext.inputsCount}
+Links: ${params.domContext.linksCount}
+Interactive Elements: ${params.domContext.interactiveElementsCount}
+Modals Detected: ${params.domContext.hasModals ? 'Yes' : 'No'}
+
+Note: Use this DOM context to better understand the page structure. Match visual elements you see with the DOM structure.
+`
+    : '';
+
   return `You are an expert QA engineer analyzing a web page screenshot.
 - CONTEXT -
 URL: ${params.url}
 Testing Goal: ${params.goal}
-${params.previousContext ? `Previous Context: ${params.previousContext}` : ''}
-
+${params.previousContext ? `Previous Context: ${params.previousContext}` : ''}${domContextSection}
 - TASK -
-Analyze this screenshot and provide detailed information.
+Analyze this screenshot and provide detailed information. Use the DOM context to better understand which elements are interactive and match visual elements with DOM structure.
 
 RESPONSE FORMAT (JSON):
 {

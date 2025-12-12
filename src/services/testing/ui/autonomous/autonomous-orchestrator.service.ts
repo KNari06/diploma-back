@@ -12,7 +12,7 @@ import { generateTestPlanFromExploration } from './helpers/test-plan-generator';
 
 /**
  * Autonomous testing workflow orchestrator
- * Handles the full flow from user request to test execution
+ * Handles the full platform test or defined test flow from user request to test execution
  *
  * ✅ ENHANCED: Integrates smart URL analysis and scope-specific guidance
  * ✅ REFACTORED: Split into smaller, readable helper modules

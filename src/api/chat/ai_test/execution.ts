@@ -1,17 +1,16 @@
-import { Response } from 'express';
-import { logger } from '@/utils/logger';
-import { confirmTestPlan } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
+import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
-import { ProjectContextService } from '@/services/utils/project-context.service';
-import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
+import { confirmTestPlan } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
+import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { webSocketService } from '@/websocket/websocket.service';
+import { ProjectContextService } from '@/services/utils/project-context.service';
+import { logger } from '@/utils/logger';
 import { ChatTestUpdatePayload } from '@/websocket/types';
-import { emitProcessingStep } from '../shared/utils';
-import { normalizeUrl } from '../shared/utils';
-import { supabaseAdmin } from '@/db/supabase';
+import { webSocketService } from '@/websocket/websocket.service';
+import { Response } from 'express';
+import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -161,69 +160,110 @@ export async function executeUiTestFlow(
     checkTimeout();
 
     // FIX #9: Wrap ManualTestService.runTest in try-catch
+    // ✅ IMPROVEMENT: Validate plan fields before use
+    const intelligentMode = plan.intelligentMode ?? true; // Default to true (all UI tests are intelligent)
+    const planCommands = Array.isArray(plan.commands) ? plan.commands : [];
+    const planScope = plan.scope || 'general';
+    const planSummary = plan.summary || 'Automated UI test';
+    const planEstimatedPages = plan.estimatedPages || '2-3 pages';
+
     let testCreated: any;
+    let actualTestId: string | null = null;
+
     try {
+      // ✅ IMPROVEMENT: Validate required fields before creating testRequest
+      if (!plan.url || typeof plan.url !== 'string' || plan.url.trim().length === 0) {
+        throw new Error('Invalid plan URL - URL is required and must be a non-empty string');
+      }
+
       const testRequest = {
-        url: plan.url,
+        url: plan.url.trim(),
         browsers: ['chrome' as const],
         projectId: project_id,
         userId,
         options: {},
-        commands: plan.commands,
-        intent: plan.scope,
-        intelligentMode: plan.intelligentMode,
-        testGoal: plan.intelligentMode ? plan.summary : undefined,
-        estimatedCost: plan.estimatedCost, // For dynamic credit calculation
+        commands: planCommands, // ✅ Safe: always array
+        intent: planScope, // ✅ Safe: always string
+        intelligentMode, // ✅ Safe: always boolean
+        testGoal: intelligentMode ? planSummary : undefined, // ✅ Safe: always string or undefined
+        estimatedCost: plan.estimatedCost, // Optional field
       };
+
       /// Here we run the main UI/UX manual test
       testCreated = await ManualTestService.runTest(testRequest);
 
-      if (!testCreated.success || !testCreated.data?.id) {
-        throw new Error('Test creation failed - no test ID returned');
+      // ✅ IMPROVEMENT: More thorough validation of response
+      if (!testCreated) {
+        throw new Error('ManualTestService.runTest returned null/undefined');
       }
+
+      if (!testCreated.success) {
+        throw new Error(`Test creation failed: ${testCreated.message || 'Unknown error'}`);
+      }
+
+      if (!testCreated.data || typeof testCreated.data !== 'object') {
+        throw new Error('Test creation failed - invalid response data structure');
+      }
+
+      if (!testCreated.data.id || typeof testCreated.data.id !== 'string') {
+        throw new Error('Test creation failed - no valid test ID returned');
+      }
+
+      actualTestId = testCreated.data.id;
+
     } catch (testError) {
       logger.error('[UI_TEST] ManualTestService.runTest failed', {
         error: testError instanceof Error ? testError.message : String(testError),
         url: plan.url,
+        // ✅ IMPROVEMENT: Log that credits were already deducted
+        note: 'Credits were deducted before test creation - they will not be refunded',
       });
+
+      // ✅ NOTE: Credits were already deducted (line 86), they are NOT refunded on failure
+      // This is intentional behavior - credits are spent for attempting to create the test
       throw new Error(`Failed to start test: ${testError instanceof Error ? testError.message : 'Unknown error'}`);
     }
 
+    // ✅ IMPROVEMENT: Type guard - ensure testId exists before using
+    if (!actualTestId) {
+      throw new Error('Test ID is missing after successful test creation');
+    }
+
     logger.info('✅ [UI_TEST] Test created successfully', {
-      testId: testCreated.data.id,
-      intelligentMode: plan.intelligentMode,
+      testId: actualTestId,
+      intelligentMode,
     });
 
     emitProcessingStep(chatSessionId, 'executing_test', '✅ Test started successfully!', 100);
 
     // Save test-chat mapping (non-blocking)
-    if (chatSessionId && userId) {
+    if (chatSessionId && userId && actualTestId) {
       TestChatMappingService.saveTestChatMapping({
-        testId: testCreated.data.id,
+        testId: actualTestId,
         chatSessionId,
         userId,
       }).catch(mappingError => {
         logger.error('[UI_TEST] Failed to save test-chat mapping', {
           error: mappingError instanceof Error ? mappingError.message : String(mappingError),
-          testId: testCreated.data.id,
+          testId: actualTestId,
         });
       });
     }
 
     // Emit WebSocket event (non-blocking)
-    if (chatSessionId) {
+    if (chatSessionId && actualTestId) {
       try {
-        const testModeMessage = plan.intelligentMode
+        const testModeMessage = intelligentMode
           ? '🤖 Intelligent test started! AI will autonomously explore and adapt to your site.'
           : '✅ Test started! Monitor progress in real-time.';
 
         const chatTestUpdatePayload: ChatTestUpdatePayload = {
           sessionId: chatSessionId,
-          testId: testCreated.data.id,
+          testId: actualTestId,
           message: testModeMessage,
           status: 'created',
           links: {
-            fullReport: `/api/v1/manual-test/${testCreated.data.id}/summary`,
+            fullReport: `/api/v1/manual-test/${actualTestId}/summary`,
           },
           timestamp: new Date().toISOString(),
         };
@@ -236,25 +276,24 @@ export async function executeUiTestFlow(
     }
 
     // Build success message
-    const testModeInfo = plan.intelligentMode
-      ? `\n\n🤖 **Mode:** Intelligent/Adaptive Testing\n📊 **Estimated:** ${plan.estimatedPages || '5-10 pages'}`
+    const testModeInfo = intelligentMode
+      ? `\n\n🤖 **Mode:** Intelligent/Adaptive Testing\n📊 **Estimated:** ${planEstimatedPages}`
       : '';
 
-    const successMessage = `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${testCreated.data.id}\n\nCheck status: GET /api/v1/manual-test/${testCreated.data.id}/status`;
+    const successMessage = `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${actualTestId}\n\nCheck status: GET /api/v1/manual-test/${actualTestId}/status`;
 
     // ✅ FIX: Test is considered "runned" if it was successfully created and added to queue
-    // If testCreated.data.id exists, the test was launched (added to queue), even if not yet completed
-    const isTestRunned = !!testCreated.data.id;
+    const isTestRunned = !!actualTestId;
 
     // FIX #11: Make chat save non-blocking (fire-and-forget)
-    if (chatSessionId) {
+    if (chatSessionId && actualTestId) {
       ChatService.saveChatMessages(chatSessionId, [
-        { role: 'user', content: userMessage }, // FIX #14: Use actual user message
+        { role: 'user', content: userMessage || 'Approved test execution' }, // ✅ IMPROVEMENT: Fallback for userMessage
         {
           role: 'ai',
           content: successMessage,
           metadata: {
-            testId: testCreated.data.id,
+            testId: actualTestId,
             testMode: 'intelligent', // ✅ UPDATED: All UI tests are intelligent mode
             is_test_runned: isTestRunned, // ✅ NEW: Flag indicating if test is completed/failed
           },
@@ -267,17 +306,25 @@ export async function executeUiTestFlow(
       });
     }
 
+    // ✅ IMPROVEMENT: Check if response already sent before sending
+    if (res.headersSent) {
+      logger.warn('[UI_TEST] Response already sent, cannot send success response', {
+        testId: actualTestId,
+      });
+      return;
+    }
+
     // Send response immediately (don't wait for chat save)
     res.json({
       success: true, // ← Frontend expects this!
       reply: successMessage,
-      testId: testCreated.data.id,
+      testId: actualTestId,
       timestamp: new Date().toISOString(),
       sessionId: chatSessionId,
     });
 
     logger.info('✅ [UI_TEST] HTTP response sent successfully', {
-      testId: testCreated.data.id,
+      testId: actualTestId,
       duration: Date.now() - flowStartTime,
     });
   } catch (error) {

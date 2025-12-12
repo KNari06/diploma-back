@@ -100,6 +100,7 @@ export interface TestProgressPayload {
   progress: number; // 0-100
   phase: string; // 'initialization' | 'analysis' | 'planning' | 'execution' | 'finalization'
   currentStep?: string;
+  icon?: string; // Icon name for frontend display (e.g., 'click', 'fill', 'navigate', 'wait', etc.)
   action?: {
     type: string; // 'click' | 'fill' | 'navigate' | etc.
     description: string;
@@ -391,3 +392,152 @@ export const createRoomName = (type: RoomType, id: string): string => {
 
   return `${type}:${id.trim()}`;
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ICON UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get icon name for action type
+ * Returns string identifier that frontend can use to display appropriate icon
+ */
+export function getActionIcon(actionType?: string, phase?: string): string | undefined {
+  if (!actionType && !phase) {
+    return undefined;
+  }
+
+  // If action type is provided, use it
+  if (actionType) {
+    const actionIconMap: Record<string, string> = {
+      // Navigation
+      goto: 'navigate',
+      goBack: 'go-back',
+      goForward: 'go-forward',
+      reload: 'reload',
+      // Interactions
+      click: 'click',
+      dblclick: 'double-click',
+      fill: 'fill',
+      type: 'type',
+      select: 'select',
+      selectOption: 'select',
+      check: 'check',
+      uncheck: 'uncheck',
+      hover: 'hover',
+      press: 'press',
+      focus: 'focus',
+      blur: 'blur',
+      // Touch/Mobile
+      dragAndDrop: 'drag-drop',
+      swipe: 'swipe',
+      tap: 'tap',
+      // Wait & Scroll
+      wait: 'wait',
+      waitForSelector: 'wait-selector',
+      waitForTimeout: 'wait',
+      waitForLoadState: 'wait',
+      waitForNavigation: 'wait-navigation',
+      scroll: 'scroll',
+      scrollIntoView: 'scroll-into-view',
+      // File operations
+      upload: 'upload',
+      download: 'download',
+      screenshot: 'screenshot',
+      // Assertions
+      assertVisible: 'assert-visible',
+      assertHidden: 'assert-hidden',
+      assertEnabled: 'assert-enabled',
+      assertDisabled: 'assert-disabled',
+      assertText: 'assert-text',
+      assertValue: 'assert-value',
+      assertUrl: 'assert-url',
+      assertCount: 'assert-count',
+      assert: 'assert',
+      expect: 'assert',
+      // Data extraction
+      extract: 'extract',
+      evaluate: 'evaluate',
+    };
+
+    return actionIconMap[actionType] || 'action';
+  }
+
+  // If only phase is provided, map phase to icon
+  if (phase) {
+    const phaseIconMap: Record<string, string> = {
+      initialization: 'initialization',
+      analysis: 'analysis',
+      planning: 'planning',
+      generation: 'generation',
+      execution: 'execution',
+      finalization: 'finalization',
+    };
+
+    return phaseIconMap[phase] || 'default';
+  }
+
+  return undefined;
+}
+
+/**
+ * Get emoji for action type (for text display in logs/UI)
+ * Uses the same action types as getActionIcon for consistency
+ */
+export function getActionEmoji(actionType?: string): string {
+  if (!actionType) {
+    return '🔄';
+  }
+
+  const emojiMap: Record<string, string> = {
+    // Navigation
+    goto: '🌐',
+    goBack: '⬅️',
+    goForward: '➡️',
+    reload: '🔄',
+    // Interactions
+    click: '👆',
+    dblclick: '👆👆',
+    fill: '✍️',
+    type: '⌨️',
+    select: '📋',
+    selectOption: '📋',
+    check: '✅',
+    uncheck: '☑️',
+    hover: '🖱️',
+    press: '⌨️',
+    focus: '🎯',
+    blur: '👁️',
+    // Touch/Mobile
+    dragAndDrop: '↔️',
+    swipe: '👆',
+    tap: '👆',
+    // Wait & Scroll
+    wait: '⏱️',
+    waitForSelector: '⏱️',
+    waitForTimeout: '⏱️',
+    waitForLoadState: '⏱️',
+    waitForNavigation: '⏱️',
+    scroll: '📜',
+    scrollIntoView: '📜',
+    // File operations
+    upload: '📤',
+    download: '📥',
+    screenshot: '📸',
+    // Assertions
+    assertVisible: '👁️',
+    assertHidden: '🙈',
+    assertEnabled: '✅',
+    assertDisabled: '❌',
+    assertText: '📝',
+    assertValue: '💾',
+    assertUrl: '🔗',
+    assertCount: '🔢',
+    assert: '✓',
+    expect: '✓',
+    // Data extraction
+    extract: '📊',
+    evaluate: '🔍',
+  };
+
+  return emojiMap[actionType] || '🔄';
+}
