@@ -1,0 +1,3 @@
+{
+  "description": "The Chat Flow handles all user messages sent to POST /api/v1/chat. It includes input validation, intent parsing, routing to appropriate handlers (api_test, platform_test, general_chat), and response generation. Key steps: Input Validation → Workspace Check → Session Management → Intent Parsing → Handler Execution → Response."
+}

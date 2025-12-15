@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Features Documentation - QAI Backend</title>
+    <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Features Documentation</h1>
+            <p>Complete visualization of all features with automatic diagram updates</p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="number" id="totalFeatures">8</div>
+                <div class="label">Total Features</div>
+            </div>
+            <div class="stat-card">
+                <div class="number" id="lastUpdated">-</div>
+                <div class="label">Last Updated</div>
+            </div>
+            <div class="stat-card">
+                <div class="number" id="totalMethods">-</div>
+                <div class="label">Total Methods</div>
+            </div>
+            <div class="stat-card">
+                <div class="number" id="changedThisWeek">-</div>
+                <div class="label">Changed This Week</div>
+            </div>
+        </div>
+
+        <div class="content">
+            <div class="search-section">
+                <input type="text" class="search-box" id="searchBox" placeholder="🔍 Search features...">
+        <div class="filters">
+            <button class="filter-btn active" onclick="filterFeatures('all', event)">All</button>
+            <button class="filter-btn" onclick="filterFeatures('core', event)">Core</button>
+            <button class="filter-btn" onclick="filterFeatures('api', event)">API</button>
+            <button class="filter-btn" onclick="filterFeatures('ai', event)">AI</button>
+        </div>
+            </div>
+
+            <div class="features-grid" id="featuresGrid">
+                <!-- Features will be inserted here by JavaScript -->
+            </div>
+        </div>
+    </div>
+
+    <script src="assets/app.js"></script>
+</body>
+</html>

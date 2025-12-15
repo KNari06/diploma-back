@@ -15,14 +15,28 @@ export async function analyzeScreenshotWithVision(
     url: string;
   }
 ): Promise<{
+  // Core fields (backward compatible)
   elements: Array<{
     type: string;
     purpose: string;
+    text: string;
     location: string;
-    required?: boolean;
+    required: boolean;
+    priority: string;
+    isCTA?: boolean;
   }>;
   layout: string;
   suggestions: string[];
+  // Enhanced fields (new)
+  pageType?: string;
+  description?: string;
+  warnings?: string[];
+  modals?: Array<{
+    type: string;
+    description: string;
+    hasCloseButton: boolean;
+    closeButtonText: string | null;
+  }>;
 }> {
   try {
     logger.info('Analyzing screenshot with GPT-4o Vision', {
@@ -68,15 +82,39 @@ export async function analyzeScreenshotWithVision(
 
     const parsed = JSON.parse(content);
 
+    // ✅ ENHANCED: Validate and sanitize Vision analysis response (matching intelligent-page-analyzer.ts)
+    const validatedElements = (parsed.elements || []).filter((el: any) => {
+      // Filter out invalid elements
+      return el && typeof el === 'object' && el.type && el.purpose;
+    }).map((el: any) => ({
+      type: el.type || 'other',
+      purpose: el.purpose || '',
+      text: el.text || '',
+      location: el.location || '',
+      required: el.required || false,
+      priority: el.priority || 'medium',
+      isCTA: el.isCTA === true ? true : undefined,
+    }));
+
     logger.info('Screenshot analysis completed', {
-      elementsFound: parsed.elements?.length || 0,
+      elementsFound: validatedElements.length,
       suggestionsCount: parsed.suggestions?.length || 0,
+      pageType: parsed.pageType || 'unknown',
+      warningsCount: parsed.warnings?.length || 0,
+      modalsCount: parsed.modals?.length || 0,
     });
 
+    // Return enhanced structure with backward compatibility
     return {
-      elements: parsed.elements || [],
-      layout: parsed.layout || 'Unknown layout',
+      // Core fields (backward compatible)
+      elements: validatedElements,
+      layout: parsed.layout || parsed.description || 'Unknown layout',
       suggestions: parsed.suggestions || [],
+      // Enhanced fields (new)
+      pageType: parsed.pageType || 'unknown',
+      description: parsed.description || parsed.layout || 'No description',
+      warnings: parsed.warnings || [],
+      modals: (parsed.modals || []).filter((modal: any) => modal && typeof modal === 'object'),
     };
   } catch (error) {
     logger.error('Vision analysis failed', { error });
@@ -86,6 +124,10 @@ export async function analyzeScreenshotWithVision(
       elements: [],
       layout: 'Could not analyze layout',
       suggestions: ['Perform manual visual inspection'],
+      pageType: 'unknown',
+      description: 'Vision analysis failed',
+      warnings: ['Vision analysis failed'],
+      modals: [],
     };
   }
 }

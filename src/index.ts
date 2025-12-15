@@ -186,6 +186,45 @@ app.get('/api/docs.json', (req: express.Request, res: express.Response) => {
   res.send(swaggerSpec);
 });
 
+// Features documentation (password protected)
+import { docsLogin, docsLogout, requireDocsAuth } from '@/middleware/docs-auth.middleware';
+import path from 'path';
+
+// Get correct path for static files (works in both dev and production)
+const getDocsPath = () => {
+  // In production, __dirname points to dist/
+  // In development, we need to go up from dist/ to root
+  const isProduction = process.env.NODE_ENV === 'production';
+  if (isProduction) {
+    // In production: dist/ -> root -> docs/features
+    return path.join(__dirname, '../../docs/features');
+  } else {
+    // In development: dist/ -> root -> docs/features (same)
+    return path.join(process.cwd(), 'docs/features');
+  }
+};
+
+const docsPath = getDocsPath();
+
+// Login/logout routes for documentation
+app.post('/api/features/login', express.urlencoded({ extended: true }), docsLogin);
+app.post('/api/features/logout', docsLogout);
+
+// Serve features documentation with password protection
+app.use('/api/features', requireDocsAuth, express.static(docsPath, {
+  index: 'index.html',
+  extensions: ['html'],
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  },
+}));
+
+// Redirect root /api/features to index
+app.get('/api/features', requireDocsAuth, (req: express.Request, res: express.Response) => {
+  const indexPath = path.join(docsPath, 'index.html');
+  res.sendFile(indexPath);
+});
+
 /**
  * @swagger
  * /health:

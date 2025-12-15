@@ -114,6 +114,10 @@ export async function analyzePageWithAI(
         elements: [],
         layout: 'unknown',
         suggestions: [],
+        pageType: 'unknown',
+        description: 'Vision analysis failed',
+        warnings: ['Vision analysis failed'],
+        modals: [],
       };
 
   const domAnalysis = domResult.status === 'fulfilled'

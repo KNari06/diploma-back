@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Flow - Features Documentation</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <style>
+        .feature-page { padding: 40px; }
+        .section { margin-bottom: 50px; }
+        .section-title { font-size: 2em; margin-bottom: 20px; color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 10px; }
+        .overview { background: #f8f9fa; padding: 25px; border-radius: 12px; margin-bottom: 30px; }
+        .diagram-container { background: #f8f9fa; padding: 30px; border-radius: 12px; margin-bottom: 40px; overflow-x: auto; }
+        .mermaid { background: white; padding: 20px; border-radius: 8px; }
+        .back-link { display: inline-block; margin-bottom: 20px; color: #667eea; text-decoration: none; font-weight: 500; }
+        .back-link:hover { text-decoration: underline; }
+        .event-card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #667eea; }
+        .event-name { font-weight: bold; color: #667eea; margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔌 WebSocket Flow</h1>
+            <p>Real-time connections, events, and updates for test progress and graph visualization</p>
+        </div>
+        <div class="feature-page">
+            <a href="../../index.html" class="back-link">← Back to Features</a>
+
+            <div class="section">
+                <h2 class="section-title">📋 Overview</h2>
+                <div class="overview">
+                    <p>WebSocket system provides real-time communication for test progress updates, graph visualization, and live status updates.</p>
+                    <p><strong>Architecture:</strong></p>
+                    <ul>
+                        <li><strong>Main Process:</strong> Emits directly via WebSocket</li>
+                        <li><strong>Worker Process:</strong> Publishes to Redis Pub/Sub → Main Process → WebSocket</li>
+                        <li>Socket.IO with typed events</li>
+                        <li>Authentication middleware for secure connections</li>
+                        <li>Room-based event routing (user rooms, test rooms)</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 WebSocket Connection Flow</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Start([Client Connects]) --> ExtractToken[Extract Auth Token]
+    ExtractToken --> AuthMiddleware[authenticateSocket Middleware]
+
+    AuthMiddleware --> ValidateToken[Validate JWT Token]
+    ValidateToken -->|Invalid| RejectConnection[Reject Connection]
+    ValidateToken -->|Valid| GetUser[Get User Data]
+
+    GetUser --> AttachUserData[Attach User to Socket Data]
+    AttachUserData --> EmitAuthenticated[Emit 'authenticated' Event]
+    EmitAuthenticated --> JoinUserRoom[Join user:userId Room]
+
+    JoinUserRoom --> SetupHandlers[Setup Event Handlers]
+    SetupHandlers --> HandleSubscriptions[handleSubscriptions]
+    SetupHandlers --> HandleHeartbeat[handleHeartbeat]
+
+    HandleSubscriptions --> SubscribeTest[Subscribe to Test Events]
+    SubscribeTest --> JoinTestRoom[Join test:testId Room]
+
+    HandleHeartbeat --> SetupPing[Setup Ping/Pong]
+    SetupPing --> Connected([✅ Connected])
+
+    RejectConnection --> End([End])
+    Connected --> ListenEvents[Listen for Events]
+
+    ListenEvents --> TestProgress[test:progress]
+    ListenEvents --> TestCompleted[test:completed]
+    ListenEvents --> TestFailed[test:failed]
+    ListenEvents --> GraphUpdate[test:graph_update]
+    ListenEvents --> ChatMessage[chat:message]
+
+    style AuthMiddleware fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style ValidateToken fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style JoinUserRoom fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style JoinTestRoom fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style Connected fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📡 Event Emission Flow</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    EventSource{Event Source?}
+
+    EventSource -->|Main Process| MainProcess[WebSocketService.emit]
+    EventSource -->|Worker Process| WorkerProcess[Worker Process]
+
+    MainProcess --> CheckReady{WebSocket Ready?}
+    CheckReady -->|Yes| DirectEmit[Emit Directly via WebSocket]
+    CheckReady -->|No| RedisFallback[Publish to Redis Pub/Sub]
+
+    WorkerProcess --> RedisPublish[Publish to Redis Channel]
+    RedisPublish --> RedisChannel[Redis: websocket:events]
+
+    RedisChannel --> RedisSubscriber[Redis Subscriber in Main Process]
+    RedisSubscriber --> RouteEvent[Route Event to Handler]
+    RouteEvent --> DirectEmit
+
+    DirectEmit --> GetIO[Get Socket.IO Instance]
+    GetIO --> FindRooms[Find Target Rooms]
+    FindRooms --> RoomType{Room Type?}
+
+    RoomType -->|User Room| UserRoom[user:userId]
+    RoomType -->|Test Room| TestRoom[test:testId]
+    RoomType -->|Session Room| SessionRoom[session:sessionId]
+    RoomType -->|Broadcast| Broadcast[All Connected Clients]
+
+    UserRoom --> EmitToRoom[Emit to Room]
+    TestRoom --> EmitToRoom
+    SessionRoom --> EmitToRoom
+    Broadcast --> EmitToRoom
+
+    EmitToRoom --> ClientReceives([Client Receives Event])
+
+    style MainProcess fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style WorkerProcess fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style RedisPublish fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style RedisSubscriber fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style EmitToRoom fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📨 WebSocket Events</h2>
+
+                <div class="event-card">
+                    <div class="event-name">authenticated</div>
+                    <p>Sent when client successfully authenticates</p>
+                    <p><strong>Payload:</strong> { userId, isAnonymous, timestamp }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">test:created</div>
+                    <p>Test was created</p>
+                    <p><strong>Payload:</strong> { testId, userId, type, status }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">test:started</div>
+                    <p>Test execution started</p>
+                    <p><strong>Payload:</strong> { testId, startedAt }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">test:progress</div>
+                    <p>Test progress update</p>
+                    <p><strong>Payload:</strong> { testId, progress, currentStep, totalSteps }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">test:step_completed</div>
+                    <p>Test step completed</p>
+                    <p><strong>Payload:</strong> { testId, step, result }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">test:graph_update</div>
+                    <p>Graph visualization update</p>
+                    <p><strong>Payload:</strong> { testId, graph, nodes, edges }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">test:completed</div>
+                    <p>Test execution completed</p>
+                    <p><strong>Payload:</strong> { testId, result, duration, summary }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">test:failed</div>
+                    <p>Test execution failed</p>
+                    <p><strong>Payload:</strong> { testId, error, reason }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">test:cancelled</div>
+                    <p>Test was cancelled</p>
+                    <p><strong>Payload:</strong> { testId, reason }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">test:browser_completed</div>
+                    <p>Browser test completed</p>
+                    <p><strong>Payload:</strong> { testId, browser, result }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">ai:analysis_started</div>
+                    <p>AI analysis started</p>
+                    <p><strong>Payload:</strong> { testId, analysisType }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">ai:analysis_progress</div>
+                    <p>AI analysis progress</p>
+                    <p><strong>Payload:</strong> { testId, progress, stage }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">ai:analysis_completed</div>
+                    <p>AI analysis completed</p>
+                    <p><strong>Payload:</strong> { testId, result, insights }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">ai:bug_found</div>
+                    <p>AI found a bug</p>
+                    <p><strong>Payload:</strong> { testId, bug, severity, location }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">chat:message</div>
+                    <p>Chat message update</p>
+                    <p><strong>Payload:</strong> { sessionId, message, role }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">result:ready</div>
+                    <p>Test result ready</p>
+                    <p><strong>Payload:</strong> { testId, result, url }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">result:screenshot</div>
+                    <p>Screenshot captured</p>
+                    <p><strong>Payload:</strong> { testId, screenshot, url }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">result:error</div>
+                    <p>Error occurred</p>
+                    <p><strong>Payload:</strong> { testId, error, stack }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">system:error</div>
+                    <p>System error</p>
+                    <p><strong>Payload:</strong> { error, message, timestamp }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">system:maintenance</div>
+                    <p>Maintenance mode</p>
+                    <p><strong>Payload:</strong> { message, estimatedDuration }</p>
+                </div>
+
+                <div class="event-card">
+                    <div class="event-name">ping / pong</div>
+                    <p>Heartbeat mechanism</p>
+                    <p>Client sends ping, server responds with pong</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🏗️ Architecture</h2>
+                <div class="overview">
+                    <p><strong>Server:</strong> src/websocket/server.ts - Socket.IO server initialization</p>
+                    <p><strong>Service:</strong> src/websocket/websocket.service.ts - Singleton service for emitting events</p>
+                    <p><strong>Middleware:</strong> src/websocket/middleware.ts - Authentication middleware</p>
+                    <p><strong>Handlers:</strong> src/websocket/handlers/ - Connection, subscription, heartbeat handlers</p>
+                    <p><strong>Redis Bridge:</strong> src/services/websocket/redis-bridge.service.ts - Redis Pub/Sub bridge</p>
+                    <p><strong>Types:</strong> src/websocket/types.ts - Typed events and payloads</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>

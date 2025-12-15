@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Packages System - Features Documentation</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <style>
+        .feature-page { padding: 40px; }
+        .section { margin-bottom: 50px; }
+        .section-title { font-size: 2em; margin-bottom: 20px; color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 10px; }
+        .overview { background: #f8f9fa; padding: 25px; border-radius: 12px; margin-bottom: 30px; }
+        .diagram-container { background: #f8f9fa; padding: 30px; border-radius: 12px; margin-bottom: 40px; overflow-x: auto; }
+        .mermaid { background: white; padding: 20px; border-radius: 8px; }
+        .back-link { display: inline-block; margin-bottom: 20px; color: #667eea; text-decoration: none; font-weight: 500; }
+        .back-link:hover { text-decoration: underline; }
+        .package-card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #667eea; }
+        .package-name { font-weight: bold; color: #667eea; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📦 Packages System</h1>
+            <p>Package structure, dependencies, imports/exports, and module organization</p>
+        </div>
+        <div class="feature-page">
+            <a href="../../index.html" class="back-link">← Back to Features</a>
+
+            <div class="section">
+                <h2 class="section-title">📋 Overview</h2>
+                <div class="overview">
+                    <p>Packages system manages module structure, dependencies, and imports/exports across the codebase.</p>
+                    <p><strong>Key Features:</strong></p>
+                    <ul>
+                        <li>Organized by feature/domain</li>
+                        <li>Centralized exports via index files</li>
+                        <li>Type-safe imports with path aliases</li>
+                        <li>Clear separation of concerns</li>
+                        <li>Reusable utilities and services</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Package Structure</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Root[src/] --> Agent[agent/]
+    Root --> API[api/]
+    Root --> Services[services/]
+    Root --> AI[ai/]
+    Root --> WebSocket[websocket/]
+    Root --> Utils[utils/]
+    Root --> Types[types/]
+    Root --> Config[config/]
+    Root --> Middleware[middleware/]
+
+    Agent --> AgentCore[Core Services]
+    Agent --> AgentPlaywright[playwright/]
+    Agent --> AgentTypes[types/]
+    Agent --> AgentUtils[utils/]
+
+    API --> APIAuth[auth/]
+    API --> APIChat[chat/]
+    API --> APITest[apiTest/]
+    API --> APIIntelligent[intelligentTest/]
+    API --> APIUser[user/]
+    API --> APIProject[project/]
+
+    Services --> ServicesAI[ai/]
+    Services --> ServicesCore[core/]
+    Services --> ServicesTesting[testing/]
+    Services --> ServicesWebSocket[websocket/]
+    Services --> ServicesAuth[auth/]
+
+    AI --> AIPrompts[prompts/]
+    AIPrompts --> PromptsIntent[intent-and-chat-prompts.ts]
+    AIPrompts --> PromptsTest[test-plan-prompts.ts]
+    AIPrompts --> PromptsIntelligent[intelligent-testing-prompts.ts]
+    AIPrompts --> PromptsIndex[index.ts]
+
+    WebSocket --> WSServer[server.ts]
+    WebSocket --> WSService[websocket.service.ts]
+    WebSocket --> WSHandlers[handlers/]
+    WebSocket --> WSTypes[types.ts]
+
+    style Root fill:#e1f5ff,stroke:#01579b,stroke-width:3px
+    style Agent fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style API fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style Services fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style AI fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📁 Main Packages</h2>
+
+                <div class="package-card">
+                    <div class="package-name">agent/</div>
+                    <p><strong>Purpose:</strong> Intelligent testing agent and orchestration</p>
+                    <p><strong>Key Files:</strong></p>
+                    <ul>
+                        <li>intelligent-test-orchestrator.ts - Main orchestrator</li>
+                        <li>intelligent-page-analyzer.ts - Page analysis</li>
+                        <li>contextual-action-generator.ts - Action generation</li>
+                        <li>pre-action-analyzer.ts - Pre-action analysis</li>
+                        <li>post-action-analyzer.ts - Post-action analysis</li>
+                        <li>playwright/ - Playwright integration</li>
+                    </ul>
+                </div>
+
+                <div class="package-card">
+                    <div class="package-name">api/</div>
+                    <p><strong>Purpose:</strong> REST API endpoints and controllers</p>
+                    <p><strong>Structure:</strong> Each feature has its own folder with controller and route files</p>
+                    <p><strong>Examples:</strong> auth/, chat/, apiTest/, intelligentTest/, user/, project/</p>
+                </div>
+
+                <div class="package-card">
+                    <div class="package-name">services/</div>
+                    <p><strong>Purpose:</strong> Business logic and reusable services</p>
+                    <p><strong>Sub-packages:</strong></p>
+                    <ul>
+                        <li>ai/ - AI services (vision, embeddings, etc.)</li>
+                        <li>core/ - Core services (credits, pricing, etc.)</li>
+                        <li>testing/ - Testing services (UI, API, etc.)</li>
+                        <li>websocket/ - WebSocket bridge</li>
+                        <li>auth/ - Authentication services</li>
+                    </ul>
+                </div>
+
+                <div class="package-card">
+                    <div class="package-name">ai/prompts/</div>
+                    <p><strong>Purpose:</strong> Centralized AI prompts</p>
+                    <p><strong>Files:</strong></p>
+                    <ul>
+                        <li>index.ts - Central export</li>
+                        <li>intent-and-chat-prompts.ts - Intent parsing, chat</li>
+                        <li>test-plan-prompts.ts - Test plan generation</li>
+                        <li>intelligent-testing-prompts.ts - Intelligent testing prompts</li>
+                    </ul>
+                </div>
+
+                <div class="package-card">
+                    <div class="package-name">websocket/</div>
+                    <p><strong>Purpose:</strong> Real-time communication</p>
+                    <p><strong>Files:</strong></p>
+                    <ul>
+                        <li>server.ts - Socket.IO server setup</li>
+                        <li>websocket.service.ts - Event emission service</li>
+                        <li>handlers/ - Connection, subscription handlers</li>
+                        <li>types.ts - Typed events</li>
+                    </ul>
+                </div>
+
+                <div class="package-card">
+                    <div class="package-name">utils/</div>
+                    <p><strong>Purpose:</strong> Utility functions</p>
+                    <p><strong>Files:</strong></p>
+                    <ul>
+                        <li>logger.ts - Logging utility</li>
+                        <li>error-handler.ts - Error handling</li>
+                        <li>validation.ts - Validation helpers</li>
+                        <li>playwrightParser.ts - Playwright code parsing</li>
+                    </ul>
+                </div>
+
+                <div class="package-card">
+                    <div class="package-name">types/</div>
+                    <p><strong>Purpose:</strong> TypeScript type definitions</p>
+                    <p><strong>Files:</strong></p>
+                    <ul>
+                        <li>index.ts - Main types export</li>
+                        <li>playwright.types.ts - Playwright types</li>
+                        <li>notifications.types.ts - Notification types</li>
+                    </ul>
+                </div>
+
+                <div class="package-card">
+                    <div class="package-name">config/</div>
+                    <p><strong>Purpose:</strong> Configuration files</p>
+                    <p><strong>Files:</strong></p>
+                    <ul>
+                        <li>env.ts - Environment variables</li>
+                        <li>queues.ts - Queue configuration</li>
+                        <li>swagger.ts - Swagger/OpenAPI config</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔗 Import Patterns</h2>
+                <div class="overview">
+                    <p><strong>Path Aliases:</strong> Configured in tsconfig.json</p>
+                    <ul>
+                        <li><code>@/</code> - Points to src/</li>
+                        <li><code>@/api/</code> - API routes</li>
+                        <li><code>@/services/</code> - Services</li>
+                        <li><code>@/utils/</code> - Utilities</li>
+                        <li><code>@/types/</code> - Types</li>
+                    </ul>
+                    <p><strong>Example Imports:</strong></p>
+                    <pre><code>import { logger } from '@/utils/logger';
+import { UserCreditsService } from '@/services/core/user-credits.service';
+import { Prompts } from '@/ai/prompts';
+import { AuthUser } from '@/types';</code></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>

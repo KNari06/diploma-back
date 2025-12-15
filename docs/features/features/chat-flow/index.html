@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat Flow - Features Documentation</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <style>
+        .feature-page { padding: 40px; }
+        .section { margin-bottom: 50px; }
+        .section-title { font-size: 2em; margin-bottom: 20px; color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 10px; }
+        .overview { background: #f8f9fa; padding: 25px; border-radius: 12px; margin-bottom: 30px; }
+        .diagram-container { background: #f8f9fa; padding: 30px; border-radius: 12px; margin-bottom: 40px; overflow-x: auto; }
+        .mermaid { background: white; padding: 20px; border-radius: 8px; }
+        .back-link { display: inline-block; margin-bottom: 20px; color: #667eea; text-decoration: none; font-weight: 500; }
+        .back-link:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>💬 Chat Flow (POST /api/v1/chat)</h1>
+            <p>Complete flow of message processing from user input to AI response</p>
+        </div>
+        <div class="feature-page">
+            <a href="../../index.html" class="back-link">← Back to Features</a>
+            <div class="section">
+                <h2 class="section-title">📋 Overview</h2>
+                <div class="overview">
+                    <p>The Chat Flow handles all user messages sent to POST /api/v1/chat. It includes input validation, intent parsing, routing to appropriate handlers (api_test, platform_test, general_chat), and response generation.</p>
+                    <p>Key steps: Input Validation → Workspace Check → Session Management → Intent Parsing → Handler Execution → Response.</p>
+                </div>
+            </div>
+            <div class="section">
+                <h2 class="section-title">📊 Flow Diagram</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Start([POST /api/v1/chat]) --> AuthMiddleware[requireAuth Middleware]
+    AuthMiddleware --> ValidateSchema[Validate Request Schema]
+    ValidateSchema -->|Invalid| Return400[Return 400 Bad Request]
+    ValidateSchema -->|Valid| HandleChat[handleChat Controller]
+
+    HandleChat --> SetupTimeout[Setup Request Timeout]
+    SetupTimeout --> SetupConnectionCheck[Setup Connection Check]
+    SetupConnectionCheck --> TryBlock[Try Block]
+
+    TryBlock --> CheckConnection1[checkConnection]
+    CheckConnection1 -->|Closed| ThrowConnectionError[throw Error: Connection closed]
+    CheckConnection1 -->|OK| Step0[STEP 0: validateInput]
+
+    Step0 --> CheckInput{Input Valid?}
+    CheckInput -->|No| Return400Step0[Return 400 - Response sent]
+    CheckInput -->|Yes| ExtractData[Extract: userId, message, context, sessionId]
+    ExtractData --> CheckTimeout1[checkRequestTimeout]
+
+    CheckTimeout1 --> Step1[STEP 1: checkWorkspace]
+    Step1 --> CheckTimeout2[checkRequestTimeout]
+    CheckTimeout2 --> Step2[STEP 2: manageChatSession]
+    Step2 --> CheckTimeout3[checkRequestTimeout]
+
+    CheckTimeout3 --> Step2_2[STEP 2.2: hasActiveRequest?]
+    Step2_2 -->|Yes| Return409[Return 409 Conflict - Request in progress]
+    Step2_2 -->|No| Step2_3[STEP 2.3: registerActiveRequest]
+
+    Step2_3 --> GetAbortSignal[Get AbortSignal]
+    GetAbortSignal --> CheckAborted1[checkRequestAborted]
+    CheckAborted1 -->|Aborted| ThrowAborted[throw Error: Request cancelled]
+    CheckAborted1 -->|OK| Step3[STEP 3: checkPendingApproval]
+
+    Step3 --> ApprovalHandled{Approval Handled?}
+    ApprovalHandled -->|Yes| Unregister1[unregisterActiveRequest]
+    Unregister1 --> ReturnApproval[Return - Response sent]
+    ApprovalHandled -->|No| CheckAborted2[checkRequestAborted]
+
+    CheckAborted2 --> Step4[STEP 4: parseIntent]
+    Step4 --> CheckTimeout4[checkRequestTimeout]
+    CheckTimeout4 --> CheckAborted3[checkRequestAborted]
+
+    CheckAborted3 --> Step5[STEP 5: routeToHandler]
+    Step5 --> EmitRouting[emitProcessingStep: Processing request]
+    EmitRouting --> CheckAborted4[checkRequestAborted]
+
+    CheckAborted4 --> IntentCheck{Intent Type?}
+
+    IntentCheck -->|needs_clarification| HandleClarification[handleClarificationRequest]
+    IntentCheck -->|platform_test| HandlePlatform[handlePlatformTest]
+    IntentCheck -->|api_test| HandleApi[handleApiTest]
+    IntentCheck -->|general_chat| HandleGeneral[handleGeneralChat]
+
+    HandleClarification --> SaveHistory1[Save to Chat History]
+    HandlePlatform --> SaveHistory2[Save to Chat History]
+    HandleApi --> SaveHistory3[Save to Chat History]
+    HandleGeneral --> SaveHistory4[Save to Chat History]
+
+    SaveHistory1 --> Unregister2[unregisterActiveRequest]
+    SaveHistory2 --> Unregister2
+    SaveHistory3 --> Unregister2
+    SaveHistory4 --> Unregister2
+
+    Unregister2 --> ReturnSuccess[Return 200 Success]
+
+    TryBlock -->|Exception| CatchBlock[Catch Block]
+    CatchBlock --> CheckErrorType{Error Type?}
+
+    CheckErrorType -->|Timeout| ReturnTimeout[Return 500: Request timeout]
+    CheckErrorType -->|Aborted| Return499[Return 499: Request cancelled]
+    CheckErrorType -->|Connection Closed| ReturnConnectionError[Return 500: Connection closed]
+    CheckErrorType -->|Other| LogError[Log Error]
+
+    LogError --> Unregister3[unregisterActiveRequest]
+    Unregister3 --> Return500[Return 500: Internal Server Error]
+
+    Return400 --> End([End])
+    Return400Step0 --> End
+    Return409 --> End
+    ReturnApproval --> End
+    ReturnSuccess --> End
+    ReturnTimeout --> End
+    Return499 --> End
+    ReturnConnectionError --> End
+    Return500 --> End
+
+    ThrowConnectionError --> CatchBlock
+    ThrowAborted --> CatchBlock
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>

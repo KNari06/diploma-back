@@ -492,64 +492,58 @@ export function buildNextStepPrompt(params: {
   visitedPages: string[];
   errors: string[];
 }): string {
-  return `You are an expert QA engineer deciding the next step in testing.
+  return `You are an expert QA engineer deciding the next step in an autonomous UI test.
+Your goal is to make progress reliably with minimal risk and minimal redundant steps.
 
 --- CONTEXT ---
 Testing Goal: ${params.goal}
-Current Page: ${params.currentPage}
-Visited Pages: ${params.visitedPages.join(' → ')}
+Current Page Type: ${params.currentPage}
+Visited Pages (order): ${params.visitedPages.join(' -> ')}
 
-History:
+Recent History (most recent last):
 ${params.history}
 
-${params.errors.length > 0 ? `Errors Encountered:\n${params.errors.join('\n')}` : 'No errors so far.'}
+Errors Encountered:
+${params.errors.length > 0 ? params.errors.join('\n') : 'None'}
 
 --- TASK ---
-Decide what to do next.
+Decide what to do next. Choose ONE decision:
+- continue: proceed with the next logical test step
+- retry: repeat an attempt with a safer/more reliable strategy (wait/reload/navigate_back/alternative target)
+- skip: skip the current page/branch and choose a different route
+- wait_for_user: pause because user approval or manual action is required
+- stop: stop only if goal is fully achieved or further progress is not possible without unsafe actions
 
-RESPONSE FORMAT (JSON):
+--- SAFETY RULES ---
+- If the next step can cause irreversible changes (payment, purchase, subscribe, delete, remove, logout, account changes, submit order, data loss), choose wait_for_user.
+- If CAPTCHA / 2FA / email verification / manual verification is required, choose wait_for_user.
+- Prefer deterministic steps (navigation/menu links, stable CTAs) over speculative steps.
+- Avoid loops: if you see repeated states/pages without progress, choose skip and propose a loop-breaking nextTarget.
+
+--- RELIABILITY RULES ---
+- If errors suggest a transient issue (timeout, network, element not ready), choose retry and specify retryStrategy.
+- If errors suggest a permanent blocker (broken page, 404, missing permissions), choose skip or stop and explain why.
+- If the goal likely requires authentication and the user is not authenticated, route toward login before continuing the goal flow.
+
+--- RESPONSE FORMAT (STRICT JSON ONLY, no markdown) ---
 {
   "decision": "continue|stop|wait_for_user|retry|skip",
-  "reason": "Explain why (2-3 sentences)",
+  "reason": "1-2 concise sentences. Mention key evidence from history/errors.",
+  "confidence": 0.0-1.0,
   "progress": 0-100,
   "goalAchieved": true/false,
-  "nextTarget": "Description of next logical step or null if stopping"
+  "riskLevel": "low|medium|high",
+  "blockingSignals": ["captcha|2fa|auth_required|rate_limit|modal_overlay|validation_errors|broken_page|none"],
+  "retryStrategy": "wait|reload|navigate_back|choose_alternative_target|reduce_scope|null",
+  "nextTarget": {
+    "type": "page|element|flow",
+    "description": "What to try next in plain English",
+    "successCriteria": "What would confirm progress",
+    "avoid": ["Optional list of things to avoid or not repeat"]
+  }
 }
 
-DECISION RULES:
-
-**continue**: Keep testing if:
-- Goal not yet achieved
-- Found new pages to explore
-- Still have relevant actions to test
-
-**stop**: Stop testing if:
-- Goal fully achieved (e.g., completed purchase flow)
-- Reached dead end (no more actions possible)
-- Too many errors (>5 failures)
-
-**wait_for_user**: Pause if:
-- Encountered dangerous action (payment, delete)
-- Found CAPTCHA or manual verification
-- Unclear what to do next (confidence <0.5)
-
-**retry**: Try again if:
-- Temporary error that might resolve (network, timeout)
-- Element not found but might load later
-
-**skip**: Skip current page if:
-- Already visited this page 3+ times (cycle detected)
-- Page is irrelevant to goal
-- Blocking issue (broken page)
-
-**progress**: Estimate % of goal completion (0-100)
-
-**goalAchieved**:
-- true only if the main goal is FULLY completed
-- For "test purchase": achieved only if reached checkout/payment
-- For "test login": achieved only if successfully logged in
-
-Be realistic about progress and goal achievement.`;
+Return only valid JSON.`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -684,41 +678,172 @@ Focus on LOGICAL dependencies, not just technical ones. Consider the testing GOA
 
 /**
  * Build prompt for vision analysis based on scope
+ * ENHANCED: Now matches buildPageAnalysisPrompt structure with full validation
  * Uses AI to dynamically understand context without hardcoded checks
  */
 export function buildVisionPrompt(scope: string, url: string): string {
-  return `Analyze this screenshot of a web page (URL: ${url}).
+  return `You are an expert QA engineer analyzing a web page screenshot.
+- CONTEXT -
+URL: ${url}
+User's Testing Focus: "${scope}"
 
-Task: Identify all interactive elements and provide testing recommendations.
-User's testing focus: "${scope}"
+- TASK -
+Analyze this screenshot and provide detailed information about interactive elements relevant to the user's testing focus.
 
-Based on the user's focus and what you see in the screenshot, intelligently identify relevant elements.
+CRITICAL: You MUST return a valid JSON object matching EXACTLY this structure. No markdown, no code blocks, no additional text outside JSON.
 
-Return JSON in this format:
+REQUIRED JSON STRUCTURE:
 {
-  "elements": [
-    {
-      "type": "input|button|link|select|checkbox|etc",
-      "purpose": "What this element does",
-      "location": "Where on page",
-      "required": true/false
-    }
-  ],
-  "layout": "Brief description of page layout",
-  "suggestions": ["Specific test case suggestions based on user's focus"]
+  "pageType": "string (REQUIRED)",
+  "description": "string (REQUIRED)",
+  "elements": [array (REQUIRED, can be empty [])],
+  "suggestions": [array (REQUIRED, can be empty [])],
+  "warnings": [array (REQUIRED, use empty array [] if none)],
+  "modals": [array (REQUIRED, use empty array [] if none)],
+  "layout": "string (REQUIRED, brief description of page layout)"
 }
 
-Guidelines (adapt based on what you see):
-- Identify ALL interactive elements relevant to the user's testing focus
+DETAILED FIELD SPECIFICATIONS:
+
+1. **pageType** (REQUIRED, string, must be one of):
+   "home" | "product" | "cart" | "checkout" | "login" | "register" | "search_results" | "category" | "profile" | "dashboard" | "settings" | "payment" | "error" | "unknown"
+   Example: "login"
+
+   **SPECIAL PAGE TYPES**:
+   - Use "payment" if you see credit card fields, billing address, CVV, expiry date, or payment processor logos (Stripe, PayPal)
+   - Use "unknown" with descriptive text if this is an onboarding/welcome/tutorial page
+
+2. **description** (REQUIRED, string):
+   Brief description of the page (2-3 sentences)
+   Example: "Login page with email and password fields, and a 'Sign in' button"
+
+3. **elements** (REQUIRED, array of objects, can be empty []):
+   Each element object MUST have ALL these fields:
+   {
+     "type": "button" | "input" | "select" | "link" | "form" | "modal" | "other" (REQUIRED),
+     "purpose": "string" (REQUIRED, e.g., "search", "add_to_cart", "login", "submit"),
+     "text": "string" (REQUIRED, visible text on element, use empty string "" if no text, preserve original language),
+     "location": "string" (REQUIRED, where on page, e.g., "top-left form", "center of page"),
+     "required": true | false (REQUIRED, boolean, not string),
+     "priority": "critical" | "high" | "medium" | "low" (REQUIRED, string),
+     "isCTA": true | false (OPTIONAL, boolean, mark as true for Call-To-Action buttons like Skip, Next, Continue, Register, Login, Get Started, Sign Up, Start, Begin)
+   }
+
+   **IMPORTANT - Call-To-Action (CTA) Detection**:
+   Mark "isCTA": true for buttons that are common navigation/flow CTAs:
+   - Skip buttons (Skip, Skip for now, Пропустить)
+   - Next/Continue buttons (Next, Continue, Далее, Продолжить)
+   - Start/Begin buttons (Get Started, Start, Begin, Начать)
+   - Registration buttons (Register, Sign Up, Регистрация)
+   - Login buttons (Login, Sign In, Войти)
+   - Complete/Finish buttons (Complete, Finish, Done, Завершить)
+
+4. **suggestions** (REQUIRED, array of strings, can be empty []):
+   Array of specific test case suggestions based on user's focus and visible elements
+   Example: ["Test login with valid credentials", "Verify form validation with empty fields"]
+
+5. **warnings** (REQUIRED, array of strings, use [] if none):
+   Flag dangerous actions or blockers
+   Example: ["Payment form detected - requires manual approval", "CAPTCHA present"]
+
+   **CRITICAL WARNINGS TO DETECT**:
+   - "Payment form detected" - if you see credit card inputs, billing fields, payment buttons
+   - "CAPTCHA present" - if you see any CAPTCHA/reCAPTCHA
+   - "Onboarding flow detected" - if this is a welcome/tutorial/getting-started page with Skip/Next buttons
+   - "Paywall detected" - if content is blocked behind payment/subscription
+   - "Login required" - if page shows "Please login to continue" or similar
+
+6. **modals** (REQUIRED, array of objects, use [] if none):
+   Each modal object MUST have ALL these fields:
+   {
+     "type": "cookie_banner" | "newsletter" | "popup" | "welcome" | "other" (REQUIRED),
+     "description": "string" (REQUIRED),
+     "hasCloseButton": true | false (REQUIRED, boolean, not string),
+     "closeButtonText": "string" | null (REQUIRED, visible text on close button or null if not visible)
+   }
+
+7. **layout** (REQUIRED, string):
+   Brief description of page layout and structure
+   Example: "Single-column layout with header navigation, main content area, and footer"
+
+VALIDATION RULES (MUST FOLLOW):
+- ALL fields must be present in JSON (even if empty arrays)
+- "pageType" must be exactly one of the allowed string values
+- "elements" array items must have 6 required fields (type, purpose, text, location, required, priority) + optional "isCTA" field
+- "modals" array items must have ALL 4 required fields (type, description, hasCloseButton, closeButtonText)
+- Use boolean true/false (NOT strings "true"/"false")
+- Use null (NOT string "null") for closeButtonText when not visible
+- Preserve original UI language in "text" field (do not translate)
+- Max ~20 elements in "elements" array
+- Include ONLY visible interactive elements relevant to user's testing focus
+- Do NOT invent elements - if unsure, omit them
+- Mark "isCTA": true for navigation/flow buttons (Skip, Next, Continue, Register, Login, Get Started)
+
+SCOPE-SPECIFIC FOCUS:
+Based on user's testing focus "${scope}", intelligently identify relevant elements:
+
 - For registration/signup pages: Focus on email/username, passwords, confirm password, terms/privacy checkboxes, social login
 - For login/signin/auth pages: Focus on credentials, "Remember me", "Forgot password" links, social login options
 - For forms: Focus on all input types, required vs optional fields, validation rules, submit/cancel buttons, file uploads, dropdowns
 - For e-commerce: Focus on product selection, cart, checkout flows, payment forms
 - For dashboards: Focus on navigation, data display, interactive widgets, filters
+- For checkout/payment: Focus on payment forms, billing address, shipping options, order summary
+- For navigation: Focus on menus, links, breadcrumbs, navigation buttons
+
+ADDITIONAL GUIDELINES:
 - Note required fields (asterisk, 'required' label, red border, validation hints)
 - Pay attention to validation messages, error states, loading indicators
 - Identify accessibility features (aria labels, alt text, keyboard navigation)
-- Suggest specific test cases that match the user's testing focus
+- Be intelligent: If user says "test checkout", focus on payment-related elements. If they say "verify navigation", focus on menus and links.
 
-Be intelligent: If user says "test checkout", focus on payment-related elements. If they say "verify navigation", focus on menus and links.`;
+EXAMPLE COMPLETE VALID RESPONSE:
+{
+  "pageType": "login",
+  "description": "Login page with email input, password input, and Sign In button. Also has 'Forgot password?' link.",
+  "elements": [
+    {
+      "type": "input",
+      "purpose": "email",
+      "text": "",
+      "location": "center form, top field",
+      "required": true,
+      "priority": "critical"
+    },
+    {
+      "type": "input",
+      "purpose": "password",
+      "text": "",
+      "location": "center form, below email",
+      "required": true,
+      "priority": "critical"
+    },
+    {
+      "type": "button",
+      "purpose": "login",
+      "text": "Sign In",
+      "location": "center form, below password",
+      "required": true,
+      "priority": "critical",
+      "isCTA": true
+    },
+    {
+      "type": "link",
+      "purpose": "forgot_password",
+      "text": "Forgot password?",
+      "location": "below login button",
+      "required": false,
+      "priority": "low"
+    }
+  ],
+  "suggestions": [
+    "Test login with valid credentials",
+    "Test form validation with empty fields",
+    "Verify forgot password link functionality"
+  ],
+  "warnings": [],
+  "modals": [],
+  "layout": "Centered single-column layout with login form in the middle of the page"
+}
+
+Focus on elements relevant to the testing goal: "${scope}".`;
 }

@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Intelligent Testing Flow - Features Documentation</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <style>
+        .feature-page {
+            padding: 40px;
+        }
+
+        .section {
+            margin-bottom: 50px;
+        }
+
+        .section-title {
+            font-size: 2em;
+            margin-bottom: 20px;
+            color: #667eea;
+            border-bottom: 3px solid #667eea;
+            padding-bottom: 10px;
+        }
+
+        .overview {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+        }
+
+        .overview p {
+            line-height: 1.8;
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .diagram-container {
+            background: #f8f9fa;
+            padding: 30px;
+            border-radius: 12px;
+            margin-bottom: 40px;
+            overflow-x: auto;
+        }
+
+        .mermaid {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+        }
+
+        .methods-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .method-card {
+            background: white;
+            border: 2px solid #e0e0e0;
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+
+        .method-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+        }
+
+        .method-card.new {
+            border-color: #4caf50;
+            background: linear-gradient(135deg, #e8f5e9 0%, #ffffff 100%);
+        }
+
+        .method-card.enhanced {
+            border-color: #f44336;
+            background: linear-gradient(135deg, #ffebee 0%, #ffffff 100%);
+        }
+
+        .method-card.refactored {
+            border-color: #ff9800;
+            background: linear-gradient(135deg, #fff4e1 0%, #ffffff 100%);
+        }
+
+        .method-card.unchanged {
+            border-color: #2196f3;
+            background: linear-gradient(135deg, #e1f5ff 0%, #ffffff 100%);
+        }
+
+        .method-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+
+        .method-name {
+            font-weight: bold;
+            font-size: 1.1em;
+            color: #333;
+            font-family: 'Courier New', monospace;
+        }
+
+        .method-badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .badge-new {
+            background: #4caf50;
+            color: white;
+        }
+
+        .badge-enhanced {
+            background: #f44336;
+            color: white;
+        }
+
+        .badge-refactored {
+            background: #ff9800;
+            color: white;
+        }
+
+        .badge-unchanged {
+            background: #2196f3;
+            color: white;
+        }
+
+        .method-description {
+            color: #666;
+            font-size: 0.95em;
+            line-height: 1.6;
+        }
+
+        .changelog-entry {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            border-left: 4px solid #667eea;
+        }
+
+        .changelog-date {
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+
+        .changelog-commit {
+            font-size: 0.85em;
+            color: #999;
+            margin-bottom: 10px;
+        }
+
+        .change-item {
+            margin-bottom: 10px;
+        }
+
+        .change-details {
+            margin-top: 5px;
+            padding-left: 15px;
+            color: #666;
+            font-size: 0.9em;
+        }
+
+        .code-references {
+            list-style: none;
+            padding: 0;
+        }
+
+        .code-reference {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border: 1px solid #e0e0e0;
+        }
+
+        .code-reference a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .code-reference a:hover {
+            text-decoration: underline;
+        }
+
+        .back-link {
+            display: inline-block;
+            margin-bottom: 20px;
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .back-link:hover {
+            text-decoration: underline;
+        }
+
+        .filters {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .filter-btn {
+            padding: 10px 20px;
+            border: 2px solid #667eea;
+            background: white;
+            color: #667eea;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 500;
+        }
+
+        .filter-btn:hover {
+            background: #667eea;
+            color: white;
+        }
+
+        .filter-btn.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .search-box {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1em;
+            margin-bottom: 20px;
+        }
+
+        .search-box:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .improvements-list {
+            list-style: none;
+            padding: 0;
+        }
+
+        .improvements-list li {
+            padding: 15px;
+            margin-bottom: 10px;
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Intelligent Testing Flow</h1>
+            <p>Complete flow of intelligent UI testing with AI-driven action generation and execution</p>
+        </div>
+
+        <div class="feature-page">
+            <a href="../../index.html" class="back-link">← Back to Features</a>
+
+            <div class="section">
+                <h2 class="section-title">📋 Overview</h2>
+                <div class="overview" id="overview">
+                    <p>The Intelligent Testing Flow is the core system for autonomous UI testing. It uses AI to analyze pages, generate test actions, and execute them with comprehensive error handling and quality verification.</p>
+                    <p>Key components include page analysis (Vision + DOM), contextual action generation, intelligent execution with pre/post-action analysis, and adaptive decision-making for test progression.</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Flow Diagram</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Start([🚀 Test Execution Starts]) --> Execute[IntelligentTestOrchestrator.execute<br/>🔵 Core Orchestrator]
+
+    Execute --> Setup[Setup Phase<br/>🔵 Initialize Services]
+    Setup --> MainLoop[MainLoopService.execute<br/>🔵 Main Loop]
+
+    MainLoop --> LoopStart{🔄 Main Loop Iteration}
+
+    LoopStart --> AnalyzePage[analyzePage<br/>🔵 Page Analysis]
+    AnalyzePage --> PageAnalyzer[IntelligentPageAnalyzer.analyzePage<br/>🔵 Page Analyzer]
+
+    PageAnalyzer --> WaitSPA[waitForSPALoad<br/>🔵 Wait SPA]
+    WaitSPA --> CaptureScreenshot[captureScreenshot<br/>🔵 Screenshot]
+    CaptureScreenshot --> WaitModals[waitForModals<br/>🔵 Wait Modals]
+    WaitModals --> AnalyzeDOM[analyzeDOMFull<br/>🔵 DOM Analysis]
+    AnalyzeDOM --> EnhanceDOM[enhanceDOMWithAISelectors<br/>🔵 Enhance DOM]
+    EnhanceDOM --> VisionCheck{Should Use Vision?}
+
+    VisionCheck -->|Yes| AnalyzeVision[analyzeWithVision<br/>🔴 Enhanced Prompt]
+    VisionCheck -->|No| AnalyzeWithoutVision[analyzeWithoutVision<br/>🔵 Fallback]
+
+    AnalyzeVision --> MatchVision[matchVisionElementsWithDOMSelectors<br/>🔵 Match Elements]
+    AnalyzeWithoutVision --> MatchVision
+    MatchVision --> EnhanceModals[enhanceDOMWithVisionModals<br/>🔵 Enhance Modals]
+    EnhanceModals --> AnalyzeLogic[analyzeLogic<br/>🔵 Logic Analysis]
+    AnalyzeLogic --> BuildContext[Build PageContext<br/>🔵 Context Builder]
+
+    BuildContext --> GenerateActions[generateActions<br/>🔵 Generate Actions]
+    GenerateActions --> ActionGenerator[ContextualActionGenerator.generateActions<br/>🔵 Action Generator]
+
+    ActionGenerator --> ValidateCache[validateCachedActions<br/>🔵 Validate Cache]
+    ValidateCache --> BuildHistory[buildHistorySummary<br/>🔵 Build History]
+    BuildHistory --> BuildElements[buildElementsSummary<br/>🔵 Build Elements]
+    BuildElements --> BuildDOM[buildDOMSummary<br/>🔵 Build DOM]
+    BuildDOM --> GetHTML[getPageHTML<br/>🔵 Get HTML]
+    GetHTML --> MaskPII[maskPII<br/>🔴 Enhanced PII Masking]
+    MaskPII --> ParseJSON[parseRobustJSON<br/>🔴 Enhanced JSON Parsing]
+    ParseJSON --> Sanitize[sanitizeActions<br/>🔵 Sanitize]
+    Sanitize --> ReturnActions[Return Actions<br/>🔵 Return]
+
+    ReturnActions --> ExecuteActions[executeActions<br/>🟡 Refactored]
+    ExecuteActions --> ExecuteSingle[executeSingleAction<br/>🟢 NEW: Main Action Orchestrator]
+
+    ExecuteSingle --> PreAnalysis[handlePreActionAnalysis<br/>🟢 NEW: Pre-Action Handler]
+    PreAnalysis --> PreActionAnalyzer[PreActionAnalyzer.analyzeBeforeAction<br/>🔵 Pre-Action Analyzer]
+    PreActionAnalyzer --> LogPrereq[logPrerequisiteAction<br/>🟢 NEW: Logging Helper]
+    LogPrereq --> ValidateSelector[validateAndPrepareSelector<br/>🟢 NEW: Selector Validator]
+    ValidateSelector --> SelfHealing[SelfHealingService.healSelector<br/>🔵 Self-Healing]
+    SelfHealing --> CaptureBefore[captureActionScreenshots<br/>🟢 NEW: Screenshot Helper]
+    CaptureBefore --> ExecuteCommand[executeActionCommand<br/>🟢 NEW: Command Executor]
+
+    ExecuteCommand --> LogExecution[logActionExecution<br/>🟢 NEW: Logging Helper]
+    LogExecution --> CommandExec[CommandExecutor.executeCommand<br/>🔵 Command Executor]
+    CommandExec --> WaitEffect[waitForActionEffect<br/>🟢 NEW: Wait Effect]
+    WaitEffect --> HandleAsync[handleAsyncOperations<br/>🟢 NEW: Async Handler]
+    HandleAsync --> EnsureComplete[ensureActionCompleted<br/>🟢 NEW: Ensure Complete]
+    EnsureComplete --> VerifySuccess[verifyActionSuccess<br/>🟢 NEW: Verify Success]
+    VerifySuccess --> CaptureAfter[captureActionScreenshots<br/>🟢 NEW: Screenshot Helper]
+
+    CaptureAfter --> ValidateResult[ResultValidator.validateResult<br/>🔵 Result Validator]
+    ValidateResult --> PostAnalysis[handlePostActionAnalysisMethod<br/>🟢 NEW: Post-Action Handler]
+    PostAnalysis --> PostActionAnalyzer[PostActionAnalyzer.analyze<br/>🔵 Post-Action Analyzer]
+    PostActionAnalyzer --> LogPost[logPostActionAnalysis<br/>🟢 NEW: Logging Helper]
+
+    PostAnalysis --> CheckState[checkElementStateAfterAction<br/>🟢 NEW: Check State]
+    CheckState --> DetectChanges[detectPageChanges<br/>🟢 NEW: Detect Changes]
+    DetectChanges --> HandleError{Action Failed?}
+
+    HandleError -->|Yes| HandleFailure[handleActionFailure<br/>🟢 NEW: Failure Handler]
+    HandleFailure --> CreateErrorCtx[createActionErrorContext<br/>🟢 NEW: Error Context]
+    CreateErrorCtx --> LogError[logActionError<br/>🟢 NEW: Logging Helper]
+    LogError --> ShouldRetry{shouldRetryAction?<br/>🟢 NEW: Retry Check}
+    ShouldRetry -->|Yes| ExecuteSingle
+    ShouldRetry -->|No| NextAction
+
+    HandleError -->|No| NextAction[Next Action<br/>🔵 Next]
+    NextAction --> DecideNext[decideNextStep<br/>🔵 Decide Next]
+    DecideNext --> ContextualDecide[ContextualActionGenerator.decideNextStep<br/>🔵 Contextual Decide]
+    ContextualDecide --> ParseDecision[parseRobustJSON<br/>🔴 Enhanced JSON Parsing]
+    ParseDecision --> DecisionCheck{Decision Type}
+
+    DecisionCheck -->|continue| LoopStart
+    DecisionCheck -->|stop| BuildResult[buildResult<br/>🔵 Build Result]
+    DecisionCheck -->|wait_for_user| WaitUser[Wait for User<br/>🔵 Wait]
+    DecisionCheck -->|retry| RetryAction[Retry Action<br/>🔵 Retry]
+    DecisionCheck -->|skip| SkipAction[Skip Action<br/>🔵 Skip]
+
+    RetryAction --> ExecuteSingle
+    SkipAction --> NextAction
+    WaitUser --> BuildResult
+
+    BuildResult --> ValidateTest[validateTestResult<br/>🔵 Validate Test]
+    ValidateTest --> BuildSummary[buildSummary<br/>🔵 Build Summary]
+    BuildSummary --> UploadGraph[uploadGraphScreenshotsToStorage<br/>🔵 Upload Graph]
+    UploadGraph --> End([✅ Test Complete])
+
+    style Execute fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style ExecuteSingle fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style PreAnalysis fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style ValidateSelector fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style ExecuteCommand fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style VerifySuccess fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style PostAnalysis fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style HandleFailure fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style ExecuteActions fill:#fff4e1,stroke:#e65100,stroke-width:3px
+
+    style LogExecution fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style LogError fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style LogPrereq fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style LogPost fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style CreateErrorCtx fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style ShouldRetry fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style WaitEffect fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style HandleAsync fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style EnsureComplete fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style CheckState fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style DetectChanges fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style CaptureBefore fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style CaptureAfter fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+
+    style ParseJSON fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style MaskPII fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style AnalyzeVision fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style ParseDecision fill:#ffebee,stroke:#c62828,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔍 Methods Changed This Week</h2>
+                <div class="filters">
+                    <button class="filter-btn active" onclick="filterMethods('all', event)">All</button>
+                    <button class="filter-btn" onclick="filterMethods('new', event)">New (25)</button>
+                    <button class="filter-btn" onclick="filterMethods('enhanced', event)">Enhanced (4)</button>
+                    <button class="filter-btn" onclick="filterMethods('refactored', event)">Refactored (1)</button>
+                </div>
+                <input type="text" class="search-box" id="methodSearchBox" placeholder="🔍 Search methods..." onkeyup="searchMethods()">
+                <div class="methods-grid" id="methodsGrid">
+                    <!-- Methods will be rendered by JavaScript -->
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">✅ Methods Unchanged (Still in Use)</h2>
+                <div class="methods-grid" id="unchangedMethodsGrid">
+                    <!-- Unchanged methods will be rendered by JavaScript -->
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📝 Changelog</h2>
+                <div id="changelog">
+                    <!-- Changelog will be loaded from changelog.json -->
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">✨ Key Improvements</h2>
+                <ul class="improvements-list">
+                    <li><strong>Better Structure:</strong> executeActions broken into logical sub-methods</li>
+                    <li><strong>Better Logging:</strong> Structured logging helpers for consistent logging</li>
+                    <li><strong>Better Context:</strong> Context helpers for AI to make better decisions</li>
+                    <li><strong>Better Validation:</strong> Enhanced validation methods for action results</li>
+                    <li><strong>Better Quality:</strong> Action quality verification methods to ensure real success</li>
+                    <li><strong>Better Error Handling:</strong> Structured error handling with retry logic</li>
+                    <li><strong>Better Prompts:</strong> Enhanced AI prompts with full validation structure</li>
+                </ul>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📚 Code References</h2>
+                <ul class="code-references" id="codeReferences">
+                    <!-- Code references will be loaded from methods.json -->
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <script src="../../assets/components.js"></script>
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+
+        async function loadFeatureData() {
+            try {
+                // Load methods from JSON (optional, for additional data)
+                try {
+                    const methodsResponse = await fetch('methods.json');
+                    if (methodsResponse.ok) {
+                        const methods = await methodsResponse.json();
+                        // Use JSON data if available
+                        if (Object.keys(methods).length > 0) {
+                            const codeRefs = Object.values(methods)
+                                .filter(m => m.file)
+                                .map(m => ({
+                                    file: m.file,
+                                    line: m.line,
+                                    method: m.name
+                                }));
+
+                            const codeRefsContainer = document.getElementById('codeReferences');
+                            if (codeRefsContainer) {
+                                codeRefsContainer.innerHTML = codeRefs.map(ref => {
+                                    const relativePath = ref.file.startsWith('src/') ? ref.file : `src/${ref.file}`;
+                                    return `
+                                    <li class="code-reference">
+                                        <a href="../../../../${relativePath}#L${ref.line}" target="_blank">
+                                            ${ref.file}:${ref.line} - ${ref.method}
+                                        </a>
+                                    </li>
+                                `;
+                                }).join('');
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Could not load methods.json:', e);
+                }
+
+                // Load changelog
+                try {
+                    const changelogResponse = await fetch('changelog.json');
+                    if (changelogResponse.ok) {
+                        const changelog = await changelogResponse.json();
+                        if (typeof renderChangelog === 'function' && changelog.entries) {
+                            renderChangelog(changelog.entries, 'changelog');
+                        } else if (changelog.entries) {
+                            const changelogContainer = document.getElementById('changelog');
+                            if (changelogContainer) {
+                                changelogContainer.innerHTML = changelog.entries.map(entry => `
+                                    <div class="changelog-entry">
+                                        <div class="changelog-date">${entry.date}</div>
+                                        <div class="changelog-commit">Commit: ${entry.commit}</div>
+                                        <div class="changelog-changes">
+                                            ${entry.changes.map(change => `
+                                                <div class="change-item">
+                                                    <strong>${change.method}</strong>: ${change.action}
+                                                    ${change.details ? `<div class="change-details">${change.details}</div>` : ''}
+                                                </div>
+                                            `).join('')}
+                                        </div>
+                                    </div>
+                                `).join('');
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Could not load changelog.json:', e);
+                }
+
+            } catch (error) {
+                console.error('Error loading feature data:', error);
+            }
+        }
+
+        function filterMethods(type, event) {
+            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
+            if (event && event.target) {
+                event.target.classList.add('active');
+            }
+            renderChangedMethods(type);
+        }
+
+        function searchMethods() {
+            const query = document.getElementById('methodSearchBox').value.toLowerCase();
+            const cards = document.querySelectorAll('#methodsGrid .method-card');
+            cards.forEach(card => {
+                const text = card.textContent.toLowerCase();
+                card.style.display = text.includes(query) ? 'block' : 'none';
+            });
+        }
+
+        // Initialize
+        renderChangedMethods();
+        renderUnchangedMethods();
+        loadFeatureData();
+    </script>
+</body>
+</html>

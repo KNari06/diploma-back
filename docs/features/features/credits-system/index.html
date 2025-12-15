@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Credits System - Features Documentation</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <style>
+        .feature-page { padding: 40px; }
+        .section { margin-bottom: 50px; }
+        .section-title { font-size: 2em; margin-bottom: 20px; color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 10px; }
+        .overview { background: #f8f9fa; padding: 25px; border-radius: 12px; margin-bottom: 30px; }
+        .diagram-container { background: #f8f9fa; padding: 30px; border-radius: 12px; margin-bottom: 40px; overflow-x: auto; }
+        .mermaid { background: white; padding: 20px; border-radius: 8px; }
+        .back-link { display: inline-block; margin-bottom: 20px; color: #667eea; text-decoration: none; font-weight: 500; }
+        .back-link:hover { text-decoration: underline; }
+        .service-card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #667eea; }
+        .service-name { font-weight: bold; color: #667eea; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>💳 Credits System</h1>
+            <p>Credit allocation, deduction, limits, and subscription plan management</p>
+        </div>
+        <div class="feature-page">
+            <a href="../../index.html" class="back-link">← Back to Features</a>
+
+            <div class="section">
+                <h2 class="section-title">📋 Overview</h2>
+                <div class="overview">
+                    <p>Credits system manages user credits, subscription plans, limits, and credit allocation/deduction for various operations.</p>
+                    <p><strong>Key Features:</strong></p>
+                    <ul>
+                        <li>Decimal credits support (0.5, 1.23, etc.)</li>
+                        <li>Daily and monthly credit limits</li>
+                        <li>Subscription plan management (Free, Pro, Ultra)</li>
+                        <li>Credit transactions tracking</li>
+                        <li>Automatic credit reset (daily/monthly)</li>
+                        <li>Credit cost calculation for AI operations</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Credits Flow</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Start([User Action]) --> CheckCredits[Check User Credits]
+    CheckCredits --> GetUserCredits[UserCreditsService.getOrCreateUserCredits]
+
+    GetUserCredits --> GetPlan[PricingPlansService.getUserPlanInfo]
+    GetPlan --> PlanInfo[Get Plan Limits]
+
+    PlanInfo --> CheckDailyLimit{Daily Limit OK?}
+    CheckDailyLimit -->|No| ReturnDailyLimit[Return: Daily Limit Exceeded]
+    CheckDailyLimit -->|Yes| CheckMonthlyLimit{Monthly Limit OK?}
+
+    CheckMonthlyLimit -->|No| ReturnMonthlyLimit[Return: Monthly Limit Exceeded]
+    CheckMonthlyLimit -->|Yes| CheckBalance{Balance >= Required?}
+
+    CheckBalance -->|No| ReturnInsufficient[Return: Insufficient Credits]
+    CheckBalance -->|Yes| CalculateCost[Calculate Credit Cost]
+
+    CalculateCost --> CostTracker[CreditCostTrackerService.calculateTestCost]
+    CostTracker --> AIUsage[Track AI Token Usage]
+    AIUsage --> CalculateCredits[Calculate Credits from Tokens]
+
+    CalculateCredits --> DeductCredits[UserCreditsService.deductCredits]
+    DeductCredits --> UpdateBalance[Update credits_balance]
+    UpdateBalance --> UpdateUsage[Update credits_used_today/month]
+    UpdateUsage --> CreateTransaction[Create credit_transaction Record]
+
+    CreateTransaction --> Success([✅ Credits Deducted])
+
+    ReturnDailyLimit --> End([End])
+    ReturnMonthlyLimit --> End
+    ReturnInsufficient --> End
+    Success --> End
+
+    style CheckCredits fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style GetPlan fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style CalculateCost fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style DeductCredits fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style Success fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">💎 Subscription Plans</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart LR
+    Free[Free Plan<br/>$0/month] --> FreeLimits[Daily: 10<br/>Monthly: 100]
+    Pro[Pro Plan<br/>$X/month] --> ProLimits[Daily: 100<br/>Monthly: 1000]
+    Ultra[Ultra Plan<br/>$Y/month] --> UltraLimits[Daily: Unlimited<br/>Monthly: Unlimited]
+
+    FreeLimits --> Features1[Basic Features]
+    ProLimits --> Features2[All Features + Priority]
+    UltraLimits --> Features3[All Features + Highest Priority]
+
+    style Free fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style Pro fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style Ultra fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔧 Core Services</h2>
+
+                <div class="service-card">
+                    <div class="service-name">UserCreditsService</div>
+                    <p><strong>File:</strong> src/services/core/user-credits.service.ts</p>
+                    <p><strong>Methods:</strong></p>
+                    <ul>
+                        <li><code>getOrCreateUserCredits(userId)</code> - Get or create user credits record</li>
+                        <li><code>hasCredits(userId, amount)</code> - Check if user has enough credits</li>
+                        <li><code>deductCredits(userId, amount, description, metadata)</code> - Deduct credits from balance</li>
+                        <li><code>addCredits(userId, amount, description, metadata)</code> - Add credits to balance</li>
+                        <li><code>updateSubscription(userId, plan)</code> - Update user subscription plan</li>
+                    </ul>
+                </div>
+
+                <div class="service-card">
+                    <div class="service-name">PricingPlansService</div>
+                    <p><strong>File:</strong> src/services/core/pricing-plans.service.ts</p>
+                    <p><strong>Methods:</strong></p>
+                    <ul>
+                        <li><code>getAllPlans()</code> - Get all active pricing plans</li>
+                        <li><code>getPlanBySlug(slug)</code> - Get plan by slug (free, pro, ultra)</li>
+                        <li><code>getUserPlanInfo(userId)</code> - Get user's plan with limits and usage</li>
+                        <li><code>assignPlanToUser(userId, planId)</code> - Assign plan to user</li>
+                        <li><code>checkCreditLimits(userId, amount)</code> - Check if user can use credits</li>
+                        <li><code>useCredits(userId, amount)</code> - Use credits with limit checking</li>
+                    </ul>
+                </div>
+
+                <div class="service-card">
+                    <div class="service-name">CreditCostTrackerService</div>
+                    <p><strong>File:</strong> src/services/core/credit-cost-tracker.service.ts</p>
+                    <p><strong>Methods:</strong></p>
+                    <ul>
+                        <li><code>trackAICall(model, inputTokens, outputTokens)</code> - Track AI call and calculate credits</li>
+                        <li><code>calculateTestCost(testType, operations)</code> - Calculate total cost for test</li>
+                        <li><code>deductCreditsForTest(deduction)</code> - Deduct credits for test execution</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Database Schema</h2>
+                <div class="overview">
+                    <p><strong>user_credits table:</strong></p>
+                    <ul>
+                        <li>user_id (UUID) - Foreign key to users</li>
+                        <li>credits_balance (NUMERIC) - Current balance (supports decimals)</li>
+                        <li>subscription_plan (TEXT) - Current plan (free, pro, ultra)</li>
+                        <li>total_used (NUMERIC) - Total credits used</li>
+                        <li>created_at, updated_at</li>
+                    </ul>
+                    <p><strong>credit_transactions table:</strong></p>
+                    <ul>
+                        <li>user_id (UUID)</li>
+                        <li>amount (NUMERIC) - Positive for additions, negative for deductions</li>
+                        <li>type (TEXT) - usage, purchase, refund, etc.</li>
+                        <li>description (TEXT)</li>
+                        <li>metadata (JSONB) - Additional data</li>
+                        <li>created_at</li>
+                    </ul>
+                    <p><strong>pricing_plans table:</strong></p>
+                    <ul>
+                        <li>id, name, slug, description</li>
+                        <li>price (NUMERIC) - NULL for free plan</li>
+                        <li>credits_per_month (INTEGER) - -1 for unlimited</li>
+                        <li>credits_per_day (INTEGER) - NULL if no daily limit</li>
+                        <li>features (TEXT[]), limitations (TEXT[])</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">💰 Credit Calculation</h2>
+                <div class="overview">
+                    <p><strong>AI Operations:</strong> Credits calculated based on token usage</p>
+                    <ul>
+                        <li>Input tokens: Model-specific rate</li>
+                        <li>Output tokens: Model-specific rate</li>
+                        <li>Vision API: Additional cost per image</li>
+                    </ul>
+                    <p><strong>Test Types:</strong></p>
+                    <ul>
+                        <li><strong>Intelligent Test:</strong> Base cost + AI operations</li>
+                        <li><strong>Standard Test:</strong> Base cost per browser</li>
+                        <li><strong>API Test:</strong> Lower cost, no browser overhead</li>
+                    </ul>
+                    <p><strong>Decimal Support:</strong> All credit amounts support decimals (0.5, 1.23, etc.)</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>

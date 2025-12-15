@@ -1,0 +1,38 @@
+{
+  "handleChat": {
+    "name": "handleChat()",
+    "file": "src/api/chat/chat.controller.ts",
+    "line": 26,
+    "type": "async",
+    "status": "active",
+    "service": "ChatController",
+    "description": "Main chat handler - processes user messages through all steps"
+  },
+  "validateInput": {
+    "name": "validateInput()",
+    "file": "src/api/chat/shared/validation.ts",
+    "line": 21,
+    "type": "function",
+    "status": "active",
+    "service": "Validation",
+    "description": "Validates input request data"
+  },
+  "parseIntent": {
+    "name": "parseIntent()",
+    "file": "src/api/chat/shared/intent-parsing.ts",
+    "line": 1,
+    "type": "async",
+    "status": "active",
+    "service": "IntentParser",
+    "description": "Parses user intent using AI"
+  },
+  "routeToHandler": {
+    "name": "routeToHandler()",
+    "file": "src/api/chat/shared/routing.ts",
+    "line": 13,
+    "type": "async",
+    "status": "active",
+    "service": "Routing",
+    "description": "Routes request to appropriate handler based on intent"
+  }
+}

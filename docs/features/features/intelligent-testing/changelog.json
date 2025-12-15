@@ -1,0 +1,46 @@
+{
+  "entries": [
+    {
+      "date": "2024-12-15",
+      "commit": "abc123def",
+      "changes": [
+        {
+          "method": "executeActions",
+          "action": "refactored",
+          "details": "Split into logical sub-methods: executeSingleAction, handlePreActionAnalysis, validateAndPrepareSelector, etc.",
+          "files": ["src/agent/intelligent-test-orchestrator.ts"]
+        },
+        {
+          "method": "executeSingleAction",
+          "action": "new",
+          "details": "Created main orchestrator for single action execution with full lifecycle",
+          "files": ["src/agent/intelligent-test-orchestrator.ts"]
+        },
+        {
+          "method": "handlePreActionAnalysis",
+          "action": "new",
+          "details": "Added pre-action analysis handler with prerequisite actions",
+          "files": ["src/agent/intelligent-test-orchestrator.ts"]
+        }
+      ]
+    },
+    {
+      "date": "2024-12-14",
+      "commit": "xyz789ghi",
+      "changes": [
+        {
+          "method": "parseRobustJSON",
+          "action": "enhanced",
+          "details": "Enhanced JSON parsing with better error handling, support for arrays, balanced bracket matching",
+          "files": ["src/agent/contextual-action-generator.ts"]
+        },
+        {
+          "method": "maskPII",
+          "action": "enhanced",
+          "details": "Enhanced PII masking with more patterns: API keys, JWTs, IPv4, SSN",
+          "files": ["src/agent/contextual-action-generator.ts"]
+        }
+      ]
+    }
+  ]
+}

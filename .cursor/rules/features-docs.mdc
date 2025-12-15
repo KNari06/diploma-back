@@ -1,0 +1,57 @@
+# Features Documentation Auto-Update Rules
+
+## When to update documentation
+
+### 1. When a method is changed:
+   - Update methods.json with new metadata
+   - Add entry to changelog.json
+   - Update diagram if method relationships changed
+   - Run: `node docs/features/scripts/track-changes.js <file.ts> --feature=docs/features/features/<feature-name>`
+
+### 2. When a new method is added:
+   - Add to methods.json
+   - Update diagram to include new method
+   - Add entry to changelog
+   - Run: `node docs/features/scripts/track-changes.js <file.ts> --feature=docs/features/features/<feature-name>`
+
+### 3. When a method is deleted:
+   - Mark as deleted in methods.json
+   - Update diagram to remove method
+   - Add entry to changelog
+   - Run: `node docs/features/scripts/track-changes.js <file.ts> --feature=docs/features/features/<feature-name>`
+
+## Automatic actions
+
+### After changing files in src/agent/
+   - Update intelligent-testing docs
+   - Run: `node docs/features/scripts/track-changes.js src/agent/intelligent-test-orchestrator.ts --feature=docs/features/features/intelligent-testing`
+   - Run: `node docs/features/scripts/update-docs.js --feature=docs/features/features/intelligent-testing`
+
+### After changing prompts
+   - Update prompts-system docs
+   - Run: `node docs/features/scripts/track-changes.js src/ai/prompts/*.ts --feature=docs/features/features/prompts-system`
+
+### After changing auth files
+   - Update authentication docs
+   - Run: `node docs/features/scripts/track-changes.js src/api/auth/*.ts --feature=docs/features/features/authentication`
+
+### After changing chat files
+   - Update chat-flow docs (PRIORITY 1)
+   - Run: `node docs/features/scripts/track-changes.js src/api/chat/**/*.ts --feature=docs/features/features/chat-flow`
+   - Run: `node docs/features/scripts/update-docs.js --feature=docs/features/features/chat-flow --entry=handleChat`
+
+## File mapping
+
+- `src/agent/intelligent-test-orchestrator.ts` → `docs/features/features/intelligent-testing/`
+- `src/api/chat/**/*.ts` → `docs/features/features/chat-flow/`
+- `src/api/auth/**/*.ts` → `docs/features/features/authentication/`
+- `src/ai/prompts/**/*.ts` → `docs/features/features/prompts-system/`
+- `src/services/core/pricing-plans.service.ts` → `docs/features/features/credits-system/`
+- `src/services/core/user-credits.service.ts` → `docs/features/features/credits-system/`
+
+## Important notes
+
+- Always run track-changes.js before update-docs.js
+- Diagrams are auto-generated from methods.json
+- Changelog entries are automatically created with git info
+- Methods metadata includes: file, line, type, parameters, returns, dependencies, execution paths, error handling, side effects
