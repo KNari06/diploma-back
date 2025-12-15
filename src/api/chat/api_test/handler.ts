@@ -7,6 +7,7 @@ import { ChatService } from '@/services/utils/chat.service';
 import { emitProcessingStep } from '../shared/utils';
 import { convertApiTestPlanToTestPlan } from './formatting';
 import { CONSTANTS } from '../shared/constants';
+import { checkRequestAborted } from '../shared/request-cancellation';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -24,9 +25,12 @@ export async function handleApiTest(
     chatSessionId?: string;
     conversationId?: string;
     answers?: Record<string, any>;
+    abortSignal?: AbortSignal;
   }
 ): Promise<void> {
-  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers } = params;
+  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal } = params;
+
+  if (abortSignal) checkRequestAborted(abortSignal);
 
   try {
     // FIX #8: Validate and merge answers into parsedIntent if provided

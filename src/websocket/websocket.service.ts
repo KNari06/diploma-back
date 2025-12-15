@@ -11,29 +11,29 @@ import { redisWebSocketBridge } from '@/services/websocket/redis-bridge.service'
 import { logger } from '@/utils/logger';
 import { getIO, isWebSocketInitialized } from './server';
 import {
-    AIAnalysisCompletedPayload,
-    AIAnalysisProgressPayload,
-    AIAnalysisStartedPayload,
-    AIBugFoundPayload,
-    ChatMessagePayload,
-    ChatTestUpdatePayload,
-    createRoomName,
-    ResultErrorPayload,
-    ResultReadyPayload,
-    ResultScreenshotPayload,
-    RoomType,
-    ServerToClientEvents,
-    SystemErrorPayload,
-    SystemMaintenancePayload,
-    TestBrowserCompletedPayload,
-    TestCancelledPayload,
-    TestCompletedPayload,
-    TestCreatedPayload,
-    TestFailedPayload,
-    TestGraphUpdatePayload, // ✅ NEW
-    TestProgressPayload,
-    TestStartedPayload,
-    TestStepCompletedPayload,
+  AIAnalysisCompletedPayload,
+  AIAnalysisProgressPayload,
+  AIAnalysisStartedPayload,
+  AIBugFoundPayload,
+  ChatMessagePayload,
+  ChatTestUpdatePayload,
+  createRoomName,
+  ResultErrorPayload,
+  ResultReadyPayload,
+  ResultScreenshotPayload,
+  RoomType,
+  ServerToClientEvents,
+  SystemErrorPayload,
+  SystemMaintenancePayload,
+  TestBrowserCompletedPayload,
+  TestCancelledPayload, // ✅ NEW: Clarification
+  TestCompletedPayload,
+  TestCreatedPayload,
+  TestFailedPayload,
+  TestGraphUpdatePayload, // ✅ NEW
+  TestProgressPayload,
+  TestStartedPayload,
+  TestStepCompletedPayload
 } from './types';
 
 class WebSocketService {
@@ -480,6 +480,26 @@ class WebSocketService {
       'test:cancelled',
       payload,
       () => this.emitToTest(testId, 'test:cancelled', payload),
+      { testId }
+    );
+  }
+
+  public emitTestClarificationRequest(testId: string, payload: any): void {
+    this.emitWithFallback(
+      'test:clarification:request',
+      payload,
+      () => {
+        logger.info('[WebSocketService] Emitting clarification request', {
+          testId,
+          questionId: payload.questionId,
+          type: payload.type,
+        });
+        this.emitToTest(testId, 'test:clarification:request', payload);
+        // Also emit to user if userId provided
+        if (payload.userId) {
+          this.emitToUser(payload.userId, 'test:clarification:request', payload);
+        }
+      },
       { testId }
     );
   }

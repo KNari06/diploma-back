@@ -93,25 +93,25 @@ Generate 10-15 negative test scenarios to try to break this API. Think like a pe
 
 CATEGORIES TO COVER:
 
-1️⃣ **AUTHENTICATION TESTS** (type: "authentication"):
+1. **AUTHENTICATION TESTS** (type: "authentication"):
    • Remove Authorization header completely
    • Use invalid token format
    • Use expired token pattern
    • Use token from different API
    Expected: 401 Unauthorized
 
-2️⃣ **AUTHORIZATION TESTS** (type: "authorization"):
+2. **AUTHORIZATION TESTS** (type: "authorization"):
    • Try to access another user's resources (if endpoint has user ID)
    • Try to access admin-only endpoints
    • Try to modify resources you shouldn't have access to
    Expected: 403 Forbidden
 
-3️⃣ **METHOD VALIDATION** (type: "method_validation"):
+3. **METHOD VALIDATION** (type: "method_validation"):
    • Use wrong HTTP method (POST on GET endpoint, DELETE on POST, etc.)
    • Use OPTIONS, TRACE, HEAD methods
    Expected: 405 Method Not Allowed
 
-4️⃣ **PAYLOAD VALIDATION** (type: "payload_validation"):
+4. **PAYLOAD VALIDATION** (type: "payload_validation"):
    • Send malformed JSON (missing quotes, extra commas)
    • Send empty body where required → Expected: 400 Bad Request
    • Send huge payload (> 10MB) → Expected: 413 Payload Too Large
@@ -119,7 +119,7 @@ CATEGORIES TO COVER:
    • Send negative numbers where positive expected → Expected: 400 Bad Request
    • Send extremely long strings (> 10K chars) → Expected: 400 Bad Request (or 413 if size limit exceeded)
 
-5️⃣ **SECURITY TESTS** (type: "security"):
+5. **SECURITY TESTS** (type: "security"):
    • SQL Injection: Add ' OR '1'='1 to parameters
    • XSS: Add <script>alert(1)</script> to string fields
    • Path Traversal: Add ../../etc/passwd to paths
@@ -127,12 +127,12 @@ CATEGORIES TO COVER:
    • NoSQL Injection: Add {"$gt":""} to parameters
    Expected: Sanitized/escaped, should NOT execute
 
-6️⃣ **RATE LIMITING** (type: "rate_limiting"):
+6. **RATE LIMITING** (type: "rate_limiting"):
    • Send 100 identical requests rapidly
    • Send requests from same IP in burst
    Expected: 429 Too Many Requests (if rate limit exists)
 
-7️⃣ **PERFORMANCE** (type: "performance"):
+7. **PERFORMANCE** (type: "performance"):
    • Send 10 concurrent requests
    • Send request with very short timeout (1ms)
    Expected: Reasonable performance, no timeouts
@@ -269,8 +269,8 @@ ${testTypes.length > 0 ? `Test Types: ${testTypes.join(', ')}` : ''}
     ? `
 URL CONTEXT ANALYSIS:
 ${urlInsights.length > 0 ? `Insights:\n${urlInsights.map((i: string) => `  - ${i}`).join('\n')}` : ''}
-${urlWarnings.length > 0 ? `Warnings:\n${urlWarnings.map((w: string) => `  ⚠️ ${w}`).join('\n')}` : ''}
-${urlRecommendations.length > 0 ? `Recommendations:\n${urlRecommendations.map((r: string) => `  ✅ ${r}`).join('\n')}` : ''}
+${urlWarnings.length > 0 ? `Warnings:\n${urlWarnings.map((w: string) => `  [WARNING] ${w}`).join('\n')}` : ''}
+${urlRecommendations.length > 0 ? `Recommendations:\n${urlRecommendations.map((r: string) => `  [RECOMMENDED] ${r}`).join('\n')}` : ''}
 `
     : '';
 

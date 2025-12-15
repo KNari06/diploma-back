@@ -1,6 +1,161 @@
 import { dbService } from '@/db/supabase';
 import { ApiResponse, NotFoundError, Test, ValidationError } from '@/types';
 import { logger, logTestEvent } from '@/utils/logger';
+import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
+
+/**
+ * Get all running tests for a user
+ */
+export async function getRunningTestsForUser(userId: string): Promise<Test[]> {
+  try {
+    const { data: tests, error } = await dbService.supabaseAdmin
+      .from('tests')
+      .select('*')
+      .eq('user_id', userId)
+      .in('status', ['pending', 'running'])
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.error(`[CANCEL_TEST] Failed to get running tests for user: ${userId}`, error);
+      return [];
+    }
+
+    return (tests || []) as Test[];
+  } catch (error) {
+    logger.error(`[CANCEL_TEST] Error getting running tests for user: ${userId}`, error);
+    return [];
+  }
+}
+
+/**
+ * Get all running tests for a chat session
+ */
+export async function getRunningTestsForChatSession(chatSessionId: string): Promise<Test[]> {
+  try {
+    // Get test IDs from test_chat_mappings
+    const testIds = await TestChatMappingService.getTestIdsForChatSession(chatSessionId);
+
+    if (testIds.length === 0) {
+      return [];
+    }
+
+    const { data: tests, error } = await dbService.supabaseAdmin
+      .from('tests')
+      .select('*')
+      .in('id', testIds)
+      .in('status', ['pending', 'running'])
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.error(`[CANCEL_TEST] Failed to get running tests for chat session: ${chatSessionId}`, error);
+      return [];
+    }
+
+    return (tests || []) as Test[];
+  } catch (error) {
+    logger.error(`[CANCEL_TEST] Error getting running tests for chat session: ${chatSessionId}`, error);
+    return [];
+  }
+}
+
+/**
+ * Cancel all running tests for a user
+ */
+export async function cancelAllRunningTestsForUser(userId: string): Promise<{
+  success: boolean;
+  cancelledCount: number;
+  errors: string[];
+}> {
+  try {
+    const runningTests = await getRunningTestsForUser(userId);
+    const errors: string[] = [];
+    let cancelledCount = 0;
+
+    for (const test of runningTests) {
+      try {
+        await cancelTest(test.id, userId);
+        cancelledCount++;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        errors.push(`Failed to cancel test ${test.id}: ${errorMsg}`);
+        logger.error(`[CANCEL_TEST] Failed to cancel test ${test.id}`, error);
+      }
+    }
+
+    logger.info(`[CANCEL_TEST] Cancelled ${cancelledCount} tests for user: ${userId}`, {
+      totalRunning: runningTests.length,
+      cancelledCount,
+      errorsCount: errors.length,
+    });
+
+    return {
+      success: true,
+      cancelledCount,
+      errors,
+    };
+  } catch (error) {
+    logger.error(`[CANCEL_TEST] Error cancelling all tests for user: ${userId}`, error);
+    return {
+      success: false,
+      cancelledCount: 0,
+      errors: [error instanceof Error ? error.message : String(error)],
+    };
+  }
+}
+
+/**
+ * Cancel all running tests for a chat session
+ */
+export async function cancelAllRunningTestsForChatSession(
+  chatSessionId: string,
+  userId?: string
+): Promise<{
+  success: boolean;
+  cancelledCount: number;
+  errors: string[];
+}> {
+  try {
+    const runningTests = await getRunningTestsForChatSession(chatSessionId);
+    const errors: string[] = [];
+    let cancelledCount = 0;
+
+    for (const test of runningTests) {
+      try {
+        // Verify user has access if userId provided
+        if (userId && test.user_id && test.user_id !== userId) {
+          errors.push(`Access denied to test ${test.id}`);
+          continue;
+        }
+
+        await cancelTest(test.id, userId);
+        cancelledCount++;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        errors.push(`Failed to cancel test ${test.id}: ${errorMsg}`);
+        logger.error(`[CANCEL_TEST] Failed to cancel test ${test.id}`, error);
+      }
+    }
+
+    logger.info(`[CANCEL_TEST] Cancelled ${cancelledCount} tests for chat session: ${chatSessionId}`, {
+      totalRunning: runningTests.length,
+      cancelledCount,
+      errorsCount: errors.length,
+    });
+
+    return {
+      success: true,
+      cancelledCount,
+      errors,
+    };
+  } catch (error) {
+    logger.error(`[CANCEL_TEST] Error cancelling all tests for chat session: ${chatSessionId}`, error);
+    return {
+      success: false,
+      cancelledCount: 0,
+      errors: [error instanceof Error ? error.message : String(error)],
+    };
+  }
+}
 
 /**
  * Cancel all queue jobs for a test

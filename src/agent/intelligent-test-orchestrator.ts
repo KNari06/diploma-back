@@ -6,19 +6,19 @@
 
 import { dbAdminService } from '@/db/supabase';
 import { AICostManager, getCostManager, removeCostManager } from '@/services/ai-cost-manager.service';
-import { SelfHealingService } from '@/services/ai-selector/self-healing.service'; // ✅ NEW: Self-healing for selectors
+import { SelfHealingService } from '@/services/ai-selector/self-healing.service'; // Self-healing service for automatic selector recovery
 import { logger } from '@/utils/logger';
 import { getActionEmoji, getActionIcon } from '@/websocket/types';
 import { webSocketService } from '@/websocket/websocket.service';
 import { Browser, Page } from 'playwright';
-import { AdaptiveConfigService } from './adaptive-config.service'; // ✅ NEW: Adaptive configuration
+import { AdaptiveConfigService } from './adaptive-config.service'; // Adaptive configuration service for dynamic timeout and threshold management
 import { CommandExecutor } from './command-executor';
 import { ContextualActionGenerator } from './contextual-action-generator';
-import { FormIntelligenceService } from './form-intelligence.service'; // ✅ NEW: Smart form handling
+import { FormIntelligenceService } from './form-intelligence.service'; // Intelligent form handling service for validation error fixing
 import { IntelligentPageAnalyzer } from './intelligent-page-analyzer';
-import { MainLoopService } from './main-loop.service'; // ✅ NEW: Main loop extracted to separate service
-import { DOMSnapshot, PostActionAnalyzer } from './post-action-analyzer'; // ✅ NEW: AI-driven post-action analysis
-import { PreActionAnalyzer } from './pre-action-analyzer'; // ✅ NEW: Pre-action analysis for smart action execution
+import { MainLoopService } from './main-loop.service'; // Main testing loop service (analyze → generate → execute → decide)
+import { DOMSnapshot, PostActionAnalyzer } from './post-action-analyzer'; // Post-action analysis service for detecting state changes and follow-up actions
+import { PreActionAnalyzer } from './pre-action-analyzer'; // Pre-action analysis service for detecting blocking factors before execution
 import { ResultValidator } from './result-validator';
 import { SafetyGuard } from './safety-guard';
 import { StateTracker } from './state-tracker';
@@ -31,7 +31,8 @@ import {
   PageVisit,
   TestState,
 } from './types/intelligent-testing.types';
-import { GraphBuilder } from './utils/graph-builder.service'; // ✅ NEW
+import { ErrorCollectorService } from './utils/error-collector.service';
+import { GraphBuilder } from './utils/graph-builder.service'; // Graph builder for real-time test visualization
 import { TestProgressEmitter } from './utils/progress-emitter';
 import { getElementDisabledContext, getLocator, normalizeSelector } from './utils/selector-utils';
 
@@ -45,7 +46,7 @@ import { getElementDisabledContext, getLocator, normalizeSelector } from './util
 const COST_VISION_ANALYSIS = 0.0055; // GPT-4o Vision (1 screenshot)
 const COST_DOM_ANALYSIS = 0.0001; // GPT-4o-mini (400 input + 100 output)
 const COST_ACTION_GENERATION = 0.0002; // GPT-4o-mini (500 input + 150 output)
-const COST_DECISION = 0.0001; // GPT-4o-mini (300 input + 100 output)
+// const COST_DECISION = 0.0001; // GPT-4o-mini (300 input + 100 output)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // NOTE: All hardcoded values moved to AdaptiveConfigService
@@ -62,7 +63,6 @@ const COST_DECISION = 0.0001; // GPT-4o-mini (300 input + 100 output)
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class IntelligentTestOrchestrator {
-  private browser!: Browser;
   private page!: Page;
   private config: IntelligentTestConfig;
   private state!: TestState;
@@ -70,12 +70,13 @@ export class IntelligentTestOrchestrator {
   private testId?: string;
   private commandExecutor!: CommandExecutor;
   private progressEmitter?: TestProgressEmitter;
-  private graphBuilder!: GraphBuilder; // ✅ NEW: Graph builder for real-time visualization
-  private abortController: AbortController; // ✅ FIX 7: AbortController for cancellation
-  private costManager?: AICostManager; // ✅ FIX 9: AI cost manager for budget control
+  private graphBuilder!: GraphBuilder; // Graph builder for real-time test visualization
+  private abortController: AbortController; // AbortController for cancelling test execution when user requests cancellation
+  private costManager?: AICostManager; // AI cost manager for tracking and limiting API costs per test
+  private errorCollector?: ErrorCollectorService; // Error collector service for capturing console, network, and UI errors
   private navigationListenersAttached = false;
 
-  // ✅ OPTIMIZED: Screenshot metrics for monitoring
+  // Screenshot metrics for monitoring and optimization
   private screenshotMetrics = {
     totalCaptured: 0,
     beforeActions: 0,
@@ -85,10 +86,10 @@ export class IntelligentTestOrchestrator {
     onPageAnalysis: 0,
   };
 
-  // ✅ NEW: Track consecutive empty pages to stop early
+  // Track consecutive empty pages to stop early when navigation fails repeatedly
   private consecutiveEmptyPages = 0;
 
-  // ✅ NEW: Track selector failures to prevent infinite loops
+  // Track selector failures to prevent infinite loops when selectors repeatedly fail
   private selectorFailures = new Map<string, number>(); // selector -> failure count
 
   private async buildCancelledResult(): Promise<IntelligentTestResult> {
@@ -124,10 +125,10 @@ export class IntelligentTestOrchestrator {
     this.userId = userId;
     this.testId = testId;
 
-    // ✅ FIX 7: Initialize AbortController
+    // Initialize AbortController for test cancellation support
     this.abortController = new AbortController();
 
-    // ✅ FIX 9: Initialize AI cost manager
+    // Initialize AI cost manager to track and limit API costs
     if (this.testId) {
       this.costManager = getCostManager(this.testId, {
         maxCostPerTest: 1.0,      // $1 per test
@@ -145,8 +146,8 @@ export class IntelligentTestOrchestrator {
   }
 
   /**
-   * ✅ FIX 7: Abort test execution
-   * Called when user cancels the test
+   * Abort test execution
+   * Called when user cancels the test via cancellation endpoint
    */
   abort(): void {
     logger.info('[INTELLIGENT_ORCHESTRATOR] Aborting test execution', {
@@ -166,7 +167,6 @@ export class IntelligentTestOrchestrator {
    * Main entry point
    */
   async execute(browser: Browser, page: Page): Promise<IntelligentTestResult> {
-    this.browser = browser;
     this.page = page;
 
     const isAboutUrl = (url: string): boolean => url === 'about:blank' || url.startsWith('about:');
@@ -204,11 +204,11 @@ export class IntelligentTestOrchestrator {
       }
     };
 
-    // ✅ FIX 7: Pass AbortSignal to CommandExecutor
-    // ✅ FIX 9: Pass cost manager to CommandExecutor
+    // Pass AbortSignal to CommandExecutor for cancellation support
+    // Pass cost manager to CommandExecutor for cost tracking
     this.commandExecutor = new CommandExecutor(page, {
       abortSignal: this.abortController.signal,
-      costManager: this.costManager, // ✅ FIX 9: Pass cost manager
+      costManager: this.costManager, // Cost manager for tracking API usage
       metadata: {
         url: this.config.startUrl,
         projectId: this.config.userContext?.projectId as string | undefined,
@@ -216,10 +216,10 @@ export class IntelligentTestOrchestrator {
       },
     });
 
-    // ✅ CRITICAL FIX: Setup navigation listeners to track all URL changes
+    // Setup navigation listeners to track all URL changes and detect about:blank redirects
     this.setupNavigationListeners();
 
-    // ✅ CRITICAL FIX: Verify we're on the correct URL before starting
+    // Verify we're on the correct URL before starting test execution
     const initialUrl = page.url();
     if (!initialUrl || isAboutUrl(initialUrl)) {
       logger.error('[INTELLIGENT_ORCHESTRATOR] Page is on about:blank - navigation failed', {
@@ -283,17 +283,19 @@ export class IntelligentTestOrchestrator {
       }
     }
 
-    const safetyConfig = SafetyGuard.getConfigForLevel(this.config.safety.level);
-
     // Initialize state
     this.state = StateTracker.createInitialState(
       this.config.goal,
       this.config.startUrl,
-      safetyConfig.maxPages,
-      safetyConfig.maxDuration
+      this.config.safety.maxPages,
+      this.config.safety.maxDuration
     );
 
-    // ✅ NEW: Initialize graph builder
+    // Initialize error collector to capture console, network, and UI errors
+    this.errorCollector = new ErrorCollectorService(this.page);
+    this.errorCollector.startCollecting();
+
+    // Initialize graph builder for real-time test visualization
     this.graphBuilder = new GraphBuilder();
 
     logger.info('[INTELLIGENT_ORCHESTRATOR] Starting intelligent test', {
@@ -310,7 +312,7 @@ export class IntelligentTestOrchestrator {
       mode: this.config.mode,
     });
 
-    // ✅ NEW: Add start node and emit initial graph
+    // Add start node to graph and emit initial graph state to frontend
     if (this.testId && this.userId) {
       const startUpdate = this.graphBuilder.addStartNode();
       this.emitGraphUpdate(startUpdate);
@@ -409,8 +411,11 @@ export class IntelligentTestOrchestrator {
       const consecutiveEmptyPagesRef = { value: this.consecutiveEmptyPages };
       const wasCancelled = await MainLoopService.execute({
         page: this.page,
-        state: this.state,
         config: this.config,
+        getState: () => this.state,
+        setState: (next) => {
+          this.state = next;
+        },
         testId: this.testId,
         userId: this.userId,
         graphBuilder: this.graphBuilder,
@@ -435,7 +440,7 @@ export class IntelligentTestOrchestrator {
       // Build result and validate it
       const result = await this.buildResult(true);
 
-      // ✅ CRITICAL FIX: Validate test result quality
+      // Validate test result quality to ensure test actually executed meaningful actions
       const isValidTest = this.validateTestResult(result);
 
       if (!isValidTest.isValid) {
@@ -520,7 +525,7 @@ export class IntelligentTestOrchestrator {
 
       return result;
     } catch (error) {
-      // ✅ FIX: Explicitly extract error details for debugging
+      // Extract error details for debugging and logging
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       const errorStack = error instanceof Error ? error.stack : undefined;
 
@@ -535,14 +540,13 @@ export class IntelligentTestOrchestrator {
         } : String(error),
       });
 
-      // ✅ FIX: Ensure state is initialized and error is recorded
+      // Ensure state is initialized and error is recorded in state
       if (!this.state) {
-        const safetyConfig = SafetyGuard.getConfigForLevel(this.config.safety.level);
         this.state = StateTracker.createInitialState(
           this.config.goal,
           this.config.startUrl,
-          safetyConfig.maxPages,
-          safetyConfig.maxDuration
+          this.config.safety.maxPages,
+          this.config.safety.maxDuration
         );
       }
 
@@ -558,7 +562,7 @@ export class IntelligentTestOrchestrator {
 
       return await this.buildResult(false);
     } finally {
-      // ✅ FIX 9: Cleanup cost manager after test completion
+      // Cleanup cost manager after test completion and log final stats
       if (this.testId) {
         // Log final cost stats before cleanup
         if (this.costManager) {
@@ -758,7 +762,7 @@ export class IntelligentTestOrchestrator {
       url: currentUrl,
     });
 
-    // ✅ CRITICAL FIX: Check for about:blank before analysis
+    // Check for about:blank before analysis and attempt recovery if detected
     if (currentUrl === 'about:blank' || currentUrl.startsWith('about:')) {
       logger.warn('[INTELLIGENT_ORCHESTRATOR] Page is about:blank, attempting to navigate back', {
         testId: this.testId,
@@ -805,7 +809,7 @@ export class IntelligentTestOrchestrator {
       url: this.page.url(),
     });
 
-    // ✅ FIX: Emit test:progress when analyzing page
+    // Emit test:progress event when analyzing page
     if (this.progressEmitter) {
       this.progressEmitter.emit({
         progress: 40,
@@ -824,7 +828,7 @@ export class IntelligentTestOrchestrator {
         icon: getActionIcon(undefined, 'analysis'),
         status: 'running',
         timestamp: new Date().toISOString(),
-        userId: this.userId, // ✅ FIX: Include userId for user room broadcast
+        userId: this.userId, // Include userId for WebSocket user room broadcast
       });
     }
 
@@ -837,7 +841,10 @@ export class IntelligentTestOrchestrator {
       this.config.goal,
       this.config.mode,
       previousContext,
-      this.config.spaLoadConfig // ✅ FIX 7: Pass configurable SPA load settings
+      this.config.spaLoadConfig, // Configurable SPA load settings for single-page applications
+      this.state, // Pass state for history context in page analysis
+      this.config.hints, // Pass hints from test plan to guide AI analysis
+      this.errorCollector // Pass error collector for capturing page errors
     );
 
     // Update cost
@@ -853,7 +860,7 @@ export class IntelligentTestOrchestrator {
       elementsFound: context.vision.elements.length,
     });
 
-    // ✅ FIX: Emit test:progress after page analysis
+    // Emit test:progress event after page analysis completes
     if (this.progressEmitter) {
       this.progressEmitter.emit({
         progress: 50,
@@ -872,7 +879,7 @@ export class IntelligentTestOrchestrator {
         icon: getActionIcon(undefined, 'analysis'),
         status: 'running',
         timestamp: new Date().toISOString(),
-        userId: this.userId, // ✅ FIX: Include userId for user room broadcast
+        userId: this.userId, // Include userId for WebSocket user room broadcast
       });
     }
 
@@ -895,7 +902,7 @@ export class IntelligentTestOrchestrator {
 
     this.emitEvent('actions_generating', {});
 
-    // ✅ FIX: Emit test:progress when generating actions
+    // Emit test:progress event when generating actions
     if (this.progressEmitter) {
       this.progressEmitter.emit({
         progress: 55,
@@ -914,11 +921,11 @@ export class IntelligentTestOrchestrator {
         icon: getActionIcon(undefined, 'generation'),
         status: 'running',
         timestamp: new Date().toISOString(),
-        userId: this.userId, // ✅ FIX: Include userId for user room broadcast
+        userId: this.userId, // Include userId for WebSocket user room broadcast
       });
     }
 
-    // ✅ NEW: Convert TestHint[] to simpler format for ContextualActionGenerator
+    // Convert TestHint[] to simpler format for ContextualActionGenerator
     const hints = this.config.hints?.map(h => ({
       description: h.description,
       action: h.action,
@@ -927,13 +934,13 @@ export class IntelligentTestOrchestrator {
       priority: h.priority,
     }));
 
-    // ✅ FIX 9: Pass cost manager and hints to action generator
+    // Pass cost manager and hints to action generator for cost tracking and AI guidance
     const result = await ContextualActionGenerator.generateActions(
       context,
       this.state,
       this.page,
       this.costManager,
-      hints  // ✅ NEW: Pass hints for AI guidance
+      hints  // Pass hints for AI guidance during action generation
     );
 
     // Update cost
@@ -967,7 +974,7 @@ export class IntelligentTestOrchestrator {
       safeActions.push(action);
     }
 
-    // ✅ FIX: Emit test:progress after actions generated
+    // Emit test:progress event after actions are generated
     if (this.progressEmitter) {
       this.progressEmitter.emit({
         progress: 60,
@@ -986,7 +993,7 @@ export class IntelligentTestOrchestrator {
         icon: getActionIcon(undefined, 'generation'),
         status: 'running',
         timestamp: new Date().toISOString(),
-        userId: this.userId, // ✅ FIX: Include userId for user room broadcast
+        userId: this.userId, // Include userId for WebSocket user room broadcast
       });
     }
 
@@ -1033,7 +1040,7 @@ export class IntelligentTestOrchestrator {
           completedSteps: i,
         });
 
-        // ✅ NEW: Log detailed action information before execution
+        // Log detailed action information before execution for debugging
         logger.info('[INTELLIGENT_ORCHESTRATOR] Executing action (FINAL COMMAND)', {
           testId: this.testId,
           actionIndex: i + 1,
@@ -1066,33 +1073,74 @@ export class IntelligentTestOrchestrator {
         });
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // ✅ NEW: PRE-ACTION ANALYSIS (Phase 1 - UI Tester Intelligence)
-        // Analyzes page state BEFORE action to prevent failures
+        // PRE-ACTION ANALYSIS: Analyzes page state BEFORE action to prevent failures
+        // Detects blocking factors (disabled elements, missing fields) and suggests fixes
         // ═══════════════════════════════════════════════════════════════════════════
         const pageContext = AdaptiveConfigService.analyzePageContext(this.state, context.pageType);
+        let preAnalysis: import('./pre-action-analyzer').PreActionAnalysis | undefined;
+
         if (action.selector && AdaptiveConfigService.requiresPreActionAnalysis(action, {
           pageType: context.pageType,
           hasForm: (context.dom?.forms?.length || 0) > 0,
           isSlowPage: pageContext.isSlowPage,
         })) {
-          const preAnalysis = await PreActionAnalyzer.analyzeBeforeAction(this.page, action);
+          // Enhance action with test context for better AI understanding
+          const actionWithContext = {
+            ...action,
+            // Add test goal context to action description for AI analysis
+            description: action.description || `${action.action} on ${action.selector}`,
+            // Store context in action metadata (if supported by type)
+            metadata: {
+              testGoal: this.state.goal,
+              pageType: context.pageType,
+              pageUrl: context.url,
+              previousActions: this.state.completedActions.slice(-3).map(a => a.action.description),
+            },
+          } as DynamicAction & { metadata?: any };
+
+          preAnalysis = await PreActionAnalyzer.analyzeBeforeAction(this.page, actionWithContext);
 
           // If there are blocking factors, try to resolve them first
           if (!preAnalysis.canProceed && preAnalysis.suggestedActions.length > 0) {
+            // Enhanced logging with context for AI understanding
             logger.info('[INTELLIGENT_ORCHESTRATOR] Pre-action analysis found blocking factors', {
               testId: this.testId,
               action: action.description,
-              blockingFactors: preAnalysis.blockingFactors.map(bf => bf.description),
+              testGoal: this.state.goal,
+              pageType: context.pageType,
+              pageUrl: context.url,
+              blockingFactors: preAnalysis.blockingFactors.map(bf => ({
+                type: bf.type,
+                description: bf.description,
+                priority: bf.priority || 'medium',
+                hasSuggestedActions: (bf.suggestedActions?.length || 0) > 0,
+              })),
               suggestedActionsCount: preAnalysis.suggestedActions.length,
+              context: preAnalysis.context,
             });
 
             // Execute suggested prerequisite actions (e.g., fill required fields)
-            for (const prereqAction of preAnalysis.suggestedActions) {
+            // Sort by priority if available (critical first)
+            const sortedPrereqActions = [...preAnalysis.suggestedActions].sort((a, b) => {
+              const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+              const aPriority = (a as any).priority || 'medium';
+              const bPriority = (b as any).priority || 'medium';
+              return (priorityOrder[aPriority as keyof typeof priorityOrder] || 2) -
+                     (priorityOrder[bPriority as keyof typeof priorityOrder] || 2);
+            });
+
+            for (let prereqIdx = 0; prereqIdx < sortedPrereqActions.length; prereqIdx++) {
+              const prereqAction = sortedPrereqActions[prereqIdx];
               try {
+                // Enhanced logging with context for AI understanding
                 logger.info('[INTELLIGENT_ORCHESTRATOR] Executing prerequisite action', {
                   testId: this.testId,
                   prereqAction: prereqAction.description,
                   forAction: action.description,
+                  testGoal: this.state.goal,
+                  priority: (prereqAction as any).priority || 'medium',
+                  progress: `${prereqIdx + 1}/${sortedPrereqActions.length}`,
+                  pageType: context.pageType,
                 });
 
                 // Convert to PlaywrightCommand and execute
@@ -1135,12 +1183,22 @@ export class IntelligentTestOrchestrator {
             }
 
             // Re-analyze after prerequisite actions
-            const reAnalysis = await PreActionAnalyzer.analyzeBeforeAction(this.page, action);
+            const reAnalysis = await PreActionAnalyzer.analyzeBeforeAction(this.page, actionWithContext);
             if (!reAnalysis.canProceed) {
+              // Enhanced logging with context for AI understanding
               logger.warn('[INTELLIGENT_ORCHESTRATOR] Still cannot proceed after prerequisites', {
                 testId: this.testId,
                 action: action.description,
-                remainingBlockers: reAnalysis.blockingFactors.map(bf => bf.description),
+                testGoal: this.state.goal,
+                pageType: context.pageType,
+                prerequisitesExecuted: sortedPrereqActions.length,
+                remainingBlockers: reAnalysis.blockingFactors.map(bf => ({
+                  type: bf.type,
+                  description: bf.description,
+                  priority: bf.priority || 'medium',
+                  context: bf.context,
+                })),
+                context: reAnalysis.context,
               });
 
               // If still blocked and action is not optional, skip it
@@ -1159,17 +1217,25 @@ export class IntelligentTestOrchestrator {
             }
           }
 
-          // Log validation errors if any
+          // Log validation errors if any with enhanced context
           if (preAnalysis.validationErrors.length > 0) {
             logger.warn('[INTELLIGENT_ORCHESTRATOR] Validation errors detected before action', {
               testId: this.testId,
               action: action.description,
+              testGoal: this.state.goal,
+              pageType: context.pageType,
+              pageUrl: context.url,
               errors: preAnalysis.validationErrors,
+              requiredFields: preAnalysis.requiredFields.map(f => ({
+                selector: f.selector,
+                label: f.label,
+                isEmpty: f.isEmpty,
+              })),
             });
           }
         }
 
-        // ✅ IMPROVED: Validate selector exists AND is visible/actionable before execution
+        // Validate selector exists AND is visible/actionable before execution
         const normalizedSelectorForReliability = action.selector ? normalizeSelector(action.selector) : '';
         const selectorReliability = normalizedSelectorForReliability && this.selectorFailures.has(normalizedSelectorForReliability)
           ? 'low' as const
@@ -1179,20 +1245,20 @@ export class IntelligentTestOrchestrator {
           selectorReliability,
         })) {
           try {
-            // ✅ FIX: Normalize selector format before using (convert getByText('text') → text="text")
+            // Normalize selector format before using (convert getByText('text') → text="text")
             const normalizedSelector = normalizeSelector(action.selector);
-            // ✅ CRITICAL FIX: Use getLocator() helper to support text=, role=, label= formats
+            // Use getLocator() helper to support text=, role=, label= formats
             const locator = this.getLocatorWrapper(normalizedSelector);
             const elementCount = await locator.count();
 
             if (elementCount === 0) {
-              // ✅ NEW: Track selector failures to prevent infinite loops
+              // Track selector failures to prevent infinite loops
               const failureCount = (this.selectorFailures.get(normalizedSelector) || 0) + 1;
               this.selectorFailures.set(normalizedSelector, failureCount);
 
               let healingSuccessful = false;
 
-              // ✅ NEW: Try self-healing before giving up (only on first failure)
+              // Try self-healing before giving up (only on first failure)
               if (failureCount === 1) {
                 try {
                   logger.info('[INTELLIGENT_ORCHESTRATOR] Selector not found, attempting self-healing', {
@@ -1311,11 +1377,11 @@ export class IntelligentTestOrchestrator {
                 continue; // Skip this action
               }
             } else {
-              // ✅ NEW: Reset failure count if selector works
+              // Reset failure count if selector works
               this.selectorFailures.delete(normalizedSelector);
             }
 
-            // ✅ NEW: For click actions, also check if element is visible and actionable
+            // For click actions, also check if element is visible and actionable
             if (action.action === 'click') {
               try {
                 // Wait for element to be visible and actionable (reuse outer pageContext)
@@ -1330,7 +1396,7 @@ export class IntelligentTestOrchestrator {
                 });
 
                 // Check if element is actionable (not covered by other elements)
-                // ✅ FIX: Use first() to get single element for evaluate
+                // Use first() to get single element for evaluate
                 const firstLocator = locator.first();
                 const isActionable = await firstLocator.evaluate((el) => {
                   // @ts-ignore - browser context
@@ -1370,7 +1436,7 @@ export class IntelligentTestOrchestrator {
           }
         }
 
-        // ✅ OPTIMIZED: Smart screenshot capture - only when necessary
+        // Smart screenshot capture - only when necessary to reduce storage and processing overhead
         // BEFORE optimization: 2-3 screenshots per action (before + after + page analysis)
         // AFTER optimization: 0-1 screenshots per action (only when needed)
         //
@@ -1382,6 +1448,8 @@ export class IntelligentTestOrchestrator {
         // Expected reduction: ~60-70% fewer screenshots
         let screenshotBefore: string | undefined;
         let screenshotAfter: string | undefined;
+        let screenshotBeforeIndex: number | undefined;
+        let screenshotAfterIndex: number | undefined;
 
         // Capture BEFORE screenshot only for navigation actions
         const isNavigationAction = action.action === 'click' && action.description?.toLowerCase().includes('link');
@@ -1394,6 +1462,7 @@ export class IntelligentTestOrchestrator {
             screenshotBefore = screenshotBuffer.toString('base64');
             this.screenshotMetrics.beforeActions++;
             this.screenshotMetrics.totalCaptured++;
+            screenshotBeforeIndex = this.screenshotMetrics.totalCaptured;
             logger.debug('[INTELLIGENT_ORCHESTRATOR] Captured before screenshot for navigation', {
               action: action.description,
               totalScreenshots: this.screenshotMetrics.totalCaptured
@@ -1405,7 +1474,7 @@ export class IntelligentTestOrchestrator {
           }
         }
 
-        // ✅ NEW: Check if element is disabled BEFORE attempting action
+        // Check if element is disabled BEFORE attempting action to provide better error context
         // If disabled, log detailed context for debugging
         if (action.selector && (action.action === 'click' || action.action === 'fill')) {
           const disabledContext = await getElementDisabledContext(this.page, action.selector);
@@ -1422,7 +1491,7 @@ export class IntelligentTestOrchestrator {
               alternatives: disabledContext.alternatives,
             });
 
-            // ✅ STRATEGY: Instead of generating new actions mid-execution,
+            // Strategy: Instead of generating new actions mid-execution,
             // let the action fail naturally and let the AI decide next steps
             // in the next iteration (via decideNextStep)
 
@@ -1448,7 +1517,7 @@ export class IntelligentTestOrchestrator {
           }
         }
 
-        // ✅ NEW: Capture DOM snapshot BEFORE action for post-action analysis
+        // Capture DOM snapshot BEFORE action for post-action analysis
         let snapshotBefore: DOMSnapshot | undefined;
         const shouldDoPostAnalysis = ['fill', 'type', 'click', 'select'].includes(action.action);
         if (shouldDoPostAnalysis) {
@@ -1456,7 +1525,7 @@ export class IntelligentTestOrchestrator {
         }
 
         // Execute action using CommandExecutor
-        // ✅ FIX: Pass original selector - CommandExecutor will normalize it ONCE via prepareSelector()
+        // Pass original selector - CommandExecutor will normalize it ONCE via prepareSelector()
         // DON'T normalize here to avoid double-processing!
         // Determine assertion type based on action type
         let assertionType: 'visible' | 'hidden' | 'text' | 'value' | 'count' | 'url' | 'enabled' | 'disabled' = 'text';
@@ -1481,7 +1550,7 @@ export class IntelligentTestOrchestrator {
           } : undefined,
         };
 
-        // ✅ NEW: Log final command before execution
+        // Log final command before execution for debugging
         logger.info('[INTELLIGENT_ORCHESTRATOR] Final Playwright command to execute', {
           testId: this.testId,
           command: {
@@ -1499,12 +1568,12 @@ export class IntelligentTestOrchestrator {
           },
         });
 
-        // ✅ NEW: Measure action execution duration
+        // Measure action execution duration for performance tracking
         const actionStartTime = Date.now();
         const executionResult = await this.commandExecutor.executeCommand(finalCommand);
         const actionDurationMs = Date.now() - actionStartTime;
 
-        // ✅ OPTIMIZED: Smart waiting - only wait if URL changed (page navigation)
+        // Smart waiting - only wait if URL changed (page navigation) to reduce unnecessary delays
         const urlAfter = this.page.url();
         const urlChanged = urlBefore !== urlAfter;
 
@@ -1519,9 +1588,9 @@ export class IntelligentTestOrchestrator {
             logger.debug('[INTELLIGENT_ORCHESTRATOR] DOM not fully loaded after navigation, continuing anyway');
           });
         }
-        // ✅ REMOVED: No delay needed for same-page actions (most actions don't need delay)
+        // No delay needed for same-page actions (most actions don't need delay)
 
-        // ✅ OPTIMIZED: Capture AFTER screenshot only in critical cases:
+        // Capture AFTER screenshot only in critical cases to reduce storage usage:
         // 1. Action failed (to debug what went wrong)
         // 2. URL changed (new page loaded, need to capture it)
         // 3. Action was a click on a button (might show modal/message)
@@ -1540,6 +1609,7 @@ export class IntelligentTestOrchestrator {
             // Track metrics
             this.screenshotMetrics.afterActions++;
             this.screenshotMetrics.totalCaptured++;
+            screenshotAfterIndex = this.screenshotMetrics.totalCaptured;
             if (!executionResult.success) {
               this.screenshotMetrics.onErrors++;
             }
@@ -1570,7 +1640,7 @@ export class IntelligentTestOrchestrator {
           executionSuccess: executionResult.success,
         });
 
-        // ✅ CRITICAL FIX: Check if action redirected to about:blank
+        // Check if action redirected to about:blank and attempt recovery
         if (urlAfter === 'about:blank' || urlAfter.startsWith('about:')) {
           logger.error('[INTELLIGENT_ORCHESTRATOR] Action redirected to about:blank', {
             testId: this.testId,
@@ -1635,7 +1705,7 @@ export class IntelligentTestOrchestrator {
           this.page
         );
 
-        // ✅ NEW: Log validation details
+        // Log validation details for debugging
         logger.info('[INTELLIGENT_ORCHESTRATOR] Validation result', {
           testId: this.testId,
           action: action.description,
@@ -1665,7 +1735,7 @@ export class IntelligentTestOrchestrator {
         completedActions.push(actionResult);
         this.state = StateTracker.recordActionResult(this.state, actionResult);
 
-        // ✅ FIX: Emit test:progress update after each action completion
+        // Emit test:progress update after each action completion
         if (this.progressEmitter) {
           const progress = 60 + Math.round(((i + 1) / actions.length) * 30);
           this.progressEmitter.emit({
@@ -1685,7 +1755,7 @@ export class IntelligentTestOrchestrator {
           });
         }
 
-        // ✅ FIX: Also emit via WebSocket for test:update compatibility
+        // Also emit via WebSocket for test:update compatibility
         if (this.testId) {
           webSocketService.emitTestProgress(this.testId, {
             testId: this.testId,
@@ -1705,43 +1775,131 @@ export class IntelligentTestOrchestrator {
             completedSteps: i + 1,
             status: actionResult.success ? 'running' : 'failed',
             timestamp: new Date().toISOString(),
-            userId: this.userId, // ✅ FIX: Include userId for user room broadcast
+            userId: this.userId, // Include userId for WebSocket user room broadcast
           });
         }
 
-        // ✅ NEW: Add action to graph and emit real-time update
+        // Add action to graph and emit real-time update to frontend
         if (this.testId && this.userId && this.graphBuilder) {
+          const isBase64Like = (str: string | undefined): boolean => {
+            if (!str || typeof str !== 'string') return false;
+            return str.startsWith('data:image/') || (str.length > 100 && /^[A-Za-z0-9+/=]+$/.test(str));
+          };
+
+          const sanitizeNodeScreenshots = (
+            node: import('@/types').GraphNode | undefined
+          ): import('@/types').GraphNode | undefined => {
+            if (!node) return undefined;
+            const meta = node.meta ?? {};
+            return {
+              ...node,
+              meta: {
+                ...meta,
+                screenshotBefore: isBase64Like(meta.screenshotBefore) ? undefined : meta.screenshotBefore,
+                screenshotAfter: isBase64Like(meta.screenshotAfter) ? undefined : meta.screenshotAfter,
+              },
+            };
+          };
+
           const graphUpdate = this.graphBuilder.addActionNode(action, {
             success: actionResult.success,
             error: actionResult.error,
-            durationMs: actionDurationMs, // ✅ FIX: Include actual execution duration
+            durationMs: actionDurationMs, // Include actual execution duration in graph node
             urlChanged: actionResult.urlChanged,
             urlBefore: actionResult.urlBefore,
             urlAfter: actionResult.urlAfter,
             retryCount: actionResult.retryCount,
             isTimeout: (actionResult.error?.toLowerCase() ?? '').includes('timeout'),
-            // ✅ NEW: Include validation data
+            // Include validation data in graph node metadata
             validation: {
               expected: validation.expected,
               actual: validation.actual,
               passed: validation.passed,
               message: validation.message,
             },
-            // ✅ REMOVED: Screenshots not included in real-time updates (too large)
-            // Screenshots will be uploaded after test completion and replaced with URLs
+            // Keep screenshots in graph builder for final graph persistence (base64),
+            // but sanitize them out of WebSocket payloads (we will stream URLs later).
+            screenshotBefore,
+            screenshotAfter,
           });
-          this.emitGraphUpdate(graphUpdate);
+          this.emitGraphUpdate({
+            ...graphUpdate,
+            newNode: sanitizeNodeScreenshots(graphUpdate.newNode),
+          });
+
+          // Upload screenshots immediately and emit URL updates via WebSocket (small payload).
+          // We keep real-time graph updates fast by sending screenshots later as `updatedNode`.
+          const nodeId = graphUpdate.newNode?.id;
+          if (nodeId && (screenshotBefore || screenshotAfter)) {
+            const testId = this.testId;
+            const userId = this.userId;
+            const beforeBase64 = screenshotBefore;
+            const afterBase64 = screenshotAfter;
+            const beforeIdx = screenshotBeforeIndex;
+            const afterIdx = screenshotAfterIndex;
+
+            void (async () => {
+              const { uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+
+              if (beforeBase64 && beforeIdx !== undefined) {
+                try {
+                  const beforeUrl = await uploadScreenshotToStorage(beforeBase64, testId, userId, beforeIdx);
+                  const update = this.graphBuilder?.updateNodeMeta(nodeId, { screenshotBefore: beforeUrl });
+                  if (update) {
+                    this.emitGraphUpdate({
+                      ...update,
+                      updatedNode: sanitizeNodeScreenshots(update.updatedNode),
+                    });
+                  }
+                } catch (e) {
+                  logger.warn('[INTELLIGENT_ORCHESTRATOR] Failed to upload screenshotBefore', {
+                    testId,
+                    nodeId,
+                    error: e instanceof Error ? e.message : String(e),
+                  });
+                }
+              }
+
+              if (afterBase64 && afterIdx !== undefined) {
+                try {
+                  const afterUrl = await uploadScreenshotToStorage(afterBase64, testId, userId, afterIdx);
+                  const update = this.graphBuilder?.updateNodeMeta(nodeId, { screenshotAfter: afterUrl });
+                  if (update) {
+                    this.emitGraphUpdate({
+                      ...update,
+                      updatedNode: sanitizeNodeScreenshots(update.updatedNode),
+                    });
+                  }
+                } catch (e) {
+                  logger.warn('[INTELLIGENT_ORCHESTRATOR] Failed to upload screenshotAfter', {
+                    testId,
+                    nodeId,
+                    error: e instanceof Error ? e.message : String(e),
+                  });
+                }
+              }
+            })();
+          }
         }
 
-        // Log action result (success/failure)
+        // Log action result (success/failure) with enhanced context for AI understanding
         if (!actionResult.success) {
           success = false;
           logger.warn('[INTELLIGENT_ORCHESTRATOR] Action failed', {
             testId: this.testId,
             action: action.action,
             description: action.description,
+            testGoal: this.state.goal,
+            pageType: context.pageType,
+            pageUrl: context.url,
             error: actionResult.error,
             optional: action.optional,
+            urlChanged: actionResult.urlChanged,
+            validationPassed: validation.passed,
+            validationMessage: validation.message,
+            // Include context about what was tried
+            attemptedPrerequisites: preAnalysis?.suggestedActions.length || 0,
+            blockingFactors: preAnalysis?.blockingFactors.map((bf: any) => bf.description) || [],
           });
 
           // If action is not optional, consider stopping
@@ -1766,7 +1924,7 @@ export class IntelligentTestOrchestrator {
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // ✅ NEW: POST-ACTION ANALYSIS - Check for errors after action
+        // POST-ACTION ANALYSIS: Check for errors after action execution
         // ═══════════════════════════════════════════════════════════════════════════
         const isSubmitAction = action.action === 'click' && action.description?.toLowerCase().includes('submit');
         if (AdaptiveConfigService.requiresPostActionAnalysis(action, {
@@ -1774,22 +1932,39 @@ export class IntelligentTestOrchestrator {
           hasForm: (context.dom?.forms?.length || 0) > 0,
           isSubmitAction,
         })) {
+          // Enhance action with context for post-action analysis
+          const actionWithContextForPost = {
+            ...action,
+            metadata: {
+              testGoal: this.state.goal,
+              pageType: context.pageType,
+              pageUrl: context.url,
+              actionSucceeded: actionResult.success,
+            },
+          } as DynamicAction & { metadata?: any };
+
           const postAnalysis = await PreActionAnalyzer.analyzeAfterAction(
             this.page,
-            action,
+            actionWithContextForPost,
             actionResult.success
           );
 
           if (postAnalysis.hasNewErrors) {
+            // Enhanced logging with context for AI understanding
             logger.warn('[INTELLIGENT_ORCHESTRATOR] Post-action analysis detected errors', {
               testId: this.testId,
               action: action.description,
+              testGoal: this.state.goal,
+              pageType: context.pageType,
+              pageUrl: context.url,
+              actionSucceeded: actionResult.success,
               errors: postAnalysis.errors,
               suggestions: postAnalysis.suggestions,
+              errorCount: postAnalysis.errors.length,
             });
 
             // ═══════════════════════════════════════════════════════════════════════════
-            // ✅ PHASE 2: FORM INTELLIGENCE - Try to fix validation errors
+            // FORM INTELLIGENCE: Try to fix validation errors using AI
             // ═══════════════════════════════════════════════════════════════════════════
             if (action.selector && postAnalysis.errors.length > 0) {
               await this.tryFixValidationErrors(action, postAnalysis.errors);
@@ -1811,18 +1986,24 @@ export class IntelligentTestOrchestrator {
           }
 
           // ═══════════════════════════════════════════════════════════════════════════
-          // ✅ NEW: AI-DRIVEN POST-ACTION ANALYSIS
+          // AI-DRIVEN POST-ACTION ANALYSIS: Analyzes state changes and suggests follow-up actions
           // Analyzes what changed and decides if follow-up actions are needed
           // ═══════════════════════════════════════════════════════════════════════════
           if (shouldDoPostAnalysis && actionResult.success && !urlChanged) {
             try {
+              // Enhanced context for post-action analysis
+              // Note: PostActionContext doesn't support pageContext, but goal and action context are sufficient
               const postActionDecision = await PostActionAnalyzer.analyze(
                 this.page,
                 {
-                  action,
+                  action: {
+                    ...action,
+                    // Enhance action description with context for AI
+                    description: `${action.description} [Page: ${context.pageType}, Goal: ${this.state.goal}]`,
+                  },
                   actionResult,
                   inputValue: action.value?.toString(),
-                  goal: this.state.goal,
+                  goal: `${this.state.goal} | Current page: ${context.pageType} | URL: ${context.url}`,
                 },
                 snapshotBefore,
                 this.costManager
@@ -1830,11 +2011,16 @@ export class IntelligentTestOrchestrator {
 
               // Execute follow-up actions if AI decided they're needed
               if (postActionDecision.needsFollowUp && postActionDecision.followUpActions.length > 0) {
+                // Enhanced logging with context for AI understanding
                 logger.info('[INTELLIGENT_ORCHESTRATOR] Executing AI-decided follow-up actions', {
                   testId: this.testId,
+                  testGoal: this.state.goal,
+                  pageType: context.pageType,
+                  originalAction: action.description,
                   reason: postActionDecision.reason,
                   stateChange: postActionDecision.stateChange,
                   followUpCount: postActionDecision.followUpActions.length,
+                  confidence: postActionDecision.confidence,
                 });
 
                 for (const followUpAction of postActionDecision.followUpActions) {
@@ -1879,7 +2065,7 @@ export class IntelligentTestOrchestrator {
           }
 
           // ═══════════════════════════════════════════════════════════════════════════
-          // ✅ PHASE 2: FORM INTELLIGENCE - Wait for conditional fields after fill/select
+          // FORM INTELLIGENCE: Wait for conditional fields after fill/select actions
           // ═══════════════════════════════════════════════════════════════════════════
           const formAnalysis = await PreActionAnalyzer.analyzeFormBeforeSubmit(
             this.page,
@@ -1901,7 +2087,7 @@ export class IntelligentTestOrchestrator {
           break;
         }
       } catch (error) {
-        // ✅ FIX: Enhanced error logging for action execution
+        // Enhanced error logging for action execution failures
         logger.error('[INTELLIGENT_ORCHESTRATOR] Action execution error', {
           testId: this.testId,
           action: {
@@ -1953,7 +2139,7 @@ export class IntelligentTestOrchestrator {
    * Convert DynamicAction to PlaywrightCommand for execution
    */
   private convertActionToCommand(action: DynamicAction): import('@/types').PlaywrightCommand {
-    // ✅ FIX: Don't normalize selector here - CommandExecutor.prepareSelector() will do it ONCE
+    // Don't normalize selector here - CommandExecutor.prepareSelector() will do it ONCE to avoid double-processing
     return {
       action: action.action as import('@/types').PlaywrightActionType,
       selector: action.selector,
@@ -2163,7 +2349,7 @@ export class IntelligentTestOrchestrator {
       };
     }
 
-    // ✅ IMPROVED: Check if we visited the start URL (with normalization and redirect handling)
+    // Check if we visited the start URL (with normalization and redirect handling)
     // Many sites redirect (e.g., https://repetino.kz → https://repetino.kz/onboarding)
     // We should check if we visited the base domain, not just the exact URL
     const normalizeUrl = (url: string): string => {
@@ -2278,22 +2464,21 @@ export class IntelligentTestOrchestrator {
   }
 
   private async buildResult(success: boolean): Promise<IntelligentTestResult> {
-    // ✅ FIX: Handle case where state might not be initialized (early errors)
-    if (!this.state) {
-      const safetyConfig = SafetyGuard.getConfigForLevel(this.config.safety.level);
-      this.state = StateTracker.createInitialState(
-        this.config.goal,
-        this.config.startUrl,
-        safetyConfig.maxPages,
-        safetyConfig.maxDuration
-      );
-    }
+      // Handle case where state might not be initialized (early errors before state creation)
+      if (!this.state) {
+        this.state = StateTracker.createInitialState(
+          this.config.goal,
+          this.config.startUrl,
+          this.config.safety.maxPages,
+          this.config.safety.maxDuration
+        );
+      }
 
     const stats = StateTracker.getStatistics(this.state);
 
     const summary = this.buildSummary(success, stats);
 
-    // ✅ NEW: Collect screenshots from page visits
+    // Collect screenshots from page visits for result storage
     const screenshots = this.state.visitedPages
       .filter(pageVisit => pageVisit.screenshot)
       .map((pageVisit, index) => ({
@@ -2301,7 +2486,7 @@ export class IntelligentTestOrchestrator {
         screenshot: pageVisit.screenshot!,
       }));
 
-    // ✅ OPTIMIZED: Log screenshot metrics
+    // Log screenshot metrics for monitoring and optimization analysis
     logger.info('[INTELLIGENT_ORCHESTRATOR] Screenshot optimization metrics', {
       totalCaptured: this.screenshotMetrics.totalCaptured,
       breakdown: {
@@ -2318,7 +2503,7 @@ export class IntelligentTestOrchestrator {
       totalSize: `${Math.round(screenshots.reduce((sum, s) => sum + s.screenshot.length, 0) / 1024)}KB`,
     });
 
-    // ✅ NEW: Add end node and emit final graph
+    // Add end node to graph and emit final graph state to frontend
     if (this.testId && this.userId && this.graphBuilder) {
       const endUpdate = this.graphBuilder.addEndNode(
         success,
@@ -2335,10 +2520,10 @@ export class IntelligentTestOrchestrator {
       this.emitGraphUpdate(endUpdate);
     }
 
-    // ✅ NEW: Get final graph for storage
+    // Get final graph data for storage in database
     let graphData = this.graphBuilder ? this.graphBuilder.getFullGraph() : undefined;
 
-    // ✅ NEW: Log graph data for debugging
+    // Log graph data for debugging and verification
     if (graphData) {
       logger.info('[INTELLIGENT_ORCHESTRATOR] Graph data prepared for storage', {
         testId: this.testId,
@@ -2353,7 +2538,7 @@ export class IntelligentTestOrchestrator {
       });
     }
 
-    // ✅ NEW: Upload screenshots from graph to storage and replace base64 with public URLs
+    // Upload screenshots from graph to storage and replace base64 with public URLs to reduce data size
     if (graphData && this.testId && this.userId) {
       try {
         graphData = await this.uploadGraphScreenshotsToStorage(graphData);
@@ -2382,12 +2567,12 @@ export class IntelligentTestOrchestrator {
       summary,
       pageVisits: this.state.visitedPages,
       screenshots,
-      graphData, // ✅ NEW: Include complete graph with public URLs
+      graphData, // Include complete graph with public URLs for frontend visualization
     };
   }
 
   /**
-   * ✅ NEW: Upload all screenshots from graph to storage and replace base64 with public URLs
+   * Upload all screenshots from graph to storage and replace base64 with public URLs
    * This reduces graph_data size and makes screenshots accessible via public URLs
    */
   private async uploadGraphScreenshotsToStorage(graphData: any): Promise<any> {
@@ -2538,12 +2723,1005 @@ export class IntelligentTestOrchestrator {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // CONTEXT HELPERS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Create action with context for AI analysis
+   */
+  private createActionWithContext(action: DynamicAction, metadata?: Partial<import('./types/intelligent-testing.types').ActionMetadata>): DynamicAction {
+    return {
+      ...action,
+      description: action.description || `${action.action} on ${action.selector}`,
+      metadata: {
+        testGoal: metadata?.testGoal || this.state.goal,
+        pageType: metadata?.pageType,
+        pageUrl: metadata?.pageUrl,
+        previousActions: metadata?.previousActions || this.state.completedActions.slice(-3).map(a => a.action.description),
+      },
+    };
+  }
+
+  /**
+   * Get current action context
+   */
+  private getActionContext(context?: PageContext): {
+    testGoal: string;
+    pageType: string;
+    pageUrl: string;
+    previousActions: string[];
+  } {
+    return {
+      testGoal: this.state.goal,
+      pageType: context?.pageType || 'unknown',
+      pageUrl: context?.url || this.state.currentUrl,
+      previousActions: this.state.completedActions.slice(-3).map(a => a.action.description),
+    };
+  }
+
+  /**
+   * Enrich action for AI with additional context
+   */
+  private enrichActionForAI(action: DynamicAction, context: PageContext): {
+    action: DynamicAction;
+    goal: string;
+  } {
+    return {
+      action: {
+        ...action,
+        description: `${action.description} [Page: ${context.pageType}, Goal: ${this.state.goal}]`,
+      },
+      goal: `${this.state.goal} | Current page: ${context.pageType} | URL: ${context.url}`,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EXECUTE ACTIONS SUB-METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Execute a single action with full lifecycle (pre-analysis, execution, post-analysis)
+   */
+  private async executeSingleAction(
+    action: DynamicAction,
+    context: PageContext,
+    snapshotBefore: DOMSnapshot
+  ): Promise<ActionResult> {
+    try {
+      // Step 1 & 2: Run pre-action analysis and selector validation in parallel (if selector exists)
+      const [preAnalysisResult, selectorValidation] = await Promise.all([
+        this.handlePreActionAnalysis(action, context),
+        action.selector
+          ? this.validateAndPrepareSelector(action, context)
+          : Promise.resolve({ isValid: true, healedAction: undefined, error: undefined } as const),
+      ]);
+
+      if (preAnalysisResult.shouldSkip) {
+        return await this.handleActionFailure(action, 'Action blocked by prerequisite conditions', {
+          pageType: context.pageType,
+          pageUrl: context.url,
+          preAnalysis: preAnalysisResult.preAnalysis,
+        });
+      }
+
+      // Check selector validation
+      if (!selectorValidation.isValid) {
+        return await this.handleActionFailure(action, selectorValidation.error || 'Selector validation failed', {
+          pageType: context.pageType,
+          pageUrl: context.url,
+        });
+      }
+
+      // Use healed action if available
+      if (selectorValidation.healedAction) {
+        action = selectorValidation.healedAction;
+      }
+
+      // Step 3: Capture before screenshot
+      const screenshots = await this.captureActionScreenshots(action, { isBeforeAction: true });
+
+      // Step 4: Execute action command
+      const executionResult = await this.executeActionCommand(action, context);
+
+      // Step 5: Capture after screenshot
+      const afterScreenshots = await this.captureActionScreenshots(action, {
+        isAfterAction: !executionResult.success,
+        isError: !executionResult.success,
+      });
+
+      // Step 6: Create action result
+      const actionResult: ActionResult = {
+        action,
+        success: executionResult.success,
+        error: executionResult.error,
+        urlChanged: executionResult.urlChanged,
+        urlBefore: executionResult.urlBefore,
+        urlAfter: executionResult.urlAfter,
+        screenshot: afterScreenshots.after || screenshots.before,
+        timestamp: Date.now(),
+      };
+
+      // Step 7: Validate result
+      const validation = await ResultValidator.validateResult(action, actionResult, this.page);
+
+      if (!validation.passed) {
+        actionResult.success = false;
+        actionResult.error = validation.message || 'Validation failed';
+      }
+
+      // Step 8: Update state
+      this.state = StateTracker.recordActionResult(this.state, actionResult);
+
+      // Step 9: Post-action analysis (if needed)
+      if (this.shouldPerformPostAnalysis(action, {
+        urlChanged: actionResult.urlChanged,
+        actionSucceeded: actionResult.success,
+      })) {
+        await this.handlePostActionAnalysisMethod(action, actionResult, context, snapshotBefore);
+      }
+
+      return actionResult;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return await this.handleActionFailure(action, errorMessage, {
+        pageType: context.pageType,
+        pageUrl: context.url,
+      });
+    }
+  }
+
+  /**
+   * Handle pre-action analysis and execute prerequisite actions
+   */
+  private async handlePreActionAnalysis(
+    action: DynamicAction,
+    context: PageContext
+  ): Promise<{
+    shouldSkip: boolean;
+    preAnalysis?: any;
+    prerequisiteResults?: ActionResult[];
+  }> {
+    const actionContext = this.getActionContext(context);
+    const actionWithContext = this.createActionWithContext(action, actionContext);
+
+    // Perform pre-action analysis
+    const preAnalysis = await PreActionAnalyzer.analyzeBeforeAction(this.page, actionWithContext);
+
+    // Log blocking factors if any
+    if (preAnalysis.blockingFactors.length > 0) {
+      logger.info('[INTELLIGENT_ORCHESTRATOR] Pre-action analysis found blocking factors', {
+        testId: this.testId,
+        action: action.description,
+        testGoal: actionContext.testGoal,
+        pageType: actionContext.pageType,
+        pageUrl: actionContext.pageUrl,
+        blockingFactors: preAnalysis.blockingFactors.map((bf: any) => ({
+          type: bf.type,
+          description: bf.description,
+          priority: bf.priority || 'medium',
+          hasSuggestedActions: (bf.suggestedActions?.length || 0) > 0,
+        })),
+        suggestedActionsCount: preAnalysis.suggestedActions.length,
+        context: preAnalysis.context,
+      });
+
+      // Execute prerequisite actions if suggested
+      const prerequisiteResults: ActionResult[] = [];
+      if (preAnalysis.suggestedActions.length > 0) {
+        const sortedPrereqActions = [...preAnalysis.suggestedActions].sort((a: any, b: any) => {
+          const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+          const aPriority = a.priority || 'medium';
+          const bPriority = b.priority || 'medium';
+          return (priorityOrder[aPriority as keyof typeof priorityOrder] || 2) -
+                 (priorityOrder[bPriority as keyof typeof priorityOrder] || 2);
+        });
+
+        for (const prereqAction of sortedPrereqActions) {
+          this.logPrerequisiteAction(prereqAction, {
+            testGoal: actionContext.testGoal,
+            pageType: actionContext.pageType,
+            pageUrl: actionContext.pageUrl,
+            blockingFactor: preAnalysis.blockingFactors[0]?.description || 'Unknown',
+            priority: (prereqAction as any).priority,
+          });
+
+          try {
+            const result = await this.commandExecutor.executeCommand(prereqAction as any);
+            prerequisiteResults.push({
+              action: prereqAction,
+              success: result.success,
+              error: result.error,
+              urlChanged: false,
+              urlBefore: context.url,
+              urlAfter: context.url,
+              timestamp: Date.now(),
+            });
+
+            if (!result.success) {
+              logger.warn('[INTELLIGENT_ORCHESTRATOR] Prerequisite action failed', {
+                testId: this.testId,
+                action: prereqAction.description,
+                error: result.error,
+              });
+            }
+          } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            prerequisiteResults.push({
+              action: prereqAction,
+              success: false,
+              error: errorMessage,
+              urlChanged: false,
+              urlBefore: context.url,
+              urlAfter: context.url,
+              timestamp: Date.now(),
+            });
+          }
+        }
+      }
+
+      // Check if still blocked after prerequisites
+      if (this.isActionBlocked(preAnalysis)) {
+        return { shouldSkip: true, preAnalysis, prerequisiteResults };
+      }
+
+      return { shouldSkip: false, preAnalysis, prerequisiteResults };
+    }
+
+    return { shouldSkip: false, preAnalysis };
+  }
+
+  /**
+   * Validate and prepare selector with self-healing
+   */
+  private async validateAndPrepareSelector(
+    action: DynamicAction,
+    context: PageContext
+  ): Promise<{
+    isValid: boolean;
+    healedAction?: DynamicAction;
+    error?: string;
+  }> {
+    if (!action.selector) {
+      return { isValid: true };
+    }
+
+    const normalizedSelector = normalizeSelector(action.selector);
+    const locator = this.getLocatorWrapper(normalizedSelector);
+    const elementCount = await locator.count();
+
+    if (elementCount === 0) {
+      // Track selector failures
+      const failureCount = (this.selectorFailures.get(normalizedSelector) || 0) + 1;
+      this.selectorFailures.set(normalizedSelector, failureCount);
+
+      // Try self-healing on first failure
+      if (failureCount === 1) {
+        try {
+          logger.info('[INTELLIGENT_ORCHESTRATOR] Selector not found, attempting self-healing', {
+            testId: this.testId,
+            action: action.description,
+            selector: normalizedSelector,
+          });
+
+          const healingResult = await SelfHealingService.healSelector({
+            oldSelector: normalizedSelector,
+            intent: action.description || `${action.action} element`,
+            page: this.page,
+            errorMessage: `Selector not found: ${normalizedSelector}`,
+            metadata: {
+              url: this.page.url(),
+              projectId: this.config.userContext?.projectId as string | undefined,
+              userId: this.userId,
+            },
+            mode: 'fast',
+          });
+
+          if (healingResult.success && healingResult.newSelector && healingResult.autoApplied) {
+            const healedNormalized = normalizeSelector(healingResult.newSelector);
+            const healedLocator = getLocator(this.page, healedNormalized);
+            const healedCount = await healedLocator.count();
+
+            if (healedCount > 0) {
+              logger.info('[INTELLIGENT_ORCHESTRATOR] Self-healing successful', {
+                testId: this.testId,
+                oldSelector: normalizedSelector,
+                newSelector: healingResult.newSelector,
+                confidence: healingResult.diff.confidence,
+              });
+
+              // Reset failure count
+              this.selectorFailures.delete(normalizedSelector);
+
+              return {
+                isValid: true,
+                healedAction: { ...action, selector: healingResult.newSelector },
+              };
+            }
+          }
+        } catch (healingError) {
+          logger.debug('[INTELLIGENT_ORCHESTRATOR] Self-healing failed', {
+            testId: this.testId,
+            error: healingError instanceof Error ? healingError.message : String(healingError),
+          });
+        }
+      }
+
+      return {
+        isValid: false,
+        error: `Selector not found: ${normalizedSelector} (failed ${failureCount} times)`,
+      };
+    }
+
+    // Reset failure count if selector works
+    this.selectorFailures.delete(normalizedSelector);
+    return { isValid: true };
+  }
+
+  /**
+   * Capture screenshots for action
+   */
+  private async captureActionScreenshots(
+    action: DynamicAction,
+    context: { isBeforeAction?: boolean; isAfterAction?: boolean; isError?: boolean }
+  ): Promise<{ before?: string; after?: string }> {
+    const screenshots: { before?: string; after?: string } = {};
+
+    if (context.isBeforeAction && this.shouldCaptureScreenshot(action, { isBeforeAction: true })) {
+      try {
+        const buffer = await this.page.screenshot({ fullPage: false });
+        screenshots.before = buffer.toString('base64');
+        this.screenshotMetrics.beforeActions++;
+        this.screenshotMetrics.totalCaptured++;
+      } catch (error) {
+        logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to capture before screenshot', {
+          testId: this.testId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (context.isAfterAction && this.shouldCaptureScreenshot(action, { isAfterAction: true })) {
+      try {
+        const buffer = await this.page.screenshot({ fullPage: false });
+        screenshots.after = buffer.toString('base64');
+        this.screenshotMetrics.afterActions++;
+        this.screenshotMetrics.totalCaptured++;
+      } catch (error) {
+        logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to capture after screenshot', {
+          testId: this.testId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (context.isError) {
+      try {
+        const buffer = await this.page.screenshot({ fullPage: false });
+        screenshots.after = buffer.toString('base64');
+        this.screenshotMetrics.onErrors++;
+        this.screenshotMetrics.totalCaptured++;
+      } catch (error) {
+        logger.debug('[INTELLIGENT_ORCHESTRATOR] Failed to capture error screenshot', {
+          testId: this.testId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return screenshots;
+  }
+
+  /**
+   * Execute action command through CommandExecutor
+   */
+  private async executeActionCommand(
+    action: DynamicAction,
+    context: PageContext
+  ): Promise<{
+    success: boolean;
+    error?: string;
+    urlChanged: boolean;
+    urlBefore: string;
+    urlAfter: string;
+  }> {
+    const actionContext = this.getActionContext(context);
+
+    this.logActionExecution(action, {
+      testGoal: actionContext.testGoal,
+      pageType: actionContext.pageType,
+      pageUrl: actionContext.pageUrl,
+      actionIndex: this.state.completedActions.length,
+      totalActions: this.state.completedActions.length + 1,
+      previousActions: actionContext.previousActions,
+    });
+
+    const urlBefore = this.page.url();
+
+    // Wait for action effect
+    await this.handleAsyncOperations(action);
+
+    // Execute through CommandExecutor
+    const executionResult = await this.commandExecutor.executeCommand(action as any);
+
+    // Wait for action to complete
+    await this.ensureActionCompleted(action);
+
+    const urlAfter = this.page.url();
+    const urlChanged = urlBefore !== urlAfter;
+
+    // Verify action success
+    const verification = await this.verifyActionSuccess(action, executionResult.success);
+
+    return {
+      success: verification.success,
+      error: verification.reason || executionResult.error,
+      urlChanged,
+      urlBefore,
+      urlAfter,
+    };
+  }
+
+  /**
+   * Handle post-action analysis
+   */
+  private async handlePostActionAnalysisMethod(
+    action: DynamicAction,
+    actionResult: ActionResult,
+    context: PageContext,
+    snapshotBefore: DOMSnapshot
+  ): Promise<{
+    shouldContinue: boolean;
+    followUpActions?: DynamicAction[];
+  }> {
+    if (!this.shouldPerformPostAnalysis(action, {
+      urlChanged: actionResult.urlChanged,
+      actionSucceeded: actionResult.success,
+    })) {
+      return { shouldContinue: true };
+    }
+
+    const enriched = this.enrichActionForAI(action, context);
+
+    const postActionDecision = await PostActionAnalyzer.analyze(
+      this.page,
+      {
+        action: enriched.action,
+        actionResult,
+        inputValue: action.value?.toString(),
+        goal: enriched.goal,
+      },
+      snapshotBefore,
+      this.costManager
+    );
+
+    this.logPostActionAnalysis(action, {
+      shouldContinue: !postActionDecision.needsFollowUp,
+      reason: postActionDecision.reason,
+      suggestedActions: postActionDecision.followUpActions,
+      detectedChanges: postActionDecision.stateChange ? [postActionDecision.stateChange] : [],
+      errorsDetected: [],
+    }, this.getActionContext(context));
+
+    return {
+      shouldContinue: !postActionDecision.needsFollowUp,
+      followUpActions: postActionDecision.followUpActions,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ACTION QUALITY AND VERIFICATION METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Verify that action actually succeeded (not just no error)
+   */
+  private async verifyActionSuccess(action: DynamicAction, executionSuccess: boolean): Promise<{ success: boolean; reason?: string }> {
+    if (!executionSuccess) {
+      return { success: false, reason: 'Execution failed' };
+    }
+
+    // For fill/type actions, verify input value
+    if ((action.action === 'fill' || action.action === 'type') && action.selector && action.value) {
+      try {
+        const element = getLocator(this.page, action.selector).first();
+        const actualValue = await element.inputValue({ timeout: 2000 }).catch(() => '');
+        const expectedValue = String(action.value);
+
+        if (!actualValue.includes(expectedValue)) {
+          return { success: false, reason: `Input value mismatch. Expected: "${expectedValue}", Got: "${actualValue}"` };
+        }
+      } catch (error) {
+        // If inputValue fails, try textContent for contenteditable
+        try {
+          const textContent = await getLocator(this.page, action.selector).first().textContent({ timeout: 2000 });
+          const expectedValue = String(action.value);
+          if (!textContent?.includes(expectedValue)) {
+            return { success: false, reason: `Text content mismatch. Expected: "${expectedValue}", Got: "${textContent || ''}"` };
+          }
+        } catch {
+          // If both fail, assume success (element might not be an input)
+        }
+      }
+    }
+
+    // For select actions, verify selected value
+    if (action.action === 'select' && action.selector && action.value) {
+      try {
+        const element = getLocator(this.page, action.selector).first();
+        const selectedValue = await element.inputValue({ timeout: 2000 }).catch(() => '');
+        const expectedValue = String(action.value);
+
+        if (selectedValue !== expectedValue && !selectedValue.includes(expectedValue)) {
+          return { success: false, reason: `Select value mismatch. Expected: "${expectedValue}", Got: "${selectedValue}"` };
+        }
+      } catch {
+        // Assume success if verification fails
+      }
+    }
+
+    // For check/uncheck actions, verify checkbox state
+    if ((action.action === 'check' || action.action === 'uncheck') && action.selector) {
+      try {
+        const element = getLocator(this.page, action.selector).first();
+        const isChecked = await element.isChecked({ timeout: 2000 }).catch(() => false);
+        const expectedChecked = action.action === 'check';
+
+        if (isChecked !== expectedChecked) {
+          return { success: false, reason: `Checkbox state mismatch. Expected: ${expectedChecked}, Got: ${isChecked}` };
+        }
+      } catch {
+        // Assume success if verification fails
+      }
+    }
+
+    return { success: true };
+  }
+
+  /**
+   * Wait for action effect to appear on page
+   */
+  private async waitForActionEffect(action: DynamicAction, timeout: number = 3000): Promise<void> {
+    try {
+      // For click actions, wait for potential navigation or state change
+      if (action.action === 'click') {
+        await this.page.waitForLoadState('domcontentloaded', { timeout }).catch(() => {});
+        await this.page.waitForTimeout(500); // Small delay for JS to execute
+      }
+
+      // For fill/type actions, wait for validation or dependent fields
+      if (action.action === 'fill' || action.action === 'type') {
+        await this.page.waitForTimeout(300); // Wait for validation
+      }
+
+      // For select actions, wait for dependent fields to update
+      if (action.action === 'select') {
+        await this.page.waitForTimeout(500); // Wait for dependent updates
+      }
+    } catch {
+      // Ignore timeout errors
+    }
+  }
+
+  /**
+   * Check element state after action
+   */
+  private async checkElementStateAfterAction(action: DynamicAction): Promise<{
+    exists: boolean;
+    visible: boolean;
+    enabled: boolean;
+    value?: string;
+  }> {
+    if (!action.selector) {
+      return { exists: false, visible: false, enabled: false };
+    }
+
+    try {
+      const element = getLocator(this.page, action.selector).first();
+      const count = await element.count();
+
+      if (count === 0) {
+        return { exists: false, visible: false, enabled: false };
+      }
+
+      const visible = await element.isVisible({ timeout: 1000 }).catch(() => false);
+      const enabled = await element.isEnabled({ timeout: 1000 }).catch(() => true);
+
+      let value: string | undefined;
+      if (action.action === 'fill' || action.action === 'type' || action.action === 'select') {
+        value = await element.inputValue({ timeout: 1000 }).catch(() => undefined);
+      }
+
+      return { exists: true, visible, enabled, value };
+    } catch {
+      return { exists: false, visible: false, enabled: false };
+    }
+  }
+
+  /**
+   * Detect page changes after action
+   */
+  private async detectPageChanges(beforeSnapshot: DOMSnapshot, afterSnapshot: DOMSnapshot): Promise<{
+    hasChanges: boolean;
+    changes: string[];
+  }> {
+    const changes: string[] = [];
+
+    // Compare visible elements count
+    if (beforeSnapshot.visibleElements.length !== afterSnapshot.visibleElements.length) {
+      changes.push(`Visible elements changed: ${beforeSnapshot.visibleElements.length} → ${afterSnapshot.visibleElements.length}`);
+    }
+
+    // Compare modals
+    if (beforeSnapshot.modals.length !== afterSnapshot.modals.length) {
+      changes.push(`Modals changed: ${beforeSnapshot.modals.length} → ${afterSnapshot.modals.length}`);
+    }
+
+    // Compare errors
+    if (beforeSnapshot.errors.length !== afterSnapshot.errors.length) {
+      changes.push(`Errors changed: ${beforeSnapshot.errors.length} → ${afterSnapshot.errors.length}`);
+    }
+
+    // Compare button states
+    if (beforeSnapshot.buttonStates.length !== afterSnapshot.buttonStates.length) {
+      changes.push(`Button states changed: ${beforeSnapshot.buttonStates.length} → ${afterSnapshot.buttonStates.length}`);
+    }
+
+    // Check for new elements
+    const beforeSelectors = new Set(beforeSnapshot.visibleElements.map(el => el.selector));
+    const newElements = afterSnapshot.visibleElements.filter(el => !beforeSelectors.has(el.selector));
+
+    if (newElements.length > 0) {
+      changes.push(`New elements appeared: ${newElements.slice(0, 3).map(el => el.text || el.selector).join(', ')}${newElements.length > 3 ? '...' : ''}`);
+    }
+
+    return {
+      hasChanges: changes.length > 0,
+      changes,
+    };
+  }
+
+  /**
+   * Ensure action completed before proceeding
+   */
+  private async ensureActionCompleted(action: DynamicAction): Promise<void> {
+    // Wait for page to stabilize
+    await this.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+
+    // Wait for network to be idle (no pending requests)
+    await this.page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+
+    // Small delay for animations/transitions
+    await this.page.waitForTimeout(200);
+  }
+
+  /**
+   * Handle async operations (SPA, lazy loading)
+   */
+  private async handleAsyncOperations(action: DynamicAction): Promise<void> {
+    // For navigation-like actions, wait longer
+    if (action.action === 'click' || action.action === 'goto') {
+      await this.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+    }
+
+    // For form actions, wait for validation
+    if (action.action === 'fill' || action.action === 'type' || action.action === 'select') {
+      await this.page.waitForTimeout(500); // Wait for validation/dependent fields
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ERROR HANDLING METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Create error context for AI analysis
+   */
+  private createActionErrorContext(action: DynamicAction, error: string, context: {
+    pageType: string;
+    pageUrl: string;
+    preAnalysis?: any;
+    validation?: any;
+  }): {
+    action: DynamicAction;
+    error: string;
+    context: {
+      pageType: string;
+      pageUrl: string;
+      testGoal: string;
+      blockingFactors?: string[];
+      validationMessage?: string;
+      previousActions: string[];
+    };
+  } {
+    return {
+      action,
+      error,
+      context: {
+        pageType: context.pageType,
+        pageUrl: context.pageUrl,
+        testGoal: this.state.goal,
+        blockingFactors: context.preAnalysis?.blockingFactors?.map((bf: any) => bf.description),
+        validationMessage: context.validation?.message,
+        previousActions: this.state.completedActions.slice(-3).map(a => a.action.description),
+      },
+    };
+  }
+
+  /**
+   * Determine if action should be retried
+   */
+  private shouldRetryAction(action: DynamicAction, error: string, attemptCount: number): boolean {
+    const maxRetries = action.retry || 2;
+
+    // Don't retry if max attempts reached
+    if (attemptCount >= maxRetries) {
+      return false;
+    }
+
+    // Retry on timeout errors
+    if (error.includes('timeout') || error.includes('Timeout')) {
+      return true;
+    }
+
+    // Retry on selector not found errors
+    if (error.includes('not found') || error.includes('not visible')) {
+      return true;
+    }
+
+    // Retry on network errors
+    if (error.includes('net::') || error.includes('ERR_')) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Handle action failure with structured error reporting
+   */
+  private async handleActionFailure(action: DynamicAction, error: string, context: {
+    pageType: string;
+    pageUrl: string;
+    preAnalysis?: any;
+    validation?: any;
+    screenshot?: string;
+  }): Promise<ActionResult> {
+    const errorContext = this.createActionErrorContext(action, error, context);
+
+    // Log structured error
+    this.logActionError(action, error, {
+      testGoal: errorContext.context.testGoal,
+      pageType: errorContext.context.pageType,
+      pageUrl: errorContext.context.pageUrl,
+      validationMessage: errorContext.context.validationMessage,
+      blockingFactors: errorContext.context.blockingFactors,
+    });
+
+    // Create action result
+    const actionResult: ActionResult = {
+      action,
+      success: false,
+      error,
+      urlChanged: false,
+      urlBefore: context.pageUrl,
+      urlAfter: context.pageUrl,
+      screenshot: context.screenshot,
+      timestamp: Date.now(),
+    };
+
+    // Update state
+    this.state = StateTracker.recordActionResult(this.state, actionResult);
+
+    return actionResult;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // VALIDATION AND CHECK METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Determine if screenshot should be captured for this action
+   */
+  private shouldCaptureScreenshot(action: DynamicAction, context: {
+    isError?: boolean;
+    isNavigation?: boolean;
+    isBeforeAction?: boolean;
+    isAfterAction?: boolean;
+  }): boolean {
+    // Always capture on errors
+    if (context.isError) {
+      return true;
+    }
+
+    // Always capture on navigation
+    if (context.isNavigation) {
+      return true;
+    }
+
+    // Capture before critical actions
+    if (context.isBeforeAction && (action.action === 'click' || action.action === 'fill' || action.action === 'select')) {
+      return true;
+    }
+
+    // Capture after actions that might change UI state
+    if (context.isAfterAction && (action.action === 'click' || action.action === 'fill' || action.action === 'check' || action.action === 'uncheck')) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Determine if post-action analysis should be performed
+   */
+  private shouldPerformPostAnalysis(action: DynamicAction, context: {
+    urlChanged: boolean;
+    actionSucceeded: boolean;
+    isLastAction?: boolean;
+  }): boolean {
+    // Skip if URL changed (page navigation)
+    if (context.urlChanged) {
+      return false;
+    }
+
+    // Skip if action failed
+    if (!context.actionSucceeded) {
+      return false;
+    }
+
+    // Always analyze last action
+    if (context.isLastAction) {
+      return true;
+    }
+
+    // Analyze after critical actions
+    const criticalActions = ['click', 'fill', 'select', 'check', 'uncheck'];
+    if (criticalActions.includes(action.action)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Check if action is blocked by prerequisite conditions
+   */
+  private isActionBlocked(preAnalysis: {
+    blockingFactors: Array<{ type: string; description: string; priority?: string }>;
+    suggestedActions: DynamicAction[];
+  }): boolean {
+    // Check if there are any blocking factors
+    if (!preAnalysis.blockingFactors || preAnalysis.blockingFactors.length === 0) {
+      return false;
+    }
+
+    // Check if there are critical or high priority blocking factors
+    const hasCriticalBlocking = preAnalysis.blockingFactors.some(
+      bf => bf.priority === 'critical' || bf.priority === 'high'
+    );
+
+    return hasCriticalBlocking;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STRUCTURED LOGGING HELPERS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Log action execution with full context
+   */
+  private logActionExecution(action: DynamicAction, context: {
+    testGoal: string;
+    pageType: string;
+    pageUrl: string;
+    actionIndex: number;
+    totalActions: number;
+    previousActions?: string[];
+  }): void {
+    logger.info('[INTELLIGENT_ORCHESTRATOR] Executing action', {
+      testId: this.testId,
+      action: action.action,
+      description: action.description,
+      selector: action.selector,
+      value: action.value,
+      optional: action.optional,
+      testGoal: context.testGoal,
+      pageType: context.pageType,
+      pageUrl: context.pageUrl,
+      progress: `${context.actionIndex + 1}/${context.totalActions}`,
+      previousActions: context.previousActions,
+    });
+  }
+
+  /**
+   * Log action error with full context
+   */
+  private logActionError(action: DynamicAction, error: string, context: {
+    testGoal: string;
+    pageType: string;
+    pageUrl: string;
+    validationPassed?: boolean;
+    validationMessage?: string;
+    attemptedPrerequisites?: number;
+    blockingFactors?: string[];
+    urlChanged?: boolean;
+  }): void {
+    logger.warn('[INTELLIGENT_ORCHESTRATOR] Action failed', {
+      testId: this.testId,
+      action: action.action,
+      description: action.description,
+      selector: action.selector,
+      testGoal: context.testGoal,
+      pageType: context.pageType,
+      pageUrl: context.pageUrl,
+      error,
+      optional: action.optional,
+      urlChanged: context.urlChanged,
+      validationPassed: context.validationPassed,
+      validationMessage: context.validationMessage,
+      attemptedPrerequisites: context.attemptedPrerequisites,
+      blockingFactors: context.blockingFactors,
+    });
+  }
+
+  /**
+   * Log prerequisite action execution
+   */
+  private logPrerequisiteAction(action: DynamicAction, context: {
+    testGoal: string;
+    pageType: string;
+    pageUrl: string;
+    blockingFactor: string;
+    priority?: string;
+  }): void {
+    logger.info('[INTELLIGENT_ORCHESTRATOR] Executing prerequisite action', {
+      testId: this.testId,
+      action: action.action,
+      description: action.description,
+      selector: action.selector,
+      testGoal: context.testGoal,
+      pageType: context.pageType,
+      pageUrl: context.pageUrl,
+      blockingFactor: context.blockingFactor,
+      priority: context.priority || 'medium',
+    });
+  }
+
+  /**
+   * Log post-action analysis results
+   */
+  private logPostActionAnalysis(action: DynamicAction, analysis: {
+    shouldContinue: boolean;
+    reason?: string;
+    suggestedActions?: DynamicAction[];
+    detectedChanges?: string[];
+    errorsDetected?: string[];
+  }, context: {
+    testGoal: string;
+    pageType: string;
+    pageUrl: string;
+  }): void {
+    logger.info('[INTELLIGENT_ORCHESTRATOR] Post-action analysis', {
+      testId: this.testId,
+      action: action.description,
+      testGoal: context.testGoal,
+      pageType: context.pageType,
+      pageUrl: context.pageUrl,
+      shouldContinue: analysis.shouldContinue,
+      reason: analysis.reason,
+      suggestedActionsCount: analysis.suggestedActions?.length || 0,
+      detectedChanges: analysis.detectedChanges,
+      errorsDetected: analysis.errorsDetected,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // WEBSOCKET EVENTS
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
    * Emit event via WebSocket
-   * ✅ OPTIMIZED: Deduplicates redundant events, only emits on state changes
+   * Deduplicates redundant events and only emits on state changes to reduce traffic
    */
   private lastEmittedEvent: { event: string; timestamp: number } | null = null;
 
@@ -2552,7 +3730,7 @@ export class IntelligentTestOrchestrator {
       return;
     }
 
-    // ✅ OPTIMIZATION: Deduplicate rapid-fire identical events
+    // Deduplicate rapid-fire identical events to reduce WebSocket traffic
     // Skip if same event was emitted less than threshold ago
     const now = Date.now();
     const pageContext = AdaptiveConfigService.analyzePageContext(this.state);
@@ -2565,7 +3743,7 @@ export class IntelligentTestOrchestrator {
       return; // Skip duplicate
     }
 
-    // ✅ OPTIMIZATION: Filter out noisy events
+    // Filter out noisy events to reduce unnecessary WebSocket messages
     // These are redundant as graph updates already show action progress
     const isCritical = this.state.completedActions.length > 0 &&
                        !this.state.completedActions[this.state.completedActions.length - 1].success;
@@ -2594,7 +3772,7 @@ export class IntelligentTestOrchestrator {
     }
   }
 
-  // ✅ NEW: Emit graph update via WebSocket
+  // Emit graph update via WebSocket for real-time visualization
   private emitGraphUpdate(update: import('./utils/graph-builder.service').GraphUpdate): void {
     if (!this.userId || !this.testId) {
       return;
@@ -2653,16 +3831,17 @@ export class IntelligentTestOrchestrator {
 
 
   /**
-   * ✅ FIX 2: Use centralized selector normalization (removed duplication)
+   * Use centralized selector normalization from utils/selector-utils.ts (removed duplicate implementation)
    */
   // Removed: normalizeSelector() - now using utils/selector-utils.ts
 
   /**
-   * ✅ FIX 2: Use centralized locator creation (removed duplication)
+   * Use centralized locator creation from utils/selector-utils.ts
+   * (removed duplicate implementation)
    */
   private getLocatorWrapper(selector: string): import('playwright').Locator {
     return getLocator(this.page, selector);
   }
 
-  // ✅ FIX 2: Old implementations removed - now using centralized selector-utils.ts
+  // Old selector utility implementations removed - now using centralized selector-utils.ts
 }

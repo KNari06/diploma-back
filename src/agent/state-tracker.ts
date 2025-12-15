@@ -152,6 +152,7 @@ export class StateTracker {
    * @param currentUrl - Current URL
    * @param maxVisits - Maximum visits to same URL
    * @returns Cycle detection result
+   * ✅ IMPROVED: Context-aware - detects cycles with query params and ignores normal patterns
    */
   static detectCycle(
     state: TestState,
@@ -160,6 +161,12 @@ export class StateTracker {
   ): CycleDetectionResult {
     // ✅ FIX: Normalize URLs for comparison
     const normalizedCurrent = this.normalizeUrl(currentUrl);
+
+    // ✅ NEW: Also check for cycles with query params (pagination, filters)
+    const queryParamCycle = this.detectQueryParamCycle(state, currentUrl);
+    if (queryParamCycle) {
+      return queryParamCycle;
+    }
 
     // Count how many times we've "meaningfully" visited this URL (normalized).
     //
@@ -186,6 +193,20 @@ export class StateTracker {
     }
 
     if (visitCount >= maxVisits) {
+      // ✅ IMPROVED: Check if this is a normal pattern (login redirect, etc.)
+      const isNormalPattern = this.isNormalCyclePattern(state, currentUrl, visitCount);
+      if (isNormalPattern) {
+        logger.debug('[STATE_TRACKER] Ignoring normal cycle pattern', {
+          url: currentUrl,
+          visitCount,
+          reason: isNormalPattern,
+        });
+        return {
+          cycleDetected: false,
+          suggestion: 'Cycle detected but appears to be normal user flow',
+        };
+      }
+
       logger.warn('[STATE_TRACKER] Cycle detected', {
         url: currentUrl,
         visitCount,
@@ -223,7 +244,116 @@ export class StateTracker {
   }
 
   /**
+   * ✅ NEW: Detect cycles with query params (pagination, filters)
+   * Example: /products?page=1 → /products?page=2 → /products?page=1
+   */
+  private static detectQueryParamCycle(
+    state: TestState,
+    currentUrl: string
+  ): CycleDetectionResult | null {
+    try {
+      const currentUrlObj = new URL(currentUrl);
+      const baseUrl = `${currentUrlObj.protocol}//${currentUrlObj.host}${currentUrlObj.pathname}`;
+
+      // Check if URL has query params that suggest pagination/filtering
+      const hasPaginationParam = currentUrlObj.searchParams.has('page') ||
+                                 currentUrlObj.searchParams.has('p') ||
+                                 currentUrlObj.searchParams.has('offset');
+      const hasFilterParam = currentUrlObj.searchParams.has('filter') ||
+                            currentUrlObj.searchParams.has('category') ||
+                            currentUrlObj.searchParams.has('sort');
+
+      if (!hasPaginationParam && !hasFilterParam) {
+        return null; // No query params to check
+      }
+
+      // Find recent visits to same base URL with different query params
+      const recentVisits = state.visitedPages.slice(-6);
+      const sameBaseUrlVisits = recentVisits.filter(p => {
+        try {
+          const pageUrlObj = new URL(p.url);
+          const pageBaseUrl = `${pageUrlObj.protocol}//${pageUrlObj.host}${pageUrlObj.pathname}`;
+          return pageBaseUrl === baseUrl;
+        } catch {
+          return false;
+        }
+      });
+
+      if (sameBaseUrlVisits.length >= 3) {
+        // Check if we're cycling through same query param values
+        const queryParamValues = sameBaseUrlVisits.map(p => {
+          try {
+            const pageUrlObj = new URL(p.url);
+            return pageUrlObj.search; // Get query string
+          } catch {
+            return '';
+          }
+        });
+
+        // Check for A → B → A pattern in query params
+        if (queryParamValues.length >= 3) {
+          const lastThree = queryParamValues.slice(-3);
+          if (lastThree[0] === lastThree[2] && lastThree[0] !== lastThree[1] && lastThree[0] !== '') {
+            logger.warn('[STATE_TRACKER] Query param cycle detected', {
+              baseUrl,
+              pattern: `${lastThree[0]} → ${lastThree[1]} → ${lastThree[0]}`,
+            });
+
+            return {
+              cycleDetected: true,
+              repeatedUrl: currentUrl,
+              visitCount: sameBaseUrlVisits.length,
+              suggestion: `Detected cycle with query params on ${baseUrl}. Consider stopping or changing filters/pagination.`,
+            };
+          }
+        }
+      }
+    } catch {
+      // URL parsing failed, skip query param detection
+    }
+
+    return null;
+  }
+
+  /**
+   * ✅ NEW: Check if cycle is a normal pattern (not a problem)
+   * Examples: Login redirects, session refresh, etc.
+   */
+  private static isNormalCyclePattern(
+    state: TestState,
+    currentUrl: string,
+    visitCount: number
+  ): string | null {
+    // Pattern 1: Login redirect loop - if we successfully logged in, might be session refresh
+    if (currentUrl.toLowerCase().includes('/login') || currentUrl.toLowerCase().includes('/signin')) {
+      const recentActions = state.completedActions.slice(-10);
+      const hasSuccessfulLogin = recentActions.some(a =>
+        a.success && (a.action.description?.toLowerCase().includes('login') ||
+                     a.action.description?.toLowerCase().includes('sign in') ||
+                     a.action.description?.toLowerCase().includes('submit'))
+      );
+      if (hasSuccessfulLogin && visitCount <= 4) {
+        return 'login_session_refresh';
+      }
+    }
+
+    // Pattern 2: Dashboard/home page - visiting multiple times might be normal (navigation)
+    if (currentUrl.toLowerCase().includes('/dashboard') ||
+        currentUrl.toLowerCase().includes('/home') ||
+        currentUrl.toLowerCase().endsWith('/')) {
+      const recentPages = state.visitedPages.slice(-6);
+      const hasDifferentPages = new Set(recentPages.map(p => this.normalizeUrl(p.url))).size > 2;
+      if (hasDifferentPages && visitCount <= 4) {
+        return 'navigation_hub';
+      }
+    }
+
+    return null; // Not a normal pattern - might be a real cycle
+  }
+
+  /**
    * Detect repeating navigation patterns (A → B → A → B)
+   * ✅ IMPROVED: Context-aware - ignores normal patterns (breadcrumbs, multi-step forms)
    */
   private static detectNavigationPattern(
     recentPages: PageVisit[]
@@ -242,11 +372,81 @@ export class StateTracker {
         urls[i + 1] === urls[i + 3] &&
         urls[i] !== urls[i + 1]
       ) {
+        // ✅ IMPROVED: Check if this is a normal navigation pattern
+        const isNormalPattern = this.isNormalNavigationPattern(recentPages, i);
+        if (isNormalPattern) {
+          logger.debug('[STATE_TRACKER] Ignoring normal navigation pattern', {
+            pattern: `${urls[i]} ↔ ${urls[i + 1]}`,
+            reason: isNormalPattern,
+          });
+          continue; // Not a problem - normal user behavior
+        }
+
         return `${urls[i]} ↔ ${urls[i + 1]}`;
       }
     }
 
     return null;
+  }
+
+  /**
+   * ✅ NEW: Check if navigation pattern is normal (not a problem)
+   * Examples: Breadcrumbs, multi-step forms, back navigation
+   */
+  private static isNormalNavigationPattern(
+    recentPages: PageVisit[],
+    patternStartIndex: number
+  ): string | null {
+    // Pattern 1: Breadcrumb navigation - going back is normal
+    // Check if page types suggest hierarchical navigation (home → category → product → category)
+    const pageTypes = recentPages.slice(patternStartIndex, patternStartIndex + 4).map(p => p.pageType);
+    const hierarchicalTypes = ['home', 'category', 'product', 'category'];
+    const isBreadcrumbLike = pageTypes.every((type, idx) =>
+      type === hierarchicalTypes[idx] || type === 'unknown'
+    );
+    if (isBreadcrumbLike) {
+      return 'breadcrumb_navigation';
+    }
+
+    // Pattern 2: Multi-step form - going back to previous step is normal
+    const hasFormPages = recentPages.slice(patternStartIndex, patternStartIndex + 4).some(p => {
+      const pageType = p.pageType?.toLowerCase() || '';
+      return pageType.includes('form') || pageType.includes('checkout') ||
+             pageType.includes('register') || pageType.includes('wizard');
+    });
+    if (hasFormPages) {
+      // Check if actions suggest form navigation (next, back, previous)
+      const actions = recentPages
+        .slice(patternStartIndex, patternStartIndex + 4)
+        .flatMap(p => p.actionResults || []);
+      const hasFormNavigation = actions.some(a => {
+        const desc = (a.action.description || '').toLowerCase();
+        return desc.includes('next') || desc.includes('back') || desc.includes('previous') ||
+               desc.includes('step') || desc.includes('continue');
+      });
+      if (hasFormNavigation) {
+        return 'multi_step_form_navigation';
+      }
+    }
+
+    // Pattern 3: Login redirect loop - if actions are successful, might be session refresh
+    const hasLoginPages = recentPages.slice(patternStartIndex, patternStartIndex + 4).some(p =>
+      p.pageType === 'login'
+    );
+    if (hasLoginPages) {
+      const actions = recentPages
+        .slice(patternStartIndex, patternStartIndex + 4)
+        .flatMap(p => p.actionResults || []);
+      const hasSuccessfulLogin = actions.some(a =>
+        a.success && (a.action.description?.toLowerCase().includes('login') ||
+                     a.action.description?.toLowerCase().includes('sign in'))
+      );
+      if (hasSuccessfulLogin) {
+        return 'login_session_refresh';
+      }
+    }
+
+    return null; // Not a normal pattern - might be a real cycle
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

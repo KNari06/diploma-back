@@ -14,6 +14,7 @@ import { StateTracker } from './state-tracker';
 import {
   DynamicAction,
   IntelligentTestConfig,
+  NextStepDecision,
   PageContext,
   PageVisit,
   TestState,
@@ -28,8 +29,9 @@ import { GraphBuilder } from './utils/graph-builder.service';
 export interface MainLoopDependencies {
   // Core dependencies
   page: Page;
-  state: TestState;
   config: IntelligentTestConfig;
+  getState: () => TestState;
+  setState: (next: TestState) => void;
 
   // Optional identifiers
   testId?: string;
@@ -67,8 +69,9 @@ export class MainLoopService {
   static async execute(deps: MainLoopDependencies): Promise<boolean> {
     const {
       page,
-      state,
       config,
+      getState,
+      setState,
       testId,
       userId,
       graphBuilder,
@@ -82,6 +85,8 @@ export class MainLoopService {
       emitGraphUpdate,
     } = deps;
 
+    const isAboutUrl = (url: string): boolean => url === 'about:blank' || url.startsWith('about:');
+
     let continueLoop = true;
     let iteration = 0;
 
@@ -93,6 +98,8 @@ export class MainLoopService {
 
     while (continueLoop) {
       iteration++;
+      const state = getState();
+
       logger.info(`[MAIN_LOOP] Loop iteration ${iteration}`, {
         testId,
         pagesVisited: state.pagesAnalyzed,
@@ -105,23 +112,24 @@ export class MainLoopService {
         logger.info('[MAIN_LOOP] Test was cancelled, stopping execution', {
           testId,
           iteration,
-          pagesVisited: state.pagesAnalyzed,
-          actionsCompleted: state.completedActions.length,
+          pagesVisited: getState().pagesAnalyzed,
+          actionsCompleted: getState().completedActions.length,
         });
         return true; // Return true to indicate cancellation
       }
 
       // Check limits before each iteration
-      const limitsCheck = SafetyGuard.checkLimits(state, config.safety);
+      const limitsCheck = SafetyGuard.checkLimits(getState(), config.safety);
       if (!limitsCheck.safe) {
+        const currentState = getState();
         logger.warn('[MAIN_LOOP] Limits exceeded', {
           testId,
           iteration,
           reason: limitsCheck.reason,
           stats: {
-            pagesVisited: state.pagesAnalyzed,
-            actionsCompleted: state.completedActions.length,
-            duration: Date.now() - state.startTime,
+            pagesVisited: currentState.pagesAnalyzed,
+            actionsCompleted: currentState.completedActions.length,
+            duration: Date.now() - currentState.startTime,
           },
         });
 
@@ -135,6 +143,21 @@ export class MainLoopService {
       try {
         // STEP 1: Analyze current page
         const context = await analyzePage();
+
+        // Safety guard: analyzePage() tries to recover from about: URLs, but if it didn't,
+        // we should not continue with action generation on an invalid page.
+        if (isAboutUrl(context.url)) {
+          logger.error('[MAIN_LOOP] Page is still on about:* after analysis recovery', {
+            testId,
+            iteration,
+            url: context.url,
+            startUrl: config.startUrl,
+          });
+          emitEvent('test_warning', {
+            message: `Navigation issue: page is at "${context.url}". Stopping run.`,
+          });
+          break;
+        }
 
         // Add page node to graph when analyzing new page
         if (testId && userId && graphBuilder) {
@@ -175,8 +198,73 @@ export class MainLoopService {
           return true;
         }
 
+        // STEP 1.5: Detect truly empty pages BEFORE spending tokens on action generation
+        const hasNoInteractiveElements =
+          context.vision.elements.length === 0 &&
+          (context.dom.forms?.length || 0) === 0 &&
+          (context.dom.buttons?.length || 0) === 0 &&
+          (context.dom.links?.length || 0) === 0 &&
+          (context.dom.inputs?.length || 0) === 0;
+
+        if (hasNoInteractiveElements) {
+          consecutiveEmptyPages.value++;
+
+          logger.warn('[MAIN_LOOP] Page has no detectable interactive elements', {
+            testId,
+            iteration,
+            url: context.url,
+            pageType: context.pageType,
+            consecutiveCount: consecutiveEmptyPages.value,
+          });
+
+          const pageContext = AdaptiveConfigService.analyzePageContext(getState(), context.pageType);
+          const emptyPagesThreshold = AdaptiveConfigService.getThreshold('CONSECUTIVE_EMPTY_PAGES_THRESHOLD', {
+            testMode: config.mode,
+            isComplexPage: pageContext.isComplexPage,
+          });
+
+          if (consecutiveEmptyPages.value >= emptyPagesThreshold) {
+            emitEvent('test_warning', {
+              message: `Stopped: ${consecutiveEmptyPages.value} consecutive pages with no interactive elements detected.`,
+            });
+            break;
+          }
+
+          // If page is empty but threshold not reached, ask the decision engine what to do next.
+          const decision = await ContextualActionGenerator.decideNextStep(
+            getState(),
+            context,
+            costManager
+          );
+
+          logger.info('[MAIN_LOOP] Decision on empty page', {
+            testId,
+            iteration,
+            action: decision.action,
+            reason: decision.reason,
+          });
+
+          if (decision.action === 'stop') {
+            continueLoop = false;
+            break;
+          }
+
+          if (decision.action === 'skip') {
+            const skipResult = await MainLoopService.handleSkipNavigation(page, config, getState);
+            if (!skipResult.shouldContinue) {
+              continueLoop = false;
+            }
+          }
+
+          // retry/continue -> move to next iteration
+          continue;
+        } else {
+          // Reset counter if page has elements
+          consecutiveEmptyPages.value = 0;
+        }
+
         // STEP 2: Check for cycles (URL-based)
-        const cycleCheck = StateTracker.detectCycle(state, context.url);
+        const cycleCheck = StateTracker.detectCycle(getState(), context.url);
         if (cycleCheck.cycleDetected) {
           logger.warn('[MAIN_LOOP] URL cycle detected', {
             suggestion: cycleCheck.suggestion,
@@ -188,7 +276,7 @@ export class MainLoopService {
           });
 
           // More aggressive stopping - if cycle detected, stop immediately
-          const pageContext = AdaptiveConfigService.analyzePageContext(state, context.pageType);
+          const pageContext = AdaptiveConfigService.analyzePageContext(getState(), context.pageType);
           const cycleThreshold = AdaptiveConfigService.getThreshold('CYCLE_DETECTION_THRESHOLD', {
             testMode: config.mode,
             errorRate: pageContext.errorRate,
@@ -203,7 +291,7 @@ export class MainLoopService {
 
           // Try to decide next step despite cycle
           const decision = await ContextualActionGenerator.decideNextStep(
-            state,
+            getState(),
             context,
             costManager
           );
@@ -214,7 +302,7 @@ export class MainLoopService {
         }
 
         // STEP 2.5: Check for action patterns (repeated actions, failed chains, etc.)
-        const patternCheck = ActionPatternDetector.detectPatterns(state);
+        const patternCheck = ActionPatternDetector.detectPatterns(getState());
         if (patternCheck.hasPattern) {
           logger.warn('[MAIN_LOOP] Problematic action patterns detected', {
             patternsCount: patternCheck.patterns.length,
@@ -251,45 +339,6 @@ export class MainLoopService {
         // STEP 3: Generate actions
         const { actions, reasoning, confidence } = await generateActions(context);
 
-        // Track empty pages and stop if 2+ consecutive empty pages
-        const isEmptyPage = actions.length === 0 && (
-          (context.vision.elements.length === 0 &&
-           (context.dom.forms?.length || 0) === 0 &&
-           (context.dom.buttons?.length || 0) === 0 &&
-           (context.dom.links?.length || 0) === 0 &&
-           (context.dom.inputs?.length || 0) === 0)
-        );
-
-        if (isEmptyPage) {
-          consecutiveEmptyPages.value++;
-          logger.warn('[MAIN_LOOP] Empty page detected', {
-            url: context.url,
-            consecutiveCount: consecutiveEmptyPages.value,
-            pageType: context.pageType,
-            elementsCount: context.vision.elements.length,
-          });
-
-          // Stop if threshold reached
-          const pageContext = AdaptiveConfigService.analyzePageContext(state, context.pageType);
-          const emptyPagesThreshold = AdaptiveConfigService.getThreshold('CONSECUTIVE_EMPTY_PAGES_THRESHOLD', {
-            testMode: config.mode,
-            isComplexPage: pageContext.isComplexPage,
-          });
-          if (consecutiveEmptyPages.value >= emptyPagesThreshold) {
-            logger.warn('[MAIN_LOOP] Stopping due to consecutive empty pages', {
-              consecutiveCount: consecutiveEmptyPages.value,
-              url: context.url,
-            });
-            emitEvent('test_warning', {
-              message: `Stopped: ${consecutiveEmptyPages.value} consecutive empty pages detected. No interactive elements found.`,
-            });
-            break;
-          }
-        } else {
-          // Reset counter if page has elements
-          consecutiveEmptyPages.value = 0;
-        }
-
         if (actions.length === 0) {
           logger.warn('[MAIN_LOOP] No actions generated', {
             url: context.url,
@@ -300,7 +349,7 @@ export class MainLoopService {
 
           // Decide next step
           const decision = await ContextualActionGenerator.decideNextStep(
-            state,
+            getState(),
             context,
             costManager
           );
@@ -325,16 +374,15 @@ export class MainLoopService {
         pageVisit.screenshot = context.screenshot;
 
         // Only record visit if URL changed OR actions were successful
-        const urlChanged = state.currentUrl !== context.url;
+        const currentStateAfterActions = getState();
+        const urlChanged = currentStateAfterActions.currentUrl !== context.url;
         const hasSuccessfulActions = pageVisit.actionResults?.some(r => r.success) || false;
         const shouldRecordVisit = urlChanged || hasSuccessfulActions;
 
         if (shouldRecordVisit) {
           // STEP 5: Record visit
-          // Note: StateTracker.recordPageVisit returns a new state object
-          const newState = StateTracker.recordPageVisit(state, pageVisit);
-          // Update state properties (state is passed by reference, but we need to update it)
-          Object.assign(state, newState);
+          const newState = StateTracker.recordPageVisit(getState(), pageVisit);
+          setState(newState);
           logger.debug('[MAIN_LOOP] Page visit recorded', {
             url: context.url,
             urlChanged,
@@ -350,7 +398,7 @@ export class MainLoopService {
 
         // STEP 6: Decide next step
         const decision = await ContextualActionGenerator.decideNextStep(
-          state,
+          getState(),
           context,
           costManager
         );
@@ -363,49 +411,24 @@ export class MainLoopService {
         emitEvent('test_progress', {
           action: decision.action,
           reason: decision.reason,
-          pagesVisited: state.pagesAnalyzed,
-          actionsCompleted: state.completedActions.length,
+          pagesVisited: getState().pagesAnalyzed,
+          actionsCompleted: getState().completedActions.length,
         });
 
         // Handle decision
-        switch (decision.action) {
-          case 'stop':
-            logger.info('[MAIN_LOOP] Stopping: ' + decision.reason);
-            continueLoop = false;
-            break;
+        const decisionResult = await MainLoopService.handleDecision({
+          decision,
+          context,
+          page,
+          config,
+          getState,
+          testId,
+          userId,
+          emitEvent,
+        });
 
-          case 'wait_for_user':
-            logger.info('[MAIN_LOOP] Waiting for user approval');
-            emitEvent('test_waiting', {
-              reason: decision.reason,
-            });
-            continueLoop = false;
-            break;
-
-          case 'skip':
-            logger.info('[MAIN_LOOP] Skipping: ' + decision.reason);
-            // Go back if possible
-            try {
-              const pageContext = AdaptiveConfigService.analyzePageContext(state);
-              await page.goBack({
-                timeout: AdaptiveConfigService.getTimeout('GO_BACK', {
-                  networkSpeed: pageContext.networkSpeed,
-                }),
-              });
-            } catch {
-              continueLoop = false;
-            }
-            break;
-
-          case 'retry':
-            logger.info('[MAIN_LOOP] Retrying...');
-            // Continue with retry
-            break;
-
-          case 'continue':
-          default:
-            // Continue loop
-            break;
+        if (!decisionResult.shouldContinue) {
+          continueLoop = false;
         }
 
         // Check cancellation after iteration
@@ -417,14 +440,16 @@ export class MainLoopService {
           return true;
         }
       } catch (error) {
+        const currentState = getState();
+
         // Enhanced error logging with iteration context
         logger.error('[MAIN_LOOP] Loop iteration failed', {
           testId,
           iteration,
           currentUrl: page.url(),
-          pagesVisited: state.pagesAnalyzed,
-          actionsCompleted: state.completedActions.length,
-          errorCount: state.errors.length,
+          pagesVisited: currentState.pagesAnalyzed,
+          actionsCompleted: currentState.completedActions.length,
+          errorCount: currentState.errors.length,
           error: error instanceof Error ? {
             message: error.message,
             name: error.name,
@@ -432,17 +457,24 @@ export class MainLoopService {
           } : String(error),
         });
 
-        state.errors.push({
-          message: error instanceof Error ? error.message : 'Iteration failed',
-          timestamp: Date.now(),
+        setState({
+          ...currentState,
+          errors: [
+            ...currentState.errors,
+            {
+              message: error instanceof Error ? error.message : 'Iteration failed',
+              timestamp: Date.now(),
+            },
+          ],
         });
 
         // Check for repeated selector errors (infinite loop detection)
-        const errorPageContext = AdaptiveConfigService.analyzePageContext(state);
+        const errorState = getState();
+        const errorPageContext = AdaptiveConfigService.analyzePageContext(errorState);
         const recentErrorsCheckCount = AdaptiveConfigService.getThreshold('RECENT_ERRORS_CHECK_COUNT', {
           errorRate: errorPageContext.errorRate,
         });
-        const recentSelectorErrors = state.errors
+        const recentSelectorErrors = errorState.errors
           .slice(-recentErrorsCheckCount)
           .filter(e => e.message.includes('Selector not found') || e.message.includes('not found'))
           .length;
@@ -454,8 +486,8 @@ export class MainLoopService {
           logger.error('[MAIN_LOOP] Too many selector errors in a row, possible infinite loop', {
             testId,
             recentSelectorErrors,
-            totalErrors: state.errors.length,
-            recentErrors: state.errors.slice(-3).map(e => e.message),
+            totalErrors: errorState.errors.length,
+            recentErrors: errorState.errors.slice(-3).map(e => e.message),
           });
           emitEvent('test_warning', {
             message: 'Too many selector errors detected. Test may be stuck in a loop.',
@@ -468,11 +500,11 @@ export class MainLoopService {
           errorRate: errorPageContext.errorRate,
           isComplexPage: errorPageContext.isComplexPage,
         });
-        if (state.errors.length > maxErrors) {
+        if (errorState.errors.length > maxErrors) {
           logger.error('[MAIN_LOOP] Too many errors, stopping', {
             testId,
-            totalErrors: state.errors.length,
-            recentErrors: state.errors.slice(-3).map(e => e.message),
+            totalErrors: errorState.errors.length,
+            recentErrors: errorState.errors.slice(-3).map(e => e.message),
           });
           break;
         }
@@ -481,7 +513,7 @@ export class MainLoopService {
         logger.info('[MAIN_LOOP] Continuing despite error', {
           testId,
           iteration,
-          errorCount: state.errors.length,
+          errorCount: errorState.errors.length,
         });
         continue;
       }
@@ -489,9 +521,340 @@ export class MainLoopService {
 
     logger.info('[MAIN_LOOP] Main loop ended', {
       testId,
-      stats: StateTracker.formatStatistics(state),
+      stats: StateTracker.formatStatistics(getState()),
     });
 
     return false; // Return false to indicate normal completion (not cancelled)
+  }
+
+  /**
+   * Handle next step decision
+   * Returns whether the loop should continue
+   */
+  private static async handleDecision(params: {
+    decision: NextStepDecision;
+    context: PageContext;
+    page: Page;
+    config: IntelligentTestConfig;
+    getState: () => TestState;
+    testId?: string;
+    userId?: string;
+    emitEvent: (event: string, data: any) => void;
+  }): Promise<{ shouldContinue: boolean }> {
+    // Validate inputs
+    if (!params || !params.decision) {
+      logger.error('[MAIN_LOOP] Invalid decision parameter');
+      return { shouldContinue: false };
+    }
+
+    if (!params.context || !params.page || !params.config || !params.getState) {
+      logger.error('[MAIN_LOOP] Missing required parameters in handleDecision', {
+        hasContext: !!params?.context,
+        hasPage: !!params?.page,
+        hasConfig: !!params?.config,
+        hasGetState: !!params?.getState,
+      });
+      return { shouldContinue: false };
+    }
+
+    const { decision, context, page, config, getState, testId, userId, emitEvent } = params;
+
+    // Validate decision.action
+    const validActions = ['continue', 'stop', 'wait_for_user', 'retry', 'skip'] as const;
+    if (!validActions.includes(decision.action as any)) {
+      logger.warn('[MAIN_LOOP] Unknown decision action', {
+        action: decision.action,
+        reason: decision.reason,
+      });
+      // Fail-safe: continue loop for unknown actions
+      return { shouldContinue: true };
+    }
+
+    switch (decision.action) {
+      case 'stop':
+        logger.info('[MAIN_LOOP] Stopping: ' + decision.reason);
+        return { shouldContinue: false };
+
+      case 'wait_for_user': {
+        // Validate reason
+        const reason = decision.reason || 'Unknown reason';
+
+        logger.warn('[MAIN_LOOP] Waiting for user input', {
+          testId,
+          reason,
+        });
+
+        // Validate testId and userId
+        if (!testId || !userId) {
+          logger.warn('[MAIN_LOOP] Cannot request clarification - missing testId or userId', {
+            testId: !!testId,
+            userId: !!userId,
+          });
+          emitEvent('test_warning', {
+            message: `Waiting for user: ${reason}`,
+          });
+          return { shouldContinue: false };
+        }
+
+        // Detect what data is missing and request clarification
+        let clarificationType: 'url' | 'credentials' | 'test_data' | 'payment_approval' | null = null;
+        try {
+          clarificationType = MainLoopService.detectMissingDataType(reason, context);
+        } catch (error) {
+          logger.error('[MAIN_LOOP] Failed to detect missing data type', {
+            error: error instanceof Error ? error.message : String(error),
+            reason,
+          });
+          // Continue without clarification type - will use generic message
+        }
+
+        // If we can request clarification (have testId, userId, and detected type)
+        if (clarificationType) {
+          // Safely load ClarificationService
+          let ClarificationService;
+          try {
+            ClarificationService = require('./utils/clarification.service').ClarificationService;
+            if (!ClarificationService || typeof ClarificationService.requestClarification !== 'function') {
+              throw new Error('ClarificationService.requestClarification is not a function');
+            }
+          } catch (requireError) {
+            logger.error('[MAIN_LOOP] Failed to load ClarificationService', {
+              error: requireError instanceof Error ? requireError.message : String(requireError),
+            });
+            emitEvent('test_warning', {
+              message: `Waiting for user: ${reason} (service unavailable)`,
+            });
+            return { shouldContinue: false };
+          }
+
+          let question: string;
+          try {
+            question = MainLoopService.buildClarificationQuestion(clarificationType, reason, context);
+          } catch (error) {
+            logger.error('[MAIN_LOOP] Failed to build clarification question', {
+              error: error instanceof Error ? error.message : String(error),
+              clarificationType,
+            });
+            emitEvent('test_warning', {
+              message: `Waiting for user: ${reason}`,
+            });
+            return { shouldContinue: false };
+          }
+
+          try {
+            const answer = await ClarificationService.requestClarification({
+              testId,
+              userId,
+              question,
+              type: clarificationType,
+              required: true,
+            });
+
+            // Validate answer (check for empty string, null, undefined)
+            if (answer && typeof answer === 'string' && answer.trim().length > 0) {
+              logger.info('[MAIN_LOOP] Received clarification response', {
+                testId,
+                type: clarificationType,
+                answerLength: answer.length,
+              });
+
+              // Store clarification for use in next iteration
+              emitEvent('test_info', {
+                message: `User provided ${clarificationType}: ${answer.substring(0, 50)}...`,
+              });
+
+              // Continue to next iteration with clarification data
+              return { shouldContinue: true };
+            } else {
+              logger.warn('[MAIN_LOOP] Empty or invalid response to clarification, stopping test', {
+                testId,
+                type: clarificationType,
+                answerType: typeof answer,
+                answerLength: answer ? String(answer).length : 0,
+              });
+              emitEvent('test_warning', {
+                message: `No response from user. Stopping test.`,
+              });
+              return { shouldContinue: false };
+            }
+          } catch (clarificationError) {
+            logger.error('[MAIN_LOOP] Clarification failed', {
+              testId,
+              error: clarificationError instanceof Error ? clarificationError.message : String(clarificationError),
+              stack: clarificationError instanceof Error ? clarificationError.stack : undefined,
+            });
+            emitEvent('test_warning', {
+              message: `Failed to request clarification: ${clarificationError instanceof Error ? clarificationError.message : 'Unknown error'}`,
+            });
+            return { shouldContinue: false };
+          }
+        } else {
+          // Generic wait_for_user without specific clarification type
+          emitEvent('test_warning', {
+            message: `Waiting for user: ${reason}`,
+          });
+          logger.warn('[MAIN_LOOP] Cannot request clarification - missing clarification type', {
+            testId: !!testId,
+            userId: !!userId,
+            clarificationType,
+            reason,
+          });
+          return { shouldContinue: false };
+        }
+      }
+
+      case 'skip': {
+        const reason = decision.reason || 'Unknown reason';
+        logger.info('[MAIN_LOOP] Skipping: ' + reason);
+
+        // Validate startUrl
+        if (!config.startUrl || typeof config.startUrl !== 'string' || !config.startUrl.trim()) {
+          logger.error('[MAIN_LOOP] Invalid startUrl in config, cannot navigate after skip', {
+            startUrl: config.startUrl,
+            startUrlType: typeof config.startUrl,
+          });
+          return { shouldContinue: false };
+        }
+
+        // Use shared navigation method
+        return await MainLoopService.handleSkipNavigation(page, config, getState);
+      }
+
+      case 'retry':
+        logger.info('[MAIN_LOOP] Retrying...');
+        // Continue with retry
+        return { shouldContinue: true };
+
+      case 'continue':
+      default:
+        // Continue loop
+        return { shouldContinue: true };
+    }
+  }
+
+  /**
+   * Handle skip navigation (goBack or goto startUrl)
+   * Shared method to avoid code duplication
+   */
+  private static async handleSkipNavigation(
+    page: Page,
+    config: IntelligentTestConfig,
+    getState: () => TestState
+  ): Promise<{ shouldContinue: boolean }> {
+    // Validate inputs
+    if (!page || !config || !getState) {
+      logger.error('[MAIN_LOOP] Invalid parameters for handleSkipNavigation');
+      return { shouldContinue: false };
+    }
+
+    // Validate startUrl
+    if (!config.startUrl || typeof config.startUrl !== 'string' || !config.startUrl.trim()) {
+      logger.error('[MAIN_LOOP] Invalid startUrl in config');
+      return { shouldContinue: false };
+    }
+
+    // Try to go back if possible
+    try {
+      const pageContext = AdaptiveConfigService.analyzePageContext(getState());
+      await page.goBack({
+        timeout: AdaptiveConfigService.getTimeout('GO_BACK', {
+          networkSpeed: pageContext.networkSpeed,
+        }),
+      });
+      logger.info('[MAIN_LOOP] Successfully went back after skip');
+      return { shouldContinue: true };
+    } catch (goBackError) {
+      logger.warn('[MAIN_LOOP] Failed to go back, trying to navigate to start URL', {
+        error: goBackError instanceof Error ? goBackError.message : String(goBackError),
+      });
+
+      // Fallback: attempt to return to start URL
+      try {
+        const pageContext = AdaptiveConfigService.analyzePageContext(getState());
+        await page.goto(config.startUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: AdaptiveConfigService.getTimeout('NAVIGATION', {
+            networkSpeed: pageContext.networkSpeed,
+            hasHeavyJS: pageContext.hasHeavyJS,
+          }),
+        });
+        logger.info('[MAIN_LOOP] Successfully navigated to start URL after skip');
+        return { shouldContinue: true };
+      } catch (gotoError) {
+        logger.error('[MAIN_LOOP] Failed to navigate to start URL after skip, stopping test', {
+          error: gotoError instanceof Error ? gotoError.message : String(gotoError),
+          startUrl: config.startUrl,
+        });
+        // Both navigation attempts failed - stop the test
+        return { shouldContinue: false };
+      }
+    }
+  }
+
+  /**
+   * Detect what type of data is missing from wait_for_user reason
+   */
+  private static detectMissingDataType(
+    reason: string,
+    context: PageContext
+  ): 'url' | 'credentials' | 'test_data' | 'payment_approval' | null {
+    const reasonLower = reason.toLowerCase();
+
+    // Payment approval
+    if (reasonLower.includes('payment') || reasonLower.includes('checkout') || reasonLower.includes('billing')) {
+      return 'payment_approval';
+    }
+
+    // Credentials
+    if (reasonLower.includes('login') || reasonLower.includes('credential') || reasonLower.includes('password') || reasonLower.includes('username')) {
+      return 'credentials';
+    }
+
+    // Test data
+    if (reasonLower.includes('test data') || reasonLower.includes('form data') || reasonLower.includes('test card') || reasonLower.includes('test information')) {
+      return 'test_data';
+    }
+
+    // URL
+    if (reasonLower.includes('url') || reasonLower.includes('navigate') || reasonLower.includes('unclear what to do')) {
+      return 'url';
+    }
+
+    // Check context for hints
+    if (context.pageType === 'payment') {
+      return 'payment_approval';
+    }
+
+    if (context.pageType === 'login' || context.pageType === 'register') {
+      return 'credentials';
+    }
+
+    return null;
+  }
+
+  /**
+   * Build clarification question based on type
+   */
+  private static buildClarificationQuestion(
+    type: 'url' | 'credentials' | 'test_data' | 'payment_approval',
+    reason: string,
+    context: PageContext
+  ): string {
+    switch (type) {
+      case 'url':
+        return `The test needs a specific URL to continue. Current page: ${context.url}. Reason: ${reason}. Please provide the URL where the test should navigate.`;
+
+      case 'credentials':
+        return `The test needs login credentials to continue. Page: ${context.pageType}. Reason: ${reason}. Please provide credentials in format: email/username:password`;
+
+      case 'test_data':
+        return `The test needs data to fill a form. Page: ${context.pageType}. Reason: ${reason}. Please provide the test data.`;
+
+      case 'payment_approval':
+        return `The test reached a payment page. Reason: ${reason}. Options: (1) Provide test card data, (2) Approve to stop test here, or (3) Cancel test. Please respond with your choice.`;
+
+      default:
+        return `The test needs your input. Reason: ${reason}. Please provide the required information.`;
+    }
   }
 }

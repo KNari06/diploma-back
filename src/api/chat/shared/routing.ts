@@ -1,11 +1,11 @@
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
-import { PROGRESS } from './constants';
-import { emitProcessingStep } from './utils';
-import { handleClarificationRequest } from './clarification';
 import { handlePlatformTest } from '../ai_test/handler';
 import { handleApiTest } from '../api_test/handler';
 import { handleGeneralChat } from '../general/handler';
+import { handleClarificationRequest } from './clarification';
+import { PROGRESS } from './constants';
+import { checkRequestAborted } from './request-cancellation';
+import { emitProcessingStep } from './utils';
 
 /**
  * STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
@@ -22,6 +22,7 @@ export async function routeToHandler(
     conversationId?: string;
     answers?: Record<string, any>;
     context?: any;
+    abortSignal?: AbortSignal;
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
@@ -29,6 +30,10 @@ export async function routeToHandler(
   // ═══════════════════════════════════════════════════════════════════════
 
   emitProcessingStep(params.chatSessionId, 'generating_plan', '🚀 Processing your request...', PROGRESS.ROUTING);
+
+  if (params.abortSignal) {
+    checkRequestAborted(params.abortSignal);
+  }
 
   const intent = params.parsedIntent?.intent || 'general_chat';
 
@@ -38,6 +43,7 @@ export async function routeToHandler(
       parsedIntent: params.parsedIntent,
       userId: params.userId,
       chatSessionId: params.chatSessionId,
+      abortSignal: params.abortSignal,
     });
   }
 
@@ -50,6 +56,7 @@ export async function routeToHandler(
       chatSessionId: params.chatSessionId,
       conversationId: params.conversationId,
       answers: params.answers,
+      abortSignal: params.abortSignal,
     });
   }
 
@@ -62,6 +69,7 @@ export async function routeToHandler(
       chatSessionId: params.chatSessionId,
       conversationId: params.conversationId,
       answers: params.answers,
+      abortSignal: params.abortSignal,
     });
   }
 
@@ -72,5 +80,6 @@ export async function routeToHandler(
     chatSessionId: params.chatSessionId,
     context: params.context,
     userLanguage: params.parsedIntent?.userLanguage, // Pass language from intent parser (avoid re-detection)
+    abortSignal: params.abortSignal,
   });
 }

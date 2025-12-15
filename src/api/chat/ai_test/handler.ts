@@ -6,6 +6,7 @@ import { ProjectContextService } from '@/services/utils/project-context.service'
 import { parseAnswers } from '@/services/utils/question-generator.service';
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
+import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 
 /**
@@ -40,9 +41,12 @@ export async function handlePlatformTest(
     chatSessionId?: string;
     conversationId?: string;
     answers?: Record<string, any>;
+    abortSignal?: AbortSignal;
   }
 ): Promise<void> {
-  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers } = params;
+  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal } = params;
+
+  if (abortSignal) checkRequestAborted(abortSignal);
 
   // FIX #3: Setup timeout for entire platform test flow
   const flowStartTime = Date.now();
@@ -426,6 +430,23 @@ export async function handlePlatformTest(
         sessionId: chatSessionId,
       });
 
+      // ✅ FIX: Validate that testPlan and message exist
+      if (!result.testPlan) {
+        logger.error('[PLATFORM_TEST] runAutonomousExploration returned without testPlan', {
+          hasExploration: !!result.exploration,
+          hasMessage: !!result.message,
+        });
+        throw new Error('Failed to generate test plan: testPlan is missing from exploration result');
+      }
+
+      if (!result.message || typeof result.message !== 'string') {
+        logger.error('[PLATFORM_TEST] runAutonomousExploration returned without valid message', {
+          hasTestPlan: !!result.testPlan,
+          messageType: typeof result.message,
+        });
+        throw new Error('Failed to generate test plan: message is missing or invalid from exploration result');
+      }
+
       testPlan = result.testPlan;
       formattedPlan = result.message;
 
@@ -558,14 +579,32 @@ export async function handlePlatformTest(
       throw explorationError;
     }
 
+    // ✅ FIX: Validate testPlan structure before accessing properties
+    if (!testPlan || typeof testPlan !== 'object') {
+      logger.error('[PLATFORM_TEST] testPlan is invalid after assignment', {
+        testPlanType: typeof testPlan,
+        testPlanValue: testPlan,
+      });
+      throw new Error('Invalid test plan: testPlan is not a valid object');
+    }
+
     logger.info('[PLATFORM_TEST] Autonomous exploration completed', {
       planId: testPlan.id,
-      stepsCount: testPlan.steps.length,
-      commandsCount: testPlan.commands.length,
+      stepsCount: testPlan.steps?.length || 0,
+      commandsCount: testPlan.commands?.length || 0,
       intelligentMode: testPlan.intelligentMode || false,
     });
 
     checkTimeout('autonomous_exploration');
+
+    // ✅ FIX: Validate formattedPlan before using it
+    if (!formattedPlan || typeof formattedPlan !== 'string') {
+      logger.error('[PLATFORM_TEST] formattedPlan is invalid before saving to history', {
+        formattedPlanType: typeof formattedPlan,
+        formattedPlanValue: formattedPlan,
+      });
+      throw new Error('Invalid formatted plan: formattedPlan is missing or not a string');
+    }
 
     // Save to history (non-blocking)
     if (chatSessionId) {

@@ -347,6 +347,30 @@ function setCachedResult<T>(cache: Map<string, { result: T; timestamp: number }>
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ERROR BASELINE (pre-action -> post-action diff)
+// Prevents false positives when the page already had validation errors
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PRE_ACTION_ERROR_BASELINE_TTL = 30 * 1000; // 30s - enough for one action cycle
+
+const preActionErrorBaseline = new Map<string, { errors: string[]; timestamp: number }>();
+
+function getErrorBaselineKey(pageUrl: string, action: DynamicAction): string {
+  const sel = action.selector ? normalizeSelector(action.selector) : '';
+  return `${pageUrl}|${action.action}|${sel}`;
+}
+
+function normalizeErrorList(errors: string[]): string[] {
+  const unique: string[] = [];
+  for (const e of errors) {
+    const cleaned = (e || '').trim();
+    if (!cleaned) continue;
+    if (!unique.includes(cleaned)) unique.push(cleaned);
+  }
+  return unique;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // TYPES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -370,6 +394,18 @@ export interface BlockingFactor {
   description: string;
   selector?: string;
   suggestedActions?: DynamicAction[];
+  priority?: 'critical' | 'high' | 'medium' | 'low';
+  context?: {
+    pageUrl?: string;
+    formType?: string;
+    relatedFields?: Array<{ selector: string; label: string; state: string }>;
+    errorMessages?: string[];
+    elementContext?: {
+      isInForm: boolean;
+      formHasErrors: boolean;
+      nearbyElements?: Array<{ type: string; selector: string; state: string }>;
+    };
+  };
 }
 
 export interface PreActionAnalysis {
@@ -379,6 +415,22 @@ export interface PreActionAnalysis {
   suggestedActions: DynamicAction[];
   validationErrors: string[];
   requiredFields: Array<{ selector: string; label: string; isEmpty: boolean }>;
+  context?: {
+    pageUrl: string;
+    pageType?: string;
+    formContext?: {
+      formType?: string;
+      totalFields: number;
+      filledFields: number;
+      requiredFieldsCount: number;
+      emptyRequiredFieldsCount: number;
+    };
+    elementContext?: {
+      isInForm: boolean;
+      formHasErrors: boolean;
+      nearbyElements?: Array<{ type: string; selector: string; state: string }>;
+    };
+  };
 }
 
 export interface FormAnalysis {
@@ -422,11 +474,13 @@ export class PreActionAnalyzer {
     action: DynamicAction
   ): Promise<PreActionAnalysis> {
     const startTime = Date.now();
+    const pageUrl = page.url();
 
     logger.debug('[PRE_ACTION] Starting pre-action analysis', {
       action: action.action,
       selector: action.selector,
       description: action.description,
+      pageUrl,
     });
 
     const analysis: PreActionAnalysis = {
@@ -435,6 +489,9 @@ export class PreActionAnalyzer {
       suggestedActions: [],
       validationErrors: [],
       requiredFields: [],
+      context: {
+        pageUrl,
+      },
     };
 
     try {
@@ -456,6 +513,10 @@ export class PreActionAnalyzer {
           type: 'not_found',
           description: `Element not found: ${normalizedSelector}`,
           selector: normalizedSelector,
+          priority: 'critical',
+          context: {
+            pageUrl,
+          },
         });
         return analysis;
       }
@@ -463,11 +524,20 @@ export class PreActionAnalyzer {
       // Step 3: Check visibility
       if (!elementState.visible) {
         analysis.canProceed = false;
+        const suggestedActions = await this.getSuggestedActionsForHidden(page, normalizedSelector);
         analysis.blockingFactors.push({
           type: 'hidden',
           description: `Element is hidden: ${normalizedSelector}`,
           selector: normalizedSelector,
-          suggestedActions: await this.getSuggestedActionsForHidden(page, normalizedSelector),
+          suggestedActions,
+          priority: 'high',
+          context: {
+            pageUrl,
+            elementContext: {
+              isInForm: false, // Will be updated if form found
+              formHasErrors: false,
+            },
+          },
         });
       }
 
@@ -475,29 +545,76 @@ export class PreActionAnalyzer {
       if (!elementState.enabled && ['click', 'fill', 'type', 'select', 'check'].includes(action.action)) {
         analysis.canProceed = false;
 
-        // Analyze WHY it's disabled
-        const disabledAnalysis = await this.analyzeDisabledReason(page, normalizedSelector, action);
+        // Analyze WHY it's disabled with enhanced context
+        const disabledAnalysis = await this.analyzeDisabledReason(page, normalizedSelector, action, pageUrl);
+        // Persist reason on elementState for downstream (logging/UI)
+        if (analysis.elementState) {
+          analysis.elementState.disabledReason = disabledAnalysis.disabledReason;
+        }
+
+        // Get form context if available
+        const formContext = await this.getFormContext(page, normalizedSelector);
 
         analysis.blockingFactors.push({
           type: 'disabled',
-          description: `Element is disabled: ${elementState.disabledReason || 'Unknown reason'}`,
+          description: `Element is disabled: ${disabledAnalysis.disabledReason || elementState.disabledReason || 'Unknown reason'}`,
           selector: normalizedSelector,
           suggestedActions: disabledAnalysis.suggestedActions,
+          priority: 'critical',
+          context: {
+            pageUrl,
+            formType: formContext?.formType,
+            relatedFields: disabledAnalysis.requiredFields.map(f => ({
+              selector: f.selector,
+              label: f.label,
+              state: f.isEmpty ? 'empty' : 'filled',
+            })),
+            errorMessages: disabledAnalysis.validationErrors || [],
+          },
         });
 
         // Add required fields info
         analysis.requiredFields = disabledAnalysis.requiredFields;
         analysis.suggestedActions = disabledAnalysis.suggestedActions;
+
+        // Update context with form information
+        if (formContext && analysis.context) {
+          analysis.context = {
+            ...analysis.context,
+            pageUrl: analysis.context.pageUrl || pageUrl,
+            formContext: {
+              formType: formContext.formType,
+              totalFields: formContext.totalFields,
+              filledFields: formContext.filledFields,
+              requiredFieldsCount: formContext.requiredFieldsCount,
+              emptyRequiredFieldsCount: formContext.emptyRequiredFieldsCount,
+            },
+            elementContext: {
+              isInForm: true,
+              formHasErrors: formContext.hasErrors,
+            },
+          };
+        }
       }
 
       // Step 5: Check for loading state
       if (elementState.isLoading) {
+        analysis.canProceed = false;
         analysis.blockingFactors.push({
           type: 'loading',
           description: 'Element or page is in loading state',
           selector: normalizedSelector,
+          priority: 'high',
+          context: { pageUrl },
         });
-        // Don't block - just wait
+        // Orchestrator executes prerequisites only when suggestedActions exist
+        analysis.suggestedActions.push({
+          action: 'wait',
+          timeout: 800,
+          description: 'Wait for loading to finish',
+          expectedResult: 'Loading indicators disappear / UI becomes stable',
+          optional: false,
+        });
       }
 
       // Step 6: For submit/click actions, check if this is a form submit
@@ -505,14 +622,27 @@ export class PreActionAnalyzer {
         // Use Form Intelligence for smart form handling
         const formAnalysis = await this.analyzeFormBeforeSubmit(page, normalizedSelector, {
           useIntelligence: true,
-          url: page.url(),
+          url: pageUrl,
         });
 
         if (!formAnalysis.canSubmit) {
           analysis.canProceed = false;
+          const emptyRequired = formAnalysis.fields.filter(f => f.required && f.isEmpty);
+          const filledRequired = formAnalysis.fields.filter(f => f.required && !f.isEmpty);
+
           analysis.blockingFactors.push({
             type: 'required_fields',
             description: `Cannot submit: ${formAnalysis.missingRequiredFields.length} required fields are empty`,
+            priority: 'critical',
+            context: {
+              pageUrl,
+              formType: formAnalysis.isForm ? 'form' : 'pseudo-form',
+              relatedFields: [
+                ...emptyRequired.map(f => ({ selector: f.selector, label: f.label, state: 'empty' })),
+                ...filledRequired.map(f => ({ selector: f.selector, label: f.label, state: 'filled' })),
+              ],
+              errorMessages: formAnalysis.validationErrors,
+            },
           });
           analysis.requiredFields = formAnalysis.fields
             .filter(f => f.required)
@@ -520,7 +650,11 @@ export class PreActionAnalyzer {
 
           // Use smart sequence from Form Intelligence if available, otherwise basic
           if (formAnalysis.smartSequence && formAnalysis.smartSequence.length > 0) {
-            analysis.suggestedActions = formAnalysis.smartSequence;
+            // Add priority to smart sequence actions
+            analysis.suggestedActions = formAnalysis.smartSequence.map((act, idx) => ({
+              ...act,
+              priority: idx === 0 ? 'critical' : idx < 3 ? 'high' : 'medium',
+            }));
             logger.debug('[PRE_ACTION] Using smart fill sequence', {
               actionsCount: formAnalysis.smartSequence.length,
             });
@@ -530,17 +664,63 @@ export class PreActionAnalyzer {
         }
 
         analysis.validationErrors = formAnalysis.validationErrors;
+
+        // Update context with form information
+        if (formAnalysis.fields.length > 0 && analysis.context) {
+          analysis.context = {
+            ...analysis.context,
+            pageUrl: analysis.context.pageUrl || pageUrl,
+            formContext: {
+              formType: formAnalysis.isForm ? 'form' : 'pseudo-form',
+              totalFields: formAnalysis.fields.length,
+              filledFields: formAnalysis.fields.filter(f => !f.isEmpty).length,
+              requiredFieldsCount: formAnalysis.fields.filter(f => f.required).length,
+              emptyRequiredFieldsCount: formAnalysis.fields.filter(f => f.required && f.isEmpty).length,
+            },
+            elementContext: {
+              isInForm: true,
+              formHasErrors: formAnalysis.validationErrors.length > 0,
+            },
+          };
+        }
       }
 
       // Step 7: Check for existing validation errors on page
       const pageErrors = await this.getValidationErrors(page);
       analysis.validationErrors.push(...pageErrors);
 
-      logger.debug('[PRE_ACTION] Analysis completed', {
+      // Store baseline errors for post-action diff (to avoid false positives)
+      {
+        const key = getErrorBaselineKey(pageUrl, { ...action, selector: normalizedSelector });
+        preActionErrorBaseline.set(key, { errors: normalizeErrorList(analysis.validationErrors), timestamp: Date.now() });
+      }
+
+      // Sort suggested actions by priority (critical first)
+      analysis.suggestedActions.sort((a, b) => {
+        const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+        const aPriority = (a as any).priority || 'medium';
+        const bPriority = (b as any).priority || 'medium';
+        return (priorityOrder[aPriority as keyof typeof priorityOrder] || 2) -
+               (priorityOrder[bPriority as keyof typeof priorityOrder] || 2);
+      });
+
+      // Enhanced logging for AI understanding
+      logger.info('[PRE_ACTION] Analysis completed with context', {
         duration: Date.now() - startTime,
         canProceed: analysis.canProceed,
         blockingFactorsCount: analysis.blockingFactors.length,
         suggestedActionsCount: analysis.suggestedActions.length,
+        context: {
+          pageUrl: analysis.context?.pageUrl,
+          formContext: analysis.context?.formContext,
+          elementContext: analysis.context?.elementContext,
+        },
+        blockingFactors: analysis.blockingFactors.map(bf => ({
+          type: bf.type,
+          priority: bf.priority || 'medium',
+          description: bf.description,
+          hasSuggestedActions: (bf.suggestedActions?.length || 0) > 0,
+        })),
       });
 
       return analysis;
@@ -629,8 +809,14 @@ export class PreActionAnalyzer {
 
             const isHidden = style.display === 'none' ||
                             style.visibility === 'hidden' ||
-                            style.opacity === '0' ||
-                            htmlEl.offsetParent === null;
+                            style.opacity === '0';
+
+            // ✅ IMPROVED: Avoid false "hidden" for fixed/sticky positioned elements
+            const position = (style.position || '').toLowerCase();
+            const rect = htmlEl.getBoundingClientRect ? htmlEl.getBoundingClientRect() : { width: 0, height: 0 };
+            const isZeroSize = !rect || rect.width === 0 || rect.height === 0;
+            const offsetParentHidden = htmlEl.offsetParent === null && position !== 'fixed' && position !== 'sticky';
+            const computedHidden = isHidden || isZeroSize || offsetParentHidden;
 
             // ✅ IMPROVED: Proper class matching - exact + substring separately
             const classList = Array.from(htmlEl.classList || []) as string[];
@@ -707,7 +893,7 @@ export class PreActionAnalyzer {
             }
 
             return {
-              visible: !isHidden,
+              visible: !computedHidden,
               enabled: !isDisabled,
               isLoading,
               tagName,
@@ -787,15 +973,18 @@ export class PreActionAnalyzer {
 
   /**
    * Analyze why element is disabled and suggest actions to enable it
+   * Enhanced with context for better AI understanding
    */
   static async analyzeDisabledReason(
     page: Page,
     selector: string,
-    action: DynamicAction
-  ): Promise<{ disabledReason: string; suggestedActions: DynamicAction[]; requiredFields: Array<{ selector: string; label: string; isEmpty: boolean }> }> {
+    action: DynamicAction,
+    pageUrl?: string
+  ): Promise<{ disabledReason: string; suggestedActions: DynamicAction[]; requiredFields: Array<{ selector: string; label: string; isEmpty: boolean }>; validationErrors?: string[] }> {
     const suggestedActions: DynamicAction[] = [];
     const requiredFields: Array<{ selector: string; label: string; isEmpty: boolean }> = [];
     let disabledReason = 'Unknown';
+    let validationErrors: string[] = [];
 
     try {
       // Find the form containing this element (if any)
@@ -808,8 +997,8 @@ export class PreActionAnalyzer {
         if (emptyRequired.length > 0) {
           disabledReason = `${emptyRequired.length} required field(s) are empty: ${emptyRequired.map(f => f.label).join(', ')}`;
 
-          // Generate fill actions for empty required fields
-          for (const field of emptyRequired) {
+          // Generate fill actions for empty required fields with priority
+          emptyRequired.forEach((field, idx) => {
             requiredFields.push({
               selector: field.selector,
               label: field.label,
@@ -823,16 +1012,19 @@ export class PreActionAnalyzer {
               description: `Fill required field: ${field.label}`,
               expectedResult: 'Field is filled',
               optional: false,
-            });
-          }
+              priority: idx === 0 ? 'critical' : idx < 3 ? 'high' : 'medium',
+            } as DynamicAction & { priority?: string });
+          });
 
-          return { disabledReason, suggestedActions, requiredFields };
+          validationErrors = formAnalysis.validationErrors;
+          return { disabledReason, suggestedActions, requiredFields, validationErrors };
         }
 
         // Check for validation errors
         if (formAnalysis.validationErrors.length > 0) {
           disabledReason = `Validation errors: ${formAnalysis.validationErrors.join(', ')}`;
-          return { disabledReason, suggestedActions, requiredFields };
+          validationErrors = formAnalysis.validationErrors;
+          return { disabledReason, suggestedActions, requiredFields, validationErrors };
         }
       }
 
@@ -841,17 +1033,18 @@ export class PreActionAnalyzer {
       if (checkboxes.length > 0) {
         disabledReason = `Required checkbox(es) not checked: ${checkboxes.map(c => c.label).join(', ')}`;
 
-        for (const checkbox of checkboxes) {
+        checkboxes.forEach((checkbox, idx) => {
           suggestedActions.push({
             action: 'check',
             selector: checkbox.selector,
             description: `Check required checkbox: ${checkbox.label}`,
             expectedResult: 'Checkbox is checked',
             optional: false,
-          });
-        }
+            priority: 'high',
+          } as DynamicAction & { priority?: string });
+        });
 
-        return { disabledReason, suggestedActions, requiredFields };
+        return { disabledReason, suggestedActions, requiredFields, validationErrors };
       }
 
       // ✅ IMPROVED: Check if page is still loading with safe selectors and better detection
@@ -898,7 +1091,38 @@ export class PreActionAnalyzer {
       });
     }
 
-    return { disabledReason, suggestedActions, requiredFields };
+    return { disabledReason, suggestedActions, requiredFields, validationErrors };
+  }
+
+  /**
+   * Get form context for better AI understanding
+   */
+  private static async getFormContext(
+    page: Page,
+    selector: string
+  ): Promise<{
+    formType?: string;
+    totalFields: number;
+    filledFields: number;
+    requiredFieldsCount: number;
+    emptyRequiredFieldsCount: number;
+    hasErrors: boolean;
+  } | null> {
+    try {
+      const formAnalysis = await this.findParentForm(page, selector);
+      if (!formAnalysis) return null;
+
+      return {
+        formType: formAnalysis.isForm ? 'form' : 'pseudo-form',
+        totalFields: formAnalysis.fields.length,
+        filledFields: formAnalysis.fields.filter(f => !f.isEmpty).length,
+        requiredFieldsCount: formAnalysis.fields.filter(f => f.required).length,
+        emptyRequiredFieldsCount: formAnalysis.fields.filter(f => f.required && f.isEmpty).length,
+        hasErrors: formAnalysis.validationErrors.length > 0,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1264,9 +1488,11 @@ export class PreActionAnalyzer {
         return ruleBasedResult.isSubmit;
       }
 
-      // Step 3: If uncertain, use AI fallback
+      // Step 3: If uncertain, use AI fallback with context
       if (ruleBasedResult.confidence < 0.7 && elementInfo.text) {
-        const aiResult = await this.isSubmitButtonAI(elementInfo.text, elementInfo.ariaLabel);
+        const aiResult = await this.isSubmitButtonAI(elementInfo.text, elementInfo.ariaLabel, {
+          isInForm: elementInfo.isInForm,
+        });
         if (aiResult !== null) {
           return aiResult;
         }
@@ -1341,10 +1567,10 @@ export class PreActionAnalyzer {
 
   /**
    * AI fallback for submit button detection
-   * ✅ IMPROVED: Uses unified AI wrapper
+   * Enhanced with better context for AI understanding
    */
-  private static async isSubmitButtonAI(text: string, ariaLabel: string): Promise<boolean | null> {
-    // ✅ IMPROVED: Sanitize text for cache key (don't log full text)
+  private static async isSubmitButtonAI(text: string, ariaLabel: string, context?: { pageUrl?: string; isInForm?: boolean }): Promise<boolean | null> {
+    // Sanitize text for cache key (don't log full text)
     const cacheKey = `submit|${text.substring(0, 30)}|${ariaLabel.substring(0, 20)}`.toLowerCase().trim();
 
     // Check cache first
@@ -1353,13 +1579,24 @@ export class PreActionAnalyzer {
       return cached;
     }
 
-    // ✅ IMPROVED: Use unified AI wrapper
+    // Enhanced prompt with context for better AI understanding
+    const contextInfo = context ? `
+Context:
+- Page URL: ${context.pageUrl || 'unknown'}
+- Is in form: ${context.isInForm ? 'yes' : 'no'}
+` : '';
+
     const result = await callAI({
       maxTokens: 10,
-      systemPrompt: 'You are a UI analyzer. Answer only "yes" or "no".',
+      systemPrompt: 'You are a UI analyzer specializing in form interactions. Analyze button context carefully. Answer only "yes" or "no".',
       userPrompt: `Is this button text for a form submit/login/register/action button (not a cancel/close/navigation button)?
+${contextInfo}
 Button text: "${text.substring(0, 50)}"
 ${ariaLabel ? `Aria label: "${ariaLabel.substring(0, 30)}"` : ''}
+
+Common submit button patterns: "Submit", "Sign In", "Login", "Register", "Create Account", "Continue", "Next", "Save", "Confirm", "Buy", "Order", "Checkout"
+Common non-submit buttons: "Cancel", "Close", "Back", "Previous", "Skip", "X", "×"
+
 Answer only "yes" or "no".`,
     });
 
@@ -1606,23 +1843,45 @@ Respond with only the field type, nothing else.`,
   }
 
   /**
-   * Generate fill actions for form fields
+   * Generate fill actions for form fields with priority based on field dependencies
+   * Prioritizes fields that might unlock other fields (e.g., country → state/city)
    */
   static generateFillActionsForForm(formAnalysis: FormAnalysis): DynamicAction[] {
     const actions: DynamicAction[] = [];
+    const emptyRequired = formAnalysis.fields.filter(f => f.required && f.isEmpty);
 
-    for (const field of formAnalysis.fields) {
-      if (field.required && field.isEmpty) {
-        actions.push({
-          action: 'fill',
-          selector: field.selector,
-          value: this.generateTestValue(field.type, field.label),
-          description: `Fill required field: ${field.label}`,
-          expectedResult: 'Field is filled with valid value',
-          optional: false,
-        });
-      }
-    }
+    // Sort fields by likely dependency order (country/region first, then dependent fields)
+    const dependencyOrder: Record<string, number> = {
+      country: 1,
+      region: 2,
+      state: 2,
+      city: 3,
+      zip: 4,
+      address: 3,
+      email: 1,
+      username: 1,
+      password: 2,
+      'password-confirm': 3,
+      'confirm-password': 3,
+    };
+
+    const sortedFields = emptyRequired.sort((a, b) => {
+      const aOrder = dependencyOrder[a.label.toLowerCase().replace(/\s+/g, '-')] || 5;
+      const bOrder = dependencyOrder[b.label.toLowerCase().replace(/\s+/g, '-')] || 5;
+      return aOrder - bOrder;
+    });
+
+    sortedFields.forEach((field, idx) => {
+      actions.push({
+        action: 'fill',
+        selector: field.selector,
+        value: this.generateTestValue(field.type, field.label),
+        description: `Fill required field: ${field.label}`,
+        expectedResult: 'Field is filled with valid value',
+        optional: false,
+        priority: idx === 0 ? 'critical' : idx < 3 ? 'high' : 'medium',
+      } as DynamicAction & { priority?: string });
+    });
 
     return actions;
   }
@@ -1706,6 +1965,12 @@ Respond with only the field type, nothing else.`,
     errors: string[];
     suggestions: string[];
   }> {
+    // If the action already failed, don't spend extra time and don't create more noise.
+    if (!actionSucceeded) {
+      return { hasNewErrors: false, errors: [], suggestions: [] };
+    }
+
+    const pageUrl = page.url();
     const errors = await this.getValidationErrors(page);
 
     // Pass patterns to browser context
@@ -1741,19 +2006,32 @@ Respond with only the field type, nothing else.`,
 
     errors.push(...toastErrors);
 
+    const normalizedCurrent = normalizeErrorList(errors);
+
+    // Compare against baseline captured in analyzeBeforeAction (same page+action+selector)
+    const baselineKey = getErrorBaselineKey(pageUrl, action);
+    const baseline = preActionErrorBaseline.get(baselineKey);
+    const baselineValid = baseline && (Date.now() - baseline.timestamp) <= PRE_ACTION_ERROR_BASELINE_TTL;
+    const baselineErrors = baselineValid ? baseline!.errors : [];
+
+    const newErrors = normalizedCurrent.filter(e => !baselineErrors.includes(e));
+
+    // Update baseline to current for safety (in case post-analysis is called multiple times)
+    preActionErrorBaseline.set(baselineKey, { errors: normalizedCurrent, timestamp: Date.now() });
+
     const suggestions: string[] = [];
 
-    if (errors.length > 0) {
+    if (newErrors.length > 0) {
       suggestions.push('Fix the validation errors before continuing');
 
       // Analyze specific error types using rule-based patterns
-      const errorSuggestions = this.generateErrorSuggestionsRuleBased(errors);
+      const errorSuggestions = this.generateErrorSuggestionsRuleBased(newErrors);
       suggestions.push(...errorSuggestions);
     }
 
     return {
-      hasNewErrors: errors.length > 0,
-      errors,
+      hasNewErrors: newErrors.length > 0,
+      errors: newErrors,
       suggestions,
     };
   }

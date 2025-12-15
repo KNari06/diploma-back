@@ -81,6 +81,28 @@ export class TestChatMappingService {
   }
 
   /**
+   * Get test IDs associated with a chat session
+   */
+  static async getTestIdsForChatSession(chatSessionId: string): Promise<string[]> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('test_chat_mappings')
+        .select('test_id')
+        .eq('chat_session_id', chatSessionId);
+
+      if (error) {
+        logger.error('[TEST_CHAT_MAPPING] Failed to get test IDs', { error, chatSessionId });
+        return [];
+      }
+
+      return data?.map((row) => row.test_id) || [];
+    } catch (error) {
+      logger.error('[TEST_CHAT_MAPPING] Unexpected error getting test IDs', { error, chatSessionId });
+      return [];
+    }
+  }
+
+  /**
    * Get mapping statistics for analytics
    */
   static async getMappingStats(userId: string): Promise<{

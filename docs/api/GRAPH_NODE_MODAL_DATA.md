@@ -24,6 +24,7 @@
 ```
 
 **Что показать:**
+
 - Время начала теста
 - Цель теста (goal)
 - Стартовый URL
@@ -67,6 +68,7 @@
 ```
 
 **Что показать:**
+
 - 📸 **Screenshot**: Скриншот страницы (`meta.screenshot` - публичный URL)
 - 📊 **Page Stats**:
   - Заголовок: `pageAnalysis.title`
@@ -102,7 +104,8 @@
     urlAfter: "https://example.com/login",
     urlChanged: false,
 
-    // ✅ Screenshots ДО и ПОСЛЕ (публичные URL после загрузки в storage)
+    // ✅ Screenshots ДО и ПОСЛЕ (публичные URL - загружаются в storage и приходят через updatedNode)
+    // См. WEBSOCKET_GRAPH_UPDATE_DATA.md для деталей
     screenshotBefore: "https://storage.supabase.co/.../screenshot-before-123.png",
     screenshotAfter: "https://storage.supabase.co/.../screenshot-after-123.png",
 
@@ -122,6 +125,7 @@
 ```
 
 **Что показать:**
+
 - 📸 **Before/After Comparison**:
   - Слева: `meta.screenshotBefore` (публичный URL)
   - Справа: `meta.screenshotAfter` (публичный URL)
@@ -188,6 +192,7 @@
 ```
 
 **Что показать:**
+
 - ❌ **Error Details**:
   - Message: `meta.errorMessage`
   - Retry attempts: `meta.retryCount`
@@ -237,6 +242,7 @@
 ```
 
 **Что показать:**
+
 - 📊 **Test Summary**:
   - Pages visited: `testSummary.pagesVisited`
   - Actions taken: `testSummary.actionsTaken`
@@ -251,8 +257,8 @@
 ## 🎨 UI Component Example
 
 ```jsx
-import { useState } from 'react';
-import { GraphNode } from './types';
+import { useState } from "react";
+import { GraphNode } from "./types";
 
 interface NodeModalProps {
   node: GraphNode;
@@ -260,7 +266,7 @@ interface NodeModalProps {
 }
 
 export function NodeDetailModal({ node, onClose }: NodeModalProps) {
-  const [activeTab, setActiveTab] = useState('overview');
+  const [activeTab, setActiveTab] = useState("overview");
 
   return (
     <Modal open onClose={onClose} size="xl">
@@ -274,7 +280,9 @@ export function NodeDetailModal({ node, onClose }: NodeModalProps) {
       {/* Tabs */}
       <Tabs value={activeTab} onChange={setActiveTab}>
         <Tab value="overview">Overview</Tab>
-        {node.meta?.screenshotBefore && <Tab value="screenshots">Screenshots</Tab>}
+        {node.meta?.screenshotBefore && (
+          <Tab value="screenshots">Screenshots</Tab>
+        )}
         {node.meta?.validation && <Tab value="validation">Validation</Tab>}
         {node.meta?.consoleLogs && <Tab value="console">Console</Tab>}
         {node.meta?.networkErrors && <Tab value="network">Network</Tab>}
@@ -283,32 +291,30 @@ export function NodeDetailModal({ node, onClose }: NodeModalProps) {
 
       {/* Content */}
       <ModalBody>
-        {activeTab === 'overview' && (
-          <OverviewTab node={node} />
-        )}
+        {activeTab === "overview" && <OverviewTab node={node} />}
 
-        {activeTab === 'screenshots' && (
+        {activeTab === "screenshots" && (
           <ScreenshotsTab
             before={node.meta.screenshotBefore}
             after={node.meta.screenshotAfter}
           />
         )}
+        {/*
+          Скриншоты доступны как публичные URL через WebSocket (updatedNode) или REST API
+          См. WEBSOCKET_GRAPH_UPDATE_DATA.md для деталей
+        */}
 
-        {activeTab === 'validation' && (
+        {activeTab === "validation" && (
           <ValidationTab validation={node.meta.validation} />
         )}
 
-        {activeTab === 'console' && (
-          <ConsoleTab logs={node.meta.consoleLogs} />
-        )}
+        {activeTab === "console" && <ConsoleTab logs={node.meta.consoleLogs} />}
 
-        {activeTab === 'network' && (
+        {activeTab === "network" && (
           <NetworkTab errors={node.meta.networkErrors} />
         )}
 
-        {activeTab === 'dom' && (
-          <DOMViewer html={node.meta.domSnapshot} />
-        )}
+        {activeTab === "dom" && <DOMViewer html={node.meta.domSnapshot} />}
       </ModalBody>
     </Modal>
   );
@@ -320,6 +326,7 @@ export function NodeDetailModal({ node, onClose }: NodeModalProps) {
 ## 📦 API Response Structure
 
 Когда фронтенд получает граф через:
+
 - **WebSocket** (`test:graph-update` event) - скриншоты могут быть base64 (во время выполнения)
 - **REST API** (`GET /api/v1/test-visualization/{testId}`) - скриншоты всегда публичные URL
 

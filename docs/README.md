@@ -28,6 +28,7 @@
 - [**Playwright API**](./api/playwright.md) - загрузка trace файлов
 - [**Real-Time Graph Visualization**](./api/real-time-graph-visualization.md) - ✨ NEW! Потоковая визуализация тестов в режиме реального времени
 - [**Frontend Graph Integration Guide**](./api/FRONTEND_GRAPH_INTEGRATION_GUIDE.md) - 📱 NEW! Гайд для фронтенда по интеграции графов
+- [**Frontend Latest Changes**](./api/frontend-latest-changes.md) - ✨ NEW! Последние изменения для фронтенда
 - [**Feedback API**](./api/feedback-api-examples.md) - система like/dislike для улучшения AI
 - [**Feedback Analytics**](./api/feedback-analytics-guide.md) - аналитика и insights для мониторинга качества AI
 - [**Intelligent API Fuzzing**](./api/INTELLIGENT_API_FUZZING_IMPLEMENTATION.md) - автоматическое security testing API

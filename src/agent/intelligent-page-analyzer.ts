@@ -18,6 +18,7 @@ import {
   PageType,
   VisionAnalysis,
 } from './types/intelligent-testing.types';
+import { buildHistorySummary } from './utils/context-compressor';
 
 // ✅ FIX: Add timeout to prevent hanging requests (default is 10 minutes!)
 const openai = new OpenAI({
@@ -87,7 +88,10 @@ export class IntelligentPageAnalyzer {
       minTextLength?: number;
       checkShadowDOM?: boolean;
       checkIframes?: boolean;
-    }
+    },
+    state?: any, // TestState - optional for backward compatibility
+    hints?: Array<{ description: string; action?: string; target?: string; value?: string; priority?: string }>,
+    errorCollector?: any // ErrorCollectorService - optional
   ): Promise<PageContext> {
     const startTime = Date.now();
     const url = page.url();
@@ -151,6 +155,20 @@ export class IntelligentPageAnalyzer {
       const shouldUseVisionResult = mode === 'full' ||
         (mode === 'balanced' && await this.shouldUseVision(domAnalysis));
 
+      // ✅ NEW: Build enriched context for logic analysis
+      const pageTitle = await page.title().catch(() => undefined);
+      const historySummary = state ? await this.buildHistorySummaryFromState(state) : undefined;
+      const errorSignalsSummary = errorCollector ? errorCollector.getSummary() : undefined;
+
+      const enrichedContext = {
+        goal,
+        historySummary,
+        url,
+        pageTitle,
+        hints,
+        errorSignals: errorSignalsSummary,
+      };
+
       // ✅ OPTIMIZED: Run Vision and Logic analysis in parallel (if Vision needed)
       let visionAnalysis: VisionAnalysis;
       let logicAnalysis: any;
@@ -178,7 +196,7 @@ export class IntelligentPageAnalyzer {
         const [visionResult, logicResult] = await Promise.all([
           this.analyzeWithVision(screenshot, url, goal, previousContext, domContext),
           // Start Logic analysis early (can use DOM-only data initially)
-          this.analyzeLogic('unknown', [], domAnalysis),
+          this.analyzeLogic('unknown', [], domAnalysis, enrichedContext),
         ]);
 
         visionAnalysis = visionResult;
@@ -198,7 +216,8 @@ export class IntelligentPageAnalyzer {
         logicAnalysis = await this.analyzeLogic(
           visionAnalysis.pageType,
           visionAnalysis.elements,
-          domAnalysis
+          domAnalysis,
+          enrichedContext
         );
       }
 
@@ -230,10 +249,18 @@ export class IntelligentPageAnalyzer {
       if (shouldUseVisionResult && visionAnalysis && visionAnalysis.elements && visionAnalysis.elements.length > 0) {
         // Re-run Logic with Vision elements for better accuracy
         try {
+          // ✅ ENHANCED: Add pageDescription and warnings from Vision to enrichedContext
+          const enrichedContextWithVision = {
+            ...enrichedContext,
+            pageDescription: visionAnalysis.description,
+            warnings: visionAnalysis.warnings,
+          };
+
           logicAnalysis = await this.analyzeLogic(
             visionAnalysis.pageType || 'unknown',
             visionAnalysis.elements.filter(el => el && el.type && el.purpose), // ✅ FIX: Filter invalid elements
-            finalEnhancedDom
+            finalEnhancedDom,
+            enrichedContextWithVision
           );
         } catch (error) {
           logger.warn('[INTELLIGENT_ANALYZER] Logic analysis with Vision elements failed, using previous result', {
@@ -270,6 +297,9 @@ export class IntelligentPageAnalyzer {
           el => el && el.priority === 'critical'
         ),
         warnings: visionAnalysis?.warnings || [],
+        errorSignals: errorCollector ? errorCollector.getErrors() : undefined,
+        skipHints: logicAnalysis?.skipHints || [],
+        navigationActions: logicAnalysis?.navigationActions || [],
       };
 
       const duration = Date.now() - startTime;
@@ -1864,6 +1894,7 @@ export class IntelligentPageAnalyzer {
         required: el.required || false,
         priority: el.priority || 'medium',
         selector: el.selector || '', // May be empty, will be matched later
+        isCTA: el.isCTA === true ? true : undefined, // ✅ NEW: Parse isCTA flag
       }));
 
       return {
@@ -2003,12 +2034,49 @@ export class IntelligentPageAnalyzer {
   private static async analyzeLogic(
     pageType: PageType,
     elements: VisionAnalysis['elements'],
-    domAnalysis: DOMAnalysis
+    domAnalysis: DOMAnalysis,
+    enrichedContext?: {
+      goal?: string;
+      historySummary?: string;
+      pageDescription?: string;
+      warnings?: string[];
+      url?: string;
+      pageTitle?: string;
+      hints?: Array<{ description: string; action?: string; target?: string; value?: string; priority?: string }>;
+      errorSignals?: string;
+    }
   ): Promise<{
     requiredActions: string[];
     possibleActions: string[];
+    skipHints?: string[];
+    navigationActions?: string[];
   }> {
     try {
+      // Build critical elements summary
+      const criticalElements = elements.filter(el => el.priority === 'critical');
+      const criticalElementsSummary = criticalElements.length > 0
+        ? JSON.stringify(criticalElements.map(el => ({ type: el.type, purpose: el.purpose, text: el.text })), null, 2)
+        : '';
+
+      // Build navigation/CTA buttons summary
+      const ctaButtons = elements.filter(el => el.isCTA);
+      const navButtonsSummary = ctaButtons.length > 0
+        ? ctaButtons.map(btn => `${btn.purpose}: "${btn.text}" (${btn.type})`).join('\n')
+        : '';
+
+      // Build forms summary
+      const formsSummary = domAnalysis.forms.length > 0
+        ? domAnalysis.forms.map((form, idx) => {
+            const requiredFields = form.fields.filter(f => f.required);
+            return `Form ${idx + 1}: ${form.fields.length} fields (${requiredFields.length} required)`;
+          }).join('\n')
+        : '';
+
+      // Build hints summary
+      const hintsSummary = enrichedContext?.hints && enrichedContext.hints.length > 0
+        ? enrichedContext.hints.map((h, i) => `${i + 1}. ${h.description}${h.priority === 'high' ? ' [HIGH PRIORITY]' : ''}`).join('\n')
+        : '';
+
       const prompt = buildLogicAnalysisPrompt({
         pageType,
         elements: JSON.stringify(elements, null, 2),
@@ -2021,6 +2089,17 @@ export class IntelligentPageAnalyzer {
           null,
           2
         ),
+        goal: enrichedContext?.goal,
+        historySummary: enrichedContext?.historySummary,
+        pageDescription: enrichedContext?.pageDescription,
+        warnings: enrichedContext?.warnings,
+        criticalElements: criticalElementsSummary,
+        navButtonsSummary,
+        formsSummary,
+        url: enrichedContext?.url,
+        pageTitle: enrichedContext?.pageTitle,
+        hints: hintsSummary,
+        errorSignals: enrichedContext?.errorSignals,
       });
 
       const response = await openai.chat.completions.create({
@@ -2053,12 +2132,16 @@ export class IntelligentPageAnalyzer {
           ...(parsed.requiredBeforeMain || []),
           ...(parsed.optionalActions || []),
         ],
+        skipHints: parsed.skipHints || [],
+        navigationActions: parsed.navigationActions || [],
       };
     } catch (error) {
       logger.error('[INTELLIGENT_ANALYZER] Logic analysis failed', { error });
       return {
         requiredActions: [],
         possibleActions: [],
+        skipHints: [],
+        navigationActions: [],
       };
     }
   }
@@ -2066,6 +2149,18 @@ export class IntelligentPageAnalyzer {
   // ═══════════════════════════════════════════════════════════════════════════
   // HELPERS
   // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build history summary from test state
+   */
+  private static async buildHistorySummaryFromState(state: any): Promise<string> {
+    try {
+      return buildHistorySummary(state);
+    } catch (error) {
+      logger.warn('[INTELLIGENT_ANALYZER] Failed to build history summary', { error });
+      return '';
+    }
+  }
 
   /**
    * ✅ OPTIMIZED: Decide if Vision should be used in balanced mode

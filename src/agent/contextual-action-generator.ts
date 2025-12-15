@@ -5,8 +5,8 @@
  */
 
 import {
-    buildActionGenerationPrompt,
-    buildNextStepPrompt,
+  buildActionGenerationPrompt,
+  buildNextStepPrompt,
 } from '@/ai/prompts/index';
 import { env } from '@/config/env';
 import { AICostManager, AIModel } from '@/services/ai-cost-manager.service';
@@ -15,13 +15,13 @@ import { OpenAI } from 'openai';
 import { Page } from 'playwright';
 import { z } from 'zod';
 import {
-    DynamicAction,
-    NextStepDecision,
-    PageContext,
-    TestState,
+  DynamicAction,
+  NextStepDecision,
+  PageContext,
+  TestState,
 } from './types/intelligent-testing.types';
 
-// ✅ FIX: Add timeout to prevent hanging requests
+// OpenAI client with timeout and retry configuration
 const openai = new OpenAI({
   apiKey: env.OPENAI_API_KEY,
   timeout: 60000, // 60 seconds timeout for OpenAI API calls
@@ -73,27 +73,46 @@ interface CachedGeneration {
 const generationCache = new Map<string, CachedGeneration>();
 const CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
 
+/**
+ * Generates a cache key from page context and goal
+ *
+ * Creates a unique identifier by combining URL, page type, and test goal.
+ * Used to cache action generations for similar contexts.
+ *
+ * @param context - Page context with URL and page type
+ * @param goal - Test goal string
+ * @returns Base64-encoded cache key (32 characters)
+ */
 function getCacheKey(context: PageContext, goal: string): string {
-  // Simple hash based on URL + pageType + goal
   const str = `${context.url}|${context.pageType}|${goal}`;
   return Buffer.from(str).toString('base64').substring(0, 32);
 }
 
-function getCachedGeneration(context: PageContext, goal: string): CachedGeneration | null {
-  const key = getCacheKey(context, goal);
-  const cached = generationCache.get(key);
+// function getCachedGeneration(context: PageContext, goal: string): CachedGeneration | null {
+//   const key = getCacheKey(context, goal);
+//   const cached = generationCache.get(key);
 
-  if (!cached) return null;
+//   if (!cached) return null;
 
-  const age = Date.now() - cached.timestamp;
-  if (age > CACHE_TTL_MS) {
-    generationCache.delete(key);
-    return null;
-  }
+//   const age = Date.now() - cached.timestamp;
+//   if (age > CACHE_TTL_MS) {
+//     generationCache.delete(key);
+//     return null;
+//   }
 
-  return cached;
-}
+//   return cached;
+// }
 
+/**
+ * Stores action generation result in cache
+ *
+ * Caches the generated actions with timestamp for future reuse.
+ * Automatically removes oldest entries when cache exceeds 50 items.
+ *
+ * @param context - Page context used for cache key generation
+ * @param goal - Test goal used for cache key generation
+ * @param result - Generation result to cache (actions, reasoning, confidence)
+ */
 function setCachedGeneration(context: PageContext, goal: string, result: CachedGeneration): void {
   const key = getCacheKey(context, goal);
   generationCache.set(key, { ...result, timestamp: Date.now() });
@@ -112,20 +131,25 @@ function setCachedGeneration(context: PageContext, goal: string, result: CachedG
 
 export class ContextualActionGenerator {
   /**
-   * Generate actions based on current page context
-   * @param context - Current page context
-   * @param state - Current test state
-   * @param page - Optional page for getting HTML
-   * @param costManager - Cost manager for budget control
-   * @param hints - Test hints from plan (user's requested steps)
-   * @returns Array of dynamic actions to execute
+   * Generates test actions based on current page context using AI
+   *
+   * Analyzes the page structure, available elements, and test history to generate
+   * appropriate actions that move the test towards its goal. Uses OpenAI to
+   * understand context and create realistic test scenarios.
+   *
+   * @param context - Current page context including DOM and vision analysis
+   * @param state - Current test state with history and goal
+   * @param page - Optional Playwright page instance for HTML extraction
+   * @param costManager - Optional cost manager for budget control
+   * @param hints - Optional test hints from plan (user's requested steps)
+   * @returns Generated actions with reasoning and confidence score
    */
   static async generateActions(
     context: PageContext,
     state: TestState,
     page?: Page,
     costManager?: AICostManager,
-    hints?: Array<{ description: string; action?: string; target?: string; value?: string; priority?: string }>  // ✅ NEW: Test hints from plan
+    hints?: Array<{ description: string; action?: string; target?: string; value?: string; priority?: string }>
   ): Promise<{
     actions: DynamicAction[];
     reasoning: string;
@@ -133,7 +157,7 @@ export class ContextualActionGenerator {
   }> {
     const startTime = Date.now();
 
-    // ✅ FIX 9: Check budget before proceeding
+    // Check budget before proceeding
     if (costManager && !costManager.canContinue()) {
       logger.warn('[ACTION_GENERATOR] Budget exceeded, stopping action generation', {
         stats: costManager.getStats(),
@@ -151,10 +175,10 @@ export class ContextualActionGenerator {
       goal: state.goal,
     });
 
-    // ✅ DISABLED: Cache is temporarily disabled
+    // Cache is temporarily disabled
     // const cached = getCachedGeneration(context, state.goal);
     // if (cached && cached.actions.length > 0) {
-    //   // ✅ NEW: Validate cached actions before using them
+    //   // Validate cached actions before using them
     //   // Check if elements referenced in cached actions still exist on the page
     //   const isValidCache = await this.validateCachedActions(cached.actions, context, page);
     //
@@ -169,7 +193,7 @@ export class ContextualActionGenerator {
     //       confidence: cached.confidence,
     //     };
     //   } else {
-    //     // ✅ NEW: Invalidate cache if actions are invalid
+    //     // Invalidate cache if actions are invalid
     //     logger.warn('[ACTION_GENERATOR] Cached actions invalid, invalidating cache', {
     //       reason: 'Elements referenced in cached actions do not exist on current page',
     //       cachedActionsCount: cached.actions.length,
@@ -179,7 +203,7 @@ export class ContextualActionGenerator {
     //   }
     // }
 
-    // ✅ DISABLED: Cache invalidation on failures
+    // Cache invalidation on failures (disabled)
     // const recentFailures = state.completedActions
     //   .slice(-5)
     //   .filter(a => !a.success && a.action.selector);
@@ -224,11 +248,11 @@ export class ContextualActionGenerator {
       // Build DOM summary
       const domSummary = this.buildDOMSummary(context.dom);
 
-      // ✅ FIX 5: Mask PII before sending to LLM
+      // Extract and sanitize HTML to mask PII before sending to LLM
       const actualHTML = page ? await this.getPageHTML(page) : '';
       const sanitizedHTML = this.maskPII(actualHTML);
 
-      // ✅ NEW: Log what AI will see in context
+      // Log context information for debugging
       logger.info('[ACTION_GENERATOR] Context sent to AI', {
         pageType: context.pageType,
         url: context.url,
@@ -270,10 +294,10 @@ export class ContextualActionGenerator {
         history: historySummary,
         domSummary,
         actualHTML: sanitizedHTML,
-        hints, // ✅ NEW: Pass hints to prompt for AI guidance
+        hints,
       });
 
-      // ✅ FIX 2: Dynamic token budget based on prompt length
+      // Calculate dynamic token budget based on prompt length
       const promptLength = prompt.length;
       const estimatedPromptTokens = Math.ceil(promptLength / 4); // rough estimate
       const maxTokensBudget = Math.min(1500, 4000 - estimatedPromptTokens); // leave room for response
@@ -284,14 +308,14 @@ export class ContextualActionGenerator {
         maxTokensBudget,
       });
 
-      // ✅ FIX 9: Get recommended model based on budget
+      // Get recommended model based on budget constraints
       const preferredModel: AIModel = 'gpt-4o';
       const model = costManager ? costManager.getRecommendedModel(preferredModel) : preferredModel;
 
       logger.debug('[ACTION_GENERATOR] Using model', { model, preferredModel });
 
       const response = await openai.chat.completions.create({
-        model, // ✅ FIX 9: Use adaptive model selection
+        model,
         messages: [
           {
             role: 'system',
@@ -312,7 +336,7 @@ export class ContextualActionGenerator {
         throw new Error('Empty response from Action Generator');
       }
 
-      // ✅ FIX 9: Record AI cost
+      // Record AI cost for budget tracking
       if (costManager) {
         const inputTokens = response.usage?.prompt_tokens || estimatedPromptTokens;
         const outputTokens = response.usage?.completion_tokens || 0;
@@ -336,15 +360,15 @@ export class ContextualActionGenerator {
         }
       }
 
-      // ✅ FIX 1: Robust JSON parsing with fallback
+      // Parse JSON response with fallback extraction strategies
       const parsed = this.parseRobustJSON(content, ActionGenerationResponseSchema);
 
-      // Validate and sanitize actions
+      // Validate and sanitize actions before returning
       const actions = this.sanitizeActions(parsed.actions || []);
 
       const duration = Date.now() - startTime;
 
-      // ✅ FIX 8: Log metrics
+      // Log generation metrics
       logger.info('[ACTION_GENERATOR] Actions generated', {
         count: actions.length,
         confidence: parsed.confidence || 0,
@@ -353,7 +377,7 @@ export class ContextualActionGenerator {
         model: response.model,
       });
 
-      // ✅ NEW: Log detailed action information for debugging
+      // Log detailed action information for debugging
       logger.info('[ACTION_GENERATOR] Generated actions details', {
         actions: actions.map(a => ({
           action: a.action,
@@ -373,7 +397,7 @@ export class ContextualActionGenerator {
         confidence: parsed.confidence || 0.5,
       };
 
-      // ✅ DISABLED: Cache is temporarily disabled
+      // Cache is temporarily disabled
       // if (actions.length > 0) {
       //   setCachedGeneration(context, state.goal, {
       //     ...result,
@@ -383,9 +407,13 @@ export class ContextualActionGenerator {
 
       return result;
     } catch (error) {
-      logger.error('[ACTION_GENERATOR] Action generation failed', { error });
+      logger.error('[ACTION_GENERATOR] Action generation failed', {
+        error: error instanceof Error ? error.message : String(error),
+        url: context.url,
+        pageType: context.pageType,
+      });
 
-      // Check if page is empty before generating fallback actions
+      // Check if page is empty
       const isEmptyPage = this.isPageEmpty(context);
       if (isEmptyPage) {
         return {
@@ -395,20 +423,26 @@ export class ContextualActionGenerator {
         };
       }
 
-      // Return safe fallback actions
+      // Return empty actions with explicit error message
+      // Let the main loop handle the decision (stop test or retry)
       return {
-        actions: this.generateFallbackActions(context),
-        reasoning: 'Action generation failed, using fallback actions',
-        confidence: 0.3,
+        actions: [],
+        reasoning: `AI action generation failed: ${error instanceof Error ? error.message : 'Unknown error'}. Cannot proceed without AI-generated actions.`,
+        confidence: 0,
       };
     }
   }
 
   /**
-   * ✅ NEW: Validate cached actions by checking if their selectors still exist on the page
-   * @param cachedActions - Actions from cache
-   * @param context - Current page context
-   * @param page - Optional page for DOM checks
+   * Validates cached actions by checking if their selectors still exist on the page
+   *
+   * When actions are cached, this method verifies that the DOM elements referenced
+   * by the cached actions still exist. If page is available, performs actual DOM
+   * checks. Otherwise, validates against DOM summary.
+   *
+   * @param cachedActions - Actions retrieved from cache
+   * @param context - Current page context for validation
+   * @param page - Optional Playwright page for actual DOM checks
    * @returns true if all actions are valid, false otherwise
    */
   private static async validateCachedActions(
@@ -460,9 +494,14 @@ export class ContextualActionGenerator {
   }
 
   /**
-   * ✅ NEW: Validate cached actions against DOM summary (when page is not available)
-   * @param cachedActions - Actions from cache
-   * @param context - Current page context
+   * Validates cached actions against DOM summary when page instance is not available
+   *
+   * Performs a lightweight validation by checking if selectors from cached actions
+   * exist in the DOM summary. This is less accurate than actual DOM checks but
+   * useful when page instance is not available.
+   *
+   * @param cachedActions - Actions retrieved from cache
+   * @param context - Current page context with DOM summary
    * @returns true if actions seem valid, false otherwise
    */
   private static validateCachedActionsAgainstDOM(
@@ -508,9 +547,13 @@ export class ContextualActionGenerator {
   }
 
   /**
-   * Check if page is empty or invalid (about:blank, no elements)
-   * @param context - Current page context
-   * @returns Object with isEmpty flag and reason, or null if page is valid
+   * Checks if page is empty or invalid (e.g., about:blank or no interactive elements)
+   *
+   * Determines whether the page has any interactive elements that can be tested.
+   * Returns null if page is valid, or an object with reason if page is empty.
+   *
+   * @param context - Current page context to check
+   * @returns Object with isEmpty flag and reason if page is empty, null if valid
    */
   private static isPageEmpty(context: PageContext): { isEmpty: boolean; reason: string } | null {
     // Check for about:blank
@@ -540,15 +583,21 @@ export class ContextualActionGenerator {
   }
 
   /**
-   * Decide next step based on current state
-   * @param state - Current test state
+   * Decides the next step in the test execution based on current state
+   *
+   * Uses AI to analyze the test progress, visited pages, errors, and current
+   * page context to determine whether to continue, stop, wait, retry, or skip.
+   * Uses cheaper model (gpt-4o-mini) for cost efficiency.
+   *
+   * @param state - Current test state with history and progress
    * @param context - Current page context
-   * @returns Decision on what to do next
+   * @param costManager - Optional cost manager for budget control
+   * @returns Decision object with action, reason, and confidence
    */
   static async decideNextStep(
     state: TestState,
     context: PageContext,
-    costManager?: AICostManager  // ✅ FIX 9: Cost manager for budget control
+    costManager?: AICostManager
   ): Promise<NextStepDecision> {
     logger.info('[ACTION_GENERATOR] Deciding next step', {
       pageType: context.pageType,
@@ -556,7 +605,7 @@ export class ContextualActionGenerator {
       goal: state.goal,
     });
 
-    // ✅ FIX 9: Check budget before proceeding
+    // Check budget before proceeding
     if (costManager && !costManager.canContinue()) {
       logger.warn('[ACTION_GENERATOR] Budget exceeded, stopping test', {
         stats: costManager.getStats(),
@@ -581,7 +630,7 @@ export class ContextualActionGenerator {
         errors,
       });
 
-      // ✅ FIX 9: Get recommended model (always use mini for next step - it's cheaper)
+      // Use cheaper model for next step decision to reduce costs
       const preferredModel: AIModel = 'gpt-4o-mini';
       const model = costManager ? costManager.getRecommendedModel(preferredModel) : preferredModel;
 
@@ -598,7 +647,7 @@ export class ContextualActionGenerator {
           },
         ],
         max_tokens: 800,
-        temperature: 0.3,
+        temperature: 0.2,
         response_format: { type: 'json_object' },
       });
 
@@ -607,7 +656,7 @@ export class ContextualActionGenerator {
         throw new Error('Empty response from Next Step Decision');
       }
 
-      // ✅ FIX 9: Record AI cost
+      // Record AI cost for budget tracking
       if (costManager) {
         const inputTokens = response.usage?.prompt_tokens || Math.ceil(prompt.length / 4);
         const outputTokens = response.usage?.completion_tokens || 0;
@@ -620,7 +669,7 @@ export class ContextualActionGenerator {
         });
       }
 
-      // ✅ FIX 1: Robust JSON parsing
+      // Parse JSON response with fallback extraction
       const parsed = this.parseRobustJSON(content, NextStepResponseSchema);
 
       const decision: NextStepDecision = {
@@ -659,6 +708,15 @@ export class ContextualActionGenerator {
   // HELPERS - SUMMARIES
   // ═══════════════════════════════════════════════════════════════════════════
 
+  /**
+   * Builds a summary of test history for AI context
+   *
+   * Creates a human-readable summary of pages visited, actions taken,
+   * and recent activity to help AI understand test progress.
+   *
+   * @param state - Current test state with history
+   * @returns Formatted history summary string
+   */
   private static buildHistorySummary(state: TestState): string {
     if (state.visitedPages.length === 0) {
       return 'Just started testing.';
@@ -689,6 +747,16 @@ export class ContextualActionGenerator {
     return summary.join('\n');
   }
 
+  /**
+   * Builds a summary of available interactive elements from vision analysis
+   *
+   * Groups elements by priority (critical, high, others) and includes
+   * selectors, text, and purpose for each element to help AI generate
+   * appropriate actions.
+   *
+   * @param context - Page context with vision analysis
+   * @returns Formatted elements summary string
+   */
   private static buildElementsSummary(context: PageContext): string {
     const elements = context.vision.elements;
 
@@ -705,7 +773,7 @@ export class ContextualActionGenerator {
 
     const summary: string[] = [];
 
-    // ✅ CRITICAL FIX: Include REAL selectors from DOM analysis
+    // Include selectors from DOM analysis for direct use
     if (critical.length > 0) {
       summary.push('Critical Elements:');
       critical.forEach(el => {
@@ -734,10 +802,20 @@ export class ContextualActionGenerator {
     return summary.join('\n');
   }
 
+  /**
+   * Builds a summary of DOM structure for AI context
+   *
+   * Creates a detailed summary of forms, buttons, inputs, links, checkboxes,
+   * radio buttons, and other interactive elements with their selectors.
+   * Includes modals and their close button selectors.
+   *
+   * @param dom - DOM analysis result with all interactive elements
+   * @returns Formatted DOM summary string
+   */
   private static buildDOMSummary(dom: PageContext['dom']): string {
     const summary: string[] = [];
 
-    // ✅ CRITICAL FIX: Include REAL selectors from DOM
+    // Include selectors from DOM for direct use by AI
     if (dom.forms.length > 0) {
       summary.push(`Forms: ${dom.forms.length}`);
       dom.forms.forEach((form, idx) => {
@@ -782,7 +860,7 @@ export class ContextualActionGenerator {
       }
     }
 
-    // ✅ NEW: Include checkboxes and radios
+    // Include checkboxes and radio buttons
     if (dom.checkboxes && dom.checkboxes.length > 0) {
       summary.push(`\nCheckboxes (${dom.checkboxes.length}):`);
       dom.checkboxes.slice(0, 10).forEach(cb => {
@@ -805,7 +883,7 @@ export class ContextualActionGenerator {
       }
     }
 
-    // ✅ NEW: Include other interactive elements
+    // Include other interactive elements
     if (dom.interactiveElements && dom.interactiveElements.length > 0) {
       summary.push(`\nOther interactive elements (${dom.interactiveElements.length}):`);
       dom.interactiveElements.slice(0, 10).forEach(el => {
@@ -836,8 +914,14 @@ export class ContextualActionGenerator {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Get actual HTML from page (limited to avoid token overflow)
-   * Returns simplified HTML with only interactive elements
+   * Extracts simplified HTML from page with only interactive elements
+   *
+   * Limits extraction to forms, buttons, inputs, selects, textareas, and links
+   * to avoid token overflow. Each element is truncated to 500 chars, and total
+   * output is limited to 3000 chars.
+   *
+   * @param page - Playwright page instance
+   * @returns Simplified HTML string with interactive elements only
    */
   private static async getPageHTML(page: Page): Promise<string> {
     try {
@@ -873,7 +957,14 @@ export class ContextualActionGenerator {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Sanitize and validate actions from AI
+   * Sanitizes and validates actions generated by AI
+   *
+   * Validates action types, required fields (selectors, URLs, values),
+   * and selector formats. Drops invalid actions and fixes common issues
+   * like mixed selector formats. Only allows actions that can be reliably executed.
+   *
+   * @param actions - Raw actions from AI response
+   * @returns Array of validated and sanitized actions
    */
   private static sanitizeActions(actions: any[]): DynamicAction[] {
     const sanitized: DynamicAction[] = [];
@@ -885,7 +976,7 @@ export class ContextualActionGenerator {
         continue;
       }
 
-      // ✅ CRITICAL FIX: Validate action type - include ALL supported actions (30+)
+      // Validate action type - only allow actions we can reliably execute
       const validActions = [
         // Navigation
         'goto', 'goBack', 'goForward', 'reload',
@@ -895,13 +986,9 @@ export class ContextualActionGenerator {
         // Drag & Drop / Mobile
         'dragAndDrop', 'tap', 'swipe',
         // Wait & Scroll
-        'wait', 'waitForSelector', 'waitForTimeout', 'waitForLoadState',
-        'waitForNavigation', 'scroll', 'scrollIntoView',
-        // Assertions
-        'assertVisible', 'assertHidden', 'assertEnabled', 'assertDisabled',
-        'assertText', 'assertValue', 'assertUrl', 'assertCount',
-        // Data & Scripts
-        'extract', 'evaluate', 'script', 'screenshot',
+        'wait', 'waitForSelector', 'waitForNavigation', 'scroll', 'scrollIntoView',
+        // Data
+        'screenshot',
       ];
       if (!validActions.includes(action.action)) {
         logger.warn('[ACTION_GENERATOR] Invalid action type, skipping', {
@@ -911,30 +998,101 @@ export class ContextualActionGenerator {
         continue;
       }
 
-      // ✅ NEW: Validate selector format to catch AI mistakes early
+      // Enforce required fields per action type (drop invalid actions early)
+      const requiresSelector = new Set<string>([
+        'click',
+        'dblclick',
+        'fill',
+        'type',
+        'select',
+        'selectOption',
+        'check',
+        'uncheck',
+        'hover',
+        'focus',
+        'blur',
+        'dragAndDrop',
+        'tap',
+        'swipe',
+        'waitForSelector',
+        'scrollIntoView',
+      ]);
+
+      const requiresUrl = new Set<string>(['goto']);
+
+      const requiresValue = new Set<string>([
+        'fill',
+        'type',
+        'select',
+        'selectOption',
+        'press', // selector optional, key required
+        'dragAndDrop', // target selector required
+      ]);
+
+      if (requiresSelector.has(action.action)) {
+        if (!action.selector || !String(action.selector).trim()) {
+          logger.warn('[ACTION_GENERATOR] Action requires selector but missing, dropping', {
+            action: action.action,
+            description: action.description,
+          });
+          continue;
+        }
+      }
+
+      if (requiresUrl.has(action.action)) {
+        if (!action.url || !String(action.url).trim()) {
+          logger.warn('[ACTION_GENERATOR] Action requires url but missing, dropping', {
+            action: action.action,
+            description: action.description,
+          });
+          continue;
+        }
+      }
+
+      if (requiresValue.has(action.action)) {
+        if (action.value === undefined || action.value === null || String(action.value).trim() === '') {
+          logger.warn('[ACTION_GENERATOR] Action requires value but missing, dropping', {
+            action: action.action,
+            description: action.description,
+          });
+          continue;
+        }
+      }
+
+      // Validate selector format to catch AI mistakes early
       if (action.selector) {
         const { validateSelectorFormat } = require('./utils/selector-utils');
-        const validation = validateSelectorFormat(action.selector);
+        const originalSelector = String(action.selector);
+        let selectorToValidate = originalSelector;
 
-        if (!validation.isValid) {
-          logger.warn('[ACTION_GENERATOR] Invalid selector format from AI, attempting fix', {
-            selector: action.selector,
-            issue: validation.issue,
-            format: validation.format,
-          });
-
+        let validation = validateSelectorFormat(selectorToValidate);
+        if (!validation.isValid && validation.format === 'mixed') {
           // Try to extract Playwright part from mixed selector
-          if (validation.format === 'mixed') {
-            const playwrightMatch = action.selector.match(/(role|text|label)\s*=\s*(.+)$/);
-            if (playwrightMatch) {
-              action.selector = `${playwrightMatch[1]}=${playwrightMatch[2].trim()}`;
-              logger.info('[ACTION_GENERATOR] Extracted Playwright selector', {
-                original: action.selector,
-                extracted: action.selector,
-              });
-            }
+          const playwrightMatch = selectorToValidate.match(/(role|text|label)\s*=\s*(.+)$/);
+          if (playwrightMatch) {
+            selectorToValidate = `${playwrightMatch[1]}=${playwrightMatch[2].trim()}`;
+            validation = validateSelectorFormat(selectorToValidate);
+
+            logger.warn('[ACTION_GENERATOR] Mixed selector fixed by extracting Playwright part', {
+              original: originalSelector,
+              extracted: selectorToValidate,
+            });
           }
         }
+
+        if (!validation.isValid) {
+          logger.warn('[ACTION_GENERATOR] Invalid selector format, dropping action', {
+            action: action.action,
+            selector: originalSelector,
+            issue: validation.issue,
+            format: validation.format,
+            description: action.description,
+          });
+          continue;
+        }
+
+        // Persist any extracted/fixed selector
+        action.selector = selectorToValidate;
       }
 
       // Build sanitized action
@@ -956,139 +1114,55 @@ export class ContextualActionGenerator {
     return sanitized;
   }
 
-  /**
-   * Generate safe fallback actions when AI fails
-   */
-  private static generateFallbackActions(context: PageContext): DynamicAction[] {
-    const actions: DynamicAction[] = [];
-
-    // 1) Close modals if present (safest first step)
-    if (context.dom.modals && context.dom.modals.length > 0) {
-      context.dom.modals.forEach(modal => {
-        if (modal.closeSelector) {
-          actions.push({
-            action: 'click',
-            selector: modal.closeSelector,
-            description: `Close ${modal.type}`,
-            optional: true,
-            timeout: 3000,
-            retry: 1,
-          });
-        }
-      });
-    }
-
-    // 2) Heuristic actions based on DOM if page has interactive elements
-    // Even when AI planning fails, try a few obvious safe interactions.
-    if (actions.length === 0) {
-      const buttons = context.dom.buttons || [];
-      const inputs = context.dom.inputs || [];
-
-      // Click up to 3 top buttons
-      buttons.slice(0, 3).forEach(btn => {
-        if (!btn.selector) return;
-        actions.push({
-          action: 'click',
-          selector: btn.selector,
-          description: `Click button "${btn.text || 'button'}" (fallback)`,
-          optional: true,
-          timeout: 5000,
-          retry: 1,
-        });
-      });
-
-      // Fill the first input if available
-      if (inputs.length > 0 && inputs[0].selector) {
-        const input = inputs[0];
-        const label = input.name || input.placeholder || input.type || 'input';
-        const value = this.generateTestData(input.type || 'text', label);
-
-        actions.push({
-          action: 'fill',
-          selector: input.selector,
-          value,
-          description: `Fill "${label}" with test data (fallback)`,
-          optional: true,
-          timeout: 5000,
-          retry: 1,
-        });
-      }
-    }
-
-    // 3) If вообще ничего нет – хотя бы подождать
-    if (actions.length === 0) {
-      actions.push({
-        action: 'wait',
-        description: 'Wait for page to stabilize',
-        timeout: 2000,
-        optional: false,
-        retry: 1,
-      });
-    }
-
-    return actions;
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // REALISTIC TEST DATA GENERATION
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Generate realistic test data for forms
-   */
-  static generateTestData(fieldType: string, fieldName: string): string {
-    const timestamp = Date.now();
-
-    switch (fieldType.toLowerCase()) {
-      case 'email':
-        return `test.user.${timestamp}@testmail.com`;
-
-      case 'password':
-        return 'TestPassword123!';
-
-      case 'text':
-        if (fieldName.toLowerCase().includes('name')) {
-          return 'John Doe';
-        }
-        if (fieldName.toLowerCase().includes('phone')) {
-          return '+1234567890';
-        }
-        if (fieldName.toLowerCase().includes('address')) {
-          return '123 Test Street';
-        }
-        if (fieldName.toLowerCase().includes('city')) {
-          return 'New York';
-        }
-        if (fieldName.toLowerCase().includes('zip')) {
-          return '10001';
-        }
-        return 'Test Value';
-
-      case 'number':
-        return '1';
-
-      case 'tel':
-      case 'phone':
-        return '+1234567890';
-
-      case 'url':
-        return 'https://example.com';
-
-      case 'date':
-        return new Date().toISOString().split('T')[0];
-
-      default:
-        return 'Test Input';
-    }
-  }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // HELPER METHODS - JSON PARSING, PII MASKING, VALIDATION
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * ✅ FIX 1: Robust JSON parsing with fallback extraction
-   * Handles cases where LLM returns text + JSON or invalid JSON
+   * Finds a balanced JSON object or array in a string by tracking bracket depth
+   *
+   * Handles nested structures correctly by counting opening and closing brackets.
+   * Returns the substring from the first opening bracket to the matching closing bracket.
+   *
+   * @param str - String to search in
+   * @param startChar - Starting character: '{' for objects or '[' for arrays
+   * @returns Extracted JSON string or null if not found
+   */
+  private static findBalancedJSON(str: string, startChar: '{' | '['): string | null {
+    const endChar = startChar === '{' ? '}' : ']';
+    let depth = 0;
+    let startIdx = str.indexOf(startChar);
+    if (startIdx === -1) return null;
+
+    for (let i = startIdx; i < str.length; i++) {
+      if (str[i] === startChar) depth++;
+      if (str[i] === endChar) {
+        depth--;
+        if (depth === 0) {
+          return str.substring(startIdx, i + 1);
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Parses JSON from LLM response with multiple fallback strategies
+   *
+   * Handles cases where LLM returns:
+   * - Pure JSON
+   * - JSON wrapped in markdown code blocks
+   * - Text with JSON embedded
+   * - JSON with trailing commas or comments
+   *
+   * Tries direct parse first, then extracts from markdown blocks, then searches
+   * for JSON in content. Cleans up common issues before parsing.
+   *
+   * @param content - Raw LLM response content
+   * @param schema - Zod schema for validation after parsing
+   * @returns Parsed and validated JSON object
+   * @throws Error if all parsing attempts fail
    */
   private static parseRobustJSON<T>(content: string, schema: z.ZodSchema<T>): T {
     // Try direct parse first
@@ -1102,26 +1176,49 @@ export class ContextualActionGenerator {
       });
     }
 
-    // Try to extract JSON from markdown code blocks or text
-    const jsonBlockMatch = content.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
-    if (jsonBlockMatch) {
-      try {
-        const parsed = JSON.parse(jsonBlockMatch[1]);
-        const validated = schema.parse(parsed);
-        logger.info('[ACTION_GENERATOR] Successfully extracted JSON from markdown block');
-        return validated;
-      } catch (blockError) {
-        logger.warn('[ACTION_GENERATOR] Markdown block extraction failed', {
-          error: blockError instanceof Error ? blockError.message : String(blockError),
-        });
+    // Try to extract JSON from markdown code blocks (both object and array)
+    const markdownBlockMatch = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (markdownBlockMatch) {
+      const blockContent = markdownBlockMatch[1].trim();
+      const jsonObject = this.findBalancedJSON(blockContent, '{');
+      const jsonArray = this.findBalancedJSON(blockContent, '[');
+      const jsonInBlock = jsonObject || jsonArray;
+
+      if (jsonInBlock) {
+        try {
+          // Try to fix common issues: trailing commas, comments
+          let cleaned = jsonInBlock
+            .replace(/,\s*([}\]])/g, '$1') // Remove trailing commas
+            .replace(/\/\*[\s\S]*?\*\//g, '') // Remove block comments
+            .replace(/\/\/.*$/gm, ''); // Remove line comments
+
+          const parsed = JSON.parse(cleaned);
+          const validated = schema.parse(parsed);
+          logger.info('[ACTION_GENERATOR] Successfully extracted JSON from markdown block');
+          return validated;
+        } catch (blockError) {
+          logger.warn('[ACTION_GENERATOR] Markdown block extraction failed', {
+            error: blockError instanceof Error ? blockError.message : String(blockError),
+          });
+        }
       }
     }
 
-    // Try to find first { ... } in content
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    // Try to find first { ... } or [ ... ] in content
+    // Use balanced bracket matching for nested structures
+    const jsonObject = this.findBalancedJSON(content, '{');
+    const jsonArray = this.findBalancedJSON(content, '[');
+    const jsonMatch = jsonObject || jsonArray;
+
     if (jsonMatch) {
       try {
-        const parsed = JSON.parse(jsonMatch[0]);
+        // Try to fix common issues
+        let cleaned = jsonMatch
+          .replace(/,\s*([}\]])/g, '$1') // Remove trailing commas
+          .replace(/\/\*[\s\S]*?\*\//g, '') // Remove block comments
+          .replace(/\/\/.*$/gm, ''); // Remove line comments
+
+        const parsed = JSON.parse(cleaned);
         const validated = schema.parse(parsed);
         logger.info('[ACTION_GENERATOR] Successfully extracted JSON from content');
         return validated;
@@ -1137,7 +1234,20 @@ export class ContextualActionGenerator {
   }
 
   /**
-   * ✅ FIX 5: Mask PII (emails, phone numbers, tokens) before sending to LLM
+   * Masks personally identifiable information (PII) in HTML before sending to LLM
+   *
+   * Replaces sensitive data with placeholders to protect user privacy:
+   * - Email addresses → [EMAIL]
+   * - Phone numbers → [PHONE]
+   * - API keys (sk_, pk_, api_, etc.) → [API_KEY]
+   * - JWT tokens → [JWT]
+   * - Long tokens (>40 chars) → [TOKEN]
+   * - Credit card numbers → [CARD]
+   * - IP addresses → [IP]
+   * - Social Security Numbers → [SSN]
+   *
+   * @param html - HTML string to sanitize
+   * @returns HTML string with PII masked
    */
   private static maskPII(html: string): string {
     if (!html) return '';
@@ -1147,14 +1257,28 @@ export class ContextualActionGenerator {
     // Mask emails: test@example.com → [EMAIL]
     masked = masked.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[EMAIL]');
 
-    // Mask phone numbers: +1234567890, (123) 456-7890, etc.
-    masked = masked.replace(/[\+]?[(]?[0-9]{1,4}[)]?[-\s\.]?[(]?[0-9]{1,4}[)]?[-\s\.]?[0-9]{1,9}/g, '[PHONE]');
+    // Mask phone numbers: more precise pattern to avoid false positives
+    // Matches: +1234567890, (123) 456-7890, 123-456-7890, etc.
+    masked = masked.replace(/(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, '[PHONE]');
 
-    // Mask tokens/keys (long alphanumeric strings > 20 chars)
-    masked = masked.replace(/[a-zA-Z0-9_-]{32,}/g, '[TOKEN]');
+    // Mask API keys (common patterns: sk_, pk_, api_)
+    masked = masked.replace(/\b(sk|pk|api|key|token|secret)_[a-zA-Z0-9]{20,}\b/gi, '[API_KEY]');
+
+    // Mask JWT tokens (header.payload.signature)
+    masked = masked.replace(/\beyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b/g, '[JWT]');
+
+    // Mask tokens/keys (long alphanumeric strings > 40 chars)
+    // Higher threshold to avoid false positives on normal IDs/classes
+    masked = masked.replace(/\b[a-zA-Z0-9_-]{40,}\b/g, '[TOKEN]');
 
     // Mask credit card numbers (basic pattern)
     masked = masked.replace(/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g, '[CARD]');
+
+    // Mask IP addresses (IPv4)
+    masked = masked.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[IP]');
+
+    // Mask SSN (US Social Security Numbers: XXX-XX-XXXX)
+    masked = masked.replace(/\b\d{3}-\d{2}-\d{4}\b/g, '[SSN]');
 
     return masked;
   }

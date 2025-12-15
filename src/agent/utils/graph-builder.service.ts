@@ -209,9 +209,10 @@ export class GraphBuilder {
         isRepeated,
         warning: isRepeated ? 'Action repeated - possible cycle' : undefined,
 
-        // ✅ NEW: Rich metadata for modal display (without screenshots in real-time)
-        // Screenshots are excluded from real-time updates to reduce payload size
-        // They will be uploaded after test completion and replaced with public URLs
+        // ✅ NEW: Rich metadata for modal display
+        // Screenshots can be base64 initially; later replaced with public URLs.
+        screenshotBefore: result?.screenshotBefore,
+        screenshotAfter: result?.screenshotAfter,
         domSnapshot: result?.domSnapshot,
         consoleLogs: result?.consoleLogs,
         networkRequests: result?.networkRequests,
@@ -250,6 +251,31 @@ export class GraphBuilder {
       type: 'incremental',
       newNode: node,
       newEdge: edge,
+    };
+  }
+
+  /**
+   * Update an existing node's meta and return incremental update.
+   * Used for late-arriving data (e.g. screenshot URLs uploaded asynchronously).
+   */
+  updateNodeMeta(
+    nodeId: string,
+    metaPatch: Partial<NonNullable<GraphNode['meta']>>
+  ): GraphUpdate | null {
+    const node = this.nodes.find((n) => n.id === nodeId);
+    if (!node) {
+      logger.warn('[GRAPH_BUILDER] updateNodeMeta: node not found', { nodeId });
+      return null;
+    }
+
+    node.meta = {
+      ...(node.meta ?? {}),
+      ...metaPatch,
+    };
+
+    return {
+      type: 'incremental',
+      updatedNode: node,
     };
   }
 

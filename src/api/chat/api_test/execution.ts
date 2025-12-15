@@ -92,6 +92,33 @@ export async function executeApiTestFlow(
     emitProcessingStep(chatSessionId, 'executing_test', '💳 Checking credits...', 10);
     checkTimeout();
 
+    // ✅ CRITICAL: Check if user sent new message (cancel running tests first)
+    // This prevents creating new test if user already sent another message
+    if (chatSessionId) {
+      try {
+        const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
+        const cancelResult = await ManualTestService.cancelAllRunningTestsForChatSession(
+          chatSessionId,
+          userId
+        );
+        if (cancelResult.cancelledCount > 0) {
+          logger.info('[API_TEST] Cancelled running tests before executing new test', {
+            chatSessionId,
+            userId,
+            cancelledCount: cancelResult.cancelledCount,
+            planId,
+          });
+        }
+      } catch (cancelError) {
+        // Don't fail if cancellation fails, but log it
+        logger.warn('[API_TEST] Failed to cancel running tests before executing new test', {
+          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+          chatSessionId,
+          userId,
+        });
+      }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // CREDITS DEDUCTION: Spisываются ДО выполнения теста
     // ═══════════════════════════════════════════════════════════════════════

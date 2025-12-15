@@ -326,39 +326,122 @@ export class AdaptiveConfigService {
     isComplexPage: boolean;
     hasManySelectors: boolean;
   } {
+    // Safety check: ensure state has required arrays
+    if (!state || !state.completedActions || !state.visitedPages) {
+      return {
+        isSlowPage: false,
+        hasHeavyJS: false,
+        networkSpeed: 'medium',
+        errorRate: 0,
+        isComplexPage: false,
+        hasManySelectors: false,
+      };
+    }
+
     // Calculate error rate
     const totalActions = state.completedActions.length;
     const failedActions = state.completedActions.filter(a => !a.success).length;
     const errorRate = totalActions > 0 ? failedActions / totalActions : 0;
 
     // Detect slow page (based on timestamps if available)
-    const isSlowPage = state.completedActions.length > 2
-      ? (state.completedActions[state.completedActions.length - 1].timestamp -
-         state.completedActions[0].timestamp) / state.completedActions.length > 2000
-      : false;
+    // Need at least 2 actions to calculate average time per action
+    let isSlowPage = false;
+    if (state.completedActions.length >= 2) {
+      const firstAction = state.completedActions[0];
+      const lastAction = state.completedActions[state.completedActions.length - 1];
+
+      // Validate actions exist and timestamps are valid numbers in chronological order
+      if (firstAction && lastAction &&
+          typeof firstAction.timestamp === 'number' &&
+          typeof lastAction.timestamp === 'number' &&
+          isFinite(firstAction.timestamp) &&
+          isFinite(lastAction.timestamp) &&
+          firstAction.timestamp > 0 &&
+          lastAction.timestamp > 0 &&
+          lastAction.timestamp >= firstAction.timestamp) {
+        const totalTime = lastAction.timestamp - firstAction.timestamp;
+        const avgTimePerAction = totalTime / state.completedActions.length;
+        // Validate result is a valid number
+        if (isFinite(avgTimePerAction) && avgTimePerAction > 0) {
+          isSlowPage = avgTimePerAction > 2000; // More than 2 seconds per action
+        }
+      }
+    }
 
     // Detect heavy JS (based on page type and errors)
-    const hasHeavyJS = pageType === 'dashboard' || pageType === 'product' || errorRate > 0.3;
+    // Expanded list of page types that typically have heavy JS
+    const heavyJSPageTypes: PageType[] = ['dashboard', 'product', 'search_results', 'payment'];
+    const hasHeavyJS = (pageType && heavyJSPageTypes.includes(pageType)) || errorRate > 0.3;
 
     // Estimate network speed (based on navigation frequency)
     const navigationActions = state.completedActions.filter(a => a.urlChanged);
     let networkSpeed: 'fast' | 'medium' | 'slow' = 'medium';
-    if (navigationActions.length > 0) {
-      // Estimate based on time between navigations
-      const timeBetweenNavs = navigationActions.length > 1
-        ? (navigationActions[navigationActions.length - 1].timestamp -
-           navigationActions[0].timestamp) / (navigationActions.length - 1)
-        : 0;
-      if (timeBetweenNavs < 2000) {
-        networkSpeed = 'fast';
-      } else if (timeBetweenNavs > 5000) {
-        networkSpeed = 'slow';
+
+    // Need at least 2 navigations to estimate speed reliably
+    if (navigationActions.length >= 2) {
+      const firstNav = navigationActions[0];
+      const lastNav = navigationActions[navigationActions.length - 1];
+
+      // Validate actions exist and timestamps are valid numbers
+      if (firstNav && lastNav &&
+          typeof firstNav.timestamp === 'number' &&
+          typeof lastNav.timestamp === 'number' &&
+          isFinite(firstNav.timestamp) &&
+          isFinite(lastNav.timestamp) &&
+          firstNav.timestamp > 0 &&
+          lastNav.timestamp > 0 &&
+          lastNav.timestamp >= firstNav.timestamp) {
+        const timeBetweenNavs = (lastNav.timestamp - firstNav.timestamp) / (navigationActions.length - 1);
+
+        // Validate result is a valid number
+        if (isFinite(timeBetweenNavs) && timeBetweenNavs > 0) {
+          if (timeBetweenNavs < 2000) {
+            networkSpeed = 'fast';
+          } else if (timeBetweenNavs > 5000) {
+            networkSpeed = 'slow';
+          }
+          // else stays 'medium' (2000-5000ms)
+        }
+      }
+    } else if (navigationActions.length === 1) {
+      // Single navigation: can't estimate speed, but if it took long, might be slow
+      const navAction = navigationActions[0];
+
+      // Validate action exists
+      if (navAction) {
+        // If this is not the first action, compare with previous action
+        const navIndex = state.completedActions.indexOf(navAction);
+        if (navIndex > 0 && navIndex < state.completedActions.length) {
+          const prevAction = state.completedActions[navIndex - 1];
+
+          // Validate previous action exists and timestamps are valid numbers
+          if (prevAction &&
+              typeof prevAction.timestamp === 'number' &&
+              typeof navAction.timestamp === 'number' &&
+              isFinite(prevAction.timestamp) &&
+              isFinite(navAction.timestamp) &&
+              prevAction.timestamp > 0 &&
+              navAction.timestamp > 0 &&
+              navAction.timestamp >= prevAction.timestamp) {
+            const navDuration = navAction.timestamp - prevAction.timestamp;
+
+            // Validate result is a valid number
+            if (isFinite(navDuration) && navDuration > 0) {
+              if (navDuration > 5000) {
+                networkSpeed = 'slow';
+              } else if (navDuration < 2000) {
+                networkSpeed = 'fast';
+              }
+            }
+          }
+        }
       }
     }
 
     // Detect complex page (based on page type and visited pages count)
-    const isComplexPage = pageType === 'checkout' ||
-                         pageType === 'dashboard' ||
+    // Expanded list of complex page types
+    const complexPageTypes: PageType[] = ['checkout', 'dashboard', 'payment', 'search_results'];
+    const isComplexPage = (pageType && complexPageTypes.includes(pageType)) ||
                          state.visitedPages.length > 5; // Many pages = complex flow
 
     // Detect many selectors (based on actions count - more actions = more selectors)

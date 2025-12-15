@@ -1,5 +1,6 @@
 import { logger } from '@/utils/logger';
 import { Request, Response } from 'express';
+import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 
 // Shared modules
 import { CONSTANTS, MESSAGES } from './shared/constants';
@@ -7,6 +8,12 @@ import { parseIntent } from './shared/intent-parsing';
 import { routeToHandler } from './shared/routing';
 import { checkPendingApproval } from './shared/test-plan-approval';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
+import {
+  registerActiveRequest,
+  unregisterActiveRequest,
+  checkRequestAborted,
+  hasActiveRequest,
+} from './shared/request-cancellation';
 
 // History handlers
 import { debugChatData, getChatHistory, getChatSessions, getCurrentChatHistory } from './history';
@@ -32,6 +39,10 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
   };
 
+  let chatSessionId: string | undefined;
+  let userId: string | undefined;
+  let abortController: AbortController | undefined;
+
   try {
     // Check connection before processing
     checkConnection();
@@ -44,7 +55,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       return; // Response already sent in validateInput
     }
 
-    const { userId, message, context, sessionId, conversationId, answers } = inputResult;
+    userId = inputResult.userId;
+    const { message, context, sessionId, conversationId, answers } = inputResult;
     checkRequestTimeout(); // Check timeout after validation
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -56,7 +68,38 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 2: CHAT SESSION MANAGEMENT (FIX #4)
     // ═══════════════════════════════════════════════════════════════════════
-    const chatSessionId = await manageChatSession(userId, sessionId, workspace_id, checkRequestTimeout);
+    chatSessionId = await manageChatSession(userId, sessionId, workspace_id, checkRequestTimeout);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 2.2: PREVENT UNEXPECTED CONCURRENT REQUESTS
+    // ═══════════════════════════════════════════════════════════════════════
+    // Frontend should not send a new message while previous request is processing.
+    // If it happens anyway (retries/double submit), return 409 and do NOT cancel anything automatically.
+    if (hasActiveRequest(chatSessionId, userId)) {
+      if (!res.headersSent) {
+        res.status(409).json({
+          success: false,
+          error: 'Request already in progress',
+          message: 'A request is already being processed. Please cancel it or wait until it finishes.',
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+      }
+      return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 2.3: REGISTER REQUEST FOR CANCELLATION
+    // ═══════════════════════════════════════════════════════════════════════
+    // Register this request so it can be cancelled via /cancel endpoint
+    abortController = registerActiveRequest(chatSessionId, userId, message);
+    const abortSignal = abortController.signal;
+
+    // Check if already aborted (shouldn't happen, but safety check)
+    checkRequestAborted(abortSignal);
+
+    // Check if request was cancelled
+    checkRequestAborted(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 3: CHECK FOR PENDING TEST PLAN APPROVAL (MUST BE FIRST!)
@@ -70,11 +113,16 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       chatSessionId,
       workspace_id,
       checkRequestTimeout,
+      abortSignal, // Pass abort signal for cancellation checks
     });
 
     if (approvalHandled) {
+      unregisterActiveRequest(chatSessionId, userId);
       return; // Approval was handled, response already sent
     }
+
+    // Check if request was cancelled
+    checkRequestAborted(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 4: PARSE INTENT (Only if not responding to test plan) (FIX #5)
@@ -85,13 +133,17 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       chatSessionId,
       userId,
       workspace_id,
-      checkRequestTimeout
+      checkRequestTimeout,
+      abortSignal // Pass abort signal for cancellation checks
     );
+
+    // Check if request was cancelled
+    checkRequestAborted(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
     // ═══════════════════════════════════════════════════════════════════════
-    return await routeToHandler(req, res, {
+    await routeToHandler(req, res, {
       message,
       parsedIntent,
       userId,
@@ -100,9 +152,41 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       conversationId,
       answers,
       context,
+      abortSignal, // Pass abort signal for cancellation checks
     });
 
+    // Unregister request on successful completion
+    unregisterActiveRequest(chatSessionId, userId);
+
   } catch (error) {
+    // Unregister request on error
+    if (chatSessionId && userId) {
+      unregisterActiveRequest(chatSessionId, userId);
+    }
+
+    // Check if request was cancelled
+    if (error instanceof Error && (
+      error.message.includes('Request was cancelled') ||
+      error.message.includes('cancelled by user') ||
+      abortController?.signal.aborted
+    )) {
+      logger.info('[CHAT] Request was cancelled by user', {
+        chatSessionId,
+        userId: userId?.substring(0, 8) + '...',
+        duration: Date.now() - requestStartTime,
+      });
+      // Don't send response if cancelled
+      if (!res.headersSent) {
+        res.status(499).json({
+          success: false,
+          error: 'Request cancelled',
+          message: 'The request was cancelled by user',
+          timestamp: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+
     // Check if client connection was closed
     if (error instanceof Error && (
       error.message.includes('Client connection closed') ||

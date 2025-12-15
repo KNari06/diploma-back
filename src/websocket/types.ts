@@ -14,6 +14,9 @@ export interface ClientToServerEvents {
   'subscribe:chat': (data: { sessionId: string }) => void;
   'unsubscribe:chat': (data: { sessionId: string }) => void;
 
+  // Clarification
+  'test:clarification:response': (data: { testId: string; questionId: string; answer: string }) => void;
+
   // Heartbeat
   ping: () => void;
 }
@@ -37,6 +40,7 @@ export interface ServerToClientEvents {
   'test:completed': (data: TestCompletedPayload) => void;
   'test:failed': (data: TestFailedPayload) => void;
   'test:cancelled': (data: TestCancelledPayload) => void;
+  'test:clarification:request': (data: TestClarificationRequestPayload) => void; // ✅ NEW: Request user input during test
 
   // Result events
   'result:ready': (data: ResultReadyPayload) => void;
@@ -229,6 +233,25 @@ export interface TestFailedPayload {
 export interface TestCancelledPayload {
   testId: string;
   reason?: string;
+  timestamp: string;
+}
+
+// Clarification Events
+export interface TestClarificationRequestPayload {
+  testId: string;
+  questionId: string;
+  question: string;
+  type: 'url' | 'credentials' | 'test_data' | 'payment_approval';
+  required: boolean;
+  options?: string[];
+  timeout?: number;
+  timestamp: string;
+}
+
+export interface TestClarificationResponsePayload {
+  testId: string;
+  questionId: string;
+  answer: string;
   timestamp: string;
 }
 

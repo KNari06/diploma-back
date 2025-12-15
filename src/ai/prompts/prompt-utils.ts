@@ -239,7 +239,7 @@ export function redactVisionPII(visionContext: {
 export function buildRetryPrompt(originalPrompt: string, errorMessage: string): string {
   return `${originalPrompt}
 
-⚠️ IMPORTANT: Your previous response was invalid JSON.
+IMPORTANT: Your previous response was invalid JSON.
 Error: ${errorMessage}
 
 Please return ONLY valid JSON now. Do not add any extra text, explanations, or markdown formatting.

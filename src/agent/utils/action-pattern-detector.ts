@@ -7,7 +7,7 @@
  */
 
 import { logger } from '@/utils/logger';
-import { ActionResult, DynamicAction, TestState } from '../types/intelligent-testing.types';
+import { ActionResult, TestState } from '../types/intelligent-testing.types';
 
 export interface ActionPattern {
   type: 'repeated_action' | 'failed_chain' | 'stuck' | 'timeout_chain';
@@ -79,6 +79,7 @@ export class ActionPatternDetector {
   /**
    * Detect if same action is being repeated
    * Example: Click same button 3+ times in a row
+   * ✅ IMPROVED: Context-aware - ignores normal patterns (form validation, multi-step forms)
    */
   private static detectRepeatedActions(state: TestState): ActionPattern | null {
     const recentActions = state.completedActions.slice(-5); // Last 5 actions
@@ -111,6 +112,18 @@ export class ActionPatternDetector {
 
     if (maxConsecutive >= 3) {
       const [actionType, selector] = repeatedSignature.split('::');
+
+      // ✅ IMPROVED: Context-aware filtering - ignore normal patterns
+      const isNormalPattern = this.isNormalRepeatedPattern(recentActions, actionType, selector);
+      if (isNormalPattern) {
+        logger.debug('[ACTION_PATTERN_DETECTOR] Ignoring normal repeated pattern', {
+          actionType,
+          selector,
+          reason: isNormalPattern,
+        });
+        return null; // Not a problem - normal user behavior
+      }
+
       return {
         type: 'repeated_action',
         severity: maxConsecutive >= 4 ? 'critical' : 'high',
@@ -123,6 +136,58 @@ export class ActionPatternDetector {
     }
 
     return null;
+  }
+
+  /**
+   * ✅ NEW: Check if repeated action is a normal pattern (not a problem)
+   * Examples: Form validation retries, multi-step form navigation, etc.
+   */
+  private static isNormalRepeatedPattern(
+    recentActions: ActionResult[],
+    actionType: string,
+    selector: string
+  ): string | null {
+    // Pattern 1: Form validation - filling same field after validation errors is normal
+    if (actionType === 'fill' || actionType === 'type') {
+      // Check if previous action failed with validation error
+      const previousAction = recentActions[recentActions.length - 2];
+      if (previousAction && !previousAction.success) {
+        const errorMsg = (previousAction.error || '').toLowerCase();
+        if (errorMsg.includes('validation') || errorMsg.includes('required') ||
+            errorMsg.includes('invalid') || errorMsg.includes('error')) {
+          return 'form_validation_retry';
+        }
+      }
+    }
+
+    // Pattern 2: Multi-step form navigation - clicking "Next" multiple times is normal
+    if (actionType === 'click') {
+      const actionDesc = (recentActions[recentActions.length - 1]?.action.description || '').toLowerCase();
+      if (actionDesc.includes('next') || actionDesc.includes('continue') ||
+          actionDesc.includes('submit') || actionDesc.includes('proceed')) {
+        // Check if we're on a form page (likely multi-step)
+        const hasFormContext = recentActions.some(a =>
+          a.action.description?.toLowerCase().includes('form') ||
+          a.action.description?.toLowerCase().includes('step')
+        );
+        if (hasFormContext) {
+          return 'multi_step_form_navigation';
+        }
+      }
+    }
+
+    // Pattern 3: Retry after temporary failure (network, timeout) - normal
+    const lastAction = recentActions[recentActions.length - 1];
+    const secondLastAction = recentActions[recentActions.length - 2];
+    if (secondLastAction && !secondLastAction.success && lastAction?.success) {
+      const errorMsg = (secondLastAction.error || '').toLowerCase();
+      if (errorMsg.includes('timeout') || errorMsg.includes('network') ||
+          errorMsg.includes('connection') || errorMsg.includes('retry')) {
+        return 'retry_after_temporary_failure';
+      }
+    }
+
+    return null; // Not a normal pattern - might be a problem
   }
 
   /**
@@ -164,6 +229,7 @@ export class ActionPatternDetector {
   /**
    * Detect stuck state (no URL changes)
    * Example: 5+ actions without URL change
+   * ✅ IMPROVED: Context-aware - ignores SPA patterns (modals, tabs, dropdowns)
    */
   private static detectStuckState(state: TestState): ActionPattern | null {
     const recentActions = state.completedActions.slice(-8); // Last 8 actions
@@ -180,6 +246,16 @@ export class ActionPatternDetector {
     const uniqueUrls = new Set(urls);
 
     if (stuckCount >= 5 && uniqueUrls.size === 1) {
+      // ✅ IMPROVED: Check if this is a normal SPA pattern (not stuck)
+      const isSPAPattern = this.isNormalSPAPattern(recentActions);
+      if (isSPAPattern) {
+        logger.debug('[ACTION_PATTERN_DETECTOR] Ignoring SPA pattern (no URL change)', {
+          reason: isSPAPattern,
+          stuckCount,
+        });
+        return null; // Not stuck - normal SPA behavior
+      }
+
       // Check if any actions succeeded
       const hasSuccesses = recentActions.some(a => a.success);
 
@@ -203,6 +279,65 @@ export class ActionPatternDetector {
     }
 
     return null;
+  }
+
+  /**
+   * ✅ NEW: Check if actions without URL change are normal SPA patterns
+   * Examples: Opening modals, switching tabs, interacting with dropdowns
+   */
+  private static isNormalSPAPattern(recentActions: ActionResult[]): string | null {
+    // Pattern 1: Modal interactions - opening/closing modals doesn't change URL
+    const hasModalActions = recentActions.some(a => {
+      const desc = (a.action.description || '').toLowerCase();
+      return desc.includes('modal') || desc.includes('dialog') || desc.includes('popup') ||
+             desc.includes('close') || desc.includes('dismiss');
+    });
+    if (hasModalActions) {
+      return 'modal_interactions';
+    }
+
+    // Pattern 2: Tab/accordion interactions - switching tabs doesn't change URL
+    const hasTabActions = recentActions.some(a => {
+      const desc = (a.action.description || '').toLowerCase();
+      return desc.includes('tab') || desc.includes('accordion') || desc.includes('panel') ||
+             desc.includes('switch') || desc.includes('toggle');
+    });
+    if (hasTabActions) {
+      return 'tab_accordion_interactions';
+    }
+
+    // Pattern 3: Dropdown/select interactions - opening dropdowns doesn't change URL
+    const hasDropdownActions = recentActions.some(a => {
+      const desc = (a.action.description || '').toLowerCase();
+      return (desc.includes('dropdown') || desc.includes('select') || desc.includes('menu')) &&
+             a.action.action === 'click'; // Clicking dropdowns, not selecting options
+    });
+    if (hasDropdownActions) {
+      return 'dropdown_interactions';
+    }
+
+    // Pattern 4: Form interactions on same page - filling forms doesn't change URL until submit
+    const hasFormFills = recentActions.filter(a =>
+      a.action.action === 'fill' || a.action.action === 'type'
+    ).length;
+    const hasFormSubmit = recentActions.some(a => {
+      const desc = (a.action.description || '').toLowerCase();
+      return desc.includes('submit') && a.action.action === 'click';
+    });
+    if (hasFormFills >= 2 && !hasFormSubmit) {
+      return 'form_filling_in_progress';
+    }
+
+    // Pattern 5: Successful actions with different selectors - user is exploring page
+    const successfulActions = recentActions.filter(a => a.success);
+    if (successfulActions.length >= 3) {
+      const uniqueSelectors = new Set(successfulActions.map(a => a.action.selector).filter(Boolean));
+      if (uniqueSelectors.size >= 3) {
+        return 'exploring_page_elements';
+      }
+    }
+
+    return null; // Not a normal SPA pattern - might be stuck
   }
 
   /**

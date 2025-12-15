@@ -20,6 +20,7 @@ export async function checkPendingApproval(params: {
   chatSessionId?: string;
   workspace_id: string;
   checkRequestTimeout: () => void;
+  abortSignal?: AbortSignal;
 }): Promise<boolean> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: CHECK FOR PENDING TEST PLAN APPROVAL (MUST BE FIRST!)
@@ -33,6 +34,7 @@ export async function checkPendingApproval(params: {
     userId: params.userId,
     chatSessionId: params.chatSessionId,
     workspace_id: params.workspace_id,
+    abortSignal: params.abortSignal,
   });
 
   // If approval was handled (approved/rejected/clarification), return early
@@ -61,6 +63,7 @@ export async function handlePendingTestPlanApproval(params: {
   userId: string;
   chatSessionId?: string;
   workspace_id: string;
+  abortSignal?: AbortSignal;
 }): Promise<boolean> {
   const { req, res, message, conversationId, userId, chatSessionId, workspace_id } = params;
 
@@ -238,6 +241,12 @@ export async function handlePendingTestPlanApproval(params: {
     return true;
   }
 
+  // Check if request was cancelled
+  if (params.abortSignal) {
+    const { checkRequestAborted } = await import('./request-cancellation');
+    checkRequestAborted(params.abortSignal);
+  }
+
   // User is responding to test plan - process approval/rejection
   logger.info('🔍 [CHAT] Found pending test plan, checking for approval/rejection', {
     planId: pendingPlan.id,
@@ -247,6 +256,12 @@ export async function handlePendingTestPlanApproval(params: {
   });
 
   const approvalResult = await detectUserApproval(message);
+
+  // Check if request was cancelled after AI call
+  if (params.abortSignal) {
+    const { checkRequestAborted } = await import('./request-cancellation');
+    checkRequestAborted(params.abortSignal);
+  }
 
   logger.info('[CHAT] Test plan response detected', {
     planId: pendingPlan.id,

@@ -257,6 +257,41 @@ export class SupabaseService {
     return data as any;
   }
 
+  /**
+   * Update test only if it is not cancelled.
+   * This helps avoid races where a cancelled test is overwritten back to running.
+   */
+  async updateTestIfNotCancelled(id: string, updates: any) {
+    // Validate inputs
+    if (!id || typeof id !== 'string') {
+      throw new Error('Invalid test id: must be a non-empty string');
+    }
+    if (!updates || typeof updates !== 'object') {
+      throw new Error('Invalid updates: must be an object');
+    }
+
+    logger.info('[DB] Updating test (if not cancelled)', { testId: id });
+
+    const { data, error } = await (this.client as any)
+      .from('tests')
+      .update(updates)
+      .eq('id', id)
+      .neq('status', 'cancelled')
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      logger.error('[DB] Failed to update test (if not cancelled)', {
+        testId: id,
+        error: error.message,
+        code: error.code,
+      });
+      throw error;
+    }
+
+    return data as any; // Can be null if test is cancelled or not found
+  }
+
   async getTestsByProject(projectId: string, limit = 50, offset = 0) {
     // Validate inputs
     if (!projectId || typeof projectId !== 'string') {

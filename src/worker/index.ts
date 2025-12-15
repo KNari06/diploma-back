@@ -6,7 +6,7 @@ import { logger } from '@/utils/logger';
 import { Worker } from 'bullmq';
 
 // Validate worker configuration
-const validateWorkerConfig = (): void => {
+const getValidatedConcurrency = (): number => {
   if (!connection || typeof connection !== 'object') {
     throw new Error('Invalid Redis connection configuration');
   }
@@ -16,21 +16,23 @@ const validateWorkerConfig = (): void => {
       provided: env.QUEUE_CONCURRENCY,
       default: 5,
     });
-    env.QUEUE_CONCURRENCY = 5;
+    return 5;
   }
+
+  return Math.floor(env.QUEUE_CONCURRENCY);
 };
 
-validateWorkerConfig();
+const queueConcurrency = Math.max(1, Math.min(100, getValidatedConcurrency())); // Clamp between 1-100
 
 // Worker configuration
 const workerOptions = {
   connection,
-  concurrency: Math.max(1, Math.min(100, Math.floor(env.QUEUE_CONCURRENCY))), // Clamp between 1-100
+  concurrency: queueConcurrency,
   removeOnComplete: { count: 100 },
   removeOnFail: { count: 50 },
-  lockDuration: 300000, // 5 minutes - для долгих Playwright тестов
-  stalledInterval: 60000, // 1 minute - проверка stalled jobs
-  maxStalledCount: 2, // Максимум 2 stalled перед permanent fail
+  lockDuration: 300000, // 5 minutes - for long Playwright tests
+  stalledInterval: 60000, // 1 minute - stalled jobs check
+  maxStalledCount: 2, // Max 2 stalled before permanent fail
 };
 
 // Create workers for each queue
@@ -125,7 +127,7 @@ const aiAnalysisWorker = new Worker(
 
     logger.info(`[AI_ANALYSIS_WORKER] Processing job: ${job.id}`, {
       testId: job.data?.testId,
-      resultId: job.data?.resultId,
+      testResultId: job.data?.testResultId ?? job.data?.resultId,
     });
 
     if (!AIAnalysisJobHandler || typeof AIAnalysisJobHandler.process !== 'function') {
@@ -195,6 +197,10 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
   });
 
   worker.on('completed', (job) => {
+    if (!job || !job.id) {
+      logger.warn(`[${workerName}] Received invalid job in 'completed' event`);
+      return;
+    }
     logger.info(`✅ ${workerName} worker completed job: ${job.id}`);
   });
 
@@ -302,30 +308,11 @@ const gracefulShutdown = async (signal: string) => {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  logger.error('[WORKER] 🚨 Uncaught exception:', {
-    error: error.message,
-    stack: error.stack,
-    name: error.name,
-  });
-  // Don't exit immediately - let workers continue and retry
-  // Graceful shutdown will handle cleanup on SIGTERM/SIGINT
-});
-
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('[WORKER] 🚨 Unhandled rejection:', {
-    reason: reason instanceof Error ? reason.message : String(reason),
-    stack: reason instanceof Error ? reason.stack : undefined,
-    promise: promise,
-  });
-  // Don't exit immediately - let workers continue and retry
-  // Graceful shutdown will handle cleanup on SIGTERM/SIGINT
-});
+// Note: process-level handlers are registered in `src/utils/logger.ts`.
+// Duplicating them here can cause double-logging and, in worst cases, JSON serialization crashes.
 
 logger.info('🚀 QAIT Worker started');
-logger.info(`📊 Concurrency: ${env.QUEUE_CONCURRENCY}`);
+logger.info(`📊 Concurrency: ${queueConcurrency}`);
 logger.info(`🔧 Environment: ${env.NODE_ENV}`);
 logger.info(`🔌 Redis: ${env.REDIS_HOST}:${env.REDIS_PORT}`);
 logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`);
@@ -356,6 +343,9 @@ logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`
 })();
 
 export {
-    aiAnalysisWorker,
-    notificationWorker, testResultWorker, testRunWorker, webhookWorker
+  aiAnalysisWorker,
+  notificationWorker,
+  testResultWorker,
+  testRunWorker,
+  webhookWorker
 };

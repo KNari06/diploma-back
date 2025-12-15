@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { logger } from '@/utils/logger';
 import { ChatService } from '@/services/utils/chat.service';
+import { checkRequestAborted } from './request-cancellation';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -17,9 +18,12 @@ export async function handleClarificationRequest(
     parsedIntent: any;
     userId: string;
     chatSessionId?: string;
+    abortSignal?: AbortSignal;
   }
 ): Promise<void> {
-  const { parsedIntent, userId, chatSessionId } = params;
+  const { parsedIntent, userId, chatSessionId, abortSignal } = params;
+
+  if (abortSignal) checkRequestAborted(abortSignal);
 
   logger.info('[CLARIFICATION] Requesting clarification from user', {
     confidence: parsedIntent.confidence,
@@ -46,6 +50,8 @@ export async function handleClarificationRequest(
       },
     ]);
   }
+
+  if (abortSignal) checkRequestAborted(abortSignal);
 
   // Send clarification question to user
   res.json({

@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 2000" style="background: white; font-family: Arial, sans-serif;">
+  <!-- Title -->
+  <text x="700" y="30" text-anchor="middle" font-size="24" font-weight="bold">Action Flow - Процесс выполнения действий</text>
+
+  <!-- Start -->
+  <rect x="600" y="60" width="200" height="40" rx="20" fill="#4CAF50" stroke="#2E7D32" stroke-width="2"/>
+  <text x="700" y="85" text-anchor="middle" fill="white" font-size="14" font-weight="bold">Начало теста</text>
+
+  <!-- Analyze Page -->
+  <rect x="600" y="130" width="200" height="50" rx="5" fill="#2196F3" stroke="#1565C0" stroke-width="2"/>
+  <text x="700" y="150" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Анализ страницы</text>
+  <text x="700" y="170" text-anchor="middle" fill="white" font-size="10">IntelligentPageAnalyzer</text>
+
+  <!-- Generate Actions -->
+  <rect x="600" y="210" width="200" height="50" rx="5" fill="#FF9800" stroke="#E65100" stroke-width="2"/>
+  <text x="700" y="230" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Генерация действий</text>
+  <text x="700" y="250" text-anchor="middle" fill="white" font-size="10">ContextualActionGenerator</text>
+
+  <!-- Build Prompt -->
+  <rect x="550" y="290" width="150" height="40" rx="5" fill="#9C27B0" stroke="#6A1B9A" stroke-width="2"/>
+  <text x="625" y="310" text-anchor="middle" fill="white" font-size="11">Построение промпта</text>
+
+  <!-- Call AI -->
+  <rect x="550" y="350" width="150" height="40" rx="5" fill="#9C27B0" stroke="#6A1B9A" stroke-width="2"/>
+  <text x="625" y="370" text-anchor="middle" fill="white" font-size="11">Вызов AI</text>
+
+  <!-- Validate & Sanitize -->
+  <rect x="550" y="410" width="150" height="40" rx="5" fill="#9C27B0" stroke="#6A1B9A" stroke-width="2"/>
+  <text x="625" y="430" text-anchor="middle" fill="white" font-size="11">Валидация</text>
+
+  <!-- Filter Safe -->
+  <rect x="700" y="290" width="150" height="40" rx="5" fill="#9C27B0" stroke="#6A1B9A" stroke-width="2"/>
+  <text x="775" y="310" text-anchor="middle" fill="white" font-size="11">Фильтрация</text>
+
+  <!-- Has Actions Decision -->
+  <polygon points="700,480 750,520 700,560 650,520" fill="#FFC107" stroke="#F57C00" stroke-width="2"/>
+  <text x="700" y="525" text-anchor="middle" fill="black" font-size="11" font-weight="bold">Есть действия?</text>
+
+  <!-- Execute Loop -->
+  <rect x="600" y="580" width="200" height="50" rx="5" fill="#F44336" stroke="#C62828" stroke-width="2"/>
+  <text x="700" y="600" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Цикл выполнения</text>
+  <text x="700" y="620" text-anchor="middle" fill="white" font-size="10">Для каждого action</text>
+
+  <!-- Pre-Action Analysis -->
+  <rect x="500" y="660" width="180" height="50" rx="5" fill="#00BCD4" stroke="#00838F" stroke-width="2"/>
+  <text x="590" y="680" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Pre-Action Analysis</text>
+  <text x="590" y="700" text-anchor="middle" fill="white" font-size="9">PreActionAnalyzer</text>
+
+  <!-- Prerequisite Actions -->
+  <rect x="500" y="730" width="180" height="40" rx="5" fill="#00BCD4" stroke="#00838F" stroke-width="2"/>
+  <text x="590" y="755" text-anchor="middle" fill="white" font-size="10">Prerequisite Actions</text>
+
+  <!-- Validate Selector -->
+  <rect x="720" y="660" width="180" height="50" rx="5" fill="#00BCD4" stroke="#00838F" stroke-width="2"/>
+  <text x="810" y="680" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Валидация селектора</text>
+  <text x="810" y="700" text-anchor="middle" fill="white" font-size="9">getLocator, count</text>
+
+  <!-- Self-Healing -->
+  <rect x="720" y="730" width="180" height="40" rx="5" fill="#00BCD4" stroke="#00838F" stroke-width="2"/>
+  <text x="810" y="755" text-anchor="middle" fill="white" font-size="10">Self-Healing</text>
+
+  <!-- Execute Command -->
+  <rect x="600" y="800" width="200" height="50" rx="5" fill="#4CAF50" stroke="#2E7D32" stroke-width="2"/>
+  <text x="700" y="820" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Выполнить команду</text>
+  <text x="700" y="840" text-anchor="middle" fill="white" font-size="10">CommandExecutor</text>
+
+  <!-- Wait Stabilization -->
+  <rect x="600" y="880" width="200" height="40" rx="5" fill="#FF9800" stroke="#E65100" stroke-width="2"/>
+  <text x="700" y="905" text-anchor="middle" fill="white" font-size="11">Ждать стабилизации</text>
+
+  <!-- Validate Result -->
+  <rect x="600" y="950" width="200" height="50" rx="5" fill="#9C27B0" stroke="#6A1B9A" stroke-width="2"/>
+  <text x="700" y="970" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Валидация результата</text>
+  <text x="700" y="990" text-anchor="middle" fill="white" font-size="10">ResultValidator</text>
+
+  <!-- Post-Action Analysis -->
+  <rect x="600" y="1030" width="200" height="50" rx="5" fill="#00BCD4" stroke="#00838F" stroke-width="2"/>
+  <text x="700" y="1050" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Post-Action Analysis</text>
+  <text x="700" y="1070" text-anchor="middle" fill="white" font-size="10">PostActionAnalyzer</text>
+
+  <!-- Record Result -->
+  <rect x="600" y="1110" width="200" height="40" rx="5" fill="#607D8B" stroke="#37474F" stroke-width="2"/>
+  <text x="700" y="1135" text-anchor="middle" fill="white" font-size="11">Записать результат</text>
+
+  <!-- More Actions Decision -->
+  <polygon points="700,1180 750,1220 700,1260 650,1220" fill="#FFC107" stroke="#F57C00" stroke-width="2"/>
+  <text x="700" y="1225" text-anchor="middle" fill="black" font-size="11" font-weight="bold">Еще actions?</text>
+
+  <!-- Decide Next Step -->
+  <rect x="600" y="1290" width="200" height="50" rx="5" fill="#795548" stroke="#5D4037" stroke-width="2"/>
+  <text x="700" y="1310" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Решить следующий шаг</text>
+  <text x="700" y="1330" text-anchor="middle" fill="white" font-size="10">decideNextStep</text>
+
+  <!-- Decision -->
+  <polygon points="700,1370 750,1410 700,1450 650,1410" fill="#FFC107" stroke="#F57C00" stroke-width="2"/>
+  <text x="700" y="1415" text-anchor="middle" fill="black" font-size="11" font-weight="bold">Решение</text>
+
+  <!-- Continue -->
+  <rect x="450" y="1490" width="120" height="40" rx="5" fill="#4CAF50" stroke="#2E7D32" stroke-width="2"/>
+  <text x="510" y="1515" text-anchor="middle" fill="white" font-size="11">continue</text>
+
+  <!-- Stop -->
+  <rect x="630" y="1490" width="120" height="40" rx="5" fill="#F44336" stroke="#C62828" stroke-width="2"/>
+  <text x="690" y="1515" text-anchor="middle" fill="white" font-size="11">stop</text>
+
+  <!-- Wait User -->
+  <rect x="810" y="1490" width="120" height="40" rx="5" fill="#FF9800" stroke="#E65100" stroke-width="2"/>
+  <text x="870" y="1515" text-anchor="middle" fill="white" font-size="11">wait_for_user</text>
+
+  <!-- End -->
+  <rect x="600" y="1570" width="200" height="40" rx="20" fill="#F44336" stroke="#C62828" stroke-width="2"/>
+  <text x="700" y="1595" text-anchor="middle" fill="white" font-size="14" font-weight="bold">Конец теста</text>
+
+  <!-- Arrows -->
+  <line x1="700" y1="100" x2="700" y2="130" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="180" x2="700" y2="210" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="260" x2="625" y2="290" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="625" y1="330" x2="625" y2="350" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="625" y1="390" x2="625" y2="410" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="260" x2="775" y2="290" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="625" y1="450" x2="700" y2="480" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="775" y1="330" x2="700" y2="480" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="520" x2="700" y2="580" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="630" x2="590" y2="660" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="630" x2="810" y2="660" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="590" y1="710" x2="590" y2="730" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="590" y1="770" x2="700" y2="800" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="810" y1="710" x2="810" y2="730" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="810" y1="770" x2="700" y2="800" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="850" x2="700" y2="880" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="920" x2="700" y2="950" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="1000" x2="700" y2="1030" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="1080" x2="700" y2="1110" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="1150" x2="700" y2="1180" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="1220" x2="700" y2="1180" stroke="#333" stroke-width="1" stroke-dasharray="5,5"/>
+  <line x1="650" y1="1220" x2="600" y2="1180" stroke="#333" stroke-width="1" stroke-dasharray="5,5"/>
+  <line x1="700" y1="1260" x2="700" y2="1290" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="1340" x2="700" y2="1370" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="650" y1="1410" x2="510" y2="1490" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="1450" x2="690" y2="1490" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="750" y1="1410" x2="870" y2="1490" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="510" y1="1530" x2="700" y2="180" stroke="#333" stroke-width="1" stroke-dasharray="5,5"/>
+  <line x1="690" y1="1530" x2="700" y2="1570" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="870" y1="1530" x2="700" y2="1570" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- Arrow marker definition -->
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#333"/>
+    </marker>
+  </defs>
+
+  <!-- Legend -->
+  <rect x="50" y="1650" width="300" height="300" rx="5" fill="#F5F5F5" stroke="#333" stroke-width="1"/>
+  <text x="200" y="1680" text-anchor="middle" font-size="16" font-weight="bold">Легенда</text>
+
+  <rect x="70" y="1700" width="30" height="20" fill="#4CAF50"/>
+  <text x="110" y="1715" font-size="12">Успешное выполнение</text>
+
+  <rect x="70" y="1730" width="30" height="20" fill="#2196F3"/>
+  <text x="110" y="1745" font-size="12">Анализ</text>
+
+  <rect x="70" y="1760" width="30" height="20" fill="#FF9800"/>
+  <text x="110" y="1775" font-size="12">Генерация/Ожидание</text>
+
+  <rect x="70" y="1790" width="30" height="20" fill="#F44336"/>
+  <text x="110" y="1805" font-size="12">Выполнение/Остановка</text>
+
+  <rect x="70" y="1820" width="30" height="20" fill="#9C27B0"/>
+  <text x="110" y="1835" font-size="12">Валидация</text>
+
+  <rect x="70" y="1850" width="30" height="20" fill="#00BCD4"/>
+  <text x="110" y="1865" font-size="12">Pre/Post Analysis</text>
+
+  <polygon points="70,1880 85,1895 70,1910 55,1895" fill="#FFC107"/>
+  <text x="110" y="1900" font-size="12">Решение/Условие</text>
+
+  <line x1="70" y1="1930" x2="100" y2="1930" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <text x="110" y="1935" font-size="12">Основной поток</text>
+
+  <line x1="70" y1="1960" x2="100" y2="1960" stroke="#333" stroke-width="1" stroke-dasharray="5,5"/>
+  <text x="110" y="1965" font-size="12">Обратный поток (цикл)</text>
+</svg>

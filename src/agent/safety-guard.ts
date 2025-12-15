@@ -57,13 +57,22 @@ export class SafetyGuard {
    * Uses hostname matching (exact or subdomain), not substring matching.
    */
   private static isAllowedDomain(targetUrl: string, allowedDomains: string[]): boolean {
+    // Validate inputs
+    if (!targetUrl || typeof targetUrl !== 'string' || !targetUrl.trim()) {
+      return false;
+    }
+    if (!Array.isArray(allowedDomains) || allowedDomains.length === 0) {
+      return false;
+    }
+
     try {
       const urlObj = new URL(targetUrl);
       let host = urlObj.hostname.toLowerCase();
       if (host.startsWith('www.')) host = host.slice(4);
 
       return allowedDomains.some((d) => {
-        let domain = String(d || '').toLowerCase().trim();
+        if (!d || typeof d !== 'string') return false;
+        let domain = d.toLowerCase().trim();
         if (!domain) return false;
         if (domain.startsWith('www.')) domain = domain.slice(4);
         // exact match or subdomain match
@@ -87,6 +96,20 @@ export class SafetyGuard {
     context: PageContext,
     config: SafetyConfig = DEFAULT_SAFETY_CONFIG
   ): SafetyCheckResult {
+    // Validate inputs
+    if (!action || !context || !config) {
+      logger.warn('[SAFETY_GUARD] Invalid inputs provided to checkAction', {
+        hasAction: !!action,
+        hasContext: !!context,
+        hasConfig: !!config,
+      });
+      return {
+        safe: false,
+        reason: 'Invalid safety check inputs',
+        suggestedAction: 'Skip this action',
+      };
+    }
+
     logger.debug('[SAFETY_GUARD] Checking action', {
       action: action.action,
       description: action.description,
@@ -135,23 +158,43 @@ export class SafetyGuard {
     state: TestState,
     config: SafetyConfig = DEFAULT_SAFETY_CONFIG
   ): SafetyCheckResult {
+    // Validate inputs
+    if (!state || !config) {
+      logger.warn('[SAFETY_GUARD] Invalid inputs provided to checkLimits', {
+        hasState: !!state,
+        hasConfig: !!config,
+      });
+      return {
+        safe: false,
+        reason: 'Invalid safety check inputs',
+        suggestedAction: 'Stop testing',
+      };
+    }
+
+    // Validate state properties
+    const pagesAnalyzed = typeof state.pagesAnalyzed === 'number' && isFinite(state.pagesAnalyzed) ? state.pagesAnalyzed : 0;
+    const startTime = typeof state.startTime === 'number' && isFinite(state.startTime) && state.startTime > 0 ? state.startTime : Date.now();
+    const estimatedCost = typeof state.estimatedCost === 'number' && isFinite(state.estimatedCost) && state.estimatedCost >= 0 ? state.estimatedCost : 0;
+    const errors = Array.isArray(state.errors) ? state.errors : [];
+    const completedActions = Array.isArray(state.completedActions) ? state.completedActions : [];
+
     // Check page limit
-    if (state.pagesAnalyzed >= config.maxPages) {
+    if (pagesAnalyzed >= config.maxPages) {
       logger.warn('[SAFETY_GUARD] Page limit exceeded', {
-        analyzed: state.pagesAnalyzed,
+        analyzed: pagesAnalyzed,
         limit: config.maxPages,
       });
 
       return {
         safe: false,
-        reason: `Page limit exceeded (${state.pagesAnalyzed}/${config.maxPages})`,
+        reason: `Page limit exceeded (${pagesAnalyzed}/${config.maxPages})`,
         suggestedAction: 'Stop testing and report results',
       };
     }
 
     // Check duration limit
-    const elapsed = Date.now() - state.startTime;
-    if (elapsed >= config.maxDuration) {
+    const elapsed = Date.now() - startTime;
+    if (elapsed >= config.maxDuration && elapsed > 0) {
       logger.warn('[SAFETY_GUARD] Duration limit exceeded', {
         elapsed: `${Math.round(elapsed / 1000)}s`,
         limit: `${Math.round(config.maxDuration / 1000)}s`,
@@ -165,25 +208,26 @@ export class SafetyGuard {
     }
 
     // Check cost limit
-    if (state.estimatedCost >= config.maxCost) {
+    if (estimatedCost >= config.maxCost) {
       logger.warn('[SAFETY_GUARD] Cost limit exceeded', {
-        cost: `$${state.estimatedCost.toFixed(3)}`,
+        cost: `$${estimatedCost.toFixed(3)}`,
         limit: `$${config.maxCost}`,
       });
 
       return {
         safe: false,
-        reason: `Cost limit exceeded ($${state.estimatedCost.toFixed(3)})`,
+        reason: `Cost limit exceeded ($${estimatedCost.toFixed(3)})`,
         suggestedAction: 'Stop testing to avoid additional costs',
       };
     }
 
     // Check error rate
-    const errorRate = state.errors.length / Math.max(state.completedActions.length, 1);
-    if (errorRate > 0.5 && state.completedActions.length > 5) {
+    const totalActions = completedActions.length;
+    const errorRate = totalActions > 0 ? errors.length / totalActions : 0;
+    if (isFinite(errorRate) && errorRate > 0.5 && totalActions > 5) {
       logger.warn('[SAFETY_GUARD] High error rate', {
-        errors: state.errors.length,
-        actions: state.completedActions.length,
+        errors: errors.length,
+        actions: totalActions,
         rate: `${Math.round(errorRate * 100)}%`,
       });
 
@@ -211,9 +255,26 @@ export class SafetyGuard {
     action: DynamicAction,
     config: SafetyConfig
   ): SafetyCheckResult {
-    const textToCheck = `${action.description} ${action.selector || ''} ${action.value || ''}`.toLowerCase();
+    // Validate inputs
+    if (!action || !config) {
+      return { safe: true }; // Fail-safe: allow if can't check
+    }
 
-    for (const forbidden of config.forbiddenActions) {
+    const description = action.description || '';
+    const selector = action.selector || '';
+    const value = action.value || '';
+    const textToCheck = `${description} ${selector} ${value}`.toLowerCase();
+
+    // Validate forbiddenActions array
+    const forbiddenActions = Array.isArray(config.forbiddenActions) ? config.forbiddenActions : [];
+    if (forbiddenActions.length === 0) {
+      return { safe: true };
+    }
+
+    for (const forbidden of forbiddenActions) {
+      if (!forbidden || typeof forbidden !== 'string') {
+        continue; // Skip invalid entries
+      }
       if (textToCheck.includes(forbidden.toLowerCase())) {
         logger.warn('[SAFETY_GUARD] Dangerous keyword detected', {
           keyword: forbidden,
@@ -240,6 +301,11 @@ export class SafetyGuard {
     action: DynamicAction,
     config: SafetyConfig
   ): SafetyCheckResult {
+    // Validate inputs
+    if (!context || !action) {
+      return { safe: true }; // Fail-safe: allow if can't check
+    }
+
     // Check page type
     if (context.pageType === 'payment' || context.pageType === 'checkout') {
       logger.warn('[SAFETY_GUARD] Payment page detected', {
@@ -261,9 +327,10 @@ export class SafetyGuard {
     }
 
     // Check warnings
-    if (context.warnings.some(w => w.toLowerCase().includes('payment'))) {
+    const warnings = Array.isArray(context.warnings) ? context.warnings : [];
+    if (warnings.some(w => w && typeof w === 'string' && w.toLowerCase().includes('payment'))) {
       logger.warn('[SAFETY_GUARD] Payment warning in context', {
-        warnings: context.warnings,
+        warnings: warnings,
       });
 
       return {
@@ -281,8 +348,14 @@ export class SafetyGuard {
    * Check for CAPTCHA
    */
   private static checkCaptcha(context: PageContext): SafetyCheckResult {
-    const captchaWarnings = context.warnings.filter(w =>
-      w.toLowerCase().includes('captcha')
+    // Validate inputs
+    if (!context) {
+      return { safe: true }; // Fail-safe: allow if can't check
+    }
+
+    const warnings = Array.isArray(context.warnings) ? context.warnings : [];
+    const captchaWarnings = warnings.filter(w =>
+      w && typeof w === 'string' && w.toLowerCase().includes('captcha')
     );
 
     if (captchaWarnings.length > 0) {
@@ -309,10 +382,22 @@ export class SafetyGuard {
     context: PageContext,
     config: SafetyConfig
   ): SafetyCheckResult {
-    // Check current URL
-    const currentUrl = context.url.toLowerCase();
+    // Validate inputs
+    if (!action || !context || !config) {
+      return { safe: true }; // Fail-safe: allow if can't check
+    }
 
-    for (const forbidden of config.forbiddenUrls) {
+    // Check current URL
+    const currentUrl = (context.url || '').toLowerCase();
+    if (!currentUrl) {
+      return { safe: true }; // Can't check empty URL
+    }
+
+    const forbiddenUrls = Array.isArray(config.forbiddenUrls) ? config.forbiddenUrls : [];
+    for (const forbidden of forbiddenUrls) {
+      if (!forbidden || typeof forbidden !== 'string') {
+        continue; // Skip invalid entries
+      }
       if (currentUrl.includes(forbidden.toLowerCase())) {
         logger.warn('[SAFETY_GUARD] Forbidden URL pattern', {
           url: context.url,
@@ -328,10 +413,13 @@ export class SafetyGuard {
     }
 
     // Check target URL (for goto actions)
-    if (action.action === 'goto' && action.url) {
+    if (action.action === 'goto' && action.url && typeof action.url === 'string' && action.url.trim()) {
       const targetUrl = action.url.toLowerCase();
 
-      for (const forbidden of config.forbiddenUrls) {
+      for (const forbidden of forbiddenUrls) {
+        if (!forbidden || typeof forbidden !== 'string') {
+          continue; // Skip invalid entries
+        }
         if (targetUrl.includes(forbidden.toLowerCase())) {
           logger.warn('[SAFETY_GUARD] Attempting to navigate to forbidden URL', {
             targetUrl: action.url,
@@ -347,8 +435,9 @@ export class SafetyGuard {
       }
 
       // Check domain if allowedDomains is set
-      if (config.allowedDomains.length > 0) {
-        const isAllowed = this.isAllowedDomain(action.url, config.allowedDomains);
+      const allowedDomains = Array.isArray(config.allowedDomains) ? config.allowedDomains : [];
+      if (allowedDomains.length > 0) {
+        const isAllowed = this.isAllowedDomain(action.url, allowedDomains);
 
         if (!isAllowed) {
           logger.warn('[SAFETY_GUARD] Domain not in allowed list', {
@@ -369,67 +458,4 @@ export class SafetyGuard {
     return { safe: true };
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // SAFETY LEVEL ADJUSTMENTS
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Get safety config based on level
-   */
-  static getConfigForLevel(level: 'strict' | 'normal' | 'loose'): SafetyConfig {
-    const baseConfig = { ...DEFAULT_SAFETY_CONFIG };
-
-    switch (level) {
-      case 'strict':
-        return {
-          ...baseConfig,
-          level: 'strict',
-          maxPages: 5,
-          maxDuration: 3 * 60 * 1000, // 3 minutes
-          maxCost: 0.2,
-          forbiddenActions: [
-            ...baseConfig.forbiddenActions,
-            'submit',
-            'send',
-            'post',
-            'create',
-            'add',
-          ],
-        };
-
-      case 'loose':
-        return {
-          ...baseConfig,
-          level: 'loose',
-          maxPages: 20,
-          maxDuration: 10 * 60 * 1000, // 10 minutes
-          maxCost: 1.0,
-          forbiddenActions: baseConfig.forbiddenActions.filter(
-            action => !['checkout', 'submit payment'].includes(action)
-          ),
-        };
-
-      case 'normal':
-      default:
-        return baseConfig;
-    }
-  }
-
-  /**
-   * Log safety violation
-   */
-  static logViolation(
-    check: SafetyCheckResult,
-    action?: DynamicAction,
-    context?: PageContext
-  ): void {
-    logger.warn('[SAFETY_GUARD] Safety violation detected', {
-      reason: check.reason,
-      requiresApproval: check.requiresApproval,
-      suggestedAction: check.suggestedAction,
-      action: action?.description,
-      pageType: context?.pageType,
-      url: context?.url,
-    });
-  }
 }

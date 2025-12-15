@@ -91,6 +91,10 @@ class WebSocketRedisSubscriber {
           wsService.emitTestCancelled(payload.testId, payload);
           break;
 
+        case 'test:clarification:request':
+          wsService.emitTestClarificationRequest(payload.testId, payload);
+          break;
+
         // Result events
         case 'result:ready':
           wsService.emitResultReady(payload.testId, payload);

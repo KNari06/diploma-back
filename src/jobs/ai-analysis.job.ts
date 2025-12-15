@@ -22,7 +22,12 @@ interface ProcessedBug extends BugSeverity {
 }
 
 interface AIAnalysisJobData {
-  testResultId: string;
+  testResultId?: string;
+  /**
+   * Backward-compatible alias.
+   * Some producers/loggers historically used `resultId`.
+   */
+  resultId?: string;
   testId: string;
 }
 
@@ -31,11 +36,12 @@ export class AIAnalysisJobHandler {
    * Process AI analysis job
    */
   static async process(job: Job<AIAnalysisJobData>) {
-    const { testResultId, testId } = job.data;
+    const testResultId = job.data?.testResultId ?? job.data?.resultId;
+    const testId = job.data?.testId;
 
     // Validate input parameters
     if (!testResultId || !testId) {
-      throw new Error('Missing required parameters: testResultId or testId');
+      throw new Error('Missing required parameters: testResultId/resultId or testId');
     }
 
     logger.info(`[AI-ANALYSIS] Processing analysis for test result: ${testResultId}`);
@@ -230,10 +236,30 @@ export class AIAnalysisJobHandler {
         .map((bug: any) => `- ${bug.message || bug.description || 'Unknown issue'}`)
         .join('\n');
 
+      // Resolve recipient email (tests.user_id is a UUID, not an email)
+      let recipient = 'admin@qai.so';
+      if (test.user_id) {
+        try {
+          const user: any = await dbAdminService.getUser(test.user_id);
+          if (user?.email && typeof user.email === 'string') {
+            recipient = user.email;
+          } else {
+            logger.warn(`[AI-ANALYSIS] User has no email, sending critical notification to default email: ${testId}`, {
+              userId: test.user_id,
+            });
+          }
+        } catch (userError) {
+          logger.warn(`[AI-ANALYSIS] Failed to resolve user email, sending critical notification to default email: ${testId}`, {
+            userId: test.user_id,
+            error: userError instanceof Error ? userError.message : String(userError),
+          });
+        }
+      }
+
       // Send critical issue notification
       await QueueManager.addNotificationJob({
         type: 'email',
-        recipient: test.user_id || 'admin@qai.so',
+        recipient,
         subject: `🚨 Critical Issues Found: ${testId}`,
         message: `Critical issues detected in test ${testId}:\n${issuesSummary}`,
         data: { testId, criticalBugs, aiSummary },

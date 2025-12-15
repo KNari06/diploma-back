@@ -11,6 +11,7 @@ import { isValidUUID } from '@/utils/validation';
 import { Request, Response } from 'express';
 import { CONSTANTS } from '../shared/constants';
 import { compressMessageContent, emitProcessingStep, checkChatCredits, deductChatCredits } from '../shared/utils';
+import { checkRequestAborted } from '../shared/request-cancellation';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -26,9 +27,12 @@ export async function handleGeneralChat(
     chatSessionId?: string;
     context?: any;
     userLanguage?: 'en' | 'ru' | 'neutral'; // Language from intent parser (avoid re-detection)
+    abortSignal?: AbortSignal;
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context, userLanguage: providedLanguage } = params;
+  const { message, userId, chatSessionId, context, userLanguage: providedLanguage, abortSignal } = params;
+
+  if (abortSignal) checkRequestAborted(abortSignal);
 
   logger.info('[GENERAL_CHAT] Handling general conversation', {
     hasSession: !!chatSessionId,
@@ -36,6 +40,8 @@ export async function handleGeneralChat(
   });
 
   emitProcessingStep(chatSessionId, 'generating_response', '💬 Thinking...', 90);
+
+  if (abortSignal) checkRequestAborted(abortSignal);
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 1: BUILD CONTEXT WITH HISTORY
@@ -47,6 +53,7 @@ export async function handleGeneralChat(
   if (chatSessionId) {
     // Get recent messages (last 20) - always needed for conversationHistory
     const recentMessages = await ChatService.getRecentMessages(chatSessionId, userId, CONSTANTS.RECENT_MESSAGES_LIMIT); // SECURITY: Pass userId for verification
+    if (abortSignal) checkRequestAborted(abortSignal);
 
     logger.info('[GENERAL_CHAT] Retrieved recent history', {
       messageCount: recentMessages.length
@@ -96,6 +103,7 @@ export async function handleGeneralChat(
               matchThreshold: 0.4, // Lowered from 0.5 for better recall on vague questions
             }
           );
+          if (abortSignal) checkRequestAborted(abortSignal);
 
           if (relevantOldMessages.length > 0) {
             // Format relevant messages as context
@@ -260,6 +268,8 @@ export async function handleGeneralChat(
     return; // Response already sent in checkChatCredits
   }
 
+  if (abortSignal) checkRequestAborted(abortSignal);
+
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: GET AI RESPONSE
   // ═══════════════════════════════════════════════════════════════════════
@@ -271,6 +281,7 @@ export async function handleGeneralChat(
     gptResponse = await getChatCompletionWithMessages(messages, {
       temperature: 0.3, // Lowered from 0.5 for more consistent responses
       max_tokens: 1000,
+      abortSignal,
     });
 
     // Mark that we should deduct credits (only if we got a real response, not fallback)
@@ -340,6 +351,8 @@ export async function handleGeneralChat(
   if (shouldDeductCredits && gptResponse && gptResponse.content) {
     await deductChatCredits(userId, shouldDeductCredits);
   }
+
+  if (abortSignal) checkRequestAborted(abortSignal);
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 4: SAVE MESSAGES

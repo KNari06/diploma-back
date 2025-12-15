@@ -527,6 +527,132 @@ router.post('/:id/cancel', requireAuth, asyncHandler(async (req: Request, res: R
 
 /**
  * @swagger
+ * /api/v1/manual-test/cancel-all:
+ *   post:
+ *     summary: Отменить все запущенные тесты пользователя
+ *     description: |
+ *       Отменяет все тесты пользователя со статусом 'pending' или 'running'.
+ *
+ *       **Действия:**
+ *       - Находит все запущенные тесты пользователя
+ *       - Отменяет каждый тест
+ *       - Возвращает количество отмененных тестов
+ *
+ *       **Ограничения:**
+ *       - Требуется авторизация
+ *       - Отменяются только тесты текущего пользователя
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Результат отмены всех тестов
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 cancelledCount:
+ *                   type: number
+ *                   example: 3
+ *                 errors:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                   example: []
+ *       500:
+ *         description: Ошибка при отмене тестов
+ */
+router.post('/cancel-all', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+
+  const result = await ManualTestService.cancelAllRunningTestsForUser(userId);
+
+  logger.info(`Cancelled ${result.cancelledCount} tests for user: ${userId}`);
+
+  res.status(200).json(result);
+}));
+
+/**
+ * @swagger
+ * /api/v1/manual-test/cancel-all-chat:
+ *   post:
+ *     summary: Отменить все запущенные тесты для чат-сессии
+ *     description: |
+ *       Отменяет все тесты, связанные с указанной чат-сессией, со статусом 'pending' или 'running'.
+ *
+ *       **Действия:**
+ *       - Находит все запущенные тесты для чат-сессии
+ *       - Отменяет каждый тест
+ *       - Возвращает количество отмененных тестов
+ *
+ *       **Ограничения:**
+ *       - Требуется авторизация
+ *       - Отменяются только тесты текущего пользователя
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - chatSessionId
+ *             properties:
+ *               chatSessionId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: ID чат-сессии
+ *     responses:
+ *       200:
+ *         description: Результат отмены всех тестов
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 cancelledCount:
+ *                   type: number
+ *                   example: 2
+ *                 errors:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                   example: []
+ *       400:
+ *         description: Не указан chatSessionId
+ *       500:
+ *         description: Ошибка при отмене тестов
+ */
+router.post('/cancel-all-chat', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+  const { chatSessionId } = req.body;
+
+  if (!chatSessionId) {
+    res.status(400).json({
+      success: false,
+      error: 'chatSessionId is required',
+    });
+    return;
+  }
+
+  const result = await ManualTestService.cancelAllRunningTestsForChatSession(chatSessionId, userId);
+
+  logger.info(`Cancelled ${result.cancelledCount} tests for chat session: ${chatSessionId}`);
+
+  res.status(200).json(result);
+}));
+
+/**
+ * @swagger
  * /api/v1/manual-test/{id}/retry:
  *   post:
  *     summary: Повторить тест

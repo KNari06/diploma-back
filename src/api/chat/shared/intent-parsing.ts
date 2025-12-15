@@ -6,6 +6,7 @@ import { convertRoleForOpenAI } from '@/utils/chat-helpers';
 import { IntentResult } from '@/types';
 import { CONSTANTS, FAST_PATH_COMMANDS, PROGRESS } from './constants';
 import { emitProcessingStep } from './utils';
+import { checkRequestAborted } from './request-cancellation';
 
 /**
  * Get chat history for intent parsing (extracted helper)
@@ -75,7 +76,8 @@ export async function parseIntent(
   chatSessionId: string | undefined,
   userId: string,
   workspace_id: string,
-  checkRequestTimeout: () => void
+  checkRequestTimeout: () => void,
+  abortSignal?: AbortSignal
 ): Promise<any> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 4: PARSE INTENT (Only if not responding to test plan) (FIX #5)
@@ -115,6 +117,11 @@ export async function parseIntent(
   }
 
   emitProcessingStep(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', PROGRESS.INTENT_PARSING);
+
+  // Check if request was cancelled
+  if (abortSignal) {
+    checkRequestAborted(abortSignal);
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // FAST PATH: Check for explicit API test keywords from frontend
@@ -218,9 +225,19 @@ export async function parseIntent(
 
   // Normal path: Use AI to parse intent (if fast path didn't set parsedIntent)
   if (!parsedIntent) {
+    // Check if request was cancelled
+    if (abortSignal) {
+      checkRequestAborted(abortSignal);
+    }
+
     // Normal path: Use AI to parse intent
     // Get chat history for context
     const chatHistory = await getChatHistoryForIntent(chatSessionId, userId); // SECURITY: Pass userId for verification
+
+    // Check if request was cancelled after async operation
+    if (abortSignal) {
+      checkRequestAborted(abortSignal);
+    }
 
     // ✅ FIX: Log if chat history is empty
     if (chatHistory.length === 0) {
@@ -238,6 +255,11 @@ export async function parseIntent(
         { chatHistory },
         workspace_id
       );
+
+      // Check if request was cancelled after AI call
+      if (abortSignal) {
+        checkRequestAborted(abortSignal);
+      }
 
       // ✅ FIX: Check if parseUserIntent returned null (doesn't throw error)
       if (!parsedIntent) {

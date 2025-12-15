@@ -43,6 +43,7 @@ export async function getChatCompletionWithMessages(
     max_tokens?: number;
     response_format?: { type: 'json_object' };
     model?: string; // Allow custom model (e.g., gpt-3.5-turbo)
+    abortSignal?: AbortSignal;
   }
 ): Promise<OpenAIResponse> {
   try {
@@ -53,13 +54,31 @@ export async function getChatCompletionWithMessages(
 
     const model = options?.model || env.OPENAI_MODEL || 'gpt-4o-mini';
 
-    const response = await openai.chat.completions.create({
+    if (options?.abortSignal?.aborted) {
+      throw new Error('Request was cancelled. Please try again.');
+    }
+
+    const abortPromise = options?.abortSignal
+      ? new Promise<never>((_, reject) => {
+          options.abortSignal!.addEventListener(
+            'abort',
+            () => reject(new Error('Request was cancelled. Please try again.')),
+            { once: true }
+          );
+        })
+      : null;
+
+    const requestPromise = openai.chat.completions.create({
       model,
       messages,
       max_tokens: options?.max_tokens || env.OPENAI_MAX_TOKENS || 1000,
       temperature: options?.temperature ?? 0.5,
       ...(options?.response_format && { response_format: options.response_format }),
     });
+
+    const response = abortPromise
+      ? await Promise.race([requestPromise, abortPromise])
+      : await requestPromise;
 
     // Validate response structure
     if (!response.choices || response.choices.length === 0) {

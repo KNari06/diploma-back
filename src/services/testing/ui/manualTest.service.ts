@@ -1,6 +1,12 @@
 // Main service file - exports all methods from modular files
 import { ApiResponse, BrowserType, PaginatedResponse, Test, TestResult, TestRunRequest } from '@/types';
-import { cancelTest } from './manual/test-cancellation';
+import {
+  cancelTest,
+  cancelAllRunningTestsForUser,
+  cancelAllRunningTestsForChatSession,
+  getRunningTestsForUser,
+  getRunningTestsForChatSession,
+} from './manual/test-cancellation';
 import { calculateRequiredCredits, checkUserCredits, deductCredits } from './manual/test-credits';
 import { getTest, getTestResults, getTestsByProject, getTestsByUser, getTestStats } from './manual/test-queries';
 import { processTestResult } from './manual/test-result-processor';
@@ -72,6 +78,45 @@ export class ManualTestService {
    */
   static async cancelTest(testId: string, userId?: string): Promise<ApiResponse<Test>> {
     return cancelTest(testId, userId);
+  }
+
+  /**
+   * Cancel all running tests for a user
+   */
+  static async cancelAllRunningTestsForUser(userId: string): Promise<{
+    success: boolean;
+    cancelledCount: number;
+    errors: string[];
+  }> {
+    return cancelAllRunningTestsForUser(userId);
+  }
+
+  /**
+   * Cancel all running tests for a chat session
+   */
+  static async cancelAllRunningTestsForChatSession(
+    chatSessionId: string,
+    userId?: string
+  ): Promise<{
+    success: boolean;
+    cancelledCount: number;
+    errors: string[];
+  }> {
+    return cancelAllRunningTestsForChatSession(chatSessionId, userId);
+  }
+
+  /**
+   * Get all running tests for a user
+   */
+  static async getRunningTestsForUser(userId: string): Promise<Test[]> {
+    return getRunningTestsForUser(userId);
+  }
+
+  /**
+   * Get all running tests for a chat session
+   */
+  static async getRunningTestsForChatSession(chatSessionId: string): Promise<Test[]> {
+    return getRunningTestsForChatSession(chatSessionId);
   }
 
   /**

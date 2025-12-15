@@ -77,7 +77,7 @@ export class ManualTestRunJobHandler {
     try {
       // Update test status to running
       logger.info(`[TEST-RUN] Updating test status to running: ${testId}`);
-      await this.updateTestStatus(testId, 'running', new Date().toISOString());
+      await this.updateTestStatus(testId, 'running', browser, new Date().toISOString());
 
       // Check again after status update (in case it was cancelled between checks)
       if (await this.checkTestCancelled(testId)) {
@@ -133,7 +133,7 @@ export class ManualTestRunJobHandler {
         });
 
         // Mark test as failed (final failure)
-        await this.updateTestStatus(testId, 'failed', undefined, new Date().toISOString());
+        await this.updateTestStatus(testId, 'failed', browser, undefined, new Date().toISOString());
 
         // Emit WebSocket events for failure
         this.emitTestFailed(testId, browser, new Error(result.error || 'Test execution failed'));
@@ -207,7 +207,7 @@ export class ManualTestRunJobHandler {
       }
 
       // Mark test as failed (final failure)
-      await this.updateTestStatus(testId, 'failed', undefined, new Date().toISOString());
+      await this.updateTestStatus(testId, 'failed', browser, undefined, new Date().toISOString());
 
       // Send failure notification
       await this.sendFailureNotification(testId, error);
@@ -222,12 +222,25 @@ export class ManualTestRunJobHandler {
   private static async updateTestStatus(
     testId: string,
     status: 'running' | 'completed' | 'failed',
+    browser: string,
     startedAt?: string,
     completedAt?: string
   ) {
     const updateData: any = { status };
     if (startedAt) updateData.started_at = startedAt;
     if (completedAt) updateData.completed_at = completedAt;
+
+    if (status === 'running') {
+      const updated = await dbAdminService.updateTestIfNotCancelled(testId, updateData);
+      if (!updated) {
+        // Most likely cancelled (or deleted). Re-check and stop gracefully.
+        if (await this.checkTestCancelled(testId)) {
+          throw new TestCancelledError(testId, browser);
+        }
+        throw new Error(`Failed to update test status to running: ${testId}`);
+      }
+      return;
+    }
 
     await dbAdminService.updateTest(testId, updateData);
   }
@@ -406,9 +419,25 @@ export class ManualTestRunJobHandler {
       const errorMessage = (error as Error).message || 'Unknown error occurred';
       logger.info(`[TEST-RUN] Sending failure notification for test: ${testId}`);
 
-      // ✅ FIX: Validate and log if user_id is missing
-      const recipient = test.user_id || DEFAULT_ADMIN_EMAIL;
-      if (!test.user_id) {
+      // Resolve recipient email (test.user_id is a UUID, not an email)
+      let recipient = DEFAULT_ADMIN_EMAIL;
+      if (test.user_id) {
+        try {
+          const user: any = await dbAdminService.getUser(test.user_id);
+          if (user?.email && typeof user.email === 'string') {
+            recipient = user.email;
+          } else {
+            logger.warn(`[TEST-RUN] User has no email, sending notification to default email: ${testId}`, {
+              userId: test.user_id,
+            });
+          }
+        } catch (userError) {
+          logger.warn(`[TEST-RUN] Failed to resolve user email, sending notification to default email: ${testId}`, {
+            userId: test.user_id,
+            error: userError instanceof Error ? userError.message : String(userError),
+          });
+        }
+      } else {
         logger.warn(`[TEST-RUN] Test has no user_id, sending notification to default email: ${testId}`);
       }
 
@@ -506,49 +535,59 @@ export class ManualTestResultJobHandler {
         return;
       }
 
+      // Never override cancelled tests
+      if (test.status === 'cancelled') {
+        logger.info(`[TEST-RESULT] Skipping status update for cancelled test: ${testId}`);
+        return;
+      }
+
       // Get all results for this test
       const results = await dbAdminService.getTestResults(testId) as any[];
 
-      // ✅ FIX: Filter out null/undefined results
-      const validResults = (results || []).filter((r: any) => r && r.status);
+      // Filter out null/undefined results
+      const validResults = (results || []).filter((r: any) => r && r.status && r.browser);
 
       if (validResults.length === 0) {
         logger.debug(`[TEST-RESULT] No valid results found for test: ${testId}`);
         return;
       }
 
-      // ✅ FIX: Get expected browsers count from test
-      const expectedBrowsers = test.browsers || [];
+      // Expected browsers from the test row
+      const expectedBrowsers: string[] = Array.isArray(test.browsers) ? test.browsers : [];
       const expectedBrowsersCount = expectedBrowsers.length;
 
-      // ✅ FIX: Check if we have results for all expected browsers
-      const hasAllResults = validResults.length >= expectedBrowsersCount;
+      // Use latest result per browser (results are ordered desc by created_at)
+      const latestByBrowser = new Map<string, any>();
+      for (const r of validResults) {
+        if (!latestByBrowser.has(r.browser)) {
+          latestByBrowser.set(r.browser, r);
+        }
+      }
 
-      // ✅ FIX: Filter out 'pending' and 'running' statuses when checking completion
-      // Only 'completed' and 'failed' are considered final states
-      const finalStatusResults = validResults.filter((r: any) =>
-        r.status === 'completed' || r.status === 'failed'
-      );
+      const hasAllResults =
+        expectedBrowsersCount > 0 &&
+        expectedBrowsers.every((b) => latestByBrowser.has(b));
+
+      const latestResults = Array.from(latestByBrowser.values());
+      const finalResults = latestResults.filter((r: any) => r.status === 'completed' || r.status === 'failed');
 
       // Determine overall test status
-      const hasFailed = validResults.some((r: any) => r.status === 'failed');
-      const allCompleted = hasAllResults &&
-        finalStatusResults.length === expectedBrowsersCount &&
-        validResults.every((r: any) => r.status === 'completed' || r.status === 'failed');
+      const hasFailed = finalResults.some((r: any) => r.status === 'failed');
+      const allCompleted = hasAllResults && finalResults.length === expectedBrowsersCount;
 
       let status: 'running' | 'completed' | 'failed' = 'running';
 
       if (allCompleted) {
         status = hasFailed ? 'failed' : 'completed';
-      } else if (hasAllResults && finalStatusResults.length < expectedBrowsersCount) {
+      } else if (hasAllResults && finalResults.length < expectedBrowsersCount) {
         // ✅ FIX: Some browsers are still running/pending
         status = 'running';
       }
 
       logger.info(`[TEST-RESULT] Updating overall test status: ${testId} -> ${status}`, {
         expectedBrowsers: expectedBrowsersCount,
-        actualResults: validResults.length,
-        finalStatusResults: finalStatusResults.length,
+        actualResults: latestResults.length,
+        finalStatusResults: finalResults.length,
         hasFailed,
         allCompleted,
       });

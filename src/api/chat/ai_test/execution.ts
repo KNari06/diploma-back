@@ -76,6 +76,33 @@ export async function executeUiTestFlow(
     emitProcessingStep(chatSessionId, 'executing_test', '💳 Checking credits...', 10);
     checkTimeout();
 
+    // ✅ CRITICAL: Check if user sent new message (cancel running tests first)
+    // This prevents creating new test if user already sent another message
+    if (chatSessionId) {
+      try {
+        const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
+        const cancelResult = await ManualTestService.cancelAllRunningTestsForChatSession(
+          chatSessionId,
+          userId
+        );
+        if (cancelResult.cancelledCount > 0) {
+          logger.info('[UI_TEST] Cancelled running tests before creating new test', {
+            chatSessionId,
+            userId,
+            cancelledCount: cancelResult.cancelledCount,
+            planId,
+          });
+        }
+      } catch (cancelError) {
+        // Don't fail if cancellation fails, but log it
+        logger.warn('[UI_TEST] Failed to cancel running tests before creating new test', {
+          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+          chatSessionId,
+          userId,
+        });
+      }
+    }
+
     // FIX #10: Deduct credits BEFORE test execution (not after)
     // ✅ UPDATED: All UI tests are intelligent mode (Standard mode removed)
     const uiTestType = 'intelligent';

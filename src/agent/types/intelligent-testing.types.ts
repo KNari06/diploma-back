@@ -37,6 +37,7 @@ export interface PageElement {
   text?: string;
   required?: boolean; // Is this element required for the goal?
   priority?: 'critical' | 'high' | 'medium' | 'low';
+  isCTA?: boolean; // Is this a Call-To-Action button (Skip, Next, Continue, Register, Login, etc.)
 }
 
 /**
@@ -121,6 +122,35 @@ export interface DOMAnalysis {
 }
 
 /**
+ * Error signals collected during page analysis
+ */
+export interface ErrorSignals {
+  consoleErrors: Array<{
+    message: string;
+    source?: string;
+    line?: number;
+    timestamp: number;
+  }>;
+  networkErrors: Array<{
+    url: string;
+    status?: number;
+    method: string;
+    error: string;
+    timestamp: number;
+  }>;
+  uiErrors: Array<{
+    text: string;
+    selector?: string;
+    timestamp: number;
+  }>;
+  accessibilityWarnings: Array<{
+    message: string;
+    selector?: string;
+    timestamp: number;
+  }>;
+}
+
+/**
  * Complete page context
  */
 export interface PageContext {
@@ -134,11 +164,34 @@ export interface PageContext {
   possibleActions: string[]; // All possible actions
   criticalElements: PageElement[];
   warnings: string[];
+  errorSignals?: ErrorSignals; // ✅ NEW: Error signals from ErrorCollectorService
+  skipHints?: string[]; // ✅ NEW: Hints about when/how to skip this page
+  navigationActions?: string[]; // ✅ NEW: Suggested navigation actions
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DYNAMIC ACTIONS
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Action metadata for AI analysis
+ */
+export interface ActionMetadata {
+  testGoal?: string;
+  pageType?: string;
+  pageUrl?: string;
+  previousActions?: string[];
+  priority?: 'critical' | 'high' | 'medium' | 'low';
+  blockingFactor?: string;
+}
+
+/**
+ * Action with priority for prerequisite execution
+ */
+export interface ActionWithPriority extends DynamicAction {
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  metadata?: ActionMetadata;
+}
 
 /**
  * Action generated dynamically based on context
@@ -181,6 +234,7 @@ export interface DynamicAction {
   timeout?: number;
   optional?: boolean; // Can skip if fails
   retry?: number; // Max retry attempts
+  metadata?: ActionMetadata; // Additional metadata for AI analysis
   // Extract config (for extract action)
   extract?: {
     name: string; // Variable name to store extracted value
