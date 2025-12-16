@@ -281,6 +281,40 @@
 
             <div class="section">
                 <h2 class="section-title">📊 Flow Diagram</h2>
+
+                <div class="overview" style="margin-bottom: 20px; padding: 20px;">
+                    <h3 style="margin-top: 0; color: #667eea;">🎨 Legend (Легенда)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e1f5ff; border: 2px solid #01579b;"></span>
+                            <div>
+                                <strong>🔵 Blue</strong> - Unchanged (Без изменений)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #fff4e1; border: 2px solid #e65100;"></span>
+                            <div>
+                                <strong>🟡 Orange</strong> - Refactored (Рефакторинг)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 2px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green</strong> - New (Новый метод)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #ffebee; border: 2px solid #c62828;"></span>
+                            <div>
+                                <strong>🔴 Red</strong> - Enhanced (Улучшен)
+                            </div>
+                        </div>
+                    </div>
+                    <p style="margin-top: 15px; font-size: 0.9em; color: #666;">
+                        <strong>Status meanings:</strong> Blue = No changes, Orange = Code refactored, Green = Newly added, Red = Enhanced/improved
+                    </p>
+                </div>
+
                 <div class="diagram-container">
                     <div class="mermaid">
 flowchart TD

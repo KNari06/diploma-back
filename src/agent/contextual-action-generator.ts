@@ -14,6 +14,7 @@ import { logger } from '@/utils/logger';
 import { OpenAI } from 'openai';
 import { Page } from 'playwright';
 import { z } from 'zod';
+import { StateTracker } from './state-tracker';
 import {
   DynamicAction,
   NextStepDecision,
@@ -54,9 +55,18 @@ const ActionGenerationResponseSchema = z.object({
 const NextStepResponseSchema = z.object({
   decision: z.enum(['continue', 'stop', 'wait_for_user', 'retry', 'skip']),
   reason: z.string(),
+  confidence: z.number().min(0).max(1).optional(),
   progress: z.number().min(0).max(100).optional(),
   goalAchieved: z.boolean().optional(),
-  nextTarget: z.string().nullable().optional(),
+  riskLevel: z.enum(['low', 'medium', 'high']).optional(),
+  blockingSignals: z.array(z.enum(['captcha', '2fa', 'auth_required', 'rate_limit', 'modal_overlay', 'validation_errors', 'broken_page', 'none'])).optional(),
+  retryStrategy: z.enum(['wait', 'reload', 'navigate_back', 'choose_alternative_target', 'reduce_scope']).nullable().optional(),
+  nextTarget: z.object({
+    type: z.enum(['page', 'element', 'flow']).optional(),
+    description: z.string().optional(),
+    successCriteria: z.string().optional(),
+    avoid: z.array(z.string()).optional(),
+  }).nullable().optional(),
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -617,10 +627,53 @@ export class ContextualActionGenerator {
       };
     }
 
+    // ✅ NEW: Check for cycles before AI call
+    const cycleDetection = StateTracker.detectCycle(state, context.url);
+    if (cycleDetection.cycleDetected) {
+      logger.warn('[ACTION_GENERATOR] Cycle detected, skipping to break loop', {
+        url: context.url,
+        visitCount: cycleDetection.visitCount,
+        suggestion: cycleDetection.suggestion,
+      });
+      return {
+        action: 'skip',
+        reason: cycleDetection.suggestion,
+        confidence: 1.0,
+      };
+    }
+
+    // ✅ NEW: Check timeout before proceeding
+    const elapsed = Date.now() - state.startTime;
+    if (elapsed >= state.maxDuration) {
+      logger.warn('[ACTION_GENERATOR] Max duration reached', {
+        elapsed: `${Math.round(elapsed / 1000)}s`,
+        maxDuration: `${Math.round(state.maxDuration / 1000)}s`,
+      });
+      return {
+        action: 'stop',
+        reason: 'Max duration reached',
+        confidence: 1.0,
+      };
+    }
+
+    // ✅ NEW: Check if all recent actions failed
+    const recentActions = state.completedActions.slice(-5);
+    const allRecentFailed = recentActions.length >= 3 &&
+                            recentActions.every(a => !a.success);
+    if (allRecentFailed) {
+      logger.warn('[ACTION_GENERATOR] All recent actions failed, trying different approach', {
+        failedCount: recentActions.length,
+      });
+      // Don't stop immediately, but let AI decide with this context
+    }
+
     try {
+      // ✅ IMPROVED: Limit errors and pages to prevent token overflow
+      const maxErrors = 10;
+      const maxPages = 20;
       const historySummary = this.buildHistorySummary(state);
-      const visitedPages = state.visitedPages.map(v => `${v.pageType} (${v.url})`);
-      const errors = state.errors.map(e => e.message);
+      const visitedPages = state.visitedPages.slice(-maxPages).map(v => `${v.pageType} (${v.url})`);
+      const errors = state.errors.slice(-maxErrors).map(e => e.message);
 
       const prompt = buildNextStepPrompt({
         goal: state.goal,
@@ -672,15 +725,72 @@ export class ContextualActionGenerator {
       // Parse JSON response with fallback extraction
       const parsed = this.parseRobustJSON(content, NextStepResponseSchema);
 
+      // ✅ NEW: Check if goal is achieved before processing decision
+      if (parsed.goalAchieved === true) {
+        logger.info('[ACTION_GENERATOR] Goal achieved, stopping test', {
+          confidence: parsed.confidence ?? 1.0,
+        });
+        return {
+          action: 'stop',
+          reason: 'Goal achieved',
+          confidence: parsed.confidence ?? 1.0,
+        };
+      }
+
+      // ✅ NEW: Handle blocking signals (captcha, 2fa, etc.)
+      const blockingSignals = parsed.blockingSignals || [];
+      if (blockingSignals.length > 0 &&
+          (blockingSignals.includes('captcha') ||
+           blockingSignals.includes('2fa') ||
+           blockingSignals.includes('auth_required'))) {
+        logger.warn('[ACTION_GENERATOR] Blocking signal detected', {
+          signals: blockingSignals,
+        });
+        return {
+          action: 'wait_for_user',
+          reason: `Blocked by: ${blockingSignals.join(', ')}`,
+          confidence: parsed.confidence ?? 0.9,
+        };
+      }
+
+      // ✅ NEW: Handle high risk level
+      if (parsed.riskLevel === 'high') {
+        logger.warn('[ACTION_GENERATOR] High risk detected', {
+          reason: parsed.reason,
+          riskLevel: parsed.riskLevel,
+        });
+        return {
+          action: 'wait_for_user',
+          reason: `High risk action: ${parsed.reason}`,
+          confidence: parsed.confidence ?? 0.9,
+        };
+      }
+
+      // ✅ IMPROVED: Use all fields from AI response
       const decision: NextStepDecision = {
         action: parsed.decision || 'stop',
         reason: parsed.reason || 'No reason provided',
-        confidence: 0.8,
+        confidence: parsed.confidence ?? 0.8, // ✅ Use AI confidence instead of hardcoded
+        expectedPage: parsed.nextTarget?.type === 'page'
+          ? parsed.nextTarget.description as any
+          : undefined,
+        // Store additional metadata for handleDecision
+        metadata: {
+          progress: parsed.progress,
+          riskLevel: parsed.riskLevel,
+          blockingSignals: parsed.blockingSignals,
+          retryStrategy: parsed.retryStrategy,
+          nextTarget: parsed.nextTarget,
+        },
       };
 
       logger.info('[ACTION_GENERATOR] Next step decided', {
         action: decision.action,
         reason: decision.reason,
+        confidence: decision.confidence,
+        progress: parsed.progress,
+        riskLevel: parsed.riskLevel,
+        blockingSignals: parsed.blockingSignals,
       });
 
       return decision;

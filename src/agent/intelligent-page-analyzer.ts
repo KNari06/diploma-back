@@ -46,18 +46,36 @@ const MODAL_DETECTION_CONFIG = {
   minModalSize: 100,        // Minimum width/height for modal (px)
   overlaySizeRatio: 0.5,    // Element must cover at least 50% of viewport to be overlay
 
-  // Close button detection
-  closeButtonKeywords: [
-    'close', 'закрыть', 'dismiss', 'cancel', 'отмена',
-    '×', '✕', '✖', 'x', 'exit', 'выход'
+  // Close / dismiss detection (scoring-based)
+  // Notes:
+  // - Avoid overly broad tokens like "x" (too noisy).
+  // - Avoid dangerous tokens like "exit/выход" (can mean logout).
+  closeButtonStrongTokens: [
+    'close', 'dismiss', 'закрыть', 'закр', 'dismiss',
+    'modal-close', 'close-modal', 'dialog-close', 'overlay-close',
   ],
-  maxCloseButtonTextLength: 10, // Maximum text length for close button selector
+  closeButtonWeakTokens: [
+    'cancel', 'отмена', 'no thanks', 'not now', 'later', 'skip', 'dismiss',
+    'не сейчас', 'нет спасибо', 'позже', 'пропустить',
+  ],
+  dangerousCloseTokens: [
+    'logout', 'log out', 'sign out', 'exit account', 'выход', 'выйти', 'выход из аккаунта',
+  ],
+  closeIconChars: ['×', '✕', '✖'],
+  maxCloseButtonTextLength: 20, // Maximum text length for close/dismiss button text selector
+
+  // Cookie consent / banner buttons (often no explicit "close")
+  cookieActionTokens: {
+    decline: ['reject', 'decline', 'deny', 'disagree', 'reject all', 'отклонить', 'отказать', 'не согласен', 'запретить', 'запретить все'],
+    accept: ['accept', 'agree', 'allow', 'ok', 'got it', 'accept all', 'принять', 'согласен', 'разрешить', 'понятно', 'ок', 'принять все', 'разрешить все'],
+    settings: ['manage', 'preferences', 'settings', 'options', 'настройки', 'параметры', 'предпочтения', 'управлять'],
+  },
 
   // Modal type detection keywords
   modalTypeKeywords: {
-    cookie: ['cookie', 'gdpr', 'consent', 'privacy', 'куки', 'согласие'],
-    newsletter: ['newsletter', 'subscribe', 'email', 'подписка', 'рассылка'],
-    popup: ['popup', 'modal', 'dialog', 'overlay', 'всплывающее'],
+    cookie: ['cookie', 'cookies', 'gdpr', 'consent', 'privacy', 'policy', 'tracking', 'analytics', 'куки', 'cookie-файл', 'согласие', 'конфиденц', 'политика'],
+    newsletter: ['newsletter', 'subscribe', 'subscription', 'sign up', 'email', 'discount', 'coupon', 'promo', 'offer', 'подпис', 'рассыл', 'скидк', 'промокод', 'акци'],
+    popup: ['popup', 'pop-up', 'modal', 'dialog', 'overlay', 'lightbox', 'drawer', 'sheet', 'всплыва', 'оверле'],
   },
 } as const;
 
@@ -385,18 +403,27 @@ export class IntelligentPageAnalyzer {
     const elementRetryDelay = config?.elementRetryDelay ?? 1500;
     const minContentElements = config?.minContentElements ?? 3;
     const minTextLength = config?.minTextLength ?? 100;
+    const checkIframes = config?.checkIframes ?? false;
+    const checkShadowDOM = config?.checkShadowDOM ?? false;
+
+    const timeLeftMs = () => Math.max(0, maxWaitTime - (Date.now() - startTime));
+    const clampTimeout = (ms: number) => Math.max(0, Math.min(ms, timeLeftMs()));
 
     try {
+      // Ensure DOM is at least initialized (cheap + avoids evaluate on about:blank races)
+      await page.waitForLoadState('domcontentloaded', { timeout: clampTimeout(2000) }).catch(() => null);
+
       // ✅ FIX 2: Better network idle detection - settle approach for long-polling/websockets
       logger.debug('[INTELLIGENT_ANALYZER] Waiting for network to settle', {
         url: page.url(),
       });
 
       // Try networkidle first, but with settle fallback
+      const netTimeout = clampTimeout(networkIdleTimeout);
       await Promise.race([
-        page.waitForLoadState('networkidle', { timeout: networkIdleTimeout }),
+        page.waitForLoadState('networkidle', { timeout: netTimeout }),
         // Fallback: Wait for network to settle (no new requests for N ms)
-        this.waitForNetworkSettle(page, networkSettleTime, networkIdleTimeout),
+        this.waitForNetworkSettle(page, networkSettleTime, netTimeout),
       ]).catch(() => {
         logger.debug('[INTELLIGENT_ANALYZER] Network settle timeout, continuing anyway');
       });
@@ -412,10 +439,11 @@ export class IntelligentPageAnalyzer {
       let elementsFound = false;
 
       for (let attempt = 1; attempt <= elementRetries; attempt++) {
+        if (timeLeftMs() <= 0) break;
         try {
           // ✅ FIX 3: Use 'visible' instead of 'attached' for interactive elements
           await page.waitForSelector('button, input, a, [role="button"], [onclick], select, textarea', {
-            timeout: 3000,
+            timeout: clampTimeout(3000),
             state: 'visible', // Changed from 'attached' - ensures element is visible and interactive
           });
           elementsFound = true;
@@ -425,13 +453,40 @@ export class IntelligentPageAnalyzer {
           });
           break;
         } catch (error) {
+          // Optional: check if interactive elements are inside iframes
+          if (!elementsFound && checkIframes && timeLeftMs() > 0) {
+            const frames = page.frames().filter(f => f !== page.mainFrame());
+            for (const frame of frames) {
+              if (timeLeftMs() <= 0) break;
+              try {
+                await frame.waitForSelector('button, input, a, [role="button"], [onclick], select, textarea', {
+                  timeout: clampTimeout(1000),
+                  state: 'visible',
+                });
+                elementsFound = true;
+                logger.debug('[INTELLIGENT_ANALYZER] Interactive elements found in iframe', {
+                  attempt,
+                  url: page.url(),
+                  frameUrl: frame.url(),
+                });
+                break;
+              } catch {
+                // Continue checking other frames
+              }
+            }
+            if (elementsFound) break;
+          }
+
           if (attempt < elementRetries) {
             logger.debug('[INTELLIGENT_ANALYZER] Elements not found yet, retrying', {
               attempt,
               maxRetries: elementRetries,
               url: page.url(),
             });
-            await page.waitForTimeout(elementRetryDelay);
+            const delay = clampTimeout(elementRetryDelay);
+            if (delay > 0) {
+              await page.waitForTimeout(delay);
+            }
           } else {
             logger.debug('[INTELLIGENT_ANALYZER] Elements not found after all retries', {
               url: page.url(),
@@ -449,7 +504,7 @@ export class IntelligentPageAnalyzer {
           // ✅ FIX 5: Optimized - limit scope to app root, pass config as args
           // Check if page has substantial content (more than just basic structure)
           page.waitForFunction(
-            ({ minContentElements, minTextLength }: { minContentElements: number; minTextLength: number }) => {
+            ({ minContentElements, minTextLength, checkShadowDOM }: { minContentElements: number; minTextLength: number; checkShadowDOM: boolean }) => {
               // @ts-expect-error - browser context
               // ✅ FIX 5: Limit scope to app root (faster than scanning entire body)
               const appRoot = document.querySelector('[id*="app"], [id*="root"], [data-reactroot], [data-v-app], main, [role="main"]') || document.body;
@@ -486,11 +541,29 @@ export class IntelligentPageAnalyzer {
               // 3. Check for text content (minimum meaningful length)
               // ✅ FIX 4: Use configurable minTextLength (passed as argument)
               const appText = appRoot.innerText || '';
-              const hasTextContent = appText.trim().length > minTextLength;
+              let hasTextContent = appText.trim().length > minTextLength;
 
               // 4. Check for interactive elements (buttons, inputs, links)
               const interactiveElements = appRoot.querySelectorAll('button, input, a, select, textarea, [role="button"], [onclick]');
-              const hasInteractiveContent = interactiveElements.length > 0;
+              let hasInteractiveContent = interactiveElements.length > 0;
+
+              // Optional: include open shadow roots for content detection
+              if (checkShadowDOM && (!hasTextContent || !hasInteractiveContent)) {
+                const hosts = Array.from(appRoot.querySelectorAll('*')).slice(0, 200);
+                for (const host of hosts) {
+                  const sr = (host as any).shadowRoot;
+                  if (!sr) continue;
+                  if (!hasInteractiveContent) {
+                    const found = sr.querySelector('button, input, a, select, textarea, [role="button"], [onclick]');
+                    if (found) hasInteractiveContent = true;
+                  }
+                  if (!hasTextContent) {
+                    const t = (sr.textContent || '').trim();
+                    if (t.length > minTextLength) hasTextContent = true;
+                  }
+                  if (hasTextContent && hasInteractiveContent) break;
+                }
+              }
 
               // ✅ FIX 4: Use configurable minContentElements (passed as argument)
               // Page is considered loaded if:
@@ -501,8 +574,8 @@ export class IntelligentPageAnalyzer {
 
               return isContentLoaded;
             },
-            { minContentElements, minTextLength },
-            { timeout: 2000 }
+            { minContentElements, minTextLength, checkShadowDOM },
+            { timeout: clampTimeout(2000) }
           ).catch(() => null),
 
           // Or check if SPA app root is populated with content (simpler fallback)
@@ -514,14 +587,18 @@ export class IntelligentPageAnalyzer {
             const hasChildren = appRoot.children.length > 0;
             const hasText = appRoot.innerText && appRoot.innerText.trim().length > 20;
             return hasChildren && hasText;
-          }, { timeout: 2000 }).catch(() => null),
+          }, { timeout: clampTimeout(2000) }).catch(() => null),
 
           // Fallback: wait 1 second for any late-loading content
-          page.waitForTimeout(1000),
+          (async () => {
+            const t = clampTimeout(1000);
+            if (t > 0) await page.waitForTimeout(t);
+          })(),
         ]);
       } else {
         // If no elements found, wait a bit more for late-loading content
-        await page.waitForTimeout(2000);
+        const t = clampTimeout(2000);
+        if (t > 0) await page.waitForTimeout(t);
       }
 
       // ✅ FIX 1: Enforce maxWaitTime with Promise.race
@@ -559,20 +636,23 @@ export class IntelligentPageAnalyzer {
     const startTime = Date.now();
     let lastRequestTime = Date.now();
 
-    // Track requests
-    const requestTimes: number[] = [];
-    page.on('request', () => {
-      requestTimes.push(Date.now());
+    const onRequest = () => {
       lastRequestTime = Date.now();
-    });
+    };
+    page.on('request', onRequest);
 
-    // Wait until no new requests for settleTime
-    while (Date.now() - startTime < maxTimeout) {
-      const timeSinceLastRequest = Date.now() - lastRequestTime;
-      if (timeSinceLastRequest >= settleTime) {
-        return; // Network settled
+    try {
+      // Wait until no new requests for settleTime
+      while (Date.now() - startTime < maxTimeout) {
+        const timeSinceLastRequest = Date.now() - lastRequestTime;
+        if (timeSinceLastRequest >= settleTime) {
+          return; // Network settled
+        }
+        await page.waitForTimeout(100); // Check every 100ms
       }
-      await page.waitForTimeout(100); // Check every 100ms
+    } finally {
+      // Prevent listener leaks across repeated analyzer calls
+      page.off('request', onRequest);
     }
   }
 
@@ -1624,16 +1704,160 @@ export class IntelligentPageAnalyzer {
         zIndexThreshold: MODAL_DETECTION_CONFIG.zIndexThreshold,
         overlaySizeRatio: MODAL_DETECTION_CONFIG.overlaySizeRatio,
         minModalSize: MODAL_DETECTION_CONFIG.minModalSize,
-        closeButtonKeywords: MODAL_DETECTION_CONFIG.closeButtonKeywords,
+        closeButtonStrongTokens: MODAL_DETECTION_CONFIG.closeButtonStrongTokens,
+        closeButtonWeakTokens: MODAL_DETECTION_CONFIG.closeButtonWeakTokens,
+        dangerousCloseTokens: MODAL_DETECTION_CONFIG.dangerousCloseTokens,
+        closeIconChars: MODAL_DETECTION_CONFIG.closeIconChars,
         maxCloseButtonTextLength: MODAL_DETECTION_CONFIG.maxCloseButtonTextLength,
+        cookieActionTokens: MODAL_DETECTION_CONFIG.cookieActionTokens,
         modalTypeKeywords: MODAL_DETECTION_CONFIG.modalTypeKeywords,
       };
 
-      return await page.evaluate((config) => {
+      const detected = await page.evaluate((config) => {
         const modals: Array<{
           type: 'cookie_banner' | 'newsletter' | 'popup' | 'other';
           closeSelector?: string;
         }> = [];
+
+        const normalize = (s: string): string =>
+          (s || '')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const includesAny = (haystack: string, needles: readonly string[]): boolean => {
+          const h = normalize(haystack);
+          return needles.some((n) => n && h.includes(normalize(n)));
+        };
+
+        const getAttr = (el: any, name: string): string => (el?.getAttribute?.(name) || '').toString();
+
+        const getElementClassLower = (el: any): string => {
+          let className = '';
+          if (typeof el.className === 'string') {
+            className = el.className.toLowerCase();
+          } else if (el.className && typeof el.className === 'object') {
+            if ('baseVal' in el.className) {
+              className = (el.className.baseVal || '').toLowerCase();
+            } else if ('value' in el.className) {
+              className = (el.className.value || '').toLowerCase();
+            } else if (typeof el.className.toString === 'function') {
+              className = el.className.toString().toLowerCase();
+            }
+          }
+          return className;
+        };
+
+        const buildBestSelector = (btn: any, modalEl: any): string | undefined => {
+          try {
+            const btnId = btn.id ? String(btn.id) : '';
+            if (btnId) return `#${btnId}`;
+
+            // Prefer test ids
+            const dataTestId = getAttr(btn, 'data-testid') || getAttr(btn, 'data-test') || getAttr(btn, 'data-cy') || getAttr(btn, 'data-qa');
+            if (dataTestId) return `[data-testid="${dataTestId}"], [data-test="${dataTestId}"], [data-cy="${dataTestId}"], [data-qa="${dataTestId}"]`;
+
+            const aria = getAttr(btn, 'aria-label');
+            if (aria) {
+              const modalId = modalEl?.id ? `#${modalEl.id} ` : '';
+              return `${modalId}[aria-label="${aria}"]`;
+            }
+
+            const title = getAttr(btn, 'title');
+            if (title) {
+              const modalId = modalEl?.id ? `#${modalEl.id} ` : '';
+              return `${modalId}[title="${title}"]`;
+            }
+
+            const txt = (btn.textContent || '').trim();
+            if (txt && txt.length <= config.maxCloseButtonTextLength) {
+              const escapedText = txt.replace(/"/g, '\\"');
+              return `button:has-text("${escapedText}")`;
+            }
+
+            const btnClass = getElementClassLower(btn);
+            const classParts = btnClass.split(' ').filter(Boolean);
+            const closeish = classParts.find((c) => c.includes('close') || c.includes('dismiss') || c.includes('modal-close'));
+            if (closeish) return `button.${closeish}`;
+          } catch {
+            // ignore
+          }
+          return undefined;
+        };
+
+        const scoreCloseCandidate = (btn: any, modalEl: any, modalText: string, modalType: string): number => {
+          const btnTextRaw = (btn.textContent || '').trim();
+          const btnText = normalize(btnTextRaw);
+          const aria = normalize(getAttr(btn, 'aria-label'));
+          const title = normalize(getAttr(btn, 'title'));
+          const id = normalize(btn.id || '');
+          const cls = normalize(getElementClassLower(btn));
+          const dataTestId = normalize(getAttr(btn, 'data-testid') || getAttr(btn, 'data-test') || getAttr(btn, 'data-cy') || getAttr(btn, 'data-qa'));
+
+          const allText = `${btnText} ${aria} ${title} ${id} ${cls} ${dataTestId}`;
+
+          // Base score
+          let score = 0;
+
+          // Penalize dangerous "close" candidates (logout/exit)
+          if (includesAny(allText, config.dangerousCloseTokens)) {
+            score -= 100;
+          }
+
+          // Strong signals
+          if (includesAny(allText, config.closeButtonStrongTokens)) score += 60;
+
+          // Weak signals (only small bonus; can be "cancel" in forms)
+          if (includesAny(allText, config.closeButtonWeakTokens)) score += 10;
+
+          // Icon-only close buttons
+          const hasSvg = !!btn.querySelector?.('svg');
+          const hasIconChar = config.closeIconChars.some((c: string) => btnTextRaw === c);
+          const isXChar = btnTextRaw.length <= 2 && /[×✕✖]/.test(btnTextRaw);
+          if (hasSvg && (!btnText || btnText.length <= 1)) score += 25;
+          if (hasIconChar || isXChar) score += 20;
+
+          // Prefer buttons with aria-label/title explicitly mentioning close
+          if (includesAny(aria, config.closeButtonStrongTokens)) score += 30;
+          if (includesAny(title, config.closeButtonStrongTokens)) score += 15;
+
+          // Position/size heuristics (close usually small, top-right in modal)
+          try {
+            const b = btn.getBoundingClientRect();
+            const m = modalEl.getBoundingClientRect();
+            const isInside = b.left >= m.left && b.top >= m.top && b.right <= m.right && b.bottom <= m.bottom;
+            if (!isInside) score -= 30;
+
+            const nearTop = b.top - m.top < Math.max(40, m.height * 0.25);
+            const nearRight = m.right - b.right < Math.max(40, m.width * 0.25);
+            if (nearTop) score += 10;
+            if (nearRight) score += 10;
+
+            const smallish = (b.width * b.height) < 2500; // ~50x50
+            if (smallish) score += 10;
+          } catch {
+            // ignore
+          }
+
+          // Cookie banner: prefer reject/decline or accept if no close
+          if (modalType === 'cookie_banner') {
+            const hasReject = includesAny(allText, config.cookieActionTokens.decline);
+            const hasAccept = includesAny(allText, config.cookieActionTokens.accept);
+            const hasSettings = includesAny(allText, config.cookieActionTokens.settings);
+            if (hasReject) score += 35;
+            if (hasAccept) score += 25;
+            if (hasSettings) score -= 10; // usually opens another screen, doesn't dismiss
+          }
+
+          // Newsletter: prefer "no thanks / not now" over submit
+          if (modalType === 'newsletter') {
+            const typeAttr = normalize(getAttr(btn, 'type'));
+            if (typeAttr === 'submit') score -= 10;
+            if (btnText.includes('subscribe') || btnText.includes('подпис')) score -= 15; // avoid subscribing
+          }
+
+          return score;
+        };
 
         // ✅ DYNAMIC: Find modals by behavior, not hardcoded selectors
         // Strategy: Find elements that behave like modals (high z-index, overlay, fixed/absolute positioning)
@@ -1673,20 +1897,7 @@ export class IntelligentPageAnalyzer {
           const hasModalRole = role === 'dialog' || role === 'alertdialog' || ariaModal === 'true';
 
           // Check for modal-like classes/ids (dynamic, not hardcoded)
-          // ✅ FIX: Handle className as string, SVGAnimatedString, or DOMTokenList
-          let className = '';
-          if (typeof el.className === 'string') {
-            className = el.className.toLowerCase();
-          } else if (el.className && typeof el.className === 'object') {
-            // Handle DOMTokenList or SVGAnimatedString
-            if ('baseVal' in el.className) {
-              className = (el.className.baseVal || '').toLowerCase();
-            } else if ('value' in el.className) {
-              className = (el.className.value || '').toLowerCase();
-            } else if (typeof el.className.toString === 'function') {
-              className = el.className.toString().toLowerCase();
-            }
-          }
+          const className = getElementClassLower(el);
           const id = (el.id || '').toLowerCase();
           const hasModalKeywords = className.includes('modal') || className.includes('popup') ||
                                    className.includes('dialog') || className.includes('overlay') ||
@@ -1701,90 +1912,10 @@ export class IntelligentPageAnalyzer {
 
         // Process each potential modal
         for (const modalEl of potentialModals) {
-          // ✅ DYNAMIC: Find close button by analyzing button properties, not hardcoded selectors
-          // @ts-ignore - browser context
-          const buttons = modalEl.querySelectorAll('button, [role="button"], a[href="#"], a[href="javascript:void(0)"]');
-          let closeSelector: string | undefined;
-
-          for (let j = 0; j < buttons.length; j++) {
-            const btn = buttons[j] as any;
-
-            // Check if button looks like a close button
-            const btnText = btn.textContent?.trim() || '';
-            const btnAriaLabel = btn.getAttribute('aria-label')?.toLowerCase() || '';
-            const btnTitle = btn.getAttribute('title')?.toLowerCase() || '';
-            // ✅ FIX: Handle className as string, SVGAnimatedString, or DOMTokenList
-            let btnClass = '';
-            if (typeof btn.className === 'string') {
-              btnClass = btn.className.toLowerCase();
-            } else if (btn.className && typeof btn.className === 'object') {
-              if ('baseVal' in btn.className) {
-                btnClass = (btn.className.baseVal || '').toLowerCase();
-              } else if ('value' in btn.className) {
-                btnClass = (btn.className.value || '').toLowerCase();
-              } else if (typeof btn.className.toString === 'function') {
-                btnClass = btn.className.toString().toLowerCase();
-              }
-            }
-            const btnId = (btn.id || '').toLowerCase();
-
-            // Dynamic patterns for close buttons
-            const hasCloseText = config.closeButtonKeywords.some(keyword =>
-              btnText.toLowerCase().includes(keyword) ||
-              btnAriaLabel.includes(keyword) ||
-              btnTitle.includes(keyword) ||
-              btnClass.includes(keyword) ||
-              btnId.includes(keyword)
-            );
-
-            // Check for icon-only close buttons (SVG, icon fonts)
-            const hasCloseIcon = btn.querySelector('svg') ||
-                                 btnClass.includes('icon') && (btnClass.includes('close') || btnClass.includes('x'));
-
-            // Check for short text (likely icon text like "X", "×")
-            const isShortText = btnText.length <= 3 && /[x×✕✖]/i.test(btnText);
-
-            if (hasCloseText || hasCloseIcon || isShortText) {
-              // Generate selector dynamically
-              if (btn.id) {
-                closeSelector = `#${btn.id}`;
-              } else if (btn.getAttribute('aria-label')) {
-                const ariaLabel = btn.getAttribute('aria-label');
-                closeSelector = `button[aria-label="${ariaLabel}"]`;
-              } else if (btnText && btnText.length <= config.maxCloseButtonTextLength) {
-                // Escape special characters for selector
-                const escapedText = btnText.replace(/"/g, '\\"');
-                closeSelector = `button:has-text("${escapedText}")`;
-              } else if (btnClass) {
-                const closeClassKeywords = ['close', 'dismiss', 'cancel'];
-                const classes = btnClass.split(' ').filter((c: string) =>
-                  c && closeClassKeywords.some(keyword => c.includes(keyword))
-                );
-                if (classes.length > 0) {
-                  closeSelector = `button.${classes[0]}`;
-                }
-              }
-
-              if (closeSelector) break;
-            }
-          }
-
           // Determine modal type dynamically using configuration
-          const modalText = modalEl.textContent?.toLowerCase() || '';
-          // ✅ FIX: Handle className as string, SVGAnimatedString, or DOMTokenList
-          let modalClass = '';
-          if (typeof modalEl.className === 'string') {
-            modalClass = modalEl.className.toLowerCase();
-          } else if (modalEl.className && typeof modalEl.className === 'object') {
-            if ('baseVal' in modalEl.className) {
-              modalClass = (modalEl.className.baseVal || '').toLowerCase();
-            } else if ('value' in modalEl.className) {
-              modalClass = (modalEl.className.value || '').toLowerCase();
-            } else if (typeof modalEl.className.toString === 'function') {
-              modalClass = modalEl.className.toString().toLowerCase();
-            }
-          }
-          const modalId = (modalEl.id || '').toLowerCase();
+          const modalText = normalize(modalEl.textContent || '');
+          const modalClass = normalize(getElementClassLower(modalEl));
+          const modalId = normalize(modalEl.id || '');
 
           // Determine modal type using configured keywords
           let modalType: 'cookie_banner' | 'newsletter' | 'popup' | 'other' = 'other';
@@ -1815,6 +1946,54 @@ export class IntelligentPageAnalyzer {
             }
           }
 
+          // ✅ NEW: Find best close/dismiss selector using scoring
+          // @ts-ignore - browser context
+          const candidates = Array.from(
+            modalEl.querySelectorAll('button, [role="button"], a[href="#"], a[href="javascript:void(0)"], [aria-label], [title]')
+          );
+          let closeSelector: string | undefined;
+          let bestScore = -9999;
+          for (const btn of candidates as any[]) {
+            // Skip hidden/disabled
+            try {
+              // @ts-ignore - browser context
+              const s = window.getComputedStyle(btn);
+              if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') continue;
+              if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+            } catch {
+              // ignore
+            }
+
+            const score = scoreCloseCandidate(btn, modalEl, modalText, modalType);
+            if (score > bestScore) {
+              const sel = buildBestSelector(btn, modalEl);
+              if (sel) {
+                bestScore = score;
+                closeSelector = sel;
+              }
+            }
+          }
+
+          // If we didn't find a close selector but it's a cookie banner, try to pick a consent action button
+          if (!closeSelector && modalType === 'cookie_banner') {
+            for (const btn of candidates as any[]) {
+              const txt = normalize((btn.textContent || '').trim());
+              const aria = normalize(getAttr(btn, 'aria-label'));
+              const all = `${txt} ${aria}`.trim();
+              if (!all) continue;
+
+              const isReject = includesAny(all, config.cookieActionTokens.decline);
+              const isAccept = includesAny(all, config.cookieActionTokens.accept);
+              if (isReject || isAccept) {
+                const sel = buildBestSelector(btn, modalEl);
+                if (sel) {
+                  closeSelector = sel;
+                  break;
+                }
+              }
+            }
+          }
+
           modals.push({
             type: modalType,
             closeSelector,
@@ -1823,6 +2002,22 @@ export class IntelligentPageAnalyzer {
 
         return modals;
       }, config);
+      // Best-effort: validate selectors exist in Playwright context
+      if (detected && detected.length > 0) {
+        for (const m of detected) {
+          if (!m.closeSelector) continue;
+          try {
+            const count = await page.locator(m.closeSelector).count();
+            if (count === 0) {
+              m.closeSelector = undefined;
+            }
+          } catch {
+            m.closeSelector = undefined;
+          }
+        }
+      }
+
+      return detected;
     } catch (error) {
       logger.warn('[INTELLIGENT_ANALYZER] Modal detection failed', { error });
       return [];

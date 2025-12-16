@@ -396,6 +396,28 @@ export class MainLoopService {
           });
         }
 
+        // ✅ FIX: If actions caused navigation, don't decide next step using stale pre-navigation context.
+        // Next iteration will analyze the new page and make a correct decision with fresh context.
+        if (urlChanged) {
+          logger.info('[MAIN_LOOP] URL changed during actions, continuing to next iteration for fresh analysis', {
+            testId,
+            iteration,
+            fromUrl: context.url,
+            toUrl: currentStateAfterActions.currentUrl,
+          });
+
+          // Check cancellation after navigation-triggering iteration
+          if (await checkTestCancelled()) {
+            logger.info('[MAIN_LOOP] Test was cancelled after navigation-triggering iteration', {
+              testId,
+              iteration,
+            });
+            return true;
+          }
+
+          continue;
+        }
+
         // STEP 6: Decide next step
         const decision = await ContextualActionGenerator.decideNextStep(
           getState(),
@@ -406,11 +428,17 @@ export class MainLoopService {
         logger.info('[MAIN_LOOP] Next step decision', {
           action: decision.action,
           reason: decision.reason,
+          confidence: decision.confidence,
+          progress: decision.metadata?.progress,
+          riskLevel: decision.metadata?.riskLevel,
         });
 
         emitEvent('test_progress', {
           action: decision.action,
           reason: decision.reason,
+          confidence: decision.confidence,
+          progress: decision.metadata?.progress,
+          riskLevel: decision.metadata?.riskLevel,
           pagesVisited: getState().pagesAnalyzed,
           actionsCompleted: getState().completedActions.length,
         });
@@ -720,10 +748,51 @@ export class MainLoopService {
         return await MainLoopService.handleSkipNavigation(page, config, getState);
       }
 
-      case 'retry':
-        logger.info('[MAIN_LOOP] Retrying...');
+      case 'retry': {
+        const retryStrategy = decision.metadata?.retryStrategy;
+        logger.info('[MAIN_LOOP] Retrying...', {
+          strategy: retryStrategy || 'default',
+        });
+
+        // ✅ NEW: Apply retry strategy if provided
+        if (retryStrategy) {
+          try {
+            switch (retryStrategy) {
+              case 'wait':
+                logger.info('[MAIN_LOOP] Applying wait strategy');
+                await page.waitForTimeout(2000);
+                break;
+              case 'reload':
+                logger.info('[MAIN_LOOP] Applying reload strategy');
+                await page.reload({ waitUntil: 'domcontentloaded' });
+                break;
+              case 'navigate_back':
+                logger.info('[MAIN_LOOP] Applying navigate_back strategy');
+                await page.goBack({ waitUntil: 'domcontentloaded' });
+                break;
+              case 'choose_alternative_target':
+                logger.info('[MAIN_LOOP] Applying choose_alternative_target strategy - will try different selectors in next iteration');
+                // Strategy will be applied in action generation phase
+                break;
+              case 'reduce_scope':
+                logger.info('[MAIN_LOOP] Applying reduce_scope strategy - will simplify actions in next iteration');
+                // Strategy will be applied in action generation phase
+                break;
+              default:
+                logger.debug('[MAIN_LOOP] Unknown retry strategy, using default');
+            }
+          } catch (retryError) {
+            logger.warn('[MAIN_LOOP] Retry strategy failed', {
+              strategy: retryStrategy,
+              error: retryError instanceof Error ? retryError.message : String(retryError),
+            });
+            // Continue anyway
+          }
+        }
+
         // Continue with retry
         return { shouldContinue: true };
+      }
 
       case 'continue':
       default:

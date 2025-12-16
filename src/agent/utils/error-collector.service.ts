@@ -16,6 +16,74 @@ export class ErrorCollectorService {
   private page: Page;
   private isListening: boolean = false;
 
+  // ✅ FIX: Store listener references so we can remove them (prevents leaks / double-collection)
+  private onConsole = (msg: any) => {
+    if (!this.isListening) return;
+    try {
+      if (msg.type?.() === 'error') {
+        this.consoleErrors.push({
+          message: msg.text?.() || '',
+          source: msg.location?.().url,
+          line: msg.location?.().lineNumber,
+          timestamp: Date.now(),
+        });
+        logger.debug('[ERROR_COLLECTOR] Console error', { message: msg.text?.() });
+      }
+    } catch {
+      // ignore listener errors
+    }
+  };
+
+  private onPageError = (error: any) => {
+    if (!this.isListening) return;
+    try {
+      const message = error?.message || String(error);
+      this.consoleErrors.push({
+        message,
+        source: error?.stack?.split('\n')?.[0] || 'unknown',
+        timestamp: Date.now(),
+      });
+      logger.debug('[ERROR_COLLECTOR] Page error', { message });
+    } catch {
+      // ignore listener errors
+    }
+  };
+
+  private onRequestFailed = (request: any) => {
+    if (!this.isListening) return;
+    try {
+      const failure = request.failure?.();
+      this.networkErrors.push({
+        url: request.url?.() || '',
+        method: request.method?.() || '',
+        error: failure?.errorText || 'Unknown network error',
+        timestamp: Date.now(),
+      });
+      logger.debug('[ERROR_COLLECTOR] Request failed', { url: request.url?.(), error: failure?.errorText });
+    } catch {
+      // ignore listener errors
+    }
+  };
+
+  private onResponse = (response: any) => {
+    if (!this.isListening) return;
+    try {
+      const status = response.status?.();
+      if (typeof status === 'number' && status >= 400) {
+        this.networkErrors.push({
+          url: response.url?.() || '',
+          status,
+          method: response.request?.().method?.() || '',
+          error: `HTTP ${status}`,
+          timestamp: Date.now(),
+        });
+        logger.debug('[ERROR_COLLECTOR] HTTP error', { url: response.url?.(), status });
+      }
+    } catch {
+      // ignore listener errors
+    }
+  };
+
   constructor(page: Page) {
     this.page = page;
   }
@@ -31,55 +99,11 @@ export class ErrorCollectorService {
 
     this.isListening = true;
 
-    // Console errors
-    this.page.on('console', (msg) => {
-      if (msg.type() === 'error') {
-        this.consoleErrors.push({
-          message: msg.text(),
-          source: msg.location().url,
-          line: msg.location().lineNumber,
-          timestamp: Date.now(),
-        });
-        logger.debug('[ERROR_COLLECTOR] Console error', { message: msg.text() });
-      }
-    });
-
-    // Page errors
-    this.page.on('pageerror', (error) => {
-      this.consoleErrors.push({
-        message: error.message,
-        source: error.stack?.split('\n')[0] || 'unknown',
-        timestamp: Date.now(),
-      });
-      logger.debug('[ERROR_COLLECTOR] Page error', { message: error.message });
-    });
-
-    // Network errors
-    this.page.on('requestfailed', (request) => {
-      const failure = request.failure();
-      this.networkErrors.push({
-        url: request.url(),
-        method: request.method(),
-        error: failure?.errorText || 'Unknown network error',
-        timestamp: Date.now(),
-      });
-      logger.debug('[ERROR_COLLECTOR] Request failed', { url: request.url(), error: failure?.errorText });
-    });
-
-    // Network errors with status codes
-    this.page.on('response', (response) => {
-      const status = response.status();
-      if (status >= 400) {
-        this.networkErrors.push({
-          url: response.url(),
-          status,
-          method: response.request().method(),
-          error: `HTTP ${status}`,
-          timestamp: Date.now(),
-        });
-        logger.debug('[ERROR_COLLECTOR] HTTP error', { url: response.url(), status });
-      }
-    });
+    // ✅ FIX: Attach listeners with stored handler refs (so we can detach later)
+    this.page.on('console', this.onConsole);
+    this.page.on('pageerror', this.onPageError);
+    this.page.on('requestfailed', this.onRequestFailed);
+    this.page.on('response', this.onResponse);
 
     logger.info('[ERROR_COLLECTOR] Started collecting errors');
   }
@@ -93,8 +117,17 @@ export class ErrorCollectorService {
     }
 
     this.isListening = false;
-    // Note: Playwright doesn't support removing specific listeners,
-    // so we just stop adding new errors
+
+    // ✅ FIX: Detach listeners to prevent leaks and double-collection across runs
+    try {
+      this.page.off('console', this.onConsole);
+      this.page.off('pageerror', this.onPageError);
+      this.page.off('requestfailed', this.onRequestFailed);
+      this.page.off('response', this.onResponse);
+    } catch {
+      // ignore listener removal errors
+    }
+
     logger.info('[ERROR_COLLECTOR] Stopped collecting errors');
   }
 

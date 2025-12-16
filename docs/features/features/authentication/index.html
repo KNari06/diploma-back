@@ -50,6 +50,31 @@
 
             <div class="section">
                 <h2 class="section-title">📊 Authentication Flow Diagram</h2>
+
+                <div class="overview" style="margin-bottom: 20px; padding: 20px;">
+                    <h3 style="margin-top: 0; color: #667eea;">🎨 Legend (Легенда)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e1f5ff; border: 2px solid #01579b;"></span>
+                            <div>
+                                <strong>🔵 Blue</strong> - API Endpoints (API точки)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #fff4e1; border: 2px solid #e65100;"></span>
+                            <div>
+                                <strong>🟡 Orange</strong> - Token Generation (Генерация токенов)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 2px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green</strong> - Supabase Auth (Supabase аутентификация)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="diagram-container">
                     <div class="mermaid">
 flowchart TD
@@ -122,6 +147,37 @@ flowchart TD
 
             <div class="section">
                 <h2 class="section-title">🔑 Authorization Flow</h2>
+
+                <div class="overview" style="margin-bottom: 20px; padding: 20px;">
+                    <h3 style="margin-top: 0; color: #667eea;">🎨 Legend (Легенда)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #fff4e1; border: 2px solid #e65100;"></span>
+                            <div>
+                                <strong>🟡 Orange</strong> - Token Verification (Проверка токена)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 2px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green</strong> - Supabase Verification (Проверка через Supabase)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e1f5ff; border: 2px solid #01579b;"></span>
+                            <div>
+                                <strong>🔵 Blue</strong> - User Attachment (Прикрепление пользователя)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 3px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green (Bold)</strong> - Allow Access (Разрешить доступ)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="diagram-container">
                     <div class="mermaid">
 flowchart TD

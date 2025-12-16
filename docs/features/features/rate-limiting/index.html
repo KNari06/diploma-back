@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rate Limiting - Features Documentation</title>
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚡ Rate Limiting</h1>
+            <p>Rate limiting configuration, limits per endpoint, throttling mechanisms, and rate limit errors</p>
+        </div>
+        <div class="feature-page">
+            <a href="../../index.html" class="back-link">← Back to Features</a>
+
+            <div class="section">
+                <h2 class="section-title">📋 Overview</h2>
+                <div class="overview">
+                    <p>Rate limiting protects the API from abuse and ensures fair resource usage. The system implements different rate limiting strategies for different user types and endpoints.</p>
+                    <p><strong>Key Features:</strong></p>
+                    <ul>
+                        <li><strong>Anonymous User Limits:</strong> Stricter limits for unauthenticated users</li>
+                        <li><strong>Authenticated User Limits:</strong> Higher limits based on subscription plan</li>
+                        <li><strong>Endpoint-Specific Limits:</strong> Different limits for different actions</li>
+                        <li><strong>Automatic Reset:</strong> Limits reset automatically based on time windows</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔒 Anonymous User Rate Limiting</h2>
+                <div class="overview">
+                    <p><strong>Limit:</strong> 3 chat messages per 24 hours</p>
+                    <p><strong>Reset:</strong> Automatically after 24 hours from first request</p>
+                    <p><strong>Scope:</strong> Only applies to anonymous (unauthenticated) users</p>
+                    <p><strong>Implementation:</strong> Database-based tracking in <code>anonymous_usage_limits</code> table</p>
+
+                    <h3>How It Works</h3>
+                    <ol>
+                        <li>Anonymous user identified by <code>anonymous_id</code> (format: <code>project_{projectId}</code>)</li>
+                        <li>Each chat request increments <code>request_count</code></li>
+                        <li>If <code>request_count >= 3</code>, returns <code>429 RATE_LIMIT_EXCEEDED</code></li>
+                        <li>Limit resets automatically after 24 hours from <code>first_request_at</code></li>
+                        <li>After authentication, limit is reset and user gets full access</li>
+                    </ol>
+
+                    <h3>Database Schema</h3>
+                    <pre style="background: #f5f5f5; padding: 15px; border-radius: 8px; overflow-x: auto;"><code>anonymous_usage_limits:
+  - id: UUID
+  - anonymous_id: TEXT (UNIQUE)
+  - request_count: INTEGER
+  - last_request_at: TIMESTAMP
+  - first_request_at: TIMESTAMP</code></pre>
+
+                    <h3>Error Response</h3>
+                    <pre style="background: #f5f5f5; padding: 15px; border-radius: 8px; overflow-x: auto;"><code>{
+  "success": false,
+  "error": "Rate limit exceeded",
+  "code": "RATE_LIMIT_EXCEEDED",
+  "details": "Anonymous users are limited to 3 chat messages per 24 hours. Please sign up for unlimited access.",
+  "timestamp": "2024-01-01T00:00:00.000Z"
+}</code></pre>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">⚙️ Global Rate Limiting Configuration</h2>
+                <div class="overview">
+                    <p><strong>Status:</strong> Currently disabled (using custom rate limiters per feature)</p>
+                    <p><strong>Configuration:</strong> Environment variables</p>
+
+                    <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                        <thead>
+                            <tr style="background: #f5f5f5;">
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Variable</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Default</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>RATE_LIMIT_WINDOW_MS</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">900000 (15 minutes)</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Time window for rate limiting</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>RATE_LIMIT_MAX_REQUESTS</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">100</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Maximum requests per window</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p><strong>Note:</strong> Global rate limiting is currently disabled in favor of feature-specific rate limiters. To enable, uncomment the rate limiter middleware in <code>src/index.ts</code>.</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Planned Endpoint-Specific Limits</h2>
+                <div class="overview">
+                    <p>The following limits are planned but not yet fully implemented:</p>
+
+                    <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                        <thead>
+                            <tr style="background: #f5f5f5;">
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Action</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Limit</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Window</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>test.run</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">10 requests</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">1 minute</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">🟡 Planned</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>test.retry</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">5 requests</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">1 minute</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">🟡 Planned</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>project.create</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">3 requests</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">1 hour</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">🟡 Planned</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>chat.message</code> (anonymous)</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">3 requests</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">24 hours</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">🟢 Implemented</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Rate Limiting Flow</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Request[Incoming Request] --> CheckAuth{User<br/>Authenticated?}
+
+    CheckAuth -->|Yes| AuthUser[Authenticated User<br/>🟢 Full Access]
+    CheckAuth -->|No| CheckAnonymous{Anonymous<br/>User?}
+
+    CheckAnonymous -->|Yes| GetAnonymousID[Get Anonymous ID<br/>🟡 project_{projectId}]
+    CheckAnonymous -->|No| AuthUser
+
+    GetAnonymousID --> CheckLimit[Check Usage Limit<br/>🟡 anonymous_usage_limits]
+    CheckLimit --> GetCount[Get request_count<br/>🟡 From database]
+
+    GetCount --> CheckCount{request_count<br/>&lt; 3?}
+    CheckCount -->|Yes| IncrementCount[Increment request_count<br/>🟡 Update database]
+    CheckCount -->|No| RateLimitExceeded[429 Rate Limit Exceeded<br/>🔴 RATE_LIMIT_EXCEEDED]
+
+    IncrementCount --> CheckFirstRequest{First<br/>Request?}
+    CheckFirstRequest -->|Yes| SetFirstRequest[Set first_request_at<br/>🟡 Current timestamp]
+    CheckFirstRequest -->|No| UpdateLastRequest[Update last_request_at<br/>🟡 Current timestamp]
+
+    SetFirstRequest --> ProcessRequest[Process Request<br/>🟢 Execute handler]
+    UpdateLastRequest --> ProcessRequest
+
+    AuthUser --> ProcessRequest
+
+    ProcessRequest --> Success[Success Response<br/>🟢 200 OK]
+    RateLimitExceeded --> ErrorResponse[Error Response<br/>🔴 429 with details]
+
+    Success --> End([Response Sent])
+    ErrorResponse --> End
+
+    style CheckLimit fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style GetCount fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style IncrementCount fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style SetFirstRequest fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style UpdateLastRequest fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style AuthUser fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style ProcessRequest fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style Success fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style RateLimitExceeded fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style ErrorResponse fill:#ffebee,stroke:#c62828,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔧 Implementation Details</h2>
+                <div class="overview">
+                    <h3>AnonymousLimiterService</h3>
+                    <p><strong>File:</strong> <code>src/services/core/anonymous-limiter.service.ts</code></p>
+                    <ul>
+                        <li><code>getRequestCount(anonymousId)</code> - Get current request count</li>
+                        <li><code>incrementRequestCount(anonymousId)</code> - Increment and return new count</li>
+                        <li><code>hasReachedLimit(anonymousId)</code> - Check if limit reached (3 requests)</li>
+                        <li><code>getRemainingRequests(anonymousId)</code> - Get remaining requests</li>
+                        <li><code>resetRequestCount(anonymousId)</code> - Reset count (after authentication)</li>
+                    </ul>
+
+                    <h3>Middleware</h3>
+                    <p><strong>File:</strong> <code>src/middleware/rate-limit.middleware.ts</code> (if exists)</p>
+                    <p><strong>Usage:</strong> Applied to chat routes to check anonymous limits before processing</p>
+
+                    <h3>Database Migration</h3>
+                    <p><strong>File:</strong> <code>supabase-migrations/migrations/anonymous-chat-limits.sql</code></p>
+                    <p>Creates <code>anonymous_usage_limits</code> table with proper indexes</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">⚠️ Rate Limit Error Response</h2>
+                <div class="overview">
+                    <p>When rate limit is exceeded, the API returns:</p>
+                    <pre style="background: #f5f5f5; padding: 15px; border-radius: 8px; overflow-x: auto;"><code>HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+
+{
+  "success": false,
+  "error": "Rate limit exceeded",
+  "code": "RATE_LIMIT_EXCEEDED",
+  "details": "Anonymous users are limited to 3 chat messages per 24 hours. Please sign up for unlimited access.",
+  "timestamp": "2024-01-01T00:00:00.000Z"
+}</code></pre>
+
+                    <h3>Response Headers</h3>
+                    <ul>
+                        <li><code>X-RateLimit-Limit</code> - Maximum requests allowed (e.g., 3)</li>
+                        <li><code>X-RateLimit-Remaining</code> - Remaining requests (e.g., 0)</li>
+                        <li><code>X-RateLimit-Reset</code> - Unix timestamp when limit resets</li>
+                        <li><code>Retry-After</code> - Seconds to wait before retrying</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">💡 Best Practices</h2>
+                <div class="overview">
+                    <ul>
+                        <li><strong>Handle 429 Errors:</strong> Implement exponential backoff when receiving rate limit errors</li>
+                        <li><strong>Check Headers:</strong> Use <code>X-RateLimit-Remaining</code> to track remaining requests</li>
+                        <li><strong>Respect Retry-After:</strong> Wait for the specified time before retrying</li>
+                        <li><strong>Authenticate for Higher Limits:</strong> Sign up to get unlimited access</li>
+                        <li><strong>Monitor Usage:</strong> Track your request count to avoid hitting limits</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📝 Code References</h2>
+                <div class="overview">
+                    <ul>
+                        <li><strong>Anonymous limiter service:</strong> <code>src/services/core/anonymous-limiter.service.ts</code></li>
+                        <li><strong>Rate limit validation:</strong> <code>src/utils/validation.ts</code> (validateRateLimit function)</li>
+                        <li><strong>Environment config:</strong> <code>src/config/env.ts</code> (RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_REQUESTS)</li>
+                        <li><strong>Error class:</strong> <code>src/types/index.ts</code> (RateLimitError)</li>
+                        <li><strong>Database migration:</strong> <code>supabase-migrations/migrations/anonymous-chat-limits.sql</code></li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>

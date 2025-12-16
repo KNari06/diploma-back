@@ -77,7 +77,27 @@ const features = [
         category: 'api',
         path: 'features/api-routing/index.html',
         methods: 25,
-        lastModified: '2024-12-08',
+        lastModified: '2024-12-15',
+        status: 'active'
+    },
+    {
+        id: 'error-handling',
+        title: 'Error Handling',
+        description: 'Error codes, patterns, troubleshooting guide, and error response structure',
+        category: 'api',
+        path: 'features/error-handling/index.html',
+        methods: 15,
+        lastModified: '2024-12-15',
+        status: 'active'
+    },
+    {
+        id: 'rate-limiting',
+        title: 'Rate Limiting',
+        description: 'Rate limiting configuration, limits per endpoint, throttling mechanisms, and rate limit errors',
+        category: 'api',
+        path: 'features/rate-limiting/index.html',
+        methods: 10,
+        lastModified: '2024-12-15',
         status: 'active'
     }
 ];

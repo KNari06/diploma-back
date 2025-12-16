@@ -264,8 +264,14 @@ export interface ActionResult {
   urlBefore: string;
   urlAfter: string;
   screenshot?: string;
+  // ✅ NEW: Optional per-action screenshots (useful for graph + debugging)
+  screenshotBefore?: string;
+  screenshotAfter?: string;
+  screenshotBeforeIndex?: number;
+  screenshotAfterIndex?: number;
   timestamp: number;
   retryCount?: number;
+  durationMs?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -443,6 +449,19 @@ export interface NextStepDecision {
   nextActions?: DynamicAction[];
   expectedPage?: PageType;
   confidence: number; // 0-1
+  // ✅ NEW: Additional metadata from AI decision
+  metadata?: {
+    progress?: number; // 0-100
+    riskLevel?: 'low' | 'medium' | 'high';
+    blockingSignals?: string[];
+    retryStrategy?: 'wait' | 'reload' | 'navigate_back' | 'choose_alternative_target' | 'reduce_scope' | null;
+    nextTarget?: {
+      type?: 'page' | 'element' | 'flow';
+      description?: string;
+      successCriteria?: string;
+      avoid?: string[];
+    } | null;
+  };
 }
 
 /**

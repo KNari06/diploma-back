@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>API Routing - Features Documentation</title>
     <link rel="stylesheet" href="../../assets/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -14,13 +15,371 @@
         </div>
         <div class="feature-page">
             <a href="../../index.html" class="back-link">← Back to Features</a>
+
             <div class="section">
                 <h2 class="section-title">📋 Overview</h2>
                 <div class="overview">
-                    <p>API routing system handles request routing, middleware execution, handler selection, and validation flow.</p>
+                    <p>The API routing system handles all incoming HTTP requests, applies middleware in a specific order, routes to appropriate handlers, and manages error responses. It uses Express.js as the core framework with custom middleware for authentication, CORS, logging, and error handling.</p>
+                    <p><strong>Key Components:</strong></p>
+                    <ul>
+                        <li><strong>Middleware Chain:</strong> Security, CORS, body parsing, logging, authentication</li>
+                        <li><strong>Route Handlers:</strong> Organized by feature (auth, chat, tests, etc.)</li>
+                        <li><strong>Error Handling:</strong> Centralized error handler with proper status codes</li>
+                        <li><strong>Validation:</strong> Request validation before handler execution</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Middleware Chain Flow</h2>
+
+                <div class="overview" style="margin-bottom: 20px; padding: 20px;">
+                    <h3 style="margin-top: 0; color: #667eea;">🎨 Legend (Легенда)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e1f5ff; border: 2px solid #01579b;"></span>
+                            <div>
+                                <strong>🔵 Blue</strong> - Security Middleware (Безопасность)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #fff4e1; border: 2px solid #e65100;"></span>
+                            <div>
+                                <strong>🟡 Orange</strong> - CORS & Headers (CORS и заголовки)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 2px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green</strong> - Body Parsing (Парсинг тела)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #ffebee; border: 2px solid #c62828;"></span>
+                            <div>
+                                <strong>🔴 Red</strong> - Route Handlers (Обработчики маршрутов)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #f3e5f5; border: 2px solid #7b1fa2;"></span>
+                            <div>
+                                <strong>🟣 Purple</strong> - Error Handling (Обработка ошибок)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Start([HTTP Request]) --> TrustProxy[Trust Proxy<br/>🔵 Set trust proxy]
+    TrustProxy --> Security[Security Middleware<br/>🔵 Helmet CSP]
+    Security --> SwaggerCheck{Is Swagger?}
+
+    SwaggerCheck -->|Yes| SwaggerRelaxed[Relaxed Security<br/>🔵 For Swagger UI]
+    SwaggerCheck -->|No| CORS[CORS Middleware<br/>🟡 Origin validation]
+
+    SwaggerRelaxed --> CORS
+    CORS --> CORSHeaders[CORS Headers Override<br/>🟡 Ensure headers on all responses]
+
+    CORSHeaders --> BodyParsing[Body Parsing<br/>🟢 express.json limit: 10mb]
+    BodyParsing --> URLEncoded[URL Encoded<br/>🟢 extended: true]
+
+    URLEncoded --> Logging[Morgan Logging<br/>🟢 Request logging]
+
+    Logging --> SwaggerUI{Is /api/docs?}
+    SwaggerUI -->|Yes| SwaggerSetup[Swagger UI Setup<br/>🔵 Documentation]
+    SwaggerUI -->|No| DocsAuth{Is /api/features?}
+
+    SwaggerSetup --> DocsAuth
+    DocsAuth -->|Yes| RequireDocsAuth[requireDocsAuth<br/>🔵 Password check]
+    DocsAuth -->|No| HealthCheck{Is /health?}
+
+    RequireDocsAuth --> HealthCheck
+    HealthCheck -->|Yes| HealthHandler[Health Check Handler<br/>🔵 System status]
+    HealthCheck -->|No| Routes[API Routes<br/>🔴 Route handlers]
+
+    HealthHandler --> Routes
+
+    Routes --> AuthRoutes[/api/v1/auth<br/>🔴 Authentication]
+    Routes --> WorkspaceRoutes[/api/v1/workspaces<br/>🔴 Workspaces]
+    Routes --> ProjectRoutes[/api/v1/projects<br/>🔴 Projects]
+    Routes --> TestRoutes[/api/v1/manual-test<br/>🔴 Manual Tests]
+    Routes --> IntelligentTestRoutes[/api/v1/intelligent-test<br/>🔴 Intelligent Tests]
+    Routes --> ChatRoutes[/api/v1/chat<br/>🔴 Chat]
+    Routes --> ApiTestRoutes[/api/v1/api-test<br/>🔴 API Tests]
+    Routes --> JiraRoutes[/api/v1/jira<br/>🔴 Jira]
+    Routes --> OtherRoutes[Other Routes...<br/>🔴 More handlers]
+
+    AuthRoutes --> RouteHandler[Route Handler<br/>🔴 Execute handler]
+    WorkspaceRoutes --> RouteHandler
+    ProjectRoutes --> RouteHandler
+    TestRoutes --> RouteHandler
+    IntelligentTestRoutes --> RouteHandler
+    ChatRoutes --> RouteHandler
+    ApiTestRoutes --> RouteHandler
+    JiraRoutes --> RouteHandler
+    OtherRoutes --> RouteHandler
+
+    RouteHandler --> Validation{Validation<br/>Passed?}
+    Validation -->|No| ValidationError[400 Validation Error<br/>🟣 Error Handler]
+    Validation -->|Yes| AuthCheck{Auth<br/>Required?}
+
+    AuthCheck -->|Yes| RequireAuth[requireAuth Middleware<br/>🔵 JWT verification]
+    AuthCheck -->|No| ExecuteHandler[Execute Handler<br/>🔴 Business logic]
+
+    RequireAuth -->|Invalid| AuthError[401 Unauthorized<br/>🟣 Error Handler]
+    RequireAuth -->|Valid| ExecuteHandler
+
+    ExecuteHandler --> Success{Success?}
+    Success -->|Yes| SuccessResponse[200 Success Response<br/>🟢 Return data]
+    Success -->|No| HandlerError[Handler Error<br/>🟣 Error Handler]
+
+    ValidationError --> NotFoundCheck{404?}
+    AuthError --> NotFoundCheck
+    HandlerError --> NotFoundCheck
+
+    NotFoundCheck -->|Yes| NotFound[404 Not Found<br/>🟣 notFoundHandler]
+    NotFoundCheck -->|No| ErrorHandler[Error Handler<br/>🟣 errorHandler]
+
+    NotFound --> Response[HTTP Response]
+    ErrorHandler --> Response
+    SuccessResponse --> Response
+
+    Response --> End([Response Sent])
+
+    style Security fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style CORS fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style CORSHeaders fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style BodyParsing fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style URLEncoded fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style Logging fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style Routes fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style RouteHandler fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style ExecuteHandler fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style RequireAuth fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style RequireDocsAuth fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style ErrorHandler fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style NotFound fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style ValidationError fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style AuthError fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style HandlerError fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔧 Middleware Details</h2>
+                <div class="overview">
+                    <h3>1. Security Middleware (Helmet)</h3>
+                    <ul>
+                        <li><strong>Purpose:</strong> Sets security headers (CSP, CORS policies)</li>
+                        <li><strong>Configuration:</strong> Relaxed for Swagger UI, strict for other routes</li>
+                        <li><strong>File:</strong> <code>src/index.ts</code> (lines 38-55)</li>
+                    </ul>
+
+                    <h3>2. CORS Middleware</h3>
+                    <ul>
+                        <li><strong>Purpose:</strong> Handles cross-origin requests</li>
+                        <li><strong>Configuration:</strong>
+                            <ul>
+                                <li>Development: Allow all origins</li>
+                                <li>Production: Only allowed origins from <code>ALLOWED_ORIGINS</code></li>
+                                <li>Methods: GET, POST, PUT, DELETE, OPTIONS</li>
+                                <li>Headers: Content-Type, Authorization, X-User-ID</li>
+                            </ul>
+                        </li>
+                        <li><strong>File:</strong> <code>src/index.ts</code> (lines 91-149)</li>
+                    </ul>
+
+                    <h3>3. Body Parsing</h3>
+                    <ul>
+                        <li><strong>express.json:</strong> Parses JSON bodies (limit: 10mb)</li>
+                        <li><strong>express.urlencoded:</strong> Parses URL-encoded bodies (extended: true, limit: 10mb)</li>
+                        <li><strong>File:</strong> <code>src/index.ts</code> (lines 168-169)</li>
+                    </ul>
+
+                    <h3>4. Logging (Morgan)</h3>
+                    <ul>
+                        <li><strong>Purpose:</strong> Logs all HTTP requests</li>
+                        <li><strong>Format:</strong> Configurable via <code>LOG_FORMAT</code> env variable</li>
+                        <li><strong>File:</strong> <code>src/index.ts</code> (line 172)</li>
+                    </ul>
+
+                    <h3>5. Authentication Middleware</h3>
+                    <ul>
+                        <li><strong>requireAuth:</strong> Validates JWT tokens for protected routes</li>
+                        <li><strong>requireDocsAuth:</strong> Password protection for documentation</li>
+                        <li><strong>File:</strong> <code>src/middleware/auth.middleware.ts</code></li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🛣️ API Routes</h2>
+                <div class="overview">
+                    <p>All API routes are prefixed with <code>/api/v1</code> (configurable via <code>API_VERSION</code> env variable).</p>
+
+                    <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                        <thead>
+                            <tr style="background: #f5f5f5;">
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Route</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Description</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Auth Required</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/auth</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Authentication & authorization</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Partial</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/workspaces</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Workspace management</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/projects</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Project management</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/manual-test</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Manual test execution</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/intelligent-test</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">AI-powered intelligent testing</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/chat</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">AI chat interface</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/api-test</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">API testing & fuzzing</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/api-config</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">API configuration management</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/jira</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Jira integration</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/kb</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Knowledge base</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/playwright</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Playwright commands</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/reports</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Test reports & Jira integration</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/test-visualization</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Test visualization</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/user</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">User management</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/notifications</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">User notifications</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>/api/v1/queue</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Queue monitoring</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Yes</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">✅ Validation Flow</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Request[Incoming Request] --> ExtractBody[Extract Request Body]
+    ExtractBody --> SchemaCheck{Schema<br/>Defined?}
+
+    SchemaCheck -->|No| SkipValidation[Skip Validation<br/>🟢 Proceed]
+    SchemaCheck -->|Yes| ValidateSchema[Validate Schema<br/>🟡 Zod/Joi]
+
+    ValidateSchema --> Valid{Valid?}
+    Valid -->|No| ValidationError[Return 400<br/>VALIDATION_ERROR<br/>🟣 Error Handler]
+    Valid -->|Yes| SkipValidation
+
+    SkipValidation --> AuthCheck{Auth<br/>Required?}
+    AuthCheck -->|No| ExecuteHandler[Execute Handler<br/>🔴 Business Logic]
+    AuthCheck -->|Yes| CheckToken{Token<br/>Present?}
+
+    CheckToken -->|No| AuthError[Return 401<br/>UNAUTHORIZED<br/>🟣 Error Handler]
+    CheckToken -->|Yes| VerifyToken[Verify JWT Token<br/>🔵 Supabase]
+
+    VerifyToken --> TokenValid{Token<br/>Valid?}
+    TokenValid -->|No| TokenError[Return 401<br/>INVALID_TOKEN<br/>🟣 Error Handler]
+    TokenValid -->|Yes| AttachUser[Attach User to Request<br/>🔵 req.user]
+
+    AttachUser --> ExecuteHandler
+    ExecuteHandler --> Success{Success?}
+
+    Success -->|Yes| Return200[Return 200<br/>Success Response<br/>🟢 Data]
+    Success -->|No| HandlerError[Handler Error<br/>🟣 Error Handler]
+
+    ValidationError --> End([Response])
+    AuthError --> End
+    TokenError --> End
+    HandlerError --> End
+    Return200 --> End
+
+    style ValidateSchema fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style VerifyToken fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style AttachUser fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style ExecuteHandler fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style ValidationError fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style AuthError fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style TokenError fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style HandlerError fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📝 Code References</h2>
+                <div class="overview">
+                    <ul>
+                        <li><strong>Main routing file:</strong> <code>src/index.ts</code></li>
+                        <li><strong>Error handlers:</strong> <code>src/utils/error-handler.ts</code></li>
+                        <li><strong>Auth middleware:</strong> <code>src/middleware/auth.middleware.ts</code></li>
+                        <li><strong>Docs auth:</strong> <code>src/middleware/docs-auth.middleware.ts</code></li>
+                    </ul>
                 </div>
             </div>
         </div>
     </div>
+
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
 </body>
 </html>

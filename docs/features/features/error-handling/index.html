@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Error Handling - Features Documentation</title>
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚠️ Error Handling</h1>
+            <p>Error codes, patterns, troubleshooting guide, and error response structure</p>
+        </div>
+        <div class="feature-page">
+            <a href="../../index.html" class="back-link">← Back to Features</a>
+
+            <div class="section">
+                <h2 class="section-title">📋 Overview</h2>
+                <div class="overview">
+                    <p>The error handling system provides consistent error responses across all API endpoints. All errors follow a standardized format with error codes, messages, and appropriate HTTP status codes.</p>
+                    <p><strong>Key Features:</strong></p>
+                    <ul>
+                        <li><strong>Standardized Format:</strong> All errors return consistent JSON structure</li>
+                        <li><strong>Error Codes:</strong> Machine-readable error codes for programmatic handling</li>
+                        <li><strong>CORS Support:</strong> Error responses include CORS headers for allowed origins</li>
+                        <li><strong>Logging:</strong> All errors are logged with context (URL, method, IP, user agent)</li>
+                        <li><strong>Error Types:</strong> Custom error classes for different error categories</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Error Response Format</h2>
+                <div class="overview">
+                    <p>All error responses follow this structure:</p>
+                    <pre style="background: #f5f5f5; padding: 15px; border-radius: 8px; overflow-x: auto;"><code>{
+  "success": false,
+  "error": "Human-readable error message",
+  "code": "ERROR_CODE",
+  "details": "Additional details (optional)",
+  "timestamp": "2024-01-01T00:00:00.000Z"
+}</code></pre>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔴 Error Codes Reference</h2>
+                <div class="overview">
+                    <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                        <thead>
+                            <tr style="background: #f5f5f5;">
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Code</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">HTTP Status</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Description</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">When It Occurs</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>VALIDATION_ERROR</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">400</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Request validation failed</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Invalid request body, missing required fields, type mismatches</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>INVALID_TOKEN</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">401</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Invalid JWT token</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Malformed or invalid JWT token format</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>TOKEN_EXPIRED</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">401</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">JWT token expired</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Token has passed its expiration time</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>UNAUTHORIZED</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">401</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Unauthorized access</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">No token provided or token verification failed</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>NOT_FOUND</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">404</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Resource not found</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Route doesn't exist or resource ID not found</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>RATE_LIMIT_EXCEEDED</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">429</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Rate limit exceeded</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Too many requests in time window</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>DATABASE_ERROR</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">400</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Database operation failed</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">PostgreSQL/Supabase errors (constraint violations, connection issues)</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>QUEUE_UNAVAILABLE</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">503</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Queue service unavailable</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Redis connection issues or queue service down</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>AI_SERVICE_UNAVAILABLE</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">503</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">AI service unavailable</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">OpenAI API errors, network issues, or service down</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>AGENT_UNAVAILABLE</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">503</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Test agent unavailable</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Test agent connection refused or timeout</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>BAD_GATEWAY</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">502</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Bad gateway</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Connection refused, timeout, or service temporarily unavailable</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>INTERNAL_ERROR</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">500</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Internal server error</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Unexpected server errors (production: generic message, development: full error)</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>SERVICE_UNAVAILABLE</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">503</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Service temporarily unavailable</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Server is shutting down or being updated</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Error Handling Flow</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Error[Error Occurs] --> ErrorType{Error Type?}
+
+    ErrorType -->|QAIError| QAIErrorHandler[QAIError Handler<br/>🔵 Custom Error]
+    ErrorType -->|ValidationError| ValidationErrorHandler[ValidationError Handler<br/>🟡 Validation]
+    ErrorType -->|JWT Error| JWTErrorHandler[JWT Error Handler<br/>🟡 Token]
+    ErrorType -->|Database Error| DatabaseErrorHandler[Database Error Handler<br/>🟡 Postgres]
+    ErrorType -->|Network Error| NetworkErrorHandler[Network Error Handler<br/>🟡 Connection]
+    ErrorType -->|Unknown| DefaultHandler[Default Error Handler<br/>🔴 Generic]
+
+    QAIErrorHandler --> SetCORS[CORS Headers<br/>🟢 For allowed origins]
+    ValidationErrorHandler --> SetCORS
+    JWTErrorHandler --> SetCORS
+    DatabaseErrorHandler --> SetCORS
+    NetworkErrorHandler --> SetCORS
+    DefaultHandler --> SetCORS
+
+    SetCORS --> LogError[Log Error<br/>🟢 Logger with context]
+    LogError --> DetermineStatus{Determine<br/>Status Code}
+
+    DetermineStatus -->|400| BadRequest[400 Bad Request<br/>VALIDATION_ERROR<br/>DATABASE_ERROR]
+    DetermineStatus -->|401| Unauthorized[401 Unauthorized<br/>INVALID_TOKEN<br/>TOKEN_EXPIRED<br/>UNAUTHORIZED]
+    DetermineStatus -->|404| NotFound[404 Not Found<br/>NOT_FOUND]
+    DetermineStatus -->|429| RateLimit[429 Too Many Requests<br/>RATE_LIMIT_EXCEEDED]
+    DetermineStatus -->|500| InternalError[500 Internal Server Error<br/>INTERNAL_ERROR]
+    DetermineStatus -->|502| BadGateway[502 Bad Gateway<br/>BAD_GATEWAY]
+    DetermineStatus -->|503| ServiceUnavailable[503 Service Unavailable<br/>QUEUE_UNAVAILABLE<br/>AI_SERVICE_UNAVAILABLE<br/>AGENT_UNAVAILABLE<br/>SERVICE_UNAVAILABLE]
+
+    BadRequest --> FormatResponse[Format Error Response<br/>🟢 JSON]
+    Unauthorized --> FormatResponse
+    NotFound --> FormatResponse
+    RateLimit --> FormatResponse
+    InternalError --> FormatResponse
+    BadGateway --> FormatResponse
+    ServiceUnavailable --> FormatResponse
+
+    FormatResponse --> SendResponse[Send HTTP Response<br/>🟢 With CORS headers]
+    SendResponse --> End([Response Sent])
+
+    style QAIErrorHandler fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style ValidationErrorHandler fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style JWTErrorHandler fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style DatabaseErrorHandler fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style NetworkErrorHandler fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style DefaultHandler fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style SetCORS fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style LogError fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style FormatResponse fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style SendResponse fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔧 Error Classes</h2>
+                <div class="overview">
+                    <h3>1. QAIError (Base Error Class)</h3>
+                    <ul>
+                        <li><strong>Properties:</strong> message, code, statusCode, details</li>
+                        <li><strong>Usage:</strong> Base class for all custom errors</li>
+                        <li><strong>File:</strong> <code>src/types/index.ts</code></li>
+                    </ul>
+
+                    <h3>2. ValidationError</h3>
+                    <ul>
+                        <li><strong>Extends:</strong> QAIError</li>
+                        <li><strong>Status Code:</strong> 400</li>
+                        <li><strong>Code:</strong> VALIDATION_ERROR</li>
+                        <li><strong>Usage:</strong> Request validation failures (Zod, Joi)</li>
+                    </ul>
+
+                    <h3>3. NotFoundError</h3>
+                    <ul>
+                        <li><strong>Extends:</strong> QAIError</li>
+                        <li><strong>Status Code:</strong> 404</li>
+                        <li><strong>Code:</strong> NOT_FOUND</li>
+                        <li><strong>Usage:</strong> Resource not found</li>
+                    </ul>
+
+                    <h3>4. RateLimitError</h3>
+                    <ul>
+                        <li><strong>Extends:</strong> QAIError</li>
+                        <li><strong>Status Code:</strong> 429</li>
+                        <li><strong>Code:</strong> RATE_LIMIT_EXCEEDED</li>
+                        <li><strong>Usage:</strong> Rate limiting violations</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🛠️ Database Error Codes</h2>
+                <div class="overview">
+                    <p>PostgreSQL error codes are mapped to user-friendly errors:</p>
+                    <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                        <thead>
+                            <tr style="background: #f5f5f5;">
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">PostgreSQL Code</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Error Code</th>
+                                <th style="padding: 12px; text-align: left; border: 1px solid #ddd;">Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>23505</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">VALIDATION_ERROR</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Unique constraint violation (resource already exists)</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>23503</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">VALIDATION_ERROR</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Foreign key constraint violation (referenced resource not found)</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 12px; border: 1px solid #ddd;"><code>23502</code></td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">VALIDATION_ERROR</td>
+                                <td style="padding: 12px; border: 1px solid #ddd;">Not null constraint violation (required field missing)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔍 Troubleshooting Guide</h2>
+                <div class="overview">
+                    <h3>Common Issues and Solutions</h3>
+
+                    <h4>1. 401 UNAUTHORIZED / INVALID_TOKEN</h4>
+                    <ul>
+                        <li><strong>Problem:</strong> Token is missing, invalid, or expired</li>
+                        <li><strong>Solution:</strong>
+                            <ul>
+                                <li>Check Authorization header: <code>Authorization: Bearer &lt;token&gt;</code></li>
+                                <li>Verify token hasn't expired</li>
+                                <li>Re-authenticate to get a new token</li>
+                            </ul>
+                        </li>
+                    </ul>
+
+                    <h4>2. 400 VALIDATION_ERROR</h4>
+                    <ul>
+                        <li><strong>Problem:</strong> Request body doesn't match expected schema</li>
+                        <li><strong>Solution:</strong>
+                            <ul>
+                                <li>Check request body structure matches API documentation</li>
+                                <li>Verify all required fields are present</li>
+                                <li>Check data types match expected types</li>
+                                <li>Review <code>details</code> field in error response for specific field errors</li>
+                            </ul>
+                        </li>
+                    </ul>
+
+                    <h4>3. 503 AI_SERVICE_UNAVAILABLE</h4>
+                    <ul>
+                        <li><strong>Problem:</strong> OpenAI API is down or rate limited</li>
+                        <li><strong>Solution:</strong>
+                            <ul>
+                                <li>Check OpenAI API status</li>
+                                <li>Verify API key is valid and has credits</li>
+                                <li>Wait for rate limit to reset</li>
+                                <li>Retry with exponential backoff</li>
+                            </ul>
+                        </li>
+                    </ul>
+
+                    <h4>4. 503 QUEUE_UNAVAILABLE</h4>
+                    <ul>
+                        <li><strong>Problem:</strong> Redis connection failed</li>
+                        <li><strong>Solution:</strong>
+                            <ul>
+                                <li>Check Redis service is running</li>
+                                <li>Verify Redis connection configuration</li>
+                                <li>Check network connectivity to Redis</li>
+                            </ul>
+                        </li>
+                    </ul>
+
+                    <h4>5. 502 BAD_GATEWAY</h4>
+                    <ul>
+                        <li><strong>Problem:</strong> Service is temporarily unavailable (deployment, restart)</li>
+                        <li><strong>Solution:</strong>
+                            <ul>
+                                <li>Wait a few moments and retry</li>
+                                <li>Check service health endpoint: <code>GET /health</code></li>
+                                <li>Verify service is not in shutdown state</li>
+                            </ul>
+                        </li>
+                    </ul>
+
+                    <h4>6. 500 INTERNAL_ERROR</h4>
+                    <ul>
+                        <li><strong>Problem:</strong> Unexpected server error</li>
+                        <li><strong>Solution:</strong>
+                            <ul>
+                                <li>In development: Check error message in response</li>
+                                <li>In production: Check server logs</li>
+                                <li>Report issue with request details and timestamp</li>
+                            </ul>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📝 Code References</h2>
+                <div class="overview">
+                    <ul>
+                        <li><strong>Error handler:</strong> <code>src/utils/error-handler.ts</code></li>
+                        <li><strong>Error classes:</strong> <code>src/types/index.ts</code> (QAIError, ValidationError, NotFoundError, RateLimitError)</li>
+                        <li><strong>Error handlers:</strong> <code>src/utils/error-handler.ts</code> (handleValidationError, handleDatabaseError, handleQueueError, handleAIError, handleAgentError)</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>

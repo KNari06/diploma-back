@@ -46,6 +46,37 @@
 
             <div class="section">
                 <h2 class="section-title">📊 Credits Flow</h2>
+
+                <div class="overview" style="margin-bottom: 20px; padding: 20px;">
+                    <h3 style="margin-top: 0; color: #667eea;">🎨 Legend (Легенда)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e1f5ff; border: 2px solid #01579b;"></span>
+                            <div>
+                                <strong>🔵 Blue</strong> - Credit Check (Проверка кредитов)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #fff4e1; border: 2px solid #e65100;"></span>
+                            <div>
+                                <strong>🟡 Orange</strong> - Plan Info & Cost Calc (Инфо плана и расчет)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 2px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green</strong> - Database Operations (Операции БД)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 3px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green (Bold)</strong> - Success (Успешно)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="diagram-container">
                     <div class="mermaid">
 flowchart TD
@@ -92,16 +123,63 @@ flowchart TD
 
             <div class="section">
                 <h2 class="section-title">💎 Subscription Plans</h2>
+
+                <div class="overview" style="margin-bottom: 20px; padding: 20px;">
+                    <h3 style="margin-top: 0; color: #667eea;">📊 Actual Plan Limits (Реальные лимиты)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px;">
+                        <div style="background: white; padding: 15px; border-radius: 8px; border-left: 4px solid #01579b; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                            <strong>🔵 Free Plan</strong>
+                            <p style="margin: 5px 0; color: #666;">Price: <strong style="color: #333;">$0/month</strong></p>
+                            <p style="margin: 5px 0; color: #666;">Daily: <strong style="color: #333;">3 credits</strong></p>
+                            <p style="margin: 5px 0; color: #666;">Monthly: <strong style="color: #333;">30 credits</strong></p>
+                        </div>
+                        <div style="background: white; padding: 15px; border-radius: 8px; border-left: 4px solid #e65100; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                            <strong>🟡 Pro Plan</strong>
+                            <p style="margin: 5px 0; color: #666;">Price: <strong style="color: #333;">$28.9/month</strong></p>
+                            <p style="margin: 5px 0; color: #666;">Daily: <strong style="color: #333;">Unlimited</strong></p>
+                            <p style="margin: 5px 0; color: #666;">Monthly: <strong style="color: #333;">1000 credits</strong></p>
+                        </div>
+                        <div style="background: white; padding: 15px; border-radius: 8px; border-left: 4px solid #2e7d32; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                            <strong>🟢 Ultra Plan</strong>
+                            <p style="margin: 5px 0; color: #666;">Price: <strong style="color: #333;">$43.9/month</strong></p>
+                            <p style="margin: 5px 0; color: #666;">Daily: <strong style="color: #333;">Unlimited</strong></p>
+                            <p style="margin: 5px 0; color: #666;">Monthly: <strong style="color: #333;">1000 credits</strong></p>
+                        </div>
+                    </div>
+
+                    <h3 style="margin-top: 0; color: #667eea;">🎨 Legend (Легенда)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e1f5ff; border: 2px solid #01579b;"></span>
+                            <div>
+                                <strong>🔵 Blue</strong> - Free Plan (Бесплатный план)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #fff4e1; border: 2px solid #e65100;"></span>
+                            <div>
+                                <strong>🟡 Orange</strong> - Pro Plan (Про план)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 2px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green</strong> - Ultra Plan (Ультра план)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="diagram-container">
                     <div class="mermaid">
 flowchart LR
-    Free[Free Plan<br/>$0/month] --> FreeLimits[Daily: 10<br/>Monthly: 100]
-    Pro[Pro Plan<br/>$X/month] --> ProLimits[Daily: 100<br/>Monthly: 1000]
-    Ultra[Ultra Plan<br/>$Y/month] --> UltraLimits[Daily: Unlimited<br/>Monthly: Unlimited]
+    Free[Free Plan<br/>$0/month] --> FreeLimits[Daily: 3<br/>Monthly: 30]
+    Pro[Pro Plan<br/>$28.9/month] --> ProLimits[Daily: Unlimited<br/>Monthly: 1000]
+    Ultra[Ultra Plan<br/>$43.9/month] --> UltraLimits[Daily: Unlimited<br/>Monthly: 1000]
 
-    FreeLimits --> Features1[Basic Features]
-    ProLimits --> Features2[All Features + Priority]
-    UltraLimits --> Features3[All Features + Highest Priority]
+    FreeLimits --> Features1[Basic Features<br/>3 tests/day max]
+    ProLimits --> Features2[All Features + Priority<br/>Unlimited tests]
+    UltraLimits --> Features3[All Features + Highest Priority<br/>Unlimited tests]
 
     style Free fill:#e1f5ff,stroke:#01579b,stroke-width:2px
     style Pro fill:#fff4e1,stroke:#e65100,stroke-width:2px
