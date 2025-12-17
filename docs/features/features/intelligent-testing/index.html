@@ -316,7 +316,10 @@
                 </div>
 
                 <div class="diagram-container">
-                    <div class="mermaid">
+                    <div style="margin-bottom: 15px; padding: 15px; background: #e3f2fd; border-radius: 8px; border-left: 4px solid #2196f3;">
+                        <strong>💡 Tip:</strong> Click on any method in the diagram to see detailed information about what it does, its parameters, dependencies, and more!
+                    </div>
+                    <div class="mermaid" id="flowDiagram">
 flowchart TD
     Start([🚀 Test Execution Starts]) --> Execute[IntelligentTestOrchestrator.execute<br/>🔵 Core Orchestrator]
 
@@ -497,15 +500,23 @@ flowchart TD
 
     <script src="../../assets/components.js"></script>
     <script>
-        mermaid.initialize({ startOnLoad: true, theme: 'default' });
-
         async function loadFeatureData() {
             try {
-                // Load methods from JSON (optional, for additional data)
+                // Extract embedded diagram code and render it interactively
+                const diagramContainer = document.getElementById('flowDiagram');
+                const embeddedDiagram = diagramContainer.textContent.trim();
+                diagramContainer.textContent = '';
+
+                // Load methods from JSON first (needed for tooltips)
+                let methods = {};
                 try {
                     const methodsResponse = await fetch('methods.json');
                     if (methodsResponse.ok) {
-                        const methods = await methodsResponse.json();
+                        methods = await methodsResponse.json();
+                        // Store methods globally for tooltips
+                        if (typeof window !== 'undefined') {
+                            window.methodsData = methods;
+                        }
                         // Use JSON data if available
                         if (Object.keys(methods).length > 0) {
                             const codeRefs = Object.values(methods)
@@ -566,10 +577,23 @@ flowchart TD
                     console.warn('Could not load changelog.json:', e);
                 }
 
+                // Render diagram interactively after methods are loaded
+                if (typeof renderMermaidDiagram === 'function') {
+                    renderMermaidDiagram(embeddedDiagram, 'flowDiagram');
+                } else {
+                    // Fallback: render directly
+                    diagramContainer.textContent = embeddedDiagram;
+                    mermaid.initialize({ startOnLoad: true, theme: 'default' });
+                    mermaid.init(undefined, diagramContainer);
+                }
+
             } catch (error) {
                 console.error('Error loading feature data:', error);
             }
         }
+
+        // Initialize on page load
+        loadFeatureData();
 
         function filterMethods(type, event) {
             document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));

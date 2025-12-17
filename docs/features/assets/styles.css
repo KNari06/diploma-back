@@ -219,6 +219,170 @@ body {
     gap: 5px;
 }
 
+/* Interactive diagram styles */
+.diagram-node-clickable {
+    transition: opacity 0.2s;
+}
+
+.diagram-node-clickable:hover {
+    opacity: 0.8;
+}
+
+/* Method tooltip modal */
+.method-tooltip-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10000;
+    animation: fadeIn 0.2s;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+.method-tooltip-content {
+    background: white;
+    border-radius: 12px;
+    max-width: 600px;
+    max-height: 80vh;
+    width: 90%;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    display: flex;
+    flex-direction: column;
+    animation: slideUp 0.3s;
+    overflow: hidden;
+}
+
+@keyframes slideUp {
+    from {
+        transform: translateY(20px);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+.method-tooltip-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px 25px;
+    border-bottom: 2px solid #e0e0e0;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+}
+
+.method-tooltip-header h3 {
+    margin: 0;
+    font-size: 1.3em;
+    font-family: 'Courier New', monospace;
+}
+
+.method-tooltip-close {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 2em;
+    cursor: pointer;
+    padding: 0;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: background 0.2s;
+}
+
+.method-tooltip-close:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.method-tooltip-body {
+    padding: 25px;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.method-tooltip-status {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-size: 0.85em;
+    font-weight: bold;
+    text-transform: uppercase;
+    margin-bottom: 20px;
+}
+
+.method-tooltip-section {
+    margin-bottom: 25px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid #e0e0e0;
+}
+
+.method-tooltip-section:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
+}
+
+.method-tooltip-section h4 {
+    margin: 0 0 12px 0;
+    color: #667eea;
+    font-size: 1em;
+    font-weight: 600;
+}
+
+.method-tooltip-section p {
+    margin: 0;
+    line-height: 1.6;
+    color: #666;
+}
+
+.method-tooltip-section ul {
+    margin: 10px 0 0 0;
+    padding-left: 20px;
+    color: #666;
+}
+
+.method-tooltip-section li {
+    margin-bottom: 8px;
+    line-height: 1.5;
+}
+
+.method-tooltip-section code {
+    background: #f5f5f5;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.9em;
+    color: #667eea;
+}
+
+.method-tooltip-section a {
+    color: #667eea;
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.method-tooltip-section a:hover {
+    text-decoration: underline;
+}
+
 @media (max-width: 768px) {
     .header h1 {
         font-size: 1.8em;
@@ -230,5 +394,18 @@ body {
 
     .stats-grid {
         grid-template-columns: repeat(2, 1fr);
+    }
+
+    .method-tooltip-content {
+        width: 95%;
+        max-height: 90vh;
+    }
+
+    .method-tooltip-header {
+        padding: 15px 20px;
+    }
+
+    .method-tooltip-body {
+        padding: 20px;
     }
 }
