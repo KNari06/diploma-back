@@ -103,22 +103,31 @@ export async function executeUiTestFlow(
       }
     }
 
-    // FIX #10: Deduct credits BEFORE test execution (not after)
-    // ✅ UPDATED: All UI tests are intelligent mode (Standard mode removed)
+    // ✅ FIX #1: Check credits availability BEFORE test creation (but don't deduct yet)
+    // Credits will be deducted AFTER successful queue job creation to prevent charging without running
     const uiTestType = 'intelligent';
     const testId = `ui_${planId}_${Date.now()}`;
+    const creditsRequired = TokenCalculatorService.getTestCreditCost(uiTestType);
 
     try {
-      await CreditCostTrackerService.deductCreditsForTest({
+      // Check if user has enough credits (without deducting)
+      const { data: user } = await supabaseAdmin
+        .from('users')
+        .select('credits')
+        .eq('id', userId)
+        .single();
+
+      if (!user || user.credits < creditsRequired) {
+        throw new Error('Insufficient credits');
+      }
+
+      logger.info('[UI_TEST] Credit check passed', {
         userId,
-        testType: uiTestType,
-        credits: TokenCalculatorService.getTestCreditCost(uiTestType),
-        costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001,
-        testId,
-        description: `${uiTestType} UI test: ${plan.url}`,
+        required: creditsRequired,
+        available: user.credits,
       });
     } catch (creditError) {
-      logger.error('[UI_TEST] Failed to deduct credits', {
+      logger.error('[UI_TEST] Credit check failed', {
         error: creditError instanceof Error ? creditError.message : String(creditError),
         userId,
       });
@@ -260,6 +269,42 @@ export async function executeUiTestFlow(
       testId: actualTestId,
       intelligentMode,
     });
+
+    // ✅ FIX #1: Deduct credits AFTER successful queue job creation
+    // This ensures we only charge if test actually started
+    emitProcessingStep(chatSessionId, 'executing_test', '💳 Deducting credits...', 90);
+    try {
+      await CreditCostTrackerService.deductCreditsForTest({
+        userId,
+        testType: uiTestType,
+        credits: creditsRequired,
+        costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001,
+        testId: actualTestId,
+        description: `${uiTestType} UI test: ${plan.url}`,
+      });
+      logger.info('[UI_TEST] Credits deducted successfully', {
+        testId: actualTestId,
+        credits: creditsRequired,
+      });
+    } catch (creditError) {
+      // If credit deduction fails AFTER test creation, we need to cancel the test
+      logger.error('[UI_TEST] Failed to deduct credits after test creation - cancelling test', {
+        error: creditError instanceof Error ? creditError.message : String(creditError),
+        testId: actualTestId,
+      });
+
+      // Cancel the test to prevent running without payment
+      try {
+        await ManualTestService.cancelTest(actualTestId, userId);
+      } catch (cancelError) {
+        logger.error('[UI_TEST] Failed to cancel test after credit deduction failure', {
+          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+          testId: actualTestId,
+        });
+      }
+
+      throw new Error('Failed to deduct credits - test cancelled');
+    }
 
     emitProcessingStep(chatSessionId, 'executing_test', '✅ Test started successfully!', 100);
 

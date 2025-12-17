@@ -122,7 +122,9 @@ export async function cancelAllRunningTestsForChatSession(
     for (const test of runningTests) {
       try {
         // Verify user has access if userId provided
-        if (userId && test.user_id && test.user_id !== userId) {
+        // NOTE: service-level types use camelCase, DB rows may be snake_case
+        const testUserId = (test as any).user_id ?? (test as any).userId;
+        if (userId && testUserId && testUserId !== userId) {
           errors.push(`Access denied to test ${test.id}`);
           continue;
         }

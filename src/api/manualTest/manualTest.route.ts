@@ -257,11 +257,37 @@ router.post('/run', requireAuth, requireCredits(1), asyncHandler(async (req: Req
 /**
  * POST /manual-test/result
  * Receive test result from Playwright agent
+ * ✅ FIX #6: Added authentication - this endpoint should be protected
+ * NOTE: This endpoint is DEPRECATED and should not be used.
+ * Test results are processed directly in worker via ManualTestService.processTestResult
+ * This endpoint is kept for backward compatibility only.
  */
-router.post('/result', asyncHandler(async (req: Request, res: Response) => {
+router.post('/result', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   try {
+    const userId = req.user?.id;
+    if (!userId) {
+      throw new ValidationError('User ID is required');
+    }
+
     // Validate request body
     const validatedData = testResultSchema.parse(req.body);
+
+    // ✅ FIX #6: Verify that the test belongs to the authenticated user
+    const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
+    const testResponse = await ManualTestService.getTest(validatedData.testId, userId);
+
+    if (!testResponse.success || !testResponse.data) {
+      logger.warn('[MANUAL_TEST] Unauthorized test result submission attempt', {
+        testId: validatedData.testId,
+        userId,
+      });
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'You do not have permission to submit results for this test',
+      });
+      return;
+    }
 
     const result = await ManualTestService.processTestResult(validatedData);
 

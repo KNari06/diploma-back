@@ -1,3 +1,4 @@
+/* eslint-disable no-case-declarations */
 import { AICostManager } from '@/services/ai-cost-manager.service';
 import { AIExtractService } from '@/services/ai-extract';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service';

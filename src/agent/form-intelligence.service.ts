@@ -711,7 +711,7 @@ Valid types: registration, login, checkout, contact, search, filter, settings, p
             if (!part) continue;
 
             // Already a CSS selector (starts with ., #, or [)
-            if (/^[.#\[]/.test(part)) {
+            if (part.startsWith('.') || part.startsWith('#') || part.startsWith('[')) {
               selectors.push(part);
             }
             // Plain ID - add # prefix

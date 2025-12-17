@@ -46,18 +46,48 @@ function renderMermaidDiagram(diagramCode, containerId) {
     div.textContent = diagramCode;
     container.appendChild(div);
 
-    mermaid.init(undefined, div).then(() => {
+    mermaid.init(undefined, div).then(({ svg }) => {
         // After diagram is rendered, make nodes interactive
+        // Use multiple timeouts to ensure SVG is fully rendered
         setTimeout(() => {
             makeDiagramInteractive(containerId);
-        }, 500);
+        }, 300);
+
+        // Also try after a longer delay in case SVG takes time to render
+        setTimeout(() => {
+            makeDiagramInteractive(containerId);
+        }, 1000);
+    }).catch(err => {
+        console.error('Mermaid render error:', err);
+        // Still try to make interactive after error
+        setTimeout(() => {
+            makeDiagramInteractive(containerId);
+        }, 1000);
     });
 }
 
 // Make Mermaid diagram nodes clickable and show tooltips
 async function makeDiagramInteractive(containerId) {
-    const container = document.getElementById(containerId);
-    if (!container) return;
+    // Try to find container by ID
+    let container = document.getElementById(containerId);
+
+    // If not found, try to find by class or querySelector
+    if (!container) {
+        container = document.querySelector(`#${containerId}`);
+    }
+
+    // If still not found, try to find parent container
+    if (!container) {
+        const mermaidDiv = document.querySelector('.mermaid');
+        if (mermaidDiv) {
+            container = mermaidDiv.parentElement;
+        }
+    }
+
+    if (!container) {
+        console.warn('Container not found:', containerId);
+        return;
+    }
 
     // Load methods data (check window.methodsData first if set by page)
     if (typeof window !== 'undefined' && window.methodsData && Object.keys(window.methodsData).length > 0) {
@@ -67,51 +97,125 @@ async function makeDiagramInteractive(containerId) {
         await loadMethodsData();
     }
 
-    // Find all SVG nodes in the diagram
+    // Find all SVG nodes in the diagram - try multiple approaches
     const svg = container.querySelector('svg');
-    if (!svg) return;
+    if (!svg) {
+        console.warn('SVG not found in container');
+        return;
+    }
 
-    // Find all node elements (rectangles, circles, etc.)
-    const nodes = svg.querySelectorAll('g.node, g[id^="flowchart-"], rect, circle, polygon');
+    // Mermaid renders nodes as g.node elements
+    // Try different selectors to find nodes
+    let nodeGroups = svg.querySelectorAll('g.node');
 
-    nodes.forEach(node => {
-        // Get the text content to find method name
-        const textElement = node.closest('g')?.querySelector('text');
-        if (!textElement) return;
+    // If no nodes found, try alternative selectors
+    if (nodeGroups.length === 0) {
+        nodeGroups = svg.querySelectorAll('g[id^="flowchart-"], g[class*="node"]');
+    }
 
-        const nodeText = textElement.textContent || '';
+    if (nodeGroups.length === 0) {
+        console.warn('No nodes found in diagram');
+        return;
+    }
 
-        // Extract method name from node text (remove emojis and status)
+    console.log(`Found ${nodeGroups.length} nodes in diagram`);
+
+    nodeGroups.forEach((nodeGroup, index) => {
+        // Get text content from various possible locations
+        let nodeText = '';
+
+        // Try to get text from foreignObject (for HTML labels)
+        const foreignObject = nodeGroup.querySelector('foreignObject');
+        if (foreignObject) {
+            nodeText = foreignObject.textContent || foreignObject.innerText || '';
+        }
+
+        // If no foreignObject, try regular text elements
+        if (!nodeText) {
+            const textElements = nodeGroup.querySelectorAll('text, tspan');
+            textElements.forEach(textEl => {
+                nodeText += (textEl.textContent || '') + ' ';
+            });
+            nodeText = nodeText.trim();
+        }
+
+        // If still no text, try getting from title or label
+        if (!nodeText) {
+            const title = nodeGroup.querySelector('title');
+            if (title) {
+                nodeText = title.textContent || '';
+            }
+        }
+
+        if (!nodeText) {
+            // Skip nodes without text
+            return;
+        }
+
+        // Extract method name from node text
         const methodName = extractMethodName(nodeText);
 
         if (methodName) {
             // Find method data
             const methodData = findMethodData(methodName);
 
-            if (methodData) {
-                // Make node clickable
-                const nodeGroup = node.closest('g') || node.parentElement;
-                if (nodeGroup) {
-                    nodeGroup.style.cursor = 'pointer';
-                    nodeGroup.classList.add('diagram-node-clickable');
+            // Make node clickable even if no method data found (for debugging)
+            nodeGroup.style.cursor = 'pointer';
+            nodeGroup.classList.add('diagram-node-clickable');
 
-                    // Add click handler
-                    nodeGroup.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        showMethodTooltip(methodData, e);
-                    });
+            // Add click handler
+            nodeGroup.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
 
-                    // Add hover effect
-                    nodeGroup.addEventListener('mouseenter', () => {
-                        nodeGroup.style.opacity = '0.8';
+                if (methodData) {
+                    showMethodTooltip(methodData, e);
+                } else {
+                    // Show debug info if no method data
+                    console.log('Clicked node:', {
+                        text: nodeText,
+                        extractedName: methodName,
+                        availableMethods: Object.keys(methodsData)
                     });
-                    nodeGroup.addEventListener('mouseleave', () => {
-                        nodeGroup.style.opacity = '1';
-                    });
+                    // Still show tooltip with available info
+                    showMethodTooltip({
+                        name: methodName,
+                        description: `Node text: ${nodeText}`,
+                        file: 'N/A',
+                        line: 'N/A'
+                    }, e);
                 }
-            }
+            });
+
+            // Add hover effect
+            nodeGroup.addEventListener('mouseenter', () => {
+                nodeGroup.style.opacity = '0.8';
+                nodeGroup.style.transform = 'scale(1.02)';
+            });
+            nodeGroup.addEventListener('mouseleave', () => {
+                nodeGroup.style.opacity = '1';
+                nodeGroup.style.transform = 'scale(1)';
+            });
+
+            // Also make child elements (rect, circle, etc.) clickable
+            const shapes = nodeGroup.querySelectorAll('rect, circle, polygon, ellipse, path');
+            shapes.forEach(shape => {
+                shape.style.cursor = 'pointer';
+                shape.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    nodeGroup.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                });
+            });
         }
     });
+
+    console.log('Diagram made interactive');
+}
+
+// Make function globally available
+if (typeof window !== 'undefined') {
+    window.makeDiagramInteractive = makeDiagramInteractive;
 }
 
 // Extract method name from node text

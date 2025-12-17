@@ -26,10 +26,10 @@ export async function checkAndHandleTestCompletion(testId: string): Promise<void
     const resultsResponse = await getTestResults(testId);
     const results = resultsResponse.data || [];
 
-    // Check if all browsers have completed (either 'completed' or 'failed')
+    // Check if all browsers have completed (either 'completed', 'failed', or 'cancelled')
     const expectedBrowsers = test.browsers || [];
     const completedBrowsers = results.filter(result =>
-      ['completed', 'failed'].includes(result.status)
+      ['completed', 'failed', 'cancelled'].includes(result.status)
     );
 
     const isTestComplete = expectedBrowsers.length > 0 &&
@@ -45,13 +45,32 @@ export async function checkAndHandleTestCompletion(testId: string): Promise<void
     });
 
     if (isTestComplete) {
-      // Update test status to completed
+      // ✅ FIX #8: Determine final status based on results (not always 'completed')
+      // Priority: cancelled > failed > completed
+      const hasCancelled = results.some(r => r.status === 'cancelled');
+      const hasFailed = results.some(r => r.status === 'failed');
+
+      let finalStatus: 'completed' | 'failed' | 'cancelled';
+      if (hasCancelled) {
+        finalStatus = 'cancelled';
+      } else if (hasFailed) {
+        finalStatus = 'failed';
+      } else {
+        finalStatus = 'completed';
+      }
+
+      // Update test status to final status
       await dbService.updateTest(testId, {
-        status: 'completed',
+        status: finalStatus,
         completed_at: new Date().toISOString(),
       });
 
-      logger.info('[MANUAL_TEST_SERVICE] Test marked as completed', { testId });
+      logger.info('[MANUAL_TEST_SERVICE] Test marked as finished', {
+        testId,
+        finalStatus,
+        hasCancelled,
+        hasFailed,
+      });
 
       // Notify all associated chat sessions
       await TestCompletionHandlerService.handleTestCompletion(testId);

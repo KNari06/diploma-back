@@ -84,7 +84,7 @@ if (!parseResult.success) {
 }
 
 // Generate secrets for development if not provided
-let parsedEnv = parseResult.data;
+const parsedEnv = parseResult.data;
 
 if (parsedEnv.NODE_ENV === 'development') {
   if (!parsedEnv.JWT_SECRET) {

@@ -125,7 +125,7 @@ export class SafetyGuard {
     }
 
     // Check 2: Payment/billing page
-    const paymentCheck = this.checkPaymentPage(context, action, config);
+    const paymentCheck = this.checkPaymentPage(context, action);
     if (!paymentCheck.safe) {
       return paymentCheck;
     }
@@ -298,8 +298,7 @@ export class SafetyGuard {
    */
   private static checkPaymentPage(
     context: PageContext,
-    action: DynamicAction,
-    config: SafetyConfig
+    action: DynamicAction
   ): SafetyCheckResult {
     // Validate inputs
     if (!context || !action) {

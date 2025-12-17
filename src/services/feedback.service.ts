@@ -332,7 +332,7 @@ export class FeedbackService {
       const dateFrom = new Date();
       dateFrom.setDate(dateFrom.getDate() - days);
 
-      let query = supabase
+      const query = supabase
         .from('feedback_analytics')
         .select('*')
         .gte('date', dateFrom.toISOString().split('T')[0])

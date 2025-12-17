@@ -221,11 +221,21 @@ body {
 
 /* Interactive diagram styles */
 .diagram-node-clickable {
-    transition: opacity 0.2s;
+    transition: opacity 0.2s, transform 0.2s;
 }
 
 .diagram-node-clickable:hover {
     opacity: 0.8;
+    transform: scale(1.02);
+}
+
+.diagram-node-clickable rect,
+.diagram-node-clickable circle,
+.diagram-node-clickable polygon,
+.diagram-node-clickable ellipse,
+.diagram-node-clickable path {
+    pointer-events: all;
+    cursor: pointer;
 }
 
 /* Method tooltip modal */

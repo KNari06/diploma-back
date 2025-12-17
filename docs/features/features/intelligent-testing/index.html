@@ -315,7 +315,7 @@
                     </p>
                 </div>
 
-                <div class="diagram-container">
+                <div class="diagram-container" id="diagramContainer">
                     <div style="margin-bottom: 15px; padding: 15px; background: #e3f2fd; border-radius: 8px; border-left: 4px solid #2196f3;">
                         <strong>💡 Tip:</strong> Click on any method in the diagram to see detailed information about what it does, its parameters, dependencies, and more!
                     </div>
@@ -581,10 +581,27 @@ flowchart TD
                 if (typeof renderMermaidDiagram === 'function') {
                     renderMermaidDiagram(embeddedDiagram, 'flowDiagram');
                 } else {
-                    // Fallback: render directly
+                    // Fallback: render directly and make interactive
                     diagramContainer.textContent = embeddedDiagram;
                     mermaid.initialize({ startOnLoad: true, theme: 'default' });
-                    mermaid.init(undefined, diagramContainer);
+                    mermaid.init(undefined, diagramContainer).then(() => {
+                        // Make interactive after rendering - try multiple times
+                        setTimeout(() => {
+                            if (typeof makeDiagramInteractive === 'function') {
+                                makeDiagramInteractive('diagramContainer');
+                            } else if (typeof window !== 'undefined' && window.makeDiagramInteractive) {
+                                window.makeDiagramInteractive('diagramContainer');
+                            }
+                        }, 500);
+
+                        setTimeout(() => {
+                            if (typeof makeDiagramInteractive === 'function') {
+                                makeDiagramInteractive('diagramContainer');
+                            } else if (typeof window !== 'undefined' && window.makeDiagramInteractive) {
+                                window.makeDiagramInteractive('diagramContainer');
+                            }
+                        }, 1500);
+                    });
                 }
 
             } catch (error) {

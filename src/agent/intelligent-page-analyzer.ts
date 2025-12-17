@@ -152,11 +152,10 @@ export class IntelligentPageAnalyzer {
 
       // ✅ NEW: Enhance DOM selectors with AI Selector Engine
       logger.info('[INTELLIGENT_ANALYZER] Enhancing DOM selectors with AI', { url });
-      let enhancedDomAnalysis = await this.enhanceDOMWithAISelectors(
+      const enhancedDomAnalysis = await this.enhanceDOMWithAISelectors(
         page,
         domAnalysis,
-        url,
-        goal
+        url
       );
       logger.info('[INTELLIGENT_ANALYZER] Screenshot & DOM captured successfully', {
         url,
@@ -946,8 +945,7 @@ export class IntelligentPageAnalyzer {
   private static async enhanceDOMWithAISelectors(
     page: Page,
     domAnalysis: DOMAnalysis,
-    url: string,
-    goal?: string
+    url: string
   ): Promise<DOMAnalysis> {
     const startTime = Date.now();
 
@@ -1434,11 +1432,8 @@ export class IntelligentPageAnalyzer {
       // ✅ NEW: Strategy 4 - Try aria-label and data-attributes matching via page.evaluate
       if (!matchedSelector && visionElement.text) {
         try {
-          const visionText = visionElement.text.toLowerCase().trim();
-          const elementType = visionElement.type;
-
           const ariaMatches = await page.evaluate(
-            ({ text, type }) => {
+            ({ text }) => {
               const results: Array<{ selector: string; confidence: number }> = [];
               const searchText = text.toLowerCase().trim();
 
@@ -1480,7 +1475,7 @@ export class IntelligentPageAnalyzer {
 
               return results;
             },
-            { text: visionElement.text, type: elementType }
+            { text: visionElement.text }
           );
 
           if (ariaMatches.length > 0) {
@@ -1529,8 +1524,8 @@ export class IntelligentPageAnalyzer {
 
     // ✅ ENHANCED: Batch check all text selectors at once (one page.evaluate call)
     const elementsNeedingTextCheck = matchedElements
-      .map((el, idx) => ({ element: el, index: idx }))
-      .filter((_, idx) => !matchedElements[idx].selector && (visionAnalysis.elements[idx] as any)?._needsTextCheck);
+      .map((el, index) => ({ element: el, index }))
+      .filter((item) => !item.element.selector && (visionAnalysis.elements[item.index] as any)?._needsTextCheck);
 
     if (elementsNeedingTextCheck.length > 0) {
       try {
@@ -1546,7 +1541,6 @@ export class IntelligentPageAnalyzer {
           for (const sel of selectors) {
             let found = false;
             let count = 0;
-            let workingSelector = '';
 
             // Try type selector first (more specific)
             if (sel.typeSelector) {
@@ -1556,7 +1550,6 @@ export class IntelligentPageAnalyzer {
                 count = elements.length;
                 if (count > 0) {
                   found = true;
-                  workingSelector = sel.typeSelector;
                 }
               } catch {
                 // Invalid selector, skip
@@ -1571,7 +1564,6 @@ export class IntelligentPageAnalyzer {
                 count = elements.length;
                 if (count > 0) {
                   found = true;
-                  workingSelector = sel.textSelector;
                 }
               } catch {
                 // Invalid selector, skip
@@ -1628,13 +1620,13 @@ export class IntelligentPageAnalyzer {
 
     // ✅ NEW: Final validation - check for duplicate selectors and log warnings
     const selectorCounts = new Map<string, number>();
-    matchedElements.forEach((el, idx) => {
+    matchedElements.forEach((el) => {
       if (el.selector) {
         selectorCounts.set(el.selector, (selectorCounts.get(el.selector) || 0) + 1);
       }
     });
 
-    const duplicates = Array.from(selectorCounts.entries()).filter(([_, count]) => count > 1);
+    const duplicates = Array.from(selectorCounts.entries()).filter((entry) => entry[1] > 1);
     if (duplicates.length > 0) {
       logger.warn('[INTELLIGENT_ANALYZER] Duplicate selectors detected', {
         duplicates: duplicates.map(([selector, count]) => ({ selector, count })),

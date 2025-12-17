@@ -218,6 +218,7 @@ export class ManualTestRunJobHandler {
 
   /**
    * Update test status in database
+   * ✅ FIX #5: Always check if test is cancelled before updating status
    */
   private static async updateTestStatus(
     testId: string,
@@ -230,19 +231,17 @@ export class ManualTestRunJobHandler {
     if (startedAt) updateData.started_at = startedAt;
     if (completedAt) updateData.completed_at = completedAt;
 
-    if (status === 'running') {
-      const updated = await dbAdminService.updateTestIfNotCancelled(testId, updateData);
-      if (!updated) {
-        // Most likely cancelled (or deleted). Re-check and stop gracefully.
-        if (await this.checkTestCancelled(testId)) {
-          throw new TestCancelledError(testId, browser);
-        }
-        throw new Error(`Failed to update test status to running: ${testId}`);
+    // ✅ FIX #5: Use updateTestIfNotCancelled for ALL status updates (not just 'running')
+    // This prevents overwriting cancelled status with failed/completed
+    const updated = await dbAdminService.updateTestIfNotCancelled(testId, updateData);
+    if (!updated) {
+      // Most likely cancelled (or deleted). Re-check and stop gracefully.
+      if (await this.checkTestCancelled(testId)) {
+        logger.info(`[TEST-RUN] Test is cancelled, skipping status update to ${status}: ${testId} (${browser})`);
+        throw new TestCancelledError(testId, browser);
       }
-      return;
+      throw new Error(`Failed to update test status to ${status}: ${testId}`);
     }
-
-    await dbAdminService.updateTest(testId, updateData);
   }
 
   /**
@@ -569,16 +568,28 @@ export class ManualTestResultJobHandler {
         expectedBrowsers.every((b) => latestByBrowser.has(b));
 
       const latestResults = Array.from(latestByBrowser.values());
-      const finalResults = latestResults.filter((r: any) => r.status === 'completed' || r.status === 'failed');
+      // ✅ FIX #8: Include 'cancelled' in final results
+      const finalResults = latestResults.filter((r: any) =>
+        r.status === 'completed' || r.status === 'failed' || r.status === 'cancelled'
+      );
 
       // Determine overall test status
+      // ✅ FIX #8: Priority: cancelled > failed > completed
+      const hasCancelled = finalResults.some((r: any) => r.status === 'cancelled');
       const hasFailed = finalResults.some((r: any) => r.status === 'failed');
       const allCompleted = hasAllResults && finalResults.length === expectedBrowsersCount;
 
-      let status: 'running' | 'completed' | 'failed' = 'running';
+      let status: 'running' | 'completed' | 'failed' | 'cancelled' = 'running';
 
       if (allCompleted) {
-        status = hasFailed ? 'failed' : 'completed';
+        // ✅ FIX #8: Determine final status based on priority
+        if (hasCancelled) {
+          status = 'cancelled';
+        } else if (hasFailed) {
+          status = 'failed';
+        } else {
+          status = 'completed';
+        }
       } else if (hasAllResults && finalResults.length < expectedBrowsersCount) {
         // ✅ FIX: Some browsers are still running/pending
         status = 'running';

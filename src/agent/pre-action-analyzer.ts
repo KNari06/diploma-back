@@ -137,34 +137,7 @@ const SUBMIT_BUTTON_KEYWORDS: Record<string, string[]> = {
   ko: ['제출', '로그인', '가입', '계속', '저장', '확인'],
 };
 
-/**
- * CSS class patterns for disabled state
- * Covers major UI frameworks
- */
-const DISABLED_CLASS_PATTERNS = [
-  // Generic
-  'disabled', 'is-disabled', 'btn-disabled', '--disabled',
-  // Bootstrap
-  'disabled',
-  // Material UI
-  'Mui-disabled', 'MuiButton-disabled',
-  // Ant Design
-  'ant-btn-disabled', 'ant-input-disabled',
-  // Chakra UI
-  'chakra-button__disabled',
-  // Tailwind
-  'cursor-not-allowed', 'opacity-50',
-  // Custom patterns (regex)
-];
-
-/**
- * CSS class patterns for loading state
- */
-const LOADING_CLASS_PATTERNS = [
-  'loading', 'is-loading', 'spinner', 'is-spinner',
-  'btn-loading', 'submitting', 'processing', 'pending',
-  'Mui-loading', 'ant-btn-loading',
-];
+// NOTE: Disabled/loading class pattern constants were removed (unused; caused lint errors).
 
 /**
  * CSS class patterns for error/invalid state
@@ -546,7 +519,7 @@ export class PreActionAnalyzer {
         analysis.canProceed = false;
 
         // Analyze WHY it's disabled with enhanced context
-        const disabledAnalysis = await this.analyzeDisabledReason(page, normalizedSelector, action, pageUrl);
+        const disabledAnalysis = await this.analyzeDisabledReason(page, normalizedSelector);
         // Persist reason on elementState for downstream (logging/UI)
         if (analysis.elementState) {
           analysis.elementState.disabledReason = disabledAnalysis.disabledReason;
@@ -977,9 +950,7 @@ export class PreActionAnalyzer {
    */
   static async analyzeDisabledReason(
     page: Page,
-    selector: string,
-    action: DynamicAction,
-    pageUrl?: string
+    selector: string
   ): Promise<{ disabledReason: string; suggestedActions: DynamicAction[]; requiredFields: Array<{ selector: string; label: string; isEmpty: boolean }>; validationErrors?: string[] }> {
     const suggestedActions: DynamicAction[] = [];
     const requiredFields: Array<{ selector: string; label: string; isEmpty: boolean }> = [];
@@ -1033,7 +1004,7 @@ export class PreActionAnalyzer {
       if (checkboxes.length > 0) {
         disabledReason = `Required checkbox(es) not checked: ${checkboxes.map(c => c.label).join(', ')}`;
 
-        checkboxes.forEach((checkbox, idx) => {
+        checkboxes.forEach((checkbox) => {
           suggestedActions.push({
             action: 'check',
             selector: checkbox.selector,

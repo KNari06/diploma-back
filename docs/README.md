@@ -44,6 +44,7 @@
 - [**⚡ Intelligent Mode Optimization**](./development/INTELLIGENT_MODE_OPTIMIZATION.md) - Network & data collection оптимизация
 - [**🔌 WebSocket Worker Bridge Plan**](./development/WEBSOCKET_WORKER_BRIDGE_PLAN.md) - План передачи этапов тестирования через WebSocket из Worker
 - [**✅ WebSocket Redis Bridge Implementation**](./development/WEBSOCKET_REDIS_BRIDGE_IMPLEMENTATION.md) - Реализация Redis Pub/Sub для WebSocket событий
+- [**🧪 Testing Flow Audit (last 10 days)**](./development/TESTING_FLOW_AUDIT_LAST_10_DAYS.md) - живой список рисков/проблем по end-to-end тест флоу
 - [**Auth Implementation**](./development/auth-implementation.md) - технические детали аутентификации
 - [**Auth Validation**](./development/auth-validation.md) - отчет проверки auth файлов
 - [**Anonymous User Migration**](./development/anonymous-user-migration.md) - миграция анонимных пользователей

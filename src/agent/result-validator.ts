@@ -108,7 +108,7 @@ export class ResultValidator {
     }
 
     if (expected.includes('decrease')) {
-      return await this.validateCountDecrease(expected, page);
+      return await this.validateCountDecrease();
     }
 
     if (expected.includes('message') || expected.includes('notification')) {
@@ -120,11 +120,11 @@ export class ResultValidator {
     }
 
     if (expected.includes('enable') || expected.includes('clickable')) {
-      return await this.validateElementEnabled(expected, page);
+      return await this.validateElementEnabled();
     }
 
     if (expected.includes('disable')) {
-      return await this.validateElementDisabled(expected, page);
+      return await this.validateElementDisabled();
     }
 
     // Generic text-based validation
@@ -579,10 +579,7 @@ export class ResultValidator {
   /**
    * Validate count decreases
    */
-  private static async validateCountDecrease(
-    expected: string,
-    page: Page
-  ): Promise<ValidationResult> {
+  private static async validateCountDecrease(): Promise<ValidationResult> {
     // Similar to validateCountIncrease but checking for decrease
     return {
       valid: true,
@@ -705,10 +702,7 @@ export class ResultValidator {
   /**
    * Validate element becomes enabled
    */
-  private static async validateElementEnabled(
-    expected: string,
-    page: Page
-  ): Promise<ValidationResult> {
+  private static async validateElementEnabled(): Promise<ValidationResult> {
     // Extract element from expectation
     return {
       valid: true,
@@ -722,10 +716,7 @@ export class ResultValidator {
   /**
    * Validate element becomes disabled
    */
-  private static async validateElementDisabled(
-    expected: string,
-    page: Page
-  ): Promise<ValidationResult> {
+  private static async validateElementDisabled(): Promise<ValidationResult> {
     return {
       valid: true,
       expected: 'Element should become disabled',

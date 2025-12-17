@@ -214,8 +214,9 @@ export class IntelligentTestStorageService {
           url_changed: result.urlChanged ?? false,
           url_before: result.urlBefore || null,
           url_after: result.urlAfter || null,
-          screenshot_before: result.screenshot || null,
-          screenshot_after: result.screenshot || null, // ✅ FIX #6: ActionResult only has one screenshot field
+          // ✅ FIX #9: Use proper before/after screenshot fields
+          screenshot_before: result.screenshotBefore || result.screenshot || null,
+          screenshot_after: result.screenshotAfter || result.screenshot || null,
           executed_at: result.timestamp && typeof result.timestamp === 'number'
             ? new Date(result.timestamp).toISOString()
             : new Date().toISOString(), // ✅ Fallback timestamp

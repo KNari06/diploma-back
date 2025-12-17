@@ -69,71 +69,7 @@ const NextStepResponseSchema = z.object({
   }).nullable().optional(),
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CACHE FOR RECENT GENERATIONS (1-5 min TTL)
-// ═══════════════════════════════════════════════════════════════════════════
-
-interface CachedGeneration {
-  actions: DynamicAction[];
-  reasoning: string;
-  confidence: number;
-  timestamp: number;
-}
-
-const generationCache = new Map<string, CachedGeneration>();
-const CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
-
-/**
- * Generates a cache key from page context and goal
- *
- * Creates a unique identifier by combining URL, page type, and test goal.
- * Used to cache action generations for similar contexts.
- *
- * @param context - Page context with URL and page type
- * @param goal - Test goal string
- * @returns Base64-encoded cache key (32 characters)
- */
-function getCacheKey(context: PageContext, goal: string): string {
-  const str = `${context.url}|${context.pageType}|${goal}`;
-  return Buffer.from(str).toString('base64').substring(0, 32);
-}
-
-// function getCachedGeneration(context: PageContext, goal: string): CachedGeneration | null {
-//   const key = getCacheKey(context, goal);
-//   const cached = generationCache.get(key);
-
-//   if (!cached) return null;
-
-//   const age = Date.now() - cached.timestamp;
-//   if (age > CACHE_TTL_MS) {
-//     generationCache.delete(key);
-//     return null;
-//   }
-
-//   return cached;
-// }
-
-/**
- * Stores action generation result in cache
- *
- * Caches the generated actions with timestamp for future reuse.
- * Automatically removes oldest entries when cache exceeds 50 items.
- *
- * @param context - Page context used for cache key generation
- * @param goal - Test goal used for cache key generation
- * @param result - Generation result to cache (actions, reasoning, confidence)
- */
-function setCachedGeneration(context: PageContext, goal: string, result: CachedGeneration): void {
-  const key = getCacheKey(context, goal);
-  generationCache.set(key, { ...result, timestamp: Date.now() });
-
-  // Cleanup old entries (keep max 50)
-  if (generationCache.size > 50) {
-    const oldestKey = Array.from(generationCache.entries())
-      .sort((a, b) => a[1].timestamp - b[1].timestamp)[0][0];
-    generationCache.delete(oldestKey);
-  }
-}
+// Cache for action generations is currently disabled.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ACTION GENERATOR
@@ -1242,7 +1178,7 @@ export class ContextualActionGenerator {
   private static findBalancedJSON(str: string, startChar: '{' | '['): string | null {
     const endChar = startChar === '{' ? '}' : ']';
     let depth = 0;
-    let startIdx = str.indexOf(startChar);
+    const startIdx = str.indexOf(startChar);
     if (startIdx === -1) return null;
 
     for (let i = startIdx; i < str.length; i++) {
@@ -1297,7 +1233,7 @@ export class ContextualActionGenerator {
       if (jsonInBlock) {
         try {
           // Try to fix common issues: trailing commas, comments
-          let cleaned = jsonInBlock
+          const cleaned = jsonInBlock
             .replace(/,\s*([}\]])/g, '$1') // Remove trailing commas
             .replace(/\/\*[\s\S]*?\*\//g, '') // Remove block comments
             .replace(/\/\/.*$/gm, ''); // Remove line comments
@@ -1323,7 +1259,7 @@ export class ContextualActionGenerator {
     if (jsonMatch) {
       try {
         // Try to fix common issues
-        let cleaned = jsonMatch
+        const cleaned = jsonMatch
           .replace(/,\s*([}\]])/g, '$1') // Remove trailing commas
           .replace(/\/\*[\s\S]*?\*\//g, '') // Remove block comments
           .replace(/\/\/.*$/gm, ''); // Remove line comments

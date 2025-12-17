@@ -301,20 +301,24 @@ export class AIAnalysisJobHandler {
       const webhookUrl = project.settings.integrations.webhook;
       logger.info(`[AI-ANALYSIS] Sending webhook notification for test: ${testId}`);
 
+      // ✅ FIX #12: Use actual test status instead of hardcoding 'completed'
+      const testStatus = test.status || 'completed';
+      const eventName = `test.${testStatus}`; // test.completed, test.failed, test.cancelled
+
       // Send webhook notification
       await QueueManager.addWebhookJob({
         url: webhookUrl,
-        event: 'test.completed',
+        event: eventName,
         data: {
           testId,
           projectId: test.project_id,
-          status: 'completed',
+          status: testStatus, // ✅ FIX #12: Use actual status
           aiSummary,
           timestamp: new Date().toISOString(),
         },
         headers: {
           'Content-Type': 'application/json',
-          'X-QAIT-Event': 'test.completed',
+          'X-QAIT-Event': eventName, // ✅ FIX #12: Use actual event name
         },
       });
 

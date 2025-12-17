@@ -68,7 +68,15 @@ class WebSocketRedisSubscriber {
           break;
 
         case 'test:progress':
-          wsService.emitTestProgress(payload.testId, payload);
+          // ✅ FIX #4: Unified test:progress handling (removed duplicate case below)
+          // This can come from emitToUser (intelligent-test-orchestrator) or emitTestProgress
+          if (target?.userId) {
+            // Emit to user if userId is in target (from emitToUser fallback)
+            wsService.emitToUser(target.userId, 'test:progress', payload);
+          } else if (payload.testId) {
+            // Emit to test room if testId is in payload (standard flow)
+            wsService.emitTestProgress(payload.testId, payload);
+          }
           break;
 
         case 'test:step:completed':
@@ -144,17 +152,9 @@ class WebSocketRedisSubscriber {
           }
           break;
 
-        // User events (from emitToUser fallback)
-        case 'test:progress':
-          // This can come from emitToUser (intelligent-test-orchestrator) or emitTestProgress
-          if (target?.userId) {
-            // Emit to user if userId is in target
-            wsService.emitToUser(target.userId, 'test:progress', payload);
-          } else if (payload.testId) {
-            // Emit to test room if testId is in payload
-            wsService.emitTestProgress(payload.testId, payload);
-          }
-          break;
+        // ✅ FIX #4: Removed duplicate 'test:progress' case
+        // This case was already handled above in test lifecycle events (line 70-72)
+        // Keeping only the first occurrence to avoid dead code
 
         case 'test:graph-update': // ✅ NEW: Real-time graph streaming
           // Check for userId first (from emitToUser fallback)

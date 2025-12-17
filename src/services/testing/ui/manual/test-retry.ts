@@ -1,5 +1,5 @@
 import { QueueManager } from '@/config/queues';
-import { dbService } from '@/db/supabase';
+import { dbService, supabaseAdmin } from '@/db/supabase';
 import { ApiResponse, NotFoundError, Test, ValidationError } from '@/types';
 import { logger, logTestEvent } from '@/utils/logger';
 import { checkUserCredits, deductCredits } from './test-credits';
@@ -42,17 +42,35 @@ export async function retryTest(testId: string, userId?: string): Promise<ApiRes
       test.options?.estimatedCost // May be stored in options from original test
     );
 
-    // Reset test status
-    const updatedTest = await dbService.updateTest(testId, {
-      status: 'pending',
-      started_at: null,
-      completed_at: null,
-    }) as any;
+    // ✅ FIX #18: Delete old test results before retry to prevent stale data
+    try {
+      const { error: deleteError } = await supabaseAdmin
+        .from('test_results')
+        .delete()
+        .eq('test_id', testId);
 
-    // Add jobs to queue for each browser
+      if (deleteError) {
+        logger.warn('[RETRY_TEST] Failed to delete old test results', {
+          testId,
+          error: deleteError.message,
+        });
+        // Don't fail retry if deletion fails - old results will be overwritten
+      } else {
+        logger.info('[RETRY_TEST] Deleted old test results', { testId });
+      }
+    } catch (deleteError) {
+      logger.warn('[RETRY_TEST] Failed to delete old test results', {
+        testId,
+        error: deleteError instanceof Error ? deleteError.message : String(deleteError),
+      });
+    }
+
+    // ✅ FIX #16: Add jobs to queue BEFORE updating status
+    // This ensures we don't set status to 'pending' if queueing fails
     // IMPORTANT: Restore full AI context (commands, testGoal, etc.)
+    const queuedJobs: string[] = [];
     for (const browser of test.browsers) {
-      await QueueManager.addTestRunJob({
+      const job = await QueueManager.addTestRunJob({
         testId: test.id,
         url: test.url,
         browser,
@@ -66,9 +84,16 @@ export async function retryTest(testId: string, userId?: string): Promise<ApiRes
         testGoal: test.test_goal || undefined,
         retryCount: 1, // Variant A: Retry with same plan (first retry)
       });
+      queuedJobs.push(job.id || 'unknown');
     }
 
-    // Deduct credits
+    logger.info('[RETRY_TEST] All jobs queued successfully', {
+      testId,
+      queuedJobs: queuedJobs.length,
+    });
+
+    // ✅ FIX #17: Deduct credits AFTER successful queueing (before status update)
+    // This ensures we only charge if jobs are actually queued
     await deductCredits(
       userId,
       test.id,
@@ -76,6 +101,14 @@ export async function retryTest(testId: string, userId?: string): Promise<ApiRes
       test.intelligent_mode,
       test.options?.estimatedCost
     );
+
+    // ✅ FIX #16: Reset test status AFTER queueing and credit deduction
+    // This ensures status is only updated if everything succeeded
+    const updatedTest = await dbService.updateTest(testId, {
+      status: 'pending',
+      started_at: null,
+      completed_at: null,
+    }) as any;
 
     logTestEvent('retried', testId, {
       userId,

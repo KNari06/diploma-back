@@ -419,9 +419,11 @@ export interface TestHint {
 
 /**
  * Test execution result
+ * ✅ FIX #7: Added cancelled flag to handle cancellation properly
  */
 export interface IntelligentTestResult {
   success: boolean;
+  cancelled?: boolean; // ✅ FIX #7: Track if test was cancelled
   goal: string;
   startUrl: string;
   pagesVisited: number;

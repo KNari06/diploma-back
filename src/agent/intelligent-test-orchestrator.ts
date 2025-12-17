@@ -95,6 +95,7 @@ export class IntelligentTestOrchestrator {
 
   private async buildCancelledResult(): Promise<IntelligentTestResult> {
     const result = await this.buildResult(false);
+    result.cancelled = true; // ✅ FIX #7: Mark result as cancelled
     result.summary = 'Test was cancelled by user';
     result.errors.push({
       message: 'Test was cancelled by user',
@@ -2109,7 +2110,7 @@ export class IntelligentTestOrchestrator {
       } catch {
         // Fallback: extract domain from URL string
         try {
-        const match = url.match(/https?:\/\/(?:www\.)?([^\/]+)/);
+        const match = url.match(/https?:\/\/(?:www\.)?([^/]+)/);
         return match ? match[1] : '';
         } catch {
           return '';
@@ -2259,7 +2260,7 @@ export class IntelligentTestOrchestrator {
     // Collect screenshots from page visits for result storage
     const screenshots = this.state.visitedPages
       .filter(pageVisit => pageVisit.screenshot)
-      .map((pageVisit, index) => ({
+      .map((pageVisit) => ({
         url: pageVisit.url,
         screenshot: pageVisit.screenshot!,
       }));
@@ -2540,7 +2541,7 @@ export class IntelligentTestOrchestrator {
     const escapeMarkdown = (text: string | undefined | null): string => {
       if (!text || typeof text !== 'string') return '';
       // Escape markdown special characters: * _ [ ] ( ) # + - . ! ` |
-      return text.replace(/([*_\[\]()#+\-.!`|\\])/g, '\\$1');
+      return text.replace(/([*_()[\]#+\-.!`|\\])/g, '\\$1');
     };
 
     const lines: string[] = [];
@@ -2684,7 +2685,7 @@ export class IntelligentTestOrchestrator {
       const [preAnalysisResult, selectorValidation] = await Promise.all([
         this.handlePreActionAnalysis(action, context),
         action.selector
-          ? this.validateAndPrepareSelector(action, context)
+          ? this.validateAndPrepareSelector(action)
           : Promise.resolve({ isValid: true, healedAction: undefined, error: undefined } as const),
       ]);
 
@@ -3027,8 +3028,7 @@ export class IntelligentTestOrchestrator {
    * Validate and prepare selector with self-healing
    */
   private async validateAndPrepareSelector(
-    action: DynamicAction,
-    context: PageContext
+    action: DynamicAction
   ): Promise<{
     isValid: boolean;
     healedAction?: DynamicAction;
@@ -3204,7 +3204,7 @@ export class IntelligentTestOrchestrator {
     const durationMs = Date.now() - actionStartTime;
 
     // Wait for action to complete
-    await this.ensureActionCompleted(action);
+    await this.ensureActionCompleted();
 
     let urlAfter = this.page.url();
     let urlChanged = urlBefore !== urlAfter;
@@ -3434,7 +3434,7 @@ export class IntelligentTestOrchestrator {
   /**
    * Ensure action completed before proceeding
    */
-  private async ensureActionCompleted(action: DynamicAction): Promise<void> {
+  private async ensureActionCompleted(): Promise<void> {
     // Wait for page to stabilize
     await this.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
 

@@ -75,7 +75,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // ═══════════════════════════════════════════════════════════════════════
     // Frontend should not send a new message while previous request is processing.
     // If it happens anyway (retries/double submit), return 409 and do NOT cancel anything automatically.
-    if (hasActiveRequest(chatSessionId, userId)) {
+    // ✅ FIX #2: hasActiveRequest is now async (checks Redis)
+    if (await hasActiveRequest(chatSessionId, userId)) {
       if (!res.headersSent) {
         res.status(409).json({
           success: false,
@@ -92,7 +93,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // STEP 2.3: REGISTER REQUEST FOR CANCELLATION
     // ═══════════════════════════════════════════════════════════════════════
     // Register this request so it can be cancelled via /cancel endpoint
-    abortController = registerActiveRequest(chatSessionId, userId, message);
+    // ✅ FIX #2: registerActiveRequest is now async (stores in Redis)
+    abortController = await registerActiveRequest(chatSessionId, userId, message);
     const abortSignal = abortController.signal;
 
     // Check if already aborted (shouldn't happen, but safety check)
@@ -117,7 +119,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     });
 
     if (approvalHandled) {
-      unregisterActiveRequest(chatSessionId, userId);
+      // ✅ FIX #2: unregisterActiveRequest is now async
+      await unregisterActiveRequest(chatSessionId, userId);
       return; // Approval was handled, response already sent
     }
 
@@ -156,12 +159,14 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     });
 
     // Unregister request on successful completion
-    unregisterActiveRequest(chatSessionId, userId);
+    // ✅ FIX #2: unregisterActiveRequest is now async
+    await unregisterActiveRequest(chatSessionId, userId);
 
   } catch (error) {
     // Unregister request on error
     if (chatSessionId && userId) {
-      unregisterActiveRequest(chatSessionId, userId);
+      // ✅ FIX #2: unregisterActiveRequest is now async
+      await unregisterActiveRequest(chatSessionId, userId);
     }
 
     // Check if request was cancelled

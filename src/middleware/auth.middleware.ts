@@ -1,4 +1,3 @@
-import { supabaseAdmin } from '@/db/supabase';
 import { verifyToken } from '@/services/auth/auth.service';
 import { AuthUser } from '@/types';
 import { logger } from '@/utils/logger';

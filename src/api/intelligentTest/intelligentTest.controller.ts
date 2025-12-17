@@ -48,6 +48,7 @@ export const getTestSession = async (req: Request, res: Response): Promise<void>
 
 /**
  * Get test flow for visualization (simplified view)
+ * ✅ FIX #22: Added ownership check to prevent sessionId enumeration
  */
 export const getTestFlow = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -59,7 +60,23 @@ export const getTestFlow = async (req: Request, res: Response): Promise<void> =>
       userId,
     });
 
-    const flow = await IntelligentTestStorageService.getTestFlow(sessionId);
+    // NOTE: Service typings are loose; force object shape to avoid TS treating it as any[]
+    const flow: any = await IntelligentTestStorageService.getTestFlow(sessionId);
+
+    // ✅ FIX #22: Verify ownership before returning data
+    if (flow.session.user_id !== userId) {
+      logger.warn('[INTELLIGENT_TEST_API] Unauthorized test flow access attempt', {
+        sessionId,
+        userId,
+        actualUserId: flow.session.user_id,
+      });
+      res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        message: 'You do not have permission to view this test flow',
+      });
+      return;
+    }
 
     res.json({
       success: true,
@@ -128,6 +145,7 @@ export const getTestSessions = async (req: Request, res: Response): Promise<void
 
 /**
  * Get test findings (bugs discovered during testing)
+ * ✅ FIX #23: Added ownership check to prevent sessionId enumeration
  */
 export const getTestFindings = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -143,6 +161,41 @@ export const getTestFindings = async (req: Request, res: Response): Promise<void
 
     const { supabaseAdmin } = await import('@/db/supabase');
 
+    // ✅ FIX #23: First verify session ownership
+    const { data: session, error: sessionError } = await supabaseAdmin
+      .from('intelligent_test_sessions')
+      .select('user_id')
+      .eq('id', sessionId)
+      .single();
+
+    if (sessionError || !session) {
+      logger.warn('[INTELLIGENT_TEST_API] Session not found', {
+        sessionId,
+        error: sessionError?.message,
+      });
+      res.status(404).json({
+        success: false,
+        error: 'Session not found',
+        message: 'The requested test session does not exist',
+      });
+      return;
+    }
+
+    if (session.user_id !== userId) {
+      logger.warn('[INTELLIGENT_TEST_API] Unauthorized findings access attempt', {
+        sessionId,
+        userId,
+        actualUserId: session.user_id,
+      });
+      res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        message: 'You do not have permission to view these findings',
+      });
+      return;
+    }
+
+    // Now fetch findings
     let query = supabaseAdmin
       .from('intelligent_test_findings')
       .select('*')

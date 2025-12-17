@@ -296,8 +296,9 @@ router.post('/cancel',
     }
 
     // ✅ CRITICAL: Cancel active request processing first
+    // ✅ FIX #2: cancelActiveRequest is now async (deletes from Redis)
     const { cancelActiveRequest } = await import('./shared/request-cancellation');
-    const requestCancelResult = cancelActiveRequest(chatSessionId, userId);
+    const requestCancelResult = await cancelActiveRequest(chatSessionId, userId);
 
     // Cancel running tests
     let testCancelResult = { success: true, cancelledCount: 0, errors: [] as string[] };
