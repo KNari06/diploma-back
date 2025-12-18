@@ -3,14 +3,14 @@ import { asyncHandler, handleValidationError } from '@/utils/core/error-handler'
 import { logger } from '@/utils/core/logger';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
-import { handleChat, getChatHistory, getChatSessions, getCurrentChatHistory, debugChatData } from './chat.controller';
 import {
   createNewChatSession,
-  listUserChatSessions,
-  getChatSessionById,
-  updateChatSessionTitle,
   deleteChatSession,
+  getChatSessionById,
+  listUserChatSessions,
+  updateChatSessionTitle,
 } from './chat-sessions.controller';
+import { debugChatData, getChatHistory, getCurrentChatHistory, handleChat } from './chat.controller';
 
 const router = Router();
 
@@ -339,8 +339,8 @@ router.post('/cancel',
  * @swagger
  * /api/v1/chat/history:
  *   get:
- *     summary: Получить историю текущего чата пользователя с пагинацией
- *     description: Возвращает историю единственного активного чата пользователя. Поддерживает как авторизованных пользователей (Bearer token), так и анонимных (по IP). offset=0 возвращает ПОСЛЕДНИЕ сообщения. Внутри каждой страницы сообщения отсортированы хронологически (старые → новые)
+ *     summary: Get current user's chat history (paginated)
+ *     description: Returns the history of the user's single active chat session. Supports both authenticated users (Bearer token) and anonymous users (by IP). offset=0 returns the MOST RECENT messages. Within each page, messages are sorted chronologically (old → new).
  *     tags: [Chat]
  *     parameters:
  *       - in: query
@@ -350,17 +350,17 @@ router.post('/cancel',
  *           default: 50
  *           minimum: 1
  *           maximum: 100
- *         description: Количество сообщений для возврата
+ *         description: Number of messages to return
  *       - in: query
  *         name: offset
  *         schema:
  *           type: integer
  *           default: 0
  *           minimum: 0
- *         description: Смещение для пагинации. 0 = последние сообщения, 50 = более старые сообщения
+ *         description: Pagination offset. 0 = latest messages, 50 = older messages
  *     responses:
  *       200:
- *         description: История текущего чата
+ *         description: Current chat history
  *         content:
  *           application/json:
  *             schema:
@@ -386,7 +386,7 @@ router.post('/cancel',
  *                           format: date-time
  *                     messages:
  *                       type: array
- *                       description: Сообщения в хронологическом порядке внутри страницы (старые → новые). offset=0 дает последние сообщения
+ *                       description: Messages in chronological order within the page (old → new). offset=0 returns the latest messages
  *                       items:
  *                         type: object
  *                         properties:

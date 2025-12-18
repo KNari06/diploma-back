@@ -39,6 +39,7 @@ const envSchema = z.object({
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
   AGENT_MAX_RETRIES: z.string().transform(Number).default('3'),
   AGENT_BASE_URL: z.string().default('http://localhost:3001'),
+  EXPLORATION_TIMEOUT_MS: z.string().transform(Number).default('300000'),
 
   // Logging
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),

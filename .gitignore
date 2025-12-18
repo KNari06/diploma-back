@@ -4,6 +4,13 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Environment (never commit secrets)
+.env
+.env.*
+
+# Cursor (local editor state / plans)
+.cursor/plans/
+
 # Runtime data
 pids
 *.pid

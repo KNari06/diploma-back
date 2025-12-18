@@ -1,5 +1,6 @@
 import { getCachedExploration, saveExplorationToCache } from '@/services/testing/plans/exploration-cache.service';
 import { exploreProduct } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
+import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -48,8 +49,8 @@ export async function runExploration(params: {
   // NOTE: This is ONLY for page exploration/analysis, NOT for actual test execution
   // Test execution happens later and has its own timeout settings
   const MAX_EXPLORATION_TIMEOUT = 5 * 60 * 1000; // 5 minutes maximum
-  const requestedTimeout = process.env.EXPLORATION_TIMEOUT_MS
-    ? parseInt(process.env.EXPLORATION_TIMEOUT_MS, 10)
+  const requestedTimeout = Number.isFinite(env.EXPLORATION_TIMEOUT_MS)
+    ? env.EXPLORATION_TIMEOUT_MS
     : MAX_EXPLORATION_TIMEOUT;
 
   // ✅ FIX: Enforce maximum timeout of 5 minutes
