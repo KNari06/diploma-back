@@ -1,6 +1,6 @@
-import { env } from '@/config/env';
+import { env } from '@/config/environment/env';
 import { DOMAnalysisResult } from '@/services/testing/ui/autonomous/dom-analyzer.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 
 /**

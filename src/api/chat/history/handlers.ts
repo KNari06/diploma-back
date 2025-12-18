@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Get current chat history (latest session)

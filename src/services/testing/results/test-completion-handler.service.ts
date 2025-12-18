@@ -2,7 +2,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { TestResultsFormatterService } from '@/services/testing/results/test-results-formatter.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Service to handle test completion and notify chat sessions

@@ -1,8 +1,8 @@
-import { QueueManager } from '@/config/queues';
+import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService, dbService } from '@/db/supabase';
 import { TestCompletionHandlerService } from '@/services/testing/results/test-completion-handler.service';
 import { ApiResponse, BrowserType, TestResult } from '@/types';
-import { logger, logTestEvent } from '@/utils/logger';
+import { logger, logTestEvent } from '@/utils/core/logger';
 import { getTest, getTestResults } from './test-queries';
 
 /**

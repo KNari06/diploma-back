@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { executeApiTest } from '@/services/testing/api/apiTest.service';
 import { ApiTestHistoryService } from '@/services/testing/api/api-test-history.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { ApiTestRequest } from '@/types';
 
 /**

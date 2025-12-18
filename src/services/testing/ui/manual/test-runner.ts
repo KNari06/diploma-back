@@ -1,8 +1,8 @@
-import { QueueManager } from '@/config/queues';
+import { QueueManager } from '@/config/infrastructure/queues';
 import { ApiResponse, Test, TestRunRequest, ValidationError } from '@/types';
-import { logger, logTestEvent } from '@/utils/logger';
-import { TestCreatedPayload } from '@/websocket/types';
-import { webSocketService } from '@/websocket/websocket.service';
+import { logger, logTestEvent } from '@/utils/core/logger';
+import { TestCreatedPayload } from '@/websocket/types/types';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { createTest } from './test-creator';
 import { validateTestRequest } from './test-validator';
 
@@ -65,7 +65,7 @@ export async function runTest(testRequest: TestRunRequest): Promise<ApiResponse<
 
       // Monitor the job after adding
       if (job?.id) {
-        const { QueueMonitor } = await import('@/utils/queue-monitor');
+        const { QueueMonitor } = await import('@/utils/monitoring/queue-monitor');
         QueueMonitor.monitorAfterJobAdd(job.id, test.id);
       }
     }

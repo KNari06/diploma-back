@@ -1,8 +1,8 @@
-import { logger } from '@/utils/logger';
-import { isValidUUID } from '@/utils/validation';
+import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 import { parseUserIntent } from '@/services/ai/intentParser.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { convertRoleForOpenAI } from '@/utils/chat-helpers';
+import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
 import { IntentResult } from '@/types';
 import { CONSTANTS, FAST_PATH_COMMANDS, PROGRESS } from './constants';
 import { emitProcessingStep } from './utils';

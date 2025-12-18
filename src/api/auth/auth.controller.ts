@@ -1,4 +1,4 @@
-import { env, isDevelopment } from '@/config/env';
+import { env, isDevelopment } from '@/config/environment/env';
 import {
   getCurrentUser,
   getOAuthUrl,
@@ -11,7 +11,7 @@ import {
   updatePassword,
   updateUserProfile,
 } from '@/services/auth/auth.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
 /**

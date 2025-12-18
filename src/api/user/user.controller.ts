@@ -1,8 +1,8 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
-import { logger } from '@/utils/logger';
-import { isValidUUID } from '@/utils/validation';
+import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
 
 // Maximum credit amount to prevent DoS/integer overflow

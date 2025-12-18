@@ -1,4 +1,4 @@
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { ApiTestRequest, ApiTestResponse, FuzzingScenario } from '@/types';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { buildApiFuzzingPrompt } from '@/ai/prompts';

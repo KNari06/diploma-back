@@ -4,8 +4,8 @@
  * Hybrid approach: Use action.description first, generate from goal+context as fallback
  */
 
-import { env } from '@/config/env';
-import { logger } from '@/utils/logger';
+import { env } from '@/config/environment/env';
+import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 import type { ParsedIntent, DOMNode } from './types';
 

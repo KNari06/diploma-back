@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
-import { isValidUUID } from '@/utils/validation';
+import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 import { detectUserApproval } from '@/services/ai/ai-helpers.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { getTestPlan, getLatestPendingTestPlan } from '@/services/testing/plans/exploration-cache.service';

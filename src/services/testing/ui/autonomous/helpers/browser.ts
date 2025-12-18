@@ -1,5 +1,5 @@
 import { browserPool } from '@/agent';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { BrowserContext, Page } from 'playwright';
 import { emitExplorationProgress } from './progress';
 

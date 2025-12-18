@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 export interface PricingPlan {
   id: string;

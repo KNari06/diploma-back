@@ -5,7 +5,7 @@ import {
   NotificationFilters,
   UnreadCount,
 } from '@/types/notifications.types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Service for managing user notifications

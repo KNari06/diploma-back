@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { ChatService } from '@/services/utils/chat.service';
 import { checkRequestAborted } from './request-cancellation';
 

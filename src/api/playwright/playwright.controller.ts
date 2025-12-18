@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { TraceFile, TraceFileListItem, TraceStep, TraceStepsResponse, TraceUploadRequest, TraceUploadResponse } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import AdmZip from 'adm-zip';
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';

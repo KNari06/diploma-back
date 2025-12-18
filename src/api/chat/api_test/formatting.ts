@@ -1,4 +1,4 @@
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { CONSTANTS } from '../shared/constants';
 
 /**

@@ -16,12 +16,12 @@ import reportsRoutes from '@/api/reports/reports.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
-import { env, isDevelopment } from '@/config/env';
-import { QueueManager } from '@/config/queues';
-import { swaggerSpec } from '@/config/swagger';
+import { env, isDevelopment } from '@/config/environment/env';
+import { QueueManager } from '@/config/infrastructure/queues';
+import { swaggerSpec } from '@/config/api/swagger';
 import { testSupabaseAuthHealth, testSupabaseConnection } from '@/db/supabase';
-import { errorHandler, notFoundHandler } from '@/utils/error-handler';
-import { logger, morganStream } from '@/utils/logger';
+import { errorHandler, notFoundHandler } from '@/utils/core/error-handler';
+import { logger, morganStream } from '@/utils/core/logger';
 import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
@@ -555,7 +555,7 @@ const startServer = async () => {
 
     // Initialize WebSocket server
     try {
-      const { initializeWebSocket } = await import('@/websocket/server');
+      const { initializeWebSocket } = await import('@/websocket/core/server');
       if (server) {
         initializeWebSocket(server);
         logger.info('🌐 WebSocket server initialized');
@@ -563,7 +563,7 @@ const startServer = async () => {
         // ✅ NEW: Start Redis subscriber for worker events
         // This bridges worker process events to WebSocket clients
         try {
-          const { webSocketRedisSubscriber } = await import('@/websocket/redis-subscriber');
+          const { webSocketRedisSubscriber } = await import('@/websocket/infrastructure/redis-subscriber');
           await webSocketRedisSubscriber.start();
           logger.info('📡 WebSocket Redis subscriber started (worker → WebSocket bridge)');
         } catch (subError) {
@@ -614,7 +614,7 @@ const startServer = async () => {
               // ✅ NEW: Stop Redis subscriber
               (async () => {
                 try {
-                  const { webSocketRedisSubscriber } = await import('@/websocket/redis-subscriber');
+                  const { webSocketRedisSubscriber } = await import('@/websocket/infrastructure/redis-subscriber');
                   await webSocketRedisSubscriber.stop();
                   logger.info('[SERVER] WebSocket Redis subscriber stopped');
                 } catch (error) {
@@ -639,7 +639,7 @@ const startServer = async () => {
               // Close queue connections
               (async () => {
                 try {
-                  const queuesModule = await import('@/config/queues');
+                  const queuesModule = await import('@/config/infrastructure/queues');
                   await queuesModule.gracefulShutdown();
                   logger.info('[SERVER] Queue connections closed');
                 } catch (error) {
@@ -651,7 +651,7 @@ const startServer = async () => {
               // Close WebSocket server
               (async () => {
                 try {
-                  const { shutdownWebSocket } = await import('@/websocket/server');
+                  const { shutdownWebSocket } = await import('@/websocket/core/server');
                   await shutdownWebSocket();
                   logger.info('[SERVER] WebSocket server closed');
                 } catch (error) {

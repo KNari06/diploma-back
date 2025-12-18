@@ -1,4 +1,4 @@
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
 import sharp from 'sharp';
 import { emitExplorationProgress } from './progress';

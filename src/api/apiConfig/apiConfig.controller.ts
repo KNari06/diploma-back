@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { ApiConfigService } from '@/services/api/api-config.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import {
   ApiEnvironment,
   ApiEndpoint,

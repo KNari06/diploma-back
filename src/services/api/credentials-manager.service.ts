@@ -1,6 +1,6 @@
-import { env } from '@/config/env';
+import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
 
 /**

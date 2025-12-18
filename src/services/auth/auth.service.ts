@@ -1,7 +1,7 @@
-import { env } from '@/config/env';
+import { env } from '@/config/environment/env';
 import { supabase, supabaseAdmin } from '@/db/supabase';
 import { AuthTokens, AuthUser } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Sign up with email and password

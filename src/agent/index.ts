@@ -5,7 +5,7 @@
  * Runs locally within the backend process (no separate service needed)
  */
 
-export { browserPool } from './browser-pool';
-export { CommandExecutor } from './command-executor';
-export { executePlaywrightTest, executePlaywrightTestWithRetry, getAgentStatus } from './playwright/playwright.service';
-export { ResultCollector } from './result-collector';
+export { browserPool } from './browser/browser-pool';
+export { ResultCollector } from './browser/result-collector';
+export { CommandExecutor } from './execution/command-executor';
+export { executePlaywrightTest, executePlaywrightTestWithRetry, getAgentStatus } from './playwright/core/playwright.service';

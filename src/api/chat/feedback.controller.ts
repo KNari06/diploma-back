@@ -1,8 +1,8 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { FeedbackAnalyticsService } from '@/services/feedback-analytics.service';
-import { FeedbackService } from '@/services/feedback.service';
+import { FeedbackAnalyticsService } from '@/services/feedback/feedback-analytics.service';
+import { FeedbackService } from '@/services/feedback/feedback.service';
 import { CreateFeedbackRequest } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
 // UUID validation regex

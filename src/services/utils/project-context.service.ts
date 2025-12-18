@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Credentials, CredentialsParserService } from '../api/credentials-parser.service';
 
 // ═══════════════════════════════════════════════════════════════════════════

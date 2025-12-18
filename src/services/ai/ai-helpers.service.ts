@@ -1,6 +1,6 @@
 import { buildApprovalDetectionPrompt } from '@/ai/prompts/index';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
 
 /**

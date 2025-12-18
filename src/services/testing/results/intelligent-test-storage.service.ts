@@ -1,6 +1,6 @@
 import type { ActionResult, DynamicAction, IntelligentTestResult, PageVisit } from '@/agent/types/intelligent-testing.types';
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Service for storing intelligent test results in specialized tables

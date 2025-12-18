@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { IntelligentTestStorageService } from '@/services/testing/results/intelligent-test-storage.service';
 
 /**

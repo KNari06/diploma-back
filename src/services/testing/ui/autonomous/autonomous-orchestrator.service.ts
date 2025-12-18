@@ -3,8 +3,8 @@ import {
   getTestPlan,
   rejectTestPlan as rejectPlanInDB,
 } from '@/services/testing/plans/exploration-cache.service';
-import { logger } from '@/utils/logger';
-import { isValidUUID } from '@/utils/validation';
+import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 import { handleCredentialsForExploration } from './helpers/credentials-handler';
 import { createProgressEmitter } from './helpers/exploration-progress';
 import { runExploration } from './helpers/exploration-runner';

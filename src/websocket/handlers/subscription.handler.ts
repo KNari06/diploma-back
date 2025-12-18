@@ -3,16 +3,16 @@
  * Handles room subscriptions for tests and chats
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Socket } from 'socket.io';
-import { getUserId } from '../middleware';
+import { getUserId } from '../middleware/middleware';
 import {
   ClientToServerEvents,
   createRoomName,
   ErrorPayload,
   ServerToClientEvents,
   SocketData,
-} from '../types';
+} from '../types/types';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 

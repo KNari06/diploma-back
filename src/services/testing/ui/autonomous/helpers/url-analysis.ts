@@ -3,7 +3,7 @@ import {
   buildUrlAnalysisSystemPrompt,
 } from '@/ai/prompts';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Analyze URL using GPT-4o-mini to provide context-specific insights

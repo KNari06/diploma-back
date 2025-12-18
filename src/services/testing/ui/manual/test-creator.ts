@@ -1,7 +1,7 @@
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { Test, TestRunRequest } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { v4 as uuidv4 } from 'uuid';
 
 /**

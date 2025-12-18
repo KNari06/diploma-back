@@ -1,6 +1,6 @@
 import { Response } from 'express';
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { confirmTestPlan } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
 import { executeApiTest } from '@/services/testing/api/apiTest.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';

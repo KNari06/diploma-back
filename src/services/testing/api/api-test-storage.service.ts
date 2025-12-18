@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
-import { isValidUUID } from '@/utils/validation';
+import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 
 /**
  * Service for storing API test results in database

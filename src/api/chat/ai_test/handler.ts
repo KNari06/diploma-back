@@ -4,7 +4,7 @@ import { requestMissingInformation, runAutonomousExploration } from '@/services/
 import { ChatService } from '@/services/utils/chat.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
 import { parseAnswers } from '@/services/utils/question-generator.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';

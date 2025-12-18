@@ -1,5 +1,5 @@
 import { requireAuth } from '@/middleware/auth.middleware';
-import { asyncHandler } from '@/utils/error-handler';
+import { asyncHandler } from '@/utils/core/error-handler';
 import { Router } from 'express';
 import {
   getOnboarding,

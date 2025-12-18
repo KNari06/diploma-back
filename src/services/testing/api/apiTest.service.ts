@@ -1,7 +1,7 @@
 import { ApiTestRequest, ApiTestResponse } from '@/types';
-import { logger } from '@/utils/logger';
-import { ChatProcessingStepPayload } from '@/websocket/types';
-import { webSocketService } from '@/websocket/websocket.service';
+import { logger } from '@/utils/core/logger';
+import { ChatProcessingStepPayload } from '@/websocket/types/types';
+import { webSocketService } from '@/websocket/core/websocket.service';
 
 // FIX #3: Centralized constants
 const DEFAULT_TIMEOUT = 10000; // 10 seconds

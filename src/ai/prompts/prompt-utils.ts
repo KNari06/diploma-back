@@ -3,7 +3,7 @@
  * Helper functions for prompt processing: JSON parsing, token management, PII masking
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { z } from 'zod';
 
 // ═══════════════════════════════════════════════════════════════════════════

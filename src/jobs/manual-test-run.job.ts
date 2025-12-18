@@ -1,10 +1,10 @@
 import { executePlaywrightTestWithRetry } from '@/agent';
-import { env } from '@/config/env';
-import { QueueManager } from '@/config/queues';
+import { env } from '@/config/environment/env';
+import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { AgentResponse, TestJobData } from '@/types';
-import { calculateRetryDelay, handleAgentError, shouldRetry } from '@/utils/error-handler';
-import { logger, logQueueEvent } from '@/utils/logger';
+import { calculateRetryDelay, handleAgentError, shouldRetry } from '@/utils/core/error-handler';
+import { logger, logQueueEvent } from '@/utils/core/logger';
 import {
   ResultErrorPayload,
   ResultReadyPayload,
@@ -12,8 +12,8 @@ import {
   TestCancelledPayload,
   TestFailedPayload,
   TestStartedPayload,
-} from '@/websocket/types';
-import { webSocketService } from '@/websocket/websocket.service';
+} from '@/websocket/types/types';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { Job } from 'bullmq';
 
 // Constants

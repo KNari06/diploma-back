@@ -1,6 +1,6 @@
 import { buildVisionPrompt } from '@/ai/prompts/index';
-import { env } from '@/config/env';
-import { logger } from '@/utils/logger';
+import { env } from '@/config/environment/env';
+import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });

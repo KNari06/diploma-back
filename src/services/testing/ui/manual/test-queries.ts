@@ -1,6 +1,6 @@
 import { dbAdminService, dbService } from '@/db/supabase';
 import { ApiResponse, NotFoundError, PaginatedResponse, Test, TestResult, ValidationError } from '@/types';
-import { logger, logTestEvent } from '@/utils/logger';
+import { logger, logTestEvent } from '@/utils/core/logger';
 
 /**
  * Get test by ID with results

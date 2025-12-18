@@ -1,5 +1,5 @@
 import { retrieveCredentials, storeCredentials } from '@/services/api/credentials-manager.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Handle credentials storage and retrieval for authenticated exploration

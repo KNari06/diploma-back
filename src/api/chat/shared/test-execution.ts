@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { getTestPlan } from '@/services/testing/plans/exploration-cache.service';
 import { ChatService } from '@/services/utils/chat.service';

@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { ProjectContextService } from '@/services/utils/project-context.service';
 import { ApiTestPlanService } from '@/services/testing/api/api-test-plan.service';
 import { saveTestPlan } from '@/services/testing/plans/exploration-cache.service';

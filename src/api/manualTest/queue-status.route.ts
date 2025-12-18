@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { getQueueStatus, getJobStatus } from './queue-status.controller';
-import { asyncHandler } from '@/utils/error-handler';
+import { asyncHandler } from '@/utils/core/error-handler';
 import { requireAdmin, requireAuth } from '@/middleware/auth.middleware';
 
 const router = Router();

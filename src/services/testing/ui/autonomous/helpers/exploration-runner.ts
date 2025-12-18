@@ -1,6 +1,6 @@
 import { getCachedExploration, saveExplorationToCache } from '@/services/testing/plans/exploration-cache.service';
 import { exploreProduct } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Run exploration (from cache or fresh)

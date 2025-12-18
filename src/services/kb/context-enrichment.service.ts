@@ -5,7 +5,7 @@ import {
     findTracesByUrl,
     formatTracesForPrompt
 } from '@/services/utils/trace-context.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Enrich context for command generation

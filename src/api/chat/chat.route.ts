@@ -1,6 +1,6 @@
 import { requireAuth } from '@/middleware/auth.middleware';
-import { asyncHandler, handleValidationError } from '@/utils/error-handler';
-import { logger } from '@/utils/logger';
+import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
+import { logger } from '@/utils/core/logger';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import { handleChat, getChatHistory, getChatSessions, getCurrentChatHistory, debugChatData } from './chat.controller';

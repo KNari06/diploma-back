@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { JiraReportService } from '@/services/integrations/jira-report.service';
 import { supabaseAdmin } from '@/db/supabase';

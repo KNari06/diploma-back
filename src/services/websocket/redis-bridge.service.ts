@@ -10,8 +10,8 @@
  * - Main: subscribes to Redis channel and emits via WebSocket
  */
 
-import { connection } from '@/config/queues';
-import { logger } from '@/utils/logger';
+import { connection } from '@/config/infrastructure/queues';
+import { logger } from '@/utils/core/logger';
 import Redis from 'ioredis';
 
 // Redis channel for WebSocket events

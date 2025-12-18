@@ -8,7 +8,7 @@
  */
 
 import { generateEmbeddings } from '@/services/ai/embedding.service';
-import { chunkMarkdown } from '@/utils/chunking';
+import { chunkMarkdown } from '@/utils/text-processing/chunking';
 import dotenv from 'dotenv';
 import fs from 'fs/promises';
 import path from 'path';

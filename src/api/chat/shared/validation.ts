@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { ChatRequest } from '../chat.types';
 import { CONSTANTS, MESSAGES } from './constants';
 import { WorkspaceService } from '@/services/core/workspace.service';

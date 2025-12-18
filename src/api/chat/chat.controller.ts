@@ -1,4 +1,4 @@
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 

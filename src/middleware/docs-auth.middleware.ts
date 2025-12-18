@@ -3,7 +3,7 @@
  * Protects documentation routes with password
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { NextFunction, Request, Response } from 'express';
 
 /**

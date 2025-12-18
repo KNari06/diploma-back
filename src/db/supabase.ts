@@ -1,5 +1,5 @@
-import { env } from '@/config/env';
-import { logger } from '@/utils/logger';
+import { env } from '@/config/environment/env';
+import { logger } from '@/utils/core/logger';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 // Create Supabase client

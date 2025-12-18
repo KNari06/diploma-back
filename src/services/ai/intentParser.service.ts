@@ -1,11 +1,11 @@
 import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/index';
-import { env } from '@/config/env';
+import { env } from '@/config/environment/env';
 import { detectUserApproval, extractUrlWithGPT } from '@/services/ai/ai-helpers.service';
 // TODO: KB Search temporarily disabled - will be re-enabled later
 // import { detectLanguage, searchKB } from '@/services/kb/kb.service';
 // import { RulesCacheService } from '@/services/kb/rules-cache.service';
 import { IntentResult, IntentType, KNOWN_INTENTS, VALID_SCOPES } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });

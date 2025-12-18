@@ -5,7 +5,7 @@
  */
 
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { RulesCacheService } from '@/services/kb/rules-cache.service';
 
 /**

@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
-import { env } from '@/config/env';
+import { logger } from '@/utils/core/logger';
+import { env } from '@/config/environment/env';
 import fs from 'fs/promises';
 
 /**

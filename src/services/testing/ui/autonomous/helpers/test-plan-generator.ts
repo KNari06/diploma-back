@@ -1,6 +1,6 @@
 import { saveTestPlan } from '@/services/testing/plans/exploration-cache.service';
 import { formatTestPlanForConfirmation, generateIntelligentTestPlan, generateTestPlan } from '@/services/testing/plans/test-plan-generator.service';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { getScopeStrategy } from './scope-strategy';
 import { analyzeUrlContext } from './url-analysis';
 

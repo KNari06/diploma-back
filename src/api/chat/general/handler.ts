@@ -1,13 +1,13 @@
 import { buildChatSystemPrompt } from '@/ai/prompts';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
-import { autoEmbedOldMessages, searchChatHistory } from '@/services/chat-embeddings.service';
+import { autoEmbedOldMessages, searchChatHistory } from '@/services/ai/chat-embeddings.service';
 import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { convertRoleForOpenAI } from '@/utils/chat-helpers';
-import { logger } from '@/utils/logger';
-import { isValidUUID } from '@/utils/validation';
+import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
+import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
 import { CONSTANTS } from '../shared/constants';
 import { compressMessageContent, emitProcessingStep, checkChatCredits, deductChatCredits } from '../shared/utils';

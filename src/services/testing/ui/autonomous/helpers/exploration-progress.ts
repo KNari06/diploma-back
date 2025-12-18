@@ -1,6 +1,6 @@
-import { logger } from '@/utils/logger';
-import { ChatProcessingStepPayload } from '@/websocket/types';
-import { webSocketService } from '@/websocket/websocket.service';
+import { logger } from '@/utils/core/logger';
+import { ChatProcessingStepPayload } from '@/websocket/types/types';
+import { webSocketService } from '@/websocket/core/websocket.service';
 
 /**
  * Helper to emit WebSocket events (with fallback for missing sessionId)

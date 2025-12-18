@@ -1,10 +1,10 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { logger } from '@/utils/logger';
-import { isValidUUID } from '@/utils/validation';
-import { ChatProcessingStepPayload } from '@/websocket/types';
-import { webSocketService } from '@/websocket/websocket.service';
+import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
+import { ChatProcessingStepPayload } from '@/websocket/types/types';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { Response } from 'express';
 import { PROGRESS } from './constants';
 

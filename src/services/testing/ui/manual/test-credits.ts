@@ -1,6 +1,6 @@
 import { dbService } from '@/db/supabase';
 import { BrowserType, NotFoundError, ValidationError } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Calculate required credits for browsers

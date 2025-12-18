@@ -6,8 +6,8 @@ import { IntelligentTestStorageService } from '@/services/testing/results/intell
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { NotFoundError, TestRunRequest, ValidationError } from '@/types';
-import { asyncHandler, handleValidationError } from '@/utils/error-handler';
-import { logger } from '@/utils/logger';
+import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
+import { logger } from '@/utils/core/logger';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 

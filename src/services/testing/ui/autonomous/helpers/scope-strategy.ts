@@ -4,7 +4,7 @@ import {
 } from '@/ai/prompts';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { VALID_SCOPES } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Generate custom scope strategy via AI

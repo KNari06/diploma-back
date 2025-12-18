@@ -70,6 +70,21 @@
 - ✅ Документируй все изменения
 - 🚫 НИКОГДА не возвращайся к keyword matching
 
+### 7. folder-structure.mdc (ВСЕГДА)
+
+**Auto-applied to all files**
+
+Правила структуры папок:
+
+- 📁 `/agent` - структура по ролям (core, analysis, execution, safety, browser)
+- 📁 `/config` - структура по категориям (environment, infrastructure, api, testing)
+- 📁 `/websocket` - структура по слоям (core, infrastructure, middleware, handlers, types)
+- 📁 `/utils` - структура по назначению (core, validation, parsing, text-processing, helpers, monitoring)
+- 📁 `/services` - структура по доменам (ai, feedback, core, testing, api, auth, kb, etc.)
+- ❌ НЕ создавай файлы в корне этих папок
+- ✅ Всегда следуй установленной структуре при создании новых файлов
+- ✅ Обновляй все импорты при перемещении файлов
+
 ## 🚨 Критически важное
 
 ### Перед КАЖДЫМ деплоем:

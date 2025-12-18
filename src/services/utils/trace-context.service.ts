@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { PlaywrightCommand, TraceFile, TraceStep } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Extract selectors from trace files

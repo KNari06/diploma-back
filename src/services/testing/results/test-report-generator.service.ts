@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { TestPlan } from '@/services/testing/plans/test-plan-generator.service';
 import { FinalTestReport, PlaywrightCommand, TestResult } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Service for generating comprehensive test reports with code, artifacts, and analysis

@@ -1,7 +1,7 @@
-import { QueueManager } from '@/config/queues';
+import { QueueManager } from '@/config/infrastructure/queues';
 import { dbService, supabaseAdmin } from '@/db/supabase';
 import { ApiResponse, NotFoundError, Test, ValidationError } from '@/types';
-import { logger, logTestEvent } from '@/utils/logger';
+import { logger, logTestEvent } from '@/utils/core/logger';
 import { checkUserCredits, deductCredits } from './test-credits';
 
 /**

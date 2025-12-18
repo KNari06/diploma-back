@@ -1,4 +1,4 @@
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
 import { analyzePageWithAI, getPageMetadata } from './helpers/analysis';
 import { performAuthentication } from './helpers/auth';

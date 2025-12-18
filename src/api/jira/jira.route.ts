@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { startJiraAuth, handleJiraCallback, getProjects } from './jira.controller';
-import { asyncHandler } from '@/utils/error-handler';
+import { asyncHandler } from '@/utils/core/error-handler';
 import { requireAuth } from '@/middleware/auth.middleware';
 
 const router = Router();

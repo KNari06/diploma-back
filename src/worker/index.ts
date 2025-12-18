@@ -1,8 +1,8 @@
-import { env } from '@/config/env';
-import { connection, QUEUE_NAMES } from '@/config/queues';
+import { env } from '@/config/environment/env';
+import { connection, QUEUE_NAMES } from '@/config/infrastructure/queues';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Worker } from 'bullmq';
 
 // Validate worker configuration
@@ -270,7 +270,7 @@ const gracefulShutdown = async (signal: string) => {
       // ✅ CRITICAL FIX: Close all browsers to free server resources
       (async () => {
         try {
-          const { browserPool } = await import('@/agent/browser-pool');
+          const { browserPool } = await import('@/agent');
           await browserPool.closeAll();
           logger.info('[WORKER] All browsers closed');
         } catch (error) {

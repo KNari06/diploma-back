@@ -6,9 +6,9 @@ import { confirmTestPlan } from '@/services/testing/ui/autonomous/autonomous-orc
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
-import { logger } from '@/utils/logger';
-import { ChatTestUpdatePayload } from '@/websocket/types';
-import { webSocketService } from '@/websocket/websocket.service';
+import { logger } from '@/utils/core/logger';
+import { ChatTestUpdatePayload } from '@/websocket/types/types';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { Response } from 'express';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 

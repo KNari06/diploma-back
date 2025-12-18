@@ -3,7 +3,7 @@
  * Extracts enhanced DOM nodes with bounding boxes and metadata
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
 import type { DOMNode } from './types';
 

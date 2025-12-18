@@ -1,14 +1,14 @@
-import { QueueManager } from '@/config/queues';
+import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { aiService } from '@/services/ai/ai.service';
-import { handleAIError } from '@/utils/error-handler';
-import { logAIAnalysis, logger, logQueueEvent } from '@/utils/logger';
+import { handleAIError } from '@/utils/core/error-handler';
+import { logAIAnalysis, logger, logQueueEvent } from '@/utils/core/logger';
 import {
   AIAnalysisCompletedPayload,
   AIAnalysisStartedPayload,
   AIBugFoundPayload,
-} from '@/websocket/types';
-import { webSocketService } from '@/websocket/websocket.service';
+} from '@/websocket/types/types';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { Job } from 'bullmq';
 
 // Types for better type safety

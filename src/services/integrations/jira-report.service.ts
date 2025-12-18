@@ -1,4 +1,4 @@
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { FinalTestReport, JiraIssueRequest, JiraIssue, JiraAttachment } from '@/types';
 import { supabaseAdmin } from '@/db/supabase';
 import { downloadFromStorage } from '@/services/storage/test-artifacts-storage.service';

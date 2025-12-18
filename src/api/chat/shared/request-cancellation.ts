@@ -1,5 +1,5 @@
-import { redisConnection } from '@/config/queues';
-import { logger } from '@/utils/logger';
+import { redisConnection } from '@/config/infrastructure/queues';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Active request tracking for cancellation

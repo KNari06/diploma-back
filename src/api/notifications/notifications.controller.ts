@@ -1,6 +1,6 @@
 import { NotificationService } from '@/services/notifications/notification.service';
 import { MarkAsReadRequest, NotificationFilters } from '@/types/notifications.types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
 /**

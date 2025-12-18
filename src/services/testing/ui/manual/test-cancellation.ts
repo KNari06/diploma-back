@@ -1,6 +1,6 @@
 import { dbService } from '@/db/supabase';
 import { ApiResponse, NotFoundError, Test, ValidationError } from '@/types';
-import { logger, logTestEvent } from '@/utils/logger';
+import { logger, logTestEvent } from '@/utils/core/logger';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 
 /**
@@ -165,7 +165,7 @@ export async function cancelAllRunningTestsForChatSession(
  */
 export async function cancelTestJobs(testId: string, browsers: string[]): Promise<void> {
   try {
-    const { testRunQueue } = await import('@/config/queues');
+    const { testRunQueue } = await import('@/config/infrastructure/queues');
     let cancelledCount = 0;
 
     // Cancel jobs for each browser
@@ -263,7 +263,7 @@ export async function cancelTest(testId: string, userId?: string): Promise<ApiRe
     await cancelTestJobs(testId, test.browsers || []);
 
     // Emit WebSocket event
-    const { webSocketService } = await import('@/websocket/websocket.service');
+    const { webSocketService } = await import('@/websocket/core/websocket.service');
     webSocketService.emitTestCancelled(testId, {
       testId,
       timestamp: new Date().toISOString(),

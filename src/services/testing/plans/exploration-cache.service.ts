@@ -1,8 +1,8 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { TestPlan } from '@/services/testing/plans/test-plan-generator.service';
 import { ExplorationResult } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
-import { logger } from '@/utils/logger';
-import { isValidUUID } from '@/utils/validation';
+import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
