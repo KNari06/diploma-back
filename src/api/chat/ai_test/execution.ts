@@ -103,36 +103,18 @@ export async function executeUiTestFlow(
       }
     }
 
-    // ✅ FIX #1: Check credits availability BEFORE test creation (but don't deduct yet)
+    // ✅ CREDITS ALREADY CHECKED in test-execution.ts via CreditCostTrackerService.checkCreditsForTest()
+    // No need to duplicate check here - it was already validated before calling executeUiTestFlow
     // Credits will be deducted AFTER successful queue job creation to prevent charging without running
     const uiTestType = 'intelligent';
     const testId = `ui_${planId}_${Date.now()}`;
     const creditsRequired = TokenCalculatorService.getTestCreditCost(uiTestType);
 
-    try {
-      // Check if user has enough credits (without deducting)
-      const { data: user } = await supabaseAdmin
-        .from('users')
-        .select('credits')
-        .eq('id', userId)
-        .single();
-
-      if (!user || user.credits < creditsRequired) {
-        throw new Error('Insufficient credits');
-      }
-
-      logger.info('[UI_TEST] Credit check passed', {
-        userId,
-        required: creditsRequired,
-        available: user.credits,
-      });
-    } catch (creditError) {
-      logger.error('[UI_TEST] Credit check failed', {
-        error: creditError instanceof Error ? creditError.message : String(creditError),
-        userId,
-      });
-      throw new Error('Insufficient credits or payment error');
-    }
+    logger.info('[UI_TEST] Credit check already passed in test-execution.ts', {
+      userId,
+      required: creditsRequired,
+      note: 'Credits were validated before entering this flow',
+    });
 
     emitProcessingStep(chatSessionId, 'executing_test', '🔍 Finding project context...', 20);
     checkTimeout();

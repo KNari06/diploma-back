@@ -70,14 +70,18 @@ async function callAI(options: AICallOptions): Promise<string | null> {
     cacheMap,
   } = options;
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 🚫 CACHE DISABLED: In-Memory AI Cache (pre-action-analyzer)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TODO: Uncomment to enable AI call caching
   // Check cache
-  if (cacheKey && cacheMap) {
-    const cached = cacheMap.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < AI_CACHE_TTL) {
-      logger.debug('[AI_WRAPPER] Cache hit', { cacheKey: cacheKey.substring(0, 30) + '...' });
-      return cached.result;
-    }
-  }
+  // if (cacheKey && cacheMap) {
+  //   const cached = cacheMap.get(cacheKey);
+  //   if (cached && Date.now() - cached.timestamp < AI_CACHE_TTL) {
+  //     logger.debug('[AI_WRAPPER] Cache hit', { cacheKey: cacheKey.substring(0, 30) + '...' });
+  //     return cached.result;
+  //   }
+  // }
 
   try {
     const response = await openai.chat.completions.create({
@@ -92,10 +96,14 @@ async function callAI(options: AICallOptions): Promise<string | null> {
 
     const result = response.choices[0]?.message?.content?.trim() || null;
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 🚫 CACHE DISABLED: In-Memory AI Cache Save
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TODO: Uncomment to enable saving AI results to cache
     // Cache result
-    if (result && cacheKey && cacheMap) {
-      cacheMap.set(cacheKey, { result, timestamp: Date.now() });
-    }
+    // if (result && cacheKey && cacheMap) {
+    //   cacheMap.set(cacheKey, { result, timestamp: Date.now() });
+    // }
 
     return result;
   } catch (error) {

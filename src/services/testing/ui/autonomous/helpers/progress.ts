@@ -7,7 +7,7 @@ export function emitExplorationProgress(sessionId: string | undefined, message: 
   if (!sessionId) return;
 
   try {
-    const { webSocketService } = require('@/websocket/websocket.service');
+    const { webSocketService } = require('@/websocket');
     const stepPayload = {
       sessionId,
       step: 'analyzing' as any,

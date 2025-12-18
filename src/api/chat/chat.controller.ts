@@ -1,6 +1,7 @@
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 
 // Shared modules
 import { CONSTANTS, MESSAGES } from './shared/constants';
@@ -63,6 +64,37 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // STEP 1: WORKSPACE CHECK (MANDATORY!) (FIX #3)
     // ═══════════════════════════════════════════════════════════════════════
     const workspace_id = await checkWorkspace(userId);
+    checkRequestTimeout();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 1.5: EARLY CREDITS CHECK (BEFORE ANY PROCESSING)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Check minimum credits required for chat (1 credit)
+    // This prevents wasting resources on intent parsing, AI calls, etc. if user has no credits
+    const chatCreditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'chat');
+
+    if (!chatCreditCheck.hasEnough) {
+      logger.warn('[CHAT] Insufficient credits for chat', {
+        userId: userId.substring(0, 8) + '...',
+        required: chatCreditCheck.required,
+        available: chatCreditCheck.available,
+        shortage: chatCreditCheck.shortage,
+      });
+
+      if (!res.headersSent) {
+        res.status(402).json({
+          success: false,
+          error: 'Insufficient credits',
+          message: `You need at least ${chatCreditCheck.required} credit(s) to use the chat. You have ${chatCreditCheck.available} credit(s). Please purchase ${chatCreditCheck.shortage} more credit(s) to continue.`,
+          required: chatCreditCheck.required,
+          available: chatCreditCheck.available,
+          shortage: chatCreditCheck.shortage,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+
     checkRequestTimeout();
 
     // ═══════════════════════════════════════════════════════════════════════

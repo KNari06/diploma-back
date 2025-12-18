@@ -1344,6 +1344,61 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
     if (parsed.apiBody === '') parsed.apiBody = undefined;
   }
 
+  // Step 5.1: Guardrail - prevent misclassification of regular websites as api_test
+  // This happens often on short approval messages like "run it" when URL is extracted from history.
+  // If url does not look like an API and message does not mention API/endpoint/method, treat as platform_test.
+  if (parsed.intent === 'api_test' && parsed.apiUrl) {
+    const messageLower = trimmedMessage.toLowerCase();
+    const apiKeywords = ['api', 'endpoint', 'http', 'method', 'graphql', 'rest', 'swagger', 'postman'];
+    const hasApiKeywordInMessage = apiKeywords.some((k) => messageLower.includes(k));
+    const hasApiSpecificFields = !!(parsed.apiMethod || parsed.apiBody || parsed.apiHeaders);
+
+    const looksLikeApiUrl = (() => {
+      try {
+        // If it's a relative path, it might be API path - keep api_test
+        if (!parsed.apiUrl.startsWith('http://') && !parsed.apiUrl.startsWith('https://')) return true;
+
+        const url = new URL(parsed.apiUrl);
+        const host = url.hostname.toLowerCase();
+        const path = url.pathname.toLowerCase();
+
+        // Common API signals in host/path
+        if (host === 'api' || host.startsWith('api.') || host.includes('.api.')) return true;
+        if (path === '/api' || path.startsWith('/api/') || path.includes('/api/')) return true;
+        if (path.startsWith('/graphql') || path.includes('/graphql')) return true;
+        if (path.startsWith('/v1/') || path.startsWith('/v2/') || path.startsWith('/v3/')) return true;
+
+        return false;
+      } catch {
+        return false;
+      }
+    })();
+
+    if (!looksLikeApiUrl && !hasApiKeywordInMessage && !hasApiSpecificFields) {
+      logger.warn('[INTENT_PARSER] Correcting misclassified api_test to platform_test (regular website URL)', {
+        apiUrl: parsed.apiUrl,
+        messagePreview: trimmedMessage.substring(0, 30),
+        intent_confidence: parsed.metadata?.intent_confidence ?? parsed.confidence,
+      });
+
+      // Convert to platform_test
+      const pageUrl = parsed.apiUrl;
+      parsed.intent = 'platform_test';
+      parsed.page = pageUrl;
+      parsed.apiUrl = undefined;
+      parsed.apiMethod = undefined;
+      parsed.apiBody = undefined;
+      parsed.apiHeaders = undefined;
+      parsed.isRelativePath = false;
+
+      parsed.metadata = {
+        ...parsed.metadata,
+        correction: 'api_test->platform_test',
+        correctionReason: 'URL looks like website and no API signals in message',
+      };
+    }
+  }
+
   if (parsed.intent === 'platform_test') {
     // Clean page URL
     if (parsed.page) {

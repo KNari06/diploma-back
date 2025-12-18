@@ -14,7 +14,10 @@ import { Page } from 'playwright';
  * Uses GPT-3.5-turbo for cost efficiency
  */
 export async function detectUserApproval(
-  userMessage: string
+  userMessage: string,
+  context?: {
+    lastAiMessageWasTestPlan?: boolean; // Context: was last AI message a test plan?
+  }
 ): Promise<{
   approved: boolean | null; // true = approve, false = reject, null = unclear
   confidence: number; // 0.0-1.0
@@ -40,8 +43,8 @@ export async function detectUserApproval(
       length: trimmedMessage.length,
     });
 
-    // Use centralized prompt
-    const prompt = buildApprovalDetectionPrompt(trimmedMessage);
+    // Use centralized prompt with context
+    const prompt = buildApprovalDetectionPrompt(trimmedMessage, context);
 
     const response = await getChatCompletionWithMessages([
       {
@@ -496,17 +499,21 @@ export async function extractUrlWithGPT(
   reasoning?: string;
 }> {
   try {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 🚫 CACHE DISABLED: URL Extraction Cache
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TODO: Uncomment to enable URL extraction cache
     // Build cache key from messages content
-    const cacheKey = messages.map(m => m.content).join('|') + (currentMessage || '');
-    const cached = urlExtractionCache.get(cacheKey);
-
-    if (cached && Date.now() - cached.timestamp < URL_EXTRACTION_CACHE_TTL) {
-      logger.info('🎯 [URL_EXTRACT] Using cached result', {
-        url: cached.result.url,
-        method: cached.result.method,
-      });
-      return cached.result;
-    }
+    // const cacheKey = messages.map(m => m.content).join('|') + (currentMessage || '');
+    // const cached = urlExtractionCache.get(cacheKey);
+    //
+    // if (cached && Date.now() - cached.timestamp < URL_EXTRACTION_CACHE_TTL) {
+    //   logger.info('🎯 [URL_EXTRACT] Using cached result', {
+    //     url: cached.result.url,
+    //     method: cached.result.method,
+    //   });
+    //   return cached.result;
+    // }
 
     logger.info('🔍 [URL_EXTRACT] Starting URL extraction with GPT', {
       messagesCount: messages.length,
@@ -596,11 +603,16 @@ RETURN ONLY VALID JSON:
       reasoning: parsed.reasoning,
     };
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 🚫 CACHE DISABLED: URL Extraction Cache Save
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TODO: Uncomment to enable saving URL extraction to cache
     // Cache the result
-    urlExtractionCache.set(cacheKey, {
-      result,
-      timestamp: Date.now(),
-    });
+    // const cacheKey = messages.map(m => m.content).join('|') + (currentMessage || '');
+    // urlExtractionCache.set(cacheKey, {
+    //   result,
+    //   timestamp: Date.now(),
+    // });
 
     logger.info('✅ [URL_EXTRACT] Extraction complete', {
       url: result.url,

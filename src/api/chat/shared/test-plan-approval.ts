@@ -1,12 +1,13 @@
-import { Request, Response } from 'express';
 import { supabaseAdmin } from '@/db/supabase';
+import { detectUserApproval } from '@/services/ai/ai-helpers.service';
+import { getLatestPendingTestPlan, getTestPlan } from '@/services/testing/plans/exploration-cache.service';
+import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
 import { isValidUUID } from '@/utils/validation/validation';
-import { detectUserApproval } from '@/services/ai/ai-helpers.service';
-import { ChatService } from '@/services/utils/chat.service';
-import { getTestPlan, getLatestPendingTestPlan } from '@/services/testing/plans/exploration-cache.service';
+import { Request, Response } from 'express';
 import { MESSAGES } from './constants';
 import { executeApprovedTestPlan } from './test-execution';
+
 
 /**
  * STEP 3: CHECK FOR PENDING TEST PLAN APPROVAL (MUST BE FIRST!)
@@ -120,17 +121,30 @@ export async function handlePendingTestPlanApproval(params: {
     }
   }
 
-  // If last AI message was NOT a test plan or expired choice, no approval to handle
-  if (!lastAiMessageWasTestPlan && !lastAiMessageWasExpiredChoice) {
-    logger.info('[APPROVAL_CHECK] Last AI message was not a test plan or expired choice, no approval to handle', {
-      chatSessionId: chatSessionId?.substring(0, 8) + '...' || 'none',
-    });
-    return false; // No pending approval, continue with intent parsing
-  }
-
   // Find pending test plan (parallel search for performance)
+  // If pending plan exists, it means there WAS a test plan, even if last AI message doesn't have metadata
   const pendingPlan = await findPendingTestPlan(conversationId, userId);
 
+  // If we found a pending plan, treat it as if last AI message was a test plan
+  // This handles cases where AI responded with "Yes, I remember..." but plan exists in DB
+  if (pendingPlan && pendingPlan.status === 'pending_confirmation') {
+    lastAiMessageWasTestPlan = true;
+    logger.info('[APPROVAL_CHECK] Found pending plan in DB, treating as test plan context', {
+      planId: pendingPlan.id,
+      scope: pendingPlan.scope,
+      hasMetadataInLastMessage: lastAiMessageWasTestPlan,
+    });
+  }
+
+  // If last AI message was NOT a test plan and NO pending plan exists, skip approval handling
+  if (!lastAiMessageWasTestPlan && !lastAiMessageWasExpiredChoice) {
+    logger.info('[APPROVAL_CHECK] Last AI message was not a test plan and no pending plan found, no approval to handle', {
+      chatSessionId: chatSessionId?.substring(0, 8) + '...' || 'none',
+    });
+    return false; // Continue with intent parsing
+  }
+
+  // If no pending plan found, but we already checked above, return false
   if (!pendingPlan) {
     logger.info('[CHAT] No pending test plan found', {
       userId: userId.substring(0, 8) + '...',
@@ -255,7 +269,11 @@ export async function handlePendingTestPlanApproval(params: {
     userMessage: message,
   });
 
-  const approvalResult = await detectUserApproval(message);
+  // Use AI-based approval detection with context
+  // Pass context that last AI message was a test plan (or pending plan exists in DB)
+  const approvalResult = await detectUserApproval(message, {
+    lastAiMessageWasTestPlan: lastAiMessageWasTestPlan,
+  });
 
   // Check if request was cancelled after AI call
   if (params.abortSignal) {

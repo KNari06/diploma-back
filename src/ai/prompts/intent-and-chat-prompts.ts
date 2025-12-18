@@ -293,7 +293,8 @@ EXAMPLES:
 • "yes" + NO system URL → needs_clarification
 • "yes" + system URL "https://api.example.com" → {"intent": "api_test", "apiUrl": "https://api.example.com", "intent_confidence": 0.90}
 • "давай" + NO system URL → needs_clarification
-• "давай" + system URL → {"intent": "api_test", "apiUrl": "<system_url>", "intent_confidence": 0.90}`;
+• "давай" + system URL "https://example.com" → {"intent": "platform_test", "page": "https://example.com", "intent_confidence": 0.90}
+• "давай" + system URL "https://api.example.com/users" → {"intent": "api_test", "apiUrl": "https://api.example.com/users", "apiMethod": null, "intent_confidence": 0.90}`;
 
   // Add context if available
   if (context) {
@@ -452,12 +453,23 @@ REMEMBER: Understand WHAT the user wants, not just WHAT they said!`;
  * Detect if user approved or rejected test plan
  * Used for natural language approval detection
  */
-export function buildApprovalDetectionPrompt(userMessage: string): string {
+export function buildApprovalDetectionPrompt(
+  userMessage: string,
+  context?: {
+    lastAiMessageWasTestPlan?: boolean;
+  }
+): string {
+  const hasTestPlanContext = context?.lastAiMessageWasTestPlan === true;
+
   return `You are an expert at interpreting user intent in natural language.
 
 Your task: determine whether the user is approving a TEST EXECUTION.
-Approval is ONLY valid if the LAST AI message was a TEST PLAN.
-If the last AI message was NOT a test plan → always return approved=null.
+
+${hasTestPlanContext
+  ? `✅ CONTEXT: The LAST AI message WAS a TEST PLAN. User is responding to that plan.
+     This means short approval commands like "run it", "start", "go", "давай" should be treated as APPROVAL.`
+  : `⚠️ CONTEXT: Unknown if last AI message was a test plan.
+     If user message is ambiguous without context → return approved=null with low confidence.`}
 
 USER MESSAGE:
 "${userMessage}"
@@ -474,12 +486,20 @@ You must classify the message:
    Anything else (questions, modifications, clarifications, unrelated messages).
 
 Important rules:
-• Approval must be explicit or strongly implied ("yes, run it", "давай запускай", "ok go", "start the test").
+${hasTestPlanContext
+  ? `• Since last AI message WAS a test plan, treat these as APPROVAL (high confidence):
+     - "run it", "start", "go", "go ahead", "execute", "давай", "запускай", "иә", "ok", "yes"
+     - Short commands are APPROVAL when responding to test plan
+     - Only return approved=null if message is clearly a question or modification request
+• If user asks to modify something → NOT approval (approved=false or null).
+• If user asks a question → NOT approval (approved=null).
+• If user comments or discusses results → NOT approval (approved=null).`
+  : `• Approval must be explicit or strongly implied ("yes, run it", "давай запускай", "ok go", "start the test").
 • A simple "yes" = approval ONLY if context makes sense (the last message was a plan).
 • If user asks to modify something → NOT approval.
 • If user asks a question → NOT approval.
 • If user comments or discusses results → NOT approval.
-• If the message is ambiguous → use approved=null unless confidence is high.
+• If the message is ambiguous → use approved=null unless confidence is high.`}
 
 Multilingual approval examples:
 • "run it", "start", "go ahead", "ok let's run", "давай", "запускай", "иә бастаңдар", "ok bro go", "жарайды іске қос".

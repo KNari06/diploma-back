@@ -63,23 +63,27 @@ export async function registerActiveRequest(
     }
     activeRequests.set(chatSessionId, request);
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 🚫 CACHE DISABLED: Redis Cache for Active Requests (Session)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TODO: Uncomment to enable Redis tracking for cross-instance request cancellation
     // ✅ FIX #2: Store in Redis for cross-instance tracking
-    try {
-      await redisConnection.setex(
-        `${REDIS_KEY_PREFIX}session:${chatSessionId}`,
-        REDIS_TTL,
-        JSON.stringify({
-          userId,
-          startedAt: request.startedAt,
-          message: request.message,
-        })
-      );
-    } catch (redisError) {
-      logger.warn('[REQUEST_CANCEL] Failed to store request in Redis (fallback to in-memory)', {
-        error: redisError instanceof Error ? redisError.message : String(redisError),
-        chatSessionId,
-      });
-    }
+    // try {
+    //   await redisConnection.setex(
+    //     `${REDIS_KEY_PREFIX}session:${chatSessionId}`,
+    //     REDIS_TTL,
+    //     JSON.stringify({
+    //       userId,
+    //       startedAt: request.startedAt,
+    //       message: request.message,
+    //     })
+    //   );
+    // } catch (redisError) {
+    //   logger.warn('[REQUEST_CANCEL] Failed to store request in Redis (fallback to in-memory)', {
+    //     error: redisError instanceof Error ? redisError.message : String(redisError),
+    //     chatSessionId,
+    //   });
+    // }
   }
 
   // Also register by user ID (for fallback)
@@ -93,23 +97,27 @@ export async function registerActiveRequest(
   }
   activeRequestsByUser.set(userId, request);
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 🚫 CACHE DISABLED: Redis Cache for Active Requests (User)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TODO: Uncomment to enable Redis tracking for cross-instance request cancellation
   // ✅ FIX #2: Store in Redis for cross-instance tracking
-  try {
-    await redisConnection.setex(
-      `${REDIS_KEY_PREFIX}user:${userId}`,
-      REDIS_TTL,
-      JSON.stringify({
-        chatSessionId,
-        startedAt: request.startedAt,
-        message: request.message,
-      })
-    );
-  } catch (redisError) {
-    logger.warn('[REQUEST_CANCEL] Failed to store user request in Redis (fallback to in-memory)', {
-      error: redisError instanceof Error ? redisError.message : String(redisError),
-      userId: userId.substring(0, 8) + '...',
-    });
-  }
+  // try {
+  //   await redisConnection.setex(
+  //     `${REDIS_KEY_PREFIX}user:${userId}`,
+  //     REDIS_TTL,
+  //     JSON.stringify({
+  //       chatSessionId,
+  //       startedAt: request.startedAt,
+  //       message: request.message,
+  //     })
+  //   );
+  // } catch (redisError) {
+  //   logger.warn('[REQUEST_CANCEL] Failed to store user request in Redis (fallback to in-memory)', {
+  //     error: redisError instanceof Error ? redisError.message : String(redisError),
+  //     userId: userId.substring(0, 8) + '...',
+  //   });
+  // }
 
   logger.info('[REQUEST_CANCEL] Registered active request', {
     chatSessionId,
@@ -133,19 +141,23 @@ export async function hasActiveRequest(chatSessionId: string | undefined, userId
   const userReq = activeRequestsByUser.get(userId);
   if (userReq && !userReq.abortController.signal.aborted) return true;
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 🚫 CACHE DISABLED: Redis Cache Check for Active Requests
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TODO: Uncomment to enable Redis checking for cross-instance request tracking
   // ✅ FIX #2: Check Redis for requests from other instances
-  try {
-    if (chatSessionId) {
-      const redisData = await redisConnection.get(`${REDIS_KEY_PREFIX}session:${chatSessionId}`);
-      if (redisData) return true;
-    }
-    const userRedisData = await redisConnection.get(`${REDIS_KEY_PREFIX}user:${userId}`);
-    if (userRedisData) return true;
-  } catch (redisError) {
-    logger.warn('[REQUEST_CANCEL] Failed to check Redis for active request (fallback to in-memory)', {
-      error: redisError instanceof Error ? redisError.message : String(redisError),
-    });
-  }
+  // try {
+  //   if (chatSessionId) {
+  //     const redisData = await redisConnection.get(`${REDIS_KEY_PREFIX}session:${chatSessionId}`);
+  //     if (redisData) return true;
+  //   }
+  //   const userRedisData = await redisConnection.get(`${REDIS_KEY_PREFIX}user:${userId}`);
+  //   if (userRedisData) return true;
+  // } catch (redisError) {
+  //   logger.warn('[REQUEST_CANCEL] Failed to check Redis for active request (fallback to in-memory)', {
+  //     error: redisError instanceof Error ? redisError.message : String(redisError),
+  //   });
+  // }
 
   return false;
 }
@@ -176,15 +188,19 @@ export async function cancelActiveRequest(
       activeRequests.delete(chatSessionId);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 🚫 CACHE DISABLED: Redis Cache Delete (Session)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TODO: Uncomment to enable Redis deletion for cross-instance cancellation
     // ✅ FIX #2: Delete from Redis to signal cancellation to other instances
-    try {
-      await redisConnection.del(`${REDIS_KEY_PREFIX}session:${chatSessionId}`);
-    } catch (redisError) {
-      logger.warn('[REQUEST_CANCEL] Failed to delete session from Redis', {
-        error: redisError instanceof Error ? redisError.message : String(redisError),
-        chatSessionId,
-      });
-    }
+    // try {
+    //   await redisConnection.del(`${REDIS_KEY_PREFIX}session:${chatSessionId}`);
+    // } catch (redisError) {
+    //   logger.warn('[REQUEST_CANCEL] Failed to delete session from Redis', {
+    //     error: redisError instanceof Error ? redisError.message : String(redisError),
+    //     chatSessionId,
+    //   });
+    // }
   }
 
   // Also try to cancel by user ID (fallback)
@@ -203,15 +219,19 @@ export async function cancelActiveRequest(
     activeRequestsByUser.delete(userId);
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 🚫 CACHE DISABLED: Redis Cache Delete (User)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TODO: Uncomment to enable Redis deletion for cross-instance cancellation
   // ✅ FIX #2: Delete from Redis to signal cancellation to other instances
-  try {
-    await redisConnection.del(`${REDIS_KEY_PREFIX}user:${userId}`);
-  } catch (redisError) {
-    logger.warn('[REQUEST_CANCEL] Failed to delete user request from Redis', {
-      error: redisError instanceof Error ? redisError.message : String(redisError),
-      userId: userId.substring(0, 8) + '...',
-    });
-  }
+  // try {
+  //   await redisConnection.del(`${REDIS_KEY_PREFIX}user:${userId}`);
+  // } catch (redisError) {
+  //   logger.warn('[REQUEST_CANCEL] Failed to delete user request from Redis', {
+  //     error: redisError instanceof Error ? redisError.message : String(redisError),
+  //     userId: userId.substring(0, 8) + '...',
+  //   });
+  // }
 
   return { cancelled, message: cancelledMessage };
 }
@@ -227,28 +247,36 @@ export async function unregisterActiveRequest(
   if (chatSessionId) {
     activeRequests.delete(chatSessionId);
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 🚫 CACHE DISABLED: Redis Cache Delete on Unregister (Session)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TODO: Uncomment to enable Redis cleanup on request completion
     // ✅ FIX #2: Delete from Redis
-    try {
-      await redisConnection.del(`${REDIS_KEY_PREFIX}session:${chatSessionId}`);
-    } catch (redisError) {
-      logger.warn('[REQUEST_CANCEL] Failed to delete session from Redis on unregister', {
-        error: redisError instanceof Error ? redisError.message : String(redisError),
-        chatSessionId,
-      });
-    }
+    // try {
+    //   await redisConnection.del(`${REDIS_KEY_PREFIX}session:${chatSessionId}`);
+    // } catch (redisError) {
+    //   logger.warn('[REQUEST_CANCEL] Failed to delete session from Redis on unregister', {
+    //     error: redisError instanceof Error ? redisError.message : String(redisError),
+    //     chatSessionId,
+    //   });
+    // }
   }
 
   activeRequestsByUser.delete(userId);
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 🚫 CACHE DISABLED: Redis Cache Delete on Unregister (User)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TODO: Uncomment to enable Redis cleanup on request completion
   // ✅ FIX #2: Delete from Redis
-  try {
-    await redisConnection.del(`${REDIS_KEY_PREFIX}user:${userId}`);
-  } catch (redisError) {
-    logger.warn('[REQUEST_CANCEL] Failed to delete user request from Redis on unregister', {
-      error: redisError instanceof Error ? redisError.message : String(redisError),
-      userId: userId.substring(0, 8) + '...',
-    });
-  }
+  // try {
+  //   await redisConnection.del(`${REDIS_KEY_PREFIX}user:${userId}`);
+  // } catch (redisError) {
+  //   logger.warn('[REQUEST_CANCEL] Failed to delete user request from Redis on unregister', {
+  //     error: redisError instanceof Error ? redisError.message : String(redisError),
+  //     userId: userId.substring(0, 8) + '...',
+  //   });
+  // }
 }
 
 /**

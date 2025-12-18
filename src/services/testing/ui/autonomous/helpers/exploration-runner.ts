@@ -1,6 +1,10 @@
-import { getCachedExploration, saveExplorationToCache } from '@/services/testing/plans/exploration-cache.service';
-import { exploreProduct } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
+// ═══════════════════════════════════════════════════════════════════════════
+// 🚫 CACHE DISABLED: Exploration Cache imports
+// ═══════════════════════════════════════════════════════════════════════════
+// TODO: Uncomment to enable exploration cache
+// import { getCachedExploration, saveExplorationToCache } from '@/services/testing/plans/exploration-cache.service';
 import { env } from '@/config/environment/env';
+import { exploreProduct } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -29,16 +33,20 @@ export async function runExploration(params: {
     emitProgress,
   } = params;
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 🚫 CACHE DISABLED: Exploration Cache
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TODO: Uncomment to enable exploration cache
   // Check cache first
-  logger.info('[AUTONOMOUS] Checking cache');
-  emitProgress('analyzing', '📦 Checking cache...', 15);
-  const cached = await getCachedExploration(url, projectId);
-
-  if (cached) {
-    logger.info('Using cached exploration', { url });
-    emitProgress('analyzing', '✅ Using cached data', 20);
-    return { exploration: cached };
-  }
+  // logger.info('[AUTONOMOUS] Checking cache');
+  // emitProgress('analyzing', '📦 Checking cache...', 15);
+  // const cached = await getCachedExploration(url, projectId);
+  //
+  // if (cached) {
+  //   logger.info('Using cached exploration', { url });
+  //   emitProgress('analyzing', '✅ Using cached data', 20);
+  //   return { exploration: cached };
+  // }
 
   // Run fresh exploration
   logger.info('[AUTONOMOUS] Running fresh exploration');
@@ -117,12 +125,21 @@ export async function runExploration(params: {
   logger.info('[AUTONOMOUS] Exploration completed successfully');
   emitProgress('analyzing', '✅ Analysis completed successfully!', 50);
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 🚫 CACHE DISABLED: Exploration Cache Save
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TODO: Uncomment to enable saving exploration to cache
   // Save to cache
-  emitProgress('analyzing', '💾 Saving results to cache...', 52);
-  const cacheResult = await saveExplorationToCache(exploration, userId, projectId);
+  // emitProgress('analyzing', '💾 Saving results to cache...', 52);
+  // const cacheResult = await saveExplorationToCache(exploration, userId, projectId);
+  //
+  // return {
+  //   exploration,
+  //   explorationId: cacheResult.id,
+  // };
 
   return {
     exploration,
-    explorationId: cacheResult.id,
+    // explorationId: cacheResult.id, // Disabled: cache disabled
   };
 }

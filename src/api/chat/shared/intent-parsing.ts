@@ -20,14 +20,17 @@ export async function getChatHistoryForIntent(
   }
 
   try {
+    // We want the model to reason over a small, stable context window
+    // (at least last 4 messages: user+ai). Fetch more, but slice down after formatting.
+    const CONTEXT_WINDOW_MESSAGES = 4;
     const recentMessages = await ChatService.getRecentMessages(
       chatSessionId,
       userId, // SECURITY: Pass userId for verification
-      CONSTANTS.RECENT_MESSAGES_LIMIT
+      Math.max(CONSTANTS.RECENT_MESSAGES_LIMIT, CONTEXT_WINDOW_MESSAGES)
     );
     // Convert 'ai' role to 'assistant' for OpenAI compatibility
     // ✅ FIX: Include test results from metadata so AI can see them in intent parsing
-    const chatHistory = recentMessages.map(msg => {
+    const fullChatHistory = recentMessages.map(msg => {
       let content = msg.content;
 
       // ✅ FIX: If message has test results in metadata, append them to content
@@ -55,10 +58,17 @@ export async function getChatHistoryForIntent(
     });
 
     logger.debug('[CHAT] Retrieved chat history for intent parsing', {
-      historyLength: chatHistory.length,
+      historyLength: fullChatHistory.length,
     });
 
-    return chatHistory;
+    // Only keep the last N messages (chronological order is guaranteed by ChatService.getRecentMessages)
+    const windowedHistory = fullChatHistory.slice(-CONTEXT_WINDOW_MESSAGES);
+    logger.debug('[CHAT] Using chat history window for intent parsing', {
+      windowSize: CONTEXT_WINDOW_MESSAGES,
+      used: windowedHistory.length,
+    });
+
+    return windowedHistory;
   } catch (error) {
     logger.warn('[CHAT] Failed to get chat history, continuing without it', {
       error: error instanceof Error ? error.message : String(error),
