@@ -3,8 +3,8 @@ import { supabaseAdmin } from '../../db/supabase';
 import { IntelligentTestStorageService } from '../../services/testing/results/intelligent-test-storage.service';
 import { TestReportGeneratorService } from '../../services/testing/results/test-report-generator.service';
 import { PlaywrightStep, PlaywrightStepType } from '../../types/playwright.types';
-import { logger } from '../../utils/logger';
-import { exportGraph, parsePlaywrightTestSteps } from '../../utils/playwrightParser';
+import { logger } from '@/utils/core/logger';
+import { exportGraph, parsePlaywrightTestSteps } from '@/utils/parsing/playwrightParser';
 
 // UUID validation regex
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

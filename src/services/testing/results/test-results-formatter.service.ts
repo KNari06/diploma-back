@@ -1,4 +1,4 @@
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Service to format test results for chat display
@@ -19,7 +19,8 @@ export class TestResultsFormatterService {
         return '✅ Test completed. Results are available in your dashboard.';
       }
 
-      const testType = test.options?.intelligentMode ? 'Intelligent' : 'Standard';
+      // ✅ FIX #20: Use dedicated intelligent_mode column instead of options.intelligentMode
+      const testType = test.intelligent_mode ? 'Intelligent' : 'Standard';
       const completedResults = results.filter((r) => r && r.status === 'completed');
       const failedResults = results.filter((r) => r && r.status === 'failed');
 

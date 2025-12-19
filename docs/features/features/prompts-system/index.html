@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prompts System - Features Documentation</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <style>
+        .feature-page { padding: 40px; }
+        .section { margin-bottom: 50px; }
+        .section-title { font-size: 2em; margin-bottom: 20px; color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 10px; }
+        .overview { background: #f8f9fa; padding: 25px; border-radius: 12px; margin-bottom: 30px; }
+        .diagram-container { background: #f8f9fa; padding: 30px; border-radius: 12px; margin-bottom: 40px; overflow-x: auto; }
+        .mermaid { background: white; padding: 20px; border-radius: 8px; }
+        .back-link { display: inline-block; margin-bottom: 20px; color: #667eea; text-decoration: none; font-weight: 500; }
+        .back-link:hover { text-decoration: underline; }
+        .prompt-card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #667eea; }
+        .prompt-category { font-weight: bold; color: #667eea; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Prompts System</h1>
+            <p>AI prompts with versioning, changes tracking, and usage analytics</p>
+        </div>
+        <div class="feature-page">
+            <a href="../../index.html" class="back-link">← Back to Features</a>
+
+            <div class="section">
+                <h2 class="section-title">📋 Overview</h2>
+                <div class="overview">
+                    <p>Prompts system manages all AI prompts used in the platform. All prompts are centralized in <code>src/ai/prompts/index.ts</code> for easy management and updates.</p>
+                    <p><strong>Key Features:</strong></p>
+                    <ul>
+                        <li>Centralized prompt management</li>
+                        <li>Organized by logical categories</li>
+                        <li>Context-aware prompts</li>
+                        <li>Multilingual support (AI auto-detects language)</li>
+                        <li>Version tracking and optimization</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Prompts System Flow</h2>
+
+                <div class="overview" style="margin-bottom: 20px; padding: 20px;">
+                    <h3 style="margin-top: 0; color: #667eea;">🎨 Legend (Легенда)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e1f5ff; border: 2px solid #01579b;"></span>
+                            <div>
+                                <strong>🔵 Blue</strong> - Prompt Builders (Построители промптов)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #fff4e1; border: 2px solid #e65100;"></span>
+                            <div>
+                                <strong>🟡 Orange</strong> - Central Index (Центральный экспорт)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 2px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green</strong> - Prompts Object (Объект промптов)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #ffebee; border: 2px solid #c62828;"></span>
+                            <div>
+                                <strong>🔴 Red</strong> - AI Model (AI модель)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Start([AI Request]) --> PromptType{What Type?}
+
+    PromptType -->|Intent Parsing| IntentPrompt[buildIntentPrompt]
+    PromptType -->|Chat| ChatPrompt[buildChatSystemPrompt]
+    PromptType -->|Test Plan| TestPlanPrompt[buildTestPlanPrompt]
+    PromptType -->|Intelligent Testing| IntelligentPrompts[Intelligent Testing Prompts]
+    PromptType -->|API Testing| ApiPrompts[API Testing Prompts]
+
+    IntentPrompt --> IntentFile[intent-and-chat-prompts.ts]
+    ChatPrompt --> IntentFile
+    IntentPrompt --> ApprovalPrompt[buildApprovalDetectionPrompt]
+    ApprovalPrompt --> IntentFile
+
+    TestPlanPrompt --> TestPlanFile[test-plan-prompts.ts]
+    TestPlanPrompt --> ApiTestPlan[buildApiTestPlanPrompt]
+    ApiTestPlan --> TestPlanFile
+    TestPlanPrompt --> FuzzingPrompt[buildApiFuzzingPrompt]
+    FuzzingPrompt --> TestPlanFile
+    TestPlanPrompt --> QuestionPrompt[buildDynamicQuestionPrompt]
+    QuestionPrompt --> TestPlanFile
+
+    IntelligentPrompts --> IntelligentFile[intelligent-testing-prompts.ts]
+    IntelligentPrompts --> PageAnalysis[buildPageAnalysisPrompt]
+    IntelligentPrompts --> ActionGen[buildActionGenerationPrompt]
+    IntelligentPrompts --> NextStep[buildNextStepPrompt]
+    IntelligentPrompts --> LogicAnalysis[buildLogicAnalysisPrompt]
+    IntelligentPrompts --> Vision[buildVisionPrompt]
+
+    PageAnalysis --> IntelligentFile
+    ActionGen --> IntelligentFile
+    NextStep --> IntelligentFile
+    LogicAnalysis --> IntelligentFile
+    Vision --> IntelligentFile
+
+    ApiPrompts --> TestPlanFile
+
+    IntentFile --> CentralIndex[index.ts - Central Export]
+    TestPlanFile --> CentralIndex
+    IntelligentFile --> CentralIndex
+
+    CentralIndex --> PromptsObject[Prompts Object]
+    PromptsObject --> AI[AI Model]
+    AI --> Response([AI Response])
+
+    style IntentPrompt fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style ChatPrompt fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style TestPlanPrompt fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style IntelligentPrompts fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style CentralIndex fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style PromptsObject fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style AI fill:#ffebee,stroke:#c62828,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📝 Prompt Categories</h2>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">1. Intent Parsing</div>
+                    <p><strong>buildIntentPrompt</strong> - Determines user's intention from natural language</p>
+                    <p>Detects: platform_test, api_test, general_chat, needs_clarification</p>
+                    <p>Extracts: scope, target, URL, API method, body, headers</p>
+                    <p><strong>File:</strong> intent-and-chat-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">2. Chat/Conversation</div>
+                    <p><strong>buildChatSystemPrompt</strong> - System prompt for general conversations</p>
+                    <p>Defines platform capabilities, communication style, multilingual support</p>
+                    <p><strong>File:</strong> intent-and-chat-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">3. Approval Detection</div>
+                    <p><strong>buildApprovalDetectionPrompt</strong> - Detects if user approved/rejected test plan</p>
+                    <p>Handles natural language, emojis, slang in any language</p>
+                    <p><strong>File:</strong> intent-and-chat-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">4. API Test Plans</div>
+                    <p><strong>buildApiTestPlanPrompt</strong> - Generates detailed API test plan</p>
+                    <p>Includes validation steps, expected status, headers, body, potential issues</p>
+                    <p><strong>File:</strong> test-plan-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">5. UI Test Plans</div>
+                    <p><strong>buildTestPlanPrompt</strong> - Generates comprehensive UI test plan</p>
+                    <p>Step-by-step flow, Playwright commands, duration estimate</p>
+                    <p><strong>File:</strong> test-plan-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">6. API Fuzzing</div>
+                    <p><strong>buildApiFuzzingPrompt</strong> - Generates fuzzing scenarios for API testing</p>
+                    <p>Edge cases, invalid inputs, boundary testing</p>
+                    <p><strong>File:</strong> test-plan-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">7. Dynamic Questions</div>
+                    <p><strong>buildDynamicQuestionPrompt</strong> - Generates clarifying questions</p>
+                    <p>Used when missing URL, unclear scope, need credentials</p>
+                    <p><strong>File:</strong> test-plan-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">8. Intelligent Testing - Page Analysis</div>
+                    <p><strong>buildPageAnalysisPrompt</strong> - Analyzes page screenshot with Vision API</p>
+                    <p>Identifies interactive elements, page type, layout, modals</p>
+                    <p><strong>File:</strong> intelligent-testing-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">9. Intelligent Testing - Action Generation</div>
+                    <p><strong>buildActionGenerationPrompt</strong> - Generates test actions based on page context</p>
+                    <p>Creates click, fill, wait, navigate actions with selectors</p>
+                    <p><strong>File:</strong> intelligent-testing-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">10. Intelligent Testing - Next Step</div>
+                    <p><strong>buildNextStepPrompt</strong> - Decides next step in test execution</p>
+                    <p>Returns: continue, stop, wait_for_user, retry, skip with confidence</p>
+                    <p><strong>File:</strong> intelligent-testing-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">11. Intelligent Testing - Logic Analysis</div>
+                    <p><strong>buildLogicAnalysisPrompt</strong> - Analyzes page logic and flow</p>
+                    <p>Identifies form validation, navigation patterns, state changes</p>
+                    <p><strong>File:</strong> intelligent-testing-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">12. Intelligent Testing - Vision</div>
+                    <p><strong>buildVisionPrompt</strong> - Vision API prompt for screenshot analysis</p>
+                    <p>Enhanced with DOM context, element properties, page structure</p>
+                    <p><strong>File:</strong> intelligent-testing-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">13. URL Analysis</div>
+                    <p><strong>buildUrlAnalysisPrompt</strong> - Analyzes URL context and structure</p>
+                    <p>Extracts domain, path, parameters, identifies page type</p>
+                    <p><strong>File:</strong> test-plan-prompts.ts</p>
+                </div>
+
+                <div class="prompt-card">
+                    <div class="prompt-category">14. Custom Scope Strategy</div>
+                    <p><strong>buildCustomScopeStrategyPrompt</strong> - Generates custom testing strategy</p>
+                    <p>Creates tailored approach based on user requirements</p>
+                    <p><strong>File:</strong> test-plan-prompts.ts</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📁 File Structure</h2>
+                <div class="overview">
+                    <p><strong>src/ai/prompts/index.ts</strong> - Central export file, re-exports all prompts</p>
+                    <p><strong>src/ai/prompts/intent-and-chat-prompts.ts</strong> - Intent parsing, chat, approval detection</p>
+                    <p><strong>src/ai/prompts/test-plan-prompts.ts</strong> - API/UI test plans, fuzzing, questions</p>
+                    <p><strong>src/ai/prompts/intelligent-testing-prompts.ts</strong> - Intelligent testing (page analysis, actions, vision)</p>
+                    <p><strong>src/ai/prompts/prompt-utils.ts</strong> - Utility functions for prompt building</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🌍 Language Policy</h2>
+                <div class="overview">
+                    <p><strong>All prompts are in English</strong> (for US market launch)</p>
+                    <p><strong>AI automatically detects user's language</strong> and responds accordingly</p>
+                    <p>Supports: English, Russian, Spanish, Kazakh, and more</p>
+                    <p>Context-first approach: Understands user's TRUE INTENT, not just keywords</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>

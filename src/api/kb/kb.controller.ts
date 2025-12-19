@@ -1,8 +1,8 @@
 import { supabaseAdmin } from '@/db/supabase';
 import * as kbService from '@/services/kb/kb.service';
 import { getLocalKBStats, rebuildGlobalKB } from '@/services/kb/localKB.service';
-import { errorResponse, successResponse } from '@/utils/error-handler';
-import { logger } from '@/utils/logger';
+import { errorResponse, successResponse } from '@/utils/core/error-handler';
+import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
 // UUID validation regex

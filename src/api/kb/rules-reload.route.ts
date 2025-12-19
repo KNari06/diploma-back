@@ -6,7 +6,7 @@
 
 import { Router } from 'express';
 import { requireAuth } from '@/middleware/auth.middleware';
-import { asyncHandler } from '@/utils/error-handler';
+import { asyncHandler } from '@/utils/core/error-handler';
 import * as rulesReloadController from './rules-reload.controller';
 
 const router = Router();

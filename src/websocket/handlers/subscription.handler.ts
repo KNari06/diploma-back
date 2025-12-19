@@ -3,16 +3,16 @@
  * Handles room subscriptions for tests and chats
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Socket } from 'socket.io';
-import { getUserId } from '../middleware';
+import { getUserId } from '../middleware/middleware';
 import {
-    ClientToServerEvents,
-    createRoomName,
-    ErrorPayload,
-    ServerToClientEvents,
-    SocketData,
-} from '../types';
+  ClientToServerEvents,
+  createRoomName,
+  ErrorPayload,
+  ServerToClientEvents,
+  SocketData,
+} from '../types/types';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 
@@ -253,6 +253,28 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         userId: userId || 'anonymous',
         error: error instanceof Error ? error.message : String(error),
         errorType: error instanceof Error ? error.constructor.name : typeof error,
+      });
+    }
+  });
+
+  // Handle clarification response
+  socket.on('test:clarification:response', ({ testId, questionId, answer }) => {
+    logger.info('[SubscriptionHandler] Received clarification response', {
+      socketId: socket.id,
+      userId,
+      testId,
+      questionId,
+    });
+
+    try {
+      // Import dynamically to avoid circular dependency
+      const { ClarificationService } = require('@/agent/utils/clarification.service');
+      ClarificationService.handleResponse(testId, questionId, answer);
+    } catch (error) {
+      logger.error('[SubscriptionHandler] Failed to handle clarification response', {
+        error: error instanceof Error ? error.message : String(error),
+        testId,
+        questionId,
       });
     }
   });

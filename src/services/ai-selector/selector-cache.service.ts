@@ -3,7 +3,7 @@
  * Multi-tenant cache with SHA256 keys and versioning
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import type {
   CacheKeyComponents,
   CachedSelectorResult,

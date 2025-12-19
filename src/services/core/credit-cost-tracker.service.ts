@@ -1,4 +1,4 @@
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { TokenCalculatorService } from './token-calculator.service';
 import { UserCreditsService } from './user-credits.service';
 
@@ -24,7 +24,7 @@ export interface TokenUsage {
 
 export interface CreditDeduction {
   userId: string;
-  testType: 'intelligent' | 'standard' | 'api';
+  testType: 'intelligent' | 'standard' | 'api' | 'chat';
   tokens?: TokenUsage;
   credits: number;
   costUSD: number;
@@ -230,7 +230,7 @@ export class CreditCostTrackerService {
         throw new Error('Invalid userId');
       }
 
-      if (!deduction.testType || !['intelligent', 'standard', 'api'].includes(deduction.testType)) {
+      if (!deduction.testType || !['intelligent', 'standard', 'api', 'chat'].includes(deduction.testType)) {
         throw new Error('Invalid testType');
       }
 
@@ -318,7 +318,7 @@ export class CreditCostTrackerService {
    */
   static async checkCreditsForTest(
     userId: string,
-    testType: 'intelligent' | 'standard' | 'api' | 'chat'
+    testType: 'intelligent' | 'api' | 'chat'
   ): Promise<CreditCheck> {
     try {
       // Validate inputs
@@ -328,16 +328,6 @@ export class CreditCostTrackerService {
           hasEnough: false,
           required: 0,
           available: 0,
-          shortage: 0,
-        };
-      }
-
-      // Chat is always free
-      if (testType === 'chat') {
-        return {
-          hasEnough: true,
-          required: 0,
-          available: Infinity,
           shortage: 0,
         };
       }

@@ -1,8 +1,9 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
+import { ApiTestStorageService } from './api-test-storage.service';
 
 export interface ApiTestHistoryItem {
-  id: string; // testId from metadata
+  id: string; // testId from metadata or execution ID
   testId: string;
   method: string;
   url: string;
@@ -18,6 +19,25 @@ export interface ApiTestHistoryItem {
     failed: number;
     issuesFound: number;
     securityScore: number;
+    hadFollowOn?: boolean; // NEW: Indicates if follow-on phase was executed
+    phases?: {
+      initial?: { tests: number; issues: number };
+      followOn?: { tests: number; issues: number };
+    };
+  };
+  // NEW: Additional fields from api_test_executions
+  executionId?: string; // ID from api_test_executions table
+  request?: {
+    method: string;
+    url: string;
+    headers?: Record<string, string>;
+    body?: any;
+  };
+  response?: {
+    status: number;
+    statusText: string;
+    headers?: Record<string, string>;
+    body?: any;
   };
 }
 
@@ -51,7 +71,8 @@ export interface ApiTestDetails extends ApiTestHistoryItem {
  */
 export class ApiTestHistoryService {
   /**
-   * Get all API tests for a user (from chat messages)
+   * Get all API tests for a user (merged from api_test_executions + chat_messages)
+   * NEW: Combines data from both tables for complete information
    */
   static async getApiTestsByUser(
     userId: string,
@@ -71,7 +92,29 @@ export class ApiTestHistoryService {
     try {
       const offset = (page - 1) * limit;
 
-      // Get all chat sessions for user
+      // ═══════════════════════════════════════════════════════════════════
+      // STEP 1: Get data from api_test_executions (primary source)
+      // ═══════════════════════════════════════════════════════════════════
+      let executionsData: any[] = [];
+      let executionsCount = 0;
+
+      try {
+        const executionsResult = await ApiTestStorageService.getApiTestExecutionsByUser(userId, {
+          page,
+          limit,
+        });
+        executionsData = executionsResult.data || [];
+        executionsCount = executionsResult.pagination.total;
+      } catch (executionsError) {
+        logger.warn('[API_TEST_HISTORY] Failed to get executions, falling back to chat_messages', {
+          error: executionsError instanceof Error ? executionsError.message : String(executionsError),
+        });
+        // Continue with chat_messages fallback
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // STEP 2: Get data from chat_messages (fallback + additional info)
+      // ═══════════════════════════════════════════════════════════════════
       const { data: sessions, error: sessionsError } = await supabaseAdmin
         .from('chat_sessions')
         .select('id')
@@ -81,100 +124,155 @@ export class ApiTestHistoryService {
         throw new Error(`Failed to get chat sessions: ${sessionsError.message}`);
       }
 
-      if (!sessions || sessions.length === 0) {
-        return {
-          success: true,
-          data: [],
-          pagination: {
-            page,
-            limit,
-            total: 0,
-            totalPages: 0,
-          },
-          timestamp: new Date(),
-        };
+      let messagesData: any[] = [];
+      let messagesCount = 0;
+
+      if (sessions && sessions.length > 0) {
+        const sessionIds = sessions.map(s => s.id);
+
+        // Get count
+        const { count, error: countError } = await supabaseAdmin
+          .from('chat_messages')
+          .select('*', { count: 'exact', head: true })
+          .in('session_id', sessionIds)
+          .eq('role', 'ai')
+          .not('metadata->testType', 'is', null)
+          .eq('metadata->>testType', 'api')
+          .not('metadata->testResult', 'is', null);
+
+        if (!countError) {
+          messagesCount = count || 0;
+        }
+
+        // Get messages
+        const { data: messages, error: messagesError } = await supabaseAdmin
+          .from('chat_messages')
+          .select('id, session_id, content, metadata, created_at')
+          .in('session_id', sessionIds)
+          .eq('role', 'ai')
+          .not('metadata->testType', 'is', null)
+          .eq('metadata->>testType', 'api')
+          .not('metadata->testResult', 'is', null)
+          .order('created_at', { ascending: false })
+          .range(offset, offset + limit - 1);
+
+        if (!messagesError && messages) {
+          messagesData = messages;
+        }
       }
 
-      const sessionIds = sessions.map(s => s.id);
+      // ═══════════════════════════════════════════════════════════════════
+      // STEP 3: Merge data from both sources
+      // ═══════════════════════════════════════════════════════════════════
+      const mergedTests = new Map<string, ApiTestHistoryItem>();
 
-      // Get total count of API test messages
-      const { count, error: countError } = await supabaseAdmin
-        .from('chat_messages')
-        .select('*', { count: 'exact', head: true })
-        .in('session_id', sessionIds)
-        .eq('role', 'ai')
-        .not('metadata->testType', 'is', null)
-        .eq('metadata->>testType', 'api')
-        .not('metadata->testResult', 'is', null);
+      // Process executions (primary source - has full structured data)
+      for (const execution of executionsData) {
+        const testId = execution.chat_session_id
+          ? `api_${execution.chat_session_id}_${new Date(execution.executed_at).getTime()}`
+          : execution.id;
 
-      if (countError) {
-        throw new Error(`Failed to get API test count: ${countError.message}`);
-      }
+        const fuzzingData = execution.validation_results?.fuzzing;
 
-      // Get API test messages with pagination
-      const { data: messages, error: messagesError } = await supabaseAdmin
-        .from('chat_messages')
-        .select('id, session_id, content, metadata, created_at')
-        .in('session_id', sessionIds)
-        .eq('role', 'ai')
-        .not('metadata->testType', 'is', null)
-        .eq('metadata->>testType', 'api')
-        .not('metadata->testResult', 'is', null)
-        .order('created_at', { ascending: false })
-        .range(offset, offset + limit - 1);
-
-      if (messagesError) {
-        throw new Error(`Failed to get API test messages: ${messagesError.message}`);
-      }
-
-      // Transform messages to API test history items
-      const apiTests: ApiTestHistoryItem[] = (messages || [])
-        .filter((msg: any) => {
-          // Validate that message has required metadata
-          return msg.metadata?.testResult && msg.metadata?.testId;
-        })
-        .map((msg: any) => {
-          const testResult = msg.metadata.testResult;
-          const testId = msg.metadata.testId || `api_${msg.id}`;
-
-          // Extract request details from testResult
-          const method = testResult.method || 'GET';
-
-          // ✅ FIX: Extract URL from testResult, or fallback to parsing from content
-          let url = testResult.url || '';
-          if (!url && msg.content) {
-            const urlMatch = msg.content.match(/(?:URL|url):\s*(https?:\/\/[^\s\n]+)/i);
-            if (urlMatch && urlMatch[1]) {
-              url = urlMatch[1].trim();
-            } else {
-              const anyUrlMatch = msg.content.match(/(https?:\/\/[^\s\n\)]+)/i);
-              if (anyUrlMatch && anyUrlMatch[1]) {
-                url = anyUrlMatch[1].trim();
+        mergedTests.set(testId, {
+          id: execution.id, // Use execution ID
+          testId,
+          method: execution.request_data?.method || 'GET',
+          url: execution.request_data?.url || '',
+          status: execution.status_code || 0,
+          statusText: execution.response_data?.statusText || '',
+          durationMs: execution.duration_ms || 0,
+          success: execution.success !== false,
+          executedAt: execution.executed_at,
+          chatSessionId: execution.chat_session_id || '',
+          executionId: execution.id, // NEW: Store execution ID
+          request: execution.request_data
+            ? {
+                method: execution.request_data.method,
+                url: execution.request_data.url,
+                headers: execution.request_data.headers || {},
+                body: execution.request_data.body,
               }
+            : undefined,
+          response: execution.response_data
+            ? {
+                status: execution.response_data.status,
+                statusText: execution.response_data.statusText || '',
+                headers: execution.response_data.headers || {},
+                body: execution.response_data.body,
+              }
+            : undefined,
+          fuzzingReport: fuzzingData
+            ? {
+                totalTests: fuzzingData.summary?.totalTests || 0,
+                passed: fuzzingData.summary?.passed || 0,
+                failed: fuzzingData.summary?.failed || 0,
+                issuesFound: fuzzingData.issuesCount || 0,
+                securityScore: fuzzingData.securityScore || 0,
+                hadFollowOn: fuzzingData.hadFollowOn || false, // NEW
+                phases: fuzzingData.phases, // NEW: Initial + Follow-on phases
+              }
+            : undefined,
+        });
+      }
+
+      // Process chat messages (fallback + additional info for items not in executions)
+      for (const msg of messagesData) {
+        if (!msg.metadata?.testResult || !msg.metadata?.testId) continue;
+
+        const testResult = msg.metadata.testResult;
+        const testId = msg.metadata.testId || `api_${msg.id}`;
+
+        // If already in mergedTests, skip (executions data is more complete)
+        if (mergedTests.has(testId)) {
+          continue;
+        }
+
+        // Extract URL
+        let url = testResult.url || '';
+        if (!url && msg.content) {
+          const urlMatch = msg.content.match(/(?:URL|url):\s*(https?:\/\/[^\s\n]+)/i);
+          if (urlMatch && urlMatch[1]) {
+            url = urlMatch[1].trim();
+          } else {
+            const anyUrlMatch = msg.content.match(/(https?:\/\/[^\s\n\)]+)/i);
+            if (anyUrlMatch && anyUrlMatch[1]) {
+              url = anyUrlMatch[1].trim();
             }
           }
+        }
 
-          return {
-            id: testId,
-            testId,
-            method,
-            url,
-            status: testResult.status || 0,
-            statusText: testResult.statusText || '',
-            durationMs: testResult.durationMs || 0,
-            success: testResult.success !== false,
-            executedAt: msg.created_at,
-            chatSessionId: msg.session_id,
-            fuzzingReport: msg.metadata.fuzzingReport || undefined,
-          };
+        // Add from chat_messages (fallback for older tests)
+        mergedTests.set(testId, {
+          id: testId,
+          testId,
+          method: testResult.method || 'GET',
+          url,
+          status: testResult.status || 0,
+          statusText: testResult.statusText || '',
+          durationMs: testResult.durationMs || 0,
+          success: testResult.success !== false,
+          executedAt: msg.created_at,
+          chatSessionId: msg.session_id,
+          fuzzingReport: msg.metadata.fuzzingReport || undefined,
         });
+      }
 
-      const totalPages = Math.ceil((count || 0) / limit);
+      // Convert to array and sort by executedAt (newest first)
+      const apiTests = Array.from(mergedTests.values()).sort((a, b) => {
+        return new Date(b.executedAt).getTime() - new Date(a.executedAt).getTime();
+      });
 
-      logger.info('[API_TEST_HISTORY] Retrieved API tests for user', {
+      // Use max count from both sources
+      const totalCount = Math.max(executionsCount, messagesCount);
+      const totalPages = Math.ceil(totalCount / limit);
+
+      logger.info('[API_TEST_HISTORY] Retrieved API tests for user (merged)', {
         userId: userId.substring(0, 8) + '...',
         count: apiTests.length,
-        total: count || 0,
+        fromExecutions: executionsData.length,
+        fromMessages: messagesData.length,
+        total: totalCount,
         page,
       });
 
@@ -184,7 +282,7 @@ export class ApiTestHistoryService {
         pagination: {
           page,
           limit,
-          total: count || 0,
+          total: totalCount,
           totalPages,
         },
         timestamp: new Date(),
@@ -199,7 +297,8 @@ export class ApiTestHistoryService {
   }
 
   /**
-   * Get API test details by testId
+   * Get API test details by testId (merged from api_test_executions + chat_messages)
+   * NEW: Combines data from both tables for complete information
    */
   static async getApiTestById(
     testId: string,
@@ -209,11 +308,58 @@ export class ApiTestHistoryService {
     data: ApiTestDetails | null;
   }> {
     try {
-      // ✅ FIX: API test IDs are strings (api_xxx_xxx), not UUIDs
-      // So we search directly in chat_messages, not in test_chat_mappings
-      // (test_chat_mappings.test_id is UUID type, which won't match string IDs)
+      // ═══════════════════════════════════════════════════════════════════
+      // STEP 1: Try to find in api_test_executions by chat_session_id + testId pattern
+      // ═══════════════════════════════════════════════════════════════════
+      let execution: any = null;
 
-      // Get all chat sessions for user
+      // Extract session ID from testId if possible (format: api_planId_timestamp or api_sessionId_timestamp)
+      const testIdParts = testId.split('_');
+      if (testIdParts.length >= 3) {
+        // Try to find by chat_session_id (testId might contain session info)
+        const { data: sessions } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('id')
+          .eq('user_id', userId);
+
+        if (sessions && sessions.length > 0) {
+          const sessionIds = sessions.map(s => s.id);
+
+          // Search in executions by chat_session_id
+          const { data: executions } = await supabaseAdmin
+            .from('api_test_executions')
+            .select('*')
+            .eq('user_id', userId)
+            .eq('execution_type', 'chat')
+            .in('chat_session_id', sessionIds)
+            .order('executed_at', { ascending: false })
+            .limit(100); // Get recent executions to match by timestamp
+
+          if (executions && executions.length > 0) {
+            // Try to match by timestamp in testId
+            const timestampMatch = testId.match(/_(\d+)$/);
+            if (timestampMatch) {
+              const testTimestamp = parseInt(timestampMatch[1], 10);
+              execution = executions.find((e: any) => {
+                const execTimestamp = new Date(e.executed_at).getTime();
+                // Match if timestamps are close (within 1 minute)
+                return Math.abs(execTimestamp - testTimestamp) < 60000;
+              });
+            }
+
+            // If no match by timestamp, try to match by session_id pattern
+            if (!execution && testIdParts[1]) {
+              execution = executions.find((e: any) => {
+                return e.chat_session_id && testId.includes(e.chat_session_id.substring(0, 8));
+              });
+            }
+          }
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // STEP 2: Get from chat_messages (fallback + additional info)
+      // ═══════════════════════════════════════════════════════════════════
       const { data: sessions, error: sessionsError } = await supabaseAdmin
         .from('chat_sessions')
         .select('id')
@@ -223,32 +369,98 @@ export class ApiTestHistoryService {
         throw new Error(`Failed to get chat sessions: ${sessionsError.message}`);
       }
 
-      if (!sessions || sessions.length === 0) {
+      let message: any = null;
+
+      if (sessions && sessions.length > 0) {
+        const sessionIds = sessions.map(s => s.id);
+
+        // Search for API test message by testId in metadata
+        const { data: msg, error: messageError } = await supabaseAdmin
+          .from('chat_messages')
+          .select('id, session_id, content, metadata, created_at')
+          .in('session_id', sessionIds)
+          .eq('role', 'ai')
+          .eq('metadata->>testId', testId)
+          .eq('metadata->>testType', 'api')
+          .limit(1)
+          .maybeSingle();
+
+        if (messageError && messageError.code !== 'PGRST116') {
+          throw new Error(`Failed to get test message: ${messageError.message}`);
+        }
+
+        message = msg;
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // STEP 3: Merge data from both sources
+      // ═══════════════════════════════════════════════════════════════════
+      if (!execution && !message) {
         return { success: true, data: null };
       }
 
-      const sessionIds = sessions.map(s => s.id);
+      // If we have execution, use it as primary source
+      if (execution) {
+        const fuzzingData = execution.validation_results?.fuzzing;
 
-      // Search for API test message by testId in metadata
-      const { data: message, error: messageError } = await supabaseAdmin
-        .from('chat_messages')
-        .select('id, session_id, content, metadata, created_at')
-        .in('session_id', sessionIds)
-        .eq('role', 'ai')
-        .eq('metadata->>testId', testId)
-        .eq('metadata->>testType', 'api')
-        .limit(1)
-        .maybeSingle();
+        const details: ApiTestDetails = {
+          id: execution.id,
+          testId,
+          method: execution.request_data?.method || 'GET',
+          url: execution.request_data?.url || '',
+          status: execution.status_code || 0,
+          statusText: execution.response_data?.statusText || '',
+          durationMs: execution.duration_ms || 0,
+          success: execution.success !== false,
+          executedAt: execution.executed_at,
+          chatSessionId: execution.chat_session_id || '',
+          request: {
+            method: execution.request_data?.method || 'GET',
+            url: execution.request_data?.url || '',
+            headers: execution.request_data?.headers || {},
+            body: execution.request_data?.body,
+          },
+          response: {
+            status: execution.response_data?.status || 0,
+            statusText: execution.response_data?.statusText || '',
+            headers: execution.response_data?.headers || {},
+            body: execution.response_data?.body,
+          },
+          metadata: {
+            testType: 'api',
+            is_test_runned: execution.success !== false,
+            fuzzingReport: fuzzingData
+              ? {
+                  summary: fuzzingData.summary,
+                  issues: fuzzingData.issues || [],
+                  securityScore: fuzzingData.securityScore,
+                  hadFollowOn: fuzzingData.hadFollowOn,
+                  phases: fuzzingData.phases,
+                }
+              : undefined,
+          },
+          chatMessage: message
+            ? {
+                id: message.id,
+                content: message.content,
+                created_at: message.created_at,
+              }
+            : {
+                id: '',
+                content: '',
+                created_at: execution.executed_at,
+              },
+        };
 
-      if (messageError && messageError.code !== 'PGRST116') {
-        throw new Error(`Failed to get test message: ${messageError.message}`);
+        return { success: true, data: details };
       }
 
-      if (!message) {
-        return { success: true, data: null };
+      // Fallback to chat_messages format
+      if (message) {
+        return this.formatTestDetails(message, userId);
       }
 
-      return this.formatTestDetails(message, userId);
+      return { success: true, data: null };
     } catch (error) {
       logger.error('[API_TEST_HISTORY] Failed to get API test by ID', {
         error: error instanceof Error ? error.message : String(error),

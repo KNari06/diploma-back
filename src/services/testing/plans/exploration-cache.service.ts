@@ -1,20 +1,12 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { ExplorationResult } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { TestPlan } from '@/services/testing/plans/test-plan-generator.service';
-import { logger } from '@/utils/logger';
+import { ExplorationResult } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
+import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Validate UUID format (consistent with other services)
- */
-function isValidUUID(str: string): boolean {
-  if (!str || typeof str !== 'string') return false;
-  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  return UUID_REGEX.test(str);
-}
 
 /**
  * Save exploration result to cache
@@ -71,43 +63,90 @@ export async function getCachedExploration(
   projectId: string
 ): Promise<ExplorationResult | null> {
   try {
-    const { data, error } = await supabaseAdmin
-      .from('exploration_cache')
-      .select('*')
-      .eq('url', url)
-      .eq('project_id', projectId)
-      .gt('expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (error || !data) {
+    // ✅ VALIDATION: Validate inputs
+    if (!url || typeof url !== 'string' || url.trim().length === 0) {
+      logger.warn('Invalid URL provided to getCachedExploration', { url });
       return null;
     }
 
-    // Increment hit count
-    await supabaseAdmin
+    if (!projectId || typeof projectId !== 'string' || projectId.trim().length === 0) {
+      logger.warn('Invalid projectId provided to getCachedExploration', { projectId });
+      return null;
+    }
+
+    const { data, error } = await supabaseAdmin
       .from('exploration_cache')
-      .update({ hit_count: (data.hit_count || 0) + 1 })
-      .eq('id', data.id);
+      .select('*')
+      .eq('url', url.trim())
+      .eq('project_id', projectId.trim())
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      // Handle "not found" as normal case (not an error)
+      if (error.code === 'PGRST116') {
+        logger.debug('No cached exploration found', { url, projectId });
+        return null;
+      }
+      logger.error('Database error getting cached exploration', {
+        error: error instanceof Error ? error.message : String(error),
+        errorCode: error.code,
+        url,
+        projectId,
+      });
+      return null;
+    }
+
+    if (!data) {
+      return null;
+    }
+
+    // ✅ VALIDATION: Check required fields exist
+    if (!data.url || !data.created_at) {
+      logger.error('Invalid cached exploration data structure', {
+        id: data.id,
+        hasUrl: !!data.url,
+        hasCreatedAt: !!data.created_at,
+      });
+      return null;
+    }
+
+    // Increment hit count (non-blocking, don't fail if this errors)
+    Promise.resolve(
+      supabaseAdmin
+        .from('exploration_cache')
+        .update({ hit_count: (data.hit_count || 0) + 1 })
+        .eq('id', data.id)
+    ).catch((updateError: unknown) => {
+      logger.warn('Failed to increment hit_count', {
+        error: updateError instanceof Error ? updateError.message : String(updateError),
+        id: data.id,
+      });
+    });
 
     logger.info('Retrieved cached exploration', {
       id: data.id,
       url,
-      hitCount: data.hit_count + 1,
+      hitCount: (data.hit_count || 0) + 1,
     });
 
     return {
       url: data.url,
       timestamp: data.created_at,
-      screenshot: data.screenshot,
-      visualAnalysis: data.visual_analysis,
-      domAnalysis: data.dom_analysis,
-      pageInfo: data.page_info,
-      recommendations: data.recommendations,
+      screenshot: data.screenshot || null,
+      visualAnalysis: data.visual_analysis || null,
+      domAnalysis: data.dom_analysis || null,
+      pageInfo: data.page_info || null,
+      recommendations: data.recommendations || [],
     };
   } catch (error) {
-    logger.warn('Failed to get cached exploration', { error });
+    logger.warn('Failed to get cached exploration', {
+      error: error instanceof Error ? error.message : String(error),
+      url,
+      projectId,
+    });
     return null;
   }
 }
@@ -276,8 +315,45 @@ export async function getLatestPendingTestPlan(
 
     const { data, error } = await query.maybeSingle();
 
-    if (error || !data) {
-      logger.info('[PENDING_PLAN] No pending test plan found', { userId });
+    // ✅ FIX: Better error handling - distinguish between "not found" and "database error"
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // Record not found - this is normal
+        logger.info('[GET_LATEST_PENDING] No pending plan found', { userId });
+        return null;
+      }
+      // Other database error
+      logger.error('[GET_LATEST_PENDING] Database error', {
+        error: error instanceof Error ? error.message : String(error),
+        errorCode: error.code,
+        userId,
+      });
+      return null;
+    }
+
+    if (!data) {
+      logger.info('[GET_LATEST_PENDING] No pending plan found', { userId });
+      return null;
+    }
+
+    // ✅ FIX: Check status after retrieval (race condition protection)
+    if (data.status !== 'pending_confirmation') {
+      logger.warn('[GET_LATEST_PENDING] Plan status changed', {
+        planId: data.id,
+        status: data.status,
+        userId,
+      });
+      return null;
+    }
+
+    // ✅ FIX: Check expires_at after retrieval (defensive check)
+    if (data.expires_at && new Date(data.expires_at) <= new Date()) {
+      logger.warn('[GET_LATEST_PENDING] Plan expired', {
+        planId: data.id,
+        userId,
+        expiresAt: data.expires_at,
+        now: new Date().toISOString(),
+      });
       return null;
     }
 
@@ -287,20 +363,26 @@ export async function getLatestPendingTestPlan(
       createdAt: data.created_at,
     });
 
+    // ✅ FIX: Return complete TestPlan with all fields (matching getTestPlan)
     return {
       id: data.id,
       status: data.status,
       url: data.url,
       scope: data.scope,
       summary: data.summary,
-      steps: data.steps,
-      commands: data.commands,
+      steps: data.steps || [],
+      commands: data.commands || [],
       estimatedDuration: data.estimated_duration,
-      whatWillBeTested: data.what_will_be_tested,
-      whatWillNotBeTested: data.what_will_not_be_tested,
-      risks: data.risks,
+      whatWillBeTested: data.what_will_be_tested || [],
+      whatWillNotBeTested: data.what_will_not_be_tested || [],
+      risks: data.risks || [],
+      notes: data.notes || null, // ✅ Added: Support notes field
       createdAt: data.created_at,
       expiresAt: data.expires_at,
+      // ✅ Added: Missing optional fields
+      intelligentMode: data.intelligent_mode || false,
+      estimatedPages: data.estimated_pages,
+      estimatedCost: data.estimated_cost,
     };
   } catch (error) {
     logger.error('Error getting latest pending test plan', { error });
@@ -375,6 +457,35 @@ export async function getTestPlan(
         planId,
         userId,
       });
+      return null;
+    }
+
+    // ✅ FIX: Check expires_at to prevent using expired plans
+    if (data.expires_at && new Date(data.expires_at) <= new Date()) {
+      logger.warn('[GET_TEST_PLAN] Test plan expired', {
+        planId,
+        userId,
+        expiresAt: data.expires_at,
+        now: new Date().toISOString(),
+      });
+      // Optionally update status to expired (non-blocking)
+      // ✅ FIX: Convert PromiseLike to Promise and add proper error typing
+      Promise.resolve(
+        supabaseAdmin
+          .from('test_plans')
+          .update({ status: 'expired' })
+          .eq('id', planId)
+          .eq('user_id', userId)
+      )
+        .then(() => {
+          logger.info('[GET_TEST_PLAN] Plan status updated to expired', { planId });
+        })
+        .catch((error: unknown) => {
+          logger.warn('[GET_TEST_PLAN] Failed to update plan status', {
+            error: error instanceof Error ? error.message : String(error),
+            planId
+          });
+        });
       return null;
     }
 

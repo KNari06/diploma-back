@@ -1,9 +1,21 @@
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { JiraReportService } from '@/services/integrations/jira-report.service';
 import { supabaseAdmin } from '@/db/supabase';
 import { FinalTestReport, JiraIssueRequest } from '@/types';
+
+async function ensureUserOwnsTest(testId: string, userId: string): Promise<boolean> {
+  // ✅ FIX #26/#27: Prevent cross-user data exposure; avoid testId enumeration by returning false for non-owned tests
+  const { data, error } = await supabaseAdmin
+    .from('tests')
+    .select('id')
+    .eq('id', testId)
+    .eq('user_id', userId)
+    .single();
+
+  return !!(data && !error);
+}
 
 /**
  * Generate final test report with code, artifacts, and analysis
@@ -12,12 +24,30 @@ import { FinalTestReport, JiraIssueRequest } from '@/types';
 export const generateReport = async (req: Request, res: Response): Promise<void> => {
   try {
     const { testId } = req.params;
-    const userId = (req as any).user?.id;
+    const userId = req.user?.id;
 
     if (!testId) {
       res.status(400).json({
         success: false,
         message: 'Test ID is required',
+      });
+      return;
+    }
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        message: 'User authentication required',
+      });
+      return;
+    }
+
+    // ✅ FIX #26: Ownership check BEFORE any report/result access
+    const ownsTest = await ensureUserOwnsTest(testId, userId);
+    if (!ownsTest) {
+      res.status(404).json({
+        success: false,
+        message: 'Test not found',
       });
       return;
     }
@@ -101,11 +131,30 @@ export const generateReport = async (req: Request, res: Response): Promise<void>
 export const getReport = async (req: Request, res: Response): Promise<void> => {
   try {
     const { testId } = req.params;
+    const userId = req.user?.id;
 
     if (!testId) {
       res.status(400).json({
         success: false,
         message: 'Test ID is required',
+      });
+      return;
+    }
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        message: 'User authentication required',
+      });
+      return;
+    }
+
+    // ✅ FIX #26: Ownership check
+    const ownsTest = await ensureUserOwnsTest(testId, userId);
+    if (!ownsTest) {
+      res.status(404).json({
+        success: false,
+        message: 'Report not found',
       });
       return;
     }
@@ -146,7 +195,7 @@ export const createJiraIssue = async (req: Request, res: Response): Promise<void
   try {
     const { testId } = req.params;
     const { projectKey, issueType, priority } = req.body;
-    const userId = (req as any).user?.id;
+    const userId = req.user?.id;
 
     if (!userId) {
       res.status(401).json({
@@ -160,6 +209,16 @@ export const createJiraIssue = async (req: Request, res: Response): Promise<void
       res.status(400).json({
         success: false,
         message: 'Test ID is required',
+      });
+      return;
+    }
+
+    // ✅ FIX #26: Ownership check BEFORE any report/result access
+    const ownsTest = await ensureUserOwnsTest(testId, userId);
+    if (!ownsTest) {
+      res.status(404).json({
+        success: false,
+        message: 'Test not found',
       });
       return;
     }
@@ -262,11 +321,30 @@ export const createJiraIssue = async (req: Request, res: Response): Promise<void
 export const downloadCode = async (req: Request, res: Response): Promise<void> => {
   try {
     const { testId } = req.params;
+    const userId = req.user?.id;
 
     if (!testId) {
       res.status(400).json({
         success: false,
         message: 'Test ID is required',
+      });
+      return;
+    }
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        message: 'User authentication required',
+      });
+      return;
+    }
+
+    // ✅ FIX #26: Ownership check
+    const ownsTest = await ensureUserOwnsTest(testId, userId);
+    if (!ownsTest) {
+      res.status(404).json({
+        success: false,
+        message: 'Report not found',
       });
       return;
     }

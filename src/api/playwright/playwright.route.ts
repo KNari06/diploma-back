@@ -1,10 +1,14 @@
-import { asyncHandler } from '@/utils/error-handler';
+import { asyncHandler } from '@/utils/core/error-handler';
+import { requireAuth } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
 import { deleteTrace, getTrace, listTraces, uploadTrace, getTraceFilesByUser, getTraceSteps } from './playwright.controller';
 
 const router = Router();
+
+// ✅ FIX #24: Protect all Playwright trace endpoints with authentication
+router.use(requireAuth);
 
 // Configure multer to use memory storage (for Supabase Storage upload)
 const storage = multer.memoryStorage();

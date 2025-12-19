@@ -129,7 +129,7 @@ BEGIN
         WHEN 'intelligent' THEN 20
         WHEN 'standard' THEN 1
         WHEN 'api' THEN 2
-        WHEN 'chat' THEN 0
+        WHEN 'chat' THEN 1
         ELSE 0
     END;
 END;

@@ -1,4 +1,4 @@
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Token Calculator Service
@@ -45,7 +45,7 @@ export const TEST_CREDITS = {
   INTELLIGENT: 20, // ~10K tokens (multiple pages + vision analysis)
   STANDARD: 1, // No AI, just infrastructure
   API: 2, // ~1K tokens (lightweight AI analysis)
-  CHAT: 0, // Free for users
+  CHAT: 1, // 1 credit per chat message
 } as const;
 
 /**

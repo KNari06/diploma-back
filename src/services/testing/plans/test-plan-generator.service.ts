@@ -2,7 +2,7 @@ import { buildTestPlanPrompt } from '@/ai/prompts/index';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
 import { ExplorationResult } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { PlaywrightCommand } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { randomUUID } from 'crypto';
 
 /**
@@ -401,7 +401,7 @@ export interface TestPlan {
   risks: string[];
   notes?: string | null; // Additional notes about the plan
   createdAt: string;
-  expiresAt: string; // Plan expires after 1 hour
+  expiresAt: string; // Plan expires after 3 days
 
   // Intelligent testing mode (now always true - Standard Mode removed)
   intelligentMode?: boolean; // Flag for intelligent testing
@@ -502,7 +502,7 @@ export async function generateTestPlan(
       risks: aiPlan.risks || [],
       notes: aiPlan.notes || null,
       createdAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), // 1 hour
+      expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(), // 3 days
       // ✅ CRITICAL: Always intelligent mode - Standard Mode removed
       intelligentMode: true,
     };
@@ -763,7 +763,7 @@ export async function generateIntelligentTestPlan(
       },
     ], {
       temperature: 0.4,
-      max_tokens: 3000,
+      max_tokens: 4000,
       response_format: { type: 'json_object' },
     });
 
@@ -854,7 +854,7 @@ export async function generateIntelligentTestPlan(
         'Popups and modals may block automation',
       ],
       createdAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(), // 3 days
 
       // Intelligent mode flags
       intelligentMode: true,

@@ -118,6 +118,10 @@ meta.timestamp    : 1732534567890
 meta.elapsedTime  : 5000
 ```
 
+**⚠️ Скриншоты НЕ передаются через WebSocket** в `newNode` (слишком большие).
+Скриншоты приходят через `updatedNode` как URL после загрузки в storage.
+**См. WEBSOCKET_GRAPH_UPDATE_DATA.md** для деталей.
+
 **Problem Indicators:**
 
 ```

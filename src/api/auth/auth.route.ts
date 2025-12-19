@@ -1,4 +1,4 @@
-import { asyncHandler, handleValidationError } from '@/utils/error-handler';
+import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import {

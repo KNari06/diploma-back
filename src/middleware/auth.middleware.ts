@@ -1,7 +1,6 @@
-import { supabaseAdmin } from '@/db/supabase';
 import { verifyToken } from '@/services/auth/auth.service';
 import { AuthUser } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { NextFunction, Request, Response } from 'express';
 
 // Extend Express Request type to include user

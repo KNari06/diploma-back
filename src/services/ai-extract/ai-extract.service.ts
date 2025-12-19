@@ -4,8 +4,8 @@
  * Similar to Momentic's AI extract functionality
  */
 
-import { env } from '@/config/env';
-import { logger } from '@/utils/logger';
+import { env } from '@/config/environment/env';
+import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 import { Page } from 'playwright';
 import type {
@@ -96,7 +96,7 @@ export class AIExtractService {
   static async extract(
     page: Page,
     request: AIExtractRequest,
-    costManager?: import('@/services/ai-cost-manager.service').AICostManager
+    costManager?: import('@/services/ai/ai-cost-manager.service').AICostManager
   ): Promise<AIExtractResponse> {
     const startTime = Date.now();
 

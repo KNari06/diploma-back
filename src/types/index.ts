@@ -696,6 +696,7 @@ export const KNOWN_INTENTS = [
   'platform_test',           // UI testing (replaces check_element, fill_form, login_flow, assert_ui, navigate)
   'api_test',                // API testing (single request)
   'general_chat',            // General conversation
+  'needs_clarification',     // When AI is uncertain and needs user to clarify intent
   // LEGACY: Keep for backward compatibility (will be migrated to platform_test)
   'check_element',
   'fill_form',
@@ -729,11 +730,27 @@ export type ActionType =
   | 'navigate'
   | string; // Allow custom actions
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TESTING SCOPE CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Valid testing scopes for platform_test
+ * Used for validation and type safety across the codebase
+ */
+export const VALID_SCOPES = ['full', 'page', 'element', 'flow', 'form', 'auth', 'navigation'] as const;
+
+export type TestScope = typeof VALID_SCOPES[number] | 'general' | null;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTENT TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
 export interface IntentResult {
   intent: IntentType;
 
   // NEW: Scope and target for platform_test
-  scope?: 'full' | 'page' | 'element' | 'flow' | 'form' | 'auth' | 'navigation' | null;
+  scope?: TestScope;
   target?: string | null; // What exactly to test (e.g., "registration form", "Buy button")
 
   // Legacy fields (for backward compatibility)
@@ -761,6 +778,11 @@ export interface IntentResult {
   selector?: string; // For UI testing intents
   // Playwright commands generated from intent
   commands?: PlaywrightCommand[];
+
+  // Clarification fields (for needs_clarification intent)
+  clarificationQuestion?: string; // Question to ask user when intent is unclear
+  possibleIntents?: IntentType[]; // List of possible intents AI is considering
+  clarificationReason?: string; // Why clarification is needed (for debugging)
 }
 
 // Playwright Command types

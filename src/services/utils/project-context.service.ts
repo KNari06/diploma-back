@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Credentials, CredentialsParserService } from '../api/credentials-parser.service';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -470,20 +470,21 @@ export class ProjectContextService {
 
       // FIX #6: Safe credentials decryption with validation
       try {
-        // Validate encrypted data exists
-        if (!data.email_encrypted && !data.username_encrypted) {
+        // Validate encrypted data exists (check for null/undefined)
+        if ((!data.email_encrypted || data.email_encrypted.trim().length === 0) &&
+            (!data.username_encrypted || data.username_encrypted.trim().length === 0)) {
           logger.warn('[PROJECT] No encrypted credentials found', { projectId });
           return null;
         }
 
-        if (!data.password_encrypted) {
+        if (!data.password_encrypted || data.password_encrypted.trim().length === 0) {
           logger.warn('[PROJECT] No encrypted password found', { projectId });
           return null;
         }
 
         const decrypted = CredentialsParserService.decryptCredentials({
-          email_encrypted: data.email_encrypted,
-          username_encrypted: data.username_encrypted,
+          email_encrypted: data.email_encrypted || undefined,
+          username_encrypted: data.username_encrypted || undefined,
           password_encrypted: data.password_encrypted,
         });
 
@@ -493,13 +494,16 @@ export class ProjectContextService {
           return null;
         }
 
-        // Validate at least one identifier exists
-        if (!decrypted.email && !decrypted.username) {
+        // Validate at least one identifier exists and is not empty
+        const hasEmail = decrypted.email && decrypted.email.trim().length > 0;
+        const hasUsername = decrypted.username && decrypted.username.trim().length > 0;
+        if (!hasEmail && !hasUsername) {
           logger.error('[PROJECT] Decrypted credentials missing identifier', { projectId });
           return null;
         }
 
-        if (!decrypted.password) {
+        // Validate password exists and is not empty
+        if (!decrypted.password || decrypted.password.trim().length === 0) {
           logger.error('[PROJECT] Decrypted credentials missing password', { projectId });
           return null;
         }

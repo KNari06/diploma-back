@@ -1,8 +1,8 @@
-import { env } from '@/config/env';
-import { logger } from '@/utils/logger';
+import { buildChatSystemPrompt } from '@/ai/prompts/index';
+import { env } from '@/config/environment/env';
+import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 import { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
-import { buildChatSystemPrompt } from '@/ai/prompts/index';
 
 /**
  * ✅ FIX: Configure OpenAI client with timeout and retry settings
@@ -43,12 +43,32 @@ export async function getChatCompletionWithMessages(
     max_tokens?: number;
     response_format?: { type: 'json_object' };
     model?: string; // Allow custom model (e.g., gpt-3.5-turbo)
+    abortSignal?: AbortSignal;
   }
 ): Promise<OpenAIResponse> {
   try {
+    // Validate input
+    if (!messages || messages.length === 0) {
+      throw new Error('Messages array cannot be empty');
+    }
+
     const model = options?.model || env.OPENAI_MODEL || 'gpt-4o-mini';
 
-    const response = await openai.chat.completions.create({
+    if (options?.abortSignal?.aborted) {
+      throw new Error('Request was cancelled. Please try again.');
+    }
+
+    const abortPromise = options?.abortSignal
+      ? new Promise<never>((_, reject) => {
+          options.abortSignal!.addEventListener(
+            'abort',
+            () => reject(new Error('Request was cancelled. Please try again.')),
+            { once: true }
+          );
+        })
+      : null;
+
+    const requestPromise = openai.chat.completions.create({
       model,
       messages,
       max_tokens: options?.max_tokens || env.OPENAI_MAX_TOKENS || 1000,
@@ -56,8 +76,30 @@ export async function getChatCompletionWithMessages(
       ...(options?.response_format && { response_format: options.response_format }),
     });
 
-    const reply = response.choices[0]?.message?.content || '';
+    const response = abortPromise
+      ? await Promise.race([requestPromise, abortPromise])
+      : await requestPromise;
+
+    // Validate response structure
+    if (!response.choices || response.choices.length === 0) {
+      logger.error('[OPENAI] No choices in response', { model, messageCount: messages.length });
+      throw new Error('No response choices from OpenAI');
+    }
+
+    const reply = response.choices[0]?.message?.content;
+    if (!reply) {
+      logger.error('[OPENAI] Empty content in response', {
+        model,
+        messageCount: messages.length,
+        finishReason: response.choices[0]?.finish_reason,
+      });
+      throw new Error('Empty response content from OpenAI');
+    }
+
     const usage = response.usage;
+    if (!usage) {
+      logger.warn('[OPENAI] No usage data in response', { model });
+    }
 
     logger.info('[OPENAI] Chat completion with messages successful', {
       model,
@@ -77,31 +119,45 @@ export async function getChatCompletionWithMessages(
         model,
       },
     };
-  } catch (error: any) {
+  } catch (error: unknown) {
     // Handle abort signal errors (client closed connection, timeout, etc.)
-    if (error?.message?.includes('aborted') || error?.message?.includes('signal')) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorCode = (error as any)?.code;
+    const errorStatus = (error as any)?.status;
+    const errorType = (error as any)?.type;
+
+    if (errorMessage.includes('aborted') || errorMessage.includes('signal')) {
       logger.warn('[OPENAI] Request aborted', {
-        message: error.message,
-        code: error.code,
-        type: error.type,
+        message: errorMessage,
+        code: errorCode,
+        type: errorType,
       });
       throw new Error('Request was cancelled. Please try again.');
     }
 
     // Handle timeout errors
-    if (error?.message?.includes('timeout') || error?.code === 'ETIMEDOUT') {
+    if (errorMessage.includes('timeout') || errorCode === 'ETIMEDOUT') {
       logger.warn('[OPENAI] Request timeout', {
-        message: error.message,
-        code: error.code,
+        message: errorMessage,
+        code: errorCode,
       });
       throw new Error('Request took too long. Please try again.');
     }
 
+    // Re-throw validation errors as-is
+    if (error instanceof Error && (
+      error.message.includes('cannot be empty') ||
+      error.message.includes('No response choices') ||
+      error.message.includes('Empty response content')
+    )) {
+      throw error;
+    }
+
     logger.error('[OPENAI] Chat completion with messages error:', {
-      message: error instanceof Error ? error.message : String(error),
-      code: error?.code,
-      status: error?.status,
-      type: error?.type,
+      message: errorMessage,
+      code: errorCode,
+      status: errorStatus,
+      type: errorType,
       stack: error instanceof Error ? error.stack : undefined,
     });
     throw new Error('AI chat failed');

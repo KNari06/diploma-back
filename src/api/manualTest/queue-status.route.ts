@@ -1,8 +1,12 @@
 import { Router } from 'express';
 import { getQueueStatus, getJobStatus } from './queue-status.controller';
-import { asyncHandler } from '@/utils/error-handler';
+import { asyncHandler } from '@/utils/core/error-handler';
+import { requireAdmin, requireAuth } from '@/middleware/auth.middleware';
 
 const router = Router();
+
+// ✅ FIX #25: Queue debug endpoints must not be public (job metadata leak)
+router.use(requireAuth, requireAdmin);
 
 /**
  * @swagger

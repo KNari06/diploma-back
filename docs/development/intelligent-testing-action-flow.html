@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Intelligent Testing Action Flow - QAI Backend</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            padding: 30px;
+            background: #f8f9fa;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            text-align: center;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 12px rgba(0,0,0,0.15);
+        }
+
+        .stat-card .number {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .label {
+            color: #666;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            padding: 30px;
+            background: #f8f9fa;
+            flex-wrap: wrap;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .legend-color {
+            width: 30px;
+            height: 30px;
+            border-radius: 6px;
+            border: 2px solid #333;
+        }
+
+        .legend-color.blue { background: #e1f5ff; border-color: #01579b; }
+        .legend-color.yellow { background: #fff4e1; border-color: #e65100; }
+        .legend-color.green { background: #e8f5e9; border-color: #2e7d32; }
+        .legend-color.red { background: #ffebee; border-color: #c62828; }
+
+        .content {
+            padding: 40px;
+        }
+
+        .section {
+            margin-bottom: 50px;
+        }
+
+        .section-title {
+            font-size: 2em;
+            margin-bottom: 20px;
+            color: #667eea;
+            border-bottom: 3px solid #667eea;
+            padding-bottom: 10px;
+        }
+
+        .diagram-container {
+            background: #f8f9fa;
+            padding: 30px;
+            border-radius: 12px;
+            margin-bottom: 40px;
+            overflow-x: auto;
+        }
+
+        .mermaid {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+        }
+
+        .methods-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .method-card {
+            background: white;
+            border: 2px solid #e0e0e0;
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+
+        .method-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+        }
+
+        .method-card.new {
+            border-color: #4caf50;
+            background: linear-gradient(135deg, #e8f5e9 0%, #ffffff 100%);
+        }
+
+        .method-card.enhanced {
+            border-color: #f44336;
+            background: linear-gradient(135deg, #ffebee 0%, #ffffff 100%);
+        }
+
+        .method-card.refactored {
+            border-color: #ff9800;
+            background: linear-gradient(135deg, #fff4e1 0%, #ffffff 100%);
+        }
+
+        .method-card.unchanged {
+            border-color: #2196f3;
+            background: linear-gradient(135deg, #e1f5ff 0%, #ffffff 100%);
+        }
+
+        .method-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .method-name {
+            font-weight: bold;
+            font-size: 1.1em;
+            color: #333;
+            font-family: 'Courier New', monospace;
+        }
+
+        .method-badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .badge-new {
+            background: #4caf50;
+            color: white;
+        }
+
+        .badge-enhanced {
+            background: #f44336;
+            color: white;
+        }
+
+        .badge-refactored {
+            background: #ff9800;
+            color: white;
+        }
+
+        .badge-unchanged {
+            background: #2196f3;
+            color: white;
+        }
+
+        .method-description {
+            color: #666;
+            font-size: 0.95em;
+            line-height: 1.6;
+        }
+
+        .filters {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+
+        .filter-btn {
+            padding: 10px 20px;
+            border: 2px solid #667eea;
+            background: white;
+            color: #667eea;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 500;
+        }
+
+        .filter-btn:hover {
+            background: #667eea;
+            color: white;
+        }
+
+        .filter-btn.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .search-box {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1em;
+            margin-bottom: 20px;
+        }
+
+        .search-box:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .improvements-list {
+            list-style: none;
+            padding: 0;
+        }
+
+        .improvements-list li {
+            padding: 15px;
+            margin-bottom: 10px;
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            border-radius: 4px;
+        }
+
+        .service-section {
+            margin-bottom: 30px;
+        }
+
+        .service-title {
+            font-size: 1.5em;
+            color: #667eea;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e0e0e0;
+        }
+
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 1.8em;
+            }
+
+            .methods-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Intelligent Testing Action Flow</h1>
+            <p>Complete method flow visualization with change tracking</p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="number">60</div>
+                <div class="label">Total Methods</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">26</div>
+                <div class="label">Changed This Week</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">25</div>
+                <div class="label">New Methods</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">34</div>
+                <div class="label">Unchanged</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">4</div>
+                <div class="label">Enhanced</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">1</div>
+                <div class="label">Refactored</div>
+            </div>
+        </div>
+
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-color blue"></div>
+                <span><strong>Blue</strong> - Core methods (unchanged)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color yellow"></div>
+                <span><strong>Yellow</strong> - Refactored methods</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color green"></div>
+                <span><strong>Green</strong> - New methods added</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color red"></div>
+                <span><strong>Red</strong> - Enhanced methods</span>
+            </div>
+        </div>
+
+        <div class="content">
+            <div class="section">
+                <h2 class="section-title">📊 Action Flow Diagram</h2>
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Start([🚀 Test Execution Starts]) --> Execute[IntelligentTestOrchestrator.execute<br/>🔵 Core Orchestrator]
+
+    Execute --> Setup[Setup Phase<br/>🔵 Initialize Services]
+    Setup --> MainLoop[MainLoopService.execute<br/>🔵 Main Loop]
+
+    MainLoop --> LoopStart{🔄 Main Loop Iteration}
+
+    LoopStart --> AnalyzePage[analyzePage<br/>🔵 Page Analysis]
+    AnalyzePage --> PageAnalyzer[IntelligentPageAnalyzer.analyzePage<br/>🔵 Page Analyzer]
+
+    PageAnalyzer --> WaitSPA[waitForSPALoad<br/>🔵 Wait SPA]
+    WaitSPA --> CaptureScreenshot[captureScreenshot<br/>🔵 Screenshot]
+    CaptureScreenshot --> WaitModals[waitForModals<br/>🔵 Wait Modals]
+    WaitModals --> AnalyzeDOM[analyzeDOMFull<br/>🔵 DOM Analysis]
+    AnalyzeDOM --> EnhanceDOM[enhanceDOMWithAISelectors<br/>🔵 Enhance DOM]
+    EnhanceDOM --> VisionCheck{Should Use Vision?}
+
+    VisionCheck -->|Yes| AnalyzeVision[analyzeWithVision<br/>🔴 Enhanced Prompt]
+    VisionCheck -->|No| AnalyzeWithoutVision[analyzeWithoutVision<br/>🔵 Fallback]
+
+    AnalyzeVision --> MatchVision[matchVisionElementsWithDOMSelectors<br/>🔵 Match Elements]
+    AnalyzeWithoutVision --> MatchVision
+    MatchVision --> EnhanceModals[enhanceDOMWithVisionModals<br/>🔵 Enhance Modals]
+    EnhanceModals --> AnalyzeLogic[analyzeLogic<br/>🔵 Logic Analysis]
+    AnalyzeLogic --> BuildContext[Build PageContext<br/>🔵 Context Builder]
+
+    BuildContext --> GenerateActions[generateActions<br/>🔵 Generate Actions]
+    GenerateActions --> ActionGenerator[ContextualActionGenerator.generateActions<br/>🔵 Action Generator]
+
+    ActionGenerator --> ValidateCache[validateCachedActions<br/>🔵 Validate Cache]
+    ValidateCache --> BuildHistory[buildHistorySummary<br/>🔵 Build History]
+    BuildHistory --> BuildElements[buildElementsSummary<br/>🔵 Build Elements]
+    BuildElements --> BuildDOM[buildDOMSummary<br/>🔵 Build DOM]
+    BuildDOM --> GetHTML[getPageHTML<br/>🔵 Get HTML]
+    GetHTML --> MaskPII[maskPII<br/>🔴 Enhanced PII Masking]
+    MaskPII --> ParseJSON[parseRobustJSON<br/>🔴 Enhanced JSON Parsing]
+    ParseJSON --> Sanitize[sanitizeActions<br/>🔵 Sanitize]
+    Sanitize --> ReturnActions[Return Actions<br/>🔵 Return]
+
+    ReturnActions --> ExecuteActions[executeActions<br/>🟡 Refactored]
+    ExecuteActions --> ExecuteSingle[executeSingleAction<br/>🟢 NEW: Main Action Orchestrator]
+
+    ExecuteSingle --> PreAnalysis[handlePreActionAnalysis<br/>🟢 NEW: Pre-Action Handler]
+    PreAnalysis --> PreActionAnalyzer[PreActionAnalyzer.analyzeBeforeAction<br/>🔵 Pre-Action Analyzer]
+    PreActionAnalyzer --> LogPrereq[logPrerequisiteAction<br/>🟢 NEW: Logging Helper]
+    LogPrereq --> ValidateSelector[validateAndPrepareSelector<br/>🟢 NEW: Selector Validator]
+    ValidateSelector --> SelfHealing[SelfHealingService.healSelector<br/>🔵 Self-Healing]
+    SelfHealing --> CaptureBefore[captureActionScreenshots<br/>🟢 NEW: Screenshot Helper]
+    CaptureBefore --> ExecuteCommand[executeActionCommand<br/>🟢 NEW: Command Executor]
+
+    ExecuteCommand --> LogExecution[logActionExecution<br/>🟢 NEW: Logging Helper]
+    LogExecution --> CommandExec[CommandExecutor.executeCommand<br/>🔵 Command Executor]
+    CommandExec --> WaitEffect[waitForActionEffect<br/>🟢 NEW: Wait Effect]
+    WaitEffect --> HandleAsync[handleAsyncOperations<br/>🟢 NEW: Async Handler]
+    HandleAsync --> EnsureComplete[ensureActionCompleted<br/>🟢 NEW: Ensure Complete]
+    EnsureComplete --> VerifySuccess[verifyActionSuccess<br/>🟢 NEW: Verify Success]
+    VerifySuccess --> CaptureAfter[captureActionScreenshots<br/>🟢 NEW: Screenshot Helper]
+
+    CaptureAfter --> ValidateResult[ResultValidator.validateResult<br/>🔵 Result Validator]
+    ValidateResult --> PostAnalysis[handlePostActionAnalysisMethod<br/>🟢 NEW: Post-Action Handler]
+    PostAnalysis --> PostActionAnalyzer[PostActionAnalyzer.analyze<br/>🔵 Post-Action Analyzer]
+    PostActionAnalyzer --> LogPost[logPostActionAnalysis<br/>🟢 NEW: Logging Helper]
+
+    PostAnalysis --> CheckState[checkElementStateAfterAction<br/>🟢 NEW: Check State]
+    CheckState --> DetectChanges[detectPageChanges<br/>🟢 NEW: Detect Changes]
+    DetectChanges --> HandleError{Action Failed?}
+
+    HandleError -->|Yes| HandleFailure[handleActionFailure<br/>🟢 NEW: Failure Handler]
+    HandleFailure --> CreateErrorCtx[createActionErrorContext<br/>🟢 NEW: Error Context]
+    CreateErrorCtx --> LogError[logActionError<br/>🟢 NEW: Logging Helper]
+    LogError --> ShouldRetry{shouldRetryAction?<br/>🟢 NEW: Retry Check}
+    ShouldRetry -->|Yes| ExecuteSingle
+    ShouldRetry -->|No| NextAction
+
+    HandleError -->|No| NextAction[Next Action<br/>🔵 Next]
+    NextAction --> DecideNext[decideNextStep<br/>🔵 Decide Next]
+    DecideNext --> ContextualDecide[ContextualActionGenerator.decideNextStep<br/>🔵 Contextual Decide]
+    ContextualDecide --> ParseDecision[parseRobustJSON<br/>🔴 Enhanced JSON Parsing]
+    ParseDecision --> DecisionCheck{Decision Type}
+
+    DecisionCheck -->|continue| LoopStart
+    DecisionCheck -->|stop| BuildResult[buildResult<br/>🔵 Build Result]
+    DecisionCheck -->|wait_for_user| WaitUser[Wait for User<br/>🔵 Wait]
+    DecisionCheck -->|retry| RetryAction[Retry Action<br/>🔵 Retry]
+    DecisionCheck -->|skip| SkipAction[Skip Action<br/>🔵 Skip]
+
+    RetryAction --> ExecuteSingle
+    SkipAction --> NextAction
+    WaitUser --> BuildResult
+
+    BuildResult --> ValidateTest[validateTestResult<br/>🔵 Validate Test]
+    ValidateTest --> BuildSummary[buildSummary<br/>🔵 Build Summary]
+    BuildSummary --> UploadGraph[uploadGraphScreenshotsToStorage<br/>🔵 Upload Graph]
+    UploadGraph --> End([✅ Test Complete])
+
+    style Execute fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style ExecuteSingle fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style PreAnalysis fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style ValidateSelector fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style ExecuteCommand fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style VerifySuccess fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style PostAnalysis fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style HandleFailure fill:#fff4e1,stroke:#e65100,stroke-width:3px
+    style ExecuteActions fill:#fff4e1,stroke:#e65100,stroke-width:3px
+
+    style LogExecution fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style LogError fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style LogPrereq fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style LogPost fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style CreateErrorCtx fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style ShouldRetry fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style WaitEffect fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style HandleAsync fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style EnsureComplete fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style CheckState fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style DetectChanges fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style CaptureBefore fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style CaptureAfter fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+
+    style ParseJSON fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style MaskPII fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style AnalyzeVision fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style ParseDecision fill:#ffebee,stroke:#c62828,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔍 Methods Changed This Week</h2>
+                <div class="filters">
+                    <button class="filter-btn active" onclick="filterMethods('all')">All</button>
+                    <button class="filter-btn" onclick="filterMethods('new')">New (25)</button>
+                    <button class="filter-btn" onclick="filterMethods('enhanced')">Enhanced (4)</button>
+                    <button class="filter-btn" onclick="filterMethods('refactored')">Refactored (1)</button>
+                </div>
+                <input type="text" class="search-box" id="searchBox" placeholder="🔍 Search methods..." onkeyup="searchMethods()">
+                <div class="methods-grid" id="changedMethods">
+                    <!-- Methods will be inserted here by JavaScript -->
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">✅ Methods Unchanged (Still in Use)</h2>
+                <div class="methods-grid" id="unchangedMethods">
+                    <!-- Methods will be inserted here by JavaScript -->
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">✨ Key Improvements</h2>
+                <ul class="improvements-list">
+                    <li><strong>Better Structure:</strong> executeActions broken into logical sub-methods</li>
+                    <li><strong>Better Logging:</strong> Structured logging helpers for consistent logging</li>
+                    <li><strong>Better Context:</strong> Context helpers for AI to make better decisions</li>
+                    <li><strong>Better Validation:</strong> Enhanced validation methods for action results</li>
+                    <li><strong>Better Quality:</strong> Action quality verification methods to ensure real success</li>
+                    <li><strong>Better Error Handling:</strong> Structured error handling with retry logic</li>
+                    <li><strong>Better Prompts:</strong> Enhanced AI prompts with full validation structure</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+
+        const changedMethods = [
+            { name: 'executeSingleAction()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Main orchestrator for single action execution with full lifecycle' },
+            { name: 'handlePreActionAnalysis()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Pre-action analysis handler with prerequisite actions' },
+            { name: 'validateAndPrepareSelector()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Selector validation with self-healing support' },
+            { name: 'captureActionScreenshots()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Smart screenshot capture based on context' },
+            { name: 'executeActionCommand()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Action execution wrapper with verification' },
+            { name: 'handlePostActionAnalysisMethod()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Post-action analysis handler with follow-up actions' },
+            { name: 'verifyActionSuccess()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Real success verification (not just no error)' },
+            { name: 'waitForActionEffect()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Wait for action effects to appear on page' },
+            { name: 'checkElementStateAfterAction()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Check element state after action execution' },
+            { name: 'detectPageChanges()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Detect real DOM changes after action' },
+            { name: 'ensureActionCompleted()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Ensure action completion before proceeding' },
+            { name: 'handleAsyncOperations()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Handle async operations (SPA, lazy loading)' },
+            { name: 'createActionErrorContext()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Create error context for AI analysis' },
+            { name: 'shouldRetryAction()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Determine if action should be retried' },
+            { name: 'handleActionFailure()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Structured action failure handling' },
+            { name: 'shouldCaptureScreenshot()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Determine screenshot necessity' },
+            { name: 'shouldPerformPostAnalysis()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Determine post-analysis necessity' },
+            { name: 'isActionBlocked()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Check if action is blocked by prerequisites' },
+            { name: 'logActionExecution()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Structured action execution logging' },
+            { name: 'logActionError()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Structured error logging with context' },
+            { name: 'logPrerequisiteAction()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Prerequisite action logging' },
+            { name: 'logPostActionAnalysis()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Post-action analysis logging' },
+            { name: 'createActionWithContext()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Create action with context for AI' },
+            { name: 'getActionContext()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Get current action context' },
+            { name: 'enrichActionForAI()', type: 'new', service: 'IntelligentTestOrchestrator', desc: 'Enrich action with AI context' },
+            { name: 'executeActions()', type: 'refactored', service: 'IntelligentTestOrchestrator', desc: 'Refactored to use new helper methods' },
+            { name: 'parseRobustJSON()', type: 'enhanced', service: 'ContextualActionGenerator', desc: 'Enhanced JSON parsing with better error handling' },
+            { name: 'maskPII()', type: 'enhanced', service: 'ContextualActionGenerator', desc: 'Enhanced PII masking with more patterns' },
+            { name: 'buildNextStepPrompt()', type: 'enhanced', service: 'IntelligentTestingPrompts', desc: 'Enhanced prompt with better decision structure' },
+            { name: 'buildVisionPrompt()', type: 'enhanced', service: 'IntelligentTestingPrompts', desc: 'Enhanced prompt with full validation structure' },
+            { name: 'analyzeScreenshotWithVision()', type: 'enhanced', service: 'VisionAnalyzerService', desc: 'Enhanced to support new structure' }
+        ];
+
+        const unchangedMethods = [
+            { service: 'IntelligentPageAnalyzer', methods: [
+                'analyzePage()', 'waitForSPALoad()', 'captureScreenshot()', 'waitForModals()',
+                'analyzeDOMFull()', 'enhanceDOMWithAISelectors()', 'analyzeWithVision()',
+                'analyzeWithoutVision()', 'matchVisionElementsWithDOMSelectors()',
+                'enhanceDOMWithVisionModals()', 'analyzeLogic()', 'shouldUseVision()'
+            ]},
+            { service: 'PreActionAnalyzer', methods: ['analyzeBeforeAction()'] },
+            { service: 'PostActionAnalyzer', methods: ['analyze()'] },
+            { service: 'ResultValidator', methods: ['validateResult()'] },
+            { service: 'CommandExecutor', methods: ['executeCommand()'] },
+            { service: 'MainLoopService', methods: ['execute()'] },
+            { service: 'ContextualActionGenerator', methods: [
+                'generateActions()', 'decideNextStep()', 'validateCachedActions()',
+                'buildHistorySummary()', 'buildElementsSummary()', 'buildDOMSummary()',
+                'getPageHTML()', 'sanitizeActions()'
+            ]},
+            { service: 'SafetyGuard', methods: ['checkLimits()'] },
+            { service: 'StateTracker', methods: ['recordActionResult()'] },
+            { service: 'SelfHealingService', methods: ['healSelector()'] },
+            { service: 'FormIntelligenceService', methods: ['analyzeForm()'] },
+            { service: 'GraphBuilder', methods: ['addPageNode()'] },
+            { service: 'AdaptiveConfigService', methods: ['getThreshold()', 'getTimeout()'] }
+        ];
+
+        function renderChangedMethods(filter = 'all') {
+            const container = document.getElementById('changedMethods');
+            const filtered = filter === 'all'
+                ? changedMethods
+                : changedMethods.filter(m => m.type === filter);
+
+            container.innerHTML = filtered.map(method => `
+                <div class="method-card ${method.type}" onclick="showMethodDetails('${method.name}')">
+                    <div class="method-header">
+                        <span class="method-name">${method.name}</span>
+                        <span class="method-badge badge-${method.type}">${method.type}</span>
+                    </div>
+                    <div style="color: #999; font-size: 0.85em; margin-bottom: 8px;">${method.service}</div>
+                    <div class="method-description">${method.desc}</div>
+                </div>
+            `).join('');
+        }
+
+        function renderUnchangedMethods() {
+            const container = document.getElementById('unchangedMethods');
+            container.innerHTML = unchangedMethods.map(service => `
+                <div class="service-section">
+                    <div class="service-title">${service.service}</div>
+                    <div class="methods-grid">
+                        ${service.methods.map(method => `
+                            <div class="method-card unchanged">
+                                <div class="method-header">
+                                    <span class="method-name">${method}</span>
+                                    <span class="method-badge badge-unchanged">Unchanged</span>
+                                </div>
+                                <div style="color: #999; font-size: 0.85em; margin-bottom: 8px;">${service.service}</div>
+                                <div class="method-description">Core method - no changes this week</div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function filterMethods(type) {
+            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+            renderChangedMethods(type);
+        }
+
+        function searchMethods() {
+            const query = document.getElementById('searchBox').value.toLowerCase();
+            const cards = document.querySelectorAll('#changedMethods .method-card');
+            cards.forEach(card => {
+                const text = card.textContent.toLowerCase();
+                card.style.display = text.includes(query) ? 'block' : 'none';
+            });
+        }
+
+        function showMethodDetails(name) {
+            const method = changedMethods.find(m => m.name === name);
+            if (method) {
+                alert(`${method.name}\n\nService: ${method.service}\nType: ${method.type}\n\n${method.desc}`);
+            }
+        }
+
+        // Initialize
+        renderChangedMethods();
+        renderUnchangedMethods();
+    </script>
+</body>
+</html>

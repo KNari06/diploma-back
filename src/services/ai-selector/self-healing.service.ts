@@ -3,7 +3,7 @@
  * Automatically repairs broken selectors using AI Selector Engine
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
 import { AISelectorEngine } from './ai-selector-engine.service';
 import { DOMNodeExtractor } from './dom-node-extractor';

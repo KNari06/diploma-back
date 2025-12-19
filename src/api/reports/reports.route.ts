@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { asyncHandler } from '@/utils/error-handler';
+import { asyncHandler } from '@/utils/core/error-handler';
 import { requireAuth } from '@/middleware/auth.middleware';
 import {
   generateReport,

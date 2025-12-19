@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { TraceFile, TraceFileListItem, TraceStep, TraceStepsResponse, TraceUploadRequest, TraceUploadResponse } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import AdmZip from 'adm-zip';
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
@@ -10,6 +10,7 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 
 /**
  * Handle Playwright trace file upload to Supabase Storage
+ * ✅ FIX #24: Use authenticated user ID instead of client-provided userId
  */
 export const uploadTrace = async (
   req: Request,
@@ -25,27 +26,9 @@ export const uploadTrace = async (
       return;
     }
 
-    const { userId, testId, browser, metadata } = req.body as TraceUploadRequest;
-
-    // Validation
-    if (!userId) {
-      res.status(400).json({
-        success: false,
-        message: 'userId is required',
-        error: 'MISSING_USER_ID',
-      });
-      return;
-    }
-
-    // Validate userId format (UUID)
-    if (!UUID_REGEX.test(userId)) {
-      res.status(400).json({
-        success: false,
-        message: 'Invalid userId format',
-        error: 'INVALID_USER_ID',
-      });
-      return;
-    }
+    // ✅ FIX #24: Use authenticated user ID from JWT token
+    const userId = req.user!.id;
+    const { testId, browser, metadata } = req.body as Omit<TraceUploadRequest, 'userId'>;
 
     // Validate testId format if provided (UUID)
     if (testId && !UUID_REGEX.test(testId)) {
@@ -55,6 +38,33 @@ export const uploadTrace = async (
         error: 'INVALID_TEST_ID',
       });
       return;
+    }
+
+    // ✅ FIX #28: If testId is provided, verify it belongs to the authenticated user
+    if (testId) {
+      const { data: testRow, error: testError } = await supabaseAdmin
+        .from('tests')
+        .select('user_id')
+        .eq('id', testId)
+        .single();
+
+      if (testError || !testRow) {
+        res.status(404).json({
+          success: false,
+          message: 'Test not found',
+          error: 'TEST_NOT_FOUND',
+        });
+        return;
+      }
+
+      if (!testRow.user_id || testRow.user_id !== userId) {
+        res.status(403).json({
+          success: false,
+          message: 'Access denied',
+          error: 'FORBIDDEN',
+        });
+        return;
+      }
     }
 
     // Validate file size (max 100MB)
@@ -206,10 +216,13 @@ export const uploadTrace = async (
 /**
  * Get trace file from Supabase Storage
  */
+/**
+ * ✅ FIX #24: Added ownership check
+ */
 export const getTrace = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const { userId } = req.query;
+    const userId = req.user!.id; // ✅ FIX #24: Use authenticated user ID
 
     if (!id) {
       res.status(400).json({
@@ -319,16 +332,9 @@ export const getTrace = async (req: Request, res: Response): Promise<void> => {
  */
 export const listTraces = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { testId, userId } = req.query;
-
-    if (!testId && !userId) {
-      res.status(400).json({
-        success: false,
-        message: 'testId or userId is required',
-        error: 'MISSING_FILTER',
-      });
-      return;
-    }
+    // ✅ FIX #24: Always scope listing to authenticated user
+    const authUserId = req.user!.id;
+    const { testId } = req.query as { testId?: string };
 
     // Validate testId format if provided (UUID)
     if (testId && !UUID_REGEX.test(testId as string)) {
@@ -340,33 +346,20 @@ export const listTraces = async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
-    // Validate userId format if provided (UUID)
-    if (userId && !UUID_REGEX.test(userId as string)) {
-      res.status(400).json({
-        success: false,
-        message: 'Invalid userId format',
-        error: 'INVALID_USER_ID',
-      });
-      return;
-    }
-
     let query = supabaseAdmin
       .from('trace_files')
       .select('*')
+      .eq('user_id', authUserId)
       .order('created_at', { ascending: false });
 
     if (testId) {
       query = query.eq('test_id', testId);
     }
 
-    if (userId) {
-      query = query.eq('user_id', userId);
-    }
-
     const { data: traces, error: fetchError } = await query;
 
     if (fetchError) {
-      logger.error('Failed to fetch traces', { error: fetchError, testId, userId });
+      logger.error('Failed to fetch traces', { error: fetchError, testId, userId: authUserId });
       res.status(500).json({
         success: false,
         message: 'Failed to fetch traces',
@@ -378,7 +371,7 @@ export const listTraces = async (req: Request, res: Response): Promise<void> => 
     logger.info('Traces listed', {
       count: traces?.length || 0,
       testId,
-      userId,
+      userId: authUserId,
     });
 
     res.json({
@@ -409,7 +402,8 @@ export const listTraces = async (req: Request, res: Response): Promise<void> => 
 export const deleteTrace = async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const { userId } = req.body;
+    // ✅ FIX #24: Use authenticated user ID, never trust client-provided userId
+    const userId = req.user!.id;
 
     if (!id) {
       res.status(400).json({
@@ -430,25 +424,12 @@ export const deleteTrace = async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
-    // Validate userId format if provided (UUID)
-    if (userId && !UUID_REGEX.test(userId)) {
-      res.status(400).json({
-        success: false,
-        message: 'Invalid userId format',
-        error: 'INVALID_USER_ID',
-      });
-      return;
-    }
-
     // Get trace metadata
-    let query = supabaseAdmin
+    const query = supabaseAdmin
       .from('trace_files')
       .select('*')
-      .eq('id', id);
-
-    if (userId) {
-      query = query.eq('user_id', userId);
-    }
+      .eq('id', id)
+      .eq('user_id', userId);
 
     const { data: traceFiles, error: fetchError } = await query;
     const traceFile = traceFiles && traceFiles.length > 0 ? traceFiles[0] : null;
@@ -523,26 +504,8 @@ export const deleteTrace = async (req: Request, res: Response): Promise<void> =>
  */
 export const getTraceFilesByUser = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { userId } = req.query;
-
-    if (!userId) {
-      res.status(400).json({
-        success: false,
-        message: 'userId is required',
-        error: 'MISSING_USER_ID',
-      });
-      return;
-    }
-
-    // Validate userId format (UUID)
-    if (!UUID_REGEX.test(userId as string)) {
-      res.status(400).json({
-        success: false,
-        message: 'Invalid userId format',
-        error: 'INVALID_USER_ID',
-      });
-      return;
-    }
+    // ✅ FIX #24: Use authenticated user ID, ignore any query param
+    const userId = req.user!.id;
 
     // Fetch all trace files for the user
     const { data: traceFiles, error: fetchError } = await supabaseAdmin
@@ -606,6 +569,7 @@ export const getTraceFilesByUser = async (req: Request, res: Response): Promise<
 export const getTraceSteps = async (req: Request, res: Response<TraceStepsResponse>): Promise<void> => {
   try {
     const { testId } = req.params;
+    const userId = req.user!.id;
 
     if (!testId) {
       res.status(400).json({
@@ -626,11 +590,39 @@ export const getTraceSteps = async (req: Request, res: Response<TraceStepsRespon
       return;
     }
 
+    // ✅ FIX #24: Verify test ownership before accessing trace steps
+    const { data: testRow, error: testError } = await supabaseAdmin
+      .from('tests')
+      .select('user_id')
+      .eq('id', testId)
+      .single();
+
+    if (testError || !testRow) {
+      logger.warn('Test not found for trace steps', { testId, error: testError });
+      res.status(404).json({
+        success: false,
+        message: 'Test not found',
+        error: 'TEST_NOT_FOUND',
+      });
+      return;
+    }
+
+    if (!testRow.user_id || testRow.user_id !== userId) {
+      logger.warn('Unauthorized trace steps access attempt', { testId, userId });
+      res.status(403).json({
+        success: false,
+        message: 'Access denied',
+        error: 'FORBIDDEN',
+      });
+      return;
+    }
+
     // Find trace file for this test
     const { data: traceFiles, error: fetchError } = await supabaseAdmin
       .from('trace_files')
       .select('*')
       .eq('test_id', testId)
+      .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .limit(1);
 

@@ -1,15 +1,16 @@
 import { requireAuth } from '@/middleware/auth.middleware';
-import { asyncHandler, handleValidationError } from '@/utils/error-handler';
+import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
+import { logger } from '@/utils/core/logger';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
-import { handleChat, getChatHistory, getChatSessions, getCurrentChatHistory, debugChatData } from './chat.controller';
 import {
   createNewChatSession,
-  listUserChatSessions,
-  getChatSessionById,
-  updateChatSessionTitle,
   deleteChatSession,
+  getChatSessionById,
+  listUserChatSessions,
+  updateChatSessionTitle,
 } from './chat-sessions.controller';
+import { debugChatData, getChatHistory, getCurrentChatHistory, handleChat } from './chat.controller';
 
 const router = Router();
 
@@ -34,7 +35,8 @@ const chatRequestSchema = z.object({
  *       - **API Testing** - тестирование API endpoints
  *       - **General Chat** - обычный разговор с AI
  *
- *       **Чат БЕСПЛАТНЫЙ (0 кредитов)**, кредиты списываются только за тесты:
+ *       **Стоимость:**
+ *       - Чат: 1 кредит за сообщение
  *       - Intelligent тест: 20 кредитов (~50 тестов/месяц за $39)
  *       - Standard тест: 1 кредит (~1000 тестов/месяц)
  *       - API тест: 2 кредита (~500 тестов/месяц)
@@ -144,13 +146,42 @@ const chatRequestSchema = z.object({
  *                 creditsRemaining:
  *                   type: number
  *                   description: Остаток кредитов после операции
- *                 chatIsFree:
- *                   type: boolean
- *                   description: Указывает что чат бесплатный
  *       400:
  *         description: Ошибка валидации
  *       402:
  *         description: Недостаточно кредитов для выполнения теста
+ *       409:
+ *         description: Уже есть активный запрос обработки сообщения
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Request already in progress"
+ *                 message:
+ *                   type: string
+ *                   example: "Another request is currently being processed. Please cancel it first or wait for completion."
+ *       499:
+ *         description: Запрос был отменен пользователем
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Request cancelled"
+ *                 message:
+ *                   type: string
+ *                   example: "The request was cancelled by user"
  *       500:
  *         description: Ошибка сервера
  */
@@ -175,10 +206,141 @@ router.post('/',
 
 /**
  * @swagger
+ * /api/v1/chat/cancel:
+ *   post:
+ *     summary: Отменить текущий запрос обработки сообщения и все запущенные тесты
+ *     description: |
+ *       Отменяет активный HTTP-запрос обработки сообщения (парсинг интента, генерация плана, выполнение теста)
+ *       и все запущенные тесты для указанной чат-сессии.
+ *
+ *       **Критически важно:**
+ *       - Вызывается при нажатии кнопки "Отменить" на фронтенде
+ *       - Можно вызвать **параллельно** с основным запросом `/api/v1/chat` (не блокируется)
+ *       - Останавливает обработку запроса на любом этапе (intent parsing, AI calls, test execution)
+ *       - Отменяет все тесты со статусом 'pending' или 'running' (статус меняется на 'cancelled')
+ *
+ *       **Поведение:**
+ *       1. Отменяет активный HTTP-запрос обработки сообщения (через AbortController)
+ *       2. Отменяет все запущенные тесты для чат-сессии
+ *       3. Возвращает информацию о том, что было отменено
+ *
+ *       **После отмены:**
+ *       - Фронтенд должен разблокировать поле ввода
+ *       - Пользователь может отправить новое сообщение
+ *       - Отмененный запрос `/api/v1/chat` вернет HTTP 499 (Request cancelled)
+ *     tags: [Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               sessionId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: ID чат-сессии (опционально, если не указан - используется последняя сессия пользователя)
+ *     responses:
+ *       200:
+ *         description: Результат отмены запроса и тестов
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 requestCancelled:
+ *                   type: boolean
+ *                   description: Был ли отменен активный HTTP-запрос обработки сообщения
+ *                   example: true
+ *                 testsCancelled:
+ *                   type: number
+ *                   description: Количество отмененных тестов
+ *                   example: 2
+ *                 errors:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                   description: Ошибки при отмене (если были)
+ *                   example: []
+ *                 message:
+ *                   type: string
+ *                   description: Описание того, что было отменено
+ *                   example: "Cancelled request processing and 2 test(s)"
+ *       400:
+ *         description: Ошибка валидации (например, нет чат-сессии)
+ *       500:
+ *         description: Ошибка сервера
+ */
+router.post('/cancel',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response) => {
+    const userId = req.user!.id;
+    const { sessionId } = req.body || {};
+
+    // Get chat session ID
+    let chatSessionId = sessionId;
+
+    // If sessionId not provided, get the latest session for user
+    if (!chatSessionId) {
+      const { ChatService } = await import('@/services/utils/chat.service');
+      const { getOrCreateChatSession } = await import('./shared/utils');
+      const { checkWorkspace } = await import('./shared/validation');
+
+      const workspace_id = await checkWorkspace(userId);
+      chatSessionId = await getOrCreateChatSession(userId, undefined, workspace_id, false);
+    }
+
+    // ✅ CRITICAL: Cancel active request processing first
+    // ✅ FIX #2: cancelActiveRequest is now async (deletes from Redis)
+    const { cancelActiveRequest } = await import('./shared/request-cancellation');
+    const requestCancelResult = await cancelActiveRequest(chatSessionId, userId);
+
+    // Cancel running tests
+    let testCancelResult = { success: true, cancelledCount: 0, errors: [] as string[] };
+    if (chatSessionId) {
+      try {
+        const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
+        testCancelResult = await ManualTestService.cancelAllRunningTestsForChatSession(chatSessionId, userId);
+      } catch (error) {
+        logger.warn('[CHAT] Failed to cancel tests', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        testCancelResult.errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    logger.info(`[CHAT] Cancelled request and tests via cancel endpoint`, {
+      chatSessionId,
+      userId,
+      requestCancelled: requestCancelResult.cancelled,
+      testsCancelled: testCancelResult.cancelledCount,
+    });
+
+    res.status(200).json({
+      success: true,
+      requestCancelled: requestCancelResult.cancelled,
+      testsCancelled: testCancelResult.cancelledCount,
+      errors: testCancelResult.errors,
+      message: requestCancelResult.cancelled
+        ? `Cancelled request processing${testCancelResult.cancelledCount > 0 ? ` and ${testCancelResult.cancelledCount} test(s)` : ''}`
+        : testCancelResult.cancelledCount > 0
+        ? `Cancelled ${testCancelResult.cancelledCount} test(s)`
+        : 'No active request or tests to cancel',
+    });
+  })
+);
+
+/**
+ * @swagger
  * /api/v1/chat/history:
  *   get:
- *     summary: Получить историю текущего чата пользователя с пагинацией
- *     description: Возвращает историю единственного активного чата пользователя. Поддерживает как авторизованных пользователей (Bearer token), так и анонимных (по IP). offset=0 возвращает ПОСЛЕДНИЕ сообщения. Внутри каждой страницы сообщения отсортированы хронологически (старые → новые)
+ *     summary: Get current user's chat history (paginated)
+ *     description: Returns the history of the user's single active chat session. Supports both authenticated users (Bearer token) and anonymous users (by IP). offset=0 returns the MOST RECENT messages. Within each page, messages are sorted chronologically (old → new).
  *     tags: [Chat]
  *     parameters:
  *       - in: query
@@ -188,17 +350,17 @@ router.post('/',
  *           default: 50
  *           minimum: 1
  *           maximum: 100
- *         description: Количество сообщений для возврата
+ *         description: Number of messages to return
  *       - in: query
  *         name: offset
  *         schema:
  *           type: integer
  *           default: 0
  *           minimum: 0
- *         description: Смещение для пагинации. 0 = последние сообщения, 50 = более старые сообщения
+ *         description: Pagination offset. 0 = latest messages, 50 = older messages
  *     responses:
  *       200:
- *         description: История текущего чата
+ *         description: Current chat history
  *         content:
  *           application/json:
  *             schema:
@@ -224,7 +386,7 @@ router.post('/',
  *                           format: date-time
  *                     messages:
  *                       type: array
- *                       description: Сообщения в хронологическом порядке внутри страницы (старые → новые). offset=0 дает последние сообщения
+ *                       description: Messages in chronological order within the page (old → new). offset=0 returns the latest messages
  *                       items:
  *                         type: object
  *                         properties:

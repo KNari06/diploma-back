@@ -1,5 +1,5 @@
-import { env } from '@/config/env';
-import { logger } from '@/utils/logger';
+import { env } from '@/config/environment/env';
+import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 
 // Validate API key on module load
@@ -52,27 +52,95 @@ export async function generateEmbedding(text: string): Promise<number[]> {
 
   try {
     // OpenAI recommends replacing newlines with spaces for better embeddings
-    const cleanedText = trimmedText
+    let cleanedText = trimmedText
       .substring(0, MAX_TEXT_LENGTH)
       .replace(/\n/g, ' ')
       .trim();
 
+    // ✅ FIX: Check if text became empty after cleaning
+    if (cleanedText.length === 0) {
+      throw new Error('Text became empty after cleaning (only whitespace/newlines)');
+    }
+
+    // ✅ FIX: Additional length check after cleaning (replace may change length)
+    if (cleanedText.length > MAX_TEXT_LENGTH) {
+      cleanedText = cleanedText.substring(0, MAX_TEXT_LENGTH);
+    }
+
     logger.info('[EMBEDDING] Generating embedding', {
       textLength: cleanedText.length,
+      originalLength: trimmedText.length,
       model: EMBEDDING_MODEL,
     });
 
-    const response = await openai.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: cleanedText,
-      dimensions: EMBEDDING_DIMENSIONS,
-    });
+    // ✅ FIX: Retry logic for temporary API errors (rate limits, network issues)
+    const MAX_RETRIES = 3;
+    let lastError: any;
+    let response;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        response = await openai.embeddings.create({
+          model: EMBEDDING_MODEL,
+          input: cleanedText,
+          dimensions: EMBEDDING_DIMENSIONS,
+        }, {
+          timeout: 60000, // ✅ FIX: Increased timeout for embedding requests (60s)
+        });
+        break; // Success - exit retry loop
+      } catch (apiError: any) {
+        lastError = apiError;
+
+        // Check if it's a retryable error
+        const isRetryable =
+          apiError?.status === 429 || // Rate limit
+          apiError?.status === 503 || // Service unavailable
+          apiError?.status === 502 || // Bad gateway
+          apiError?.code === 'ECONNRESET' || // Network reset
+          apiError?.code === 'ETIMEDOUT'; // Timeout
+
+        if (isRetryable && attempt < MAX_RETRIES) {
+          const delay = 1000 * attempt; // Exponential backoff: 1s, 2s, 3s
+          logger.warn('[EMBEDDING] Retryable error, retrying', {
+            attempt,
+            maxRetries: MAX_RETRIES,
+            delay,
+            errorStatus: apiError?.status,
+            errorCode: apiError?.code,
+          });
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+
+        // Not retryable or max retries reached - throw
+        throw apiError;
+      }
+    }
+
+    if (!response) {
+      throw lastError || new Error('Failed to generate embedding after retries');
+    }
+
+    // ✅ FIX: Validate response structure
+    if (!response || !response.data || !Array.isArray(response.data) || response.data.length === 0) {
+      throw new Error('OpenAI API returned empty or invalid response');
+    }
+
+    if (!response.data[0] || !response.data[0].embedding) {
+      throw new Error('OpenAI API returned invalid response structure (missing embedding)');
+    }
 
     const embedding = response.data[0].embedding;
 
-    // Validate embedding
+    // ✅ FIX: Validate embedding structure and dimensions
     if (!embedding || !Array.isArray(embedding) || embedding.length !== EMBEDDING_DIMENSIONS) {
       throw new Error(`Invalid embedding dimensions: expected ${EMBEDDING_DIMENSIONS}, got ${embedding?.length}`);
+    }
+
+    // ✅ FIX: Validate all values are valid numbers
+    const invalidValues = embedding.filter(val => typeof val !== 'number' || isNaN(val) || !isFinite(val));
+    if (invalidValues.length > 0) {
+      throw new Error(`Embedding contains ${invalidValues.length} invalid numbers (NaN or non-finite)`);
     }
 
     logger.info('[EMBEDDING] Embedding generated successfully', {
@@ -82,11 +150,22 @@ export async function generateEmbedding(text: string): Promise<number[]> {
 
     return embedding;
   } catch (error) {
-    logger.error('[EMBEDDING] Generation failed', {
+    // ✅ FIX: Preserve original error with stack trace
+    const errorDetails = {
       error,
+      errorType: error instanceof Error ? error.constructor.name : typeof error,
+      errorMessage: error instanceof Error ? error.message : String(error),
+      errorStack: error instanceof Error ? error.stack : undefined,
       textLength: trimmedText?.length,
-    });
-    throw new Error(`Failed to generate embedding: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    };
+
+    logger.error('[EMBEDDING] Generation failed', errorDetails);
+
+    // ✅ FIX: Re-throw original error to preserve stack trace
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error(`Failed to generate embedding: ${String(error)}`);
   }
 }
 

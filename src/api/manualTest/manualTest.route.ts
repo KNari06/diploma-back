@@ -6,8 +6,8 @@ import { IntelligentTestStorageService } from '@/services/testing/results/intell
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { NotFoundError, TestRunRequest, ValidationError } from '@/types';
-import { asyncHandler, handleValidationError } from '@/utils/error-handler';
-import { logger } from '@/utils/logger';
+import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
+import { logger } from '@/utils/core/logger';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 
@@ -257,11 +257,37 @@ router.post('/run', requireAuth, requireCredits(1), asyncHandler(async (req: Req
 /**
  * POST /manual-test/result
  * Receive test result from Playwright agent
+ * ✅ FIX #6: Added authentication - this endpoint should be protected
+ * NOTE: This endpoint is DEPRECATED and should not be used.
+ * Test results are processed directly in worker via ManualTestService.processTestResult
+ * This endpoint is kept for backward compatibility only.
  */
-router.post('/result', asyncHandler(async (req: Request, res: Response) => {
+router.post('/result', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   try {
+    const userId = req.user?.id;
+    if (!userId) {
+      throw new ValidationError('User ID is required');
+    }
+
     // Validate request body
     const validatedData = testResultSchema.parse(req.body);
+
+    // ✅ FIX #6: Verify that the test belongs to the authenticated user
+    const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
+    const testResponse = await ManualTestService.getTest(validatedData.testId, userId);
+
+    if (!testResponse.success || !testResponse.data) {
+      logger.warn('[MANUAL_TEST] Unauthorized test result submission attempt', {
+        testId: validatedData.testId,
+        userId,
+      });
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'You do not have permission to submit results for this test',
+      });
+      return;
+    }
 
     const result = await ManualTestService.processTestResult(validatedData);
 
@@ -521,6 +547,132 @@ router.post('/:id/cancel', requireAuth, asyncHandler(async (req: Request, res: R
   const result = await ManualTestService.cancelTest(id, userId);
 
   logger.info(`Test cancelled: ${id}`);
+
+  res.status(200).json(result);
+}));
+
+/**
+ * @swagger
+ * /api/v1/manual-test/cancel-all:
+ *   post:
+ *     summary: Отменить все запущенные тесты пользователя
+ *     description: |
+ *       Отменяет все тесты пользователя со статусом 'pending' или 'running'.
+ *
+ *       **Действия:**
+ *       - Находит все запущенные тесты пользователя
+ *       - Отменяет каждый тест
+ *       - Возвращает количество отмененных тестов
+ *
+ *       **Ограничения:**
+ *       - Требуется авторизация
+ *       - Отменяются только тесты текущего пользователя
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Результат отмены всех тестов
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 cancelledCount:
+ *                   type: number
+ *                   example: 3
+ *                 errors:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                   example: []
+ *       500:
+ *         description: Ошибка при отмене тестов
+ */
+router.post('/cancel-all', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+
+  const result = await ManualTestService.cancelAllRunningTestsForUser(userId);
+
+  logger.info(`Cancelled ${result.cancelledCount} tests for user: ${userId}`);
+
+  res.status(200).json(result);
+}));
+
+/**
+ * @swagger
+ * /api/v1/manual-test/cancel-all-chat:
+ *   post:
+ *     summary: Отменить все запущенные тесты для чат-сессии
+ *     description: |
+ *       Отменяет все тесты, связанные с указанной чат-сессией, со статусом 'pending' или 'running'.
+ *
+ *       **Действия:**
+ *       - Находит все запущенные тесты для чат-сессии
+ *       - Отменяет каждый тест
+ *       - Возвращает количество отмененных тестов
+ *
+ *       **Ограничения:**
+ *       - Требуется авторизация
+ *       - Отменяются только тесты текущего пользователя
+ *     tags: [Manual Tests]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - chatSessionId
+ *             properties:
+ *               chatSessionId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: ID чат-сессии
+ *     responses:
+ *       200:
+ *         description: Результат отмены всех тестов
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 cancelledCount:
+ *                   type: number
+ *                   example: 2
+ *                 errors:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                   example: []
+ *       400:
+ *         description: Не указан chatSessionId
+ *       500:
+ *         description: Ошибка при отмене тестов
+ */
+router.post('/cancel-all-chat', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+  const { chatSessionId } = req.body;
+
+  if (!chatSessionId) {
+    res.status(400).json({
+      success: false,
+      error: 'chatSessionId is required',
+    });
+    return;
+  }
+
+  const result = await ManualTestService.cancelAllRunningTestsForChatSession(chatSessionId, userId);
+
+  logger.info(`Cancelled ${result.cancelledCount} tests for chat session: ${chatSessionId}`);
 
   res.status(200).json(result);
 }));

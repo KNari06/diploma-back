@@ -10,8 +10,8 @@
  * - Main: subscribes to Redis channel and emits via WebSocket
  */
 
-import { connection } from '@/config/queues';
-import { logger } from '@/utils/logger';
+import { connection } from '@/config/infrastructure/queues';
+import { logger } from '@/utils/core/logger';
 import Redis from 'ioredis';
 
 // Redis channel for WebSocket events
@@ -197,11 +197,8 @@ class RedisWebSocketBridge {
         }
       }
 
-      // Subscribe to channel
-      await this.subscriber.subscribe(WEBSOCKET_EVENTS_CHANNEL);
-      this.isSubscribed = true;
-
-      // ✅ FIX: Register message handler BEFORE subscribing (prevent race condition)
+      // ✅ FIX #3: Register message handler BEFORE subscribing (prevent race condition)
+      // This ensures we don't lose any messages that arrive immediately after subscribe
       this.subscriber.on('message', (channel, message) => {
         if (channel !== WEBSOCKET_EVENTS_CHANNEL) {
           return;
@@ -229,6 +226,10 @@ class RedisWebSocketBridge {
           // ✅ REMOVED: REDIS_BRIDGE logs
         }
       });
+
+      // Subscribe to channel AFTER registering handler
+      await this.subscriber.subscribe(WEBSOCKET_EVENTS_CHANNEL);
+      this.isSubscribed = true;
 
       // ✅ REMOVED: REDIS_BRIDGE logs
     } catch (error) {

@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authentication & Authorization - Features Documentation</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <style>
+        .feature-page { padding: 40px; }
+        .section { margin-bottom: 50px; }
+        .section-title { font-size: 2em; margin-bottom: 20px; color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 10px; }
+        .overview { background: #f8f9fa; padding: 25px; border-radius: 12px; margin-bottom: 30px; }
+        .diagram-container { background: #f8f9fa; padding: 30px; border-radius: 12px; margin-bottom: 40px; overflow-x: auto; }
+        .mermaid { background: white; padding: 20px; border-radius: 8px; }
+        .back-link { display: inline-block; margin-bottom: 20px; color: #667eea; text-decoration: none; font-weight: 500; }
+        .back-link:hover { text-decoration: underline; }
+        .endpoint-card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #667eea; }
+        .endpoint-method { display: inline-block; padding: 5px 10px; border-radius: 4px; font-weight: bold; margin-right: 10px; }
+        .method-post { background: #4caf50; color: white; }
+        .method-get { background: #2196f3; color: white; }
+        .method-put { background: #ff9800; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔐 Authentication & Authorization</h1>
+            <p>OAuth flow, JWT tokens, session management, and role-based access control</p>
+        </div>
+        <div class="feature-page">
+            <a href="../../index.html" class="back-link">← Back to Features</a>
+
+            <div class="section">
+                <h2 class="section-title">📋 Overview</h2>
+                <div class="overview">
+                    <p>Authentication system handles user login, registration, OAuth providers (Google, GitHub, GitLab, Bitbucket), JWT token management, password reset, and session handling.</p>
+                    <p><strong>Key Features:</strong></p>
+                    <ul>
+                        <li>Email/Password authentication</li>
+                        <li>Magic Link (passwordless) authentication</li>
+                        <li>OAuth providers (Google, GitHub, GitLab, Bitbucket)</li>
+                        <li>JWT token refresh mechanism</li>
+                        <li>Password reset flow</li>
+                        <li>Role-based access control (RBAC)</li>
+                        <li>Middleware for protected routes</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">📊 Authentication Flow Diagram</h2>
+
+                <div class="overview" style="margin-bottom: 20px; padding: 20px;">
+                    <h3 style="margin-top: 0; color: #667eea;">🎨 Legend (Легенда)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e1f5ff; border: 2px solid #01579b;"></span>
+                            <div>
+                                <strong>🔵 Blue</strong> - API Endpoints (API точки)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #fff4e1; border: 2px solid #e65100;"></span>
+                            <div>
+                                <strong>🟡 Orange</strong> - Token Generation (Генерация токенов)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 2px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green</strong> - Supabase Auth (Supabase аутентификация)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Start([User Request]) --> AuthType{Authentication Type?}
+
+    AuthType -->|Email/Password| EmailAuth[POST /auth/login]
+    AuthType -->|Sign Up| SignUp[POST /auth/signup]
+    AuthType -->|Magic Link| MagicLink[POST /auth/magic-link]
+    AuthType -->|OAuth| OAuthFlow[GET /auth/oauth/:provider]
+
+    EmailAuth --> ValidateEmail[Validate Email & Password]
+    ValidateEmail -->|Invalid| Return400[Return 400 Bad Request]
+    ValidateEmail -->|Valid| SignInService[signInWithEmail Service]
+
+    SignUp --> ValidateSignup[Validate Email, Password, Name]
+    ValidateSignup -->|Invalid| Return400Signup[Return 400]
+    ValidateSignup -->|Valid| SignUpService[signUpWithEmail Service]
+
+    MagicLink --> ValidateMagic[Validate Email]
+    ValidateMagic -->|Invalid| Return400Magic[Return 400]
+    ValidateMagic -->|Valid| MagicLinkService[signInWithMagicLink Service]
+
+    OAuthFlow --> ValidateProvider{Provider Valid?}
+    ValidateProvider -->|No| Return400OAuth[Return 400 Invalid Provider]
+    ValidateProvider -->|Yes| GetOAuthUrl[getOAuthUrl Service]
+    GetOAuthUrl --> SupabaseOAuth[Supabase Auth.signInWithOAuth]
+    SupabaseOAuth --> RedirectOAuth[Redirect to OAuth Provider]
+    RedirectOAuth --> OAuthCallback[OAuth Callback Handler]
+    OAuthCallback --> CreateSession[Create Session]
+
+    SignInService --> SupabaseAuth[Supabase Auth.signInWithPassword]
+    SignUpService --> SupabaseSignUp[Supabase Auth.signUp]
+    MagicLinkService --> SupabaseMagic[Supabase Auth.signInWithOtp]
+
+    SupabaseAuth -->|Error| Return401[Return 401 Unauthorized]
+    SupabaseAuth -->|Success| GenerateTokens[Generate JWT Tokens]
+
+    SupabaseSignUp -->|Error| Return400Signup
+    SupabaseSignUp -->|Success| SyncUser[Sync to public.users Table]
+    SyncUser --> GenerateTokens
+
+    SupabaseMagic -->|Error| Return400Magic
+    SupabaseMagic -->|Success| SendEmail[Send Magic Link Email]
+    SendEmail --> Return200Magic[Return 200 - Check Email]
+
+    GenerateTokens --> ReturnTokens[Return Access & Refresh Tokens]
+    ReturnTokens --> End([✅ Authenticated])
+
+    CreateSession --> GenerateTokens
+
+    Return400 --> End
+    Return400Signup --> End
+    Return400Magic --> End
+    Return400OAuth --> End
+    Return401 --> End
+    Return200Magic --> End
+
+    style EmailAuth fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style SignUp fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style MagicLink fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style OAuthFlow fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style GenerateTokens fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style SupabaseAuth fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style SupabaseSignUp fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style SupabaseMagic fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style SupabaseOAuth fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🔑 Authorization Flow</h2>
+
+                <div class="overview" style="margin-bottom: 20px; padding: 20px;">
+                    <h3 style="margin-top: 0; color: #667eea;">🎨 Legend (Легенда)</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #fff4e1; border: 2px solid #e65100;"></span>
+                            <div>
+                                <strong>🟡 Orange</strong> - Token Verification (Проверка токена)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 2px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green</strong> - Supabase Verification (Проверка через Supabase)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e1f5ff; border: 2px solid #01579b;"></span>
+                            <div>
+                                <strong>🔵 Blue</strong> - User Attachment (Прикрепление пользователя)
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #e8f5e9; border: 3px solid #2e7d32;"></span>
+                            <div>
+                                <strong>🟢 Green (Bold)</strong> - Allow Access (Разрешить доступ)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="diagram-container">
+                    <div class="mermaid">
+flowchart TD
+    Request([Incoming Request]) --> ExtractToken[Extract Authorization Header]
+    ExtractToken --> HasToken{Token Present?}
+
+    HasToken -->|No| Return401[Return 401 Unauthorized]
+    HasToken -->|Yes| ValidateFormat[Validate Token Format]
+
+    ValidateFormat -->|Invalid| Return401Format[Return 401 Invalid Format]
+    ValidateFormat -->|Valid| VerifyToken[verifyToken Service]
+
+    VerifyToken --> SupabaseVerify[Supabase Auth.getUser]
+    SupabaseVerify -->|Error| Return401Verify[Return 401 Invalid Token]
+    SupabaseVerify -->|Success| CheckEmail[Check Email Confirmed]
+
+    CheckEmail -->|Not Confirmed| Return401Email[Return 401 Email Not Confirmed]
+    CheckEmail -->|Confirmed| GetUserData[Get User from public.users]
+    GetUserData --> AttachUser[Attach User to Request]
+    AttachUser --> CheckRole{Need Admin?}
+
+    CheckRole -->|Yes| IsAdmin{Is Admin?}
+    CheckRole -->|No| AllowAccess[✅ Allow Access]
+
+    IsAdmin -->|No| Return403[Return 403 Forbidden]
+    IsAdmin -->|Yes| AllowAccess
+
+    Return401 --> End([End])
+    Return401Format --> End
+    Return401Verify --> End
+    Return401Email --> End
+    Return403 --> End
+    AllowAccess --> End
+
+    style VerifyToken fill:#fff4e1,stroke:#e65100,stroke-width:2px
+    style SupabaseVerify fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style AttachUser fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    style AllowAccess fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🌐 API Endpoints</h2>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-post">POST</span>
+                    <strong>/api/v1/auth/signup</strong>
+                    <p>Register new user with email and password</p>
+                    <p><strong>Body:</strong> { email, password, name? }</p>
+                </div>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-post">POST</span>
+                    <strong>/api/v1/auth/login</strong>
+                    <p>Sign in with email and password</p>
+                    <p><strong>Body:</strong> { email, password }</p>
+                </div>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-post">POST</span>
+                    <strong>/api/v1/auth/magic-link</strong>
+                    <p>Send passwordless login link to email</p>
+                    <p><strong>Body:</strong> { email, redirectTo? }</p>
+                </div>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-get">GET</span>
+                    <strong>/api/v1/auth/oauth/:provider</strong>
+                    <p>OAuth authentication (google, github, gitlab, bitbucket)</p>
+                    <p><strong>Params:</strong> provider</p>
+                </div>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-post">POST</span>
+                    <strong>/api/v1/auth/logout</strong>
+                    <p>Sign out and invalidate session</p>
+                    <p><strong>Headers:</strong> Authorization: Bearer {token}</p>
+                </div>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-post">POST</span>
+                    <strong>/api/v1/auth/refresh</strong>
+                    <p>Refresh access token using refresh token</p>
+                    <p><strong>Body:</strong> { refresh_token }</p>
+                </div>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-get">GET</span>
+                    <strong>/api/v1/auth/me</strong>
+                    <p>Get current authenticated user</p>
+                    <p><strong>Headers:</strong> Authorization: Bearer {token}</p>
+                </div>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-post">POST</span>
+                    <strong>/api/v1/auth/password/reset-request</strong>
+                    <p>Request password reset email</p>
+                    <p><strong>Body:</strong> { email, redirectTo? }</p>
+                </div>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-post">POST</span>
+                    <strong>/api/v1/auth/password/update</strong>
+                    <p>Update user password</p>
+                    <p><strong>Headers:</strong> Authorization: Bearer {token}</p>
+                    <p><strong>Body:</strong> { newPassword }</p>
+                </div>
+
+                <div class="endpoint-card">
+                    <span class="endpoint-method method-put">PUT</span>
+                    <strong>/api/v1/auth/profile</strong>
+                    <p>Update user profile (name)</p>
+                    <p><strong>Headers:</strong> Authorization: Bearer {token}</p>
+                    <p><strong>Body:</strong> { name }</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2 class="section-title">🛡️ Middleware</h2>
+                <div class="overview">
+                    <p><strong>requireAuth:</strong> Validates JWT token and attaches user to request. Returns 401 if invalid.</p>
+                    <p><strong>optionalAuth:</strong> Validates token if present, but doesn't fail if missing.</p>
+                    <p><strong>requireAdmin:</strong> Requires user to have admin role. Returns 403 if not admin.</p>
+                    <p><strong>requireCredits(n):</strong> Checks if user has enough credits before action.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>

@@ -1,10 +1,10 @@
 import { executePlaywrightTestWithRetry } from '@/agent';
-import { env } from '@/config/env';
-import { QueueManager } from '@/config/queues';
+import { env } from '@/config/environment/env';
+import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { AgentResponse, TestJobData } from '@/types';
-import { calculateRetryDelay, handleAgentError, shouldRetry } from '@/utils/error-handler';
-import { logger, logQueueEvent } from '@/utils/logger';
+import { calculateRetryDelay, handleAgentError, shouldRetry } from '@/utils/core/error-handler';
+import { logger, logQueueEvent } from '@/utils/core/logger';
 import {
   ResultErrorPayload,
   ResultReadyPayload,
@@ -12,8 +12,8 @@ import {
   TestCancelledPayload,
   TestFailedPayload,
   TestStartedPayload,
-} from '@/websocket/types';
-import { webSocketService } from '@/websocket/websocket.service';
+} from '@/websocket/types/types';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { Job } from 'bullmq';
 
 // Constants
@@ -77,7 +77,7 @@ export class ManualTestRunJobHandler {
     try {
       // Update test status to running
       logger.info(`[TEST-RUN] Updating test status to running: ${testId}`);
-      await this.updateTestStatus(testId, 'running', new Date().toISOString());
+      await this.updateTestStatus(testId, 'running', browser, new Date().toISOString());
 
       // Check again after status update (in case it was cancelled between checks)
       if (await this.checkTestCancelled(testId)) {
@@ -133,7 +133,7 @@ export class ManualTestRunJobHandler {
         });
 
         // Mark test as failed (final failure)
-        await this.updateTestStatus(testId, 'failed', undefined, new Date().toISOString());
+        await this.updateTestStatus(testId, 'failed', browser, undefined, new Date().toISOString());
 
         // Emit WebSocket events for failure
         this.emitTestFailed(testId, browser, new Error(result.error || 'Test execution failed'));
@@ -207,7 +207,7 @@ export class ManualTestRunJobHandler {
       }
 
       // Mark test as failed (final failure)
-      await this.updateTestStatus(testId, 'failed', undefined, new Date().toISOString());
+      await this.updateTestStatus(testId, 'failed', browser, undefined, new Date().toISOString());
 
       // Send failure notification
       await this.sendFailureNotification(testId, error);
@@ -218,10 +218,12 @@ export class ManualTestRunJobHandler {
 
   /**
    * Update test status in database
+   * ✅ FIX #5: Always check if test is cancelled before updating status
    */
   private static async updateTestStatus(
     testId: string,
     status: 'running' | 'completed' | 'failed',
+    browser: string,
     startedAt?: string,
     completedAt?: string
   ) {
@@ -229,7 +231,17 @@ export class ManualTestRunJobHandler {
     if (startedAt) updateData.started_at = startedAt;
     if (completedAt) updateData.completed_at = completedAt;
 
-    await dbAdminService.updateTest(testId, updateData);
+    // ✅ FIX #5: Use updateTestIfNotCancelled for ALL status updates (not just 'running')
+    // This prevents overwriting cancelled status with failed/completed
+    const updated = await dbAdminService.updateTestIfNotCancelled(testId, updateData);
+    if (!updated) {
+      // Most likely cancelled (or deleted). Re-check and stop gracefully.
+      if (await this.checkTestCancelled(testId)) {
+        logger.info(`[TEST-RUN] Test is cancelled, skipping status update to ${status}: ${testId} (${browser})`);
+        throw new TestCancelledError(testId, browser);
+      }
+      throw new Error(`Failed to update test status to ${status}: ${testId}`);
+    }
   }
 
   /**
@@ -281,55 +293,108 @@ export class ManualTestRunJobHandler {
   private static async handleSuccessfulTest(testId: string, browser: string, result: any) {
     logger.info(`[TEST-RUN] Creating test result in database: ${testId}`);
 
-    // Create test result in database
-    const testResultRecord = await dbAdminService.createTestResult({
-      test_id: testId,
-      browser,
-      status: result.status as any,
-      screenshot: result.screenshot,
-      dom: result.dom,
-      logs: result.logs || [],
-      network_logs: result.networkLogs || [],
-      errors: result.errors || [],
-      performance: result.performance,
-      completed_at: new Date().toISOString(),
-    });
+    try {
+      // Create test result in database
+      const testResultRecord = await dbAdminService.createTestResult({
+        test_id: testId,
+        browser,
+        status: result.status as any,
+        screenshot: result.screenshot,
+        dom: result.dom,
+        logs: result.logs || [],
+        network_logs: result.networkLogs || [],
+        errors: result.errors || [],
+        performance: result.performance,
+        completed_at: new Date().toISOString(),
+      });
 
-    // Emit WebSocket: browser completed
-    const browserCompletedPayload: TestBrowserCompletedPayload = {
-      testId,
-      browser,
-      status: 'completed',
-      errorsCount: result.errors?.length || 0,
-      timestamp: new Date().toISOString(),
-    };
-    webSocketService.emitTestBrowserCompleted(testId, browserCompletedPayload);
+      // ✅ FIX: Validate testResultRecord before using
+      if (!testResultRecord || !(testResultRecord as any).id) {
+        logger.error(`[TEST-RUN] Failed to create test result - invalid response: ${testId} (${browser})`, {
+          testId,
+          browser,
+          testResultRecord: testResultRecord ? 'exists but no id' : 'null/undefined',
+        });
+        throw new Error(`Failed to create test result for ${testId} (${browser}) - invalid response from database`);
+      }
 
-    // Emit WebSocket: result ready
-    const resultReadyPayload: ResultReadyPayload = {
-      testId,
-      browser,
-      resultId: (testResultRecord as any).id,
-      timestamp: new Date().toISOString(),
-    };
-    webSocketService.emitResultReady(testId, resultReadyPayload);
+      const resultId = (testResultRecord as any).id;
 
-    // Add AI analysis job
-    const testResult = await dbAdminService.getTestResultByTestAndBrowser(testId, browser);
-    if (testResult) {
-      await QueueManager.addAIAnalysisJob(testResult.id, testId);
-      logger.info(`[TEST-RUN] AI analysis job queued for test result: ${testResult.id}`);
+      // Emit WebSocket: browser completed
+      const browserCompletedPayload: TestBrowserCompletedPayload = {
+        testId,
+        browser,
+        status: 'completed',
+        errorsCount: result.errors?.length || 0,
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitTestBrowserCompleted(testId, browserCompletedPayload);
+
+      // Emit WebSocket: result ready
+      const resultReadyPayload: ResultReadyPayload = {
+        testId,
+        browser,
+        resultId,
+        timestamp: new Date().toISOString(),
+      };
+      webSocketService.emitResultReady(testId, resultReadyPayload);
+
+      // ✅ FIX: Use testResultRecord.id directly instead of querying DB again
+      // This eliminates duplicate DB query and potential race condition
+      try {
+        await QueueManager.addAIAnalysisJob(resultId, testId);
+        logger.info(`[TEST-RUN] AI analysis job queued for test result: ${resultId}`);
+      } catch (aiJobError) {
+        // ✅ FIX: Don't fail the whole method if AI analysis job fails
+        // Test is successful, AI analysis is not critical for basic functionality
+        logger.error(`[TEST-RUN] Failed to queue AI analysis job: ${testId}`, {
+          error: aiJobError instanceof Error ? aiJobError.message : String(aiJobError),
+          resultId,
+          testId,
+          browser,
+        });
+        // Continue execution - test result is saved, WebSocket events sent
+      }
+
+      // ///improvement: Update overall test status synchronously to prevent race condition
+      // This ensures test status is updated immediately after result is created
+      try {
+        await ManualTestResultJobHandler.updateOverallTestStatus(testId);
+      } catch (statusError) {
+        // ✅ FIX: Don't fail the whole method if status update fails
+        // Test result is already saved, status update can be retried
+        logger.error(`[TEST-RUN] Failed to update overall test status: ${testId}`, {
+          error: statusError instanceof Error ? statusError.message : String(statusError),
+          testId,
+          browser,
+        });
+        // Continue execution - test result is saved
+      }
+
+      logger.info(`[TEST-RUN] Test completed successfully: ${testId}`, {
+        browser,
+        logsCount: result.logs?.length || 0,
+        errorsCount: result.errors?.length || 0,
+      });
+
+    } catch (error) {
+      // ✅ FIX: Handle errors during test result creation
+      logger.error(`[TEST-RUN] Failed to handle successful test: ${testId} (${browser})`, {
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
+        testId,
+        browser,
+      });
+
+      // Emit WebSocket error event
+      this.emitResultError(testId, browser, error instanceof Error ? error : new Error(String(error)));
+
+      // Re-throw to let caller handle it (will be caught in process() method)
+      throw error;
     }
-
-    // ///improvement: Update overall test status synchronously to prevent race condition
-    // This ensures test status is updated immediately after result is created
-    await ManualTestResultJobHandler.updateOverallTestStatus(testId);
-
-    logger.info(`[TEST-RUN] Test completed successfully: ${testId}`, {
-      browser,
-      logsCount: result.logs?.length || 0,
-      errorsCount: result.errors?.length || 0,
-    });
   }
 
   /**
@@ -344,13 +409,41 @@ export class ManualTestRunJobHandler {
         return;
       }
 
+      // ✅ FIX: Don't send notification for cancelled tests
+      if (test.status === 'cancelled') {
+        logger.debug(`[TEST-RUN] Skipping failure notification for cancelled test: ${testId}`);
+        return;
+      }
+
       const errorMessage = (error as Error).message || 'Unknown error occurred';
       logger.info(`[TEST-RUN] Sending failure notification for test: ${testId}`);
+
+      // Resolve recipient email (test.user_id is a UUID, not an email)
+      let recipient = DEFAULT_ADMIN_EMAIL;
+      if (test.user_id) {
+        try {
+          const user: any = await dbAdminService.getUser(test.user_id);
+          if (user?.email && typeof user.email === 'string') {
+            recipient = user.email;
+          } else {
+            logger.warn(`[TEST-RUN] User has no email, sending notification to default email: ${testId}`, {
+              userId: test.user_id,
+            });
+          }
+        } catch (userError) {
+          logger.warn(`[TEST-RUN] Failed to resolve user email, sending notification to default email: ${testId}`, {
+            userId: test.user_id,
+            error: userError instanceof Error ? userError.message : String(userError),
+          });
+        }
+      } else {
+        logger.warn(`[TEST-RUN] Test has no user_id, sending notification to default email: ${testId}`);
+      }
 
       // Send notification
       await QueueManager.addNotificationJob({
         type: 'email',
-        recipient: test.user_id || DEFAULT_ADMIN_EMAIL,
+        recipient,
         subject: `Test Failed: ${testId}`,
         message: `Test ${testId} failed with error: ${errorMessage}`,
         data: { testId, error: errorMessage },
@@ -434,25 +527,81 @@ export class ManualTestResultJobHandler {
    */
   static async updateOverallTestStatus(testId: string) {
     try {
-      // Get all results for this test
-      const results = await dbAdminService.getTestResults(testId) as any[];
-
-      if (results.length === 0) {
-        logger.debug(`[TEST-RESULT] No results found for test: ${testId}`);
+      // Get test details to check expected browsers
+      const test = await dbAdminService.getTest(testId) as any;
+      if (!test) {
+        logger.warn(`[TEST-RESULT] Test not found for status update: ${testId}`);
         return;
       }
 
-      // Determine overall test status
-      const hasFailed = results.some((r: any) => r.status === 'failed');
-      const allCompleted = results.every((r: any) => r.status === 'completed' || r.status === 'failed');
-
-      let status: 'running' | 'completed' | 'failed' = 'running';
-
-      if (allCompleted) {
-        status = hasFailed ? 'failed' : 'completed';
+      // Never override cancelled tests
+      if (test.status === 'cancelled') {
+        logger.info(`[TEST-RESULT] Skipping status update for cancelled test: ${testId}`);
+        return;
       }
 
-      logger.info(`[TEST-RESULT] Updating overall test status: ${testId} -> ${status}`);
+      // Get all results for this test
+      const results = await dbAdminService.getTestResults(testId) as any[];
+
+      // Filter out null/undefined results
+      const validResults = (results || []).filter((r: any) => r && r.status && r.browser);
+
+      if (validResults.length === 0) {
+        logger.debug(`[TEST-RESULT] No valid results found for test: ${testId}`);
+        return;
+      }
+
+      // Expected browsers from the test row
+      const expectedBrowsers: string[] = Array.isArray(test.browsers) ? test.browsers : [];
+      const expectedBrowsersCount = expectedBrowsers.length;
+
+      // Use latest result per browser (results are ordered desc by created_at)
+      const latestByBrowser = new Map<string, any>();
+      for (const r of validResults) {
+        if (!latestByBrowser.has(r.browser)) {
+          latestByBrowser.set(r.browser, r);
+        }
+      }
+
+      const hasAllResults =
+        expectedBrowsersCount > 0 &&
+        expectedBrowsers.every((b) => latestByBrowser.has(b));
+
+      const latestResults = Array.from(latestByBrowser.values());
+      // ✅ FIX #8: Include 'cancelled' in final results
+      const finalResults = latestResults.filter((r: any) =>
+        r.status === 'completed' || r.status === 'failed' || r.status === 'cancelled'
+      );
+
+      // Determine overall test status
+      // ✅ FIX #8: Priority: cancelled > failed > completed
+      const hasCancelled = finalResults.some((r: any) => r.status === 'cancelled');
+      const hasFailed = finalResults.some((r: any) => r.status === 'failed');
+      const allCompleted = hasAllResults && finalResults.length === expectedBrowsersCount;
+
+      let status: 'running' | 'completed' | 'failed' | 'cancelled' = 'running';
+
+      if (allCompleted) {
+        // ✅ FIX #8: Determine final status based on priority
+        if (hasCancelled) {
+          status = 'cancelled';
+        } else if (hasFailed) {
+          status = 'failed';
+        } else {
+          status = 'completed';
+        }
+      } else if (hasAllResults && finalResults.length < expectedBrowsersCount) {
+        // ✅ FIX: Some browsers are still running/pending
+        status = 'running';
+      }
+
+      logger.info(`[TEST-RESULT] Updating overall test status: ${testId} -> ${status}`, {
+        expectedBrowsers: expectedBrowsersCount,
+        actualResults: latestResults.length,
+        finalStatusResults: finalResults.length,
+        hasFailed,
+        allCompleted,
+      });
 
       // Update test status
       await dbAdminService.updateTest(testId, {
@@ -461,44 +610,18 @@ export class ManualTestResultJobHandler {
       });
 
       // Email notifications disabled - all data is available in DB via API
-      // if (allCompleted) {
-      //   await this.sendCompletionNotification(testId, status, results);
-      // }
+      // Real-time updates are sent via WebSocket events (emitTestBrowserCompleted, emitResultReady)
+      // Chat notifications are handled by TestCompletionHandlerService.handleTestCompletion()
 
     } catch (error) {
-      logger.error(`[TEST-RESULT] Failed to update test status for ${testId}:`, error);
-    }
-  }
-
-  /**
-   * Send completion notification
-   */
-  private static async sendCompletionNotification(
-    testId: string,
-    status: string,
-    results: any[]
-  ) {
-    try {
-      const test = await dbAdminService.getTest(testId) as any;
-      if (!test) {
-        logger.warn(`[TEST-RESULT] Test not found for completion notification: ${testId}`);
-        return;
-      }
-
-      const successCount = results.filter((r: any) => r.status === 'completed').length;
-      const totalCount = results.length;
-
-      logger.info(`[TEST-RESULT] Sending completion notification: ${testId} (${successCount}/${totalCount} successful)`);
-
-      await QueueManager.addNotificationJob({
-        type: 'email',
-        recipient: test.user_id || DEFAULT_ADMIN_EMAIL,
-        subject: `Test ${status}: ${testId}`,
-        message: `Test ${testId} ${status}. ${successCount}/${totalCount} browsers completed successfully.`,
-        data: { testId, status, results: results.length },
+      logger.error(`[TEST-RESULT] Failed to update test status for ${testId}:`, {
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
+        testId,
       });
-    } catch (error) {
-      logger.error(`[TEST-RESULT] Failed to send completion notification for test ${testId}:`, error);
     }
   }
 }

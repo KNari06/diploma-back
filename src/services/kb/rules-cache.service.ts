@@ -10,7 +10,7 @@
  * - Memory: ~14-20 MB for 2 languages
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { KBChunk, searchKB } from './kb.service';
 
 interface CachedRules {

@@ -1,0 +1,421 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    padding: 20px;
+    color: #333;
+}
+
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+    background: white;
+    border-radius: 20px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    overflow: hidden;
+}
+
+.header {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 40px;
+    text-align: center;
+}
+
+.header h1 {
+    font-size: 2.5em;
+    margin-bottom: 10px;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+}
+
+.header p {
+    font-size: 1.2em;
+    opacity: 0.9;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 20px;
+    padding: 30px;
+    background: #f8f9fa;
+}
+
+.stat-card {
+    background: white;
+    padding: 25px;
+    border-radius: 12px;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    text-align: center;
+    transition: transform 0.3s, box-shadow 0.3s;
+}
+
+.stat-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 8px 12px rgba(0,0,0,0.15);
+}
+
+.stat-card .number {
+    font-size: 2.5em;
+    font-weight: bold;
+    color: #667eea;
+    margin-bottom: 10px;
+}
+
+.stat-card .label {
+    color: #666;
+    font-size: 0.9em;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.content {
+    padding: 40px;
+}
+
+.search-section {
+    margin-bottom: 30px;
+}
+
+.search-box {
+    width: 100%;
+    padding: 15px;
+    border: 2px solid #e0e0e0;
+    border-radius: 8px;
+    font-size: 1em;
+    margin-bottom: 20px;
+}
+
+.search-box:focus {
+    outline: none;
+    border-color: #667eea;
+}
+
+.filters {
+    display: flex;
+    gap: 15px;
+    flex-wrap: wrap;
+}
+
+.filter-btn {
+    padding: 10px 20px;
+    border: 2px solid #667eea;
+    background: white;
+    color: #667eea;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.3s;
+    font-weight: 500;
+}
+
+.filter-btn:hover {
+    background: #667eea;
+    color: white;
+}
+
+.filter-btn.active {
+    background: #667eea;
+    color: white;
+}
+
+.features-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+    gap: 20px;
+}
+
+.feature-card {
+    background: white;
+    border: 2px solid #e0e0e0;
+    border-radius: 12px;
+    padding: 25px;
+    transition: all 0.3s;
+    cursor: pointer;
+    text-decoration: none;
+    color: inherit;
+    display: block;
+}
+
+.feature-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+    border-color: #667eea;
+}
+
+.feature-card.core {
+    border-color: #4caf50;
+    background: linear-gradient(135deg, #e8f5e9 0%, #ffffff 100%);
+}
+
+.feature-card.api {
+    border-color: #2196f3;
+    background: linear-gradient(135deg, #e1f5ff 0%, #ffffff 100%);
+}
+
+.feature-card.ai {
+    border-color: #ff9800;
+    background: linear-gradient(135deg, #fff4e1 0%, #ffffff 100%);
+}
+
+.feature-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 15px;
+}
+
+.feature-title {
+    font-size: 1.3em;
+    font-weight: bold;
+    color: #333;
+}
+
+.feature-badge {
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.8em;
+    font-weight: bold;
+    text-transform: uppercase;
+}
+
+.badge-core {
+    background: #4caf50;
+    color: white;
+}
+
+.badge-api {
+    background: #2196f3;
+    color: white;
+}
+
+.badge-ai {
+    background: #ff9800;
+    color: white;
+}
+
+.feature-description {
+    color: #666;
+    font-size: 0.95em;
+    line-height: 1.6;
+    margin-bottom: 15px;
+}
+
+.feature-meta {
+    display: flex;
+    gap: 15px;
+    font-size: 0.85em;
+    color: #999;
+}
+
+.feature-meta span {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+/* Interactive diagram styles */
+.diagram-node-clickable {
+    transition: opacity 0.2s, transform 0.2s;
+}
+
+.diagram-node-clickable:hover {
+    opacity: 0.8;
+    transform: scale(1.02);
+}
+
+.diagram-node-clickable rect,
+.diagram-node-clickable circle,
+.diagram-node-clickable polygon,
+.diagram-node-clickable ellipse,
+.diagram-node-clickable path {
+    pointer-events: all;
+    cursor: pointer;
+}
+
+/* Method tooltip modal */
+.method-tooltip-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10000;
+    animation: fadeIn 0.2s;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+.method-tooltip-content {
+    background: white;
+    border-radius: 12px;
+    max-width: 600px;
+    max-height: 80vh;
+    width: 90%;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    display: flex;
+    flex-direction: column;
+    animation: slideUp 0.3s;
+    overflow: hidden;
+}
+
+@keyframes slideUp {
+    from {
+        transform: translateY(20px);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+.method-tooltip-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px 25px;
+    border-bottom: 2px solid #e0e0e0;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+}
+
+.method-tooltip-header h3 {
+    margin: 0;
+    font-size: 1.3em;
+    font-family: 'Courier New', monospace;
+}
+
+.method-tooltip-close {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 2em;
+    cursor: pointer;
+    padding: 0;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: background 0.2s;
+}
+
+.method-tooltip-close:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.method-tooltip-body {
+    padding: 25px;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.method-tooltip-status {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-size: 0.85em;
+    font-weight: bold;
+    text-transform: uppercase;
+    margin-bottom: 20px;
+}
+
+.method-tooltip-section {
+    margin-bottom: 25px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid #e0e0e0;
+}
+
+.method-tooltip-section:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
+}
+
+.method-tooltip-section h4 {
+    margin: 0 0 12px 0;
+    color: #667eea;
+    font-size: 1em;
+    font-weight: 600;
+}
+
+.method-tooltip-section p {
+    margin: 0;
+    line-height: 1.6;
+    color: #666;
+}
+
+.method-tooltip-section ul {
+    margin: 10px 0 0 0;
+    padding-left: 20px;
+    color: #666;
+}
+
+.method-tooltip-section li {
+    margin-bottom: 8px;
+    line-height: 1.5;
+}
+
+.method-tooltip-section code {
+    background: #f5f5f5;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.9em;
+    color: #667eea;
+}
+
+.method-tooltip-section a {
+    color: #667eea;
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.method-tooltip-section a:hover {
+    text-decoration: underline;
+}
+
+@media (max-width: 768px) {
+    .header h1 {
+        font-size: 1.8em;
+    }
+
+    .features-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .stats-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .method-tooltip-content {
+        width: 95%;
+        max-height: 90vh;
+    }
+
+    .method-tooltip-header {
+        padding: 15px 20px;
+    }
+
+    .method-tooltip-body {
+        padding: 20px;
+    }
+}

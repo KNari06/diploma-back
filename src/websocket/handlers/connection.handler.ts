@@ -3,15 +3,15 @@
  * Handles WebSocket connection lifecycle
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Socket } from 'socket.io';
-import { getUserId } from '../middleware';
+import { getUserId } from '../middleware/middleware';
 import {
   AuthenticatedPayload,
   ClientToServerEvents,
   ServerToClientEvents,
   SocketData,
-} from '../types';
+} from '../types/types';
 import { handleHeartbeat } from './heartbeat.handler';
 import { handleSubscriptions } from './subscription.handler';
 

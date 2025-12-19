@@ -1,7 +1,7 @@
-import { env } from '@/config/env';
+import { env } from '@/config/environment/env';
 import { AISummary, BugReport, TestResult } from '@/types';
-import { handleAIError } from '@/utils/error-handler';
-import { logAIAnalysis, logger } from '@/utils/logger';
+import { handleAIError } from '@/utils/core/error-handler';
+import { logAIAnalysis, logger } from '@/utils/core/logger';
 import OpenAI from 'openai';
 
 // Constants

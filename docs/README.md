@@ -28,6 +28,7 @@
 - [**Playwright API**](./api/playwright.md) - загрузка trace файлов
 - [**Real-Time Graph Visualization**](./api/real-time-graph-visualization.md) - ✨ NEW! Потоковая визуализация тестов в режиме реального времени
 - [**Frontend Graph Integration Guide**](./api/FRONTEND_GRAPH_INTEGRATION_GUIDE.md) - 📱 NEW! Гайд для фронтенда по интеграции графов
+- [**Frontend Latest Changes**](./api/frontend-latest-changes.md) - ✨ NEW! Последние изменения для фронтенда
 - [**Feedback API**](./api/feedback-api-examples.md) - система like/dislike для улучшения AI
 - [**Feedback Analytics**](./api/feedback-analytics-guide.md) - аналитика и insights для мониторинга качества AI
 - [**Intelligent API Fuzzing**](./api/INTELLIGENT_API_FUZZING_IMPLEMENTATION.md) - автоматическое security testing API
@@ -38,10 +39,12 @@
 - [**Руководство разработчика**](./development/README.md) - как разрабатывать
 - [**Стандарты кодирования**](./development/coding-standards.md) - правила написания кода
 - [**🤖 Intent Parsing Guide**](./development/INTENT_PARSING_GUIDE.md) - ✨ Context-First AI подход и трекинг изменений
+- [**❓ Needs Clarification Flow**](./development/needs-clarification-flow.md) - ✨ NEW! Как система спрашивает уточнения при низком confidence
 - [**🔍 Playwright Logging Improvements**](./development/PLAYWRIGHT_LOGGING_IMPROVEMENTS.md) - Детальное логирование всего testing flow
 - [**⚡ Intelligent Mode Optimization**](./development/INTELLIGENT_MODE_OPTIMIZATION.md) - Network & data collection оптимизация
 - [**🔌 WebSocket Worker Bridge Plan**](./development/WEBSOCKET_WORKER_BRIDGE_PLAN.md) - План передачи этапов тестирования через WebSocket из Worker
 - [**✅ WebSocket Redis Bridge Implementation**](./development/WEBSOCKET_REDIS_BRIDGE_IMPLEMENTATION.md) - Реализация Redis Pub/Sub для WebSocket событий
+- [**🧪 Testing Flow Audit (last 10 days)**](./development/TESTING_FLOW_AUDIT_LAST_10_DAYS.md) - живой список рисков/проблем по end-to-end тест флоу
 - [**Auth Implementation**](./development/auth-implementation.md) - технические детали аутентификации
 - [**Auth Validation**](./development/auth-validation.md) - отчет проверки auth файлов
 - [**Anonymous User Migration**](./development/anonymous-user-migration.md) - миграция анонимных пользователей

@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { WorkspaceCreateRequest } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
 // UUID validation regex

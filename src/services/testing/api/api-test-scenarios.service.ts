@@ -1,5 +1,5 @@
 import { ApiTestRequest, ApiTestResponse } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { executeApiTest } from './apiTest.service';
 
 /**

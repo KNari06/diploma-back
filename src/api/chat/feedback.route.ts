@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '@/middleware/auth.middleware';
-import { asyncHandler } from '@/utils/error-handler';
+import { asyncHandler } from '@/utils/core/error-handler';
 import { z } from 'zod';
 import {
   createFeedback,

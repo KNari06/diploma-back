@@ -1,12 +1,32 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { TestPlan } from '@/services/testing/plans/test-plan-generator.service';
 import { FinalTestReport, PlaywrightCommand, TestResult } from '@/types';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Service for generating comprehensive test reports with code, artifacts, and analysis
  */
 export class TestReportGeneratorService {
+  /**
+   * Ownership-aware report retrieval (safe helper for API layers)
+   * Returns null if test does not exist OR does not belong to user (prevents enumeration).
+   */
+  static async getReportByTestIdForUser(testId: string, userId: string): Promise<FinalTestReport | null> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('tests')
+        .select('id')
+        .eq('id', testId)
+        .eq('user_id', userId)
+        .single();
+
+      if (error || !data) return null;
+      return await this.getReportByTestId(testId);
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Generate final test report with all artifacts and generated code
    */

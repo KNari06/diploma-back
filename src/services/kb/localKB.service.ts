@@ -1,5 +1,5 @@
-import { logger } from '@/utils/logger';
-import { cosineSimilarity } from '@/utils/vector';
+import { logger } from '@/utils/core/logger';
+import { cosineSimilarity } from '@/utils/text-processing/vector';
 import fs from 'fs/promises';
 import path from 'path';
 

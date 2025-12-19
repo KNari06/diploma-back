@@ -3,14 +3,14 @@
  * Handles ping/pong for connection health checks
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { Socket } from 'socket.io';
-import { getUserId } from '../middleware';
+import { getUserId } from '../middleware/middleware';
 import {
     ClientToServerEvents,
     ServerToClientEvents,
     SocketData,
-} from '../types';
+} from '../types/types';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 

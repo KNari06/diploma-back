@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 
 /**
  * Service to manage test-chat session mappings
@@ -76,6 +76,28 @@ export class TestChatMappingService {
       return data?.map((row) => row.chat_session_id) || [];
     } catch (error) {
       logger.error('[TEST_CHAT_MAPPING] Unexpected error getting sessions', { error, testId });
+      return [];
+    }
+  }
+
+  /**
+   * Get test IDs associated with a chat session
+   */
+  static async getTestIdsForChatSession(chatSessionId: string): Promise<string[]> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('test_chat_mappings')
+        .select('test_id')
+        .eq('chat_session_id', chatSessionId);
+
+      if (error) {
+        logger.error('[TEST_CHAT_MAPPING] Failed to get test IDs', { error, chatSessionId });
+        return [];
+      }
+
+      return data?.map((row) => row.test_id) || [];
+    } catch (error) {
+      logger.error('[TEST_CHAT_MAPPING] Unexpected error getting test IDs', { error, chatSessionId });
       return [];
     }
   }

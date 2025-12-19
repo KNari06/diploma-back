@@ -3,7 +3,7 @@
  * Intent-based adaptive selector resolution with self-healing
  */
 
-import { logger } from '@/utils/logger';
+import { logger } from '@/utils/core/logger';
 import { IntentParserService } from './intent-parser.service';
 import { SelectorCacheService } from './selector-cache.service';
 import type {

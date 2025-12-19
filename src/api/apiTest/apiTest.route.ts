@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { runApiTest, getApiTests, getApiTestById, getApiTestsByProject } from './apiTest.controller';
-import { asyncHandler, handleValidationError } from '@/utils/error-handler';
+import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
 import { requireAuth } from '@/middleware/auth.middleware';
 
 const router = Router();

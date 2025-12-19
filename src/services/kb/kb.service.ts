@@ -1,8 +1,8 @@
 import { supabase } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
-import { chunkMarkdown, chunkText } from '@/utils/chunking';
-import { getFileSizeMB, isValidFileType, parseFile } from '@/utils/fileParser';
-import { logger } from '@/utils/logger';
+import { chunkMarkdown, chunkText } from '@/utils/text-processing/chunking';
+import { getFileSizeMB, isValidFileType, parseFile } from '@/utils/parsing/fileParser';
+import { logger } from '@/utils/core/logger';
 import { promises as fs } from 'fs';
 import { generateEmbedding, generateEmbeddings } from '../ai/embedding.service';
 import { searchLocalGlobalKB } from './localKB.service';
@@ -358,7 +358,7 @@ RETURN ONLY: ru, en, or neutral`;
         },
       ],
       {
-        model: 'gpt-3.5-turbo',
+        model: 'gpt-4o-mini',
         temperature: 0.1, // Very low for consistent results
         max_tokens: 10, // Just need 1-2 tokens
       }

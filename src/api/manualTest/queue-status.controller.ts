@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
-import { logger } from '@/utils/logger';
-import { QueueMonitor } from '@/utils/queue-monitor';
+import { logger } from '@/utils/core/logger';
+import { QueueMonitor } from '@/utils/monitoring/queue-monitor';
 
 /**
  * GET /api/v1/queue/status
