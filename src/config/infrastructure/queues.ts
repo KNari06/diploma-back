@@ -18,6 +18,7 @@ if (!env.REDIS_HOST || !env.REDIS_PORT) {
 
 // Redis connection configuration
 const redisConnection = new IORedis(env.REDIS_URL, {
+  password: env.REDIS_PASSWORD || undefined,
   maxRetriesPerRequest: 3,
   enableReadyCheck: false,
   connectTimeout: 10000, // 10 seconds
