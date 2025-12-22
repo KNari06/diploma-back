@@ -61,6 +61,9 @@ CRITICAL: You MUST return a valid JSON object matching EXACTLY this structure. N
 REQUIRED JSON STRUCTURE:
 {
   "pageType": "string (REQUIRED)",
+  "primaryIntent": "string (REQUIRED)",
+  "mainAction": "string | null (REQUIRED)",
+  "requiresUserInput": true | false (REQUIRED),
   "description": "string (REQUIRED)",
   "elements": [array (REQUIRED, can be empty [])],
   "suggestions": [array (REQUIRED, can be empty [])],
@@ -78,11 +81,20 @@ DETAILED FIELD SPECIFICATIONS:
    - Use "payment" if you see credit card fields, billing address, CVV, expiry date, or payment processor logos (Stripe, PayPal)
    - Use "unknown" with descriptive text if this is an onboarding/welcome/tutorial page (e.g., "Welcome screen with Skip and Get Started buttons")
 
-2. **description** (REQUIRED, string):
+2. **primaryIntent** (REQUIRED, string):
+   See INTENT DETECTION RULES below.
+
+3. **mainAction** (REQUIRED, string | null):
+   See INTENT DETECTION RULES below.
+
+4. **requiresUserInput** (REQUIRED, boolean):
+   See INTENT DETECTION RULES below.
+
+5. **description** (REQUIRED, string):
    Brief description of the page (2-3 sentences)
    Example: "Login page with email and password fields, and a 'Sign in' button"
 
-3. **elements** (REQUIRED, array of objects, can be empty []):
+6. **elements** (REQUIRED, array of objects, can be empty []):
    Each element object MUST have ALL these fields:
    {
      "type": "button" | "input" | "select" | "link" | "form" | "modal" | "other" (REQUIRED),
@@ -122,11 +134,11 @@ DETAILED FIELD SPECIFICATIONS:
      "isCTA": true
    }
 
-4. **suggestions** (REQUIRED, array of strings, can be empty []):
+7. **suggestions** (REQUIRED, array of strings, can be empty []):
    Array of test suggestions
    Example: ["Test search functionality", "Verify add to cart button"]
 
-5. **warnings** (REQUIRED, array of strings, use [] if none):
+8. **warnings** (REQUIRED, array of strings, use [] if none):
    Flag dangerous actions or blockers
    Example: ["Payment form detected - requires manual approval", "CAPTCHA present"]
 
@@ -137,7 +149,7 @@ DETAILED FIELD SPECIFICATIONS:
    - "Paywall detected" - if content is blocked behind payment/subscription
    - "Login required" - if page shows "Please login to continue" or similar
 
-6. **modals** (REQUIRED, array of objects, use [] if none):
+9. **modals** (REQUIRED, array of objects, use [] if none):
    Each modal object MUST have ALL these fields:
    {
      "type": "cookie_banner" | "newsletter" | "popup" | "welcome" | "other" (REQUIRED),
@@ -154,9 +166,65 @@ DETAILED FIELD SPECIFICATIONS:
      "closeButtonText": "Accept"
    }
 
+INTENT DETECTION RULES:
+
+**primaryIntent** (REQUIRED):
+Describes WHY this page exists (the business purpose), NOT what elements are shown.
+Think: "What is the user trying to accomplish by visiting this page?"
+
+Choose exactly ONE from:
+- "authenticate_user" - Login, sign in, password reset pages
+- "onboard_user" - Welcome screens, tutorials, getting started flows
+- "purchase" - Product pages, cart, checkout, payment pages
+- "browse" - Homepage, category pages, search results, product listings
+- "configure" - Settings, preferences, customization pages
+- "manage_account" - Profile, account settings, subscription management
+- "support" - Help pages, FAQ, contact forms, documentation
+- "unknown" - If purpose is unclear or doesn't fit above categories
+
+Examples:
+- Login page → "authenticate_user" (WHY: user wants to sign in)
+- Product listing → "browse" (WHY: user wants to explore products)
+- Checkout page → "purchase" (WHY: user wants to buy)
+- Settings page → "configure" (WHY: user wants to change settings)
+- Welcome screen → "onboard_user" (WHY: user is being introduced to the app)
+
+**mainAction** (REQUIRED, string | null):
+The single most important user action on this page - what button/action moves the user forward in their goal.
+- Must be a short verb phrase (max 3 words)
+- Examples: "Login", "Register", "Add to Cart", "Continue", "Pay", "Save", "Search", "Skip"
+- If page has multiple actions but none is clearly primary → return null
+- If page is purely informational (no action needed) → return null
+
+Examples:
+- Login page with "Sign In" button → "Login"
+- Product page with "Add to Cart" button → "Add to Cart"
+- Checkout page with "Pay Now" button → "Pay"
+- Onboarding page with "Skip" and "Next" buttons → "Skip" or "Next" (choose most prominent)
+- Homepage with search bar → "Search"
+- Info page with no clear action → null
+
+**requiresUserInput** (REQUIRED, boolean):
+Indicates if user MUST enter data (typing, selecting, checking) to proceed with main action.
+
+- true = User must type/select/check something (forms, inputs, dropdowns, checkboxes)
+- false = User can proceed by clicking/navigating only (no data entry needed)
+
+Examples:
+- Login page (email + password fields) → true
+- Product page (just "Add to Cart" button, no size/color selection) → false
+- Product page (must select size/color before adding to cart) → true
+- Checkout page (billing form) → true
+- Homepage (just navigation links) → false
+- Search results page (just click links) → false
+- Settings page (must fill form to save) → true
+
 VALIDATION RULES (MUST FOLLOW):
 - ALL fields must be present in JSON (even if empty arrays)
 - "pageType" must be exactly one of the allowed string values
+- "primaryIntent" must be exactly one of the allowed enum values
+- "mainAction" must be null or a short verb phrase (max 3 words)
+- "requiresUserInput" must be boolean true/false
 - "elements" array items must have 5 required fields (type, purpose, text, required, priority) + optional "isCTA" field
 - "modals" array items must have ALL 4 required fields (type, description, hasCloseButton, closeButtonText)
 - Use boolean true/false (NOT strings "true"/"false")
@@ -170,6 +238,9 @@ VALIDATION RULES (MUST FOLLOW):
 EXAMPLE COMPLETE VALID RESPONSE:
 {
   "pageType": "login",
+  "primaryIntent": "authenticate_user",
+  "mainAction": "Login",
+  "requiresUserInput": true,
   "description": "Login page with email input, password input, and Sign In button. Also has 'Forgot password?' link.",
   "elements": [
     {
