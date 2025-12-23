@@ -187,6 +187,10 @@ const options: swaggerJsdoc.Options = {
         name: 'User',
         description: 'Управление профилем пользователя, кредитами и планами (требует auth)',
       },
+      {
+        name: 'Waitlist',
+        description: 'Регистрация в waitlist для раннего доступа (публичный endpoint, не требует auth)',
+      },
     ],
   },
   apis: [

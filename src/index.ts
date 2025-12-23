@@ -15,6 +15,7 @@ import projectRoutes from '@/api/project/project.routes';
 import reportsRoutes from '@/api/reports/reports.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
+import waitlistRoutes from '@/api/waitlist/waitlist.route';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
 import { env, isDevelopment } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
@@ -364,6 +365,7 @@ app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, reportsRoutes); // ✅ NEW: Test reports & Jira integration
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
+app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications
 app.use(`/api/${env.API_VERSION}/queue`, queueStatusRoutes); // Queue monitoring
 

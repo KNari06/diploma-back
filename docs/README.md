@@ -33,6 +33,7 @@
 - [**Feedback Analytics**](./api/feedback-analytics-guide.md) - аналитика и insights для мониторинга качества AI
 - [**Intelligent API Fuzzing**](./api/INTELLIGENT_API_FUZZING_IMPLEMENTATION.md) - автоматическое security testing API
 - [**Enhanced Fuzzing Details**](./api/ENHANCED_FUZZING_DETAILS.md) - детальная информация о failed tests
+- [**Waitlist API**](./api/waitlist-api.md) - регистрация в waitlist для раннего доступа
 
 ### 💻 Разработка
 
