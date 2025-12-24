@@ -93,6 +93,10 @@ export class IntelligentTestOrchestrator {
   // Track selector failures to prevent infinite loops when selectors repeatedly fail
   private selectorFailures = new Map<string, number>(); // selector -> failure count
 
+  // ✅ FIX: Track sent graph entities to prevent duplicates
+  private graphSentNodeIds = new Set<string>();
+  private graphSentEdgeIds = new Set<string>();
+
   private async buildCancelledResult(): Promise<IntelligentTestResult> {
     const result = await this.buildResult(false);
     result.cancelled = true; // ✅ FIX #7: Mark result as cancelled
@@ -304,6 +308,10 @@ export class IntelligentTestOrchestrator {
 
     // Initialize graph builder for real-time test visualization
     this.graphBuilder = new GraphBuilder();
+
+    // ✅ FIX: Clear graph tracking sets for new test to prevent false duplicates
+    this.graphSentNodeIds.clear();
+    this.graphSentEdgeIds.clear();
 
     logger.info('[INTELLIGENT_ORCHESTRATOR] Starting intelligent test', {
       goal: this.config.goal,
@@ -3819,27 +3827,80 @@ export class IntelligentTestOrchestrator {
       return;
     }
 
-    // Validate that update has at least one data field
-    const hasIncrementalData = update.newNode || update.newEdge || update.updatedNode;
-    const hasFullData = update.fullGraph;
+    // ✅ FIX: Strict graph update handling to prevent duplicates and syncing issues
+    let normalized = { ...update };
+
+    // 1. If type is 'full', send ONLY fullGraph to prevent duplicate processing on frontend
+    if (update.type === 'full') {
+      if (update.fullGraph) {
+        normalized = {
+          type: 'full',
+          fullGraph: update.fullGraph,
+          // Explicitly remove incremental data to avoid confusion/duplication
+          newNode: undefined,
+          newEdge: undefined,
+          updatedNode: undefined,
+        };
+
+        // Sync sent sets with full graph to prevent re-sending existing nodes if we switch back to incremental
+        // ✅ FIX: Use normalized.fullGraph instead of update.fullGraph for consistency
+        if (normalized.fullGraph?.nodes) {
+          normalized.fullGraph.nodes.forEach(n => {
+            if (n?.id) {
+              this.graphSentNodeIds.add(n.id);
+            }
+          });
+        }
+        if (normalized.fullGraph?.edges) {
+          normalized.fullGraph.edges.forEach(e => {
+            if (e?.id) {
+              this.graphSentEdgeIds.add(e.id);
+            }
+          });
+        }
+      }
+    } else {
+      // 2. If type is 'incremental', perform deduplication
+
+      // Check newNode duplication
+      if (normalized.newNode?.id) {
+        if (this.graphSentNodeIds.has(normalized.newNode.id)) {
+          // Check if it's really the same node (prevent false positives if IDs are reused erroneously, though they shouldn't be)
+          // For safety, we assume ID uniqueness is strict.
+          normalized.newNode = undefined;
+        } else {
+          this.graphSentNodeIds.add(normalized.newNode.id);
+        }
+      }
+
+      // Check newEdge duplication
+      if (normalized.newEdge?.id) {
+        if (this.graphSentEdgeIds.has(normalized.newEdge.id)) {
+          normalized.newEdge = undefined;
+        } else {
+          this.graphSentEdgeIds.add(normalized.newEdge.id);
+        }
+      }
+    }
+
+    // Validate that update has at least one data field after normalization
+    const hasIncrementalData = normalized.newNode || normalized.newEdge || normalized.updatedNode;
+    const hasFullData = normalized.fullGraph;
 
     if (!hasIncrementalData && !hasFullData) {
-      logger.warn('[INTELLIGENT_ORCHESTRATOR] Graph update missing data', {
-        testId: this.testId,
-        type: update.type,
-      });
+      // Silent return if everything was filtered out (duplicate or empty)
       return;
     }
 
     try {
       const payload = {
         testId: this.testId,
-        type: update.type,
+        type: normalized.type,
         data: {
-          newNode: update.newNode,
-          newEdge: update.newEdge,
-          updatedNode: update.updatedNode,
-          fullGraph: update.fullGraph,
+          newNode: normalized.newNode,
+          newEdge: normalized.newEdge,
+          updatedNode: normalized.updatedNode,
+          fullGraph: normalized.fullGraph,
         },
         timestamp: new Date().toISOString(),
       };

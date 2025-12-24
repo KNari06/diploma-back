@@ -385,7 +385,6 @@ ONLY ask questions that are NOT already covered above.
 Examples of good ADDITIONAL questions:
 - "What should happen after successful registration?" (for registration tests)
 - "Are there any specific validation rules we should test?" (for form tests)
-- "Which browser should we prioritize?" (if multi-browser testing)
 
 Return ONLY a JSON array of questions in this format:
 [
