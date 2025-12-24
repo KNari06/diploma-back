@@ -7,8 +7,8 @@ import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
 import { logger } from '@/utils/core/logger';
-import { ChatTestUpdatePayload } from '@/websocket/types/types';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import { ChatTestUpdatePayload } from '@/websocket/types/types';
 import { Response } from 'express';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 
@@ -334,7 +334,7 @@ export async function executeUiTestFlow(
       ? `\n\n🤖 **Mode:** Intelligent/Adaptive Testing\n📊 **Estimated:** ${planEstimatedPages}`
       : '';
 
-    const successMessage = `✅ Test plan approved and running!${testModeInfo}\n\nTest ID: ${actualTestId}\n\nCheck status: GET /api/v1/manual-test/${actualTestId}/status`;
+    const successMessage = `✅ Test plan approved and running!${testModeInfo}\n`;
 
     // ✅ FIX: Test is considered "runned" if it was successfully created and added to queue
     const isTestRunned = !!actualTestId;
