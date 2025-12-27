@@ -4,7 +4,7 @@
 README.md
 SECURITY_FIX_REQUIRED.md
 *.md
-docs/
+# docs/ - commented out, we need docs/INTELLIGENT_MODE_ARCHITECTURE.html in the image
 
 
 
