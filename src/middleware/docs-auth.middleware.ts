@@ -63,15 +63,46 @@ export const requireDocsAuth = (
     return next();
   }
 
+  // Check if authenticated via cookie (parse manually if cookie-parser not available)
+  const cookies = req.headers.cookie || '';
+  // Parse cookies manually
+  const cookieMatch = cookies.match(/docs_authenticated=([^;]+)/);
+  if (cookieMatch && cookieMatch[1] === 'true') {
+    logger.debug('[DOCS_AUTH] Authenticated via cookie', { ip: req.ip });
+    return next();
+  }
+
   // Check for password in query or body (for API access)
   const providedPassword = req.query.password as string || req.body.password;
   const correctPassword = getDocsPassword();
 
-  if (providedPassword && providedPassword === correctPassword) {
+  // Trim passwords to handle whitespace issues
+  const trimmedProvidedPassword = providedPassword?.trim();
+  const trimmedCorrectPassword = correctPassword.trim();
+
+  // Debug logging for password comparison (only in development)
+  if (process.env.NODE_ENV === 'development' && trimmedProvidedPassword) {
+    logger.debug('[DOCS_AUTH] Password comparison', {
+      providedLength: trimmedProvidedPassword.length,
+      correctLength: trimmedCorrectPassword.length,
+      match: trimmedProvidedPassword === trimmedCorrectPassword,
+      providedBytes: Buffer.from(trimmedProvidedPassword).toString('hex'),
+      correctBytes: Buffer.from(trimmedCorrectPassword).toString('hex'),
+    });
+  }
+
+  if (trimmedProvidedPassword && trimmedProvidedPassword === trimmedCorrectPassword) {
     // Set session (if session middleware is configured)
     if ((req as any).session) {
       (req as any).session.docsAuthenticated = true;
     }
+    // Also set cookie for authentication (works even without session middleware)
+    res.cookie('docs_authenticated', 'true', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    });
     return next();
   }
 
@@ -235,15 +266,14 @@ export const docsLogin = (req: Request, res: Response): void => {
   const { password, redirect } = req.body;
   const correctPassword = getDocsPassword();
 
-  // Debug logging (only in development)
-  if (process.env.NODE_ENV === 'development') {
-    logger.debug('[DOCS_AUTH] Login attempt', {
-      hasPassword: !!password,
-      passwordLength: password?.length,
-      correctPasswordLength: correctPassword.length,
-      redirect,
-    });
-  }
+  // Log login attempt (always log for debugging)
+  logger.info('[DOCS_AUTH] Login attempt', {
+    hasPassword: !!password,
+    passwordLength: password?.length,
+    correctPasswordLength: correctPassword.length,
+    redirect,
+    nodeEnv: process.env.NODE_ENV,
+  });
 
   // Validate redirect path to prevent open redirect attacks
   const rawRedirectPath = redirect || '/api/features';
@@ -265,11 +295,29 @@ export const docsLogin = (req: Request, res: Response): void => {
   const trimmedPassword = password.trim();
   const trimmedCorrectPassword = correctPassword.trim();
 
+  // Log password comparison for debugging
+  logger.info('[DOCS_AUTH] Password comparison', {
+    providedLength: trimmedPassword.length,
+    correctLength: trimmedCorrectPassword.length,
+    match: trimmedPassword === trimmedCorrectPassword,
+  });
+
   if (trimmedPassword === trimmedCorrectPassword) {
     // Set session (if session middleware is configured)
     if ((req as any).session) {
       (req as any).session.docsAuthenticated = true;
     }
+
+    // Set cookie for authentication (manually set header since cookie-parser not available)
+    const cookieOptions = [
+      'docs_authenticated=true',
+      'HttpOnly',
+      process.env.NODE_ENV === 'production' ? 'Secure' : '',
+      'SameSite=Lax',
+      `Max-Age=${24 * 60 * 60}`, // 24 hours
+      'Path=/',
+    ].filter(Boolean).join('; ');
+    res.setHeader('Set-Cookie', cookieOptions);
 
     logger.info('[DOCS_AUTH] Documentation access granted', {
       ip: req.ip,
@@ -278,7 +326,11 @@ export const docsLogin = (req: Request, res: Response): void => {
     });
 
     // Redirect to requested documentation (validated)
-    res.redirect(redirectPath);
+    // Add password to query for immediate access (cookie will work on next request)
+    const redirectUrl = redirectPath.includes('?')
+      ? `${redirectPath}&password=${encodeURIComponent(trimmedCorrectPassword)}`
+      : `${redirectPath}?password=${encodeURIComponent(trimmedCorrectPassword)}`;
+    res.redirect(redirectUrl);
   } else {
     logger.warn('[DOCS_AUTH] Invalid password attempt', {
       ip: req.ip,
