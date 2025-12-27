@@ -228,25 +228,39 @@ app.get('/api/features', requireDocsAuth, (req: express.Request, res: express.Re
 
 // Architecture documentation (password protected)
 const getArchitectureDocPath = () => {
+  // Use same logic as getDocsPath for consistency
   const isProduction = process.env.NODE_ENV === 'production';
   if (isProduction) {
+    // In production: dist/ -> root -> docs/INTELLIGENT_MODE_ARCHITECTURE.html
     return path.join(__dirname, '../../docs/INTELLIGENT_MODE_ARCHITECTURE.html');
   } else {
+    // In development: use process.cwd() (works with both compiled and ts-node/tsx)
     return path.join(process.cwd(), 'docs/INTELLIGENT_MODE_ARCHITECTURE.html');
   }
 };
 
 app.get('/api/architecture', requireDocsAuth, (req: express.Request, res: express.Response) => {
   const architecturePath = getArchitectureDocPath();
+
+  logger.debug('[SERVER] Serving architecture documentation', {
+    path: architecturePath,
+    cwd: process.cwd(),
+    __dirname: __dirname,
+    nodeEnv: process.env.NODE_ENV,
+  });
+
   res.sendFile(architecturePath, (err) => {
     if (err) {
       logger.error('[SERVER] Failed to serve architecture documentation', {
         error: err.message,
         path: architecturePath,
+        cwd: process.cwd(),
+        __dirname: __dirname,
       });
       res.status(404).json({
         success: false,
         error: 'Architecture documentation not found',
+        path: architecturePath,
       });
     }
   });
