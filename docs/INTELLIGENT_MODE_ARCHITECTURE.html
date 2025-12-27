@@ -272,7 +272,8 @@
                     <li><a href="#files">2. Файлы и их роли</a></li>
                     <li><a href="#flow">3. Полный Flow тестирования</a></li>
                     <li><a href="#ai-models">4. AI модели и стоимость</a></li>
-                    <li><a href="#config">5. Конфигурация</a></li>
+                    <li><a href="#improvements">5. Недавние улучшения</a></li>
+                    <li><a href="#config">6. Конфигурация</a></li>
                 </ul>
             </div>
 
@@ -305,8 +306,16 @@
 
                 <h3>Основной цикл работы:</h3>
                 <div class="code-block">
-<code>analyze → understand → generate → execute → validate → decide → repeat</code>
+<code>analyze → understand → generate → pre-check → execute → post-check → validate → decide → repeat</code>
                 </div>
+                <p><strong>Улучшения:</strong></p>
+                <ul>
+                    <li>✅ <strong>MainLoopService</strong> — выделен отдельный сервис для цикла</li>
+                    <li>✅ <strong>Logic Analysis</strong> — новый этап понимания логики страницы</li>
+                    <li>✅ <strong>Error Collection</strong> — сбор ошибок на всех этапах</li>
+                    <li>✅ <strong>Cancellation Support</strong> — поддержка отмены теста</li>
+                    <li>✅ <strong>Pattern Detection</strong> — обнаружение проблемных паттернов</li>
+                </ul>
             </section>
 
             <section id="files">
@@ -319,10 +328,35 @@
                     <h4>Ключевые методы:</h4>
                     <ul>
                         <li><code>execute()</code> — запуск теста</li>
-                        <li><code>mainLoop()</code> — основной цикл тестирования</li>
-                        <li><code>analyzeCurrentPage()</code> — анализ текущей страницы</li>
-                        <li><code>generateAndExecuteActions()</code> — генерация и выполнение действий</li>
-                        <li><code>makeDecision()</code> — решение о продолжении/остановке</li>
+                        <li><code>abort()</code> — отмена выполнения теста</li>
+                        <li>Использует <code>MainLoopService</code> для основного цикла</li>
+                    </ul>
+                    <h4>Новые возможности:</h4>
+                    <ul>
+                        <li>✅ Поддержка отмены теста (cancellation)</li>
+                        <li>✅ Error Collector для сбора ошибок (console, network, UI)</li>
+                        <li>✅ Graph Builder для визуализации теста</li>
+                        <li>✅ Cost Manager для контроля бюджета</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>1.5. MainLoopService</h3>
+                    <p><strong>Файл:</strong> <code>main-loop.service.ts</code></p>
+                    <p><strong>Роль:</strong> Основной цикл тестирования (выделен из Orchestrator)</p>
+                    <h4>Ключевые методы:</h4>
+                    <ul>
+                        <li><code>execute()</code> — выполнение основного цикла</li>
+                        <li><code>handleDecision()</code> — обработка решений (continue/stop/retry/skip/wait_for_user)</li>
+                        <li><code>handleSkipNavigation()</code> — навигация при skip</li>
+                    </ul>
+                    <h4>Логика цикла:</h4>
+                    <ul>
+                        <li>Проверка отмены перед каждой итерацией</li>
+                        <li>Проверка лимитов (pages, duration, errors)</li>
+                        <li>Обнаружение пустых страниц (consecutive empty pages)</li>
+                        <li>Обнаружение циклов (URL-based cycle detection)</li>
+                        <li>Обнаружение проблемных паттернов (ActionPatternDetector)</li>
                     </ul>
                 </div>
 
@@ -373,6 +407,17 @@
                         <li>Доступные элементы (кнопки, формы, ссылки)</li>
                         <li>Модальные окна (cookie banners, popups)</li>
                         <li>Состояние SPA (ждёт полную загрузку)</li>
+                        <li>✅ <strong>Logic Analysis</strong> (GPT-4o-mini) — определяет requiredActions, possibleActions, skipHints, navigationActions</li>
+                        <li>✅ <strong>AI Selector Enhancement</strong> — улучшает DOM селекторы с помощью AI Selector Engine</li>
+                        <li>✅ <strong>Error Signals</strong> — собирает ошибки консоли, сети, UI</li>
+                    </ul>
+                    <h4>Новые поля в PageContext:</h4>
+                    <ul>
+                        <li><code>requiredActions</code> — действия, обязательные перед основными</li>
+                        <li><code>possibleActions</code> — все возможные действия</li>
+                        <li><code>skipHints</code> — подсказки о том, когда/как пропустить страницу</li>
+                        <li><code>navigationActions</code> — предложенные действия навигации</li>
+                        <li><code>errorSignals</code> — собранные ошибки (console, network, UI)</li>
                     </ul>
                 </div>
 
@@ -400,8 +445,16 @@
 
                     <h4>AI модели:</h4>
                     <ul>
-                        <li><span class="badge badge-info">gpt-4o-mini</span> — быстрая генерация (по умолчанию)</li>
-                        <li><span class="badge badge-success">gpt-4o</span> — точная генерация (для сложных случаев)</li>
+                        <li><span class="badge badge-success">gpt-4o</span> — генерация действий (по умолчанию)</li>
+                        <li><span class="badge badge-info">gpt-4o-mini</span> — fallback при ограничении бюджета</li>
+                    </ul>
+                    <h4>Новые возможности:</h4>
+                    <ul>
+                        <li>✅ <strong>PII Masking</strong> — маскирование персональных данных в HTML перед отправкой в AI</li>
+                        <li>✅ <strong>Robust JSON Parsing</strong> — извлечение JSON из ответов AI с fallback стратегиями</li>
+                        <li>✅ <strong>Action Sanitization</strong> — валидация и очистка действий перед выполнением</li>
+                        <li>✅ <strong>Empty Page Detection</strong> — раннее обнаружение пустых страниц</li>
+                        <li>✅ <strong>Cycle Detection</strong> — обнаружение циклов перед генерацией</li>
                     </ul>
                 </div>
 
@@ -585,14 +638,57 @@ const result = await getSmartLocator(page, selector, actionType, intent);
                 </div>
 
                 <div class="component-card">
-                    <h3>7-12. Дополнительные компоненты</h3>
+                    <h3>7. PreActionAnalyzer</h3>
+                    <p><strong>Файл:</strong> <code>pre-action-analyzer.ts</code></p>
+                    <p><strong>Роль:</strong> Анализ ПЕРЕД выполнением действия</p>
+                    <h4>Проверяет:</h4>
                     <ul>
-                        <li><strong>PreActionAnalyzer</strong> — анализ ПЕРЕД выполнением действия</li>
-                        <li><strong>PostActionAnalyzer</strong> — анализ ПОСЛЕ выполнения действия</li>
+                        <li>Существование элемента (exists)</li>
+                        <li>Видимость элемента (visible)</li>
+                        <li>Доступность элемента (enabled/disabled)</li>
+                        <li>Состояние загрузки (loading)</li>
+                        <li>Обязательные поля формы (required fields)</li>
+                        <li>Ошибки валидации (validation errors)</li>
+                    </ul>
+                    <h4>Новые возможности:</h4>
+                    <ul>
+                        <li>✅ <strong>Form Intelligence Integration</strong> — умная работа с формами</li>
+                        <li>✅ <strong>Smart Fill Sequence</strong> — генерация последовательности заполнения</li>
+                        <li>✅ <strong>Error Baseline</strong> — отслеживание ошибок до/после действия</li>
+                        <li>✅ <strong>Multi-language Support</strong> — поддержка множества языков для обнаружения submit кнопок</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>8. PostActionAnalyzer</h3>
+                    <p><strong>Файл:</strong> <code>post-action-analyzer.ts</code></p>
+                    <p><strong>Роль:</strong> Анализ ПОСЛЕ выполнения действия</p>
+                    <h4>Обнаруживает:</h4>
+                    <ul>
+                        <li>Новые элементы (autocomplete, suggestions, chips)</li>
+                        <li>Новые ошибки валидации</li>
+                        <li>Изменения состояния кнопок (enabled/disabled)</li>
+                        <li>Новые модальные окна</li>
+                    </ul>
+                    <h4>Новые возможности:</h4>
+                    <ul>
+                        <li>✅ <strong>AI-driven Follow-up</strong> — AI решает нужны ли follow-up действия</li>
+                        <li>✅ <strong>Duplicate Detection</strong> — предотвращение повторных кликов на тот же элемент</li>
+                        <li>✅ <strong>DOM Snapshot Comparison</strong> — сравнение состояния до/после</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>9-14. Дополнительные компоненты</h3>
+                    <ul>
                         <li><strong>SelfHealingService</strong> — автоматическое восстановление сломанных селекторов</li>
                         <li><strong>SafetyGuard</strong> — защита от опасных действий</li>
                         <li><strong>StateTracker</strong> — отслеживание состояния теста</li>
                         <li><strong>FormIntelligenceService</strong> — умная работа с формами</li>
+                        <li><strong>ErrorCollectorService</strong> — ✅ НОВОЕ: сбор ошибок (console, network, UI)</li>
+                        <li><strong>ActionPatternDetector</strong> — ✅ НОВОЕ: обнаружение проблемных паттернов</li>
+                        <li><strong>GraphBuilder</strong> — ✅ НОВОЕ: построение графа теста для визуализации</li>
+                        <li><strong>AdaptiveConfigService</strong> — ✅ НОВОЕ: адаптивная конфигурация (timeouts, thresholds)</li>
                     </ul>
                 </div>
             </section>
@@ -621,18 +717,27 @@ const result = await getSmartLocator(page, selector, actionType, intent);
                 <div class="flow-step">
                     <h4>3. АНАЛИЗ СТРАНИЦЫ (IntelligentPageAnalyzer)</h4>
                     <ul>
-                        <li><strong>Vision Analysis</strong> (GPT-4o) — скриншот → понимание UI</li>
+                        <li><strong>SPA Load Wait</strong> — ожидание полной загрузки SPA (network idle + interactive elements)</li>
+                        <li><strong>Modal Detection</strong> — обнаружение модальных окон (cookie banners, popups)</li>
                         <li><strong>DOM Analysis</strong> — структура, элементы, формы</li>
-                        <li><strong>Modal Detection</strong> — cookie banners, popups</li>
-                        <li><strong>Результат:</strong> <code>PageContext { url, pageType, elements, forms, warnings }</code></li>
+                        <li>✅ <strong>AI Selector Enhancement</strong> — улучшение DOM селекторов с помощью AI</li>
+                        <li><strong>Vision Analysis</strong> (GPT-4o, если нужно) — скриншот → понимание UI</li>
+                        <li>✅ <strong>Logic Analysis</strong> (GPT-4o-mini) — определение requiredActions, possibleActions, skipHints, navigationActions</li>
+                        <li>✅ <strong>Error Collection</strong> — сбор ошибок консоли, сети, UI</li>
+                        <li><strong>Результат:</strong> <code>PageContext { url, pageType, elements, forms, warnings, requiredActions, possibleActions, skipHints, navigationActions, errorSignals }</code></li>
                     </ul>
                 </div>
 
                 <div class="flow-step">
                     <h4>4. ГЕНЕРАЦИЯ ДЕЙСТВИЙ (ContextualActionGenerator)</h4>
                     <ul>
-                        <li>AI (GPT-4o-mini) анализирует контекст</li>
+                        <li>✅ Проверка бюджета перед генерацией</li>
+                        <li>✅ Проверка пустых страниц (early exit)</li>
+                        <li>✅ Обнаружение циклов перед генерацией</li>
+                        <li>AI (GPT-4o по умолчанию, GPT-4o-mini fallback) анализирует контекст</li>
+                        <li>✅ PII Masking — маскирование персональных данных в HTML</li>
                         <li>Генерирует действия для достижения цели</li>
+                        <li>✅ Sanitization — валидация и очистка действий</li>
                         <li><strong>Результат:</strong> <code>DynamicAction[] + reasoning + confidence</code></li>
                     </ul>
                 </div>
@@ -640,9 +745,13 @@ const result = await getSmartLocator(page, selector, actionType, intent);
                 <div class="flow-step">
                     <h4>5. PRE-ACTION ANALYSIS (PreActionAnalyzer)</h4>
                     <ul>
-                        <li>Проверка: элемент enabled/visible?</li>
-                        <li>Нужны ли prerequisite actions?</li>
-                        <li><strong>Результат:</strong> <code>canProceed + prerequisiteActions</code></li>
+                        <li>Проверка: элемент exists/visible/enabled?</li>
+                        <li>Проверка состояния загрузки (loading)</li>
+                        <li>✅ Анализ формы (Form Intelligence) — если это submit кнопка</li>
+                        <li>✅ Обнаружение обязательных полей и ошибок валидации</li>
+                        <li>✅ Генерация prerequisite actions (smart fill sequence)</li>
+                        <li>✅ Сохранение baseline ошибок для сравнения после действия</li>
+                        <li><strong>Результат:</strong> <code>canProceed + blockingFactors + suggestedActions + requiredFields</code></li>
                     </ul>
                 </div>
 
@@ -672,10 +781,14 @@ d) При ошибке → Self-Healing
                 <div class="flow-step">
                     <h4>7. POST-ACTION ANALYSIS (PostActionAnalyzer)</h4>
                     <ul>
-                        <li>Что изменилось в DOM?</li>
-                        <li>Появились ли autocomplete/suggestions?</li>
+                        <li>✅ Capture DOM Snapshot — снимок состояния DOM</li>
+                        <li>✅ Detect Changes — сравнение с предыдущим снимком</li>
+                        <li>Что изменилось в DOM? (новые элементы, ошибки, модальные окна)</li>
+                        <li>Появились ли autocomplete/suggestions/chips?</li>
                         <li>Появились ли модальные окна?</li>
-                        <li>Нужны ли follow-up actions?</li>
+                        <li>✅ AI-driven Decision — AI решает нужны ли follow-up actions</li>
+                        <li>✅ Duplicate Prevention — предотвращение повторных кликов</li>
+                        <li><strong>Результат:</strong> <code>needsFollowUp + followUpActions + reason + confidence</code></li>
                     </ul>
                 </div>
 
@@ -692,11 +805,17 @@ d) При ошибке → Self-Healing
                 <div class="flow-step">
                     <h4>9. DECISION (ContextualActionGenerator.decideNextStep)</h4>
                     <ul>
+                        <li>✅ Проверка бюджета перед решением</li>
+                        <li>✅ Проверка циклов (cycle detection)</li>
+                        <li>✅ Проверка таймаута (max duration)</li>
+                        <li>✅ Проверка goalAchieved — цель достигнута?</li>
+                        <li>✅ Обнаружение blocking signals (captcha, 2fa, auth_required)</li>
+                        <li>✅ Оценка risk level (low/medium/high)</li>
                         <li><span class="badge badge-success">continue</span> — продолжить тестирование</li>
                         <li><span class="badge badge-danger">stop</span> — цель достигнута или лимиты</li>
-                        <li><span class="badge badge-warning">wait_for_user</span> — нужен input пользователя</li>
-                        <li><span class="badge badge-info">retry</span> — повторить действие</li>
-                        <li><span class="badge badge-info">skip</span> — пропустить и продолжить</li>
+                        <li><span class="badge badge-warning">wait_for_user</span> — нужен input пользователя (с clarification request)</li>
+                        <li><span class="badge badge-info">retry</span> — повторить действие (с retryStrategy: wait/reload/navigate_back/choose_alternative_target/reduce_scope)</li>
+                        <li><span class="badge badge-info">skip</span> — пропустить и продолжить (goBack или goto startUrl)</li>
                     </ul>
                 </div>
 
@@ -719,26 +838,38 @@ d) При ошибке → Self-Healing
                                           ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │ 3. АНАЛИЗ СТРАНИЦЫ (IntelligentPageAnalyzer)                                    │
-│    • Vision Analysis (GPT-4o) — скриншот → понимание UI                         │
-│    • DOM Analysis — структура, элементы, формы                                  │
+│    • SPA Load Wait — network idle + interactive elements                        │
 │    • Modal Detection — cookie banners, popups                                    │
-│    • Результат: PageContext { url, pageType, elements, forms, warnings }        │
+│    • DOM Analysis — структура, элементы, формы                                  │
+│    • ✅ AI Selector Enhancement — улучшение селекторов с AI                      │
+│    • Vision Analysis (GPT-4o, если нужно) — скриншот → понимание UI             │
+│    • ✅ Logic Analysis (GPT-4o-mini) — requiredActions, possibleActions          │
+│    • ✅ Error Collection — console, network, UI errors                          │
+│    • Результат: PageContext { url, pageType, elements, forms, warnings,        │
+│      requiredActions, possibleActions, skipHints, navigationActions, errorSignals }│
 └─────────────────────────────────────────────────────────────────────────────────┘
                                           │
                                           ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │ 4. ГЕНЕРАЦИЯ ДЕЙСТВИЙ (ContextualActionGenerator)                               │
-│    • AI (GPT-4o-mini) анализирует контекст                                      │
+│    • ✅ Проверка бюджета и пустых страниц                                       │
+│    • ✅ Обнаружение циклов                                                     │
+│    • AI (GPT-4o по умолчанию) анализирует контекст                              │
+│    • ✅ PII Masking — маскирование персональных данных                         │
 │    • Генерирует действия для достижения цели                                    │
+│    • ✅ Sanitization — валидация и очистка действий                            │
 │    • Результат: DynamicAction[] + reasoning + confidence                        │
 └─────────────────────────────────────────────────────────────────────────────────┘
                                           │
                                           ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │ 5. PRE-ACTION ANALYSIS (PreActionAnalyzer)                                      │
-│    • Проверка: элемент enabled/visible?                                         │
-│    • Нужны ли prerequisite actions?                                            │
-│    • Результат: canProceed + prerequisiteActions                                │
+│    • Проверка: элемент exists/visible/enabled/loading?                          │
+│    • ✅ Form Intelligence — анализ формы (если submit кнопка)                     │
+│    • ✅ Обнаружение обязательных полей и ошибок валидации                      │
+│    • ✅ Smart Fill Sequence — умная последовательность заполнения               │
+│    • ✅ Error Baseline — сохранение baseline для сравнения                      │
+│    • Результат: canProceed + blockingFactors + suggestedActions                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
                                           │
                                           ▼
@@ -771,10 +902,14 @@ d) При ошибке → Self-Healing
                                           ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │ 7. POST-ACTION ANALYSIS (PostActionAnalyzer)                                    │
-│    • Что изменилось в DOM?                                                      │
-│    • Появились ли autocomplete/suggestions?                                     │
+│    • ✅ Capture DOM Snapshot — снимок состояния DOM                            │
+│    • ✅ Detect Changes — сравнение с предыдущим снимком                        │
+│    • Что изменилось в DOM? (новые элементы, ошибки, модальные окна)            │
+│    • Появились ли autocomplete/suggestions/chips?                              │
 │    • Появились ли модальные окна?                                               │
-│    • Нужны ли follow-up actions?                                                │
+│    • ✅ AI-driven Decision — AI решает нужны ли follow-up actions             │
+│    • ✅ Duplicate Prevention — предотвращение повторных кликов                 │
+│    • Результат: needsFollowUp + followUpActions + reason + confidence          │
 └─────────────────────────────────────────────────────────────────────────────────┘
                                           │
                                           ▼
@@ -789,11 +924,15 @@ d) При ошибке → Self-Healing
                                           ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │ 9. DECISION (ContextualActionGenerator.decideNextStep)                          │
+│    • ✅ Проверка бюджета, циклов, таймаута                                      │
+│    • ✅ Проверка goalAchieved — цель достигнута?                                │
+│    • ✅ Обнаружение blocking signals (captcha, 2fa, auth_required)            │
+│    • ✅ Оценка risk level (low/medium/high)                                    │
 │    • continue — продолжить тестирование                                         │
 │    • stop — цель достигнута или лимиты                                          │
-│    • wait_for_user — нужен input пользователя                                    │
-│    • retry — повторить действие                                                 │
-│    • skip — пропустить и продолжить                                             │
+│    • wait_for_user — нужен input пользователя (с clarification request)        │
+│    • retry — повторить действие (с retryStrategy)                               │
+│    • skip — пропустить и продолжить (goBack или goto startUrl)                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
                                           │
                                           ▼
@@ -830,8 +969,18 @@ d) При ошибке → Self-Healing
                         </tr>
                         <tr>
                             <td>Action Generation</td>
+                            <td><span class="badge badge-success">GPT-4o</span></td>
+                            <td>~$0.0005-0.001</td>
+                        </tr>
+                        <tr>
+                            <td>Logic Analysis</td>
                             <td><span class="badge badge-info">GPT-4o-mini</span></td>
-                            <td>~$0.0002</td>
+                            <td>~$0.0001</td>
+                        </tr>
+                        <tr>
+                            <td>Post-Action Analysis</td>
+                            <td><span class="badge badge-info">GPT-4o-mini</span></td>
+                            <td>~$0.0001</td>
                         </tr>
                         <tr>
                             <td>Decision Making</td>
@@ -862,22 +1011,124 @@ d) При ошибке → Self-Healing
                 </div>
             </section>
 
+            <section id="improvements">
+                <h2>5. Недавние улучшения</h2>
+
+                <div class="component-card">
+                    <h3>✅ MainLoopService — Выделение основного цикла</h3>
+                    <p>Основной цикл тестирования выделен в отдельный сервис для лучшей организации кода.</p>
+                    <ul>
+                        <li>Проверка отмены перед каждой итерацией</li>
+                        <li>Проверка лимитов (pages, duration, errors)</li>
+                        <li>Обнаружение пустых страниц (consecutive empty pages threshold)</li>
+                        <li>Обнаружение циклов (URL-based cycle detection)</li>
+                        <li>Обнаружение проблемных паттернов (ActionPatternDetector)</li>
+                        <li>Обработка решений (continue/stop/retry/skip/wait_for_user)</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>✅ Logic Analysis — Новый этап анализа</h3>
+                    <p>AI анализирует логику страницы и определяет необходимые действия.</p>
+                    <ul>
+                        <li><code>requiredActions</code> — действия, обязательные перед основными</li>
+                        <li><code>possibleActions</code> — все возможные действия</li>
+                        <li><code>skipHints</code> — подсказки о том, когда/как пропустить страницу</li>
+                        <li><code>navigationActions</code> — предложенные действия навигации</li>
+                        <li>Использует GPT-4o-mini для экономии</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>✅ AI Selector Enhancement</h3>
+                    <p>DOM элементы улучшаются с помощью AI Selector Engine для большей стабильности.</p>
+                    <ul>
+                        <li>Генерация intent-based селекторов</li>
+                        <li>Улучшение селекторов для кнопок и инпутов (топ-10 элементов)</li>
+                        <li>Использование fast mode для производительности</li>
+                        <li>Кэширование результатов для повторного использования</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>✅ Error Collector Service</h3>
+                    <p>Сбор ошибок на всех этапах тестирования для лучшей диагностики.</p>
+                    <ul>
+                        <li>Console errors — ошибки JavaScript</li>
+                        <li>Network errors — ошибки сетевых запросов</li>
+                        <li>UI errors — ошибки интерфейса (validation errors, alerts)</li>
+                        <li>Accessibility warnings — предупреждения доступности</li>
+                        <li>Интеграция в PageContext для использования AI</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>✅ Улучшенный PreActionAnalyzer</h3>
+                    <ul>
+                        <li>Form Intelligence Integration — умная работа с формами</li>
+                        <li>Smart Fill Sequence — генерация последовательности заполнения</li>
+                        <li>Error Baseline — отслеживание ошибок до/после действия</li>
+                        <li>Multi-language Support — поддержка множества языков</li>
+                        <li>Enhanced Disabled Detection — улучшенное обнаружение disabled элементов</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>✅ Улучшенный PostActionAnalyzer</h3>
+                    <ul>
+                        <li>AI-driven Follow-up — AI решает нужны ли follow-up действия</li>
+                        <li>Duplicate Detection — предотвращение повторных кликов</li>
+                        <li>DOM Snapshot Comparison — сравнение состояния до/после</li>
+                        <li>Change Detection — обнаружение новых элементов, ошибок, модальных окон</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>✅ Улучшенный ContextualActionGenerator</h3>
+                    <ul>
+                        <li>PII Masking — маскирование персональных данных в HTML</li>
+                        <li>Robust JSON Parsing — извлечение JSON с fallback стратегиями</li>
+                        <li>Action Sanitization — валидация и очистка действий</li>
+                        <li>Empty Page Detection — раннее обнаружение пустых страниц</li>
+                        <li>Cycle Detection — обнаружение циклов перед генерацией</li>
+                        <li>Blocking Signals Detection — обнаружение captcha, 2fa, auth_required</li>
+                        <li>Risk Level Assessment — оценка уровня риска</li>
+                        <li>Retry Strategy — стратегии повтора (wait/reload/navigate_back/choose_alternative_target/reduce_scope)</li>
+                    </ul>
+                </div>
+
+                <div class="component-card">
+                    <h3>✅ Cancellation Support</h3>
+                    <p>Поддержка отмены теста в любой момент.</p>
+                    <ul>
+                        <li>AbortController для отмены операций</li>
+                        <li>Проверка отмены перед каждой итерацией</li>
+                        <li>Graceful shutdown — корректное завершение</li>
+                        <li>Результат с флагом <code>cancelled: true</code></li>
+                    </ul>
+                </div>
+            </section>
+
             <section id="config">
-                <h2>5. Конфигурация</h2>
+                <h2>6. Конфигурация</h2>
 
                 <div class="code-block">
 <code>interface IntelligentTestConfig {
   goal: string;              // Цель тестирования
   startUrl: string;          // URL для начала
   mode: 'full' | 'fast' | 'balanced';  // Режим анализа
-  maxPages?: number;         // Макс. страниц (default: 10)
-  maxDuration?: number;      // Макс. время (default: 5 мин)
-  safetyLevel?: 'strict' | 'normal' | 'permissive';
-  hints?: TestHint[];        // Подсказки от пользователя
+  safety: SafetyConfig;      // Конфигурация безопасности
+  browser?: string;          // Тип браузера для прогресса
   credentials?: {            // Для авторизации
+    username?: string;
     email?: string;
     password?: string;
   };
+  userContext?: Record&lt;string, any&gt;;  // Дополнительный контекст
+  spaLoadConfig?: SPALoadConfig;  // ✅ НОВОЕ: Настройки загрузки SPA
+  hints?: TestHint[];        // Подсказки от пользователя
+  waitForSelector?: string;  // ✅ НОВОЕ: Ожидание селектора перед началом
+  customScripts?: string[];  // ✅ НОВОЕ: Кастомные JS скрипты
 }</code>
                 </div>
 
@@ -887,12 +1138,23 @@ d) При ошибке → Self-Healing
   goal: "Зарегистрировать нового пользователя",
   startUrl: "https://example.com/register",
   mode: "balanced",
-  maxPages: 10,
-  maxDuration: 5 * 60 * 1000, // 5 минут
-  safetyLevel: "normal",
+  safety: {
+    level: "normal",
+    maxPages: 10,
+    maxDuration: 5 * 60 * 1000, // 5 минут
+    maxCost: 1.0, // $1
+    allowedDomains: ["example.com"],
+    forbiddenActions: [],
+    forbiddenUrls: []
+  },
   credentials: {
     email: "test@example.com",
     password: "securePassword123"
+  },
+  spaLoadConfig: {
+    maxWaitTime: 10000,
+    networkIdleTimeout: 8000,
+    elementRetries: 3
   }
 };
 

@@ -17,9 +17,9 @@ import testVisualizationRoutes from '@/api/testVisualization/testVisualization.r
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
+import { swaggerSpec } from '@/config/api/swagger';
 import { env, isDevelopment } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
-import { swaggerSpec } from '@/config/api/swagger';
 import { testSupabaseAuthHealth, testSupabaseConnection } from '@/db/supabase';
 import { errorHandler, notFoundHandler } from '@/utils/core/error-handler';
 import { logger, morganStream } from '@/utils/core/logger';
@@ -226,6 +226,32 @@ app.get('/api/features', requireDocsAuth, (req: express.Request, res: express.Re
   res.sendFile(indexPath);
 });
 
+// Architecture documentation (password protected)
+const getArchitectureDocPath = () => {
+  const isProduction = process.env.NODE_ENV === 'production';
+  if (isProduction) {
+    return path.join(__dirname, '../../docs/INTELLIGENT_MODE_ARCHITECTURE.html');
+  } else {
+    return path.join(process.cwd(), 'docs/INTELLIGENT_MODE_ARCHITECTURE.html');
+  }
+};
+
+app.get('/api/architecture', requireDocsAuth, (req: express.Request, res: express.Response) => {
+  const architecturePath = getArchitectureDocPath();
+  res.sendFile(architecturePath, (err) => {
+    if (err) {
+      logger.error('[SERVER] Failed to serve architecture documentation', {
+        error: err.message,
+        path: architecturePath,
+      });
+      res.status(404).json({
+        success: false,
+        error: 'Architecture documentation not found',
+      });
+    }
+  });
+});
+
 /**
  * @swagger
  * /health:
@@ -392,6 +418,7 @@ app.get('/', (req: express.Request, res: express.Response) => {
       notifications: `/api/${env.API_VERSION}/notifications`,
       docs: '/api/docs',
       docsJson: '/api/docs.json',
+      architecture: '/api/architecture',
     },
   });
 });

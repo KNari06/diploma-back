@@ -15,6 +15,42 @@ const getDocsPassword = (): string => {
 };
 
 /**
+ * Validate and sanitize redirect path to prevent open redirect attacks
+ */
+const validateRedirectPath = (path: string): string | null => {
+  if (!path || typeof path !== 'string') {
+    return null;
+  }
+
+  // Only allow paths starting with /api/features or /api/architecture
+  const allowedPrefixes = ['/api/features', '/api/architecture'];
+  const normalizedPath = path.split('?')[0]; // Remove query params for validation
+
+  if (!allowedPrefixes.some(prefix => normalizedPath.startsWith(prefix))) {
+    return null;
+  }
+
+  // Check for dangerous characters
+  if (/[<>"']/.test(path)) {
+    return null;
+  }
+
+  return path;
+};
+
+/**
+ * Escape HTML to prevent XSS attacks
+ */
+const escapeHtml = (unsafe: string): string => {
+  return unsafe
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+};
+
+/**
  * Middleware to check if user is authenticated for documentation
  */
 export const requireDocsAuth = (
@@ -48,6 +84,11 @@ export const requireDocsAuth = (
     });
     return;
   }
+
+  // Get redirect path from request and validate it
+  const rawRedirectPath = req.originalUrl || req.path;
+  const redirectPath = validateRedirectPath(rawRedirectPath) || '/api/features';
+  const safeRedirectPath = escapeHtml(redirectPath);
 
   // Otherwise, show login page
   res.status(401).send(`
@@ -145,6 +186,7 @@ export const requireDocsAuth = (
         <p>Enter password to access internal documentation</p>
         <div class="error" id="error"></div>
         <form id="loginForm" method="POST" action="/api/features/login">
+            <input type="hidden" name="redirect" value="${safeRedirectPath}" />
             <input
                 type="password"
                 name="password"
@@ -190,11 +232,18 @@ export const requireDocsAuth = (
  * Login endpoint for documentation
  */
 export const docsLogin = (req: Request, res: Response): void => {
-  const { password } = req.body;
+  const { password, redirect } = req.body;
   const correctPassword = getDocsPassword();
 
+  // Validate redirect path to prevent open redirect attacks
+  const rawRedirectPath = redirect || '/api/features';
+  const redirectPath = validateRedirectPath(rawRedirectPath) || '/api/features';
+  const errorPath = redirectPath.includes('?')
+    ? `${redirectPath}&error=invalid`
+    : `${redirectPath}?error=invalid`;
+
   if (!password) {
-    res.redirect('/api/features?error=invalid');
+    res.redirect(errorPath);
     return;
   }
 
@@ -207,17 +256,19 @@ export const docsLogin = (req: Request, res: Response): void => {
     logger.info('[DOCS_AUTH] Documentation access granted', {
       ip: req.ip,
       userAgent: req.headers['user-agent'],
+      redirectPath,
     });
 
-    // Redirect to documentation
-    res.redirect('/api/features');
+    // Redirect to requested documentation (validated)
+    res.redirect(redirectPath);
   } else {
     logger.warn('[DOCS_AUTH] Invalid password attempt', {
       ip: req.ip,
       userAgent: req.headers['user-agent'],
+      redirectPath,
     });
 
-    res.redirect('/api/features?error=invalid');
+    res.redirect(errorPath);
   }
 };
 
@@ -230,5 +281,14 @@ export const docsLogout = (req: Request, res: Response): void => {
     delete (req as any).session.docsAuthenticated;
   }
 
-  res.redirect('/api/features');
+  logger.info('[DOCS_AUTH] Documentation access revoked', {
+    ip: req.ip,
+    userAgent: req.headers['user-agent'],
+  });
+
+  // Validate redirect path to prevent open redirect attacks
+  // Only allow query parameter, not referer (referer can be from external domain)
+  const rawRedirectPath = (req.query.redirect as string) || '/api/features';
+  const redirectPath = validateRedirectPath(rawRedirectPath) || '/api/features';
+  res.redirect(redirectPath);
 };
