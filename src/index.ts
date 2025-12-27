@@ -37,8 +37,8 @@ app.set('trust proxy', true);
 
 // Security middleware with Swagger-friendly CSP
 app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
-  // Disable strict CSP for Swagger UI
-  if (req.path.startsWith('/api/docs')) {
+  // Disable strict CSP for Swagger UI and documentation routes
+  if (req.path.startsWith('/api/docs') || req.path.startsWith('/api/features') || req.path.startsWith('/api/architecture')) {
     return next();
   }
 
@@ -64,6 +64,23 @@ app.use('/api/docs', (req: express.Request, res: express.Response, next: express
     crossOriginResourcePolicy: false,
   })(req, res, next);
 }, swaggerUi.serve);
+
+// Relaxed security for documentation routes (login forms need inline scripts)
+app.use(['/api/features', '/api/architecture'], (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"], // Allow inline scripts for login form
+        imgSrc: ["'self'", "data:", "https:"],
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+    crossOriginOpenerPolicy: false,
+    crossOriginResourcePolicy: false,
+  })(req, res, next);
+});
 
 // CORS configuration
 const getCorsOrigins = (): boolean | string[] => {
