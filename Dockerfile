@@ -48,6 +48,9 @@ COPY --from=builder /app/src ./src
 # Копируем данные (Global KB embeddings)
 COPY --from=builder /app/data ./data
 
+# Копируем документацию
+COPY --from=builder /app/docs ./docs
+
 # tsconfig-paths для алиасов в рантайме ( @/* -> dist/* )
 RUN printf '{\n  "compilerOptions": {\n    "baseUrl": ".",\n    "paths": { "@/*": ["dist/*"] }\n  }\n}\n' > /app/tsconfig.json
 

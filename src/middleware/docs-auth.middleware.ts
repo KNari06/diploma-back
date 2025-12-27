@@ -235,6 +235,16 @@ export const docsLogin = (req: Request, res: Response): void => {
   const { password, redirect } = req.body;
   const correctPassword = getDocsPassword();
 
+  // Debug logging (only in development)
+  if (process.env.NODE_ENV === 'development') {
+    logger.debug('[DOCS_AUTH] Login attempt', {
+      hasPassword: !!password,
+      passwordLength: password?.length,
+      correctPasswordLength: correctPassword.length,
+      redirect,
+    });
+  }
+
   // Validate redirect path to prevent open redirect attacks
   const rawRedirectPath = redirect || '/api/features';
   const redirectPath = validateRedirectPath(rawRedirectPath) || '/api/features';
@@ -243,11 +253,19 @@ export const docsLogin = (req: Request, res: Response): void => {
     : `${redirectPath}?error=invalid`;
 
   if (!password) {
+    logger.warn('[DOCS_AUTH] No password provided', {
+      ip: req.ip,
+      redirectPath,
+    });
     res.redirect(errorPath);
     return;
   }
 
-  if (password === correctPassword) {
+  // Trim password to handle whitespace issues
+  const trimmedPassword = password.trim();
+  const trimmedCorrectPassword = correctPassword.trim();
+
+  if (trimmedPassword === trimmedCorrectPassword) {
     // Set session (if session middleware is configured)
     if ((req as any).session) {
       (req as any).session.docsAuthenticated = true;
