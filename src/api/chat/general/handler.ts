@@ -12,6 +12,7 @@ import { Request, Response } from 'express';
 import { CONSTANTS } from '../shared/constants';
 import { compressMessageContent, emitProcessingStep, checkChatCredits, deductChatCredits } from '../shared/utils';
 import { checkRequestAborted } from '../shared/request-cancellation';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -28,20 +29,34 @@ export async function handleGeneralChat(
     context?: any;
     userLanguage?: 'en' | 'ru' | 'neutral'; // Language from intent parser (avoid re-detection)
     abortSignal?: AbortSignal;
+    logger?: FunctionLogger;
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context, userLanguage: providedLanguage, abortSignal } = params;
+  const { message, userId, chatSessionId, context, userLanguage: providedLanguage, abortSignal, logger: functionLogger } = params;
 
-  if (abortSignal) checkRequestAborted(abortSignal);
+  if (abortSignal) {
+    const checkRequestAbortedWithLogging = functionLogger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(abortSignal);
+  }
 
   logger.info('[GENERAL_CHAT] Handling general conversation', {
     hasSession: !!chatSessionId,
     messageLength: message.length
   });
 
-  emitProcessingStep(chatSessionId, 'generating_response', '💬 Thinking...', 90);
+  const emitProcessingStepWithLogging = functionLogger
+    ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
+    : emitProcessingStep;
+  emitProcessingStepWithLogging(chatSessionId, 'generating_response', '💬 Thinking...', 90);
 
-  if (abortSignal) checkRequestAborted(abortSignal);
+  if (abortSignal) {
+    const checkRequestAbortedWithLogging = functionLogger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(abortSignal);
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 1: BUILD CONTEXT WITH HISTORY
@@ -52,8 +67,16 @@ export async function handleGeneralChat(
 
   if (chatSessionId) {
     // Get recent messages (last 20) - always needed for conversationHistory
-    const recentMessages = await ChatService.getRecentMessages(chatSessionId, userId, CONSTANTS.RECENT_MESSAGES_LIMIT); // SECURITY: Pass userId for verification
-    if (abortSignal) checkRequestAborted(abortSignal);
+    const getRecentMessagesWithLogging = functionLogger
+      ? withFunctionLogging(ChatService.getRecentMessages.bind(ChatService), 'ChatService.getRecentMessages', functionLogger)
+      : ChatService.getRecentMessages.bind(ChatService);
+    const recentMessages = await getRecentMessagesWithLogging(chatSessionId, userId, CONSTANTS.RECENT_MESSAGES_LIMIT); // SECURITY: Pass userId for verification
+    if (abortSignal) {
+      const checkRequestAbortedWithLogging = functionLogger
+        ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+        : checkRequestAborted;
+      checkRequestAbortedWithLogging(abortSignal);
+    }
 
     logger.info('[GENERAL_CHAT] Retrieved recent history', {
       messageCount: recentMessages.length
@@ -95,7 +118,10 @@ export async function handleGeneralChat(
         try {
           // Search for relevant old messages using semantic similarity
           // Note: We don't await autoEmbedOldMessages - it runs in background for NEXT request
-          const relevantOldMessages = await searchChatHistory(
+          const searchChatHistoryWithLogging = functionLogger
+            ? withFunctionLogging(searchChatHistory, 'searchChatHistory', functionLogger)
+            : searchChatHistory;
+          const relevantOldMessages = await searchChatHistoryWithLogging(
             chatSessionId,
             message, // Current user query
             {
@@ -225,7 +251,10 @@ export async function handleGeneralChat(
   // STEP 3: BUILD MESSAGES ARRAY FOR OPENAI
   // ═══════════════════════════════════════════════════════════════════════
 
-  const systemPrompt = buildChatSystemPrompt();
+  const buildChatSystemPromptWithLogging = functionLogger
+    ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
+    : buildChatSystemPrompt;
+  const systemPrompt = buildChatSystemPromptWithLogging();
 
   // Enhance system prompt with old context summary
   const enhancedSystemPrompt = oldContextSummary
@@ -263,12 +292,20 @@ export async function handleGeneralChat(
   // Check user has enough credits (1 credit per chat message)
   // This prevents wasting OpenAI API calls if user has no credits
 
-  const hasEnoughCredits = await checkChatCredits(userId, res);
+  const checkChatCreditsWithLogging = functionLogger
+    ? withFunctionLogging(checkChatCredits, 'checkChatCredits', functionLogger)
+    : checkChatCredits;
+  const hasEnoughCredits = await checkChatCreditsWithLogging(userId, res);
   if (!hasEnoughCredits) {
     return; // Response already sent in checkChatCredits
   }
 
-  if (abortSignal) checkRequestAborted(abortSignal);
+  if (abortSignal) {
+    const checkRequestAbortedWithLogging = functionLogger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(abortSignal);
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: GET AI RESPONSE
@@ -278,7 +315,10 @@ export async function handleGeneralChat(
   let shouldDeductCredits = false; // Track if we should deduct credits
 
   try {
-    gptResponse = await getChatCompletionWithMessages(messages, {
+    const getChatCompletionWithMessagesWithLogging = functionLogger
+      ? withFunctionLogging(getChatCompletionWithMessages, 'getChatCompletionWithMessages', functionLogger)
+      : getChatCompletionWithMessages;
+    gptResponse = await getChatCompletionWithMessagesWithLogging(messages, {
       temperature: 0.3, // Lowered from 0.5 for more consistent responses
       max_tokens: 1000,
       abortSignal,
@@ -349,17 +389,28 @@ export async function handleGeneralChat(
   // Only deduct if we got a real OpenAI response (not fallback)
 
   if (shouldDeductCredits && gptResponse && gptResponse.content) {
-    await deductChatCredits(userId, shouldDeductCredits);
+    const deductChatCreditsWithLogging = functionLogger
+      ? withFunctionLogging(deductChatCredits, 'deductChatCredits', functionLogger)
+      : deductChatCredits;
+    await deductChatCreditsWithLogging(userId, shouldDeductCredits);
   }
 
-  if (abortSignal) checkRequestAborted(abortSignal);
+  if (abortSignal) {
+    const checkRequestAbortedWithLogging = functionLogger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(abortSignal);
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 4: SAVE MESSAGES
   // ═══════════════════════════════════════════════════════════════════════
 
   if (chatSessionId) {
-    await ChatService.saveChatMessages(chatSessionId, [
+    const saveChatMessagesWithLogging = functionLogger
+      ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+      : ChatService.saveChatMessages.bind(ChatService);
+    await saveChatMessagesWithLogging(chatSessionId, [
       { role: 'user', content: message },
       { role: 'ai', content: gptResponse.content },
     ]);

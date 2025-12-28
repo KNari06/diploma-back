@@ -6,6 +6,7 @@ import { handleClarificationRequest } from './clarification';
 import { PROGRESS } from './constants';
 import { checkRequestAborted } from './request-cancellation';
 import { emitProcessingStep } from './utils';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 
 /**
  * STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
@@ -23,23 +24,33 @@ export async function routeToHandler(
     answers?: Record<string, any>;
     context?: any;
     abortSignal?: AbortSignal;
+    logger?: FunctionLogger;
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
   // ═══════════════════════════════════════════════════════════════════════
 
-  emitProcessingStep(params.chatSessionId, 'generating_plan', '🚀 Processing your request...', PROGRESS.ROUTING);
+  const emitProcessingStepWithLogging = params.logger
+    ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', params.logger)
+    : emitProcessingStep;
+  emitProcessingStepWithLogging(params.chatSessionId, 'generating_plan', '🚀 Processing your request...', PROGRESS.ROUTING);
 
   if (params.abortSignal) {
-    checkRequestAborted(params.abortSignal);
+    const checkRequestAbortedWithLogging = params.logger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', params.logger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(params.abortSignal);
   }
 
   const intent = params.parsedIntent?.intent || 'general_chat';
 
   // Handle clarification requests (new!)
   if (intent === 'needs_clarification') {
-    return await handleClarificationRequest(req, res, {
+    const handleClarificationRequestWithLogging = params.logger
+      ? withFunctionLogging(handleClarificationRequest, 'handleClarificationRequest', params.logger)
+      : handleClarificationRequest;
+    return await handleClarificationRequestWithLogging(req, res, {
       parsedIntent: params.parsedIntent,
       userId: params.userId,
       chatSessionId: params.chatSessionId,
@@ -48,7 +59,10 @@ export async function routeToHandler(
   }
 
   if (intent === 'platform_test') {
-    return await handlePlatformTest(req, res, {
+    const handlePlatformTestWithLogging = params.logger
+      ? withFunctionLogging(handlePlatformTest, 'handlePlatformTest', params.logger)
+      : handlePlatformTest;
+    return await handlePlatformTestWithLogging(req, res, {
       message: params.message,
       parsedIntent: params.parsedIntent,
       userId: params.userId,
@@ -57,11 +71,15 @@ export async function routeToHandler(
       conversationId: params.conversationId,
       answers: params.answers,
       abortSignal: params.abortSignal,
+      logger: params.logger,
     });
   }
 
   if (intent === 'api_test') {
-    return await handleApiTest(req, res, {
+    const handleApiTestWithLogging = params.logger
+      ? withFunctionLogging(handleApiTest, 'handleApiTest', params.logger)
+      : handleApiTest;
+    return await handleApiTestWithLogging(req, res, {
       message: params.message,
       parsedIntent: params.parsedIntent,
       userId: params.userId,
@@ -70,16 +88,21 @@ export async function routeToHandler(
       conversationId: params.conversationId,
       answers: params.answers,
       abortSignal: params.abortSignal,
+      logger: params.logger,
     });
   }
 
   // general_chat
-  return await handleGeneralChat(req, res, {
+  const handleGeneralChatWithLogging = params.logger
+    ? withFunctionLogging(handleGeneralChat, 'handleGeneralChat', params.logger)
+    : handleGeneralChat;
+  return await handleGeneralChatWithLogging(req, res, {
     message: params.message,
     userId: params.userId,
     chatSessionId: params.chatSessionId,
     context: params.context,
     userLanguage: params.parsedIntent?.userLanguage, // Pass language from intent parser (avoid re-detection)
     abortSignal: params.abortSignal,
+    logger: params.logger,
   });
 }
