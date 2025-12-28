@@ -59,8 +59,12 @@
                     </div>
                 </div>
 
-                <div class="diagram-container">
-                    <div class="mermaid">
+                <div class="diagram-container" id="chatDiagramContainer">
+                    <div id="chatDiagramLoading" style="text-align: center; padding: 40px; color: #666;">
+                        <div style="font-size: 1.2em; margin-bottom: 10px;">⏳ Loading diagram...</div>
+                        <div style="font-size: 0.9em;">Please wait while the flow diagram is being rendered.</div>
+                    </div>
+                    <div class="mermaid" id="chatFlowDiagram" style="display: none;">
 flowchart TD
     Start([POST /api/v1/chat]) --> AuthMiddleware[requireAuth Middleware]
     AuthMiddleware --> ValidateSchema[Validate Request Schema]
@@ -155,7 +159,35 @@ flowchart TD
         </div>
     </div>
     <script>
-        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+        // Initialize Mermaid with proper settings
+        mermaid.initialize({
+            startOnLoad: false,
+            theme: 'default',
+            securityLevel: 'loose',
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true,
+                curve: 'basis'
+            }
+        });
+
+        // Wait for DOM to be ready
+        document.addEventListener('DOMContentLoaded', function() {
+            const diagramElement = document.getElementById('chatFlowDiagram');
+            const loadingElement = document.getElementById('chatDiagramLoading');
+
+            if (diagramElement && loadingElement) {
+                diagramElement.style.display = 'block';
+
+                mermaid.init(undefined, diagramElement).then(() => {
+                    console.log('Chat flow diagram rendered successfully');
+                    loadingElement.style.display = 'none';
+                }).catch((error) => {
+                    console.error('Error rendering chat flow diagram:', error);
+                    loadingElement.innerHTML = '<div style="padding: 20px; background: #ffebee; border-radius: 8px; color: #c62828;"><strong>Error loading diagram:</strong> ' + error.message + '<br><br>Please refresh the page or check the browser console for more details.</div>';
+                });
+            }
+        });
     </script>
 </body>
 </html>

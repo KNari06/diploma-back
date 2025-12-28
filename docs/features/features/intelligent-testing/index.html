@@ -48,6 +48,18 @@
             background: white;
             padding: 20px;
             border-radius: 8px;
+            min-height: 400px;
+            display: block !important;
+            visibility: visible !important;
+        }
+
+        .diagram-container {
+            position: relative;
+        }
+
+        #diagramLoading, #chatDiagramLoading {
+            background: #f8f9fa;
+            border-radius: 8px;
         }
 
         .methods-grid {
@@ -319,7 +331,11 @@
                     <div style="margin-bottom: 15px; padding: 15px; background: #e3f2fd; border-radius: 8px; border-left: 4px solid #2196f3;">
                         <strong>💡 Tip:</strong> Click on any method in the diagram to see detailed information about what it does, its parameters, dependencies, and more!
                     </div>
-                    <div class="mermaid" id="flowDiagram">
+                    <div id="diagramLoading" style="text-align: center; padding: 40px; color: #666;">
+                        <div style="font-size: 1.2em; margin-bottom: 10px;">⏳ Loading diagram...</div>
+                        <div style="font-size: 0.9em;">Please wait while the flow diagram is being rendered.</div>
+                    </div>
+                    <div class="mermaid" id="flowDiagram" style="display: none;">
 flowchart TD
     Start([🚀 Test Execution Starts]) --> Execute[IntelligentTestOrchestrator.execute<br/>🔵 Core Orchestrator]
 
@@ -577,14 +593,34 @@ flowchart TD
                     console.warn('Could not load changelog.json:', e);
                 }
 
+                // Initialize Mermaid first
+                mermaid.initialize({
+                    startOnLoad: false,
+                    theme: 'default',
+                    securityLevel: 'loose',
+                    flowchart: {
+                        useMaxWidth: true,
+                        htmlLabels: true,
+                        curve: 'basis'
+                    }
+                });
+
                 // Render diagram interactively after methods are loaded
                 if (typeof renderMermaidDiagram === 'function') {
                     renderMermaidDiagram(embeddedDiagram, 'flowDiagram');
                 } else {
-                    // Fallback: render directly and make interactive
-                    diagramContainer.textContent = embeddedDiagram;
-                    mermaid.initialize({ startOnLoad: true, theme: 'default' });
-                    mermaid.init(undefined, diagramContainer).then(() => {
+                    // Fallback: render directly
+                    diagramContainer.innerHTML = '<div class="mermaid" id="flowDiagram">' + embeddedDiagram + '</div>';
+                    const mermaidElement = document.getElementById('flowDiagram');
+
+                    mermaidElement.style.display = 'block';
+                    const loadingElement = document.getElementById('diagramLoading');
+
+                    mermaid.init(undefined, mermaidElement).then(() => {
+                        console.log('Mermaid diagram rendered successfully');
+                        if (loadingElement) {
+                            loadingElement.style.display = 'none';
+                        }
                         // Make interactive after rendering - try multiple times
                         setTimeout(() => {
                             if (typeof makeDiagramInteractive === 'function') {
@@ -601,6 +637,13 @@ flowchart TD
                                 window.makeDiagramInteractive('diagramContainer');
                             }
                         }, 1500);
+                    }).catch((error) => {
+                        console.error('Error rendering Mermaid diagram:', error);
+                        if (loadingElement) {
+                            loadingElement.style.display = 'none';
+                        }
+                        // Show error message
+                        diagramContainer.innerHTML = '<div style="padding: 20px; background: #ffebee; border-radius: 8px; color: #c62828;"><strong>Error loading diagram:</strong> ' + error.message + '<br><br>Please refresh the page or check the browser console for more details.</div>';
                     });
                 }
 
