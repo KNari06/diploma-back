@@ -7,13 +7,15 @@ import { IntentResult } from '@/types';
 import { CONSTANTS, FAST_PATH_COMMANDS, PROGRESS } from './constants';
 import { emitProcessingStep } from './utils';
 import { checkRequestAborted } from './request-cancellation';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 
 /**
  * Get chat history for intent parsing (extracted helper)
  */
 export async function getChatHistoryForIntent(
   chatSessionId: string | undefined,
-  userId?: string // SECURITY: Optional userId for verification
+  userId?: string, // SECURITY: Optional userId for verification
+  functionLogger?: FunctionLogger
 ): Promise<Array<{ role: string; content: string }>> {
   if (!chatSessionId) {
     return [];
@@ -23,7 +25,10 @@ export async function getChatHistoryForIntent(
     // We want the model to reason over a small, stable context window
     // (at least last 4 messages: user+ai). Fetch more, but slice down after formatting.
     const CONTEXT_WINDOW_MESSAGES = 4;
-    const recentMessages = await ChatService.getRecentMessages(
+    const getRecentMessagesWithLogging = functionLogger
+      ? withFunctionLogging(ChatService.getRecentMessages.bind(ChatService), 'ChatService.getRecentMessages', functionLogger)
+      : ChatService.getRecentMessages.bind(ChatService);
+    const recentMessages = await getRecentMessagesWithLogging(
       chatSessionId,
       userId, // SECURITY: Pass userId for verification
       Math.max(CONSTANTS.RECENT_MESSAGES_LIMIT, CONTEXT_WINDOW_MESSAGES)
@@ -87,7 +92,8 @@ export async function parseIntent(
   userId: string,
   workspace_id: string,
   checkRequestTimeout: () => void,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  functionLogger?: FunctionLogger
 ): Promise<any> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 4: PARSE INTENT (Only if not responding to test plan) (FIX #5)
@@ -126,11 +132,17 @@ export async function parseIntent(
     validMessage = validMessage.substring(0, MAX_MESSAGE_LENGTH);
   }
 
-  emitProcessingStep(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', PROGRESS.INTENT_PARSING);
+  const emitProcessingStepWithLogging = functionLogger
+    ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
+    : emitProcessingStep;
+  emitProcessingStepWithLogging(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', PROGRESS.INTENT_PARSING);
 
   // Check if request was cancelled
   if (abortSignal) {
-    checkRequestAborted(abortSignal);
+    const checkRequestAbortedWithLogging = functionLogger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(abortSignal);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -237,16 +249,25 @@ export async function parseIntent(
   if (!parsedIntent) {
     // Check if request was cancelled
     if (abortSignal) {
-      checkRequestAborted(abortSignal);
+      const checkRequestAbortedWithLogging = functionLogger
+        ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+        : checkRequestAborted;
+      checkRequestAbortedWithLogging(abortSignal);
     }
 
     // Normal path: Use AI to parse intent
     // Get chat history for context
-    const chatHistory = await getChatHistoryForIntent(chatSessionId, userId); // SECURITY: Pass userId for verification
+    const getChatHistoryForIntentWithLogging = functionLogger
+      ? withFunctionLogging(getChatHistoryForIntent, 'getChatHistoryForIntent', functionLogger)
+      : getChatHistoryForIntent;
+    const chatHistory = await getChatHistoryForIntentWithLogging(chatSessionId, userId, functionLogger); // SECURITY: Pass userId for verification
 
     // Check if request was cancelled after async operation
     if (abortSignal) {
-      checkRequestAborted(abortSignal);
+      const checkRequestAbortedWithLogging = functionLogger
+        ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+        : checkRequestAborted;
+      checkRequestAbortedWithLogging(abortSignal);
     }
 
     // ✅ FIX: Log if chat history is empty
@@ -260,7 +281,10 @@ export async function parseIntent(
 
     // Parse intent with error handling (FIX #5)
     try {
-      parsedIntent = await parseUserIntent(
+      const parseUserIntentWithLogging = functionLogger
+        ? withFunctionLogging(parseUserIntent, 'parseUserIntent', functionLogger)
+        : parseUserIntent;
+      parsedIntent = await parseUserIntentWithLogging(
         validMessage,
         { chatHistory },
         workspace_id
@@ -268,7 +292,10 @@ export async function parseIntent(
 
       // Check if request was cancelled after AI call
       if (abortSignal) {
-        checkRequestAborted(abortSignal);
+        const checkRequestAbortedWithLogging = functionLogger
+          ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+          : checkRequestAborted;
+        checkRequestAbortedWithLogging(abortSignal);
       }
 
       // ✅ FIX: Check if parseUserIntent returned null (doesn't throw error)
@@ -301,8 +328,11 @@ export async function parseIntent(
   }
 
   // Emit detailed intent information
-  const intentMessage = buildIntentMessage(parsedIntent);
-  emitProcessingStep(chatSessionId, 'parsing_intent', intentMessage, PROGRESS.INTENT_PARSED);
+  const buildIntentMessageWithLogging = functionLogger
+    ? withFunctionLogging(buildIntentMessage, 'buildIntentMessage', functionLogger)
+    : buildIntentMessage;
+  const intentMessage = buildIntentMessageWithLogging(parsedIntent);
+  emitProcessingStepWithLogging(chatSessionId, 'parsing_intent', intentMessage, PROGRESS.INTENT_PARSED);
 
   const intent = parsedIntent?.intent || 'general_chat';
 

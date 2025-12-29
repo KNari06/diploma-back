@@ -5,6 +5,7 @@ import { CONSTANTS, MESSAGES } from './constants';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { getOrCreateChatSession } from './utils';
 import { emitProcessingStep, PROGRESS } from './utils';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 
 /**
  * STEP 0: INPUT VALIDATION (FIX #1 & #2)
@@ -21,7 +22,8 @@ export interface Step0Result {
 export function validateInput(
   req: Request,
   res: Response,
-  checkConnection: () => void
+  checkConnection: () => void,
+  functionLogger?: FunctionLogger
 ): Step0Result | null {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 0: INPUT VALIDATION (FIX #1 & #2)
@@ -92,13 +94,16 @@ export function validateInput(
 /**
  * STEP 1: WORKSPACE CHECK (MANDATORY!) (FIX #3)
  */
-export async function checkWorkspace(userId: string): Promise<string> {
+export async function checkWorkspace(userId: string, functionLogger?: FunctionLogger): Promise<string> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 1: WORKSPACE CHECK (MANDATORY!) (FIX #3)
   // ═══════════════════════════════════════════════════════════════════════
 
   try {
-    const workspaceResult = await WorkspaceService.checkOrCreateWorkspace(userId);
+    const checkOrCreateWorkspaceWithLogging = functionLogger
+      ? withFunctionLogging(WorkspaceService.checkOrCreateWorkspace.bind(WorkspaceService), 'WorkspaceService.checkOrCreateWorkspace', functionLogger)
+      : WorkspaceService.checkOrCreateWorkspace.bind(WorkspaceService);
+    const workspaceResult = await checkOrCreateWorkspaceWithLogging(userId);
     const workspace_id = workspaceResult.workspace_id;
 
     if (workspaceResult.is_new) {
@@ -122,7 +127,8 @@ export async function manageChatSession(
   userId: string,
   sessionId: string | undefined,
   workspace_id: string,
-  checkRequestTimeout: () => void
+  checkRequestTimeout: () => void,
+  functionLogger?: FunctionLogger
 ): Promise<string | undefined> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 2: CHAT SESSION MANAGEMENT (FIX #4)
@@ -130,7 +136,10 @@ export async function manageChatSession(
 
   let chatSessionId: string | undefined;
   try {
-    chatSessionId = await getOrCreateChatSession(userId, sessionId, workspace_id);
+    const getOrCreateChatSessionWithLogging = functionLogger
+      ? withFunctionLogging(getOrCreateChatSession, 'getOrCreateChatSession', functionLogger)
+      : getOrCreateChatSession;
+    chatSessionId = await getOrCreateChatSessionWithLogging(userId, sessionId, workspace_id);
     logger.debug('[CHAT] Chat session ready', {
       chatSessionId: chatSessionId || 'none',
       providedSessionId: sessionId || 'none',
@@ -145,7 +154,10 @@ export async function manageChatSession(
   }
 
   // Emit: Enriching context (FIX #11: Using PROGRESS constants)
-  emitProcessingStep(chatSessionId, 'enriching_context', '🔍 Analyzing your request...', PROGRESS.ENRICHING);
+  const emitProcessingStepWithLogging = functionLogger
+    ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
+    : emitProcessingStep;
+  emitProcessingStepWithLogging(chatSessionId, 'enriching_context', '🔍 Analyzing your request...', PROGRESS.ENRICHING);
 
   checkRequestTimeout();
 

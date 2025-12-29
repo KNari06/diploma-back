@@ -7,6 +7,7 @@ import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
 import { MESSAGES } from './constants';
 import { executeApprovedTestPlan } from './test-execution';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 
 
 /**
@@ -22,12 +23,16 @@ export async function checkPendingApproval(params: {
   workspace_id: string;
   checkRequestTimeout: () => void;
   abortSignal?: AbortSignal;
+  logger?: FunctionLogger;
 }): Promise<boolean> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: CHECK FOR PENDING TEST PLAN APPROVAL (MUST BE FIRST!)
   // ═══════════════════════════════════════════════════════════════════════
 
-  const approvalHandled = await handlePendingTestPlanApproval({
+  const handlePendingTestPlanApprovalWithLogging = params.logger
+    ? withFunctionLogging(handlePendingTestPlanApproval, 'handlePendingTestPlanApproval', params.logger)
+    : handlePendingTestPlanApproval;
+  const approvalHandled = await handlePendingTestPlanApprovalWithLogging({
     req: params.req,
     res: params.res,
     message: params.message,
@@ -36,6 +41,7 @@ export async function checkPendingApproval(params: {
     chatSessionId: params.chatSessionId,
     workspace_id: params.workspace_id,
     abortSignal: params.abortSignal,
+    logger: params.logger,
   });
 
   // If approval was handled (approved/rejected/clarification), return early
@@ -65,6 +71,7 @@ export async function handlePendingTestPlanApproval(params: {
   chatSessionId?: string;
   workspace_id: string;
   abortSignal?: AbortSignal;
+  logger?: FunctionLogger;
 }): Promise<boolean> {
   const { req, res, message, conversationId, userId, chatSessionId, workspace_id } = params;
 
@@ -83,7 +90,10 @@ export async function handlePendingTestPlanApproval(params: {
 
   if (chatSessionId) {
     try {
-      const recentMessages = await ChatService.getRecentMessages(chatSessionId, userId, 5); // Last 5 messages (SECURITY: Pass userId)
+      const getRecentMessagesWithLogging = params.logger
+        ? withFunctionLogging(ChatService.getRecentMessages.bind(ChatService), 'ChatService.getRecentMessages', params.logger)
+        : ChatService.getRecentMessages.bind(ChatService);
+      const recentMessages = await getRecentMessagesWithLogging(chatSessionId, userId, 5); // Last 5 messages (SECURITY: Pass userId)
 
       // Find last AI message
       // ✅ getRecentMessages returns messages in chronological order (oldest first) after .reverse()
@@ -123,7 +133,10 @@ export async function handlePendingTestPlanApproval(params: {
 
   // Find pending test plan (parallel search for performance)
   // If pending plan exists, it means there WAS a test plan, even if last AI message doesn't have metadata
-  const pendingPlan = await findPendingTestPlan(conversationId, userId);
+  const findPendingTestPlanWithLogging = params.logger
+    ? withFunctionLogging(findPendingTestPlan, 'findPendingTestPlan', params.logger)
+    : findPendingTestPlan;
+  const pendingPlan = await findPendingTestPlanWithLogging(conversationId, userId, params.logger);
 
   // If we found a pending plan, treat it as if last AI message was a test plan
   // This handles cases where AI responded with "Yes, I remember..." but plan exists in DB
@@ -199,7 +212,10 @@ export async function handlePendingTestPlanApproval(params: {
       }
 
       // Execute the plan
-      await executeApprovedTestPlan(req, res, {
+      const executeApprovedTestPlanWithLogging = params.logger
+        ? withFunctionLogging(executeApprovedTestPlan, 'executeApprovedTestPlan', params.logger)
+        : executeApprovedTestPlan;
+      await executeApprovedTestPlanWithLogging(req, res, {
         planId: pendingPlan.id,
         userId,
         chatSessionId,
@@ -226,11 +242,15 @@ export async function handlePendingTestPlanApproval(params: {
         logger.warn('[APPROVAL_CHECK] Failed to mark plan as expired', { error: expireError, planId: pendingPlan.id });
       }
 
-      await saveAndRespond(
+      const saveAndRespondWithLogging = params.logger
+        ? withFunctionLogging(saveAndRespond, 'saveAndRespond', params.logger)
+        : saveAndRespond;
+      await saveAndRespondWithLogging(
         chatSessionId,
         res,
         message,
-        'Понял, создаю новый тест-план. Пожалуйста, опишите, что вы хотите протестировать.'
+        'Понял, создаю новый тест-план. Пожалуйста, опишите, что вы хотите протестировать.',
+        params.logger
       );
       return true;
     }
@@ -240,7 +260,10 @@ export async function handlePendingTestPlanApproval(params: {
       ? `${expiredHoursAgo} ${expiredHoursAgo === 1 ? 'час' : expiredHoursAgo < 5 ? 'часа' : 'часов'} назад`
       : `${Math.floor(expiredHoursAgo / 24)} ${Math.floor(expiredHoursAgo / 24) === 1 ? 'день' : 'дня'} назад`;
 
-    await saveAndRespond(
+    const saveAndRespondWithLogging = params.logger
+      ? withFunctionLogging(saveAndRespond, 'saveAndRespond', params.logger)
+      : saveAndRespond;
+    await saveAndRespondWithLogging(
       chatSessionId,
       res,
       message,
@@ -258,7 +281,10 @@ export async function handlePendingTestPlanApproval(params: {
   // Check if request was cancelled
   if (params.abortSignal) {
     const { checkRequestAborted } = await import('./request-cancellation');
-    checkRequestAborted(params.abortSignal);
+    const checkRequestAbortedWithLogging = params.logger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', params.logger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(params.abortSignal);
   }
 
   // User is responding to test plan - process approval/rejection
@@ -271,14 +297,20 @@ export async function handlePendingTestPlanApproval(params: {
 
   // Use AI-based approval detection with context
   // Pass context that last AI message was a test plan (or pending plan exists in DB)
-  const approvalResult = await detectUserApproval(message, {
+  const detectUserApprovalWithLogging = params.logger
+    ? withFunctionLogging(detectUserApproval, 'detectUserApproval', params.logger)
+    : detectUserApproval;
+  const approvalResult = await detectUserApprovalWithLogging(message, {
     lastAiMessageWasTestPlan: lastAiMessageWasTestPlan,
   });
 
   // Check if request was cancelled after AI call
   if (params.abortSignal) {
     const { checkRequestAborted } = await import('./request-cancellation');
-    checkRequestAborted(params.abortSignal);
+    const checkRequestAbortedWithLogging = params.logger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', params.logger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(params.abortSignal);
   }
 
   logger.info('[CHAT] Test plan response detected', {
@@ -310,7 +342,10 @@ export async function handlePendingTestPlanApproval(params: {
       scope: pendingPlan.scope,
     });
 
-    await executeApprovedTestPlan(req, res, {
+    const executeApprovedTestPlanWithLogging = params.logger
+      ? withFunctionLogging(executeApprovedTestPlan, 'executeApprovedTestPlan', params.logger)
+      : executeApprovedTestPlan;
+    await executeApprovedTestPlanWithLogging(req, res, {
       planId: pendingPlan.id,
       userId,
       chatSessionId,
@@ -324,11 +359,15 @@ export async function handlePendingTestPlanApproval(params: {
   if (approvalResult.approved === false) {
     logger.info('[CHAT] Test plan rejected', { planId: pendingPlan.id });
 
-    await saveAndRespond(
+    const saveAndRespondWithLogging = params.logger
+      ? withFunctionLogging(saveAndRespond, 'saveAndRespond', params.logger)
+      : saveAndRespond;
+    await saveAndRespondWithLogging(
       chatSessionId,
       res,
       message,
-      MESSAGES.TEST_REJECTED
+      MESSAGES.TEST_REJECTED,
+      params.logger
     );
     return true;
   }
@@ -342,7 +381,8 @@ export async function handlePendingTestPlanApproval(params: {
  */
 export async function findPendingTestPlan(
   conversationId: string | undefined,
-  userId: string
+  userId: string,
+  functionLogger?: FunctionLogger
 ): Promise<any | null> {
   logger.info('🔍 [PENDING_PLAN_SEARCH] Starting parallel search', {
     conversationId: conversationId || 'NONE',
@@ -360,9 +400,15 @@ export async function findPendingTestPlan(
   }
 
   // Run both queries in parallel (50ms instead of 100ms)
+  const getTestPlanWithLogging = functionLogger
+    ? withFunctionLogging(getTestPlan, 'getTestPlan', functionLogger)
+    : getTestPlan;
+  const getLatestPendingTestPlanWithLogging = functionLogger
+    ? withFunctionLogging(getLatestPendingTestPlan, 'getLatestPendingTestPlan', functionLogger)
+    : getLatestPendingTestPlan;
   const [planByConversation, latestPlan] = await Promise.all([
-    isValidConversationId ? getTestPlan(conversationId, userId) : Promise.resolve(null),
-    getLatestPendingTestPlan(userId),
+    isValidConversationId ? getTestPlanWithLogging(conversationId, userId) : Promise.resolve(null),
+    getLatestPendingTestPlanWithLogging(userId),
   ]);
 
   // ✅ FIX: Check expires_at for planByConversation (getTestPlan already checks, but double-check for safety)
@@ -416,10 +462,14 @@ export async function saveAndRespond(
   chatSessionId: string | undefined,
   res: Response,
   userMessage: string,
-  aiMessage: string
+  aiMessage: string,
+  functionLogger?: FunctionLogger
 ): Promise<void> {
   if (chatSessionId) {
-    await ChatService.saveChatMessages(chatSessionId, [
+    const saveChatMessagesWithLogging = functionLogger
+      ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+      : ChatService.saveChatMessages.bind(ChatService);
+    await saveChatMessagesWithLogging(chatSessionId, [
       { role: 'user', content: userMessage },
       { role: 'ai', content: aiMessage },
     ]);

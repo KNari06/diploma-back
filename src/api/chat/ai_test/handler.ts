@@ -8,6 +8,7 @@ import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -42,11 +43,17 @@ export async function handlePlatformTest(
     conversationId?: string;
     answers?: Record<string, any>;
     abortSignal?: AbortSignal;
+    logger?: FunctionLogger;
   }
 ): Promise<void> {
-  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal } = params;
+  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal, logger: functionLogger } = params;
 
-  if (abortSignal) checkRequestAborted(abortSignal);
+  if (abortSignal) {
+    const checkRequestAbortedWithLogging = functionLogger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(abortSignal);
+  }
 
   // FIX #3: Setup timeout for entire platform test flow
   const flowStartTime = Date.now();
@@ -97,7 +104,10 @@ export async function handlePlatformTest(
     });
 
     // FIX #4: Better progress updates
-    emitProcessingStep(chatSessionId, 'checking_autonomous', '🤖 Analyzing your request...', 30);
+    const emitProcessingStepWithLogging = functionLogger
+      ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
+      : emitProcessingStep;
+    emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', '🤖 Analyzing your request...', 30);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 0: LOAD CHAT SESSION CONTEXT (FIX #1: Error handling)
@@ -106,7 +116,10 @@ export async function handlePlatformTest(
     let sessionProject: { id: string; name: string; settings?: { main_url?: string } } | null = null;
     if (chatSessionId) {
       try {
-        const sessionData = await ChatService.getSessionWithProject(chatSessionId, userId); // SECURITY: Pass userId for verification
+        const getSessionWithProjectWithLogging = functionLogger
+          ? withFunctionLogging(ChatService.getSessionWithProject.bind(ChatService), 'ChatService.getSessionWithProject', functionLogger)
+          : ChatService.getSessionWithProject.bind(ChatService);
+        const sessionData = await getSessionWithProjectWithLogging(chatSessionId, userId); // SECURITY: Pass userId for verification
 
         // Explicitly handle null/undefined cases for consistency
         if (sessionData?.project) {
@@ -167,7 +180,10 @@ export async function handlePlatformTest(
       });
 
       try {
-        const parsed = parseAnswers(answers);
+        const parseAnswersWithLogging = functionLogger
+          ? withFunctionLogging(parseAnswers, 'parseAnswers', functionLogger)
+          : parseAnswers;
+        const parsed = parseAnswersWithLogging(answers);
 
         // Only set parsedAnswers if we got meaningful data (not empty object)
         // This helps distinguish between "no answers" (null) and "empty answers" (empty object)
@@ -203,7 +219,10 @@ export async function handlePlatformTest(
       null;
 
     // Normalize URL: add https:// if protocol is missing
-    const extractedUrl = rawUrl ? normalizeUrl(rawUrl) : null;
+    const normalizeUrlWithLogging = functionLogger
+      ? withFunctionLogging(normalizeUrl, 'normalizeUrl', functionLogger)
+      : normalizeUrl;
+    const extractedUrl = rawUrl ? normalizeUrlWithLogging(rawUrl) : null;
 
     const hasUrl = !!extractedUrl;
     const hasScope = !!(parsedAnswers?.scope || parsedIntent?.scope);
@@ -248,7 +267,10 @@ export async function handlePlatformTest(
       }
 
       try {
-        const result = await requestMissingInformation(message, {
+        const requestMissingInformationWithLogging = functionLogger
+          ? withFunctionLogging(requestMissingInformation, 'requestMissingInformation', functionLogger)
+          : requestMissingInformation;
+        const result = await requestMissingInformationWithLogging(message, {
           hasUrl,
           hasScope,
           intent: 'platform_test',
@@ -264,7 +286,10 @@ export async function handlePlatformTest(
 
           const fullContent = `📝 I need some more information to set up the test:\n\n${questionsText}`;
 
-          ChatService.saveChatMessages(chatSessionId, [
+          const saveChatMessagesWithLogging = functionLogger
+            ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+            : ChatService.saveChatMessages.bind(ChatService);
+          saveChatMessagesWithLogging(chatSessionId, [
             { role: 'user', content: message },
             {
               role: 'ai',
@@ -304,11 +329,14 @@ export async function handlePlatformTest(
     // STEP 2: FIND OR CREATE PROJECT (FIX #1: Error handling)
     // ═══════════════════════════════════════════════════════════════════════
 
-    emitProcessingStep(chatSessionId, 'checking_autonomous', '🔍 Setting up project...', 40);
+    emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', '🔍 Setting up project...', 40);
 
     let project_id: string;
     try {
-      const projectResult = await ProjectContextService.findOrCreateProject(
+      const findOrCreateProjectWithLogging = functionLogger
+        ? withFunctionLogging(ProjectContextService.findOrCreateProject.bind(ProjectContextService), 'ProjectContextService.findOrCreateProject', functionLogger)
+        : ProjectContextService.findOrCreateProject.bind(ProjectContextService);
+      const projectResult = await findOrCreateProjectWithLogging(
         workspace_id,
         extractedUrl,
         userId
@@ -321,7 +349,10 @@ export async function handlePlatformTest(
 
       // Update session with project (non-blocking)
       if (chatSessionId) {
-        ChatService.updateSessionProject(chatSessionId, project_id, userId).catch(updateError => {
+        const updateSessionProjectWithLogging = functionLogger
+          ? withFunctionLogging(ChatService.updateSessionProject.bind(ChatService), 'ChatService.updateSessionProject', functionLogger)
+          : ChatService.updateSessionProject.bind(ChatService);
+        updateSessionProjectWithLogging(chatSessionId, project_id, userId).catch(updateError => {
           logger.warn('[PLATFORM_TEST] Failed to update session project', {
             error: updateError instanceof Error ? updateError.message : String(updateError),
           });
@@ -367,9 +398,12 @@ export async function handlePlatformTest(
     // Priority 2: Saved credentials from DB (if not found in answers or invalid)
     if (!finalCredentials) {
       try {
-        emitProcessingStep(chatSessionId, 'validating_credentials', '🔍 Getting saved credentials...', 45);
+        emitProcessingStepWithLogging(chatSessionId, 'validating_credentials', '🔍 Getting saved credentials...', 45);
 
-        const savedCredentials = await ProjectContextService.getProjectCredentials(project_id, userId);
+        const getProjectCredentialsWithLogging = functionLogger
+          ? withFunctionLogging(ProjectContextService.getProjectCredentials.bind(ProjectContextService), 'ProjectContextService.getProjectCredentials', functionLogger)
+          : ProjectContextService.getProjectCredentials.bind(ProjectContextService);
+        const savedCredentials = await getProjectCredentialsWithLogging(project_id, userId);
 
         if (savedCredentials) {
           logger.info('[PLATFORM_TEST] Found saved credentials in DB', { project_id });
@@ -395,7 +429,7 @@ export async function handlePlatformTest(
     // Replaces UiTestPlanService with real browser-based exploration
     // ═══════════════════════════════════════════════════════════════════════
 
-    emitProcessingStep(chatSessionId, 'generating_plan', '🔍 Analyzing page with real browser...', 50);
+    emitProcessingStepWithLogging(chatSessionId, 'generating_plan', '🔍 Analyzing page with real browser...', 50);
 
     // Determine scope: from answers > from parsedIntent
     const finalScope = parsedAnswers?.scope || parsedIntent.scope;
@@ -412,7 +446,10 @@ export async function handlePlatformTest(
     let testPlan, formattedPlan;
 
     try {
-      const result = await runAutonomousExploration({
+      const runAutonomousExplorationWithLogging = functionLogger
+        ? withFunctionLogging(runAutonomousExploration, 'runAutonomousExploration', functionLogger)
+        : runAutonomousExploration;
+      const result = await runAutonomousExplorationWithLogging({
         userMessage: message,
         answers: {
           url: extractedUrl,
@@ -480,7 +517,10 @@ export async function handlePlatformTest(
 
         // Save to history
         if (chatSessionId) {
-          ChatService.saveChatMessages(chatSessionId, [
+          const saveChatMessagesWithLogging = functionLogger
+            ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+            : ChatService.saveChatMessages.bind(ChatService);
+          saveChatMessagesWithLogging(chatSessionId, [
             { role: 'user', content: message },
             {
               role: 'ai',
@@ -523,7 +563,10 @@ export async function handlePlatformTest(
         // Re-ask with credentials question
         // Note: userProjects not needed here (only credentials question)
         try {
-          const result = await requestMissingInformation(message, {
+          const requestMissingInformationWithLogging = functionLogger
+            ? withFunctionLogging(requestMissingInformation, 'requestMissingInformation', functionLogger)
+            : requestMissingInformation;
+          const result = await requestMissingInformationWithLogging(message, {
             hasUrl: true,
             hasScope: true,
             hasCredentials: false, // ← Force credentials question
@@ -540,7 +583,10 @@ export async function handlePlatformTest(
 
             const fullContent = `🔐 This site requires authentication. Please provide your credentials:\n\n${questionsText}`;
 
-            ChatService.saveChatMessages(chatSessionId, [
+            const saveChatMessagesWithLogging = functionLogger
+              ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+              : ChatService.saveChatMessages.bind(ChatService);
+            saveChatMessagesWithLogging(chatSessionId, [
               { role: 'user', content: message },
               {
                 role: 'ai',
@@ -608,7 +654,10 @@ export async function handlePlatformTest(
 
     // Save to history (non-blocking)
     if (chatSessionId) {
-      ChatService.saveChatMessages(chatSessionId, [
+      const saveChatMessagesWithLogging = functionLogger
+        ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+        : ChatService.saveChatMessages.bind(ChatService);
+      saveChatMessagesWithLogging(chatSessionId, [
         { role: 'user', content: message },
         {
           role: 'ai',
@@ -674,7 +723,10 @@ export async function handlePlatformTest(
 
     // Save error to history (non-blocking)
     if (chatSessionId) {
-      ChatService.saveChatMessages(chatSessionId, [
+      const saveChatMessagesWithLogging = functionLogger
+        ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+        : ChatService.saveChatMessages.bind(ChatService);
+      saveChatMessagesWithLogging(chatSessionId, [
         { role: 'user', content: message },
         { role: 'ai', content: `❌ Error: ${errorMessage}` },
       ]).catch(saveError => {
