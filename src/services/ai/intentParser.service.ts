@@ -4,7 +4,7 @@ import { detectUserApproval, extractUrlWithGPT } from '@/services/ai/ai-helpers.
 // TODO: KB Search temporarily disabled - will be re-enabled later
 // import { detectLanguage, searchKB } from '@/services/kb/kb.service';
 // import { RulesCacheService } from '@/services/kb/rules-cache.service';
-import { IntentResult, IntentType, KNOWN_INTENTS, VALID_SCOPES } from '@/types';
+import { IntentResult, IntentType, VALID_SCOPES } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 
@@ -67,6 +67,38 @@ const withTimeout = <T>(promise: Promise<T>, ms: number, errorMsg: string): Prom
 };
 
 /**
+ * Simple language detection (heuristic)
+ * Detects Russian vs English based on Cyrillic characters
+ * TODO: Re-enable AI-based detection when KB service is re-enabled
+ */
+function detectLanguageSimple(message: string): 'en' | 'ru' | 'neutral' {
+  if (!message || typeof message !== 'string' || message.trim().length < 2) {
+    return 'neutral';
+  }
+
+  // Check for Cyrillic characters (Russian)
+  const cyrillicPattern = /[А-Яа-яЁё]/;
+  const hasCyrillic = cyrillicPattern.test(message);
+
+  // Count Cyrillic vs Latin characters
+  const cyrillicCount = (message.match(/[А-Яа-яЁё]/g) || []).length;
+  const latinCount = (message.match(/[A-Za-z]/g) || []).length;
+
+  // If Cyrillic characters present and more than Latin, assume Russian
+  if (hasCyrillic && cyrillicCount > latinCount / 2) {
+    return 'ru';
+  }
+
+  // If mostly Latin characters, assume English
+  if (latinCount > 3 && cyrillicCount === 0) {
+    return 'en';
+  }
+
+  // Default to neutral if unclear
+  return 'neutral';
+}
+
+/**
  * FIX #9: Safe cache setter with size limit
  * Prevents memory leak by enforcing MAX_CACHE_SIZE
  */
@@ -96,7 +128,8 @@ const setCacheEntry = (key: string, result: IntentResult): void => {
 export async function parseUserIntent(
   message: string,
   context?: IntentParserContext,
-  projectId?: string
+  projectId?: string,
+  availableIntents?: string[] // NEW: Dynamic list of available intents
 ): Promise<IntentResult | null> {
   try {
     // Step 1: Validate and prepare message
@@ -122,10 +155,13 @@ export async function parseUserIntent(
     // Temporary: Use empty context and default values
     const kbRulesContext: IntentParserContext = context || {};
     const kbRulesUsed = false;
-    const userLanguage: 'en' | 'ru' | 'neutral' = 'neutral';
+
+    // Detect user language from message (simple heuristic for now)
+    // TODO: Re-enable AI-based detection when KB service is re-enabled
+    const userLanguage = detectLanguageSimple(trimmedMessage);
 
     // Step 5: Parse intent with GPT
-    const intentResult = await parseIntentWithGPT(trimmedMessage, kbRulesContext);
+    const intentResult = await parseIntentWithGPT(trimmedMessage, kbRulesContext, availableIntents);
     if (!intentResult) {
       logger.warn('[INTENT_PARSER] Initial parse failed');
       return null;
@@ -155,7 +191,7 @@ export async function parseUserIntent(
         confidence,
       });
       // Force needs_clarification for incomplete intents
-      return createFallbackResult(intentResult, Math.min(confidence, 0.65), cacheKey);
+      return createFallbackResult(intentResult, Math.min(confidence, 0.65), cacheKey, userLanguage);
     }
 
     // Step 9: Handle high confidence results
@@ -173,7 +209,7 @@ export async function parseUserIntent(
       confidence,
       intent: intentResult.intent,
     });
-    return createFallbackResult(intentResult, confidence, cacheKey);
+    return createFallbackResult(intentResult, confidence, cacheKey, userLanguage);
 
   } catch (error) {
     logger.error('[INTENT_PARSER] Intent parsing failed', { error, message });
@@ -494,7 +530,8 @@ function isIntentCompleteness(intentResult: IntentResult): boolean {
 function createFallbackResult(
   intentResult: IntentResult,
   confidence: number,
-  cacheKey: string
+  cacheKey: string,
+  userLanguage: 'en' | 'ru' | 'neutral' = 'neutral'
 ): IntentResult {
   // If confidence is too low, ask user for clarification
   if (confidence < 0.7) {
@@ -515,6 +552,7 @@ function createFallbackResult(
       clarificationReason: intentResult.clarificationReason ||
         `Confidence score (${confidence.toFixed(2)}) is below threshold (0.7). Need more information to determine intent.`,
       rawText: intentResult.rawText,
+      userLanguage, // Include language for downstream use
       metadata: {
         ...intentResult.metadata,
         originalIntent: intentResult.intent,
@@ -527,7 +565,7 @@ function createFallbackResult(
   }
 
   // Confidence is acceptable, return original intent
-  const fallbackResult = { ...intentResult, confidence };
+  const fallbackResult = { ...intentResult, confidence, userLanguage };
   setCacheEntry(cacheKey, fallbackResult);
   return fallbackResult;
 }
@@ -724,11 +762,12 @@ function getPossibleIntents(intentResult: IntentResult): string[] {
  */
 async function parseIntentWithGPT(
   message: string,
-  context?: IntentParserContext
+  context?: IntentParserContext,
+  availableIntents?: string[] // NEW: Dynamic list of available intents
 ): Promise<IntentResult | null> {
   try {
     // Step 1: Prepare prompt and log context
-    const prompt = buildIntentPrompt(message, context);
+    const prompt = buildIntentPrompt(message, context, availableIntents); // Pass availableIntents
     logContextUsage(context);
 
     // Step 2: Setup model configuration
@@ -1471,13 +1510,11 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
     messageLength: trimmedMessage.length,
   };
 
-  // Step 7: Validate known intents
-  if (!KNOWN_INTENTS.includes(parsed.intent as any)) {
-    logger.warn('[INTENT_PARSER] Unknown intent detected', {
-      intent: parsed.intent,
-      knownIntents: KNOWN_INTENTS,
-    });
-  }
+  // Step 7: Log intent for monitoring (no validation against hardcoded list)
+  logger.info('[INTENT_PARSER] Intent parsed', {
+    intent: parsed.intent,
+    confidence: parsed.intent_confidence,
+  });
 
   // Step 8: Final validation and logging
   logger.info('[INTENT_PARSER] Intent finalized successfully', {

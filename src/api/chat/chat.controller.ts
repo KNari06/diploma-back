@@ -1,20 +1,19 @@
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
-import { ManualTestService } from '@/services/testing/ui/manualTest.service';
-import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 
 // Shared modules
 import { CONSTANTS, MESSAGES } from './shared/constants';
 import { parseIntent } from './shared/intent-parsing';
+import {
+  checkRequestAborted,
+  hasActiveRequest,
+  registerActiveRequest,
+  unregisterActiveRequest,
+} from './shared/request-cancellation';
 import { routeToHandler } from './shared/routing';
 import { checkPendingApproval } from './shared/test-plan-approval';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
-import {
-  registerActiveRequest,
-  unregisterActiveRequest,
-  checkRequestAborted,
-  hasActiveRequest,
-} from './shared/request-cancellation';
 
 // History handlers
 import { debugChatData, getChatHistory, getChatSessions, getCurrentChatHistory } from './history';
@@ -136,8 +135,9 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     checkRequestAborted(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 3: CHECK FOR PENDING TEST PLAN APPROVAL (MUST BE FIRST!)
+    // STEP 4: CHECK FOR PENDING TEST PLAN APPROVAL
     // ═══════════════════════════════════════════════════════════════════════
+    // Note: Regression commands now handled via intent parsing (no direct checks)
     const approvalHandled = await checkPendingApproval({
       req,
       res,
@@ -160,7 +160,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     checkRequestAborted(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 4: PARSE INTENT (Only if not responding to test plan) (FIX #5)
+    // STEP 5: PARSE INTENT (Only if not responding to test plan) (FIX #5)
     // ═══════════════════════════════════════════════════════════════════════
     const parsedIntent = await parseIntent(
       message,
@@ -176,7 +176,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     checkRequestAborted(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
+    // STEP 6: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
     // ═══════════════════════════════════════════════════════════════════════
     await routeToHandler(req, res, {
       message,

@@ -19,16 +19,110 @@ export interface IntentParserContext {
   tracesContext?: string;
   projectInfo?: string;
   chatHistory?: Array<{ role: string; content: string }>; // Chat history for context
+
+  // Regression context (for save/run test intents)
+  lastTestId?: string;          // ID of last executed test
+  lastTestGoal?: string;        // Goal/description of last test
+  savedCasesCount?: number;     // Number of saved test cases for project
+  suitesCount?: number;         // Number of suites for project
+  recentTestIds?: string[];     // List of recent test IDs
+
+  // Extended regression & execution context
+  recentTests?: Array<{
+    id: string;
+    goal?: string;
+    createdAt?: string;
+  }>;
+
+  currentTestStatus?: 'idle' | 'running' | 'completed' | 'failed';
+  lastTestAlreadySaved?: boolean;
+
+  buildVersion?: string;
+  environment?: 'local' | 'staging' | 'prod';
+}
+
+/**
+ * Build regression context section for intent prompt
+ */
+function buildRegressionContextSection(context?: IntentParserContext): string {
+  if (!context) return '';
+
+  const hasRegressionContext =
+    context.lastTestId ||
+    context.savedCasesCount !== undefined ||
+    context.suitesCount !== undefined ||
+    (context.recentTests && context.recentTests.length > 0);
+
+  if (!hasRegressionContext) return '';
+
+  const recentTestsBlock =
+    context.recentTests && context.recentTests.length > 0
+      ? context.recentTests
+          .slice(0, 5)
+          .map(
+            (t, i) =>
+              `${i + 1}. ID=${t.id}${t.goal ? ` | Goal=${t.goal}` : ''}${t.createdAt ? ` | At=${t.createdAt}` : ''}`
+          )
+          .join('\n')
+      : 'none';
+
+  return `
+--- REGRESSION TEST CONTEXT ---
+
+LAST TEST:
+- ID: ${context.lastTestId || 'none'}
+- Goal: ${context.lastTestGoal || 'none'}
+- Status: ${context.currentTestStatus || 'unknown'}
+- Already saved: ${context.lastTestAlreadySaved ? 'yes' : 'no'}
+
+RECENT TEST HISTORY (most recent first):
+${recentTestsBlock}
+
+AVAILABLE RESOURCES:
+- Saved test cases: ${context.savedCasesCount ?? 0}
+- Regression suites: ${context.suitesCount ?? 0}
+
+ENVIRONMENT:
+- Build version: ${context.buildVersion || 'unknown'}
+- Environment: ${context.environment || 'unknown'}
+
+CONTEXT RULES:
+- "save this" / "save flow":
+    • Allowed ONLY if last test status = completed
+    • If test is running → needs_clarification
+    • If already saved → general_chat (inform user)
+- If user references a test by description ("checkout test", "previous one"):
+    • Match against RECENT TEST HISTORY goals
+- If user wants to run saved test without ID/name → needs_clarification
+- If user wants to create suite:
+    • testCaseIds MUST NOT be empty
+    • If unresolved → needs_clarification
+`;
 }
 
 /**
  * Main intent parsing prompt
- * Determines user's intention: platform_test, api_test, or general_chat
+ * Determines user's intention dynamically based on available handlers
  */
 export function buildIntentPrompt(
   userMessage: string,
-  context?: IntentParserContext
+  context?: IntentParserContext,
+  availableIntents?: string[]
 ): string {
+  // Build dynamic intent list from handler registry or use defaults
+  const intents = availableIntents || [
+    'platform_test',
+    'api_test',
+    'general_chat',
+    'needs_clarification',
+    'save_test',
+    'create_suite',
+    'run_regression',
+  ];
+
+  // Build regression context if available
+  const regressionContextStr = buildRegressionContextSection(context);
+
   let prompt = `You are an AI assistant understanding natural language like ChatGPT. Analyze the MESSAGE CONTEXT to determine what the user truly wants.
 
 YOUR TASK: Understand the USER'S GOAL, not just match keywords.
@@ -45,6 +139,8 @@ Think like a human having a conversation:
 • If someone asks "How does it work?" → they want INFORMATION
 
 --- INTENT CLASSIFICATION (Priority: CONTEXT > Keywords) ---
+
+AVAILABLE INTENTS: ${intents.join(', ')}
 
 1. "platform_test" - User wants to RUN a new UI/website test
 
@@ -135,6 +231,88 @@ Think like a human having a conversation:
        "clarificationReason": "Missing endpoint URL"
      }
 
+5. "save_test" - User wants to SAVE current/last test flow for replay
+
+   CONTEXT CLUES (Primary):
+   - User says "save this", "save current flow", "save as [name]"
+   - User wants to preserve test for future re-runs
+   - Russian: "сохрани тест", "сохрани этот флоу"
+
+   REQUIRED CONTEXT: Recent test ID must be available
+   - Check context for lastTestId
+   - If no recent test → needs_clarification
+
+   Keywords: "save", "preserve", "store", "сохрани"
+
+   Examples:
+   - "save this flow"
+   - "save as checkout test"
+   - "сохрани этот тест как регресс"
+   - "preserve this test for later"
+
+   OUTPUT FIELDS:
+   {
+     "intent": "save_test",
+     "intent_confidence": 0.85-0.95,
+     "sourceTestId": "from-context-or-null",
+     "suggestedName": "extracted-from-message-or-null",
+     "rawText": string
+   }
+
+6. "create_suite" - User wants to CREATE a regression suite from multiple test cases
+
+   CONTEXT CLUES (Primary):
+   - User mentions "suite", "collection", "набор", "группа"
+   - User wants to group/combine multiple tests
+   - User mentions "regression suite"
+
+   Keywords: "suite", "collection", "group", "combine", "набор"
+
+   Examples:
+   - "create suite from these tests"
+   - "make a regression suite"
+   - "создай набор из этих тестов"
+   - "group these test cases together"
+
+   CRITICAL RULE:
+   - If testCaseIds cannot be resolved from context or message → use needs_clarification
+   - NEVER return create_suite with empty testCaseIds array
+
+   OUTPUT FIELDS:
+   {
+     "intent": "create_suite",
+     "intent_confidence": 0.80-0.95,
+     "suiteName": "extracted-from-message-or-null",
+     "testCaseIds": ["ids-from-context-or-empty"],
+     "rawText": string
+   }
+
+7. "run_regression" - User wants to RUN a saved test case or suite
+
+   CONTEXT CLUES (Primary):
+   - User says "run saved test", "run suite", "execute regression"
+   - User references test case ID or suite ID
+   - Russian: "запусти регресс", "запусти сохраненный тест"
+
+   Keywords: "run saved", "run suite", "execute regression", "запусти"
+
+   Examples:
+   - "run saved test abc123"
+   - "run suite xyz789"
+   - "execute the checkout regression"
+   - "запусти сохраненный тест"
+
+   OUTPUT FIELDS:
+   {
+     "intent": "run_regression",
+     "intent_confidence": 0.85-0.95,
+     "savedTestCaseId": "extracted-id-or-null",
+     "suiteId": "extracted-id-or-null",
+     "rawText": string
+   }
+
+${regressionContextStr}
+
 CRITICAL: READ THE CONTEXT, NOT JUST KEYWORDS!
 
 BAD (keyword matching):
@@ -164,17 +342,22 @@ QUICK DECISION TREE:
      • Message mentions "website", "page", "UI", "form" → platform_test
      • If unclear from URL/context → needs_clarification
 
-4. Is user ASKING about past tests or results? → general_chat
-5. Is user ASKING questions (how, what, why, did you)? → general_chat
-6. Is user having a CONVERSATION? → general_chat
-7. UNCERTAIN or MISSING critical info? → needs_clarification
-8. Still unclear after checking everything? → needs_clarification (ask for clarification)
+4. Is user trying to SAVE/MANAGE tests?
+   • "save this" / "save flow" / "сохрани" → save_test
+   • "create suite" / "make collection" / "создай набор" → create_suite
+   • "run saved test" / "run suite" / "запусти регресс" → run_regression
+
+5. Is user ASKING about past tests or results? → general_chat
+6. Is user ASKING questions (how, what, why, did you)? → general_chat
+7. Is user having a CONVERSATION? → general_chat
+8. UNCERTAIN or MISSING critical info? → needs_clarification
+9. Still unclear after checking everything? → needs_clarification (ask for clarification)
 
 --- JSON FORMAT (STRICT SCHEMA) ---
 
 REQUIRED FIELDS (always include):
 {
-  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification",
+  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "create_suite" | "run_regression",
   "intent_confidence": 0.0-1.0,  // REQUIRED! Your confidence in intent classification
   "rawText": string
 }
@@ -188,7 +371,15 @@ OPTIONAL FIELDS (include if relevant):
   "apiUrl": string | null,
   "apiBody": object | null,
   "apiHeaders": object | null,
-  "urgency": "high" | "normal" | null
+  "urgency": "high" | "normal" | null,
+
+  // Regression-specific fields
+  "sourceTestId": string | null,        // For save_test
+  "suggestedName": string | null,       // For save_test, create_suite
+  "suiteName": string | null,           // For create_suite
+  "testCaseIds": string[] | null,       // For create_suite
+  "savedTestCaseId": string | null,     // For run_regression
+  "suiteId": string | null,             // For run_regression
 }
 
 REQUIRED FOR needs_clarification (MUST NOT OMIT):
@@ -222,6 +413,24 @@ Ex4: "давай" (NO system-provided URL)
 
 Ex5: "test this" (NO URL provided)
 → {"intent": "needs_clarification", "intent_confidence": 0.50, "clarificationQuestion": "I'd like to help you test something. Could you provide the URL? Is it an API endpoint or a web page?", "possibleIntents": ["api_test", "platform_test"], "clarificationReason": "Missing URL and unclear intent", "rawText": "test this"}
+
+Ex6: "save this flow" (with lastTestId in context: "abc-123")
+→ {"intent": "save_test", "intent_confidence": 0.90, "sourceTestId": "abc-123", "suggestedName": null, "rawText": "save this flow"}
+
+Ex7: "save as checkout regression" (with lastTestId in context: "def-456")
+→ {"intent": "save_test", "intent_confidence": 0.95, "sourceTestId": "def-456", "suggestedName": "checkout regression", "rawText": "save as checkout regression"}
+
+Ex8: "create a suite with these 3 tests" (with context: recentTestIds = ["id1", "id2", "id3"])
+→ {"intent": "create_suite", "intent_confidence": 0.85, "suiteName": null, "testCaseIds": ["id1", "id2", "id3"], "rawText": "create a suite with these 3 tests"}
+
+Ex9: "run saved test abc-123"
+→ {"intent": "run_regression", "intent_confidence": 0.90, "savedTestCaseId": "abc-123", "suiteId": null, "rawText": "run saved test abc-123"}
+
+Ex10: "запусти сохраненный тест" (NO specific ID)
+→ {"intent": "needs_clarification", "intent_confidence": 0.60, "clarificationQuestion": "Which saved test would you like me to run? Please provide the test ID or name.", "possibleIntents": ["run_regression"], "clarificationReason": "Missing test ID", "rawText": "запусти сохраненный тест"}
+
+Ex11: "save this flow" (with lastTestId: none, currentTestStatus: idle)
+→ {"intent": "needs_clarification", "intent_confidence": 0.60, "clarificationQuestion": "Which test would you like to save? Please run a test first or provide a test ID.", "possibleIntents": ["save_test"], "clarificationReason": "No recent test available to save", "rawText": "save this flow"}
 
 --- CRITICAL RULES (PRIORITY ORDER) ---
 

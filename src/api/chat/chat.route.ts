@@ -282,54 +282,204 @@ router.post('/cancel',
     const userId = req.user!.id;
     const { sessionId } = req.body || {};
 
+    // ✅ FIX #1: Validate sessionId format if provided
+    const { isValidUUID } = await import('@/utils/validation/validation');
+    if (sessionId && !isValidUUID(sessionId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid sessionId format (must be UUID)',
+      });
+      return;
+    }
+
     // Get chat session ID
     let chatSessionId = sessionId;
 
     // If sessionId not provided, get the latest session for user
     if (!chatSessionId) {
-      const { ChatService } = await import('@/services/utils/chat.service');
-      const { getOrCreateChatSession } = await import('./shared/utils');
-      const { checkWorkspace } = await import('./shared/validation');
+      try {
+        const { getOrCreateChatSession } = await import('./shared/utils');
+        const { checkWorkspace } = await import('./shared/validation');
 
-      const workspace_id = await checkWorkspace(userId);
-      chatSessionId = await getOrCreateChatSession(userId, undefined, workspace_id, false);
+        const workspace_id = await checkWorkspace(userId);
+        chatSessionId = await getOrCreateChatSession(userId, undefined, workspace_id, false);
+
+        if (!chatSessionId) {
+          res.status(400).json({
+            success: false,
+            error: 'No chat session found. Please provide sessionId or create a new chat session.',
+          });
+          return;
+        }
+      } catch (error) {
+        logger.error('[CHAT] Failed to get chat session for cancel', {
+          error: error instanceof Error ? error.message : String(error),
+          userId,
+        });
+        res.status(500).json({
+          success: false,
+          error: 'Failed to get chat session',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
+        return;
+      }
+    } else {
+      // ✅ FIX #2: Verify session belongs to user (security check)
+      try {
+        const { supabaseAdmin } = await import('@/db/supabase');
+        const { data: session, error: sessionError } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('id, user_id')
+          .eq('id', chatSessionId)
+          .maybeSingle();
+
+        if (sessionError || !session) {
+          res.status(404).json({
+            success: false,
+            error: 'Chat session not found',
+          });
+          return;
+        }
+
+        if (session.user_id !== userId) {
+          res.status(403).json({
+            success: false,
+            error: 'Access denied to this chat session',
+          });
+          return;
+        }
+      } catch (error) {
+        logger.error('[CHAT] Failed to verify session ownership', {
+          error: error instanceof Error ? error.message : String(error),
+          sessionId: chatSessionId,
+        });
+        res.status(500).json({
+          success: false,
+          error: 'Failed to verify session ownership',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
+        return;
+      }
     }
 
     // ✅ CRITICAL: Cancel active request processing first
-    // ✅ FIX #2: cancelActiveRequest is now async (deletes from Redis)
-    const { cancelActiveRequest } = await import('./shared/request-cancellation');
-    const requestCancelResult = await cancelActiveRequest(chatSessionId, userId);
-
-    // Cancel running tests
-    let testCancelResult = { success: true, cancelledCount: 0, errors: [] as string[] };
-    if (chatSessionId) {
-      try {
-        const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
-        testCancelResult = await ManualTestService.cancelAllRunningTestsForChatSession(chatSessionId, userId);
-      } catch (error) {
-        logger.warn('[CHAT] Failed to cancel tests', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        testCancelResult.errors.push(error instanceof Error ? error.message : String(error));
-      }
+    // ✅ FIX #3: Handle errors from cancelActiveRequest
+    let requestCancelResult: { cancelled: boolean; message?: string } = {
+      cancelled: false,
+      message: undefined
+    };
+    try {
+      const { cancelActiveRequest } = await import('./shared/request-cancellation');
+      requestCancelResult = await cancelActiveRequest(chatSessionId, userId);
+    } catch (error) {
+      logger.error('[CHAT] Failed to cancel active request', {
+        error: error instanceof Error ? error.message : String(error),
+        chatSessionId,
+        userId,
+      });
+      // Continue - try to cancel tests anyway
     }
+
+    // Cancel running tests (chatSessionId is guaranteed to be set at this point)
+    let testCancelResult = { success: true, cancelledCount: 0, errors: [] as string[] };
+    try {
+      const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
+      testCancelResult = await ManualTestService.cancelAllRunningTestsForChatSession(chatSessionId!, userId);
+    } catch (error) {
+      logger.warn('[CHAT] Failed to cancel tests', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      testCancelResult.errors.push(error instanceof Error ? error.message : String(error));
+      testCancelResult.success = false;
+    }
+
+    // ✅ FIX #4: Cancel regression runs for chat session
+    // Note: Regression runs create regular tests via ManualTestService.runTest,
+    // so those tests are already cancelled above. We also cancel the regression_run records
+    // that were triggered via chat and are still running.
+    let regressionCancelResult = { cancelledCount: 0, errors: [] as string[] };
+    try {
+      const { supabaseAdmin } = await import('@/db/supabase');
+
+      // Find regression runs triggered via chat that are still running
+      // These are linked to tests in this session through test_chat_mappings
+      const { data: regressionRuns, error: runsError } = await supabaseAdmin
+        .from('regression_runs')
+        .select('id, status, trigger')
+        .eq('user_id', userId)
+        .eq('trigger', 'chat')
+        .in('status', ['running', 'pending'])
+        .order('created_at', { ascending: false })
+        .limit(50); // Limit to prevent too many updates
+
+      if (!runsError && regressionRuns && regressionRuns.length > 0) {
+        // Get test IDs from this chat session to verify linkage
+        const { data: testMappings } = await supabaseAdmin
+          .from('test_chat_mappings')
+          .select('test_id')
+          .eq('chat_session_id', chatSessionId!);
+
+        const sessionTestIds = new Set(testMappings?.map(m => m.test_id) || []);
+
+        // Cancel regression runs (they create tests that are linked to session)
+        for (const run of regressionRuns) {
+          try {
+            // Update regression run status to cancelled
+            const { error: updateError } = await supabaseAdmin
+              .from('regression_runs')
+              .update({
+                status: 'cancelled',
+                completed_at: new Date().toISOString(),
+              })
+              .eq('id', run.id)
+              .eq('user_id', userId);
+
+            if (updateError) {
+              regressionCancelResult.errors.push(`Failed to cancel regression run ${run.id}: ${updateError.message}`);
+            } else {
+              regressionCancelResult.cancelledCount++;
+              logger.info('[CHAT] Cancelled regression run', { runId: run.id, chatSessionId });
+            }
+          } catch (error) {
+            regressionCancelResult.errors.push(`Error cancelling regression run ${run.id}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn('[CHAT] Failed to cancel regression runs', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      regressionCancelResult.errors.push(error instanceof Error ? error.message : String(error));
+    }
+
+    // Combine all errors
+    const allErrors = [...testCancelResult.errors, ...regressionCancelResult.errors];
+    const totalCancelled = testCancelResult.cancelledCount + regressionCancelResult.cancelledCount;
 
     logger.info(`[CHAT] Cancelled request and tests via cancel endpoint`, {
       chatSessionId,
       userId,
       requestCancelled: requestCancelResult.cancelled,
       testsCancelled: testCancelResult.cancelledCount,
+      regressionRunsCancelled: regressionCancelResult.cancelledCount,
+      totalCancelled,
+      errorsCount: allErrors.length,
     });
 
-    res.status(200).json({
-      success: true,
+    // ✅ FIX #5: Return success=false if there were critical errors
+    const hasCriticalErrors = allErrors.length > 0 && !requestCancelResult.cancelled && totalCancelled === 0;
+
+    res.status(hasCriticalErrors ? 500 : 200).json({
+      success: !hasCriticalErrors,
       requestCancelled: requestCancelResult.cancelled,
       testsCancelled: testCancelResult.cancelledCount,
-      errors: testCancelResult.errors,
+      regressionRunsCancelled: regressionCancelResult.cancelledCount,
+      totalCancelled,
+      errors: allErrors,
       message: requestCancelResult.cancelled
-        ? `Cancelled request processing${testCancelResult.cancelledCount > 0 ? ` and ${testCancelResult.cancelledCount} test(s)` : ''}`
-        : testCancelResult.cancelledCount > 0
-        ? `Cancelled ${testCancelResult.cancelledCount} test(s)`
+        ? `Cancelled request processing${totalCancelled > 0 ? ` and ${totalCancelled} test(s)/run(s)` : ''}`
+        : totalCancelled > 0
+        ? `Cancelled ${totalCancelled} test(s)/run(s)`
         : 'No active request or tests to cancel',
     });
   })

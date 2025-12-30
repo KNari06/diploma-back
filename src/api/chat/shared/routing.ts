@@ -1,14 +1,13 @@
 import { Request, Response } from 'express';
-import { handlePlatformTest } from '../ai_test/handler';
-import { handleApiTest } from '../api_test/handler';
-import { handleGeneralChat } from '../general/handler';
-import { handleClarificationRequest } from './clarification';
+import { INTENT_HANDLERS, getHandler } from './handler-registry';
 import { PROGRESS } from './constants';
 import { checkRequestAborted } from './request-cancellation';
 import { emitProcessingStep } from './utils';
+import { logger } from '@/utils/core/logger';
 
 /**
  * STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
+ * Uses dynamic handler registry instead of hardcoded if/else
  */
 export async function routeToHandler(
   req: Request,
@@ -26,7 +25,7 @@ export async function routeToHandler(
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
+  // STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT (DYNAMIC)
   // ═══════════════════════════════════════════════════════════════════════
 
   emitProcessingStep(params.chatSessionId, 'generating_plan', '🚀 Processing your request...', PROGRESS.ROUTING);
@@ -37,49 +36,40 @@ export async function routeToHandler(
 
   const intent = params.parsedIntent?.intent || 'general_chat';
 
-  // Handle clarification requests (new!)
-  if (intent === 'needs_clarification') {
-    return await handleClarificationRequest(req, res, {
-      parsedIntent: params.parsedIntent,
-      userId: params.userId,
-      chatSessionId: params.chatSessionId,
-      abortSignal: params.abortSignal,
-    });
-  }
+  logger.info('[ROUTING] Routing to handler', { intent, userId: params.userId });
 
-  if (intent === 'platform_test') {
-    return await handlePlatformTest(req, res, {
+  // Get handler from registry (dynamic lookup)
+  const handler = getHandler(intent);
+
+  if (!handler) {
+    // Fallback to general_chat if handler not found
+    logger.warn('[ROUTING] No handler found for intent, falling back to general_chat', { intent });
+    const fallbackHandler = getHandler('general_chat');
+
+    if (!fallbackHandler) {
+      throw new Error('Critical error: general_chat handler not registered');
+    }
+
+    return await fallbackHandler(req, res, {
       message: params.message,
-      parsedIntent: params.parsedIntent,
       userId: params.userId,
       workspace_id: params.workspace_id,
       chatSessionId: params.chatSessionId,
-      conversationId: params.conversationId,
-      answers: params.answers,
+      context: params.context,
       abortSignal: params.abortSignal,
     });
   }
 
-  if (intent === 'api_test') {
-    return await handleApiTest(req, res, {
-      message: params.message,
-      parsedIntent: params.parsedIntent,
-      userId: params.userId,
-      workspace_id: params.workspace_id,
-      chatSessionId: params.chatSessionId,
-      conversationId: params.conversationId,
-      answers: params.answers,
-      abortSignal: params.abortSignal,
-    });
-  }
-
-  // general_chat
-  return await handleGeneralChat(req, res, {
+  // Call the handler with all params
+  return await handler(req, res, {
     message: params.message,
+    parsedIntent: params.parsedIntent,
     userId: params.userId,
+    workspace_id: params.workspace_id,
     chatSessionId: params.chatSessionId,
+    conversationId: params.conversationId,
+    answers: params.answers,
     context: params.context,
-    userLanguage: params.parsedIntent?.userLanguage, // Pass language from intent parser (avoid re-detection)
     abortSignal: params.abortSignal,
   });
 }

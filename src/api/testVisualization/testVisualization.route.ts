@@ -5,6 +5,7 @@ import {
     getTestVisualization,
     parseTestSteps,
     validateTestSteps,
+    getProjectOverall,
 } from './testVisualization.controller';
 
 const router = Router();
@@ -129,6 +130,144 @@ router.post('/export', requireAuth, exportTestGraph);
  *         description: Unauthorized
  */
 router.post('/validate', requireAuth, validateTestSteps);
+
+/**
+ * @swagger
+ * /api/v1/test-visualization/project/{projectId}/overall:
+ *   get:
+ *     summary: Get project-level overall visualization (planet view)
+ *     description: |
+ *       Returns comprehensive project visualization with all test entities,
+ *       their relationships, and clusters for the frontend "planet" view.
+ *
+ *       **Includes:**
+ *       - All tests in project with status flags (success/failed/danger/cancelled)
+ *       - Relationship edges between related tests
+ *       - Clusters of related test flows (spheres)
+ *     tags: [Test Visualization]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Project ID (UUID)
+ *         example: "550e8400-e29b-41d4-a716-446655440000"
+ *     responses:
+ *       200:
+ *         description: Project overall visualization successfully retrieved
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     nodes:
+ *                       type: array
+ *                       description: Test entities as nodes
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                             format: uuid
+ *                           entityType:
+ *                             type: string
+ *                             enum: [test_run, saved_case, suite]
+ *                           label:
+ *                             type: string
+ *                           statusFlag:
+ *                             type: string
+ *                             enum: [success, failed, danger, cancelled]
+ *                           source:
+ *                             type: string
+ *                             enum: [manual, intelligent, api, regression]
+ *                           lastRunAt:
+ *                             type: string
+ *                             format: date-time
+ *                             nullable: true
+ *                           meta:
+ *                             type: object
+ *                     edges:
+ *                       type: array
+ *                       description: Relationships between nodes
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           id:
+ *                             type: string
+ *                           source:
+ *                             type: string
+ *                           target:
+ *                             type: string
+ *                           relationshipType:
+ *                             type: string
+ *                             enum: [url, page_flow, semantic, temporal]
+ *                           confidence:
+ *                             type: number
+ *                             minimum: 0
+ *                             maximum: 1
+ *                           reasons:
+ *                             type: array
+ *                             items:
+ *                               type: string
+ *                     clusters:
+ *                       type: array
+ *                       description: Related test clusters (spheres)
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           clusterId:
+ *                             type: string
+ *                           label:
+ *                             type: string
+ *                           memberNodeIds:
+ *                             type: array
+ *                             items:
+ *                               type: string
+ *                           confidence:
+ *                             type: number
+ *                           reasons:
+ *                             type: array
+ *                             items:
+ *                               type: string
+ *                     metadata:
+ *                       type: object
+ *                       properties:
+ *                         projectId:
+ *                           type: string
+ *                         totalTests:
+ *                           type: number
+ *                         totalSavedCases:
+ *                           type: number
+ *                         totalSuites:
+ *                           type: number
+ *                         generatedAt:
+ *                           type: string
+ *                           format: date-time
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: Bad request - invalid project ID format
+ *       401:
+ *         description: Unauthorized - authentication required
+ *       403:
+ *         description: Forbidden - access denied to this project
+ *       404:
+ *         description: Project not found
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/project/:projectId/overall', requireAuth, getProjectOverall);
 
 /**
  * @swagger
