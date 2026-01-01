@@ -1,9 +1,10 @@
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
+import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
-import { INTENT_HANDLERS, getHandler } from './handler-registry';
 import { PROGRESS } from './constants';
+import { getHandler } from './handler-registry';
 import { checkRequestAborted } from './request-cancellation';
 import { emitProcessingStep } from './utils';
-import { logger } from '@/utils/core/logger';
 
 /**
  * STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
@@ -22,45 +23,52 @@ export async function routeToHandler(
     answers?: Record<string, any>;
     context?: any;
     abortSignal?: AbortSignal;
+    logger?: FunctionLogger;
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT (DYNAMIC)
   // ═══════════════════════════════════════════════════════════════════════
 
-  emitProcessingStep(params.chatSessionId, 'generating_plan', '🚀 Processing your request...', PROGRESS.ROUTING);
+  const emitProcessingStepWithLogging = params.logger
+    ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', params.logger)
+    : emitProcessingStep;
+  emitProcessingStepWithLogging(
+    params.chatSessionId,
+    'generating_plan',
+    '🚀 Processing your request...',
+    PROGRESS.ROUTING
+  );
 
   if (params.abortSignal) {
-    checkRequestAborted(params.abortSignal);
+    const checkRequestAbortedWithLogging = params.logger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', params.logger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(params.abortSignal);
   }
 
   const intent = params.parsedIntent?.intent || 'general_chat';
 
-  logger.info('[ROUTING] Routing to handler', { intent, userId: params.userId });
+  logger.info('[ROUTING] Routing to handler', {
+    intent,
+    userId: params.userId,
+  });
 
   // Get handler from registry (dynamic lookup)
-  const handler = getHandler(intent);
+  let handler = getHandler(intent);
 
+  // Fallback to general_chat if handler not found
   if (!handler) {
-    // Fallback to general_chat if handler not found
-    logger.warn('[ROUTING] No handler found for intent, falling back to general_chat', { intent });
-    const fallbackHandler = getHandler('general_chat');
+    logger.warn('[ROUTING] No handler found for intent, falling back to general_chat', {
+      intent,
+    });
+    handler = getHandler('general_chat');
 
-    if (!fallbackHandler) {
+    if (!handler) {
       throw new Error('Critical error: general_chat handler not registered');
     }
-
-    return await fallbackHandler(req, res, {
-      message: params.message,
-      userId: params.userId,
-      workspace_id: params.workspace_id,
-      chatSessionId: params.chatSessionId,
-      context: params.context,
-      abortSignal: params.abortSignal,
-    });
   }
 
-  // Call the handler with all params
   return await handler(req, res, {
     message: params.message,
     parsedIntent: params.parsedIntent,

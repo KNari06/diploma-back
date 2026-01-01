@@ -1,4 +1,5 @@
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -24,6 +25,10 @@ import { debugChatData, getChatHistory, getChatSessions, getCurrentChatHistory }
  * ═══════════════════════════════════════════════════════════════════════════
  */
 export const handleChat = async (req: Request, res: Response): Promise<void> => {
+  // Initialize function logger
+  const functionLogger = new FunctionLogger();
+  functionLogger.logFunctionCall('handleChat', [req, res], undefined);
+
   // FIX #8: Setup global timeout for entire request
   const requestStartTime = Date.now();
   const checkRequestTimeout = () => {
@@ -50,7 +55,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 0: INPUT VALIDATION (FIX #1 & #2)
     // ═══════════════════════════════════════════════════════════════════════
-    const inputResult = validateInput(req, res, checkConnection);
+    const validateInputWithLogging = withFunctionLogging(validateInput, 'validateInput', functionLogger);
+    const inputResult = validateInputWithLogging(req, res, checkConnection, functionLogger);
     if (!inputResult) {
       return; // Response already sent in validateInput
     }
@@ -62,7 +68,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 1: WORKSPACE CHECK (MANDATORY!) (FIX #3)
     // ═══════════════════════════════════════════════════════════════════════
-    const workspace_id = await checkWorkspace(userId);
+    const checkWorkspaceWithLogging = withFunctionLogging(checkWorkspace, 'checkWorkspace', functionLogger);
+    const workspace_id = await checkWorkspaceWithLogging(userId, functionLogger);
     checkRequestTimeout();
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -70,7 +77,12 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // ═══════════════════════════════════════════════════════════════════════
     // Check minimum credits required for chat (1 credit)
     // This prevents wasting resources on intent parsing, AI calls, etc. if user has no credits
-    const chatCreditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'chat');
+    const checkCreditsForTestWithLogging = withFunctionLogging(
+      CreditCostTrackerService.checkCreditsForTest.bind(CreditCostTrackerService),
+      'CreditCostTrackerService.checkCreditsForTest',
+      functionLogger
+    );
+    const chatCreditCheck = await checkCreditsForTestWithLogging(userId, 'chat');
 
     if (!chatCreditCheck.hasEnough) {
       logger.warn('[CHAT] Insufficient credits for chat', {
@@ -99,7 +111,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 2: CHAT SESSION MANAGEMENT (FIX #4)
     // ═══════════════════════════════════════════════════════════════════════
-    chatSessionId = await manageChatSession(userId, sessionId, workspace_id, checkRequestTimeout);
+    const manageChatSessionWithLogging = withFunctionLogging(manageChatSession, 'manageChatSession', functionLogger);
+    chatSessionId = await manageChatSessionWithLogging(userId, sessionId, workspace_id, checkRequestTimeout, functionLogger);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 2.2: PREVENT UNEXPECTED CONCURRENT REQUESTS
@@ -107,7 +120,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // Frontend should not send a new message while previous request is processing.
     // If it happens anyway (retries/double submit), return 409 and do NOT cancel anything automatically.
     // ✅ FIX #2: hasActiveRequest is now async (checks Redis)
-    if (await hasActiveRequest(chatSessionId, userId)) {
+    const hasActiveRequestWithLogging = withFunctionLogging(hasActiveRequest, 'hasActiveRequest', functionLogger);
+    if (await hasActiveRequestWithLogging(chatSessionId, userId)) {
       if (!res.headersSent) {
         res.status(409).json({
           success: false,
@@ -125,20 +139,22 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // ═══════════════════════════════════════════════════════════════════════
     // Register this request so it can be cancelled via /cancel endpoint
     // ✅ FIX #2: registerActiveRequest is now async (stores in Redis)
-    abortController = await registerActiveRequest(chatSessionId, userId, message);
+    const registerActiveRequestWithLogging = withFunctionLogging(registerActiveRequest, 'registerActiveRequest', functionLogger);
+    abortController = await registerActiveRequestWithLogging(chatSessionId, userId, message);
     const abortSignal = abortController.signal;
 
     // Check if already aborted (shouldn't happen, but safety check)
-    checkRequestAborted(abortSignal);
+    const checkRequestAbortedWithLogging = withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger);
+    checkRequestAbortedWithLogging(abortSignal);
 
     // Check if request was cancelled
-    checkRequestAborted(abortSignal);
+    checkRequestAbortedWithLogging(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 4: CHECK FOR PENDING TEST PLAN APPROVAL
     // ═══════════════════════════════════════════════════════════════════════
-    // Note: Regression commands now handled via intent parsing (no direct checks)
-    const approvalHandled = await checkPendingApproval({
+    const checkPendingApprovalWithLogging = withFunctionLogging(checkPendingApproval, 'checkPendingApproval', functionLogger);
+    const approvalHandled = await checkPendingApprovalWithLogging({
       req,
       res,
       message,
@@ -148,37 +164,43 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       workspace_id,
       checkRequestTimeout,
       abortSignal, // Pass abort signal for cancellation checks
+      logger: functionLogger,
     });
 
     if (approvalHandled) {
       // ✅ FIX #2: unregisterActiveRequest is now async
-      await unregisterActiveRequest(chatSessionId, userId);
+      const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
+      await unregisterActiveRequestWithLogging(chatSessionId, userId);
+      await functionLogger.flushSync();
       return; // Approval was handled, response already sent
     }
 
     // Check if request was cancelled
-    checkRequestAborted(abortSignal);
+    checkRequestAbortedWithLogging(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 5: PARSE INTENT (Only if not responding to test plan) (FIX #5)
     // ═══════════════════════════════════════════════════════════════════════
-    const parsedIntent = await parseIntent(
+    const parseIntentWithLogging = withFunctionLogging(parseIntent, 'parseIntent', functionLogger);
+    const parsedIntent = await parseIntentWithLogging(
       message,
       context,
       chatSessionId,
       userId,
       workspace_id,
       checkRequestTimeout,
-      abortSignal // Pass abort signal for cancellation checks
+      abortSignal, // Pass abort signal for cancellation checks
+      functionLogger
     );
 
     // Check if request was cancelled
-    checkRequestAborted(abortSignal);
+    checkRequestAbortedWithLogging(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 6: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
     // ═══════════════════════════════════════════════════════════════════════
-    await routeToHandler(req, res, {
+    const routeToHandlerWithLogging = withFunctionLogging(routeToHandler, 'routeToHandler', functionLogger);
+    await routeToHandlerWithLogging(req, res, {
       message,
       parsedIntent,
       userId,
@@ -188,18 +210,36 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       answers,
       context,
       abortSignal, // Pass abort signal for cancellation checks
+      logger: functionLogger,
     });
 
     // Unregister request on successful completion
     // ✅ FIX #2: unregisterActiveRequest is now async
-    await unregisterActiveRequest(chatSessionId, userId);
+    const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
+    await unregisterActiveRequestWithLogging(chatSessionId, userId);
+
+    // Log handleChat success and flush
+    functionLogger.logFunctionCall('handleChat', [req, res], { success: true });
+    await functionLogger.flushSync();
 
   } catch (error) {
+    // Log handleChat error
+    functionLogger.logFunctionCall(
+      'handleChat',
+      [req, res],
+      undefined,
+      error instanceof Error ? error : new Error(String(error))
+    );
+
     // Unregister request on error
     if (chatSessionId && userId) {
       // ✅ FIX #2: unregisterActiveRequest is now async
-      await unregisterActiveRequest(chatSessionId, userId);
+      const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
+      await unregisterActiveRequestWithLogging(chatSessionId, userId);
     }
+
+    // Flush logs before handling error
+    await functionLogger.flushSync();
 
     // Check if request was cancelled
     if (error instanceof Error && (

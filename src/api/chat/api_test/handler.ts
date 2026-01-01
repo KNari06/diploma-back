@@ -8,6 +8,7 @@ import { emitProcessingStep } from '../shared/utils';
 import { convertApiTestPlanToTestPlan } from './formatting';
 import { CONSTANTS } from '../shared/constants';
 import { checkRequestAborted } from '../shared/request-cancellation';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -26,11 +27,17 @@ export async function handleApiTest(
     conversationId?: string;
     answers?: Record<string, any>;
     abortSignal?: AbortSignal;
+    logger?: FunctionLogger;
   }
 ): Promise<void> {
-  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal } = params;
+  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal, logger: functionLogger } = params;
 
-  if (abortSignal) checkRequestAborted(abortSignal);
+  if (abortSignal) {
+    const checkRequestAbortedWithLogging = functionLogger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(abortSignal);
+  }
 
   try {
     // FIX #8: Validate and merge answers into parsedIntent if provided
@@ -84,7 +91,10 @@ export async function handleApiTest(
       hasAnswers: !!answers,
     });
 
-    emitProcessingStep(chatSessionId, 'checking_autonomous', '🔍 Analyzing API request...', 30);
+    const emitProcessingStepWithLogging = functionLogger
+      ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
+      : emitProcessingStep;
+    emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', '🔍 Analyzing API request...', 30);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 1: VALIDATE API INFO - ASK FOR MISSING DETAILS
@@ -133,7 +143,10 @@ export async function handleApiTest(
 
       // Save to history
       if (chatSessionId) {
-        await ChatService.saveChatMessages(chatSessionId, [
+        const saveChatMessagesWithLogging = functionLogger
+          ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+          : ChatService.saveChatMessages.bind(ChatService);
+        await saveChatMessagesWithLogging(chatSessionId, [
           { role: 'user', content: message },
           { role: 'ai', content: clarificationMessage },
         ]);
@@ -156,7 +169,10 @@ export async function handleApiTest(
     // STEP 2: FIND OR CREATE PROJECT
     // ═══════════════════════════════════════════════════════════════════════
 
-    const { project_id } = await ProjectContextService.findOrCreateProject(
+    const findOrCreateProjectWithLogging = functionLogger
+      ? withFunctionLogging(ProjectContextService.findOrCreateProject.bind(ProjectContextService), 'ProjectContextService.findOrCreateProject', functionLogger)
+      : ProjectContextService.findOrCreateProject.bind(ProjectContextService);
+    const { project_id } = await findOrCreateProjectWithLogging(
       workspace_id,
       parsedIntent.apiUrl,
       userId
@@ -166,9 +182,12 @@ export async function handleApiTest(
     // STEP 3: GENERATE API TEST PLAN
     // ═══════════════════════════════════════════════════════════════════════
 
-    emitProcessingStep(chatSessionId, 'generating_plan', '📋 Creating test plan...', 60);
+    emitProcessingStepWithLogging(chatSessionId, 'generating_plan', '📋 Creating test plan...', 60);
 
-    const apiTestPlan = await ApiTestPlanService.generateApiTestPlan({
+    const generateApiTestPlanWithLogging = functionLogger
+      ? withFunctionLogging(ApiTestPlanService.generateApiTestPlan.bind(ApiTestPlanService), 'ApiTestPlanService.generateApiTestPlan', functionLogger)
+      : ApiTestPlanService.generateApiTestPlan.bind(ApiTestPlanService);
+    const apiTestPlan = await generateApiTestPlanWithLogging({
       method: parsedIntent.apiMethod,
       url: parsedIntent.apiUrl,
       body: parsedIntent.apiBody,
@@ -181,7 +200,10 @@ export async function handleApiTest(
     // ═══════════════════════════════════════════════════════════════════════
 
     // Convert ApiTestPlan to TestPlan for storage and execution
-    const testPlan = convertApiTestPlanToTestPlan(apiTestPlan);
+    const convertApiTestPlanToTestPlanWithLogging = functionLogger
+      ? withFunctionLogging(convertApiTestPlanToTestPlan, 'convertApiTestPlanToTestPlan', functionLogger)
+      : convertApiTestPlanToTestPlan;
+    const testPlan = convertApiTestPlanToTestPlanWithLogging(apiTestPlan);
 
     // Save test plan to database for approval tracking
     // Note: userId/projectId are shortened for logs (privacy + readability)
@@ -193,7 +215,10 @@ export async function handleApiTest(
       status: testPlan.status,
     });
 
-    const saveResult = await saveTestPlan(testPlan, userId, project_id);
+    const saveTestPlanWithLogging = functionLogger
+      ? withFunctionLogging(saveTestPlan, 'saveTestPlan', functionLogger)
+      : saveTestPlan;
+    const saveResult = await saveTestPlanWithLogging(testPlan, userId, project_id);
 
     logger.info('[API_TEST] Test plan save result', {
       planId: testPlan.id,
@@ -204,11 +229,17 @@ export async function handleApiTest(
     // STEP 5: SHOW TEST PLAN TO USER FOR APPROVAL
     // ═══════════════════════════════════════════════════════════════════════
 
-    const formattedPlan = ApiTestPlanService.formatApiTestPlanForConfirmation(apiTestPlan);
+    const formatApiTestPlanForConfirmationWithLogging = functionLogger
+      ? withFunctionLogging(ApiTestPlanService.formatApiTestPlanForConfirmation.bind(ApiTestPlanService), 'ApiTestPlanService.formatApiTestPlanForConfirmation', functionLogger)
+      : ApiTestPlanService.formatApiTestPlanForConfirmation.bind(ApiTestPlanService);
+    const formattedPlan = formatApiTestPlanForConfirmationWithLogging(apiTestPlan);
 
     // Save chat messages
     if (chatSessionId) {
-      await ChatService.saveChatMessages(chatSessionId, [
+      const saveChatMessagesWithLogging = functionLogger
+        ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+        : ChatService.saveChatMessages.bind(ChatService);
+      await saveChatMessagesWithLogging(chatSessionId, [
         { role: 'user', content: message },
         {
           role: 'ai',
@@ -244,7 +275,10 @@ export async function handleApiTest(
 
     // Save error to history
     if (chatSessionId) {
-      await ChatService.saveChatMessages(chatSessionId, [
+      const saveChatMessagesWithLogging = functionLogger
+        ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
+        : ChatService.saveChatMessages.bind(ChatService);
+      await saveChatMessagesWithLogging(chatSessionId, [
         { role: 'user', content: params.message },
         { role: 'ai', content: `❌ Error: ${errorMessage}` },
       ]);
