@@ -134,19 +134,69 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         success: liteResult.success,
         iterations: liteResult.iterations,
         reason: liteResult.reason,
+        screenshotsCount: liteResult.screenshots.length,
       });
 
-      // Convert Lite result to format expected by rest of system
+      // Lite screenshots are uploaded during execution in LiteEngine (for real-time graph updates).
+      // IMPORTANT: Do NOT upload again here — avoids duplicates and broken index mapping on partial failures.
+
+      // Convert Lite result to format expected by rest of system (IntelligentTestResult)
+      // ✅ FIXED: Now includes all required fields for Pro parity
+
+      // Build screenshots array from graphData (source of truth for URLs + screenshot URLs)
+      const screenshots: Array<{ url: string; screenshot: string }> = [];
+      const seenScreenshotUrls = new Set<string>();
+      if (liteResult.graphData?.nodes) {
+        for (const node of liteResult.graphData.nodes as any[]) {
+          if (!node?.meta) continue;
+
+          const urlAfter: string | undefined = node.meta.urlAfter;
+          const urlBefore: string | undefined = node.meta.urlBefore;
+          const screenshotAfter: string | undefined = node.meta.screenshotAfter;
+          const screenshotBefore: string | undefined = node.meta.screenshotBefore;
+          const pageScreenshot: string | undefined = node.meta.screenshot; // page nodes
+
+          const pushIfNew = (url: string | undefined, screenshotUrl: string | undefined) => {
+            if (!screenshotUrl) return;
+            if (seenScreenshotUrls.has(screenshotUrl)) return;
+            seenScreenshotUrls.add(screenshotUrl);
+            screenshots.push({ url: url || testData.url, screenshot: screenshotUrl });
+          };
+
+          pushIfNew(urlBefore, screenshotBefore);
+          pushIfNew(urlAfter, screenshotAfter);
+          pushIfNew(urlAfter, pageScreenshot);
+        }
+      }
+
       intelligentResult = {
+        // Core fields
         success: liteResult.success,
+        goal: goal,
+        startUrl: testData.url,
         pagesVisited: 1,
         actionsTaken: liteResult.iterations,
         duration: liteResult.duration || 0,
         cost: liteResult.iterations * 0.001, // Approximate cost
-        screenshots: liteResult.screenshots.map(s => s.path),
-        finalUrl: testData.url,
+
+        // Error/warning tracking
+        errors: [], // Lite doesn't track errors in same format yet
+        warnings: [],
+
+        // Summary
         summary: liteResult.reason,
-        history: liteResult.history,
+
+        // Page visits (minimal for Lite)
+        pageVisits: [],
+
+        // Screenshots: Pro format, derived from graphData (already URLs)
+        screenshots,
+
+        // ✅ NEW: Full graph data like Pro
+        graphData: liteResult.graphData,
+
+        // Internal flags
+        _liteMode: true, // Flag to skip uploadIntelligentTestScreenshots
       };
     } else {
       // Use Pro Mode (existing IntelligentTestOrchestrator)
@@ -182,10 +232,28 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       : buildIntelligentTestConfig(testData, goal, hints, retryCount);
 
     await saveIntelligentTestResults(testData, intelligentResult, finalConfig);
-    const screenshotUrls = await uploadIntelligentTestScreenshots(
-      testData,
-      intelligentResult.screenshots || []
-    );
+
+    // Upload screenshots:
+    // - Lite mode: screenshots already uploaded as URLs, just extract them
+    // - Pro mode: screenshots are base64, need to upload to storage
+    let screenshotUrls: string[] = [];
+    if (intelligentResult._liteMode) {
+      // Lite mode: screenshots are already URLs
+      screenshotUrls = (intelligentResult.screenshots || [])
+        .map((s: { screenshot?: string }) => s.screenshot)
+        .filter((url: string | undefined): url is string => !!url);
+
+      logger.debug('[PLAYWRIGHT] Lite mode: using pre-uploaded screenshot URLs', {
+        testId: testData.testId,
+        count: screenshotUrls.length,
+      });
+    } else {
+      // Pro mode: upload base64 screenshots to storage
+      screenshotUrls = await uploadIntelligentTestScreenshots(
+        testData,
+        intelligentResult.screenshots || []
+      );
+    }
 
     // Collect artifacts and cleanup (best-effort)
     let artifacts: { videoPath?: string; tracePath?: string } = {};

@@ -2,10 +2,14 @@
  * LiteEngine
  * Main test execution engine with feedback loop and dual timeout
  * CORE: Test EVERY step before moving on
+ *
+ * ✅ NEW: Full GraphBuilder integration (like Pro) for real-time graph streaming
  */
 
+import { GraphBuilder, GraphUpdate } from '@/agent/utils/visualization/graph-builder.service';
 import { TestProgressEmitter } from '@/agent/utils/visualization/progress-emitter';
 import { logger } from '@/utils/core/logger';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Page } from 'playwright';
 import { StateDiffComputer } from './analysis/state-diff';
 import { StateValidator } from './analysis/state-validator';
@@ -16,8 +20,9 @@ import { ScreenshotCollector } from './collectors/screenshot-collector';
 import { SnapshotCollector } from './collectors/snapshot-collector';
 import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
+import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
-import type { ActionOutcome, AIDecision, LiteEngineConfig, LiteTestResult, StateDiff } from './lite-types';
+import type { ActionOutcome, AIDecision, ExecutionResult, LiteEngineConfig, LiteSnapshot, LiteTestResult, StateDiff } from './lite-types';
 import { LitePromptBuilder } from './prompt/lite-prompt-builder';
 
 export class LiteEngine {
@@ -29,7 +34,13 @@ export class LiteEngine {
   private consoleCollector: ConsoleCollector;
   private screenshotCollector: ScreenshotCollector;
   private progressEmitter: TestProgressEmitter;
+  private graphBuilder: GraphBuilder; // ✅ NEW: Full graph like Pro
   private startTime: number = 0;
+
+  // Track emitted node IDs to avoid duplicates
+  private emittedNodeIds = new Set<string>();
+  private emittedEdgeIds = new Set<string>();
+  private pendingGraphScreenshotUploads: Array<Promise<void>> = [];
 
   // Limits
   private readonly MAX_ITERATIONS = 20; // Step limit
@@ -43,6 +54,7 @@ export class LiteEngine {
     this.networkTracker = new NetworkTracker(page);
     this.consoleCollector = new ConsoleCollector(page);
     this.screenshotCollector = new ScreenshotCollector(config.testId);
+    this.graphBuilder = new GraphBuilder(); // ✅ NEW: Initialize graph builder
 
     // WebSocket progress
     this.progressEmitter = new TestProgressEmitter(
@@ -56,6 +68,7 @@ export class LiteEngine {
       goal: config.goal.slice(0, 100),
       maxIterations: this.MAX_ITERATIONS,
       timeout: this.TIMEOUT_MS,
+      hasGraphBuilder: true,
     });
   }
 
@@ -100,13 +113,17 @@ export class LiteEngine {
       testId: this.config.testId,
     });
 
-    // Emit start
+    // Emit start progress
     this.progressEmitter.emit({
       progress: 20,
       phase: 'execution',
       currentStep: '🚀 Starting Lite Engine',
       status: 'running',
     });
+
+    // ✅ NEW: Emit start node to graph (like Pro)
+    const startUpdate = this.graphBuilder.addStartNode();
+    this.emitGraphUpdate(startUpdate);
 
     try {
       for (let i = 0; i < this.MAX_ITERATIONS; i++) {
@@ -154,6 +171,7 @@ export class LiteEngine {
             iterations: i + 1,
           });
           this.emitCompletion(true, decision.thought);
+          await this.flushPendingGraphScreenshotUploads();
           return this.buildResult(true, decision.thought);
         }
 
@@ -170,6 +188,7 @@ export class LiteEngine {
           });
 
           this.emitCompletion(false, reason);
+          await this.flushPendingGraphScreenshotUploads();
           return this.buildResult(false, `Blocked: ${reason}`);
         }
 
@@ -258,6 +277,9 @@ export class LiteEngine {
         // 14. Emit progress via WebSocket (with diff for frontend highlighting)
         this.emitIterationProgress(i, decision, outcome, diff);
 
+        // ✅ NEW: Add action node to graph (like Pro)
+        await this.addGraphActionNode(i, decision, execResult, snapshotBefore, diff);
+
         // 15. Log fallback usage
         if (execResult.usedFallback) {
           logger.info('[LITE_ENGINE] Used fallback', {
@@ -274,6 +296,7 @@ export class LiteEngine {
         maxIterations: this.MAX_ITERATIONS,
       });
       this.emitCompletion(false, `Step limit reached (${this.MAX_ITERATIONS} iterations)`);
+      await this.flushPendingGraphScreenshotUploads();
       return this.buildResult(false, `Step limit reached (${this.MAX_ITERATIONS} iterations)`);
     } catch (error) {
       logger.error('[LITE_ENGINE] Error in main loop', {
@@ -282,6 +305,7 @@ export class LiteEngine {
       });
 
       this.emitCompletion(false, 'Engine error');
+      await this.flushPendingGraphScreenshotUploads();
       return this.buildResult(false, `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
   }
@@ -357,17 +381,251 @@ export class LiteEngine {
 
   /**
    * Build final test result
+   * ✅ NEW: Now includes graphData (like Pro)
    */
   private buildResult(success: boolean, reason: string): LiteTestResult {
     const duration = this.startTime > 0 ? Date.now() - this.startTime : 0;
+    const iterations = this.state.getIterationCount();
+
+    // ✅ NEW: Add end node to graph and get full graph
+    const endUpdate = this.graphBuilder.addEndNode(success, reason, {
+      pagesVisited: 1, // Lite typically stays on one page
+      actionsTaken: iterations,
+      successRate: `${iterations > 0 ? Math.round((this.graphBuilder.getMetadata().completedSteps / iterations) * 100) : 0}%`,
+      duration: `${Math.round(duration / 1000)}s`,
+    });
+    this.emitGraphUpdate(endUpdate);
+
+    // Get final graph data
+    const graphData = this.graphBuilder.getFullGraph();
 
     return {
       success,
       reason,
-      iterations: this.state.getIterationCount(),
+      iterations,
       history: this.state.getFormattedHistory(10), // Include last 10 iterations
       screenshots: this.screenshotCollector.getAll(),
       duration, // Track actual execution time
+      graphData, // ✅ NEW: Full graph like Pro
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // GRAPH METHODS (like Pro)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Add action node to graph and emit update
+   * ✅ NEW: Full graph support like Pro
+   */
+  private async addGraphActionNode(
+    iteration: number,
+    decision: AIDecision,
+    execResult: ExecutionResult,
+    snapshotBefore: LiteSnapshot,
+    diff: StateDiff
+  ): Promise<void> {
+    try {
+      // Convert Lite types to Pro-compatible types for GraphBuilder
+      const dynamicAction = toDynamicAction(decision, snapshotBefore);
+      const graphResult = toGraphActionResult(execResult, diff);
+
+      // Add action node to graph
+      const graphUpdate = this.graphBuilder.addActionNode(dynamicAction, graphResult);
+
+      // Emit the graph update via WebSocket
+      this.emitGraphUpdate(graphUpdate);
+
+      // ✅ Async: Upload screenshots and update node meta with URLs
+      const nodeId = graphUpdate.newNode?.id;
+      if (nodeId) {
+        this.pendingGraphScreenshotUploads.push(this.uploadAndUpdateNodeScreenshots(nodeId, iteration));
+      }
+    } catch (error) {
+      logger.error('[LITE_ENGINE] Failed to add graph action node', {
+        testId: this.config.testId,
+        iteration,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Don't throw - graph updates should never break the test
+    }
+  }
+
+  /**
+   * Async upload screenshots and update node meta
+   * ✅ NEW: Same pattern as Pro - upload then emit updatedNode
+   */
+  private async uploadAndUpdateNodeScreenshots(nodeId: string, iteration: number): Promise<void> {
+    // Get screenshot buffers for this iteration
+    const screenshots = this.screenshotCollector.getAll();
+    const beforeScreenshot = screenshots.find(s => s.name === `${iteration}_before`);
+    const afterScreenshot = screenshots.find(s => s.name === `${iteration}_after`);
+
+    if (!beforeScreenshot?.buffer && !afterScreenshot?.buffer) {
+      return; // No screenshots to upload
+    }
+
+    try {
+      const { uploadScreenshotBufferToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+      const testId = this.config.testId;
+      const userId = this.config.userId || 'anonymous';
+
+      const [beforeUrl, afterUrl] = await Promise.all([
+        beforeScreenshot?.buffer
+          ? uploadScreenshotBufferToStorage(beforeScreenshot.buffer, testId, userId, iteration * 2)
+              .catch((e) => {
+                logger.warn('[LITE_ENGINE] Failed to upload screenshotBefore', {
+                  testId,
+                  nodeId,
+                  error: e instanceof Error ? e.message : String(e),
+                });
+                return undefined;
+              })
+          : Promise.resolve(undefined),
+        afterScreenshot?.buffer
+          ? uploadScreenshotBufferToStorage(afterScreenshot.buffer, testId, userId, iteration * 2 + 1)
+              .catch((e) => {
+                logger.warn('[LITE_ENGINE] Failed to upload screenshotAfter', {
+                  testId,
+                  nodeId,
+                  error: e instanceof Error ? e.message : String(e),
+                });
+                return undefined;
+              })
+          : Promise.resolve(undefined),
+      ]);
+
+      // Update node meta with URLs and emit updatedNode
+      if (beforeUrl || afterUrl) {
+        const metaPatch: Record<string, string> = {};
+        if (beforeUrl) metaPatch.screenshotBefore = beforeUrl;
+        if (afterUrl) metaPatch.screenshotAfter = afterUrl;
+
+        const update = this.graphBuilder.updateNodeMeta(nodeId, metaPatch);
+        if (update) {
+          this.emitGraphUpdate(update);
+        }
+      }
+    } catch (error) {
+      logger.error('[LITE_ENGINE] Failed to upload and update node screenshots', {
+        testId: this.config.testId,
+        nodeId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Best-effort wait for pending screenshot uploads to finish, so graphData has URLs.
+   * Never blocks indefinitely.
+   */
+  private async flushPendingGraphScreenshotUploads(maxWaitMs: number = 15000): Promise<void> {
+    const pending = this.pendingGraphScreenshotUploads.splice(0);
+    if (pending.length === 0) return;
+
+    try {
+      await Promise.race([
+        Promise.allSettled(pending).then(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, maxWaitMs)),
+      ]);
+    } catch {
+      // Never throw from flush
+    }
+  }
+
+  /**
+   * Emit graph update via WebSocket (like Pro)
+   * ✅ NEW: Uses emitToUser for user-room delivery
+   */
+  private emitGraphUpdate(update: GraphUpdate): void {
+    // Skip if no userId (can't emit to user room)
+    if (!this.config.userId) {
+      logger.debug('[LITE_ENGINE] Skipping graph emit - no userId', {
+        testId: this.config.testId,
+      });
+      return;
+    }
+
+    try {
+      // Normalize update to prevent duplicates (like Pro)
+      const normalized = this.normalizeGraphUpdate(update);
+
+      // Check if we have any data to emit
+      const hasIncrementalData = normalized.newNode || normalized.newEdge || normalized.updatedNode;
+      const hasFullData = normalized.fullGraph;
+
+      if (!hasIncrementalData && !hasFullData) {
+        return; // Nothing to emit
+      }
+
+      // Build payload matching TestGraphUpdatePayload
+      const payload = {
+        testId: this.config.testId,
+        type: normalized.type,
+        data: {
+          newNode: normalized.newNode,
+          newEdge: normalized.newEdge,
+          updatedNode: normalized.updatedNode,
+          fullGraph: normalized.fullGraph,
+        },
+        timestamp: new Date().toISOString(),
+      };
+
+      // Emit to user room (like Pro)
+      webSocketService.emitToUser(this.config.userId, 'test:graph-update', payload);
+
+      logger.debug('[LITE_ENGINE] Graph update emitted', {
+        testId: this.config.testId,
+        type: normalized.type,
+        hasNewNode: !!normalized.newNode,
+        hasNewEdge: !!normalized.newEdge,
+        hasUpdatedNode: !!normalized.updatedNode,
+        hasFullGraph: !!normalized.fullGraph,
+      });
+    } catch (error) {
+      logger.error('[LITE_ENGINE] Failed to emit graph update', {
+        testId: this.config.testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Don't throw - graph updates should never break the test
+    }
+  }
+
+  /**
+   * Normalize graph update to prevent duplicate nodes/edges
+   */
+  private normalizeGraphUpdate(update: GraphUpdate): GraphUpdate {
+    const normalized: GraphUpdate = { type: update.type };
+
+    // For 'full' type, just pass through fullGraph
+    if (update.type === 'full' && update.fullGraph) {
+      normalized.fullGraph = update.fullGraph;
+      // Also track all node/edge IDs
+      update.fullGraph.nodes.forEach(n => this.emittedNodeIds.add(n.id));
+      update.fullGraph.edges.forEach(e => this.emittedEdgeIds.add(e.id));
+      return normalized;
+    }
+
+    // For incremental, check for duplicates
+    if (update.newNode) {
+      if (!this.emittedNodeIds.has(update.newNode.id)) {
+        normalized.newNode = update.newNode;
+        this.emittedNodeIds.add(update.newNode.id);
+      }
+    }
+
+    if (update.newEdge) {
+      if (!this.emittedEdgeIds.has(update.newEdge.id)) {
+        normalized.newEdge = update.newEdge;
+        this.emittedEdgeIds.add(update.newEdge.id);
+      }
+    }
+
+    // updatedNode is always allowed (same node can be updated multiple times)
+    if (update.updatedNode) {
+      normalized.updatedNode = update.updatedNode;
+    }
+
+    return normalized;
   }
 }

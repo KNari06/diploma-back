@@ -110,14 +110,31 @@ export interface AIDecision {
 
 /**
  * Test result with full history and artifacts
+ * Screenshots are stored as Buffer for efficient upload to storage
+ * ✅ NEW: Now includes graphData for Pro-compatible visualization
  */
 export interface LiteTestResult {
   success: boolean;
   reason: string;
   iterations: number;
   history: string;
-  screenshots: Array<{ name: string; path: string; timestamp: number }>;
+  screenshots: Array<{ name: string; buffer: Buffer; timestamp: number }>;
   duration?: number; // Execution duration in milliseconds
+  graphData?: {
+    nodes: any[];
+    edges: any[];
+    metadata: {
+      totalNodes: number;
+      totalEdges: number;
+      totalActions: number;
+      completedSteps: number;
+      failedSteps: number;
+      startNodeId: string | null;
+      endNodeId: string | null;
+      generatedAt: string;
+      version: string;
+    };
+  };
 }
 
 /**
