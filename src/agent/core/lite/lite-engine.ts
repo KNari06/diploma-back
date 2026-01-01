@@ -74,12 +74,15 @@ export class LiteEngine {
 
   /**
    * Main execution with DUAL TIMEOUT:
-   * 1. Time limit: 5 minutes via Promise.race
+   * 1. Time limit: 5 minutes via Promise.race (or config.timeout)
    * 2. Step limit: 20 iterations max
    */
   async execute(): Promise<LiteTestResult> {
+    // ✅ FIX: Use config.timeout if provided (with minimum 60s validation)
+    const timeoutMs = Math.max(this.config.timeout || this.TIMEOUT_MS, 60000);
+
     const timeoutPromise = new Promise<LiteTestResult>((_, reject) => {
-      setTimeout(() => reject(new Error('TIMEOUT')), this.TIMEOUT_MS);
+      setTimeout(() => reject(new Error('TIMEOUT')), timeoutMs);
     });
 
     try {
@@ -88,10 +91,14 @@ export class LiteEngine {
       if (error instanceof Error && error.message === 'TIMEOUT') {
         logger.error('[LITE_ENGINE] Time limit exceeded', {
           testId: this.config.testId,
-          timeout: this.TIMEOUT_MS,
+          timeout: timeoutMs,
         });
-        this.emitCompletion(false, 'Time limit exceeded (5 min)');
-        return this.buildResult(false, 'Time limit exceeded (5 minutes)');
+        this.emitCompletion(false, `Time limit exceeded (${Math.round(timeoutMs / 60000)} min)`);
+
+        // ✅ FIX: Flush pending uploads before returning (so graphData has URLs)
+        await this.flushPendingGraphScreenshotUploads();
+
+        return this.buildResult(false, `Time limit exceeded (${Math.round(timeoutMs / 60000)} minutes)`);
       }
 
       logger.error('[LITE_ENGINE] Unexpected error', {
@@ -278,7 +285,8 @@ export class LiteEngine {
         this.emitIterationProgress(i, decision, outcome, diff);
 
         // ✅ NEW: Add action node to graph (like Pro)
-        await this.addGraphActionNode(i, decision, execResult, snapshotBefore, diff);
+        // Pass snapshotAfter for page node title when URL changes
+        await this.addGraphActionNode(i, decision, execResult, snapshotBefore, snapshotAfter, diff);
 
         // 15. Log fallback usage
         if (execResult.usedFallback) {
@@ -417,15 +425,29 @@ export class LiteEngine {
   /**
    * Add action node to graph and emit update
    * ✅ NEW: Full graph support like Pro
+   * ✅ FIX: Now adds page node when URL changes (like Pro)
    */
   private async addGraphActionNode(
     iteration: number,
     decision: AIDecision,
     execResult: ExecutionResult,
     snapshotBefore: LiteSnapshot,
+    snapshotAfter: LiteSnapshot, // ✅ FIX: Added for page node title
     diff: StateDiff
   ): Promise<void> {
     try {
+      // ✅ FIX: Add page node if URL changed (like Pro)
+      if (diff.urlChanged && diff.urlAfter) {
+        const pageUpdate = this.graphBuilder.addPageNode(
+          diff.urlAfter,
+          'unknown', // pageType - can be enhanced later with page analysis
+          {
+            title: snapshotAfter.title,
+          }
+        );
+        this.emitGraphUpdate(pageUpdate);
+      }
+
       // Convert Lite types to Pro-compatible types for GraphBuilder
       const dynamicAction = toDynamicAction(decision, snapshotBefore);
       const graphResult = toGraphActionResult(execResult, diff);
@@ -518,16 +540,48 @@ export class LiteEngine {
   /**
    * Best-effort wait for pending screenshot uploads to finish, so graphData has URLs.
    * Never blocks indefinitely.
+   * ✅ FIX: Added logging for success/failure counts
    */
   private async flushPendingGraphScreenshotUploads(maxWaitMs: number = 15000): Promise<void> {
     const pending = this.pendingGraphScreenshotUploads.splice(0);
     if (pending.length === 0) return;
 
+    logger.debug('[LITE_ENGINE] Flushing pending screenshot uploads', {
+      testId: this.config.testId,
+      count: pending.length,
+      maxWaitMs,
+    });
+
     try {
-      await Promise.race([
-        Promise.allSettled(pending).then(() => undefined),
-        new Promise<void>((resolve) => setTimeout(resolve, maxWaitMs)),
+      let timedOut = false;
+
+      const results = await Promise.race([
+        Promise.allSettled(pending),
+        new Promise<null>((resolve) =>
+          setTimeout(() => {
+            timedOut = true;
+            resolve(null);
+          }, maxWaitMs)
+        ),
       ]);
+
+      if (timedOut) {
+        logger.warn('[LITE_ENGINE] Flush timed out, some screenshots may not have URLs', {
+          testId: this.config.testId,
+          pendingCount: pending.length,
+          maxWaitMs,
+        });
+      } else if (results) {
+        const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+        const failed = results.filter((r) => r.status === 'rejected').length;
+
+        logger.debug('[LITE_ENGINE] Flush completed', {
+          testId: this.config.testId,
+          total: pending.length,
+          succeeded,
+          failed,
+        });
+      }
     } catch {
       // Never throw from flush
     }
