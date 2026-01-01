@@ -25,6 +25,7 @@ export async function routeToHandler(
     context?: any;
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
+    mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
@@ -72,6 +73,7 @@ export async function routeToHandler(
       answers: params.answers,
       abortSignal: params.abortSignal,
       logger: params.logger,
+      mode: params.mode || 'lite', // Pass mode to handler
     });
   }
 

@@ -83,6 +83,7 @@ export async function retryTest(testId: string, userId?: string): Promise<ApiRes
         intelligentMode: test.intelligent_mode || false,
         testGoal: test.test_goal || undefined,
         retryCount: 1, // Variant A: Retry with same plan (first retry)
+        mode: 'lite', // Default to 'lite' for retries (tests table doesn't have mode column)
       });
       queuedJobs.push(job.id || 'unknown');
     }

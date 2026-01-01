@@ -28,6 +28,7 @@ export async function generateTestPlanFromExploration(params: {
   explorationId?: string;
   additionalInfo?: Record<string, any>;
   emitProgress: (step: string, message: string, progress: number) => void;
+  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
 }): Promise<{ testPlan: any; message: string }> {
   const {
     exploration,
@@ -39,6 +40,7 @@ export async function generateTestPlanFromExploration(params: {
     explorationId,
     additionalInfo,
     emitProgress,
+    mode,
   } = params;
 
   // ✅ FIX: Validate input parameters
@@ -169,6 +171,8 @@ export async function generateTestPlanFromExploration(params: {
         focusAreas: scopeStrategy.focusAreas,
         testTypes: scopeStrategy.testTypes,
         estimatedDuration: scopeStrategy.estimatedDuration,
+        // Add test execution mode
+        mode: mode || 'lite',
       },
     };
 

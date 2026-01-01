@@ -407,6 +407,7 @@ export interface TestPlan {
   intelligentMode?: boolean; // Flag for intelligent testing
   estimatedPages?: string; // Estimated pages for intelligent mode
   estimatedCost?: string; // Estimated cost for intelligent mode
+  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
 }
 
 /**
@@ -505,6 +506,7 @@ export async function generateTestPlan(
       expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(), // 3 days
       // ✅ CRITICAL: Always intelligent mode - Standard Mode removed
       intelligentMode: true,
+      mode: (userRequest.additionalInfo?.mode as 'lite' | 'pro') || 'lite', // Test execution mode
     };
 
     logger.info('Test plan generated (intelligent mode)', {
@@ -860,6 +862,7 @@ export async function generateIntelligentTestPlan(
       intelligentMode: true,
       estimatedPages: '5-10 pages',
       estimatedCost: '$0.10-0.20',
+      mode: (userRequest.additionalInfo?.mode as 'lite' | 'pro') || 'lite', // Test execution mode
     };
 
     logger.info('Intelligent test plan generated', {

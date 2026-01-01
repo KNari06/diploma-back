@@ -100,6 +100,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       goal,
       url: testData.url,
       userId: testData.userId,
+      userMode: testData.mode || 'lite', // Pass user-selected mode from frontend
     });
 
     logger.info('[PLAYWRIGHT] Selected test mode', {

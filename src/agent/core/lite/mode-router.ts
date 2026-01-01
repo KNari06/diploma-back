@@ -13,8 +13,7 @@ export interface TestMode {
 export class ModeRouter {
   /**
    * Determine which mode to use for a test
-   * Currently defaults to Lite mode
-   * Pro mode will be refactored later based on Lite learnings
+   * Priority: userMode (from frontend) > default 'lite'
    *
    * @param params - Test parameters
    * @returns Selected mode and reason
@@ -23,18 +22,29 @@ export class ModeRouter {
     goal: string;
     url: string;
     userId?: string;
+    userMode?: 'lite' | 'pro'; // User-selected mode from frontend
     complexity?: 'simple' | 'medium' | 'complex';
   }): TestMode {
-    // For now, always use Lite mode
-    // Pro mode will be refactored later
-    logger.info('[MODE_ROUTER] Selected Lite mode', {
+    // Priority 1: Use user-selected mode if provided
+    const selectedMode = params.userMode || 'lite';
+
+    logger.info('[MODE_ROUTER] Selected mode', {
+      mode: selectedMode,
+      hasUserMode: !!params.userMode,
       goal: params.goal.slice(0, 50),
       url: params.url,
     });
 
+    if (selectedMode === 'pro') {
+      return {
+        mode: 'pro',
+        reason: 'Pro mode selected by user',
+      };
+    }
+
     return {
       mode: 'lite',
-      reason: 'Using Lite Engine for faster and more cost-effective testing',
+      reason: params.userMode ? 'Lite mode selected by user' : 'Using Lite Engine (default)',
     };
 
     /* Future implementation when Pro mode is refactored:

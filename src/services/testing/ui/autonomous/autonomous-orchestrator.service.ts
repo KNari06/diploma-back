@@ -32,12 +32,13 @@ export async function runAutonomousExploration(params: {
   userId: string;
   projectId: string;
   sessionId?: string;
+  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
 }): Promise<{
   exploration: any;
   testPlan: any;
   message: string;
 }> {
-  const { userMessage, answers, userId, projectId, sessionId } = params;
+  const { userMessage, answers, userId, projectId, sessionId, mode } = params;
 
   try {
     logger.info('[AUTONOMOUS] Starting exploration', { userId, projectId });
@@ -100,6 +101,7 @@ export async function runAutonomousExploration(params: {
       explorationId,
       additionalInfo: parsedAnswers.additionalInfo,
       emitProgress,
+      mode: mode || 'lite', // Pass mode to test plan generation
     });
 
     return {
