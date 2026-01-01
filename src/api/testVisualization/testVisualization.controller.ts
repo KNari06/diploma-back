@@ -5,6 +5,7 @@ import { TestReportGeneratorService } from '../../services/testing/results/test-
 import { PlaywrightStep, PlaywrightStepType } from '../../types/playwright.types';
 import { logger } from '@/utils/core/logger';
 import { exportGraph, parsePlaywrightTestSteps } from '@/utils/parsing/playwrightParser';
+import { OverallBuilderService } from '@/services/testing/visualization/overall-builder.service';
 
 // UUID validation regex
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1113,4 +1114,85 @@ function determineStepsSource(testData: any): string {
     return 'api_configs';
   }
   return 'generated_basic';
+}
+
+/**
+ * Get project-level overall visualization (planet view)
+ * Returns all test entities with relationships and clusters
+ */
+export async function getProjectOverall(req: Request, res: Response): Promise<void> {
+  try {
+    const { projectId } = req.params;
+    const userId = (req as any).user?.id;
+
+    // Validate projectId
+    if (!projectId || !UUID_REGEX.test(projectId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format',
+      });
+      return;
+    }
+
+    // Validate userId
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'User ID not found in request',
+      });
+      return;
+    }
+
+    logger.info('[TEST_VISUALIZATION] Getting project overall', { projectId, userId });
+
+    // Build overall data
+    const overallData = await OverallBuilderService.buildProjectOverall(projectId, userId);
+
+    res.json({
+      success: true,
+      data: overallData,
+      timestamp: new Date(),
+    });
+
+    logger.info('[TEST_VISUALIZATION] Project overall retrieved successfully', {
+      projectId,
+      nodesCount: overallData.nodes.length,
+      edgesCount: overallData.edges.length,
+      clustersCount: overallData.clusters.length,
+    });
+  } catch (error) {
+    logger.error('[TEST_VISUALIZATION] Error getting project overall:', error);
+
+    if (res.headersSent) {
+      logger.warn('[TEST_VISUALIZATION] Response already sent, cannot send error response');
+      return;
+    }
+
+    // Handle specific errors
+    if (error instanceof Error) {
+      if (error.message.includes('not found') || error.name === 'NotFoundError') {
+        res.status(404).json({
+          success: false,
+          error: 'Project not found',
+          message: error.message,
+        });
+        return;
+      }
+
+      if (error.message.includes('Access denied') || error.name === 'ValidationError') {
+        res.status(403).json({
+          success: false,
+          error: 'Access denied',
+          message: 'You do not have access to this project',
+        });
+        return;
+      }
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get project overall visualization',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
 }

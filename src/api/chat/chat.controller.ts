@@ -1,21 +1,20 @@
-import { logger } from '@/utils/core/logger';
-import { Request, Response } from 'express';
-import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
+import { logger } from '@/utils/core/logger';
+import { Request, Response } from 'express';
 
 // Shared modules
 import { CONSTANTS, MESSAGES } from './shared/constants';
 import { parseIntent } from './shared/intent-parsing';
+import {
+  checkRequestAborted,
+  hasActiveRequest,
+  registerActiveRequest,
+  unregisterActiveRequest,
+} from './shared/request-cancellation';
 import { routeToHandler } from './shared/routing';
 import { checkPendingApproval } from './shared/test-plan-approval';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
-import {
-  registerActiveRequest,
-  unregisterActiveRequest,
-  checkRequestAborted,
-  hasActiveRequest,
-} from './shared/request-cancellation';
 
 // History handlers
 import { debugChatData, getChatHistory, getChatSessions, getCurrentChatHistory } from './history';
@@ -152,7 +151,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     checkRequestAbortedWithLogging(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 3: CHECK FOR PENDING TEST PLAN APPROVAL (MUST BE FIRST!)
+    // STEP 4: CHECK FOR PENDING TEST PLAN APPROVAL
     // ═══════════════════════════════════════════════════════════════════════
     const checkPendingApprovalWithLogging = withFunctionLogging(checkPendingApproval, 'checkPendingApproval', functionLogger);
     const approvalHandled = await checkPendingApprovalWithLogging({
@@ -180,7 +179,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     checkRequestAbortedWithLogging(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 4: PARSE INTENT (Only if not responding to test plan) (FIX #5)
+    // STEP 5: PARSE INTENT (Only if not responding to test plan) (FIX #5)
     // ═══════════════════════════════════════════════════════════════════════
     const parseIntentWithLogging = withFunctionLogging(parseIntent, 'parseIntent', functionLogger);
     const parsedIntent = await parseIntentWithLogging(
@@ -198,7 +197,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     checkRequestAbortedWithLogging(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 5: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
+    // STEP 6: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
     // ═══════════════════════════════════════════════════════════════════════
     const routeToHandlerWithLogging = withFunctionLogging(routeToHandler, 'routeToHandler', functionLogger);
     await routeToHandlerWithLogging(req, res, {
