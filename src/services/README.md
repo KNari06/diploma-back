@@ -212,7 +212,7 @@ utils/
 ```typescript
 // From controllers/middleware
 import { WorkspaceService } from '@/services/core/workspace.service';
-import { getChatCompletion } from '@/services/ai/openai.service';
+import { getChatCompletion } from '@/services/ai/core/openai.service';
 import { executeApiTest } from '@/services/testing/apiTest.service';
 
 // Between services (relative paths)

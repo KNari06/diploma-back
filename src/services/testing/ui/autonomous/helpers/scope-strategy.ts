@@ -2,7 +2,7 @@ import {
   buildCustomScopeStrategyPrompt,
   buildCustomScopeStrategySystemPrompt,
 } from '@/ai/prompts';
-import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { VALID_SCOPES } from '@/types';
 import { logger } from '@/utils/core/logger';
 

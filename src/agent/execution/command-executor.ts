@@ -1,5 +1,5 @@
 /* eslint-disable no-case-declarations */
-import { AICostManager } from '@/services/ai/ai-cost-manager.service';
+import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
 import { AIExtractService } from '@/services/ai-extract';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';

@@ -116,8 +116,20 @@ export class LiteEngine {
         const stuckCheck = this.state.isStuck();
 
         // 2. Collect snapshot BEFORE (with visual stability)
-        const snapshotBefore = await SnapshotCollector.collect(this.page);
+        let snapshotBefore = await SnapshotCollector.collect(this.page);
         const pageErrorsBefore = await ErrorCollector.collectFromPage(this.page);
+
+        // 2a. Guard: check if snapshot is too empty (page still loading)
+        if (snapshotBefore.elements.length < 3) {
+          logger.warn('[LITE_ENGINE] Snapshot too empty, waiting for page load', {
+            testId: this.config.testId,
+            elementCount: snapshotBefore.elements.length,
+            iteration: i,
+          });
+          await this.page.waitForLoadState('domcontentloaded');
+          await this.page.waitForTimeout(2000);
+          snapshotBefore = await SnapshotCollector.collect(this.page);
+        }
 
         // 3. Screenshot BEFORE (for error debugging)
         await this.screenshotCollector.captureBefore(this.page, i);
@@ -145,14 +157,20 @@ export class LiteEngine {
           return this.buildResult(true, decision.thought);
         }
 
-        if (decision.blocked) {
+        // Check for blocked state (support both old string and new structured format)
+        if (decision.blocked || decision.blockedInfo) {
+          const reason = decision.blockedInfo?.reason || decision.blocked || 'Unknown reason';
+          const canUserHelp = decision.blockedInfo?.canUserHelp || false;
+
           logger.warn('[LITE_ENGINE] Test blocked', {
             testId: this.config.testId,
-            reason: decision.blocked,
+            reason,
+            canUserHelp,
             iterations: i + 1,
           });
-          this.emitCompletion(false, decision.blocked);
-          return this.buildResult(false, `Blocked: ${decision.blocked}`);
+
+          this.emitCompletion(false, reason);
+          return this.buildResult(false, `Blocked: ${reason}`);
         }
 
         // 6. Execute command (safe switch/case, with fuzzy fallback)

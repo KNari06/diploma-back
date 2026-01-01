@@ -1,4 +1,4 @@
-import { analyzeScreenshotWithVision } from '@/services/ai/vision-analyzer.service';
+import { analyzeScreenshotWithVision } from '@/services/ai/analysis/vision-analyzer.service';
 import { analyzeDOMStructure } from '@/services/testing/ui/autonomous/dom-analyzer.service';
 import { logger } from '@/utils/core/logger';
 import * as fs from 'fs';

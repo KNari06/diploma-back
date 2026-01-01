@@ -146,6 +146,7 @@ export class LiteState {
   /**
    * Get formatted history for AI prompt
    * Concise format to fit in token limits
+   * Compresses repeated wait/no_effect actions to reduce token waste
    *
    * @param maxIterations - Maximum number of iterations to include (default: 5)
    * @returns Formatted history string
@@ -159,11 +160,31 @@ export class LiteState {
     const recentIterations = this.iterations.slice(-maxIterations);
 
     const lines: string[] = [];
+    let lastActionKey: string | null = null;
+    let repeatCount = 1;
 
-    recentIterations.forEach((iter) => {
+    recentIterations.forEach((iter, idx) => {
       const outcomeEmoji = this.getOutcomeEmoji(iter.result.outcome);
       const actionStr = `${iter.decision.command.action}${iter.decision.command.ref ? `(${iter.decision.command.ref})` : ''}`;
 
+      // Check if this is a "noisy" action that should be compressed
+      const isNoisyAction = iter.decision.command.action === 'wait' || iter.result.outcome === 'no_effect';
+      const currentActionKey = `${actionStr}_${iter.result.outcome}`;
+
+      // Compress consecutive noisy actions
+      if (idx > 0 && isNoisyAction && currentActionKey === lastActionKey) {
+        repeatCount++;
+        return; // Skip this iteration, will add count at the end
+      }
+
+      // If we had repeated actions, add the count to the last line
+      if (repeatCount > 1 && lines.length > 0) {
+        lines[lines.length - 1] += ` (×${repeatCount})`;
+      }
+      repeatCount = 1;
+      lastActionKey = isNoisyAction ? currentActionKey : null;
+
+      // Build the line
       let line = `${iter.iteration + 1}. ${outcomeEmoji} ${actionStr}`;
 
       // Add brief state change info
@@ -179,6 +200,11 @@ export class LiteState {
 
       lines.push(line);
     });
+
+    // Handle trailing repeats
+    if (repeatCount > 1 && lines.length > 0) {
+      lines[lines.length - 1] += ` (×${repeatCount})`;
+    }
 
     return lines.join('\n');
   }

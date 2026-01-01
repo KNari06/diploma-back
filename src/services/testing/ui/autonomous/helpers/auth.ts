@@ -1,4 +1,4 @@
-import { detectLoginPage } from '@/services/ai/ai-helpers.service';
+import { detectLoginPage } from '@/services/ai/helpers/ai-helpers.service';
 import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
 

@@ -1,6 +1,6 @@
 import { logger } from '@/utils/core/logger';
 import { isValidUUID } from '@/utils/validation/validation';
-import { parseUserIntent } from '@/services/ai/intentParser.service';
+import { parseUserIntent } from '@/services/ai/intent/intent-parser.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
 import { IntentResult } from '@/types';

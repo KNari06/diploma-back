@@ -6,7 +6,7 @@
 
 import { dbAdminService } from '@/db/supabase';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service'; // Self-healing service for automatic selector recovery
-import { AICostManager, getCostManager, removeCostManager } from '@/services/ai/ai-cost-manager.service';
+import { AICostManager, getCostManager, removeCostManager } from '@/services/ai/cost/ai-cost-manager.service';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { getActionEmoji, getActionIcon } from '@/websocket/types/types';

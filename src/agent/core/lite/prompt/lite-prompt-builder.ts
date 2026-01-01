@@ -4,7 +4,7 @@
  * SECURITY: AI returns structured commands, not arbitrary code
  */
 
-import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import type { AIDecision, StuckCheck } from '../lite-types';
 
@@ -65,8 +65,9 @@ IMPORTANT RULES:
 3. If an action fails repeatedly, try a different approach
 4. Check for error messages or validation warnings
 5. If you see a modal/popup, interact with it first
+6. If the snapshot is empty or loading (< 3 elements), use the "wait" action
 
-Respond with JSON ONLY:
+RESPONSE FORMAT (JSON ONLY):
 {
   "thought": "Brief reasoning (1 sentence)",
   "command": { "action": "click", "ref": "e5" }
@@ -74,9 +75,12 @@ Respond with JSON ONLY:
 
 Special responses:
 - If goal is achieved: { "done": true, "thought": "Goal completed because..." }
-- If blocked (login required, captcha, verification code needed): { "blocked": "Reason why blocked" }
+- If blocked (login required, captcha, verification code needed):
+  Option 1: { "blocked": "Reason why blocked", "thought": "..." }
+  Option 2: { "blockedInfo": { "reason": "CAPTCHA detected", "canUserHelp": true }, "thought": "..." }
 
-Remember: Analyze state changes after each action. Success = state changed.`;
+Return ONLY a valid JSON object. No markdown blocks, no preamble, no extra text.
+Analyze state changes after each action. Success = state changed.`;
   }
 
   /**
@@ -111,9 +115,14 @@ Remember: Analyze state changes after each action. Success = state changed.`;
       // Parse JSON response
       const parsed = JSON.parse(content);
 
+      // Determine action type for logging
+      const isBlocked = parsed.blocked || parsed.blockedInfo;
+      const actionType = parsed.command?.action || (parsed.done ? 'done' : isBlocked ? 'blocked' : 'unknown');
+
       logger.debug('[LITE_PROMPT] Received AI decision', {
         thought: parsed.thought?.slice(0, 50),
-        action: parsed.command?.action || parsed.done ? 'done' : parsed.blocked ? 'blocked' : 'unknown',
+        action: actionType,
+        hasBlockedInfo: !!parsed.blockedInfo,
       });
 
       // Validate response structure
@@ -126,6 +135,19 @@ Remember: Analyze state changes after each action. Success = state changed.`;
           thought: parsed.thought,
           command: { action: 'wait' }, // Placeholder command
           done: true,
+        };
+      }
+
+      // Handle blocked state - support both old (string) and new (object) formats
+      // Priority: blockedInfo (new format) > blocked (legacy string format)
+      if (parsed.blockedInfo) {
+        return {
+          thought: parsed.thought,
+          command: { action: 'wait' }, // Placeholder command
+          blockedInfo: {
+            reason: parsed.blockedInfo.reason || 'Unknown reason',
+            canUserHelp: parsed.blockedInfo.canUserHelp || false,
+          },
         };
       }
 

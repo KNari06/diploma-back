@@ -89,13 +89,23 @@ export interface AICommand {
 }
 
 /**
+ * Structured blocked info for better UX
+ * Provides reason and whether user can help resolve the block
+ */
+export interface BlockedInfo {
+  reason: string;
+  canUserHelp: boolean;
+}
+
+/**
  * AI decision response
  */
 export interface AIDecision {
   thought: string;
   command: AICommand;  // CHANGED: structured command instead of code
   done?: boolean;
-  blocked?: string;
+  blocked?: string;  // Legacy: keep for backward compatibility
+  blockedInfo?: BlockedInfo;  // New: structured format with canUserHelp flag
 }
 
 /**

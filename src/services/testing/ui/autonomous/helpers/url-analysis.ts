@@ -2,7 +2,7 @@ import {
   buildUrlAnalysisPrompt,
   buildUrlAnalysisSystemPrompt,
 } from '@/ai/prompts';
-import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 
 /**

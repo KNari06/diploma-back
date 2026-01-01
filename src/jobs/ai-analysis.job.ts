@@ -1,6 +1,6 @@
 import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
-import { aiService } from '@/services/ai/ai.service';
+import { aiService } from '@/services/ai/analysis/test-results.service';
 import { handleAIError } from '@/utils/core/error-handler';
 import { logAIAnalysis, logger, logQueueEvent } from '@/utils/core/logger';
 import {
