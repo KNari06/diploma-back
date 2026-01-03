@@ -2,7 +2,7 @@ name: 🔍 Dependency Review
 
 on:
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
 
 permissions:
   contents: read
@@ -19,5 +19,4 @@ jobs:
         uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: moderate
-          allow-licenses: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Unlicense
           deny-licenses: GPL-2.0, GPL-3.0, AGPL-1.0, AGPL-3.0
