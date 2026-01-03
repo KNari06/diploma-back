@@ -56,6 +56,7 @@ export async function runTest(testRequest: TestRunRequest): Promise<ApiResponse<
         // Pass intelligent mode settings
         intelligentMode: testRequest.intelligentMode,
         testGoal: testRequest.testGoal,
+        mode: testRequest.mode || 'lite', // Test execution mode
       });
 
       logger.info('🟢 [MANUAL_TEST_FLOW] Step 8: Job added to queue successfully', {

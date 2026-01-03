@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { parseUserIntent } from '@/services/ai/intentParser.service';
+import { parseUserIntent } from '@/services/ai/intent/intent-parser.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { IntentResult } from '@/types';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';

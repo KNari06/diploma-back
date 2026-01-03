@@ -4,7 +4,7 @@
  */
 
 import { logger } from '@/utils/core/logger';
-import { getActionIcon } from '@/websocket/types/types';
+import { getActionIcon, StateDiffSummary } from '@/websocket/types/types';
 import { webSocketService } from '@/websocket/core/websocket.service';
 
 interface EmitParams {
@@ -19,6 +19,7 @@ interface EmitParams {
   completedSteps?: number;
   status?: string; // 'queued' | 'running' | 'completed' | 'failed'
   icon?: string; // Icon name for frontend display
+  diff?: StateDiffSummary; // State diff for frontend highlighting
 }
 
 export class TestProgressEmitter {
@@ -121,6 +122,7 @@ export class TestProgressEmitter {
         elapsedTime,
         estimatedRemaining,
         userId: this.userId,
+        diff: params.diff, // State diff for frontend highlighting
       });
 
       // Update tracking state

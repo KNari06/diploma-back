@@ -1,5 +1,5 @@
 import { buildPageNavigationPrompt, buildPageNavigationSystemPrompt } from '@/ai/prompts';
-import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
 import { emitExplorationProgress } from './progress';

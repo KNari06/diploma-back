@@ -249,6 +249,69 @@ export async function uploadScreenshotToStorage(
 }
 
 /**
+ * Upload screenshot from Buffer directly to Supabase Storage
+ * More efficient than base64 conversion (used by Lite mode)
+ */
+export async function uploadScreenshotBufferToStorage(
+  screenshotBuffer: Buffer,
+  testId: string,
+  userId: string,
+  index: number = 0
+): Promise<string> {
+  try {
+    if (!screenshotBuffer || screenshotBuffer.length === 0) {
+      throw new Error('Screenshot buffer is empty');
+    }
+
+    logger.info('[STORAGE] Uploading screenshot from buffer', {
+      testId,
+      index,
+      bufferSize: `${Math.round(screenshotBuffer.length / 1024)}KB`,
+    });
+
+    const fileName = `screenshot-${testId}-${index}-${Date.now()}.png`;
+    const storagePath = `${userId}/screenshots/${fileName}`;
+
+    // Upload to Supabase Storage
+    const { data, error } = await supabaseAdmin.storage
+      .from(env.SUPABASE_BUCKET_NAME)
+      .upload(storagePath, screenshotBuffer, {
+        contentType: 'image/png',
+        upsert: false,
+        cacheControl: '3600',
+      });
+
+    if (error) {
+      logger.error('[STORAGE] Failed to upload screenshot buffer', {
+        error,
+        testId,
+        storagePath,
+      });
+      throw new Error(`Failed to upload screenshot: ${error.message}`);
+    }
+
+    // Get public URL
+    const { data: urlData } = supabaseAdmin.storage
+      .from(env.SUPABASE_BUCKET_NAME)
+      .getPublicUrl(storagePath);
+
+    logger.info('[STORAGE] Screenshot buffer uploaded successfully', {
+      testId,
+      index,
+      url: urlData.publicUrl,
+    });
+
+    return urlData.publicUrl;
+  } catch (error) {
+    logger.error('[STORAGE] Screenshot buffer upload error', {
+      error: error instanceof Error ? error.message : String(error),
+      testId,
+    });
+    throw error;
+  }
+}
+
+/**
  * Download file from Supabase Storage
  */
 export async function downloadFromStorage(storageUrl: string): Promise<Buffer> {

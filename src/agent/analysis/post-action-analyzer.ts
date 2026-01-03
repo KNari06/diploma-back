@@ -9,7 +9,7 @@
  * - Returns actionable follow-up steps
  */
 
-import { AICostManager } from '@/services/ai/ai-cost-manager.service';
+import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
 import { logger } from '@/utils/core/logger';
 import OpenAI from 'openai';
 import { Page } from 'playwright';

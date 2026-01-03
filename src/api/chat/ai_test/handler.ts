@@ -44,9 +44,10 @@ export async function handlePlatformTest(
     answers?: Record<string, any>;
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
+    mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
   }
 ): Promise<void> {
-  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal, logger: functionLogger } = params;
+  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal, logger: functionLogger, mode } = params;
 
   if (abortSignal) {
     const checkRequestAbortedWithLogging = functionLogger
@@ -465,6 +466,7 @@ export async function handlePlatformTest(
         userId,
         projectId: project_id,
         sessionId: chatSessionId,
+        mode: mode || 'lite', // Pass mode to exploration
       });
 
       // ✅ FIX: Validate that testPlan and message exist

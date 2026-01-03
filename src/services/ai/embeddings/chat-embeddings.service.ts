@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { isValidUUID } from '@/utils/validation/validation';
-import { generateEmbedding } from './embedding.service';
+import { generateEmbedding } from '../core/embedding.service';
 
 /**
  * Chat Embeddings Service

@@ -211,6 +211,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       context,
       abortSignal, // Pass abort signal for cancellation checks
       logger: functionLogger,
+      mode: inputResult.mode || 'lite', // Pass mode from request
     });
 
     // Unregister request on successful completion

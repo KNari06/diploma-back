@@ -1,7 +1,7 @@
 import { buildChatSystemPrompt } from '@/ai/prompts';
 import { supabaseAdmin } from '@/db/supabase';
-import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
-import { autoEmbedOldMessages, searchChatHistory } from '@/services/ai/chat-embeddings.service';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { autoEmbedOldMessages, searchChatHistory } from '@/services/ai/embeddings/chat-embeddings.service';
 import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { ChatService } from '@/services/utils/chat.service';

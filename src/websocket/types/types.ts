@@ -98,6 +98,18 @@ export interface TestStartedPayload {
   timestamp: string;
 }
 
+/**
+ * State diff summary for frontend visualization
+ * Allows highlighting what changed after each action
+ */
+export interface StateDiffSummary {
+  urlChanged: boolean;
+  addedCount: number;      // Number of new elements
+  removedCount: number;    // Number of removed elements
+  changedRefs: string[];   // Refs of changed elements (for highlighting)
+  newErrors: number;       // Number of new errors detected
+}
+
 export interface TestProgressPayload {
   testId: string;
   browser: string;
@@ -116,6 +128,7 @@ export interface TestProgressPayload {
   timestamp: string;
   elapsedTime?: number; // Milliseconds since test start
   estimatedRemaining?: number; // Estimated milliseconds remaining
+  diff?: StateDiffSummary; // State diff for frontend highlighting
 }
 
 export interface TestStepCompletedPayload {

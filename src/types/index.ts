@@ -30,6 +30,7 @@ export interface TestRunRequest {
   estimatedCost?: string; // Estimated cost from test plan (e.g., "$0.10-0.20")
   commands?: PlaywrightCommand[]; // Playwright commands to execute
   intent?: string; // Original user intent for context
+  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
 }
 
 export interface TestOptions {
@@ -260,6 +261,7 @@ export interface TestJobData {
   intent?: string; // Original user intent for context
   intelligentMode?: boolean; // NEW: Enable intelligent/adaptive testing
   testGoal?: string; // NEW: Testing goal for intelligent mode
+  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
 }
 
 export interface AgentResponse {

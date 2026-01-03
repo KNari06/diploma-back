@@ -22,6 +22,7 @@ export interface ChatRequest {
   conversationId?: string; // For multi-turn conversations (questions/answers)
   answers?: Record<string, any>; // Answers to clarifying questions
   userId?: string; // Optional userId for testing/dev (when no auth token)
+  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
 }
 
 export interface ChatResponse {

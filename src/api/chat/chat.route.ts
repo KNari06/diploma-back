@@ -22,6 +22,7 @@ const chatRequestSchema = z.object({
   conversationId: z.string().optional(),
   answers: z.record(z.any()).optional(),
   userId: z.string().optional(),
+  mode: z.enum(['lite', 'pro']).optional().default('lite'), // Test execution mode
 });
 
 /**
@@ -79,6 +80,11 @@ const chatRequestSchema = z.object({
  *               userId:
  *                 type: string
  *                 description: ID пользователя (если не из auth middleware)
+ *               mode:
+ *                 type: string
+ *                 enum: [lite, pro]
+ *                 default: lite
+ *                 description: Test execution mode (lite - simplified agentic loop, pro - advanced orchestrator)
  *     responses:
  *       200:
  *         description: Успешный ответ
@@ -143,6 +149,10 @@ const chatRequestSchema = z.object({
  *                     estimatedCost:
  *                       type: string
  *                       description: Стоимость в кредитах
+ *                     mode:
+ *                       type: string
+ *                       enum: [lite, pro]
+ *                       description: Test execution mode (lite - simplified, pro - advanced)
  *                 creditsRemaining:
  *                   type: number
  *                   description: Остаток кредитов после операции

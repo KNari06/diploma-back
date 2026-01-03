@@ -1,18 +1,19 @@
 import { TestJobData } from '@/types';
 import { logger } from '@/utils/core/logger';
-import { getActionIcon } from '@/websocket/types/types';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import { getActionIcon } from '@/websocket/types/types';
 import { BrowserContext, Page } from 'playwright';
 import { IntelligentTestOrchestrator } from '../../core/intelligent-test-orchestrator';
+import { LiteEngine, ModeRouter } from '../../core/lite';
 import { saveIntelligentTestResults, uploadArtifacts, uploadIntelligentTestScreenshots } from '../artifacts/artifacts-handler';
-import { getBrowserWithProgress, setupBrowserContext } from '../setup/browser-setup';
-import { buildAllHintsWithMetadata } from '../setup/hints-builder';
+import { collectArtifactsAndCleanup } from '../artifacts/test-cleanup';
+import { formatTestResult } from '../artifacts/test-result-formatter';
 import { navigateToUrl } from '../execution/navigation-handler';
 import { RequestTracker } from '../execution/request-tracker';
-import { checkTestCancelled } from '../utils/test-cancellation-checker';
-import { collectArtifactsAndCleanup } from '../artifacts/test-cleanup';
+import { getBrowserWithProgress, setupBrowserContext } from '../setup/browser-setup';
+import { buildAllHintsWithMetadata } from '../setup/hints-builder';
 import { buildIntelligentTestConfig } from '../setup/test-config-builder';
-import { formatTestResult } from '../artifacts/test-result-formatter';
+import { checkTestCancelled } from '../utils/test-cancellation-checker';
 
 /**
  * Execute Playwright test
@@ -94,41 +95,165 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     await navigateToUrl(page, testData, requestTracker);
     await checkTestCancelled(testData.testId);
 
-    // Build config and execute test
-    const intelligentConfig = buildIntelligentTestConfig(testData, goal, hints, retryCount);
-    const orchestrator = new IntelligentTestOrchestrator(
-      intelligentConfig,
-      testData.userId,
-      testData.testId
-    );
-
-    logger.info('[PLAYWRIGHT] Starting intelligent test execution', {
-      testId: testData.testId,
+    // Determine which mode to use (Lite vs Pro)
+    const modeSelection = ModeRouter.selectMode({
       goal,
-      hintsCount: hints.length,
-      hintsFromCommandsCount,
-      feedbackHintsCount,
-      retryCount,
+      url: testData.url,
+      userId: testData.userId,
+      userMode: testData.mode || 'lite', // Pass user-selected mode from frontend
     });
 
-    // Execute matest using the orchestrator
-    const intelligentResult = await orchestrator.execute(browser, page);
-
-    logger.info('[PLAYWRIGHT] Intelligent test completed', {
+    logger.info('[PLAYWRIGHT] Selected test mode', {
       testId: testData.testId,
-      success: intelligentResult.success,
-      pagesVisited: intelligentResult.pagesVisited,
-      actionsTaken: intelligentResult.actionsTaken,
-      duration: `${Math.round(intelligentResult.duration / 1000)}s`,
-      cost: `$${intelligentResult.cost.toFixed(3)}`,
+      mode: modeSelection.mode,
+      reason: modeSelection.reason,
     });
+
+    let intelligentResult: any;
+
+    if (modeSelection.mode === 'lite') {
+      // Use Lite Engine
+      logger.info('[PLAYWRIGHT] Starting Lite Engine execution', {
+        testId: testData.testId,
+        goal,
+      });
+
+      const liteEngine = new LiteEngine(page, {
+        testId: testData.testId,
+        userId: testData.userId,
+        browser: testData.browser,
+        goal,
+        url: testData.url,
+        timeout: 5 * 60 * 1000, // 5 minutes
+      });
+
+      const liteResult = await liteEngine.execute();
+
+      logger.info('[PLAYWRIGHT] Lite Engine completed', {
+        testId: testData.testId,
+        success: liteResult.success,
+        iterations: liteResult.iterations,
+        reason: liteResult.reason,
+        screenshotsCount: liteResult.screenshots.length,
+      });
+
+      // Lite screenshots are uploaded during execution in LiteEngine (for real-time graph updates).
+      // IMPORTANT: Do NOT upload again here — avoids duplicates and broken index mapping on partial failures.
+
+      // Convert Lite result to format expected by rest of system (IntelligentTestResult)
+      // ✅ FIXED: Now includes all required fields for Pro parity
+
+      // Build screenshots array from graphData (source of truth for URLs + screenshot URLs)
+      const screenshots: Array<{ url: string; screenshot: string }> = [];
+      const seenScreenshotUrls = new Set<string>();
+      if (liteResult.graphData?.nodes) {
+        for (const node of liteResult.graphData.nodes as any[]) {
+          if (!node?.meta) continue;
+
+          const urlAfter: string | undefined = node.meta.urlAfter;
+          const urlBefore: string | undefined = node.meta.urlBefore;
+          const screenshotAfter: string | undefined = node.meta.screenshotAfter;
+          const screenshotBefore: string | undefined = node.meta.screenshotBefore;
+          const pageScreenshot: string | undefined = node.meta.screenshot; // page nodes
+
+          const pushIfNew = (url: string | undefined, screenshotUrl: string | undefined) => {
+            if (!screenshotUrl) return;
+            if (seenScreenshotUrls.has(screenshotUrl)) return;
+            seenScreenshotUrls.add(screenshotUrl);
+            screenshots.push({ url: url || testData.url, screenshot: screenshotUrl });
+          };
+
+          pushIfNew(urlBefore, screenshotBefore);
+          pushIfNew(urlAfter, screenshotAfter);
+          pushIfNew(urlAfter, pageScreenshot);
+        }
+      }
+
+      intelligentResult = {
+        // Core fields
+        success: liteResult.success,
+        goal: goal,
+        startUrl: testData.url,
+        pagesVisited: 1,
+        actionsTaken: liteResult.iterations,
+        duration: liteResult.duration || 0,
+        cost: liteResult.iterations * 0.001, // Approximate cost
+
+        // Error/warning tracking
+        errors: [], // Lite doesn't track errors in same format yet
+        warnings: [],
+
+        // Summary
+        summary: liteResult.reason,
+
+        // Page visits (minimal for Lite)
+        pageVisits: [],
+
+        // Screenshots: Pro format, derived from graphData (already URLs)
+        screenshots,
+
+        // ✅ NEW: Full graph data like Pro
+        graphData: liteResult.graphData,
+
+        // Internal flags
+        _liteMode: true, // Flag to skip uploadIntelligentTestScreenshots
+      };
+    } else {
+      // Use Pro Mode (existing IntelligentTestOrchestrator)
+      logger.info('[PLAYWRIGHT] Starting Pro Mode execution', {
+        testId: testData.testId,
+        goal,
+        hintsCount: hints.length,
+      });
+
+      const intelligentConfig = buildIntelligentTestConfig(testData, goal, hints, retryCount);
+      const orchestrator = new IntelligentTestOrchestrator(
+        intelligentConfig,
+        testData.userId,
+        testData.testId
+      );
+
+      intelligentResult = await orchestrator.execute(browser, page);
+
+      logger.info('[PLAYWRIGHT] Pro Mode completed', {
+        testId: testData.testId,
+        success: intelligentResult.success,
+        pagesVisited: intelligentResult.pagesVisited,
+        actionsTaken: intelligentResult.actionsTaken,
+        duration: `${Math.round(intelligentResult.duration / 1000)}s`,
+        cost: `$${intelligentResult.cost.toFixed(3)}`,
+      });
+    }
 
     // Save results and upload artifacts
-    await saveIntelligentTestResults(testData, intelligentResult, intelligentConfig);
-    const screenshotUrls = await uploadIntelligentTestScreenshots(
-      testData,
-      intelligentResult.screenshots || []
-    );
+    // For Lite mode, create a minimal config for compatibility
+    const finalConfig = modeSelection.mode === 'lite'
+      ? { mode: 'lite', goal, hints: [] }
+      : buildIntelligentTestConfig(testData, goal, hints, retryCount);
+
+    await saveIntelligentTestResults(testData, intelligentResult, finalConfig);
+
+    // Upload screenshots:
+    // - Lite mode: screenshots already uploaded as URLs, just extract them
+    // - Pro mode: screenshots are base64, need to upload to storage
+    let screenshotUrls: string[] = [];
+    if (intelligentResult._liteMode) {
+      // Lite mode: screenshots are already URLs
+      screenshotUrls = (intelligentResult.screenshots || [])
+        .map((s: { screenshot?: string }) => s.screenshot)
+        .filter((url: string | undefined): url is string => !!url);
+
+      logger.debug('[PLAYWRIGHT] Lite mode: using pre-uploaded screenshot URLs', {
+        testId: testData.testId,
+        count: screenshotUrls.length,
+      });
+    } else {
+      // Pro mode: upload base64 screenshots to storage
+      screenshotUrls = await uploadIntelligentTestScreenshots(
+        testData,
+        intelligentResult.screenshots || []
+      );
+    }
 
     // Collect artifacts and cleanup (best-effort)
     let artifacts: { videoPath?: string; tracePath?: string } = {};

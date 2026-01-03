@@ -248,6 +248,7 @@ export async function saveTestPlan(
         intelligent_mode: testPlan.intelligentMode || false,
         estimated_pages: testPlan.estimatedPages,
         estimated_cost: testPlan.estimatedCost,
+        mode: testPlan.mode || 'lite', // Test execution mode
       });
 
     if (error) {
@@ -509,6 +510,7 @@ export async function getTestPlan(
       intelligentMode: data.intelligent_mode || false,
       estimatedPages: data.estimated_pages,
       estimatedCost: data.estimated_cost,
+      mode: data.mode || 'lite', // Test execution mode
     };
   } catch (error) {
     logger.error('[GET_TEST_PLAN] Critical error getting test plan', {

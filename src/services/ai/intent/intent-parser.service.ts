@@ -1,6 +1,6 @@
 import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
-import { detectUserApproval, extractUrlWithGPT } from '@/services/ai/ai-helpers.service';
+import { detectUserApproval, extractUrlWithGPT } from '@/services/ai/helpers/ai-helpers.service';
 // TODO: KB Search temporarily disabled - will be re-enabled later
 // import { detectLanguage, searchKB } from '@/services/kb/kb.service';
 // import { RulesCacheService } from '@/services/kb/rules-cache.service';

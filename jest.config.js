@@ -34,7 +34,7 @@ module.exports = {
       statements: 80
     }
   },
-  // setupFilesAfterEnv: ['<rootDir>/src/test/setup.ts'],
+  setupFilesAfterEnv: ['<rootDir>/src/test/jest.setup.ts'],
   testTimeout: 10000,
   verbose: true,
 };

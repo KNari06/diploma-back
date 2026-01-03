@@ -17,6 +17,7 @@ export interface Step0Result {
   sessionId?: string;
   conversationId?: string;
   answers?: Record<string, any>;
+  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
 }
 
 export function validateInput(
@@ -59,7 +60,7 @@ export function validateInput(
   // Check connection after validation
   checkConnection();
 
-  const { message, context, sessionId, conversationId, answers } = req.body as ChatRequest;
+  const { message, context, sessionId, conversationId, answers, mode } = req.body as ChatRequest;
 
   // Validate message (FIX #1)
   if (!message || typeof message !== 'string' || message.trim().length === 0) {
@@ -78,6 +79,7 @@ export function validateInput(
     hasSession: !!sessionId,
     hasConversation: !!conversationId,
     hasAnswers: !!answers,
+    mode: mode || 'lite',
     timeout: CONSTANTS.CHAT_REQUEST_TIMEOUT,
   });
 
@@ -88,6 +90,7 @@ export function validateInput(
     sessionId,
     conversationId,
     answers,
+    mode: mode || 'lite', // Default to 'lite' mode
   };
 }
 

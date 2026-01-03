@@ -205,6 +205,7 @@ export async function executeUiTestFlow(
         intelligentMode, // ✅ Safe: always boolean
         testGoal: intelligentMode ? planSummary : undefined, // ✅ Safe: always string or undefined
         estimatedCost: plan.estimatedCost, // Optional field
+        mode: plan.mode || 'lite', // Test execution mode (default: 'lite')
       };
 
       /// Here we run the main UI/UX manual test

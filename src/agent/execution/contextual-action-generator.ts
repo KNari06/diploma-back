@@ -9,7 +9,7 @@ import {
   buildNextStepPrompt,
 } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
-import { AICostManager, AIModel } from '@/services/ai/ai-cost-manager.service';
+import { AICostManager, AIModel } from '@/services/ai/cost/ai-cost-manager.service';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 import { Page } from 'playwright';

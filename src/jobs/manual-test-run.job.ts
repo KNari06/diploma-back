@@ -48,7 +48,20 @@ export class ManualTestRunJobHandler {
    * Process test run job
    */
   static async process(job: Job<TestJobData>) {
-    const { testId, url, browser, options, projectId, userId, retryCount = 0, commands, intent, intelligentMode, testGoal } = job.data;
+    const {
+      testId,
+      url,
+      browser,
+      options,
+      projectId,
+      userId,
+      retryCount = 0,
+      commands,
+      intent,
+      intelligentMode,
+      testGoal,
+      mode,
+    } = job.data;
 
     // Validate required parameters
     if (!testId || !url || !browser) {
@@ -108,6 +121,7 @@ export class ManualTestRunJobHandler {
           intent,
           intelligentMode,
           testGoal,
+          mode,
         },
         MAX_RETRIES
       );

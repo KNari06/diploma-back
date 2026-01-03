@@ -96,7 +96,7 @@ export class AIExtractService {
   static async extract(
     page: Page,
     request: AIExtractRequest,
-    costManager?: import('@/services/ai/ai-cost-manager.service').AICostManager
+    costManager?: import('@/services/ai/cost/ai-cost-manager.service').AICostManager
   ): Promise<AIExtractResponse> {
     const startTime = Date.now();
 

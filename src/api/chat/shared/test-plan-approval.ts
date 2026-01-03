@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
-import { detectUserApproval } from '@/services/ai/ai-helpers.service';
+import { detectUserApproval } from '@/services/ai/helpers/ai-helpers.service';
 import { getLatestPendingTestPlan, getTestPlan } from '@/services/testing/plans/exploration-cache.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';

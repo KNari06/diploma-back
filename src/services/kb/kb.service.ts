@@ -1,10 +1,10 @@
 import { supabase } from '@/db/supabase';
-import { getChatCompletionWithMessages } from '@/services/ai/openai.service';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { chunkMarkdown, chunkText } from '@/utils/text-processing/chunking';
 import { getFileSizeMB, isValidFileType, parseFile } from '@/utils/parsing/fileParser';
 import { logger } from '@/utils/core/logger';
 import { promises as fs } from 'fs';
-import { generateEmbedding, generateEmbeddings } from '../ai/embedding.service';
+import { generateEmbedding, generateEmbeddings } from '@/services/ai/core/embedding.service';
 import { searchLocalGlobalKB } from './localKB.service';
 
 const MAX_FILE_SIZE_MB = 10; // Maximum file size
