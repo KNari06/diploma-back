@@ -693,22 +693,9 @@ export interface TraceStepsResponse {
 }
 
 // Intent Parsing types
-// FIX #7: Define known intents as a const array for reusability
-export const KNOWN_INTENTS = [
-  'platform_test',           // UI testing (replaces check_element, fill_form, login_flow, assert_ui, navigate)
-  'api_test',                // API testing (single request)
-  'general_chat',            // General conversation
-  'needs_clarification',     // When AI is uncertain and needs user to clarify intent
-  // LEGACY: Keep for backward compatibility (will be migrated to platform_test)
-  'check_element',
-  'fill_form',
-  'login_flow',
-  'assert_ui',
-  'navigate',
-  'api_test_comprehensive',  // Multi-step API test
-] as const;
-
-export type IntentType = typeof KNOWN_INTENTS[number] | string; // Allow custom intents for flexibility
+// Intent types are now fully dynamic - determined by available handlers
+// No hardcoded list - intents are discovered from handler registry
+export type IntentType = string; // Fully flexible - any intent that has a handler is valid
 
 export type ElementType =
   | 'button'
@@ -750,6 +737,7 @@ export type TestScope = typeof VALID_SCOPES[number] | 'general' | null;
 
 export interface IntentResult {
   intent: IntentType;
+  intent_confidence?: number; // 0-1, how confident AI is about the intent
 
   // NEW: Scope and target for platform_test
   scope?: TestScope;
@@ -762,7 +750,7 @@ export interface IntentResult {
   viewport?: ViewportType;
   action?: ActionType;
   value?: string; // For input actions
-  confidence?: number; // 0-1, how confident the parser is
+  confidence?: number; // 0-1, how confident the parser is (DEPRECATED: use intent_confidence)
   rawText?: string; // Original user message for reference
   metadata?: Record<string, any>; // Additional flexible data
 
@@ -776,6 +764,7 @@ export interface IntentResult {
 
   // Optional fields (all intents)
   urgency?: 'high' | 'normal' | null; // Detect: "urgent", "ASAP", "critical", "quick"
+  userLanguage?: 'en' | 'ru' | 'neutral'; // User's language for localization
 
   selector?: string; // For UI testing intents
   // Playwright commands generated from intent
@@ -785,6 +774,14 @@ export interface IntentResult {
   clarificationQuestion?: string; // Question to ask user when intent is unclear
   possibleIntents?: IntentType[]; // List of possible intents AI is considering
   clarificationReason?: string; // Why clarification is needed (for debugging)
+
+  // Regression test fields (for save_test, create_suite, run_regression intents)
+  sourceTestId?: string | null;        // For save_test: ID of test to save
+  suggestedName?: string | null;       // For save_test, create_suite: suggested name
+  suiteName?: string | null;           // For create_suite: name of suite
+  testCaseIds?: string[] | null;       // For create_suite: IDs of test cases
+  savedTestCaseId?: string | null;     // For run_regression: ID of saved test case
+  suiteId?: string | null;             // For run_regression: ID of suite
 }
 
 // Playwright Command types

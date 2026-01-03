@@ -1,13 +1,16 @@
-import { logger } from '@/utils/core/logger';
-import { isValidUUID } from '@/utils/validation/validation';
+import { supabaseAdmin } from '@/db/supabase';
 import { parseUserIntent } from '@/services/ai/intent/intent-parser.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
 import { IntentResult } from '@/types';
-import { CONSTANTS, FAST_PATH_COMMANDS, PROGRESS } from './constants';
-import { emitProcessingStep } from './utils';
-import { checkRequestAborted } from './request-cancellation';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
+import { logger } from '@/utils/core/logger';
+import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
+import { isValidUUID } from '@/utils/validation/validation';
+import { CONSTANTS, FAST_PATH_COMMANDS, PROGRESS } from './constants';
+import { getAvailableIntents, hasHandler } from './handler-registry';
+import { buildRegressionContext } from './regression-context';
+import { checkRequestAborted } from './request-cancellation';
+import { emitProcessingStep } from './utils';
 
 /**
  * Get chat history for intent parsing (extracted helper)
@@ -279,6 +282,31 @@ export async function parseIntent(
 
     checkRequestTimeout();
 
+    // Get project_id from chat session if available
+    let projectId: string | undefined;
+    if (chatSessionId) {
+      try {
+        const { data: session } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('project_id')
+          .eq('id', chatSessionId)
+          .maybeSingle();
+        projectId = session?.project_id || undefined;
+      } catch (error) {
+        logger.warn('[INTENT_PARSING] Failed to get project_id from session', { error, chatSessionId });
+      }
+    }
+
+    // Build regression context (last test ID, saved cases count, etc.)
+    const regressionContext = await buildRegressionContext({
+      chatSessionId,
+      userId,
+      projectId,
+    });
+
+    // Get available intents from handler registry
+    const availableIntents = getAvailableIntents();
+
     // Parse intent with error handling (FIX #5)
     try {
       const parseUserIntentWithLogging = functionLogger
@@ -286,8 +314,9 @@ export async function parseIntent(
         : parseUserIntent;
       parsedIntent = await parseUserIntentWithLogging(
         validMessage,
-        { chatHistory },
-        workspace_id
+        { chatHistory, ...regressionContext }, // Include regression context
+        projectId ?? workspace_id, // Use project_id from session if available, fallback to workspace_id
+        availableIntents // Pass dynamic intent list
       );
 
       // Check if request was cancelled after AI call
@@ -307,11 +336,12 @@ export async function parseIntent(
         parsedIntent = { intent: 'general_chat', confidence: 0 };
       }
 
-      // ✅ FIX: Validate intent value
-      const validIntents = ['api_test', 'platform_test', 'general_chat', 'needs_clarification'];
-      if (parsedIntent.intent && !validIntents.includes(parsedIntent.intent)) {
-        logger.warn('[CHAT] Invalid intent from parseUserIntent', {
+      // ✅ FIX: Validate intent using dynamic handler registry
+      // Uses hasHandler() instead of hardcoded array to support regression intents
+      if (parsedIntent.intent && !hasHandler(parsedIntent.intent)) {
+        logger.warn('[CHAT] No handler for intent, falling back to general_chat', {
           intent: parsedIntent.intent,
+          availableIntents: getAvailableIntents(),
           userId,
         });
         parsedIntent.intent = 'general_chat'; // Fallback to safe default

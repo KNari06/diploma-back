@@ -12,6 +12,7 @@ import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import notificationsRoutes from '@/api/notifications/notifications.routes';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import projectRoutes from '@/api/project/project.routes';
+import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
@@ -421,6 +422,7 @@ app.use(`/api/${env.API_VERSION}/kb`, rulesReloadRoutes);
 app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, reportsRoutes); // ✅ NEW: Test reports & Jira integration
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
+app.use(`/api/${env.API_VERSION}/regression`, regressionRoutes); // ✅ NEW: Regression testing
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
 app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications
