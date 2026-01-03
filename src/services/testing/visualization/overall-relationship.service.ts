@@ -1,4 +1,4 @@
-import { cosineSimilarity, generateEmbedding } from '@/services/ai/embedding.service';
+import { cosineSimilarity, generateEmbedding } from '@/services/ai/core/embedding.service';
 import type { OverallCluster, OverallEdge } from '@/types/overall.types';
 import { logger } from '@/utils/core/logger';
 import crypto from 'crypto';
