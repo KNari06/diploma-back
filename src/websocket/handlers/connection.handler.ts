@@ -73,10 +73,14 @@ export const handleConnection = async (socket: TypedSocket): Promise<void> => {
     });
   }
 
+  // Get transport type for monitoring
+  const transport = (socket.conn as any).transport?.name || 'unknown';
+
   logger.info('[WebSocket] New connection', {
     socketId: socket.id,
     email: userEmail || 'unknown',
     userId: userId.substring(0, 8) + '...', // Shortened for logs
+    transport, // 'polling' or 'websocket' - important for debugging excessive requests
   });
 
   try {

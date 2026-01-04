@@ -19,6 +19,19 @@ type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, So
 // Rate limiting: max subscriptions per socket
 const MAX_SUBSCRIPTIONS = 50;
 const subscriptionCounts = new Map<string, number>();
+const subscribedRooms = new Map<string, Set<string>>();
+
+/**
+ * Get (or create) set of subscribed rooms for a socket.
+ * Keeping explicit sets makes subscriptions idempotent and prevents false limit hits.
+ */
+const getRoomSet = (socketId: string): Set<string> => {
+  const existing = subscribedRooms.get(socketId);
+  if (existing) return existing;
+  const created = new Set<string>();
+  subscribedRooms.set(socketId, created);
+  return created;
+};
 
 /**
  * Check if socket can subscribe to more rooms
@@ -51,6 +64,7 @@ const decrementSubscriptions = (socketId: string): void => {
  */
 const cleanupSubscriptions = (socketId: string): void => {
   subscriptionCounts.delete(socketId);
+  subscribedRooms.delete(socketId);
 };
 
 /**
@@ -104,7 +118,21 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       }
 
       const room = createRoomName('test', testId.trim());
+      const rooms = getRoomSet(socket.id);
+
+      // Idempotent subscribe: don't double-count if already joined
+      if (rooms.has(room)) {
+        logger.debug('[WebSocket] Already subscribed to test', {
+          socketId: socket.id,
+          userId: userId || 'anonymous',
+          testId,
+          room,
+        });
+        return;
+      }
+
       socket.join(room);
+      rooms.add(room);
       incrementSubscriptions(socket.id);
 
       logger.info('[WebSocket] Subscribed to test', {
@@ -143,7 +171,11 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
 
       const room = createRoomName('test', testId.trim());
       socket.leave(room);
-      decrementSubscriptions(socket.id);
+      const rooms = getRoomSet(socket.id);
+      if (rooms.has(room)) {
+        rooms.delete(room);
+        decrementSubscriptions(socket.id);
+      }
 
       logger.info('[WebSocket] Unsubscribed from test', {
         socketId: socket.id,
@@ -200,7 +232,15 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       }
 
       const room = createRoomName('chat', sessionId.trim());
+      const rooms = getRoomSet(socket.id);
+
+      // Idempotent subscribe: don't double-count if already joined
+      if (rooms.has(room)) {
+        return;
+      }
+
       socket.join(room);
+      rooms.add(room);
       incrementSubscriptions(socket.id);
 
       // logger.info('[WebSocket] Subscribed to chat', {
@@ -239,7 +279,11 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
 
       const room = createRoomName('chat', sessionId.trim());
       socket.leave(room);
-      decrementSubscriptions(socket.id);
+      const rooms = getRoomSet(socket.id);
+      if (rooms.has(room)) {
+        rooms.delete(room);
+        decrementSubscriptions(socket.id);
+      }
 
       // logger.info('[WebSocket] Unsubscribed from chat', {
       //   socketId: socket.id,

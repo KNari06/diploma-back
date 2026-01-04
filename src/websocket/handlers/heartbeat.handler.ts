@@ -7,9 +7,9 @@ import { logger } from '@/utils/core/logger';
 import { Socket } from 'socket.io';
 import { getUserId } from '../middleware/middleware';
 import {
-    ClientToServerEvents,
-    ServerToClientEvents,
-    SocketData,
+  ClientToServerEvents,
+  ServerToClientEvents,
+  SocketData,
 } from '../types/types';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
@@ -26,6 +26,11 @@ export const handleHeartbeat = (socket: TypedSocket): void => {
     userId = undefined;
   }
 
+  // Prevent client-side ping spam (especially costly on polling transport).
+  // Socket.IO already has transport-level ping/pong; this is an app-level heartbeat.
+  let lastPingAt = 0;
+  const MIN_PING_INTERVAL_MS = 5000; // 5s hard floor
+
   socket.on('ping', () => {
     try {
       // Check if socket is still connected
@@ -36,6 +41,12 @@ export const handleHeartbeat = (socket: TypedSocket): void => {
         });
         return;
       }
+
+      const now = Date.now();
+      if (now - lastPingAt < MIN_PING_INTERVAL_MS) {
+        return;
+      }
+      lastPingAt = now;
 
       socket.emit('pong');
 

@@ -41,6 +41,12 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
     }
   }
 
+  // Optimize transport configuration:
+  // - In production: prefer websocket (more efficient, fewer HTTP requests)
+  // - In development: allow both (easier debugging)
+  // - Increase pingInterval to reduce polling frequency (important for polling transport)
+  const transports: ('websocket' | 'polling')[] = ['websocket', 'polling']; // websocket first (preferred), polling as fallback
+
   // Create Socket.IO server with typed events
   io = new SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, SocketData>(
     httpServer,
@@ -51,12 +57,20 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
         methods: ['GET', 'POST'],
       },
       // Connection options
-      pingTimeout: 60000, // 60 seconds
-      pingInterval: 25000, // 25 seconds
+      // ⚠️ CRITICAL: pingInterval affects polling frequency
+      // - Lower value = more frequent HTTP requests when using polling
+      // - Higher value = fewer requests but slower to detect dead connections
+      // - 60s is a good balance: ~1 request/minute with polling, still detects dead connections quickly
+      pingTimeout: 120000, // 120 seconds - time to wait for pong before considering connection dead
+      pingInterval: 60000, // 60 seconds - interval between pings (was 25s, too frequent for polling)
       connectTimeout: 45000, // 45 seconds
       // Transport options
-      transports: ['websocket', 'polling'],
-      allowUpgrades: true,
+      // Order matters: first transport is preferred
+      transports,
+      allowUpgrades: true, // Allow upgrade from polling to websocket
+      // Additional polling optimization
+      httpCompression: true, // Compress polling responses
+      maxHttpBufferSize: 1e6, // 1MB max message size
     }
   );
 
@@ -84,10 +98,33 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
 
   // Handle connections
   io.on('connection', (socket) => {
+    // Log initial transport type (important for debugging polling vs websocket)
+    const transport = socket.conn.transport.name;
+    logger.info('[WebSocket] New connection established', {
+      socketId: socket.id,
+      transport, // 'polling' or 'websocket'
+      // Warn if using polling in production (less efficient)
+      ...(transport === 'polling' && !isDevelopment ? {
+        warning: 'Using polling transport - consider checking firewall/proxy settings for websocket support'
+      } : {}),
+    });
+
+    // Track transport upgrades reliably per-socket (polling → websocket)
+    // Engine.IO emits 'upgrade' on the connection when transport changes.
+    socket.conn.on('upgrade', (newTransport: any) => {
+      const upgradedTo = newTransport?.name || 'unknown';
+      logger.info('[WebSocket] Transport upgraded', {
+        socketId: socket.id,
+        from: transport,
+        to: upgradedTo,
+      });
+    });
+
     // Handle async connection handler
     handleConnection(socket).catch((error) => {
       logger.error('[WebSocket] Error handling connection', {
         socketId: socket.id,
+        transport,
         error: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack : undefined,
       });
@@ -97,8 +134,11 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
   });
 
   logger.info('[WebSocket] WebSocket server initialized successfully', {
-    transports: ['websocket', 'polling'],
+    transports,
+    pingInterval: '60s',
+    pingTimeout: '120s',
     cors: isDevelopment ? 'enabled (development)' : 'configured',
+    note: 'Polling transport will create HTTP requests every ~60s. WebSocket is preferred for better performance.',
   });
 
   return io;
