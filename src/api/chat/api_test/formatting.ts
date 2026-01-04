@@ -117,7 +117,7 @@ export function convertApiTestPlanToTestPlan(apiPlan: any): any {
       action: 'validate',
       description: step,
     })),
-    commands: [], // No Playwright commands for API tests
+    commands: [], // No browser automation commands for API tests
     estimatedDuration: apiPlan.estimated_duration,
     whatWillBeTested: apiPlan.what_will_be_tested,
     whatWillNotBeTested: [], // Not provided in ApiTestPlan

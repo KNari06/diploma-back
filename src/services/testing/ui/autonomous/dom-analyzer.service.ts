@@ -1049,7 +1049,7 @@ export async function analyzeDOMStructure(
        * Priority: testid= > data-cy > getByRole > getByLabel > getByText > ID (via role=)
        * Format: testid="login", role=button[name="Login"], text="Login", label="Email", [data-cy="..."]
        * ✅ REMOVED: CSS class selectors, nth-of-type, tag-only (unstable)
-       * ✅ OPTIMIZED: data-testid uses Playwright API (testid=) instead of CSS
+       * ✅ OPTIMIZED: data-testid uses our testing framework API (testid=) instead of CSS
        * Uses closure to access selectorCounts (no need to pass as parameter)
        */
       /**
