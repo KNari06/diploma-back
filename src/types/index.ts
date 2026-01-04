@@ -49,6 +49,7 @@ export interface TestOptions {
     username?: string;
     password: string;
   };
+  mode?: 'lite' | 'pro'; // Persisted execution mode (used by retry logic)
 }
 
 export type BrowserType = 'chrome' | 'firefox' | 'safari' | 'edge' | 'mobile-chrome' | 'mobile-safari';

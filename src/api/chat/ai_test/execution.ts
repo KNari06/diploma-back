@@ -234,12 +234,11 @@ export async function executeUiTestFlow(
       logger.error('[UI_TEST] ManualTestService.runTest failed', {
         error: testError instanceof Error ? testError.message : String(testError),
         url: plan.url,
-        // ✅ IMPROVEMENT: Log that credits were already deducted
-        note: 'Credits were deducted before test creation - they will not be refunded',
+        // Credits are deducted AFTER successful test start (see below).
+        // So if runTest fails, credits were NOT deducted here.
+        note: 'Test failed to start; credits were not deducted',
       });
 
-      // ✅ NOTE: Credits were already deducted (line 86), they are NOT refunded on failure
-      // This is intentional behavior - credits are spent for attempting to create the test
       throw new Error(`Failed to start test: ${testError instanceof Error ? testError.message : 'Unknown error'}`);
     }
 

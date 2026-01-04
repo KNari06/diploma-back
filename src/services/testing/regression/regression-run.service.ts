@@ -79,7 +79,7 @@ export class RegressionRunService {
       }
 
       // 3. Build test request from saved case
-      const testRequest = await this.buildTestRequest(savedCase, parameters);
+      const testRequest = await this.buildTestRequest(savedCase, userId, parameters);
 
       // 4. Execute test using existing test service
       const testResult = await ManualTestService.runTest(testRequest);
@@ -178,7 +178,7 @@ export class RegressionRunService {
 
       for (const testCase of testCases) {
         try {
-          const testRequest = await this.buildTestRequest(testCase, parameters);
+          const testRequest = await this.buildTestRequest(testCase, userId, parameters);
           const testResult = await ManualTestService.runTest(testRequest);
 
           if (testResult.success && testResult.data?.id) {
@@ -338,6 +338,7 @@ export class RegressionRunService {
    */
   private static async buildTestRequest(
     savedCase: any,
+    userId: string,
     parameters: Record<string, any>
   ): Promise<any> {
     // Get source test for base configuration (optional - only for browsers/options)
@@ -369,6 +370,7 @@ export class RegressionRunService {
     return {
       url: savedCase.url, // Use persisted URL from saved_test_cases
       projectId: savedCase.project_id,
+      userId,
       browsers: sourceTest?.browsers || ['chrome'],
       intelligentMode: true, // Use intelligent mode for saved cases
       testGoal: savedCase.description || savedCase.name,

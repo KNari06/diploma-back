@@ -5,10 +5,10 @@
  */
 
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
-import type { Page } from 'playwright';
 import { logger } from '@/utils/core/logger';
+import type { Page } from 'playwright';
+import type { LiteElement, LiteSnapshot } from '../lite-types';
 import { VisualStability } from './visual-stability';
-import type { LiteSnapshot, LiteElement } from '../lite-types';
 
 export class SnapshotCollector {
   /**
@@ -27,7 +27,13 @@ export class SnapshotCollector {
       // @ts-expect-error - DOM types available in browser context
       const snapshot = await page.evaluate(() => {
         const elements: any[] = [];
-        let refCounter = 0;
+        // Keep stable refs across snapshots to enable meaningful diffs.
+        // Use monotonic counter stored on window to avoid reassigning refs every time.
+        // @ts-expect-error - window available in browser context
+        const win = window as any;
+        if (typeof win.__agentRefCounter !== 'number') {
+          win.__agentRefCounter = 0;
+        }
 
         /**
          * Helper: get parent context for an element
@@ -103,8 +109,15 @@ export class SnapshotCollector {
             // @ts-expect-error - window available in browser context
             if (rect.bottom < -1000 || rect.top > window.innerHeight + 1000) return;
 
-            const ref = `e${refCounter++}`;
-            el.setAttribute('data-agent-ref', ref);
+            // Reuse existing ref if present, otherwise assign a new one.
+            // This makes refs stable across iterations (unless DOM node is replaced).
+            const existingRef = el.getAttribute('data-agent-ref');
+            const ref = existingRef && /^e\d+$/.test(existingRef)
+              ? existingRef
+              : `e${win.__agentRefCounter++}`;
+            if (!existingRef || existingRef !== ref) {
+              el.setAttribute('data-agent-ref', ref);
+            }
 
             const input = el as any;
             const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';

@@ -211,6 +211,23 @@ export class ActionExecutor {
       return { success: false };
     }
 
+    // Map HTML tag to Playwright role for getByRole fallback.
+    const roleFromTag = (tag: string | undefined): 'button' | 'link' | 'textbox' | 'combobox' | undefined => {
+      switch ((tag || '').toLowerCase()) {
+        case 'button':
+          return 'button';
+        case 'a':
+          return 'link';
+        case 'input':
+        case 'textarea':
+          return 'textbox';
+        case 'select':
+          return 'combobox';
+        default:
+          return undefined;
+      }
+    };
+
     // Build fallback strategies
     const strategies: Array<{ locator: Locator; name: string } | undefined> = [
       // 1. By placeholder
@@ -235,9 +252,9 @@ export class ActionExecutor {
           }
         : undefined,
       // 4. By role + name
-      el.text && ['button', 'link', 'textbox'].includes(el.tag)
+      el.text && roleFromTag(el.tag)
         ? {
-            locator: this.page.getByRole(el.tag as any, { name: el.text }),
+            locator: this.page.getByRole(roleFromTag(el.tag) as any, { name: el.text }),
             name: 'role+name',
           }
         : undefined,

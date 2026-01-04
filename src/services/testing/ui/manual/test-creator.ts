@@ -34,7 +34,12 @@ export async function createTest(testRequest: TestRunRequest): Promise<Test> {
     user_id: userId,
     status: 'pending' as const,
     browsers: testRequest.browsers,
-    options: testRequest.options || {},
+    // Persist execution mode inside options (tests table has no dedicated mode column).
+    // This allows retries and downstream flows to preserve user's mode choice.
+    options: {
+      ...(testRequest.options || {}),
+      mode: testRequest.mode || 'lite',
+    },
     // Intelligent testing fields
     intelligent_mode: testRequest.intelligentMode || false,
     test_goal: testRequest.testGoal || null,

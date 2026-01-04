@@ -4,7 +4,9 @@ import { logger, logTestEvent } from '@/utils/core/logger';
 import { TestCreatedPayload } from '@/websocket/types/types';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { createTest } from './test-creator';
+import { cancelTestJobs } from './test-cancellation';
 import { validateTestRequest } from './test-validator';
+import { dbAdminService } from '@/db/supabase';
 
 /**
  * Create and run a new test
@@ -40,35 +42,76 @@ export async function runTest(testRequest: TestRunRequest): Promise<ApiResponse<
     // Add jobs to queue for each browser
     logger.info('🟢 [MANUAL_TEST_FLOW] Step 6: Adding jobs to queue');
 
-    for (const browser of testRequest.browsers) {
-      logger.info('🟢 [MANUAL_TEST_FLOW] Step 7: Adding job to queue', { browser, testId: test.id });
+    const queuedBrowsers: string[] = [];
+    const effectiveMode =
+      testRequest.mode ||
+      ((testRequest.options as any)?.mode as 'lite' | 'pro' | undefined) ||
+      'lite';
+    try {
+      for (const browser of testRequest.browsers) {
+        logger.info('🟢 [MANUAL_TEST_FLOW] Step 7: Adding job to queue', { browser, testId: test.id });
 
-      const job = await QueueManager.addTestRunJob({
-        testId: test.id,
-        url: testRequest.url,
-        browser,
-        options: testRequest.options,
-        projectId: testRequest.projectId,
-        userId: testRequest.userId,
-        // Pass Playwright commands if available
-        commands: (testRequest as any).commands,
-        intent: (testRequest as any).intent,
-        // Pass intelligent mode settings
-        intelligentMode: testRequest.intelligentMode,
-        testGoal: testRequest.testGoal,
-        mode: testRequest.mode || 'lite', // Test execution mode
-      });
+        const job = await QueueManager.addTestRunJob({
+          testId: test.id,
+          url: testRequest.url,
+          browser,
+          options: testRequest.options,
+          projectId: testRequest.projectId,
+          userId: testRequest.userId,
+          // Pass Playwright commands if available
+          commands: (testRequest as any).commands,
+          intent: (testRequest as any).intent,
+          // Pass intelligent mode settings
+          intelligentMode: testRequest.intelligentMode,
+          testGoal: testRequest.testGoal,
+          mode: effectiveMode, // Test execution mode (supports fallback to options.mode)
+        });
 
-      logger.info('🟢 [MANUAL_TEST_FLOW] Step 8: Job added to queue successfully', {
-        browser,
-        jobId: job?.id
-      });
+        queuedBrowsers.push(browser);
 
-      // Monitor the job after adding
-      if (job?.id) {
-        const { QueueMonitor } = await import('@/utils/monitoring/queue-monitor');
-        QueueMonitor.monitorAfterJobAdd(job.id, test.id);
+        logger.info('🟢 [MANUAL_TEST_FLOW] Step 8: Job added to queue successfully', {
+          browser,
+          jobId: job?.id
+        });
+
+        // Monitor the job after adding
+        if (job?.id) {
+          const { QueueMonitor } = await import('@/utils/monitoring/queue-monitor');
+          QueueMonitor.monitorAfterJobAdd(job.id, test.id);
+        }
       }
+    } catch (queueError) {
+      // Important: if queuing fails after we already created the test record,
+      // avoid leaving a "pending" test that will never run.
+      logger.error('[MANUAL_TEST_FLOW] Failed to queue one or more jobs; cancelling test', {
+        testId: test.id,
+        queuedBrowsers,
+        error: queueError instanceof Error ? queueError.message : String(queueError),
+      });
+
+      // Best-effort: remove waiting/delayed jobs that were already queued
+      try {
+        if (queuedBrowsers.length > 0) {
+          await cancelTestJobs(test.id, queuedBrowsers);
+        }
+      } catch {
+        // never throw from cleanup
+      }
+
+      // Best-effort: mark test as cancelled so workers stop quickly if any job already became active
+      try {
+        await dbAdminService.updateTestIfNotCancelled(test.id, {
+          status: 'cancelled',
+          completed_at: new Date().toISOString(),
+        });
+      } catch (statusError) {
+        logger.warn('[MANUAL_TEST_FLOW] Failed to mark test as cancelled after queue failure', {
+          testId: test.id,
+          error: statusError instanceof Error ? statusError.message : String(statusError),
+        });
+      }
+
+      throw queueError;
     }
 
     // NOTE: Credits should be deducted BEFORE calling runTest()
