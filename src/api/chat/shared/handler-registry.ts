@@ -39,6 +39,7 @@ export type IntentHandler = (
     answers?: Record<string, any>;
     context?: any;
     abortSignal?: AbortSignal;
+    mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
   }
 ) => Promise<void>;
 
@@ -60,6 +61,7 @@ const handlePlatformTest: IntentHandler = async (req, res, params) => {
     conversationId: params.conversationId,
     answers: params.answers,
     abortSignal: params.abortSignal,
+    mode: params.mode,
   });
 };
 

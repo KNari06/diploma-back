@@ -2,7 +2,7 @@ import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logge
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { PROGRESS } from './constants';
-import { getHandler } from './handler-registry';
+import { getHandler, type IntentHandler } from './handler-registry';
 import { checkRequestAborted } from './request-cancellation';
 import { emitProcessingStep } from './utils';
 
@@ -56,7 +56,7 @@ export async function routeToHandler(
   });
 
   // Get handler from registry (dynamic lookup)
-  let handler = getHandler(intent);
+  let handler: IntentHandler | undefined = getHandler(intent);
 
   // Fallback to general_chat if handler not found
   if (!handler) {
@@ -80,5 +80,6 @@ export async function routeToHandler(
     answers: params.answers,
     context: params.context,
     abortSignal: params.abortSignal,
+    mode: params.mode,
   });
 }
