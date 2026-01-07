@@ -97,6 +97,12 @@ export class IntelligentTestOrchestrator {
   private graphSentNodeIds = new Set<string>();
   private graphSentEdgeIds = new Set<string>();
 
+  // Flag to prevent graph updates after test completion
+  private isTestCompleted = false;
+
+  // Flag to prevent non-final graph updates during finalization (race-safe)
+  private isFinalizing = false;
+
   private async buildCancelledResult(): Promise<IntelligentTestResult> {
     const result = await this.buildResult(false);
     result.cancelled = true; // ✅ FIX #7: Mark result as cancelled
@@ -1398,10 +1404,24 @@ export class IntelligentTestOrchestrator {
             const afterIdx = result.screenshotAfterIndex;
 
             void (async () => {
+              // ✅ FIX: Skip if test is already completed (prevents late events from async operations)
+              if (this.isTestCompleted || this.isFinalizing) {
+                logger.debug('[INTELLIGENT_ORCHESTRATOR] Skipping screenshot upload - test already completed', {
+                  testId,
+                  nodeId,
+                });
+                return;
+              }
+
               const { uploadScreenshotToStorage } = await import('@/services/storage/test-artifacts-storage.service');
 
               if (beforeBase64 && beforeIdx !== undefined) {
                 try {
+                  // ✅ FIX: Check again after async operation (test might have completed during upload)
+                  if (this.isTestCompleted || this.isFinalizing) {
+                    return;
+                  }
+
                   const beforeUrl = await uploadScreenshotToStorage(beforeBase64, testId, userId, beforeIdx);
                   const update = this.graphBuilder?.updateNodeMeta(nodeId, { screenshotBefore: beforeUrl });
                   if (update) {
@@ -1421,6 +1441,11 @@ export class IntelligentTestOrchestrator {
 
               if (afterBase64 && afterIdx !== undefined) {
                 try {
+                  // ✅ FIX: Check again after async operation (test might have completed during upload)
+                  if (this.isTestCompleted || this.isFinalizing) {
+                    return;
+                  }
+
                   const afterUrl = await uploadScreenshotToStorage(afterBase64, testId, userId, afterIdx);
                   const update = this.graphBuilder?.updateNodeMeta(nodeId, { screenshotAfter: afterUrl });
                   if (update) {
@@ -2299,6 +2324,10 @@ export class IntelligentTestOrchestrator {
 
     // Add end node to graph and emit final graph state to frontend
     if (this.testId && this.userId && this.graphBuilder) {
+      // ✅ FIX: Start finalization BEFORE emitting endUpdate to prevent late async updates (e.g. screenshot uploads).
+      // We still force-emit the final endUpdate so frontend always receives the final full graph.
+      this.isFinalizing = true;
+
       const endUpdate = this.graphBuilder.addEndNode(
         success,
         summary,
@@ -2311,7 +2340,10 @@ export class IntelligentTestOrchestrator {
           finalScreenshot: screenshots[screenshots.length - 1]?.screenshot,
         }
       );
-      this.emitGraphUpdate(endUpdate);
+      this.emitGraphUpdate(endUpdate, { force: true });
+
+      // ✅ FIX: Mark test as completed AFTER emitting endUpdate (so endUpdate isn't blocked)
+      this.isTestCompleted = true;
     }
 
     // Get final graph data for storage in database
@@ -3806,7 +3838,27 @@ export class IntelligentTestOrchestrator {
   }
 
   // Emit graph update via WebSocket for real-time visualization
-  private emitGraphUpdate(update: import('../utils/visualization/graph-builder.service').GraphUpdate): void {
+  // ✅ FIX: Prevents emitting after test completion
+  private emitGraphUpdate(
+    update: import('../utils/visualization/graph-builder.service').GraphUpdate,
+    options?: { force?: boolean }
+  ): void {
+    // ✅ FIX: Skip if test is already completed (prevents late events from async operations)
+    if (this.isTestCompleted) {
+      logger.debug('[INTELLIGENT_ORCHESTRATOR] Skipping graph emit - test already completed', {
+        testId: this.testId,
+      });
+      return;
+    }
+
+    // ✅ FIX: During finalization, block all non-forced graph updates (prevents spam from async uploads)
+    if (this.isFinalizing && !options?.force) {
+      logger.debug('[INTELLIGENT_ORCHESTRATOR] Skipping graph emit - finalizing', {
+        testId: this.testId,
+      });
+      return;
+    }
+
     if (!this.userId || !this.testId) {
       return;
     }

@@ -46,6 +46,12 @@ export class LiteEngine {
   private emittedEdgeIds = new Set<string>();
   private pendingGraphScreenshotUploads: Array<Promise<void>> = [];
 
+  // Flag to prevent graph updates after test completion
+  private isTestCompleted = false;
+
+  // Flag to prevent non-final graph updates during finalization (race-safe)
+  private isFinalizing = false;
+
   // Pro-grade error collection
   private collectedErrors: CollectedError[] = [];
   private seenErrorMessages = new Set<string>(); // Deduplication by message+page+type
@@ -842,13 +848,20 @@ export class LiteEngine {
     const iterations = this.state.getIterationCount();
 
     // ✅ NEW: Add end node to graph and get full graph
+    // ✅ FIX: Start finalization BEFORE emitting endUpdate to prevent late async updates (e.g. screenshot uploads).
+    // We still force-emit the final endUpdate so frontend always receives the final full graph.
+    this.isFinalizing = true;
+
     const endUpdate = this.graphBuilder.addEndNode(success, reason, {
       pagesVisited: 1, // Lite typically stays on one page
       actionsTaken: iterations,
       successRate: `${iterations > 0 ? Math.round((this.graphBuilder.getMetadata().completedSteps / iterations) * 100) : 0}%`,
       duration: `${Math.round(duration / 1000)}s`,
     });
-    this.emitGraphUpdate(endUpdate);
+    this.emitGraphUpdate(endUpdate, { force: true });
+
+    // ✅ FIX: Mark test as completed AFTER emitting endUpdate (so endUpdate isn't blocked)
+    this.isTestCompleted = true;
 
     // Get final graph data
     const graphData = this.graphBuilder.getFullGraph();
@@ -954,8 +967,18 @@ export class LiteEngine {
   /**
    * Async upload screenshots and update node meta
    * ✅ NEW: Same pattern as Pro - upload then emit updatedNode
+   * ✅ FIX: Checks isTestCompleted before emitting updates
    */
   private async uploadAndUpdateNodeScreenshots(nodeId: string, iteration: number): Promise<void> {
+    // ✅ FIX: Skip if test is already completed (prevents late events from async operations)
+    if (this.isTestCompleted || this.isFinalizing) {
+      logger.debug('[LITE_ENGINE] Skipping screenshot upload - test already completed', {
+        testId: this.config.testId,
+        nodeId,
+      });
+      return;
+    }
+
     // Get screenshot buffers for this iteration
     const screenshots = this.screenshotCollector.getAll();
     const beforeScreenshot = screenshots.find(s => s.name === `${iteration}_before`);
@@ -1000,6 +1023,11 @@ export class LiteEngine {
         const metaPatch: Record<string, string> = {};
         if (beforeUrl) metaPatch.screenshotBefore = beforeUrl;
         if (afterUrl) metaPatch.screenshotAfter = afterUrl;
+
+        // ✅ FIX: Re-check finalization/completion before emitting (test may have finished during upload)
+        if (this.isTestCompleted || this.isFinalizing) {
+          return;
+        }
 
         const update = this.graphBuilder.updateNodeMeta(nodeId, metaPatch);
         if (update) {
@@ -1091,8 +1119,25 @@ export class LiteEngine {
   /**
    * Emit graph update via WebSocket (like Pro)
    * ✅ NEW: Uses emitToUser for user-room delivery
+   * ✅ FIX: Prevents emitting after test completion
    */
-  private emitGraphUpdate(update: GraphUpdate): void {
+  private emitGraphUpdate(update: GraphUpdate, options?: { force?: boolean }): void {
+    // ✅ FIX: Skip if test is already completed (prevents late events from async operations)
+    if (this.isTestCompleted) {
+      logger.debug('[LITE_ENGINE] Skipping graph emit - test already completed', {
+        testId: this.config.testId,
+      });
+      return;
+    }
+
+    // ✅ FIX: During finalization, block all non-forced graph updates (prevents spam from async uploads)
+    if (this.isFinalizing && !options?.force) {
+      logger.debug('[LITE_ENGINE] Skipping graph emit - finalizing', {
+        testId: this.config.testId,
+      });
+      return;
+    }
+
     // Skip if no userId (can't emit to user room)
     if (!this.config.userId) {
       logger.debug('[LITE_ENGINE] Skipping graph emit - no userId', {

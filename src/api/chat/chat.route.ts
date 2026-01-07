@@ -296,7 +296,7 @@ router.post('/cancel',
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const userId = req.user!.id;
-    const { sessionId } = req.body || {};
+    const { sessionId, testId } = req.body || {};
 
     // ✅ FIX #1: Validate sessionId format if provided
     const { isValidUUID } = await import('@/utils/validation/validation');
@@ -304,6 +304,15 @@ router.post('/cancel',
       res.status(400).json({
         success: false,
         error: 'Invalid sessionId format (must be UUID)',
+      });
+      return;
+    }
+
+    // ✅ FIX: Validate testId format if provided
+    if (testId && !isValidUUID(testId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid testId format (must be UUID)',
       });
       return;
     }
@@ -397,10 +406,35 @@ router.post('/cancel',
     }
 
     // Cancel running tests (chatSessionId is guaranteed to be set at this point)
+    // ✅ FIX: If testId is provided, cancel it directly (safe fallback when mapping is missing)
     let testCancelResult = { success: true, cancelledCount: 0, errors: [] as string[] };
     try {
       const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
-      testCancelResult = await ManualTestService.cancelAllRunningTestsForChatSession(chatSessionId!, userId);
+
+      if (testId) {
+        try {
+          const directCancel = await ManualTestService.cancelTest(testId, userId);
+          if (directCancel?.success) {
+            testCancelResult.cancelledCount += 1;
+          } else {
+            testCancelResult.success = false;
+            testCancelResult.errors.push(
+              directCancel?.message ? `Failed to cancel test ${testId}: ${directCancel.message}` : `Failed to cancel test ${testId}`
+            );
+          }
+        } catch (directError) {
+          testCancelResult.success = false;
+          testCancelResult.errors.push(
+            `Failed to cancel test ${testId}: ${directError instanceof Error ? directError.message : String(directError)}`
+          );
+        }
+      }
+
+      // Cancel other running tests linked to the chat session via mappings
+      const sessionCancel = await ManualTestService.cancelAllRunningTestsForChatSession(chatSessionId!, userId);
+      testCancelResult.cancelledCount += sessionCancel.cancelledCount;
+      testCancelResult.errors.push(...(sessionCancel.errors || []));
+      testCancelResult.success = testCancelResult.success && sessionCancel.success;
     } catch (error) {
       logger.warn('[CHAT] Failed to cancel tests', {
         error: error instanceof Error ? error.message : String(error),

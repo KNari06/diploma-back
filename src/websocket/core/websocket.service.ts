@@ -391,6 +391,8 @@ class WebSocketService {
   }
 
   // ✅ NEW: Emit real-time graph update
+  // ✅ FIX: Test completion check is done at class level (LiteEngine/IntelligentTestOrchestrator)
+  // to prevent late events from async operations (e.g., screenshot uploads)
   public emitTestGraphUpdate(testId: string, payload: TestGraphUpdatePayload): void {
     // Validate payload structure
     if (!payload || typeof payload !== 'object') {

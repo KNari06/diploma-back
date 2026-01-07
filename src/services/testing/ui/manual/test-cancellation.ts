@@ -105,6 +105,7 @@ export async function cancelAllRunningTestsForUser(userId: string): Promise<{
 
 /**
  * Cancel all running tests for a chat session
+ * Note: Cancels ONLY tests linked via test_chat_mappings to avoid cancelling unrelated user tests.
  */
 export async function cancelAllRunningTestsForChatSession(
   chatSessionId: string,
@@ -240,9 +241,41 @@ export async function cancelTestJobs(testId: string, browsers: string[]): Promis
  */
 export async function cancelTest(testId: string, userId?: string): Promise<ApiResponse<Test>> {
   try {
-    const test = await dbService.getTest(testId) as any;
+    // ✅ FIX: Use supabaseAdmin directly to bypass RLS and ensure we can find the test
+    // This is important because RLS might prevent finding tests in some cases
+    let test: any;
+
+    try {
+      // First try the service method (uses RLS)
+      test = await dbService.getTest(testId) as any;
+    } catch (getTestError) {
+      // If getTest fails (RLS issue or other), try direct admin query
+      logger.debug(`[CANCEL_TEST] getTest failed, trying admin query: ${testId}`, {
+        error: getTestError instanceof Error ? getTestError.message : String(getTestError),
+      });
+    }
+
+    // If still not found, try direct admin query
     if (!test) {
-      throw new NotFoundError('Test', testId);
+      const { data, error } = await dbService.supabaseAdmin
+        .from('tests')
+        .select('*')
+        .eq('id', testId)
+        .maybeSingle();
+
+      if (error) {
+        logger.error(`[CANCEL_TEST] Admin query failed: ${testId}`, {
+          error: error.message,
+          code: error.code,
+        });
+        throw new NotFoundError('Test', testId);
+      }
+
+      if (!data) {
+        throw new NotFoundError('Test', testId);
+      }
+
+      test = data;
     }
 
     if (userId && test.user_id && test.user_id !== userId) {
