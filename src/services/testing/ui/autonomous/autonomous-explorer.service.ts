@@ -3,7 +3,7 @@ import { Page } from 'playwright';
 import { analyzePageWithAI, getPageMetadata } from './helpers/analysis';
 import { performAuthentication } from './helpers/auth';
 import { cleanupBrowserResources, setupBrowserAndPage } from './helpers/browser';
-import { attemptAIGuidedNavigation, navigateToInitialPage, NavigationRequiresClarificationError } from './helpers/navigation';
+import { attemptAIGuidedNavigation, navigateToInitialPage } from './helpers/navigation';
 import { emitExplorationProgress } from './helpers/progress';
 import { generateTestRecommendations } from './helpers/recommendations';
 import { captureAndProcessScreenshot } from './helpers/screenshot';
@@ -175,10 +175,8 @@ export async function exploreProduct(options: {
   } catch (error) {
     logger.error('Product exploration failed', { error, url });
 
-    // Cleanup on error (skip if NavigationRequiresClarificationError - already cleaned up)
-    if (!(error instanceof NavigationRequiresClarificationError)) {
-      await cleanupBrowserResources(page, context);
-    }
+    // Always cleanup browser resources on error
+    await cleanupBrowserResources(page, context);
 
     throw error;
   }

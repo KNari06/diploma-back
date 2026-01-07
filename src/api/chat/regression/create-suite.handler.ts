@@ -96,6 +96,8 @@ export async function handleCreateSuiteIntent(
           needsClarification: true,
           question: 'Which saved test cases should be included in the suite? Please provide test case IDs.',
         },
+        timestamp: new Date().toISOString(),
+        sessionId: params.chatSessionId,
       });
       return;
     }
@@ -146,6 +148,8 @@ export async function handleCreateSuiteIntent(
         testCaseCount: uniqueTestCaseIds.length,
         testCaseIds: uniqueTestCaseIds,
       },
+      timestamp: new Date().toISOString(),
+      sessionId: params.chatSessionId,
     });
   } catch (error) {
     logger.error('[CREATE_SUITE_HANDLER] Error creating suite', {
@@ -176,6 +180,7 @@ export async function handleCreateSuiteIntent(
       success: false,
       error: localized.createSuite.error,
       details: error instanceof Error ? error.message : 'Unknown error',
+      timestamp: new Date().toISOString(),
     });
   }
 }

@@ -9,11 +9,12 @@ export class ChatService {
    * Save chat messages to database
    * @param sessionId - Chat session ID
    * @param messages - Array of messages to save
+   * @returns Array of timestamps for saved messages (in same order as input)
    */
   static async saveChatMessages(
     sessionId: string,
     messages: Array<{ role: 'user' | 'ai'; content: string; metadata?: any }>
-  ): Promise<void> {
+  ): Promise<string[]> {
     // Validate inputs
     if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
       throw new Error('Invalid sessionId');
@@ -21,7 +22,7 @@ export class ChatService {
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       logger.warn('[CHAT_SERVICE] No messages to save', { sessionId });
-      return;
+      return [];
     }
 
     try {
@@ -38,7 +39,7 @@ export class ChatService {
 
       if (validMessages.length === 0) {
         logger.warn('[CHAT_SERVICE] No valid messages to save', { sessionId, totalMessages: messages.length });
-        return;
+        return [];
       }
 
       if (validMessages.length < messages.length) {
@@ -79,6 +80,9 @@ export class ChatService {
         sessionId,
         messageCount: records.length,
       });
+
+      // Return timestamps of saved messages (in same order as input)
+      return records.map(record => record.created_at);
 
     } catch (error) {
       logger.error('[CHAT_SERVICE] Error saving chat messages', { error, sessionId });

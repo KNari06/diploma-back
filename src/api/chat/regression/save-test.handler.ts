@@ -75,6 +75,8 @@ export async function handleSaveTestIntent(
           needsClarification: true,
           question: 'Which test would you like to save? Please run a test first or provide a test ID.',
         },
+        timestamp: new Date().toISOString(),
+        sessionId: params.chatSessionId,
       });
       return;
     }
@@ -106,6 +108,8 @@ export async function handleSaveTestIntent(
         replayStrategy: result.replayStrategy,
         parametersCount: result.parametersCount,
       },
+      timestamp: new Date().toISOString(),
+      sessionId: params.chatSessionId,
     });
   } catch (error) {
     logger.error('[SAVE_TEST_HANDLER] Error saving test', {
@@ -134,6 +138,7 @@ export async function handleSaveTestIntent(
       success: false,
       error: localized.saveTest.error,
       details: error instanceof Error ? error.message : 'Unknown error',
+      timestamp: new Date().toISOString(),
     });
   }
 }

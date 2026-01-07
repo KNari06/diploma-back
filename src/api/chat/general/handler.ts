@@ -406,14 +406,23 @@ export async function handleGeneralChat(
   // STEP 4: SAVE MESSAGES
   // ═══════════════════════════════════════════════════════════════════════
 
+  let userMessageTimestamp: string | undefined;
+  let aiReplyTimestamp: string | undefined;
+
   if (chatSessionId) {
     const saveChatMessagesWithLogging = functionLogger
       ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
       : ChatService.saveChatMessages.bind(ChatService);
-    await saveChatMessagesWithLogging(chatSessionId, [
+    const timestamps = await saveChatMessagesWithLogging(chatSessionId, [
       { role: 'user', content: message },
       { role: 'ai', content: gptResponse.content },
     ]);
+
+    // Extract timestamps: first is user message, second is AI reply
+    if (timestamps.length >= 2) {
+      userMessageTimestamp = timestamps[0];
+      aiReplyTimestamp = timestamps[1];
+    }
 
     // Auto-generate title for new chats (after first user message)
     // This runs in background, doesn't block response
@@ -480,7 +489,8 @@ export async function handleGeneralChat(
   const response: any = {
     success: true, // ← Frontend expects this!
     reply: gptResponse.content,
-    timestamp: new Date().toISOString(),
+    timestamp: aiReplyTimestamp || new Date().toISOString(), // Use saved timestamp or fallback
+    userMessageTimestamp: userMessageTimestamp, // Include user message timestamp
     sessionId: chatSessionId,
   };
 

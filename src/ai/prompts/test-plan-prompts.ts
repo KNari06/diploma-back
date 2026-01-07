@@ -530,14 +530,55 @@ export function buildCustomScopeStrategySystemPrompt(): string {
  */
 export function buildPageNavigationPrompt(params: {
   userMessage: string;
-  availableLinks: Array<{ text: string; href: string; selector: string }>;
+  availableLinks: Array<{
+    text: string;
+    href: string;
+    selector: string;
+    context?: string; // Parent heading/section context
+    isVisible?: boolean; // Viewport visibility
+    section?: string; // Section grouping
+  }>;
   currentUrl: string;
 }): string {
-  const linksSection = params.availableLinks.length > 0
-    ? params.availableLinks
-        .map((link, i) => `${i + 1}. Text: "${link.text}" | Href: "${link.href}" | Selector: ${link.selector}`)
-        .join('\n')
-    : 'No links/buttons found on this page';
+  const formatLinkLine = (link: any, i: number): string => {
+    const contextInfo = link.context ? ` | Context: "${link.context}"` : '';
+    const visibilityInfo =
+      typeof link.isVisible === 'boolean'
+        ? link.isVisible
+          ? ' [VISIBLE]'
+          : ' [OFF-SCREEN]'
+        : '';
+    const sectionInfo = link.section ? ` | Section: ${link.section}` : '';
+    return `${i + 1}. Text: "${link.text}"${contextInfo}${visibilityInfo}${sectionInfo} | Href: "${link.href}" | Selector: ${link.selector}`;
+  };
+
+  const linksSection = (() => {
+    if (params.availableLinks.length === 0) return 'No links/buttons found on this page';
+
+    // Group by section to help the model navigate large pages.
+    const groups: Record<string, any[]> = { header: [], nav: [], main: [], footer: [], other: [] };
+    for (const link of params.availableLinks) {
+      const section = (link.section || 'other').toLowerCase();
+      if (section in groups) groups[section].push(link);
+      else groups.other.push(link);
+    }
+
+    const parts: string[] = [];
+    const pushGroup = (name: string, items: any[]) => {
+      if (items.length === 0) return;
+      parts.push(`${name.toUpperCase()} LINKS:`);
+      parts.push(items.map(formatLinkLine).join('\n'));
+      parts.push(''); // Spacer
+    };
+
+    pushGroup('header', groups.header);
+    pushGroup('nav', groups.nav);
+    pushGroup('main', groups.main);
+    pushGroup('footer', groups.footer);
+    pushGroup('other', groups.other);
+
+    return parts.join('\n').trim();
+  })();
 
   return `Analyze the user's testing goal and select the best link to navigate to the target page.
 
@@ -562,10 +603,13 @@ EXAMPLES:
 
 CRITICAL RULES:
 1. ONLY select from the available links above - do NOT invent links
-2. Match user's intent (registration, login, etc.) with link text/href
+2. Match user's intent (registration, login, etc.) with link text/href AND context
 3. If NO suitable link found → set shouldNavigate: false
 4. If current page already matches goal → set shouldNavigate: false
 5. Prefer exact matches (e.g., "Register" for registration) over partial matches
+6. PRIORITIZE [VISIBLE] links over [OFF-SCREEN] links when possible
+7. Use context field to disambiguate (e.g., "More" in "Prices" context vs "More" in "FAQ" context)
+8. Prefer HEADER/NAV links for top-level navigation; prefer MAIN links for page content actions
 
 RESPONSE FORMAT (JSON):
 {

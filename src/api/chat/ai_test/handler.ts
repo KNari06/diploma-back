@@ -1,6 +1,10 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { NavigationRequiresClarificationError } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { requestMissingInformation, runAutonomousExploration } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
+import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
+import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
 import { parseAnswers } from '@/services/utils/question-generator.service';
@@ -9,6 +13,8 @@ import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
+import { webSocketService } from '@/websocket/core/websocket.service';
+import { ChatTestUpdatePayload } from '@/websocket/types/types';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -426,9 +432,240 @@ export async function handlePlatformTest(
     checkTimeout('handle_credentials');
 
     // ═══════════════════════════════════════════════════════════════════════
-    // ✅ NEW STEP 4: RUN AUTONOMOUS EXPLORATION + GENERATE REAL TEST PLAN
+    // ✅ LITE MODE: SKIP EXPLORATION → RUN TEST IMMEDIATELY
+    // Pro mode continues with exploration → plan confirmation flow
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const effectiveMode = mode || 'lite';
+
+    if (effectiveMode === 'lite') {
+      // Check if request was cancelled before starting Lite test
+      if (abortSignal) {
+        const checkRequestAbortedWithLogging = functionLogger
+          ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+          : checkRequestAborted;
+        checkRequestAbortedWithLogging(abortSignal);
+      }
+
+      logger.info('[PLATFORM_TEST] Lite mode: running test immediately (no exploration)', {
+        url: extractedUrl,
+        userId,
+        project_id,
+        hasCredentials: !!finalCredentials,
+      });
+
+      emitProcessingStepWithLogging(chatSessionId, 'executing_test', '🚀 Starting Lite test...', 50);
+
+      // Step L1: Check credits
+      const testType = 'intelligent';
+      const creditsRequired = TokenCalculatorService.getTestCreditCost(testType);
+
+      // Check cancellation before credit check
+      if (abortSignal) {
+        const checkRequestAbortedWithLogging = functionLogger
+          ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+          : checkRequestAborted;
+        checkRequestAbortedWithLogging(abortSignal);
+      }
+
+      const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, testType);
+      if (!creditCheck.hasEnough) {
+        logger.warn('[PLATFORM_TEST] Lite mode: insufficient credits', {
+          userId,
+          available: creditCheck.available,
+          required: creditCheck.required,
+          shortage: creditCheck.shortage,
+        });
+
+        if (chatSessionId) {
+          ChatService.saveChatMessages(chatSessionId, [
+            { role: 'user', content: message },
+            { role: 'ai', content: `❌ Insufficient credits. You need ${creditCheck.required} credits, but you only have ${creditCheck.available}. Please purchase more credits to continue testing.` },
+          ]).catch(() => {});
+        }
+
+        res.json({
+          success: false,
+          error: 'Insufficient credits',
+          message: `You need ${creditCheck.required} credits, but you only have ${creditCheck.available}. Please purchase more credits.`,
+          creditsRequired: creditCheck.required,
+          creditsAvailable: creditCheck.available,
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+        return;
+      }
+
+      // Step L2: Build test goal from message + parsedIntent
+      const finalScope = parsedAnswers?.scope || parsedIntent.scope || 'general';
+      const testGoal = parsedIntent.target
+        ? `${parsedIntent.target} on ${extractedUrl} (${finalScope})`
+        : `Test ${finalScope} functionality on ${extractedUrl}`;
+
+      // Step L3: Create test request
+      const testRequest = {
+        url: extractedUrl.trim(),
+        browsers: ['chrome' as const],
+        projectId: project_id,
+        userId,
+        options: finalCredentials ? { credentials: finalCredentials } : {},
+        commands: [], // Lite mode: no pre-defined commands, AI generates dynamically
+        intent: finalScope,
+        intelligentMode: true, // Always intelligent for Lite
+        testGoal,
+        mode: 'lite' as const,
+      };
+
+      emitProcessingStepWithLogging(chatSessionId, 'executing_test', '⚙️ Launching browser...', 60);
+
+      // Check cancellation before creating test
+      if (abortSignal) {
+        const checkRequestAbortedWithLogging = functionLogger
+          ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+          : checkRequestAborted;
+        checkRequestAbortedWithLogging(abortSignal);
+      }
+
+      // Step L4: Run test immediately
+      let testCreated: any;
+      let actualTestId: string | null = null;
+
+      try {
+        testCreated = await ManualTestService.runTest(testRequest);
+
+        if (!testCreated?.success || !testCreated.data?.id) {
+          throw new Error(testCreated?.message || 'Failed to create test');
+        }
+
+        actualTestId = testCreated.data.id;
+
+        logger.info('[PLATFORM_TEST] Lite mode: test created', {
+          testId: actualTestId,
+          url: extractedUrl,
+        });
+      } catch (testError) {
+        logger.error('[PLATFORM_TEST] Lite mode: test creation failed', {
+          error: testError instanceof Error ? testError.message : String(testError),
+          url: extractedUrl,
+        });
+        throw new Error(`Failed to start test: ${testError instanceof Error ? testError.message : 'Unknown error'}`);
+      }
+
+      // Step L5: Deduct credits AFTER successful test creation
+      emitProcessingStepWithLogging(chatSessionId, 'executing_test', '💳 Deducting credits...', 80);
+
+      // Check cancellation before credit deduction
+      if (abortSignal) {
+        const checkRequestAbortedWithLogging = functionLogger
+          ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+          : checkRequestAborted;
+        checkRequestAbortedWithLogging(abortSignal);
+      }
+
+      try {
+        await CreditCostTrackerService.deductCreditsForTest({
+          userId,
+          testType,
+          credits: creditsRequired,
+          costUSD: 0.08, // Intelligent test cost
+          testId: actualTestId!,
+          description: `Lite UI test: ${extractedUrl}`,
+        });
+      } catch (creditError) {
+        // If credit deduction fails, cancel the test
+        logger.error('[PLATFORM_TEST] Lite mode: credit deduction failed, cancelling test', {
+          error: creditError instanceof Error ? creditError.message : String(creditError),
+          testId: actualTestId,
+        });
+
+        try {
+          await ManualTestService.cancelTest(actualTestId!, userId);
+        } catch {
+          // Ignore cancel errors
+        }
+
+        throw new Error('Failed to deduct credits - test cancelled');
+      }
+
+      // Step L6: Save test-chat mapping (non-blocking)
+      if (chatSessionId && actualTestId) {
+        TestChatMappingService.saveTestChatMapping({
+          testId: actualTestId,
+          chatSessionId,
+          userId,
+        }).catch(() => {});
+      }
+
+      // Step L7: Emit WebSocket event
+      if (chatSessionId && actualTestId) {
+        try {
+          const payload: ChatTestUpdatePayload = {
+            sessionId: chatSessionId,
+            testId: actualTestId,
+            status: 'started',
+            message: 'Lite test started',
+            timestamp: new Date().toISOString(),
+          };
+          webSocketService.emitChatTestUpdate(chatSessionId, payload);
+        } catch {
+          // Ignore WS errors
+        }
+      }
+
+      emitProcessingStepWithLogging(chatSessionId, 'executing_test', '✅ Test started!', 100);
+
+      // Step L8: Save to chat history (non-blocking)
+      const replyMessage = `🚀 **Lite Test Started!**\n\n` +
+        `I'm testing **${extractedUrl}** right now.\n\n` +
+        `**Goal:** ${testGoal}\n\n` +
+        `Watch the progress below. I'll navigate dynamically and report any issues I find.\n\n` +
+        `📊 Test ID: \`${actualTestId}\``;
+
+      if (chatSessionId) {
+        ChatService.saveChatMessages(chatSessionId, [
+          { role: 'user', content: message },
+          {
+            role: 'ai',
+            content: replyMessage,
+            metadata: {
+              testId: actualTestId,
+              mode: 'lite',
+              testGoal,
+              url: extractedUrl,
+            },
+          },
+        ]).catch(() => {});
+      }
+
+      // Step L9: Return response
+      res.json({
+        success: true,
+        reply: replyMessage,
+        testId: actualTestId,
+        mode: 'lite',
+        testStarted: true,
+        requiresApproval: false, // Key difference from Pro: no approval needed
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+
+      logger.info('[PLATFORM_TEST] Lite mode: test started successfully', {
+        testId: actualTestId,
+        duration: Date.now() - flowStartTime,
+      });
+
+      return; // Exit early - Lite mode complete
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ✅ PRO MODE (STEP 4): RUN AUTONOMOUS EXPLORATION + GENERATE REAL TEST PLAN
     // Replaces UiTestPlanService with real browser-based exploration
     // ═══════════════════════════════════════════════════════════════════════
+
+    logger.info('[PLATFORM_TEST] Pro mode: running autonomous exploration', {
+      url: extractedUrl,
+      userId,
+    });
 
     emitProcessingStepWithLogging(chatSessionId, 'generating_plan', '🔍 Analyzing page with real browser...', 50);
 
@@ -501,20 +738,16 @@ export async function handlePlatformTest(
         });
 
         const clarificationMsg = explorationError.reason === 'no_links_found'
-          ? `🤔 I couldn't find any navigation links on ${explorationError.currentUrl}.\n\nCould you provide the direct URL to the page you want to test?\n\nFor example:\n• Registration page: https://site.com/register\n• Login page: https://site.com/login\n• Specific feature: https://site.com/feature`
+          ? `🤔 I couldn't identify navigation links on ${explorationError.currentUrl}.\n\nI'll continue on the current page and try to find the registration flow. If you know the direct registration URL, you can share it to speed things up.`
           : `🤔 I tried to navigate to the target page but couldn't find it after 3 attempts.\n\nCould you provide the direct URL to the page you want to test?`;
 
         // Generate clarifying question for URL
         const clarifyingQuestion = {
           id: 'target_url',
           question: 'Please provide the direct URL to the page you want to test:',
-          required: true,
+          required: explorationError.reason !== 'no_links_found',
           type: 'url' as const,
-          placeholder: 'https://example.com/specific-page',
-          validation: {
-            pattern: '^https?://.+',
-            minLength: 10,
-          },
+          placeholder: 'example.com/register (or full URL)',
         };
 
         // Save to history

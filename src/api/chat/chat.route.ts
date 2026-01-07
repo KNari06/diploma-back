@@ -99,6 +99,12 @@ const chatRequestSchema = z.object({
  *                 timestamp:
  *                   type: string
  *                   format: date-time
+ *                   required: true
+ *                   description: Timestamp of AI reply (ISO 8601 format)
+ *                 userMessageTimestamp:
+ *                   type: string
+ *                   format: date-time
+ *                   description: Timestamp when user message was saved (ISO 8601 format, optional)
  *                 sessionId:
  *                   type: string
  *                   format: uuid
@@ -563,6 +569,8 @@ router.post('/cancel',
  *                           created_at:
  *                             type: string
  *                             format: date-time
+ *                             required: true
+ *                             description: Message timestamp (ISO 8601 format, always present)
  *                     pagination:
  *                       type: object
  *                       properties:
@@ -638,6 +646,8 @@ router.get('/history', requireAuth, asyncHandler(getCurrentChatHistory));
  *                           created_at:
  *                             type: string
  *                             format: date-time
+ *                             required: true
+ *                             description: Message timestamp (ISO 8601 format, always present)
  *                           updated_at:
  *                             type: string
  *                             format: date-time
@@ -750,6 +760,8 @@ router.get('/sessions', requireAuth, asyncHandler(listUserChatSessions)); // Upd
  *                           created_at:
  *                             type: string
  *                             format: date-time
+ *                             required: true
+ *                             description: Message timestamp (ISO 8601 format, always present)
  *                     pagination:
  *                       type: object
  *                       description: Информация о пагинации (только если указаны limit/offset)
@@ -910,6 +922,8 @@ router.post('/sessions/new', requireAuth, asyncHandler(createNewChatSession));
  *                           created_at:
  *                             type: string
  *                             format: date-time
+ *                             required: true
+ *                             description: Message timestamp (ISO 8601 format, always present)
  *                     pagination:
  *                       type: object
  *                       description: Информация о пагинации (только если указаны limit/offset)

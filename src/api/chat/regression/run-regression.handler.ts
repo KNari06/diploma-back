@@ -76,6 +76,8 @@ export async function handleRunRegressionIntent(
           needsClarification: true,
           question: 'Which saved test or suite would you like to run? Please provide a test case ID or suite ID.',
         },
+        timestamp: new Date().toISOString(),
+        sessionId: params.chatSessionId,
       });
       return;
     }
@@ -103,6 +105,8 @@ export async function handleRunRegressionIntent(
           testId: result.testId,
           type: 'saved_test_case',
         },
+        timestamp: new Date().toISOString(),
+        sessionId: params.chatSessionId,
       });
     } else if (suiteId) {
       result = await RegressionRunService.runSuite({
@@ -125,6 +129,8 @@ export async function handleRunRegressionIntent(
           testCount: result.testIds?.length || 0,
           type: 'suite',
         },
+        timestamp: new Date().toISOString(),
+        sessionId: params.chatSessionId,
       });
     }
   } catch (error) {
@@ -154,6 +160,7 @@ export async function handleRunRegressionIntent(
       success: false,
       error: localized.runRegression.error,
       details: error instanceof Error ? error.message : 'Unknown error',
+      timestamp: new Date().toISOString(),
     });
   }
 }

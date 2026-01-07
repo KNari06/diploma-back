@@ -63,6 +63,8 @@ export async function handleClarificationRequest(
       clarificationReason: parsedIntent.clarificationReason,
       originalIntent: parsedIntent.metadata?.originalIntent,
     },
+    timestamp: new Date().toISOString(),
+    sessionId: chatSessionId,
   });
 
   logger.info('[CLARIFICATION] Sent clarification request to user', {

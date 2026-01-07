@@ -33,6 +33,19 @@ export class StateValidator {
         return 'execution_error';
       }
 
+      // 2. Rate limited - HTTP 429 detected (back off and wait)
+      const net = diff.newNetworkErrors || [];
+      const rateLimited = net.some((e) => {
+        const s = (e || '').toLowerCase();
+        return s.includes('http 429') || s.includes(' 429') || s.includes('too many requests') || s.includes('rate limit');
+      });
+      if (rateLimited) {
+        logger.warn('[STATE_VALIDATOR] Rate limit detected', {
+          networkErrors: net.slice(0, 2),
+        });
+        return 'rate_limited';
+      }
+
       // 2. CRITICAL ERROR - page crashed/blank (>90% elements disappeared)
       // This indicates a white screen or page crash that needs reload
       if (
@@ -98,6 +111,7 @@ export class StateValidator {
    * @returns True if there was an error
    */
   static isError(outcome: ActionOutcome): boolean {
+    // rate_limited is not an "error" for the agent - it should back off and retry later
     return outcome === 'execution_error' || outcome === 'validation_error' || outcome === 'critical_error';
   }
 
@@ -141,6 +155,12 @@ export class StateValidator {
         }
         return 'Validation error: New errors detected';
 
+      case 'rate_limited':
+        if (diff?.newNetworkErrors && diff.newNetworkErrors.length > 0) {
+          return `Rate limited: ${diff.newNetworkErrors[0].slice(0, 100)}`;
+        }
+        return 'Rate limited: HTTP 429 detected - backing off';
+
       case 'no_effect':
         return 'No effect: Action executed but no state change detected';
 
@@ -177,6 +197,10 @@ export class StateValidator {
       case 'validation_error':
         // High confidence if errors are present
         return diff.newPageErrors.length + diff.newConsoleErrors.length > 0 ? 0.9 : 0.5;
+
+      case 'rate_limited':
+        // High confidence if network errors indicate 429
+        return (diff.newNetworkErrors || []).length > 0 ? 0.95 : 0.7;
 
       case 'execution_error':
         // Always high confidence for execution errors

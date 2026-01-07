@@ -139,6 +139,19 @@ export class ActionExecutor {
     if (command.action === 'hover' && !command.ref) {
       throw new Error('hover requires ref');
     }
+
+    // Validate scroll extras
+    if (command.action === 'scroll') {
+      if (command.targetRef && !/^e\d+$/.test(command.targetRef)) {
+        throw new Error(`Invalid targetRef format: ${command.targetRef}`);
+      }
+      if (command.amount !== undefined) {
+        const amount = Number(command.amount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          throw new Error(`Invalid scroll amount: ${command.amount}`);
+        }
+      }
+    }
   }
 
   /**
@@ -174,10 +187,34 @@ export class ActionExecutor {
         break;
 
       case 'scroll':
-        await this.page.evaluate((dir) => {
-          // @ts-expect-error - window available in browser context
-          window.scrollBy(0, dir === 'up' ? -500 : 500);
-        }, cmd.direction || 'down');
+        // If a targetRef is provided, scroll that element into view.
+        if (cmd.targetRef) {
+          const target = this.page.locator(`[data-agent-ref="${cmd.targetRef}"]`);
+          await target.scrollIntoViewIfNeeded({ timeout: 5000 });
+
+          // ✅ EXPERT ADVICE: Add offset for sticky headers (100px up)
+          // Many sites have sticky nav bars that cover the element after scrollIntoView
+          await this.page.evaluate(() => {
+            const STICKY_HEADER_OFFSET = 100; // pixels to scroll up after element is in view
+            // @ts-expect-error - window available in browser context
+            window.scrollBy(0, -STICKY_HEADER_OFFSET);
+          });
+
+          break;
+        }
+
+        // Otherwise, scroll by amount (default 500px). Clamp to avoid extreme scrolls.
+        await this.page.evaluate(
+          ({ dir, amount }) => {
+            const clamped = Math.max(50, Math.min(2000, amount));
+            // @ts-expect-error - window available in browser context
+            window.scrollBy(0, dir === 'up' ? -clamped : clamped);
+          },
+          {
+            dir: cmd.direction || 'down',
+            amount: typeof cmd.amount === 'number' ? cmd.amount : 500,
+          }
+        );
         break;
 
       case 'select':

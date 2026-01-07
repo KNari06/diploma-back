@@ -3,8 +3,8 @@
  * Computes difference between two snapshots to detect state changes
  */
 
-import type { LiteSnapshot, StateDiff } from '../lite-types';
 import { logger } from '@/utils/core/logger';
+import type { LiteSnapshot, StateDiff } from '../lite-types';
 
 export class StateDiffComputer {
   /**
@@ -23,7 +23,8 @@ export class StateDiffComputer {
     after: LiteSnapshot,
     pageErrorsBefore: string[],
     pageErrorsAfter: string[],
-    consoleErrors: string[]
+    consoleErrors: string[],
+    networkErrors: string[] = []
   ): StateDiff {
     try {
       // Check URL change
@@ -90,6 +91,7 @@ export class StateDiffComputer {
         hasVisualChange,
         newPageErrors,
         newConsoleErrors: consoleErrors,
+        newNetworkErrors: networkErrors,
       };
 
       logger.debug('[STATE_DIFF] Computed state diff', {
@@ -100,6 +102,7 @@ export class StateDiffComputer {
         hasVisualChange,
         newPageErrors: newPageErrors.length,
         newConsoleErrors: consoleErrors.length,
+        newNetworkErrors: networkErrors.length,
       });
 
       return diff;
@@ -119,6 +122,7 @@ export class StateDiffComputer {
         hasVisualChange: false,
         newPageErrors: [],
         newConsoleErrors: [],
+        newNetworkErrors: [],
       };
     }
   }
@@ -168,6 +172,13 @@ export class StateDiffComputer {
       lines.push(`New console errors: ${diff.newConsoleErrors.length}`);
       diff.newConsoleErrors.slice(0, 2).forEach((err) => {
         lines.push(`  ! ${err.slice(0, 100)}`);
+      });
+    }
+
+    if (diff.newNetworkErrors && diff.newNetworkErrors.length > 0) {
+      lines.push(`New network errors: ${diff.newNetworkErrors.length}`);
+      diff.newNetworkErrors.slice(0, 2).forEach((err) => {
+        lines.push(`  ! ${err.slice(0, 120)}`);
       });
     }
 

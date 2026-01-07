@@ -27,12 +27,22 @@ export interface ChatRequest {
 
 export interface ChatResponse {
   reply: string;
-  timestamp?: string;
+  timestamp: string; // Required: timestamp of AI reply
+  userMessageTimestamp?: string; // Optional: timestamp when user message was saved
   parsedIntent?: IntentResult | null;
   needsMoreInfo?: boolean; // Autonomous mode: needs clarification
   questions?: any[]; // Clarifying questions
   conversationId?: string; // For tracking multi-turn conversations
   testPlan?: any; // Test plan awaiting confirmation
+}
+
+// Message with timestamp for display
+export interface ChatMessageWithTimestamp {
+  id: string;
+  role: 'user' | 'ai';
+  content: string;
+  created_at: string;
+  metadata?: any;
 }
 
 export interface ChatMessage {

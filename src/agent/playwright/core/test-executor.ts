@@ -195,6 +195,15 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         }
       }
 
+      // ✅ Convert Lite errors to Pro format
+      const proErrors = (liteResult.errors || []).map((e) => ({
+        message: e.message,
+        page: e.page,
+        type: e.type,
+        timestamp: e.timestamp,
+        iteration: e.iteration,
+      }));
+
       intelligentResult = {
         // Core fields
         success: liteResult.success,
@@ -205,8 +214,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         duration: liteResult.duration || 0,
         cost: liteResult.iterations * 0.001, // Approximate cost
 
-        // Error/warning tracking
-        errors: [], // Lite doesn't track errors in same format yet
+        // Error/warning tracking (Pro-grade from Lite)
+        errors: proErrors,
         warnings: [],
 
         // Summary

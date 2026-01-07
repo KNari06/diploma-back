@@ -1,11 +1,23 @@
 /**
  * ErrorCollector
- * Collects page-level errors (JavaScript errors, failed resources, etc.)
+ * Collects page-level errors (JavaScript errors, failed resources, UI errors)
+ * ENHANCED: Structured UI error collection similar to Pro's ErrorCollectorService
  */
 
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
 import type { Page } from 'playwright';
 import { logger } from '@/utils/core/logger';
+
+/**
+ * Structured UI error (Pro-grade)
+ */
+export interface UIError {
+  text: string;
+  selector: string;
+  type: 'error' | 'warning' | 'validation';
+  timestamp: number;
+  iteration?: number;
+}
 
 export class ErrorCollector {
   /**
@@ -115,6 +127,130 @@ export class ErrorCollector {
         error: error instanceof Error ? error.message : String(error),
       });
       return false;
+    }
+  }
+
+  /**
+   * Collect structured UI errors (Pro-grade)
+   * Scans DOM for error indicators similar to ErrorCollectorService.collectUIErrors
+   *
+   * @param page - Playwright page instance
+   * @param iteration - Current test iteration for context
+   * @returns Array of structured UI errors
+   */
+  static async collectUIErrors(page: Page, iteration?: number): Promise<UIError[]> {
+    try {
+      const uiErrors = await page.evaluate(() => {
+        const errors: Array<{ text: string; selector: string; type: 'error' | 'warning' | 'validation' }> = [];
+        const seenTexts = new Set<string>();
+
+        // Error selectors (similar to Pro's ErrorCollectorService)
+        const errorSelectors = [
+          '[class*="error"]',
+          '[class*="Error"]',
+          '[class*="danger"]',
+          '[role="alert"]',
+          '[aria-label*="error"]',
+          '[aria-label*="Error"]',
+          '.text-red',
+          '.text-danger',
+          '.invalid-feedback',
+          '.form-error',
+          '[data-error]',
+          '.error-message',
+          '.field-error',
+          '.validation-error',
+        ];
+
+        // Warning selectors
+        const warningSelectors = [
+          '[class*="warning"]',
+          '[class*="Warning"]',
+          '.text-warning',
+          '.alert-warning',
+        ];
+
+        // False positive filters (similar to Pro)
+        const falsePositivePatterns = [
+          /^required$/i,
+          /^please enter/i,
+          /^please fill/i,
+          /^\*$/,
+          /^$/,
+        ];
+
+        const isFalsePositive = (text: string): boolean => {
+          if (!text || text.length < 3) return true;
+          if (text.length > 300) return true; // Too long - likely not an error message
+          return falsePositivePatterns.some((pattern) => pattern.test(text));
+        };
+
+        // Collect errors
+        errorSelectors.forEach((selector) => {
+          document.querySelectorAll(selector).forEach((el: Element) => {
+            const text = el.textContent?.trim();
+            if (text && !isFalsePositive(text) && !seenTexts.has(text)) {
+              seenTexts.add(text);
+              errors.push({
+                text: text.slice(0, 200),
+                selector,
+                type: 'error',
+              });
+            }
+          });
+        });
+
+        // Collect warnings
+        warningSelectors.forEach((selector) => {
+          document.querySelectorAll(selector).forEach((el: Element) => {
+            const text = el.textContent?.trim();
+            if (text && !isFalsePositive(text) && !seenTexts.has(text)) {
+              seenTexts.add(text);
+              errors.push({
+                text: text.slice(0, 200),
+                selector,
+                type: 'warning',
+              });
+            }
+          });
+        });
+
+        // Check for form validation errors
+        const invalidInputs = document.querySelectorAll('input:invalid, select:invalid, textarea:invalid');
+        invalidInputs.forEach((input: Element) => {
+          const htmlInput = input as HTMLInputElement;
+          const validationMessage = htmlInput.validationMessage;
+          if (validationMessage && !seenTexts.has(validationMessage)) {
+            seenTexts.add(validationMessage);
+            errors.push({
+              text: validationMessage,
+              selector: `input[name="${htmlInput.name || 'unknown'}"]`,
+              type: 'validation',
+            });
+          }
+        });
+
+        return errors;
+      });
+
+      const timestamp = Date.now();
+      const result: UIError[] = uiErrors.map((e) => ({
+        ...e,
+        timestamp,
+        iteration,
+      }));
+
+      logger.debug('[ERROR_COLLECTOR] Collected UI errors', {
+        count: result.length,
+        iteration,
+      });
+
+      return result;
+    } catch (error) {
+      logger.error('[ERROR_COLLECTOR] Failed to collect UI errors', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
     }
   }
 }
