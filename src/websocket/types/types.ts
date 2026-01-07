@@ -42,6 +42,15 @@ export interface ServerToClientEvents {
   'test:cancelled': (data: TestCancelledPayload) => void;
   'test:clarification:request': (data: TestClarificationRequestPayload) => void; // ✅ NEW: Request user input during test
 
+  // Video streaming events (Chrome CDP screencast)
+  'test:video:frame': (data: TestVideoFramePayload) => void;
+  'test:video:stats': (data: TestVideoStatsPayload) => void;
+  'test:video:paused': (data: TestVideoPausedPayload) => void;
+  'test:video:resumed': (data: TestVideoResumedPayload) => void;
+  'test:video:stopped': (data: TestVideoStoppedPayload) => void;
+  'test:video:unavailable': (data: TestVideoUnavailablePayload) => void;
+  'test:video:started': (data: TestVideoStartedPayload) => void;
+
   // Result events
   'result:ready': (data: ResultReadyPayload) => void;
   'result:screenshot': (data: ResultScreenshotPayload) => void;
@@ -246,6 +255,99 @@ export interface TestFailedPayload {
 export interface TestCancelledPayload {
   testId: string;
   reason?: string;
+  timestamp: string;
+}
+
+// ============================================================================
+// VIDEO STREAMING PAYLOADS (Chrome CDP Screencast)
+// ============================================================================
+
+/**
+ * Video frame payload for live streaming
+ * Sent ~12 times per second during test execution
+ */
+export interface TestVideoFramePayload {
+  testId: string;
+  browser: string;
+  sessionId: string; // Unique stream ID (per worker run)
+  seq: number; // Monotonic frame number
+  format: 'jpeg';
+  data: string; // base64 without prefix
+  width: number;
+  height: number;
+  timestamp: string;
+  elapsedTime: number; // Milliseconds since test start (for slider sync)
+  isCatchup?: boolean; // True for late join frames
+}
+
+/**
+ * Video stream statistics
+ * Sent every 10 seconds during streaming
+ */
+export interface TestVideoStatsPayload {
+  testId: string;
+  sessionId: string;
+  currentFPS: number;
+  framesEmitted: number;
+  framesDropped: number;
+  avgLatency: number; // ms
+  quality: 'high' | 'medium' | 'low';
+  timestamp: string;
+}
+
+/**
+ * Video stream paused notification
+ * Sent when backpressure forces stream pause
+ */
+export interface TestVideoPausedPayload {
+  testId: string;
+  sessionId: string;
+  reason: 'backpressure' | 'redis_timeout' | 'circuit_breaker';
+  timestamp: string;
+}
+
+/**
+ * Video stream resumed notification
+ * Sent when stream resumes after pause
+ */
+export interface TestVideoResumedPayload {
+  testId: string;
+  sessionId: string;
+  timestamp: string;
+}
+
+/**
+ * Video stream stopped notification
+ * Sent when streaming ends (test completed/cancelled/error)
+ */
+export interface TestVideoStoppedPayload {
+  testId: string;
+  sessionId: string;
+  reason: 'completed' | 'cancelled' | 'error' | 'timeout';
+  timestamp: string;
+}
+
+/**
+ * Video streaming unavailable notification
+ * Sent when CDP screencast fails to start
+ */
+export interface TestVideoUnavailablePayload {
+  testId: string;
+  reason: string; // Error message
+  timestamp: string;
+}
+
+/**
+ * Video stream started notification
+ * Sent when streaming begins (for late join)
+ */
+export interface TestVideoStartedPayload {
+  testId: string;
+  sessionId: string;
+  url: string;
+  width: number;
+  height: number;
+  fps: number;
   timestamp: string;
 }
 

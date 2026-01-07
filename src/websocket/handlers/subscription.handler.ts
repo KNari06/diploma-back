@@ -3,7 +3,9 @@
  * Handles room subscriptions for tests and chats
  */
 
+import { connection } from '@/config/infrastructure/queues';
 import { logger } from '@/utils/core/logger';
+import Redis from 'ioredis';
 import { Socket } from 'socket.io';
 import { getUserId } from '../middleware/middleware';
 import {
@@ -12,7 +14,166 @@ import {
   ErrorPayload,
   ServerToClientEvents,
   SocketData,
+  TestVideoFramePayload,
 } from '../types/types';
+
+// Redis client for catchup buffer
+let catchupRedis: Redis | null = null;
+let redisConnectionFailed = false;
+let redisConnectAttempts = 0;
+const MAX_REDIS_CONNECT_ATTEMPTS = 3;
+
+/**
+ * Get Redis client for catchup buffer
+ * Uses lazy initialization with retry limit
+ */
+const getCatchupRedis = async (): Promise<Redis | null> => {
+  // Return existing connection if available
+  if (catchupRedis && catchupRedis.status === 'ready') {
+    return catchupRedis;
+  }
+
+  // Don't retry if we've failed too many times
+  if (redisConnectionFailed && redisConnectAttempts >= MAX_REDIS_CONNECT_ATTEMPTS) {
+    return null;
+  }
+
+  try {
+    redisConnectAttempts++;
+
+    // Clean up old connection if exists
+    if (catchupRedis) {
+      try {
+        catchupRedis.disconnect();
+      } catch {
+        // Ignore
+      }
+    }
+
+    catchupRedis = new Redis({
+      ...(connection as any),
+      connectTimeout: 5000,
+      maxRetriesPerRequest: 1,
+      retryStrategy: () => null, // Don't auto-retry
+      lazyConnect: false,
+    });
+
+    // Wait for connection with timeout
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Redis connection timeout'));
+      }, 5000);
+
+      catchupRedis!.once('ready', () => {
+        clearTimeout(timeout);
+        redisConnectionFailed = false;
+        resolve();
+      });
+
+      catchupRedis!.once('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+    });
+
+    return catchupRedis;
+  } catch (error) {
+    redisConnectionFailed = true;
+    logger.debug('[WebSocket] Failed to connect to Redis for catchup buffer', {
+      error: error instanceof Error ? error.message : String(error),
+      attempt: redisConnectAttempts,
+      maxAttempts: MAX_REDIS_CONNECT_ATTEMPTS,
+    });
+
+    // Cleanup failed connection
+    if (catchupRedis) {
+      try {
+        catchupRedis.disconnect();
+      } catch {
+        // Ignore
+      }
+      catchupRedis = null;
+    }
+
+    return null;
+  }
+};
+
+/**
+ * Cleanup catchup Redis client
+ * Called during graceful shutdown
+ */
+export const cleanupCatchupRedis = async (): Promise<void> => {
+  if (catchupRedis) {
+    try {
+      await catchupRedis.quit();
+      logger.info('[WebSocket] Catchup Redis client closed');
+    } catch (error) {
+      logger.debug('[WebSocket] Error closing catchup Redis client', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      try {
+        catchupRedis.disconnect();
+      } catch {
+        // Ignore
+      }
+    }
+    catchupRedis = null;
+  }
+};
+
+/**
+ * Send video catchup frames to newly subscribed socket
+ */
+const sendCatchupFrames = async (socket: Socket, testId: string): Promise<void> => {
+  try {
+    const redis = await getCatchupRedis();
+    if (!redis) {
+      return;
+    }
+
+    const catchupKey = `stream:catchup:${testId}`;
+    const frames = await redis.lrange(catchupKey, 0, -1);
+
+    if (frames.length === 0) {
+      return;
+    }
+
+    logger.debug('[WebSocket] Sending catchup frames', {
+      socketId: socket.id,
+      testId,
+      frameCount: frames.length,
+    });
+
+    // Send frames in reverse order (oldest first)
+    for (const frameData of frames.reverse()) {
+      try {
+        const frame = JSON.parse(frameData);
+        const payload: TestVideoFramePayload = {
+          testId,
+          browser: 'chrome',
+          sessionId: frame.sessionId || 'catchup',
+          seq: frame.seq,
+          format: 'jpeg',
+          data: frame.data,
+          width: frame.width,
+          height: frame.height,
+          timestamp: frame.timestamp,
+          elapsedTime: frame.elapsedTime,
+          isCatchup: true,
+        };
+        socket.emit('test:video:frame', payload);
+      } catch {
+        // Ignore invalid frame data
+      }
+    }
+  } catch (error) {
+    logger.debug('[WebSocket] Error sending catchup frames', {
+      testId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+};
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 
@@ -140,6 +301,11 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         userId: userId || 'anonymous',
         testId,
         room,
+      });
+
+      // Send catchup frames for video streaming (async, fire-and-forget)
+      sendCatchupFrames(socket, testId.trim()).catch(() => {
+        // Ignore catchup errors
       });
     } catch (error) {
       logger.error('[WebSocket] Error in subscribe:test', {

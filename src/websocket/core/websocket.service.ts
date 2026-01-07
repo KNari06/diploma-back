@@ -9,7 +9,6 @@
 
 import { redisWebSocketBridge } from '@/services/websocket/redis-bridge.service';
 import { logger } from '@/utils/core/logger';
-import { getIO, isWebSocketInitialized } from './server';
 import {
   AIAnalysisCompletedPayload,
   AIAnalysisProgressPayload,
@@ -26,15 +25,24 @@ import {
   SystemErrorPayload,
   SystemMaintenancePayload,
   TestBrowserCompletedPayload,
-  TestCancelledPayload, // ✅ NEW: Clarification
+  TestCancelledPayload,
   TestCompletedPayload,
   TestCreatedPayload,
   TestFailedPayload,
-  TestGraphUpdatePayload, // ✅ NEW
+  TestGraphUpdatePayload,
   TestProgressPayload,
   TestStartedPayload,
-  TestStepCompletedPayload
+  TestStepCompletedPayload,
+  // Video streaming payloads
+  TestVideoFramePayload,
+  TestVideoPausedPayload,
+  TestVideoResumedPayload,
+  TestVideoStartedPayload,
+  TestVideoStatsPayload,
+  TestVideoStoppedPayload,
+  TestVideoUnavailablePayload,
 } from '../types/types';
+import { getIO, isWebSocketInitialized } from './server';
 
 class WebSocketService {
   private static instance: WebSocketService;
@@ -499,6 +507,129 @@ class WebSocketService {
         if (payload.userId) {
           this.emitToUser(payload.userId, 'test:clarification:request', payload);
         }
+      },
+      { testId }
+    );
+  }
+
+  // ============================================================================
+  // VIDEO STREAMING EVENTS
+  // ============================================================================
+
+  /**
+   * Emit video frame to test room
+   * High frequency - ~12 fps during streaming
+   */
+  public emitTestVideoFrame(testId: string, payload: TestVideoFramePayload): void {
+    this.emitWithFallback(
+      'test:video:frame',
+      payload,
+      () => this.emitToTest(testId, 'test:video:frame', payload),
+      { testId }
+    );
+  }
+
+  /**
+   * Emit video stats to test room
+   * Sent every 10 seconds during streaming
+   */
+  public emitTestVideoStats(testId: string, payload: TestVideoStatsPayload): void {
+    this.emitWithFallback(
+      'test:video:stats',
+      payload,
+      () => this.emitToTest(testId, 'test:video:stats', payload),
+      { testId }
+    );
+  }
+
+  /**
+   * Emit video paused notification
+   * Sent when backpressure forces stream pause
+   */
+  public emitTestVideoPaused(testId: string, payload: TestVideoPausedPayload): void {
+    this.emitWithFallback(
+      'test:video:paused',
+      payload,
+      () => {
+        logger.warn('[WebSocketService] Video stream paused', {
+          testId,
+          reason: payload.reason,
+        });
+        this.emitToTest(testId, 'test:video:paused', payload);
+      },
+      { testId }
+    );
+  }
+
+  /**
+   * Emit video resumed notification
+   * Sent when stream resumes after pause
+   */
+  public emitTestVideoResumed(testId: string, payload: TestVideoResumedPayload): void {
+    this.emitWithFallback(
+      'test:video:resumed',
+      payload,
+      () => {
+        logger.info('[WebSocketService] Video stream resumed', { testId });
+        this.emitToTest(testId, 'test:video:resumed', payload);
+      },
+      { testId }
+    );
+  }
+
+  /**
+   * Emit video stopped notification
+   * Sent when streaming ends
+   */
+  public emitTestVideoStopped(testId: string, payload: TestVideoStoppedPayload): void {
+    this.emitWithFallback(
+      'test:video:stopped',
+      payload,
+      () => {
+        logger.info('[WebSocketService] Video stream stopped', {
+          testId,
+          reason: payload.reason,
+        });
+        this.emitToTest(testId, 'test:video:stopped', payload);
+      },
+      { testId }
+    );
+  }
+
+  /**
+   * Emit video unavailable notification
+   * Sent when CDP screencast fails to start
+   */
+  public emitTestVideoUnavailable(testId: string, payload: TestVideoUnavailablePayload): void {
+    this.emitWithFallback(
+      'test:video:unavailable',
+      payload,
+      () => {
+        logger.warn('[WebSocketService] Video streaming unavailable', {
+          testId,
+          reason: payload.reason,
+        });
+        this.emitToTest(testId, 'test:video:unavailable', payload);
+      },
+      { testId }
+    );
+  }
+
+  /**
+   * Emit video started notification
+   * Sent when streaming begins (for late join)
+   */
+  public emitTestVideoStarted(testId: string, payload: TestVideoStartedPayload): void {
+    this.emitWithFallback(
+      'test:video:started',
+      payload,
+      () => {
+        logger.info('[WebSocketService] Video stream started', {
+          testId,
+          sessionId: payload.sessionId,
+          fps: payload.fps,
+        });
+        this.emitToTest(testId, 'test:video:started', payload);
       },
       { testId }
     );

@@ -180,6 +180,49 @@ class WebSocketRedisSubscriber {
           }
           break;
 
+        // Video streaming events
+        case 'test:video:frame':
+          if (payload?.testId) {
+            wsService.emitTestVideoFrame(payload.testId, payload);
+          }
+          break;
+
+        case 'test:video:stats':
+          if (payload?.testId) {
+            wsService.emitTestVideoStats(payload.testId, payload);
+          }
+          break;
+
+        case 'test:video:paused':
+          if (payload?.testId) {
+            wsService.emitTestVideoPaused(payload.testId, payload);
+          }
+          break;
+
+        case 'test:video:resumed':
+          if (payload?.testId) {
+            wsService.emitTestVideoResumed(payload.testId, payload);
+          }
+          break;
+
+        case 'test:video:stopped':
+          if (payload?.testId) {
+            wsService.emitTestVideoStopped(payload.testId, payload);
+          }
+          break;
+
+        case 'test:video:unavailable':
+          if (payload?.testId) {
+            wsService.emitTestVideoUnavailable(payload.testId, payload);
+          }
+          break;
+
+        case 'test:video:started':
+          if (payload?.testId) {
+            wsService.emitTestVideoStarted(payload.testId, payload);
+          }
+          break;
+
         // Unknown event type
         default:
           logger.warn('[WS_REDIS_SUB] Unknown event type received', {

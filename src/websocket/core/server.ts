@@ -163,6 +163,7 @@ export const isWebSocketInitialized = (): boolean => {
 
 /**
  * Graceful shutdown
+ * Closes WebSocket server and cleanup Redis connections
  */
 export const shutdownWebSocket = async (): Promise<void> => {
   if (!io) {
@@ -171,6 +172,16 @@ export const shutdownWebSocket = async (): Promise<void> => {
   }
 
   logger.info('[WebSocket] Shutting down WebSocket server...');
+
+  // Cleanup catchup Redis client
+  try {
+    const { cleanupCatchupRedis } = await import('../handlers/subscription.handler');
+    await cleanupCatchupRedis();
+  } catch (error) {
+    logger.debug('[WebSocket] Error cleaning up catchup Redis', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 
   // Save reference to avoid null check issues in callback
   const serverInstance = io;

@@ -8,6 +8,8 @@ import { LiteEngine, ModeRouter } from '../../core/lite';
 import { saveIntelligentTestResults, uploadArtifacts, uploadIntelligentTestScreenshots } from '../artifacts/artifacts-handler';
 import { collectArtifactsAndCleanup } from '../artifacts/test-cleanup';
 import { formatTestResult } from '../artifacts/test-result-formatter';
+import { VideoStreamRegistry } from '../artifacts/video-stream-registry';
+import { createVideoStreamService, VideoStreamService } from '../artifacts/video-stream.service';
 import { navigateToUrl } from '../execution/navigation-handler';
 import { RequestTracker } from '../execution/request-tracker';
 import { getBrowserWithProgress, setupBrowserContext } from '../setup/browser-setup';
@@ -36,6 +38,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   let page: Page | null = null;
   let context: BrowserContext | null = null;
   let tracePath: string | undefined;
+  let videoStreamService: VideoStreamService | null = null;
 
   try {
     // Pre-flight checks
@@ -61,6 +64,29 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     page = await context.newPage();
     if (!page) {
       throw new Error('Failed to create page');
+    }
+
+    // Start video streaming for Chrome (CDP screencast)
+    if (testData.browser.toLowerCase().includes('chrome') || testData.browser.toLowerCase().includes('chromium')) {
+      try {
+        videoStreamService = createVideoStreamService();
+        await videoStreamService.start(page, testData.testId, testData.browser, testData.userId, testData.url);
+
+        if (videoStreamService.isActive()) {
+          VideoStreamRegistry.register(testData.testId, videoStreamService);
+          logger.info('[PLAYWRIGHT] Video streaming started', {
+            testId: testData.testId,
+            browser: testData.browser,
+          });
+        }
+      } catch (videoError) {
+        // Video streaming is optional - don't fail the test
+        logger.warn('[PLAYWRIGHT] Failed to start video streaming', {
+          testId: testData.testId,
+          error: videoError instanceof Error ? videoError.message : String(videoError),
+        });
+        videoStreamService = null;
+      }
     }
 
     // Build hints (commands + feedback from previous runs)
@@ -255,6 +281,19 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       );
     }
 
+    // Stop video streaming
+    if (videoStreamService?.isActive()) {
+      try {
+        await videoStreamService.stop('completed');
+        VideoStreamRegistry.unregister(testData.testId);
+      } catch (videoError) {
+        logger.warn('[PLAYWRIGHT] Failed to stop video streaming', {
+          testId: testData.testId,
+          error: videoError instanceof Error ? videoError.message : String(videoError),
+        });
+      }
+    }
+
     // Collect artifacts and cleanup (best-effort)
     let artifacts: { videoPath?: string; tracePath?: string } = {};
     try {
@@ -298,6 +337,16 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         testId: testData.testId,
         browser: testData.browser,
       });
+
+      // Stop video streaming on cancellation
+      if (videoStreamService?.isActive()) {
+        try {
+          await videoStreamService.stop('cancelled');
+          VideoStreamRegistry.unregister(testData.testId);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
 
       // Collect artifacts and cleanup (best-effort)
       let artifacts: { videoPath?: string; tracePath?: string } = {};
@@ -345,6 +394,16 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       url: testData.url,
       intelligentMode: testData.intelligentMode || false,
     });
+
+    // Stop video streaming on error
+    if (videoStreamService?.isActive()) {
+      try {
+        await videoStreamService.stop('error');
+        VideoStreamRegistry.unregister(testData.testId);
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
 
     // Collect artifacts and cleanup (best-effort)
     let artifacts: { videoPath?: string; tracePath?: string } = {};

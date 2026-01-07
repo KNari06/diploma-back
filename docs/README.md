@@ -45,6 +45,7 @@
 - [**⚡ Intelligent Mode Optimization**](./development/INTELLIGENT_MODE_OPTIMIZATION.md) - Network & data collection оптимизация
 - [**🔌 WebSocket Worker Bridge Plan**](./development/WEBSOCKET_WORKER_BRIDGE_PLAN.md) - План передачи этапов тестирования через WebSocket из Worker
 - [**✅ WebSocket Redis Bridge Implementation**](./development/WEBSOCKET_REDIS_BRIDGE_IMPLEMENTATION.md) - Реализация Redis Pub/Sub для WebSocket событий
+- [**📹 Frontend Video Streaming Guide**](./development/frontend-video-streaming-guide.md) - ✨ NEW! Полная инструкция для реализации real-time видео стриминга на фронтенде
 - [**🧪 Testing Flow Audit (last 10 days)**](./development/TESTING_FLOW_AUDIT_LAST_10_DAYS.md) - живой список рисков/проблем по end-to-end тест флоу
 - [**💰 Token Financial Model Data**](./development/TOKEN_FINANCIAL_MODEL_DATA.md) - исходные данные для финансовой модели (кредиты, токены, цены)
 - [**Auth Implementation**](./development/auth-implementation.md) - технические детали аутентификации

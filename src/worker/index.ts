@@ -1,3 +1,4 @@
+import { VideoStreamRegistry } from '@/agent/playwright/artifacts/video-stream-registry';
 import { env } from '@/config/environment/env';
 import { connection, QUEUE_NAMES } from '@/config/infrastructure/queues';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
@@ -228,8 +229,20 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
     });
   });
 
-  worker.on('stalled', (jobId) => {
+  worker.on('stalled', async (jobId) => {
     logger.warn(`⚠️ ${workerName} worker stalled job: ${jobId}`);
+
+    // Stop all video streams when a job stalls (to prevent orphaned CDP sessions)
+    if (workerName === 'TestRun') {
+      const activeStreams = VideoStreamRegistry.getCount();
+      if (activeStreams > 0) {
+        logger.warn('[WORKER] Stopping video streams due to stalled job', {
+          jobId,
+          activeStreams,
+        });
+        await VideoStreamRegistry.stopAll('stalled');
+      }
+    }
   });
 };
 
@@ -267,7 +280,21 @@ const gracefulShutdown = async (signal: string) => {
       aiAnalysisWorker.close(),
       notificationWorker.close(),
       webhookWorker.close(),
-      // ✅ CRITICAL FIX: Close all browsers to free server resources
+      // Stop all video streams to prevent orphaned CDP sessions
+      (async () => {
+        try {
+          const activeStreams = VideoStreamRegistry.getCount();
+          if (activeStreams > 0) {
+            logger.info('[WORKER] Stopping video streams', { activeStreams });
+            await VideoStreamRegistry.stopAll('shutdown');
+          }
+        } catch (error) {
+          logger.error('[WORKER] Failed to stop video streams', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      })(),
+      // Close all browsers to free server resources
       (async () => {
         try {
           const { browserPool } = await import('@/agent');
@@ -284,7 +311,7 @@ const gracefulShutdown = async (signal: string) => {
     // Log any failures but continue shutdown
     closeResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'browserPool'];
+        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'videoStreams', 'browserPool'];
         logger.warn(`[WORKER] Failed to close ${workerNames[index]}`, {
           error: result.reason instanceof Error ? result.reason.message : String(result.reason),
         });
