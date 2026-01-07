@@ -130,7 +130,6 @@ YOUR TASK: Understand the USER'S GOAL, not just match keywords.
 CRITICAL OUTPUT REQUIREMENTS:
 • Return ONLY valid JSON (no extra text, no comments, no markdown)
 • intent_confidence is REQUIRED (0.0-1.0) - your confidence in the intent classification
-• If intent_confidence < 0.7 → use needs_clarification
 • Return JSON in the same language as the user message (but field names in English)
 
 Think like a human having a conversation:
@@ -146,6 +145,7 @@ AVAILABLE INTENTS: ${intents.join(', ')}
 
    CONTEXT CLUES (Primary - analyze URL and message):
    - URL is a regular website (http/https, typically NO "/api/" in path)
+   - Bare domain (example.com, repetino.kz) → treat as website URL (system will normalize protocol)
    - User mentions "website", "page", "UI", "form", "button", "login", "checkout"
    - User wants to verify/check/explore a web page visually
    - It's a COMMAND/REQUEST, not a question about past tests
@@ -154,6 +154,8 @@ AVAILABLE INTENTS: ${intents.join(', ')}
    • https://example.com → platform_test
    • https://mysite.com/login → platform_test
    • https://shop.com/products → platform_test
+   • repetino.kz → platform_test (bare domain = website)
+   • example.com/register → platform_test
 
    Keywords (Secondary): "test", "check", "verify" + website URL
 
@@ -161,6 +163,7 @@ AVAILABLE INTENTS: ${intents.join(', ')}
    - "Test this website https://example.com"
    - "Check if login works on mysite.com"
    - "Explore this page https://..."
+   - "repetino.kz try to register" → platform_test (clear URL + action)
 
 2. "api_test" - User wants to RUN a new API test OR approved to run existing one
 
@@ -202,11 +205,16 @@ AVAILABLE INTENTS: ${intents.join(', ')}
 
 4. "needs_clarification" - You're UNCERTAIN about user's intent
 
-   WHEN TO USE:
-   - Message is ambiguous (could be multiple intents)
-   - Missing critical information (URL, method, scope)
-   - Context doesn't provide enough clues
-   - Confidence is low (<0.7)
+   WHEN TO USE (BE SELECTIVE - prefer action over questions):
+   - Missing CRITICAL information that CANNOT be inferred (e.g., no URL at all for platform_test)
+   - Truly ambiguous intent after analyzing full context
+   - Confidence is low (<0.6) AND critical data is missing
+
+   WHEN NOT TO USE (prefer taking action):
+   - User provided URL/domain + clear action (even if bare domain like "example.com")
+   - Context makes intent obvious (even if confidence ~0.65-0.70)
+   - You can reasonably infer what user wants
+   - User gave enough info to proceed (URL, action request, or approval)
 
    CRITICAL: When using "needs_clarification", you MUST provide:
    • clarificationQuestion: REQUIRED! Generate a specific, helpful question based on what's missing
@@ -393,43 +401,50 @@ REQUIRED FOR needs_clarification (MUST NOT OMIT):
 
 VALIDATION RULES:
 • intent_confidence MUST be 0.0-1.0 (decimal number)
-• If intent_confidence < 0.7 → MUST use needs_clarification
+• Use needs_clarification ONLY when critical info is truly missing AND cannot be inferred
 • If intent = needs_clarification → clarificationQuestion, possibleIntents, clarificationReason are REQUIRED
 • If system-provided URL exists → MUST use it (don't ignore!)
+• Prefer taking action over asking questions when user intent is reasonably clear
 
 --- EXAMPLES (CONTEXT-FIRST REASONING) ---
 
 Ex1: "Test registration form on https://mysite.com/register"
 → {"intent": "platform_test", "intent_confidence": 0.95, "scope": "form", "target": "registration form", "page": "https://mysite.com/register", "rawText": "Test registration form on https://mysite.com/register"}
 
-Ex2: System: "URL FOUND IN HISTORY: https://api.example.com, Method: GET", User: "yes, execute it now"
+Ex2: "repetino.kz try to register"
+→ {"intent": "platform_test", "intent_confidence": 0.88, "scope": "form", "target": "registration", "page": "repetino.kz", "rawText": "repetino.kz try to register"}
+
+Ex3: System: "URL FOUND IN HISTORY: https://api.example.com, Method: GET", User: "yes, execute it now"
 → {"intent": "api_test", "intent_confidence": 0.90, "apiMethod": "GET", "apiUrl": "https://api.example.com", "rawText": "yes, execute it now"}
 
-Ex3: "So, did you run API test already?"
+Ex4: "So, did you run API test already?"
 → {"intent": "general_chat", "intent_confidence": 0.85, "rawText": "So, did you run API test already?"}
 
-Ex4: "давай" (NO system-provided URL)
+Ex5: "давай" (NO system-provided URL)
 → {"intent": "needs_clarification", "intent_confidence": 0.40, "clarificationQuestion": "What would you like me to do? Please provide more details.", "possibleIntents": ["api_test", "platform_test", "general_chat"], "clarificationReason": "Unclear intent from single word without context", "rawText": "давай"}
 
-Ex5: "test this" (NO URL provided)
+Ex6: "test this" (NO URL provided)
 → {"intent": "needs_clarification", "intent_confidence": 0.50, "clarificationQuestion": "I'd like to help you test something. Could you provide the URL? Is it an API endpoint or a web page?", "possibleIntents": ["api_test", "platform_test"], "clarificationReason": "Missing URL and unclear intent", "rawText": "test this"}
 
-Ex6: "save this flow" (with lastTestId in context: "abc-123")
+Ex7: "example.com check if login works"
+→ {"intent": "platform_test", "intent_confidence": 0.90, "scope": "flow", "target": "login", "page": "example.com", "rawText": "example.com check if login works"}
+
+Ex8: "save this flow" (with lastTestId in context: "abc-123")
 → {"intent": "save_test", "intent_confidence": 0.90, "sourceTestId": "abc-123", "suggestedName": null, "rawText": "save this flow"}
 
-Ex7: "save as checkout regression" (with lastTestId in context: "def-456")
+Ex9: "save as checkout regression" (with lastTestId in context: "def-456")
 → {"intent": "save_test", "intent_confidence": 0.95, "sourceTestId": "def-456", "suggestedName": "checkout regression", "rawText": "save as checkout regression"}
 
-Ex8: "create a suite with these 3 tests" (with context: recentTestIds = ["id1", "id2", "id3"])
+Ex10: "create a suite with these 3 tests" (with context: recentTestIds = ["id1", "id2", "id3"])
 → {"intent": "create_suite", "intent_confidence": 0.85, "suiteName": null, "testCaseIds": ["id1", "id2", "id3"], "rawText": "create a suite with these 3 tests"}
 
-Ex9: "run saved test abc-123"
+Ex11: "run saved test abc-123"
 → {"intent": "run_regression", "intent_confidence": 0.90, "savedTestCaseId": "abc-123", "suiteId": null, "rawText": "run saved test abc-123"}
 
-Ex10: "запусти сохраненный тест" (NO specific ID)
+Ex12: "запусти сохраненный тест" (NO specific ID)
 → {"intent": "needs_clarification", "intent_confidence": 0.60, "clarificationQuestion": "Which saved test would you like me to run? Please provide the test ID or name.", "possibleIntents": ["run_regression"], "clarificationReason": "Missing test ID", "rawText": "запусти сохраненный тест"}
 
-Ex11: "save this flow" (with lastTestId: none, currentTestStatus: idle)
+Ex13: "save this flow" (with lastTestId: none, currentTestStatus: idle)
 → {"intent": "needs_clarification", "intent_confidence": 0.60, "clarificationQuestion": "Which test would you like to save? Please run a test first or provide a test ID.", "possibleIntents": ["save_test"], "clarificationReason": "No recent test available to save", "rawText": "save this flow"}
 
 --- CRITICAL RULES (PRIORITY ORDER) ---
@@ -438,10 +453,11 @@ Ex11: "save this flow" (with lastTestId: none, currentTestStatus: idle)
    Analyze what user is TRYING TO DO:
    • Giving you something to test? → Analyze URL and message:
      - URL contains "/api/" or domain suggests API → api_test
-     - URL is regular website (no /api/) → platform_test
+     - URL is regular website (no /api/) OR bare domain → platform_test
+     - Bare domain (example.com, repetino.kz) = website URL
      - Message mentions "API", "endpoint", "HTTP method" → api_test
      - Message mentions "website", "page", "UI", "form" → platform_test
-     - If unclear → needs_clarification
+     - If unclear → needs_clarification (ONLY if truly ambiguous)
    • Asking about past/status? → general_chat
    • Requesting information? → general_chat
    • Having conversation? → general_chat
@@ -456,6 +472,13 @@ Ex11: "save this flow" (with lastTestId: none, currentTestStatus: idle)
    • "website", "page", "UI" → suggests platform_test (but MUST check URL and full context first!)
    • Keywords ALONE are NOT enough to determine intent - always analyze URL and message context
 
+**SMART AI RULES (Be intelligent, not rigid):**
+   • If user provides domain + action (e.g., "repetino.kz try to register") → platform_test (don't ask for URL)
+   • If user provides URL + clear request → choose api_test or platform_test based on URL/context (don't ask for clarification)
+   • Prefer taking action over asking questions when intent is reasonably clear
+   • Use needs_clarification ONLY when critical info is truly missing AND cannot be inferred
+   • Don't be overly strict about confidence thresholds - if context is clear, proceed with action
+
 **SPECIAL CASES:**
    • System says "URL FOUND IN HISTORY!" + user approves → api_test
    • User says "Test that with POST" (modifying existing test) → api_test
@@ -469,6 +492,12 @@ Ex11: "save this flow" (with lastTestId: none, currentTestStatus: idle)
    WRONG: "Contains 'test' → must be testing intent"
    CORRECT: "Contains 'test' but it's past tense question → general_chat"
 
+   WRONG: "No https:// in URL → needs_clarification"
+   CORRECT: "Bare domain provided (example.com) → platform_test (system will normalize)"
+
+   WRONG: "Confidence 0.68 < 0.7 → needs_clarification"
+   CORRECT: "Confidence 0.68 but URL+action clear → platform_test"
+
    WRONG: "Contains 'yes' + 'give' + 'data' → must be api_test"
    CORRECT: "Contains 'from THAT test' → past test, not new test → general_chat"
 
@@ -476,8 +505,8 @@ Ex11: "save this flow" (with lastTestId: none, currentTestStatus: idle)
    CORRECT: "Context: 'from THAT test' (referring to past) → general_chat"
 
 **WHEN IN DOUBT:**
-   Use needs_clarification to ask user for specific details rather than guessing
-   Only default to general_chat if it's clearly a conversational question
+   Use needs_clarification ONLY if critical info is missing AND cannot be inferred
+   Prefer taking action (platform_test/api_test) if user provided enough context to proceed
 
 --- SYSTEM-PROVIDED CONTEXT (PRIORITY RULE) ---
 
@@ -497,6 +526,11 @@ RULES:
 2. If system_provided_url exists + user asks question → general_chat (but URL is still available)
 3. If system_provided_url exists + user modifies request → use new request but keep URL as base
 4. If NO system_provided_url + user says single word ("давай", "yes") → needs_clarification
+
+SMART RULES:
+• Bare domains (example.com, repetino.kz) are valid website URLs - don't ask for clarification
+• If user provides domain/URL + action request → proceed with test (don't ask "what feature?")
+• System will normalize protocols and ask follow-ups during test execution if needed
 
 EXAMPLES:
 • "yes" + NO system URL → needs_clarification

@@ -57,13 +57,12 @@ export async function handleApiTest(
       }
 
       if (answers.apiUrl && typeof answers.apiUrl === 'string') {
-        // Validate URL format
-        try {
-          new URL(answers.apiUrl);
-          parsedIntent.apiUrl = answers.apiUrl;
-          validatedAnswers.apiUrl = answers.apiUrl;
-        } catch {
-          logger.warn('[API_TEST] Invalid URL in answers', { apiUrl: answers.apiUrl });
+        // Accept both absolute URLs and relative paths (no strict URL format validation)
+        const trimmed = answers.apiUrl.trim();
+        if (trimmed.length > 0) {
+          parsedIntent.apiUrl = trimmed;
+          parsedIntent.isRelativePath = !trimmed.startsWith('http://') && !trimmed.startsWith('https://');
+          validatedAnswers.apiUrl = trimmed;
         }
       }
 

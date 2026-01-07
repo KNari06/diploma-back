@@ -234,15 +234,19 @@ export async function parseIntent(
     } else {
       parsedIntent = {
         intent: 'api_test',
-        confidence: 100,
+        // Confidence is expected to be 0..1 across the codebase
+        intent_confidence: 1,
+        confidence: 1,
+        rawText: validMessage,
         apiMethod: validApiMethod,
         apiUrl: validApiUrl,
         apiBody: validApiBody,
         apiHeaders: validApiHeaders,
-        assertions: validAssertions,
+        // Keep assertions in metadata (IntentResult does not define this field)
         metadata: {
           source: 'explicit_keyword',
           parsedAt: new Date().toISOString(),
+          assertions: validAssertions,
         },
       };
     }

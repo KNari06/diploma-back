@@ -17,11 +17,12 @@ const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 // FIX #2: Centralized validation constants
 const VALID_HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'] as const;
 // ✅ VALID_SCOPES now imported from @/types
-const VALID_INTENTS = ['platform_test', 'api_test', 'general_chat', 'needs_clarification'] as const;
+// ✅ VALID_INTENTS removed - now dynamically validated via handler-registry (getAvailableIntents())
 
 // Cache configuration
-const CACHE_TTL = 60000; // 1 minute
-const MAX_CACHE_SIZE = 500; // Maximum cache entries to prevent memory leak
+// TODO: Cache temporarily disabled
+// const CACHE_TTL = 60000; // 1 minute
+// const MAX_CACHE_SIZE = 500; // Maximum cache entries to prevent memory leak
 
 // Timeout configuration
 const RAG_TIMEOUT = 10000; // 5 seconds for KB search
@@ -30,29 +31,41 @@ const GPT_TIMEOUT = 10000; // 10 seconds for GPT parsing
 // Metrics reset interval
 const METRICS_RESET_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
 
+// Confidence and validation thresholds
+const MIN_CONFIDENCE_FOR_ACTION = 0.7; // Minimum confidence to proceed without clarification
+const MIN_CLARIFICATION_CONFIDENCE_CAP = 0.65; // Max confidence for needs_clarification intent
+const MIN_CONFIDENCE_FOR_CLARIFICATION = 0.6; // Threshold below which to request clarification
+
+// Message length thresholds
+const VERY_SHORT_MESSAGE_LENGTH = 5; // Messages < 5 chars (approvals, unclear)
+const DETAILED_MESSAGE_LENGTH = 50; // Messages > 50 chars (detailed, more confident)
+const MIN_API_URL_LENGTH = 7; // Minimum valid URL length ("http://x")
+
 // Intent cache for avoiding duplicate RAG calls
-const intentCache = new Map<string, { result: IntentResult; timestamp: number }>();
+// TODO: Cache temporarily disabled - will be re-enabled later if needed
+// const intentCache = new Map<string, { result: IntentResult; timestamp: number }>();
 
 // FIX #9: Periodic cache cleanup to prevent memory leak
 // Clean up expired cache entries every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  let cleanedCount = 0;
-
-  for (const [key, value] of intentCache.entries()) {
-    if (now - value.timestamp > CACHE_TTL) {
-      intentCache.delete(key);
-      cleanedCount++;
-    }
-  }
-
-  if (cleanedCount > 0) {
-    logger.info('[INTENT_CACHE] Cleaned up expired entries', {
-      cleaned: cleanedCount,
-      remaining: intentCache.size,
-    });
-  }
-}, 300000); // 5 minutes
+// TODO: Cache temporarily disabled
+// setInterval(() => {
+//   const now = Date.now();
+//   let cleanedCount = 0;
+//
+//   for (const [key, value] of intentCache.entries()) {
+//     if (now - value.timestamp > CACHE_TTL) {
+//       intentCache.delete(key);
+//       cleanedCount++;
+//     }
+//   }
+//
+//   if (cleanedCount > 0) {
+//     logger.info('[INTENT_CACHE] Cleaned up expired entries', {
+//       cleaned: cleanedCount,
+//       remaining: intentCache.size,
+//     });
+//   }
+// }, 300000); // 5 minutes
 
 /**
  * Timeout helper for Promise.race
@@ -101,21 +114,22 @@ function detectLanguageSimple(message: string): 'en' | 'ru' | 'neutral' {
 /**
  * FIX #9: Safe cache setter with size limit
  * Prevents memory leak by enforcing MAX_CACHE_SIZE
+ * TODO: Cache temporarily disabled
  */
 const setCacheEntry = (key: string, result: IntentResult): void => {
-  // If cache is full, remove oldest entry (first entry in Map)
-  if (intentCache.size >= MAX_CACHE_SIZE) {
-    const firstKey = intentCache.keys().next().value;
-    if (firstKey) {
-      intentCache.delete(firstKey);
-      logger.warn('[INTENT_CACHE] Cache size limit reached, removed oldest entry', {
-        removedKey: firstKey.substring(0, 50),
-        cacheSize: intentCache.size,
-      });
-    }
-  }
-
-  intentCache.set(key, { result, timestamp: Date.now() });
+  // Cache disabled - no-op
+  // TODO: Re-enable when needed
+  // if (intentCache.size >= MAX_CACHE_SIZE) {
+  //   const firstKey = intentCache.keys().next().value;
+  //   if (firstKey) {
+  //     intentCache.delete(firstKey);
+  //     logger.warn('[INTENT_CACHE] Cache size limit reached, removed oldest entry', {
+  //       removedKey: firstKey.substring(0, 50),
+  //       cacheSize: intentCache.size,
+  //     });
+  //   }
+  // }
+  // intentCache.set(key, { result, timestamp: Date.now() });
 };
 
 /**
@@ -136,52 +150,35 @@ export async function parseUserIntent(
     const trimmedMessage = validateAndPrepareMessage(message);
     if (!trimmedMessage) return null;
 
-    // Step 2: Check if this is a response to clarification
-    const isResponseToClarification = checkIfResponseToClarification(context);
+    // Step 2: Check cache for existing results
+    // TODO: Cache temporarily disabled
+    // const cacheKey = buildCacheKey(trimmedMessage, projectId, availableIntents);
+    // const cachedResult = getCachedResult(cacheKey);
+    // if (cachedResult) return cachedResult;
+    const cacheKey = ''; // Placeholder for API compatibility (cache disabled)
 
-    // Step 3: Check cache for existing results
-    const cacheKey = buildCacheKey(trimmedMessage, projectId);
-    const cachedResult = getCachedResult(cacheKey);
-    if (cachedResult) return cachedResult;
-
-    // Step 4: Get KB rules context (FAST/SLOW path)
+    // Step 3: Get KB rules context (FAST/SLOW path)
     // TODO: KB Search temporarily disabled - will be re-enabled later
-    // const { kbRulesContext, kbRulesUsed, userLanguage } = await getKBRulesContext(
-    //   trimmedMessage,
-    //   context,
-    //   projectId
-    // );
+    // When re-enabled, use: const { kbRulesContext, userLanguage } = await getKBRulesContext(...)
 
     // Temporary: Use empty context and default values
     const kbRulesContext: IntentParserContext = context || {};
-    const kbRulesUsed = false;
 
     // Detect user language from message (simple heuristic for now)
     // TODO: Re-enable AI-based detection when KB service is re-enabled
     const userLanguage = detectLanguageSimple(trimmedMessage);
 
-    // Step 5: Parse intent with GPT
+    // Step 4: Parse intent with GPT
     const intentResult = await parseIntentWithGPT(trimmedMessage, kbRulesContext, availableIntents);
     if (!intentResult) {
       logger.warn('[INTENT_PARSER] Initial parse failed');
       return null;
     }
 
-    // Step 6: Calculate confidence and decide next steps
+    // Step 5: Calculate confidence and decide next steps
     let confidence = calculateConfidence(intentResult, trimmedMessage);
 
-    // Step 7: Log if this is a response to clarification (for debugging)
-    // Note: GPT already sees chatHistory with clarification question, so it should
-    // naturally give higher confidence when user responds. No bonus needed.
-    if (isResponseToClarification) {
-      logger.info('[INTENT_PARSER] Detected response to clarification', {
-        confidence,
-        intent: intentResult.intent,
-        note: 'GPT sees chatHistory with clarification question, should naturally have higher confidence',
-      });
-    }
-
-    // Step 8: Check if intent is complete (has required fields)
+    // Step 6: Check if intent is complete (has required fields)
     // This check happens BEFORE confidence handling to ensure incomplete intents
     // always trigger needs_clarification, regardless of confidence
     const isComplete = isIntentCompleteness(intentResult);
@@ -194,7 +191,7 @@ export async function parseUserIntent(
       return createFallbackResult(intentResult, Math.min(confidence, 0.65), cacheKey, userLanguage);
     }
 
-    // Step 9: Handle high confidence results
+    // Step 7: Handle high confidence results
     const highConfidenceResult = handleHighConfidenceResult(
       intentResult,
       confidence,
@@ -203,7 +200,7 @@ export async function parseUserIntent(
     );
     if (highConfidenceResult) return highConfidenceResult;
 
-    // Step 10: Handle low confidence (< 0.7)
+    // Step 8: Handle low confidence (< 0.7)
     // Note: RAG/KB is temporarily disabled, so we just return fallback result
     logger.info('[INTENT_PARSER] Low confidence, returning fallback result', {
       confidence,
@@ -241,22 +238,26 @@ function validateAndPrepareMessage(message: string): string | null {
 
 /**
  * Build cache key for intent result
+ * Includes availableIntents to prevent cache collision when intent set changes
+ * TODO: Cache temporarily disabled
  */
-function buildCacheKey(message: string, projectId?: string): string {
-  return `${message.toLowerCase()}|${projectId || 'global'}`;
+function buildCacheKey(message: string, projectId?: string, availableIntents?: string[]): string {
+  const intentsKey = availableIntents?.sort().join(',') || 'default';
+  return `${message.toLowerCase()}|${projectId || 'global'}|${intentsKey}`;
 }
 
 /**
  * Get cached result if available and not expired
+ * TODO: Cache temporarily disabled
  */
 function getCachedResult(cacheKey: string): IntentResult | null {
-    const cached = intentCache.get(cacheKey);
-
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-      logger.info('[INTENT_PARSER] Using cached result', { cacheKey });
-      return { ...cached.result };
-    }
-
+  // Cache disabled - always return null
+  // TODO: Re-enable when needed
+  // const cached = intentCache.get(cacheKey);
+  // if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+  //   logger.info('[INTENT_PARSER] Using cached result', { cacheKey });
+  //   return { ...cached.result };
+  // }
   return null;
 }
 
@@ -372,11 +373,12 @@ function getCachedResult(cacheKey: string): IntentResult | null {
 
 /**
  * Handle high confidence results (>= 0.7)
+ * Returns result if confidence is sufficient, null otherwise
  */
 function handleHighConfidenceResult(
   intentResult: IntentResult,
   confidence: number,
-  cacheKey: string,
+  cacheKey: string, // TODO: Cache disabled, but kept for API compatibility
   userLanguage: 'en' | 'ru' | 'neutral'
 ): IntentResult | null {
     logger.info('[INTENT_PARSER] Initial parse confidence', {
@@ -385,8 +387,7 @@ function handleHighConfidenceResult(
     });
 
     // If confidence is high enough, return immediately (fast path)
-    // Note: KB rules are temporarily disabled, so we don't check for them
-    if (confidence >= 0.7) {
+    if (confidence >= MIN_CONFIDENCE_FOR_ACTION) {
       logger.info('[INTENT_PARSER] High confidence, using standard parse');
       const finalResult = {
         ...intentResult,
@@ -394,11 +395,12 @@ function handleHighConfidenceResult(
         userLanguage, // Include language for downstream use
       };
 
-      setCacheEntry(cacheKey, finalResult);
+      // TODO: Cache temporarily disabled
+      // setCacheEntry(cacheKey, finalResult);
       return finalResult;
     }
 
-  return null; // Low confidence, need RAG fallback
+  return null; // Low confidence, will create fallback result
 }
 
 // TODO: KB Search temporarily disabled - will be re-enabled later
@@ -474,6 +476,7 @@ function handleHighConfidenceResult(
  * Returns false if intent is incomplete (should trigger needs_clarification)
  */
 function isIntentCompleteness(intentResult: IntentResult): boolean {
+  // Check api_test requirements
   if (intentResult.intent === 'api_test') {
     // api_test requires apiUrl (can be relative path, but must exist)
     if (!intentResult.apiUrl || intentResult.apiUrl.trim().length === 0) {
@@ -483,10 +486,38 @@ function isIntentCompleteness(intentResult: IntentResult): boolean {
     // apiMethod is optional (can be inferred)
   }
 
+  // Check platform_test requirements
   if (intentResult.intent === 'platform_test') {
     // platform_test requires page URL
     if (!intentResult.page || intentResult.page.trim().length === 0) {
       logger.debug('[INTENT_PARSER] platform_test incomplete: missing page');
+      return false;
+    }
+  }
+
+  // Check save_test requirements
+  if (intentResult.intent === 'save_test') {
+    // save_test requires sourceTestId
+    if (!intentResult.sourceTestId) {
+      logger.debug('[INTENT_PARSER] save_test incomplete: missing sourceTestId');
+      return false;
+    }
+  }
+
+  // Check create_suite requirements
+  if (intentResult.intent === 'create_suite') {
+    // create_suite requires testCaseIds
+    if (!intentResult.testCaseIds || intentResult.testCaseIds.length === 0) {
+      logger.debug('[INTENT_PARSER] create_suite incomplete: missing or empty testCaseIds');
+      return false;
+    }
+  }
+
+  // Check run_regression requirements
+  if (intentResult.intent === 'run_regression') {
+    // run_regression requires either savedTestCaseId or suiteId
+    if (!intentResult.savedTestCaseId && !intentResult.suiteId) {
+      logger.debug('[INTENT_PARSER] run_regression incomplete: missing both savedTestCaseId and suiteId');
       return false;
     }
   }
@@ -525,7 +556,9 @@ function isIntentCompleteness(intentResult: IntentResult): boolean {
 // }
 
 /**
- * Create fallback result for failed enhanced parsing
+ * Create fallback result for incomplete or low confidence intents
+ * Note: AI model should decide when to use needs_clarification in most cases
+ * This is a safety net for edge cases
  */
 function createFallbackResult(
   intentResult: IntentResult,
@@ -533,26 +566,20 @@ function createFallbackResult(
   cacheKey: string,
   userLanguage: 'en' | 'ru' | 'neutral' = 'neutral'
 ): IntentResult {
-  // If confidence is too low, ask user for clarification
-  if (confidence < 0.7) {
-    logger.info('[INTENT_PARSER] Confidence too low, requesting clarification', {
-      originalIntent: intentResult.intent,
-      confidence,
-    });
-
-    // Use clarificationQuestion from GPT if available, otherwise fallback
+  // If AI explicitly returned needs_clarification, respect its decision
+  if (intentResult.intent === 'needs_clarification') {
+    // Ensure all required fields are present
     const clarificationQuestion = intentResult.clarificationQuestion ||
       getFallbackClarificationQuestion(intentResult);
 
     const clarificationResult: IntentResult = {
       intent: 'needs_clarification',
-      confidence,
+      confidence: Math.min(confidence, MIN_CLARIFICATION_CONFIDENCE_CAP),
       clarificationQuestion,
       possibleIntents: intentResult.possibleIntents || getPossibleIntents(intentResult),
-      clarificationReason: intentResult.clarificationReason ||
-        `Confidence score (${confidence.toFixed(2)}) is below threshold (0.7). Need more information to determine intent.`,
+      clarificationReason: intentResult.clarificationReason || 'AI requested clarification',
       rawText: intentResult.rawText,
-      userLanguage, // Include language for downstream use
+      userLanguage,
       metadata: {
         ...intentResult.metadata,
         originalIntent: intentResult.intent,
@@ -560,13 +587,46 @@ function createFallbackResult(
       },
     };
 
-    setCacheEntry(cacheKey, clarificationResult);
+    // TODO: Cache temporarily disabled
+    // setCacheEntry(cacheKey, clarificationResult);
     return clarificationResult;
   }
 
-  // Confidence is acceptable, return original intent
+  // For very low confidence (< 0.6) on actionable intents, consider asking for clarification
+  // But only if the intent is truly unclear, not just low confidence
+  if (confidence < MIN_CONFIDENCE_FOR_CLARIFICATION &&
+      (intentResult.intent === 'api_test' || intentResult.intent === 'platform_test')) {
+    logger.info('[INTENT_PARSER] Very low confidence on actionable intent, requesting clarification', {
+      originalIntent: intentResult.intent,
+      confidence,
+    });
+
+    const clarificationQuestion = getFallbackClarificationQuestion(intentResult);
+
+    const clarificationResult: IntentResult = {
+      intent: 'needs_clarification',
+      confidence,
+      clarificationQuestion,
+      possibleIntents: getPossibleIntents(intentResult),
+      clarificationReason: `Confidence score (${confidence.toFixed(2)}) is very low. Need more information to determine intent.`,
+      rawText: intentResult.rawText,
+      userLanguage,
+      metadata: {
+        ...intentResult.metadata,
+        originalIntent: intentResult.intent,
+        originalConfidence: confidence,
+      },
+    };
+
+    // TODO: Cache temporarily disabled
+    // setCacheEntry(cacheKey, clarificationResult);
+    return clarificationResult;
+  }
+
+  // Confidence is acceptable (>= 0.6) or intent is not actionable, return original intent
   const fallbackResult = { ...intentResult, confidence, userLanguage };
-  setCacheEntry(cacheKey, fallbackResult);
+  // TODO: Cache temporarily disabled
+  // setCacheEntry(cacheKey, fallbackResult);
   return fallbackResult;
 }
 
@@ -784,7 +844,7 @@ async function parseIntentWithGPT(
     if (!response) return null;
 
     // Step 6: Parse and validate response
-    const parsed = await parseGPTResponse(response, message);
+    const parsed = await parseGPTResponse(response);
     if (!parsed) return null;
 
     // Step 7: Finalize and return result
@@ -1014,7 +1074,9 @@ async function makeOpenAICall(
  * Parse GPT response and handle JSON extraction
  * IMPROVED: Multiple extraction strategies with fallbacks
  */
-async function parseGPTResponse(responseText: string, message: string): Promise<IntentResult | null> {
+async function parseGPTResponse(
+  responseText: string
+): Promise<IntentResult | null> {
   // Validate input
   if (!responseText || typeof responseText !== 'string' || responseText.trim().length === 0) {
     logger.warn('[INTENT_PARSER] Empty or invalid responseText in parseGPTResponse');
@@ -1185,6 +1247,7 @@ function extractMarkdownWithQuoteFix(text: string): IntentResult | null {
 /**
  * Validate parsed intent result structure
  * FIX #2: Use centralized constants for validation
+ * Note: Intent handler validation is done in intent-parsing.ts using hasHandler()
  */
 function validateIntentResult(parsed: any): IntentResult | null {
   // Check if parsed is an object
@@ -1215,14 +1278,8 @@ function validateIntentResult(parsed: any): IntentResult | null {
     }
   }
 
-  // FIX #2: Validate intent value using centralized constant
-  if (!VALID_INTENTS.includes(parsed.intent as any)) {
-    logger.warn('[INTENT_PARSER] Invalid intent value', {
-      intent: parsed.intent,
-      validIntents: VALID_INTENTS,
-    });
-    // Don't return null - maybe it's a custom intent
-  }
+  // Note: Intent validation against available handlers is done in intent-parsing.ts
+  // using hasHandler() with proper fallback to general_chat
 
   // Validate intent-specific fields
   if (parsed.intent === 'api_test') {
@@ -1273,13 +1330,8 @@ function validateIntentResult(parsed: any): IntentResult | null {
       });
     }
 
-    // Validate intent_confidence should be < 0.7 for needs_clarification
-    const confidence = parsedAny.intent_confidence !== undefined ? Number(parsedAny.intent_confidence) : undefined;
-    if (confidence !== undefined && confidence >= 0.7) {
-      logger.warn('[INTENT_PARSER] needs_clarification with high confidence', {
-        intent_confidence: confidence,
-      });
-    }
+    // Note: Removed strict confidence < 0.7 check for needs_clarification
+    // AI should use needs_clarification only when critical info is truly missing
   }
 
   logger.debug('[INTENT_PARSER] Intent result validated successfully', {
@@ -1430,21 +1482,32 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
       parsed.apiHeaders = undefined;
       parsed.isRelativePath = false;
 
+      // Recalculate confidence after intent change
+      parsed.confidence = calculateConfidence(parsed, trimmedMessage);
+
       parsed.metadata = {
         ...parsed.metadata,
         correction: 'api_test->platform_test',
         correctionReason: 'URL looks like website and no API signals in message',
+        recalculatedConfidence: parsed.confidence,
       };
     }
   }
 
+  // Step 5.2: Finalize platform_test URL normalization and cleanup
   if (parsed.intent === 'platform_test') {
-    // Clean page URL
+    // Clean and normalize page URL (consolidated from multiple places)
     if (parsed.page) {
       parsed.page = parsed.page.trim();
+
       // Check for empty string AFTER trim
       if (parsed.page === '') {
         parsed.page = null;
+      } else {
+        // Add protocol if missing (for bare domains like example.com)
+        if (!parsed.page.startsWith('http://') && !parsed.page.startsWith('https://')) {
+          parsed.page = `https://${parsed.page}`;
+        }
       }
     }
 
@@ -1828,16 +1891,12 @@ export function calculateConfidence(intentResult: IntentResult, message: string)
       confidence += 0.1;
     }
 
-    return Math.min(confidence, 0.65); // Cap at 0.65 for needs_clarification
+    return Math.min(confidence, MIN_CLARIFICATION_CONFIDENCE_CAP); // Cap at 0.65 for needs_clarification
   }
 
   // Platform test confidence boosters
   if (intentResult.intent === 'platform_test') {
-    // Validate URL quality (more strict)
-    if (intentResult.page) {
-      const isValidUrl = intentResult.page.length > 10 && /^https?:\/\/.+\..+/.test(intentResult.page);
-      confidence += isValidUrl ? 0.2 : 0.05;
-    }
+    // No URL-format heuristics here: rely on the model + other signals (scope/target/message).
 
     // FIX #2: Validate scope using centralized constant
     if (intentResult.scope) {
@@ -1863,7 +1922,7 @@ export function calculateConfidence(intentResult: IntentResult, message: string)
     }
 
     // Validate API URL has meaningful content (stricter length check)
-    if (intentResult.apiUrl && intentResult.apiUrl.length > 7) {  // At least "http://x"
+    if (intentResult.apiUrl && intentResult.apiUrl.length > MIN_API_URL_LENGTH) {
       confidence += 0.2;
     }
 
@@ -1878,10 +1937,10 @@ export function calculateConfidence(intentResult: IntentResult, message: string)
     const lowerMessage = trimmedMessage.toLowerCase();
 
     // Check if message is a question
-    if (message.includes('?')) confidence += 0.2;
+    if (trimmedMessage.includes('?')) confidence += 0.2;
 
     // Check if message has no URL (less likely to be testing request)
-    if (!message.match(/https?:\/\//)) confidence += 0.1;
+    if (!trimmedMessage.match(/https?:\/\//)) confidence += 0.1;
 
     // Check for common greeting/help words
     const helpWords = ['what', 'how', 'help', 'explain', 'tell', 'show', 'hi', 'hello', 'thanks', 'why', 'did', 'have'];
@@ -1893,12 +1952,12 @@ export function calculateConfidence(intentResult: IntentResult, message: string)
   // Message length adjustments (applies to all intents except needs_clarification)
   if (intentResult.intent !== 'needs_clarification') {
     // Very short messages (< 5 chars) are often approvals or unclear
-    if (trimmedMessage.length < 5) {
+    if (trimmedMessage.length < VERY_SHORT_MESSAGE_LENGTH) {
       confidence -= 0.1;
     }
 
     // Long, detailed messages are usually more confident
-    if (trimmedMessage.length > 50) {
+    if (trimmedMessage.length > DETAILED_MESSAGE_LENGTH) {
       confidence += 0.05;
     }
   }
