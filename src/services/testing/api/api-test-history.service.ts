@@ -235,7 +235,7 @@ export class ApiTestHistoryService {
           if (urlMatch && urlMatch[1]) {
             url = urlMatch[1].trim();
           } else {
-            const anyUrlMatch = msg.content.match(/(https?:\/\/[^\s\n\)]+)/i);
+            const anyUrlMatch = msg.content.match(/(https?:\/\/[^\s\n)]+)/i);
             if (anyUrlMatch && anyUrlMatch[1]) {
               url = anyUrlMatch[1].trim();
             }
@@ -476,7 +476,8 @@ export class ApiTestHistoryService {
    */
   private static formatTestDetails(
     message: any,
-    userId: string
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _userId: string
   ): {
     success: boolean;
     data: ApiTestDetails | null;
@@ -502,7 +503,7 @@ export class ApiTestHistoryService {
         url = urlMatch[1].trim();
       } else {
         // Try to find any URL in the content
-        const anyUrlMatch = message.content.match(/(https?:\/\/[^\s\n\)]+)/i);
+        const anyUrlMatch = message.content.match(/(https?:\/\/[^\s\n)]+)/i);
         if (anyUrlMatch && anyUrlMatch[1]) {
           url = anyUrlMatch[1].trim();
         }
@@ -646,7 +647,7 @@ export class ApiTestHistoryService {
             if (urlMatch && urlMatch[1]) {
               url = urlMatch[1].trim();
             } else {
-              const anyUrlMatch = msg.content.match(/(https?:\/\/[^\s\n\)]+)/i);
+              const anyUrlMatch = msg.content.match(/(https?:\/\/[^\s\n)]+)/i);
               if (anyUrlMatch && anyUrlMatch[1]) {
                 url = anyUrlMatch[1].trim();
               }

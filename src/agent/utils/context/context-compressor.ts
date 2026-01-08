@@ -216,7 +216,7 @@ export function buildHistorySummary(state: TestState): string {
   // Recent actions (last 20)
   if (compressed.recentActions.length > 0 && compressed.recentActions.length <= RECENT_ACTIONS_COUNT) {
     parts.push(`\nRecent actions (last ${compressed.recentActions.length}):`);
-    compressed.recentActions.slice(-10).forEach((action, idx) => {
+    compressed.recentActions.slice(-10).forEach((action) => {
       const status = action.success ? '✓' : '✗';
       const actionType = action.action?.action || 'unknown';
       const description = action.action?.description || '';

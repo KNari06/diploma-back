@@ -107,7 +107,7 @@ export async function executeUiTestFlow(
     // No need to duplicate check here - it was already validated before calling executeUiTestFlow
     // Credits will be deducted AFTER successful queue job creation to prevent charging without running
     const uiTestType = 'intelligent';
-    const testId = `ui_${planId}_${Date.now()}`;
+    // testId variable removed - was not used
     const creditsRequired = TokenCalculatorService.getTestCreditCost(uiTestType);
 
     logger.info('[UI_TEST] Credit check already passed in test-execution.ts', {

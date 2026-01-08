@@ -770,7 +770,7 @@ export class ProjectContextService {
   private static generateProjectName(baseUrl: string): string {
     try {
       const parsed = new URL(baseUrl);
-      let hostname = parsed.hostname.replace('www.', '');
+      const hostname = parsed.hostname.replace('www.', '');
 
       if (!hostname || hostname.length === 0) {
         return this.createFallbackProjectName(baseUrl);
@@ -783,7 +783,7 @@ export class ProjectContextService {
 
       // Handle IPv6 addresses
       if (hostname.includes(':') && hostname.includes('[')) {
-        return `Project ${hostname.replace(/[\[\]]/g, '')}`;
+        return `Project ${hostname.replace(/[[\]]/g, '')}`;
       }
 
       // Sanitize hostname (remove special chars, keep alphanumeric and dots/hyphens)

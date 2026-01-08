@@ -5,9 +5,9 @@
 
 import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
-import { AISelectorEngine } from './ai-selector-engine.service';
 import { DOMNodeExtractor } from './dom-node-extractor';
-import type { SelfHealingResult, SelectorType } from './types';
+import { AISelectorEngine } from './index';
+import type { SelectorType, SelfHealingResult } from './types';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SELF-HEALING SERVICE
@@ -30,7 +30,7 @@ export class SelfHealingService {
     };
     mode?: 'fast' | 'accurate'; // Fast: DOM only, Accurate: + screenshot
   }): Promise<SelfHealingResult> {
-    const { oldSelector, intent, page, errorMessage, metadata, mode = 'fast' } = params;
+    const { oldSelector, intent, page, metadata, mode = 'fast' } = params;
 
     logger.info('[SELF_HEALING] Attempting to heal selector', {
       oldSelector,
@@ -286,7 +286,7 @@ export class SelfHealingService {
     }
 
     // 3. Handle role= format
-    const roleMatch = s.match(/^role\s*=\s*([^\[\s]+)(?:\s*\[name\s*=\s*(.+?)\])?$/i);
+    const roleMatch = s.match(/^role\s*=\s*([^[\s]+)(?:\s*\[name\s*=\s*(.+?)\])?$/i);
     if (roleMatch) {
       const role = roleMatch[1].trim() as any;
       let name = roleMatch[2]?.trim();

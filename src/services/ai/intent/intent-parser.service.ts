@@ -24,9 +24,9 @@ const VALID_HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 
 // const CACHE_TTL = 60000; // 1 minute
 // const MAX_CACHE_SIZE = 500; // Maximum cache entries to prevent memory leak
 
-// Timeout configuration
-const RAG_TIMEOUT = 10000; // 5 seconds for KB search
-const GPT_TIMEOUT = 10000; // 10 seconds for GPT parsing
+// Timeout configuration (currently unused - may be used in future)
+// const RAG_TIMEOUT = 10000; // 5 seconds for KB search
+// const GPT_TIMEOUT = 10000; // 10 seconds for GPT parsing
 
 // Metrics reset interval
 const METRICS_RESET_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
@@ -68,8 +68,9 @@ const MIN_API_URL_LENGTH = 7; // Minimum valid URL length ("http://x")
 // }, 300000); // 5 minutes
 
 /**
- * Timeout helper for Promise.race
+ * Timeout helper for Promise.race (currently unused)
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const withTimeout = <T>(promise: Promise<T>, ms: number, errorMsg: string): Promise<T> => {
   return Promise.race([
     promise,
@@ -116,7 +117,13 @@ function detectLanguageSimple(message: string): 'en' | 'ru' | 'neutral' {
  * Prevents memory leak by enforcing MAX_CACHE_SIZE
  * TODO: Cache temporarily disabled
  */
-const setCacheEntry = (key: string, result: IntentResult): void => {
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const setCacheEntry = (
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _key: string,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _result: IntentResult
+): void => {
   // Cache disabled - no-op
   // TODO: Re-enable when needed
   // if (intentCache.size >= MAX_CACHE_SIZE) {
@@ -176,7 +183,7 @@ export async function parseUserIntent(
     }
 
     // Step 5: Calculate confidence and decide next steps
-    let confidence = calculateConfidence(intentResult, trimmedMessage);
+    const confidence = calculateConfidence(intentResult, trimmedMessage);
 
     // Step 6: Check if intent is complete (has required fields)
     // This check happens BEFORE confidence handling to ensure incomplete intents
@@ -241,6 +248,7 @@ function validateAndPrepareMessage(message: string): string | null {
  * Includes availableIntents to prevent cache collision when intent set changes
  * TODO: Cache temporarily disabled
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildCacheKey(message: string, projectId?: string, availableIntents?: string[]): string {
   const intentsKey = availableIntents?.sort().join(',') || 'default';
   return `${message.toLowerCase()}|${projectId || 'global'}|${intentsKey}`;
@@ -250,7 +258,11 @@ function buildCacheKey(message: string, projectId?: string, availableIntents?: s
  * Get cached result if available and not expired
  * TODO: Cache temporarily disabled
  */
-function getCachedResult(cacheKey: string): IntentResult | null {
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function getCachedResult(
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _cacheKey: string
+): IntentResult | null {
   // Cache disabled - always return null
   // TODO: Re-enable when needed
   // const cached = intentCache.get(cacheKey);
@@ -649,8 +661,12 @@ function getFallbackClarificationQuestion(intentResult: IntentResult): string {
  * by looking at chat history context
  *
  * Uses metadata approach instead of hardcoded markers - more reliable!
+ * Currently unused - may be used in future
  */
-function checkIfResponseToClarification(context?: IntentParserContext): boolean {
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function checkIfResponseToClarification(
+  context?: IntentParserContext
+): boolean {
   if (!context?.chatHistory || !Array.isArray(context.chatHistory)) {
     return false;
   }
@@ -1225,7 +1241,9 @@ function extractWithQuoteFix(text: string): IntentResult | null {
 /**
  * Strategy 5: Extract from markdown THEN fix quotes
  * Handles: ```json {'intent': 'api_test'} ```
+ * Currently unused - may be used in future
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function extractMarkdownWithQuoteFix(text: string): IntentResult | null {
   // First extract from markdown
   const extracted = extractMarkdownJSON(text);
@@ -1310,7 +1328,6 @@ function validateIntentResult(parsed: any): IntentResult | null {
 
   if (parsed.intent === 'needs_clarification') {
     // Validate required fields for needs_clarification
-    const parsedAny = parsed as any;
     if (!parsed.clarificationQuestion || typeof parsed.clarificationQuestion !== 'string') {
       logger.warn('[INTENT_PARSER] needs_clarification missing clarificationQuestion', {
         hasQuestion: !!parsed.clarificationQuestion,

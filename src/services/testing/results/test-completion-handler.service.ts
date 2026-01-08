@@ -152,7 +152,8 @@ export class TestCompletionHandlerService {
    */
   private static async updateRegressionRuns(
     testId: string,
-    testStatus: string
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _testStatus: string
   ): Promise<void> {
     try {
       // Find regression runs that reference this test

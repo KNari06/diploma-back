@@ -185,7 +185,7 @@ export class StateValidator {
    */
   static getConfidence(outcome: ActionOutcome, diff: StateDiff): number {
     switch (outcome) {
-      case 'state_changed':
+      case 'state_changed': {
         // High confidence if multiple indicators of change
         let score = 0.5;
         if (diff.urlChanged) score += 0.3;
@@ -193,6 +193,7 @@ export class StateValidator {
         if (diff.removedRefs.length > 3) score += 0.1;
         if (diff.changedElements.length > 0) score += 0.1;
         return Math.min(score, 1.0);
+      }
 
       case 'validation_error':
         // High confidence if errors are present

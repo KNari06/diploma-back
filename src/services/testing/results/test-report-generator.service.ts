@@ -226,10 +226,11 @@ export class TestReportGeneratorService {
         code += `${indent}await page.waitForNavigation();\n`;
         break;
 
-      case 'screenshot':
+      case 'screenshot': {
         const filename = command.selector || `screenshot-${Date.now()}.png`;
         code += `${indent}await page.screenshot({ path: '${filename}' });\n`;
         break;
+      }
 
       case 'assert':
         if (command.selector) {

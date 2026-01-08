@@ -11,20 +11,19 @@ export { IntentParserService } from './intent-parser.service';
 export { SelectorCacheService } from './selector-cache.service';
 
 export type {
-  // Request/Response types
-  SelectorResolveRequest,
-  SelectorResolveResponse,
-  // Node types
-  DOMNode,
-  SelectedNode,
-  SelectorCandidate,
-  // Intent types
-  ParsedIntent,
-  // Selector types
-  SelectorType,
-  // Self-healing types
-  SelfHealingResult,
   // Cache types
   CacheKeyComponents,
   CachedSelectorResult,
+  // Node types
+  DOMNode,
+  // Intent types
+  ParsedIntent, SelectedNode,
+  SelectorCandidate,
+  // Request/Response types
+  SelectorResolveRequest,
+  SelectorResolveResponse,
+  // Selector types
+  SelectorType,
+  // Self-healing types
+  SelfHealingResult
 } from './types';

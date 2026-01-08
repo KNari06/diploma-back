@@ -36,7 +36,7 @@ function normalizeTextKey(text: string): string {
     .normalize('NFKD') // Decompose characters (é → e + ́)
     .replace(/[\u0300-\u036F]/g, '') // Remove diacritics
     .toLowerCase()
-    .replace(/[\u2018\u2019\u201C\u201D'\""]/g, '') // normalize quotes
+    .replace(/[\u2018\u2019\u201C\u201D'"]/g, '') // normalize quotes
     .replace(/[^\n\p{L}\p{N}\s]/gu, '') // remove punctuation (unicode aware)
     .replace(/\s+/g, ' ') // normalize whitespace
     .trim();

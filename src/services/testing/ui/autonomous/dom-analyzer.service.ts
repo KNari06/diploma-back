@@ -134,7 +134,7 @@ async function waitForSPAPage(
   }
 ): Promise<void> {
   const startTime = Date.now();
-  const { maxWaitTime, networkSettleTime, elementTimeout } = config;
+  const { networkSettleTime, elementTimeout } = config;
 
   try {
     // ✅ EDGE CASE: Check if page is already loaded (fast path)
@@ -1037,7 +1037,7 @@ export async function analyzeDOMStructure(
 
         // 10. Classes with special chars (spaces, brackets, etc.) = invalid/dynamic
         // Matches: "class with spaces", "[class]", etc.
-        if (/[\s\[\]{}()]/.test(className)) {
+        if (/[\s[\]{}()]/.test(className)) {
           return true;
         }
 
@@ -1290,7 +1290,7 @@ export async function analyzeDOMStructure(
             return 'button';
           case 'a':
             return element.hasAttribute('href') ? 'link' : null;
-          case 'input':
+          case 'input': {
             const inputType = (element.getAttribute('type') || 'text').toLowerCase();
             switch (inputType) {
               case 'button':
@@ -1325,6 +1325,7 @@ export async function analyzeDOMStructure(
               default:
                 return null;
             }
+          }
           case 'textarea':
             return 'textbox';
           case 'select':
@@ -2479,6 +2480,83 @@ export async function analyzeDOMStructure(
         // 2. Check custom elements (elements with hyphen in tag name) - likely to have Shadow DOM
         // 3. Recursively check ALL children (with reasonable depth limit) to catch non-interactive Shadow DOM hosts
         // This ensures we find Shadow DOM hosts even if they're not in combinedSelector
+
+        // ✅ FIX: Move function declarations to function body root (before try block)
+        const customElements: any[] = [];
+        const customElementsSet = new Set<any>(); // For deduplication
+
+        function findCustomElements(parent: any, maxDepth: number, currentDepth: number = 0): void {
+          if (currentDepth >= maxDepth) return;
+
+          try {
+            const children = Array.from(parent.children || []) as any[];
+            for (const child of children) {
+              if (!child) continue;
+
+              const tag = child?.tagName?.toLowerCase();
+              // Custom elements have hyphen in name (e.g., my-component, web-component)
+              // This is the standard way to identify Web Components
+              if (tag && tag.includes('-') && !customElementsSet.has(child)) {
+                customElements.push(child);
+                customElementsSet.add(child);
+              }
+              // Recursively check children (reasonable depth to catch nested custom elements)
+              findCustomElements(child, maxDepth, currentDepth + 1);
+            }
+          } catch (e) {
+            // Parent might be detached
+          }
+        }
+
+        function checkChildrenForShadowDOM(parent: any, maxDepth: number, currentDepth: number = 0): void {
+          if (currentDepth >= maxDepth) return;
+
+          try {
+            const children = Array.from(parent.children || []) as any[];
+            for (const child of children) {
+              if (!child || visited.has(child)) continue;
+
+              let shadowRoot: any = null;
+              try {
+                if (child && typeof (child as any).shadowRoot !== 'undefined') {
+                  shadowRoot = (child as any).shadowRoot;
+                }
+              } catch (e) {
+                shadowRoot = null;
+              }
+
+              if (shadowRoot) {
+                visited.add(child);
+
+                const shadowResult = traverseShadowDOM(
+                  shadowRoot,
+                  child,
+                  depth + 1,
+                  maxDepth
+                );
+
+                result.buttons.push(...shadowResult.buttons);
+                result.links.push(...shadowResult.links);
+                result.inputs.push(...shadowResult.inputs);
+                result.checkboxes.push(...shadowResult.checkboxes);
+                result.radios.push(...shadowResult.radios);
+                result.interactiveElements.push(...shadowResult.interactiveElements);
+                if (shadowResult.hiddenInteractive) {
+                  if (!result.hiddenInteractive) result.hiddenInteractive = [];
+                  result.hiddenInteractive.push(...shadowResult.hiddenInteractive);
+                }
+              }
+
+              // ✅ IMPROVED: Recursively check children with reasonable depth (5 levels)
+              // This ensures we catch Shadow DOM hosts even in nested structures
+              // 5 levels is reasonable for real-world applications
+              checkChildrenForShadowDOM(child, maxDepth, currentDepth + 1);
+            }
+          } catch (e) {
+            // Parent might be detached
+          }
+        }
+
         try {
           // ✅ OPTIMIZED: Get all elements that were processed in collectAllElementsFromRoot
           // These are interactive elements that might have Shadow DOM
@@ -2487,31 +2565,6 @@ export async function analyzeDOMStructure(
           // ✅ IMPROVED: Find ALL custom elements (elements with hyphen in tag name)
           // Custom elements often have Shadow DOM but might not be in combinedSelector
           // We use recursive traversal with reasonable depth to catch all custom elements
-          const customElements: any[] = [];
-          const customElementsSet = new Set<any>(); // For deduplication
-
-          function findCustomElements(parent: any, maxDepth: number, currentDepth: number = 0): void {
-            if (currentDepth >= maxDepth) return;
-
-            try {
-              const children = Array.from(parent.children || []) as any[];
-              for (const child of children) {
-                if (!child) continue;
-
-                const tag = child?.tagName?.toLowerCase();
-                // Custom elements have hyphen in name (e.g., my-component, web-component)
-                // This is the standard way to identify Web Components
-                if (tag && tag.includes('-') && !customElementsSet.has(child)) {
-                  customElements.push(child);
-                  customElementsSet.add(child);
-                }
-                // Recursively check children (reasonable depth to catch nested custom elements)
-                findCustomElements(child, maxDepth, currentDepth + 1);
-              }
-            } catch (e) {
-              // Parent might be detached
-            }
-          }
 
           // ✅ IMPROVED: Find custom elements with deeper traversal (5 levels)
           // This ensures we catch custom elements even in deeply nested structures
@@ -2576,63 +2629,6 @@ export async function analyzeDOMStructure(
               }
             } catch (e) {
               // assignedSlot might not be available in all contexts
-            }
-          }
-
-          // ✅ IMPROVED: Recursively check ALL children for Shadow DOM hosts (reasonable depth)
-          // This catches Shadow DOM hosts that are not interactive elements themselves
-          // Examples: <div> with Shadow DOM but no interactive attributes
-          // We use reasonable depth (5 levels) to catch most real-world cases
-          // This is still much more efficient than querySelectorAll('*') because:
-          // 1. We only check children (not all descendants via querySelector)
-          // 2. We skip already visited elements
-          // 3. We stop at reasonable depth
-          function checkChildrenForShadowDOM(parent: any, maxDepth: number, currentDepth: number = 0): void {
-            if (currentDepth >= maxDepth) return;
-
-            try {
-              const children = Array.from(parent.children || []) as any[];
-              for (const child of children) {
-                if (!child || visited.has(child)) continue;
-
-                let shadowRoot: any = null;
-                try {
-                  if (child && typeof (child as any).shadowRoot !== 'undefined') {
-                    shadowRoot = (child as any).shadowRoot;
-                  }
-                } catch (e) {
-                  shadowRoot = null;
-                }
-
-                if (shadowRoot) {
-                  visited.add(child);
-
-                  const shadowResult = traverseShadowDOM(
-                    shadowRoot,
-                    child,
-                    depth + 1,
-                    maxDepth
-                  );
-
-                  result.buttons.push(...shadowResult.buttons);
-                  result.links.push(...shadowResult.links);
-                  result.inputs.push(...shadowResult.inputs);
-                  result.checkboxes.push(...shadowResult.checkboxes);
-                  result.radios.push(...shadowResult.radios);
-                  result.interactiveElements.push(...shadowResult.interactiveElements);
-                  if (shadowResult.hiddenInteractive) {
-                    if (!result.hiddenInteractive) result.hiddenInteractive = [];
-                    result.hiddenInteractive.push(...shadowResult.hiddenInteractive);
-                  }
-                }
-
-                // ✅ IMPROVED: Recursively check children with reasonable depth (5 levels)
-                // This ensures we catch Shadow DOM hosts even in nested structures
-                // 5 levels is reasonable for real-world applications
-                checkChildrenForShadowDOM(child, maxDepth, currentDepth + 1);
-              }
-            } catch (e) {
-              // Parent might be detached
             }
           }
 
@@ -2741,13 +2737,13 @@ export async function analyzeDOMStructure(
 
           // ✅ EDGE CASE: Check if iframe is sandboxed (might have restricted access)
           // Sandboxed iframes might have limited functionality, but we can still try
-          const sandboxAttr = iframe.getAttribute('sandbox');
+          // const sandboxAttr = iframe.getAttribute('sandbox'); // Currently unused
           // Note: Sandbox doesn't prevent contentDocument access, but might restrict scripts
           // We'll still try to access it
 
           // ✅ EDGE CASE: Check if iframe has srcdoc (inline content)
           // srcdoc iframes don't have src, but contentDocument should still work
-          const hasSrcdoc = iframe.hasAttribute('srcdoc');
+          // const hasSrcdoc = iframe.hasAttribute('srcdoc'); // Currently unused
 
           // Try to access iframe content
           let iframeDocument: any = null;

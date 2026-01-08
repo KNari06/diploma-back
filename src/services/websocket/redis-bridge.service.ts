@@ -50,7 +50,10 @@ class RedisWebSocketBridge {
         this.publisher = new Redis(connection as any);
 
         // Error handler - DON'T throw, just log
-        this.publisher.on('error', (error) => {
+        this.publisher.on('error', (
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          _error
+        ) => {
           // ✅ REMOVED: REDIS_BRIDGE logs
         });
 
@@ -173,7 +176,10 @@ class RedisWebSocketBridge {
         try {
           this.subscriber = new Redis(connection as any);
 
-          this.subscriber.on('error', (error) => {
+          this.subscriber.on('error', (
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            _error
+          ) => {
             // ✅ REMOVED: REDIS_BRIDGE logs
           });
 

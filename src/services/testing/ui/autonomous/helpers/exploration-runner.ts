@@ -28,9 +28,10 @@ export async function runExploration(params: {
     needsAuth,
     sessionId,
     userMessage,
-    userId,
-    projectId,
     emitProgress,
+    // userId and projectId are not used in this function but kept for API compatibility
+    // userId: _userId,
+    // projectId: _projectId,
   } = params;
 
   // ═══════════════════════════════════════════════════════════════════════════

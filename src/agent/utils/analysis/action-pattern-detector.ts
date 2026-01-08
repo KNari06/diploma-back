@@ -147,6 +147,8 @@ export class ActionPatternDetector {
     actionType: string,
     selector: string
   ): string | null {
+    void selector; // Used for signature consistency; currently patterns don't require it
+
     // Pattern 1: Form validation - filling same field after validation errors is normal
     if (actionType === 'fill' || actionType === 'type') {
       // Check if previous action failed with validation error

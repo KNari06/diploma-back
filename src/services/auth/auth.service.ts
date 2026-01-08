@@ -697,7 +697,7 @@ export async function updatePassword(
     logger.info('[AUTH] Updating password', { userId });
 
     // Use admin API to update password
-    const { data: updatedUser, error } = await supabaseAdmin.auth.admin.updateUserById(
+    const { error } = await supabaseAdmin.auth.admin.updateUserById(
       userId,
       { password: newPassword }
     );
@@ -764,7 +764,7 @@ export async function updateUserProfile(
     });
 
     // Update user metadata in Supabase Auth using admin API
-    const { data: updatedAuthData, error: authError } = await supabaseAdmin.auth.admin.updateUserById(
+    const { error: authError } = await supabaseAdmin.auth.admin.updateUserById(
       userId,
       {
         user_metadata: { name: trimmedName }

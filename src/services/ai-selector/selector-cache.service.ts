@@ -5,9 +5,9 @@
 
 import { logger } from '@/utils/core/logger';
 import type {
-  CacheKeyComponents,
-  CachedSelectorResult,
-  SelectorResolveResponse,
+    CacheKeyComponents,
+    CachedSelectorResult,
+    SelectorResolveResponse,
 } from './types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -178,7 +178,7 @@ export class SelectorCacheService {
     let totalHits = 0;
     let totalAge = 0;
 
-    for (const [_, cached] of memoryCache.entries()) {
+    for (const [, cached] of memoryCache.entries()) {
       totalHits += cached.hitCount;
       totalAge += now - cached.createdAt;
     }

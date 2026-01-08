@@ -46,9 +46,10 @@ export async function uploadArtifacts(
   testData: TestJobData,
   videoPath?: string,
   tracePath?: string,
-  screenshotUrls?: string[]
+  _screenshotUrls?: string[]
 ): Promise<{ videoUrl?: string; traceUrl?: string }> {
   const result: { videoUrl?: string; traceUrl?: string } = {};
+  void _screenshotUrls; // Intentionally not used here (screenshots are uploaded elsewhere)
 
   try {
     const { uploadVideoToStorage, uploadTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');

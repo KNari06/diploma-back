@@ -361,7 +361,7 @@ export class LiteState {
     const diff = last.result.stateDiff;
 
     switch (last.result.outcome) {
-      case 'state_changed':
+      case 'state_changed': {
         if (diff.urlChanged) {
           return `✅ Success: Navigated to ${this.getShortUrl(diff.urlAfter)}`;
         }
@@ -373,8 +373,9 @@ export class LiteState {
           changeDesc += ` (Added: ${addedCount}, Removed: ${removedCount})`;
         }
         return `✅ Success: ${changeDesc}`;
+      }
 
-      case 'validation_error':
+      case 'validation_error': {
         if (diff.newPageErrors.length > 0) {
           // ✅ MY IDEA: Show multiple errors if available (max 2)
           const errors = diff.newPageErrors.slice(0, 2);
@@ -382,16 +383,18 @@ export class LiteState {
           return `⚠️ Validation error: ${errorMsg.slice(0, 150)}${diff.newPageErrors.length > 2 ? ` (+${diff.newPageErrors.length - 2} more)` : ''}`;
         }
         return `⚠️ Validation error detected`;
+      }
 
       case 'no_effect':
         // ✅ MY IDEA: Add hint about what to try next
         return `➖ No effect: Action executed but no state change detected. Try: different element, scroll, or wait.`;
 
-      case 'execution_error':
+      case 'execution_error': {
         // ✅ MY IDEA: Include action that failed for better context
         const failedAction = last.decision.command.action;
         const failedRef = last.decision.command.ref;
         return `❌ Execution error (${failedAction}${failedRef ? ` on ${failedRef}` : ''}): ${last.result.error?.slice(0, 100) || 'Unknown error'}`;
+      }
 
       case 'critical_error':
         return `🔴 CRITICAL ERROR: Page crashed/blank - page was reloaded. Start fresh.`;

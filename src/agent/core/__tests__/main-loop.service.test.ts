@@ -3,16 +3,15 @@
  * Tests the main loop logic with mocked dependencies (no Playwright)
  */
 
-import { MainLoopService, MainLoopDependencies } from '../main-loop.service';
 import {
-  createTestState,
-  createPageContext,
   createDynamicAction,
-  createActionResult,
-  createPageVisit,
   createIntelligentTestConfig,
+  createPageContext,
+  createPageVisit,
+  createTestState,
 } from '@/test/mocks';
-import { TestState, PageContext, DynamicAction, PageVisit } from '../../types/intelligent-testing.types';
+import { PageVisit, TestState } from '../../types/intelligent-testing.types';
+import { MainLoopDependencies, MainLoopService } from '../main-loop.service';
 
 // Mock SafetyGuard
 jest.mock('../../safety/safety-guard', () => ({
@@ -66,9 +65,9 @@ jest.mock('../../safety/adaptive-config.service', () => ({
   },
 }));
 
+import { ContextualActionGenerator } from '../../execution/contextual-action-generator';
 import { SafetyGuard } from '../../safety/safety-guard';
 import { StateTracker } from '../../safety/state-tracker';
-import { ContextualActionGenerator } from '../../execution/contextual-action-generator';
 import { ActionPatternDetector } from '../../utils/analysis/action-pattern-detector';
 
 const mockSafetyGuard = SafetyGuard as jest.Mocked<typeof SafetyGuard>;
@@ -401,7 +400,7 @@ describe('MainLoopService', () => {
         return iterations >= 3;
       });
 
-      const wasCancelled = await MainLoopService.execute(mockDeps);
+      await MainLoopService.execute(mockDeps);
 
       // Should have added error to state
       expect(mockDeps.setState).toHaveBeenCalledWith(

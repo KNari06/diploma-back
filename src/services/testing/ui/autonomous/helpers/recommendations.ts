@@ -800,7 +800,8 @@ function generateButtonRecommendations(
  */
 function generateScopeRecommendations(
   pageType: DetectedPageType,
-  context: PageContext
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _context: PageContext
 ): PrioritizedRecommendation[] {
   const recommendations: PrioritizedRecommendation[] = [];
 

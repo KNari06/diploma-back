@@ -468,18 +468,18 @@ Which option should we click? Return ONLY the number (1-${navOptions.length}) or
 
 /**
  * Cache for URL extraction results
+ * Currently disabled - uncomment when cache is needed
  */
-interface UrlExtractionCache {
-  result: {
-    url: string | null;
-    method: string | null;
-    confidence: number;
-  };
-  timestamp: number;
-}
-
-const urlExtractionCache = new Map<string, UrlExtractionCache>();
-const URL_EXTRACTION_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+// interface UrlExtractionCache {
+//   result: {
+//     url: string | null;
+//     method: string | null;
+//     confidence: number;
+//   };
+//   timestamp: number;
+// }
+// const urlExtractionCache = new Map<string, UrlExtractionCache>();
+// const URL_EXTRACTION_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Extract URL and HTTP method from chat messages using GPT-3.5-turbo

@@ -1,11 +1,10 @@
-import { Request, Response } from 'express';
+import { WorkspaceService } from '@/services/core/workspace.service';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
+import { Request, Response } from 'express';
 import { ChatRequest } from '../chat.types';
 import { CONSTANTS, MESSAGES } from './constants';
-import { WorkspaceService } from '@/services/core/workspace.service';
-import { getOrCreateChatSession } from './utils';
-import { emitProcessingStep, PROGRESS } from './utils';
-import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
+import { PROGRESS, emitProcessingStep, getOrCreateChatSession } from './utils';
 
 /**
  * STEP 0: INPUT VALIDATION (FIX #1 & #2)
@@ -20,11 +19,13 @@ export interface Step0Result {
   mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function validateInput(
   req: Request,
   res: Response,
   checkConnection: () => void,
-  functionLogger?: FunctionLogger
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _functionLogger?: FunctionLogger
 ): Step0Result | null {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 0: INPUT VALIDATION (FIX #1 & #2)

@@ -306,6 +306,8 @@ export class SmartWaitService {
     stabilityScore: SelectorStabilityScore,
     page: Page
   ): WaitStrategy {
+    void page; // Strategy is currently based on stability score only
+
     // Flaky selectors need more robust waiting
     if (stabilityScore.isFlaky) {
       return 'stable';

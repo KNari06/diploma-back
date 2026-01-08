@@ -148,7 +148,10 @@ export class WorkspaceService {
   /**
    * Generate workspace name - default to "Untitled"
    */
-  private static generateWorkspaceName(userId: string): string {
+  private static generateWorkspaceName(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _userId: string
+  ): string {
     return 'Untitled';
   }
 

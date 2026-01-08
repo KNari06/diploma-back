@@ -137,7 +137,8 @@ export async function analyzeScreenshotWithVision(
  */
 // Moved to src/ai/prompts/index.ts
 
-// Legacy function for backward compatibility
+// Legacy function for backward compatibility (currently unused)
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildVisionPromptLegacy(scope: string, url: string): string {
   let basePrompt = `Analyze this screenshot of a web page (URL: ${url}).
 

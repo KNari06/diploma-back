@@ -92,7 +92,7 @@ function extractFailedSelectors(errors: string[]): Set<string> {
     }
 
     // Pattern 7: Generic "not found" with selector-like pattern (fallback)
-    match = msg.match(/(?:selector|element|input|checkbox|select|button|link)\s+not\s+found[:\s]+([a-zA-Z0-9#.\[\]()_\-=:"'`\s]+?)(?:\s*$|\.|,|;|\(|\[)/i);
+    match = msg.match(/(?:selector|element|input|checkbox|select|button|link)\s+not\s+found[:\s]+([a-zA-Z0-9#.[\]()_\-=:"'`\s\]]+?)(?:\s*$|\.|,|;|\(|\[)/i);
     if (match?.[1]) {
       const potentialSelector = cleanSelector(match[1]);
       if (potentialSelector) {
@@ -109,7 +109,7 @@ function extractFailedSelectors(errors: string[]): Set<string> {
              potentialSelector.includes('role=') ||
              potentialSelector.includes('text=') ||
              potentialSelector.includes('label=') ||
-             /^[a-zA-Z0-9_\-]+$/.test(potentialSelector))) {
+             /^[a-zA-Z0-9_-]+$/.test(potentialSelector))) {
           failedSelectors.add(potentialSelector);
         }
       }

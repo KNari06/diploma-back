@@ -1,14 +1,13 @@
-import { Request, Response } from 'express';
-import { logger } from '@/utils/core/logger';
-import { ProjectContextService } from '@/services/utils/project-context.service';
 import { ApiTestPlanService } from '@/services/testing/api/api-test-plan.service';
 import { saveTestPlan } from '@/services/testing/plans/exploration-cache.service';
 import { ChatService } from '@/services/utils/chat.service';
+import { ProjectContextService } from '@/services/utils/project-context.service';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
+import { logger } from '@/utils/core/logger';
+import { Request, Response } from 'express';
+import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep } from '../shared/utils';
 import { convertApiTestPlanToTestPlan } from './formatting';
-import { CONSTANTS } from '../shared/constants';
-import { checkRequestAborted } from '../shared/request-cancellation';
-import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -30,7 +29,7 @@ export async function handleApiTest(
     logger?: FunctionLogger;
   }
 ): Promise<void> {
-  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal, logger: functionLogger } = params;
+  const { message, parsedIntent, userId, workspace_id, chatSessionId, answers, abortSignal, logger: functionLogger } = params;
 
   if (abortSignal) {
     const checkRequestAbortedWithLogging = functionLogger

@@ -30,9 +30,7 @@ export const handleConnection = async (socket: TypedSocket): Promise<void> => {
     return;
   }
 
-  const socketData = socket.data;
-
-  // Get userId safely
+  // Get userId safely (socketData removed - was not used)
   let userId: string;
   try {
     userId = getUserId(socket);

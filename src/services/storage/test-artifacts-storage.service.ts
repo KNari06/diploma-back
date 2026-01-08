@@ -1,6 +1,6 @@
+import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
-import { env } from '@/config/environment/env';
 import fs from 'fs/promises';
 
 /**
@@ -47,7 +47,7 @@ export async function uploadVideoToStorage(
     const storagePath = `${userId}/videos/${fileName}`;
 
     // Upload to Supabase Storage
-    const { data, error } = await supabaseAdmin.storage
+    const { error } = await supabaseAdmin.storage
       .from(env.SUPABASE_BUCKET_NAME)
       .upload(storagePath, fileBuffer, {
         contentType: 'video/webm',
@@ -139,7 +139,7 @@ export async function uploadTraceToStorage(
     const storagePath = `${userId}/traces/${fileName}`;
 
     // Upload to Supabase Storage
-    const { data, error} = await supabaseAdmin.storage
+    const { error } = await supabaseAdmin.storage
       .from(env.SUPABASE_BUCKET_NAME)
       .upload(storagePath, fileBuffer, {
         contentType: 'application/zip',
@@ -210,7 +210,7 @@ export async function uploadScreenshotToStorage(
     const storagePath = `${userId}/screenshots/${fileName}`;
 
     // Upload to Supabase Storage
-    const { data, error } = await supabaseAdmin.storage
+    const { error } = await supabaseAdmin.storage
       .from(env.SUPABASE_BUCKET_NAME)
       .upload(storagePath, buffer, {
         contentType: 'image/png',
@@ -273,7 +273,7 @@ export async function uploadScreenshotBufferToStorage(
     const storagePath = `${userId}/screenshots/${fileName}`;
 
     // Upload to Supabase Storage
-    const { data, error } = await supabaseAdmin.storage
+    const { error } = await supabaseAdmin.storage
       .from(env.SUPABASE_BUCKET_NAME)
       .upload(storagePath, screenshotBuffer, {
         contentType: 'image/png',

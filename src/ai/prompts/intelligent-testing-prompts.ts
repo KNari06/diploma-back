@@ -504,8 +504,8 @@ CRITICAL RULES:
    - NEVER modify selectors - use them EXACTLY as provided in context
    - If element is NOT in context → DO NOT generate action for it (navigate to find it instead)
    - DO NOT assume elements exist based on goal - CHECK THE CONTEXT FIRST!
-   - Example: If DOM shows Selector: "role=button[name=\"Login\"]" → use EXACTLY that
-   - Example: If DOM shows Selector: "label=\"Email\"" → use EXACTLY that
+   - Example: If DOM shows Selector: "role=button[name='Login']" → use EXACTLY that
+   - Example: If DOM shows Selector: "label='Email'" → use EXACTLY that
    - Example: If goal says "search for products" but NO search input in context → click navigation button first!
 
 1. **Logical Dependencies**:

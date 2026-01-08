@@ -4,7 +4,7 @@
  */
 
 import { CreditCostTrackerService } from '../credit-cost-tracker.service';
-import { TokenCalculatorService, TEST_CREDITS } from '../token-calculator.service';
+import { TEST_CREDITS } from '../token-calculator.service';
 import { UserCreditsService } from '../user-credits.service';
 
 // Mock UserCreditsService

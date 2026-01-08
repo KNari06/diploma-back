@@ -192,7 +192,7 @@ export function maskPII(text: string): string {
   masked = masked.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[EMAIL]');
 
   // Mask phone numbers: +1234567890, (123) 456-7890, etc.
-  masked = masked.replace(/[\+]?[(]?[0-9]{1,4}[)]?[-\s\.]?[(]?[0-9]{1,4}[)]?[-\s\.]?[0-9]{1,9}/g, '[PHONE]');
+  masked = masked.replace(/[+]?[(]?[0-9]{1,4}[)]?[-\s.]?[(]?[0-9]{1,4}[)]?[-\s.]?[0-9]{1,9}/g, '[PHONE]');
 
   // Mask tokens/keys (long alphanumeric strings > 20 chars)
   masked = masked.replace(/[a-zA-Z0-9_-]{32,}/g, '[TOKEN]');

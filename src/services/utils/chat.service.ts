@@ -807,7 +807,7 @@ export class ChatService {
       let title = firstMessage.content.trim();
 
       // Remove markdown, URLs, and special chars
-      title = title.replace(/[#*`\[\]]/g, '');
+      title = title.replace(/[#*`[\]]/g, '');
       title = title.replace(/https?:\/\/[^\s]+/g, '');
       title = title.trim();
 

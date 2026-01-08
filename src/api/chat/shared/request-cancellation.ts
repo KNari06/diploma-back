@@ -1,4 +1,4 @@
-import { redisConnection } from '@/config/infrastructure/queues';
+// redisConnection import removed - currently disabled (commented out)
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -26,9 +26,10 @@ const activeRequestsByUser = new Map<string, ActiveRequest>();
 /**
  * Redis keys for active request tracking (shared across instances)
  * TTL: 5 minutes (requests should not last longer than this)
+ * Currently disabled - uncomment when Redis tracking is enabled
  */
-const REDIS_KEY_PREFIX = 'active_request:';
-const REDIS_TTL = 300; // 5 minutes in seconds
+// const REDIS_KEY_PREFIX = 'active_request:';
+// const REDIS_TTL = 300; // 5 minutes in seconds
 
 /**
  * Register active request for cancellation

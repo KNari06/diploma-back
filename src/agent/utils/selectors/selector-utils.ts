@@ -80,7 +80,7 @@ export function validateSelectorFormat(selector: string): {
   const s = selector.trim();
 
   // Check for mixed CSS + Playwright (INVALID)
-  if (s.match(/^[.#\[].*\s*>\s*(role|text|label)\s*=/)) {
+  if (s.match(/^[.#[].*\s*>\s*(role|text|label)\s*=/)) {
     return {
       isValid: false,
       format: 'mixed',
@@ -89,7 +89,7 @@ export function validateSelectorFormat(selector: string): {
   }
 
   // Check for space-separated mixed (INVALID)
-  if (s.match(/^[.#\[].*\s+(role|text|label)\s*=/)) {
+  if (s.match(/^[.#[].*\s+(role|text|label)\s*=/)) {
     return {
       isValid: false,
       format: 'mixed',
@@ -108,7 +108,7 @@ export function validateSelectorFormat(selector: string): {
   }
 
   // Valid CSS (starts with #, ., [, or tag name)
-  if (s.match(/^[#.\[]/) || s.match(/^[a-z][a-z0-9]*(\[|$)/i)) {
+  if (s.match(/^[#.[]/) || s.match(/^[a-z][a-z0-9]*(\[|$)/i)) {
     return { isValid: true, format: 'css' };
   }
 
@@ -199,7 +199,7 @@ export function normalizeSelector(selector: string): string {
   }
 
   // 6. Normalize role= format: role=button[name='...'] → role=button[name="..."]
-  const roleSingleQuoteMatch = s.match(/^role\s*=\s*([^\[\s]+)\[name\s*=\s*'(.+?)'\]$/);
+  const roleSingleQuoteMatch = s.match(/^role\s*=\s*([^\s[]+)\[name\s*=\s*'(.+?)'\]$/);
   if (roleSingleQuoteMatch) {
     return `role=${roleSingleQuoteMatch[1]}[name="${roleSingleQuoteMatch[2]}"]`;
   }
@@ -248,7 +248,7 @@ export function normalizeSelector(selector: string): string {
       const playwrightValue = mixedWithSpaceMatch[2].trim();
 
       // Only fix if first part looks like CSS selector
-      if (/^[.#\[]|^[a-z]/i.test(potentialCss)) {
+      if (/^[.#[]|^[a-z]/i.test(potentialCss)) {
         const extracted = `${playwrightType}=${playwrightValue}`;
 
         logger.warn('[SELECTOR_UTILS] Extracted Playwright selector from mixed format', {
@@ -336,7 +336,7 @@ export function getLocator(page: Page, selector: string): Locator {
   // Formats: testid="login-button", testid=login-button
   const testidMatch = s.match(/^testid\s*=\s*(.+)$/i);
   if (testidMatch) {
-    let testId = testidMatch[1].trim().replace(/^["']|["']$/g, '');
+    const testId = testidMatch[1].trim().replace(/^["']|["']$/g, '');
     return page.getByTestId(testId);
   }
 
@@ -344,13 +344,13 @@ export function getLocator(page: Page, selector: string): Locator {
   // Formats: label="Email", label=Email
   const labelMatch = s.match(/^label\s*=\s*(.+)$/i);
   if (labelMatch) {
-    let label = labelMatch[1].trim().replace(/^["']|["']$/g, '');
+    const label = labelMatch[1].trim().replace(/^["']|["']$/g, '');
     return page.getByLabel(label);
   }
 
   // 4. Handle role= format (with or without name, with or without regex)
   // Formats: role=button, role=button[name="Login"], role=button[name=/Login/i]
-  const roleMatch = s.match(/^role\s*=\s*([^\[\s]+)(?:\s*\[name\s*=\s*(.+?)\])?$/i);
+  const roleMatch = s.match(/^role\s*=\s*([^\s[]+)(?:\s*\[name\s*=\s*(.+?)\])?$/i);
   if (roleMatch) {
     const role = roleMatch[1].trim() as any;
     let name = roleMatch[2]?.trim();

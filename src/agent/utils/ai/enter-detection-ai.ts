@@ -30,6 +30,7 @@ interface InputContext {
  * Gather context about input element for AI analysis
  */
 async function gatherInputContext(locator: Locator, page: Page): Promise<InputContext | null> {
+  const pageUrl = page.url();
   // @ts-expect-error - HTMLElement, HTMLInputElement, HTMLTextAreaElement are browser globals
   const inputContext = await locator.evaluate((el: HTMLElement) => {
     // @ts-expect-error - HTMLInputElement, HTMLTextAreaElement are browser globals
@@ -68,6 +69,10 @@ async function gatherInputContext(locator: Locator, page: Page): Promise<InputCo
     }
     return null;
   }).catch(() => null);
+
+  if (!inputContext) {
+    logger.debug('[ENTER_DETECTION] Failed to gather input context', { pageUrl });
+  }
 
   return inputContext;
 }

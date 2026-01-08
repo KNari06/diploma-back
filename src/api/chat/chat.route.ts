@@ -209,8 +209,8 @@ router.post('/',
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
   try {
-    // Validate request body
-    const validatedData = chatRequestSchema.parse(req.body);
+    // Validate request body (validation happens via schema.parse)
+    chatRequestSchema.parse(req.body);
 
     // User ID comes from auth middleware (req.user)
     await handleChat(req, res);
@@ -407,7 +407,7 @@ router.post('/cancel',
 
     // Cancel running tests (chatSessionId is guaranteed to be set at this point)
     // ✅ FIX: If testId is provided, cancel it directly (safe fallback when mapping is missing)
-    let testCancelResult = { success: true, cancelledCount: 0, errors: [] as string[] };
+    const testCancelResult = { success: true, cancelledCount: 0, errors: [] as string[] };
     try {
       const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
 
@@ -447,7 +447,7 @@ router.post('/cancel',
     // Note: Regression runs create regular tests via ManualTestService.runTest,
     // so those tests are already cancelled above. We also cancel the regression_run records
     // that were triggered via chat and are still running.
-    let regressionCancelResult = { cancelledCount: 0, errors: [] as string[] };
+    const regressionCancelResult = { cancelledCount: 0, errors: [] as string[] };
     try {
       const { supabaseAdmin } = await import('@/db/supabase');
 
@@ -463,13 +463,12 @@ router.post('/cancel',
         .limit(50); // Limit to prevent too many updates
 
       if (!runsError && regressionRuns && regressionRuns.length > 0) {
-        // Get test IDs from this chat session to verify linkage
-        const { data: testMappings } = await supabaseAdmin
-          .from('test_chat_mappings')
-          .select('test_id')
-          .eq('chat_session_id', chatSessionId!);
-
-        const sessionTestIds = new Set(testMappings?.map(m => m.test_id) || []);
+        // Get test IDs from this chat session to verify linkage (for future use)
+        // const { data: testMappings } = await supabaseAdmin
+        //   .from('test_chat_mappings')
+        //   .select('test_id')
+        //   .eq('chat_session_id', chatSessionId!);
+        // const sessionTestIds = new Set(testMappings?.map(m => m.test_id) || []);
 
         // Cancel regression runs (they create tests that are linked to session)
         for (const run of regressionRuns) {

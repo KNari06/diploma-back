@@ -5,14 +5,14 @@ import { autoEmbedOldMessages, searchChatHistory } from '@/services/ai/embedding
 import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
+import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
 import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
 import { CONSTANTS } from '../shared/constants';
-import { compressMessageContent, emitProcessingStep, checkChatCredits, deductChatCredits } from '../shared/utils';
 import { checkRequestAborted } from '../shared/request-cancellation';
-import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
+import { checkChatCredits, compressMessageContent, deductChatCredits, emitProcessingStep } from '../shared/utils';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -32,7 +32,7 @@ export async function handleGeneralChat(
     logger?: FunctionLogger;
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context, userLanguage: providedLanguage, abortSignal, logger: functionLogger } = params;
+  const { message, userId, chatSessionId, context, abortSignal, logger: functionLogger } = params;
 
   if (abortSignal) {
     const checkRequestAbortedWithLogging = functionLogger
@@ -243,9 +243,7 @@ export async function handleGeneralChat(
   // ═══════════════════════════════════════════════════════════════════════
   // TODO: KB Search temporarily disabled - will be re-enabled later
 
-  // KB context variables (disabled)
-  const kbContext = '';
-  const kbRulesContext = '';
+  // KB context variables (disabled) - removed unused variables
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: BUILD MESSAGES ARRAY FOR OPENAI

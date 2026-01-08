@@ -9,8 +9,10 @@ import { stopTracingAndGetVideo } from './artifacts-handler';
 export async function cleanupBrowserResources(
   page: Page | null,
   context: BrowserContext | null,
-  tracePath: string | undefined
+  _tracePath: string | undefined
 ): Promise<void> {
+  void _tracePath; // Cleanup is best-effort; trace file is handled by artifact collector/uploader
+
   if (page) {
     try {
       await page.close();

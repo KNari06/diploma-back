@@ -214,7 +214,8 @@ async function getSuitesCount(projectId: string, userId: string): Promise<number
  */
 async function getRecentTestIds(
   chatSessionId: string,
-  userId: string
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _userId: string
 ): Promise<string[]> {
   try {
     // Note: chat_messages table uses 'session_id' not 'chat_session_id'

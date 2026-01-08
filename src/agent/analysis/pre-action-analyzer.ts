@@ -66,8 +66,9 @@ async function callAI(options: AICallOptions): Promise<string | null> {
     temperature = 0,
     systemPrompt,
     userPrompt,
-    cacheKey,
-    cacheMap,
+    // cacheKey and cacheMap are intentionally unused (cache is disabled)
+    // cacheKey,
+    // cacheMap,
   } = options;
 
   // ═══════════════════════════════════════════════════════════════════════════
