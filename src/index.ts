@@ -192,10 +192,291 @@ app.use(morgan(env.LOG_FORMAT, { stream: morganStream }));
 
 // Swagger documentation setup (middleware already registered above)
 app.use('/api/docs', swaggerUi.setup(swaggerSpec, {
-  customCss: '.swagger-ui .topbar { display: none }',
+  customCss: `
+    .swagger-ui .topbar { display: none }
+
+    /* Dark Mode Theme */
+    .swagger-ui {
+      background: #1e1e1e;
+      color: #e1e1e1;
+    }
+
+    .swagger-ui .info {
+      background: #252525;
+      border-color: #3a3a3a;
+    }
+
+    .swagger-ui .info .title {
+      color: #ffffff;
+    }
+
+    .swagger-ui .info .description p,
+    .swagger-ui .info .description a,
+    .swagger-ui .info .description code {
+      color: #d4d4d4;
+    }
+
+    .swagger-ui .opblock-tag {
+      color: #ffffff;
+      border-color: #3a3a3a;
+    }
+
+    .swagger-ui .opblock.opblock-post {
+      background: rgba(73, 204, 144, 0.1);
+      border-color: #49cc90;
+    }
+
+    .swagger-ui .opblock.opblock-get {
+      background: rgba(97, 175, 254, 0.1);
+      border-color: #61affe;
+    }
+
+    .swagger-ui .opblock.opblock-put {
+      background: rgba(252, 161, 48, 0.1);
+      border-color: #fca130;
+    }
+
+    .swagger-ui .opblock.opblock-delete {
+      background: rgba(249, 62, 62, 0.1);
+      border-color: #f93e3e;
+    }
+
+    .swagger-ui .opblock.opblock-patch {
+      background: rgba(80, 227, 194, 0.1);
+      border-color: #50e3c2;
+    }
+
+    .swagger-ui .opblock .opblock-summary {
+      background: transparent;
+    }
+
+    .swagger-ui .opblock .opblock-summary .opblock-summary-method {
+      background: #1e1e1e;
+    }
+
+    .swagger-ui .opblock .opblock-summary .opblock-summary-path,
+    .swagger-ui .opblock .opblock-summary .opblock-summary-operation-id {
+      color: #e1e1e1;
+    }
+
+    .swagger-ui .opblock-body {
+      background: #252525;
+      border-color: #3a3a3a;
+    }
+
+    .swagger-ui .opblock-description-wrapper p,
+    .swagger-ui .opblock-external-docs p,
+    .swagger-ui .opblock-title_normal p {
+      color: #d4d4d4;
+    }
+
+    .swagger-ui .parameter__name,
+    .swagger-ui .parameter__type,
+    .swagger-ui .parameter__in {
+      color: #b8b8b8;
+    }
+
+    .swagger-ui .parameter__name.required::after {
+      color: #f93e3e;
+    }
+
+    .swagger-ui .btn {
+      background: #3a3a3a;
+      border-color: #4a4a4a;
+      color: #e1e1e1;
+    }
+
+    .swagger-ui .btn:hover {
+      background: #4a4a4a;
+    }
+
+    .swagger-ui .btn.authorize {
+      background: #49cc90;
+      border-color: #49cc90;
+      color: #1e1e1e;
+    }
+
+    .swagger-ui .btn.authorize:hover {
+      background: #5dd69f;
+    }
+
+    .swagger-ui .btn.execute {
+      background: #4990e2;
+      border-color: #4990e2;
+    }
+
+    .swagger-ui .btn.execute:hover {
+      background: #5a9fe3;
+    }
+
+    .swagger-ui input[type=text],
+    .swagger-ui input[type=email],
+    .swagger-ui input[type=password],
+    .swagger-ui textarea,
+    .swagger-ui select {
+      background: #2a2a2a;
+      border-color: #3a3a3a;
+      color: #e1e1e1;
+    }
+
+    .swagger-ui input[type=text]:focus,
+    .swagger-ui input[type=email]:focus,
+    .swagger-ui input[type=password]:focus,
+    .swagger-ui textarea:focus,
+    .swagger-ui select:focus {
+      border-color: #4990e2;
+      background: #1e1e1e;
+    }
+
+    .swagger-ui .response-col_status {
+      color: #b8b8b8;
+    }
+
+    .swagger-ui .response-col_links {
+      color: #b8b8b8;
+    }
+
+    .swagger-ui .response .response-col_status {
+      color: #49cc90;
+    }
+
+    .swagger-ui .response.highlighted .response-col_status {
+      background: #252525;
+    }
+
+    .swagger-ui .highlight-code {
+      background: #1e1e1e;
+    }
+
+    .swagger-ui .microlight {
+      background: #1e1e1e;
+      color: #d4d4d4;
+    }
+
+    .swagger-ui .scheme-container {
+      background: #252525;
+      border-color: #3a3a3a;
+    }
+
+    .swagger-ui .scheme-container .schemes {
+      background: transparent;
+    }
+
+    .swagger-ui .loading-container {
+      background: #1e1e1e;
+    }
+
+    .swagger-ui .loading::after {
+      border-top-color: #4990e2;
+    }
+
+    .swagger-ui .model-box-control,
+    .swagger-ui .model-toggle {
+      background: transparent;
+      color: #4990e2;
+    }
+
+    .swagger-ui .model-title {
+      color: #ffffff;
+    }
+
+    .swagger-ui .model {
+      background: #252525;
+      color: #d4d4d4;
+    }
+
+    .swagger-ui .prop-format {
+      color: #999;
+    }
+
+    .swagger-ui table thead tr td,
+    .swagger-ui table thead tr th {
+      background: #2a2a2a;
+      color: #ffffff;
+      border-color: #3a3a3a;
+    }
+
+    .swagger-ui table tbody tr td {
+      border-color: #3a3a3a;
+      color: #d4d4d4;
+    }
+
+    .swagger-ui .response-col_description__inner {
+      color: #d4d4d4;
+    }
+
+    .swagger-ui .renderedMarkdown p,
+    .swagger-ui .renderedMarkdown code,
+    .swagger-ui .renderedMarkdown pre {
+      color: #d4d4d4;
+    }
+
+    .swagger-ui .renderedMarkdown code {
+      background: #2a2a2a;
+      color: #e1e1e1;
+    }
+
+    .swagger-ui .renderedMarkdown pre {
+      background: #1e1e1e;
+      border-color: #3a3a3a;
+    }
+
+    .swagger-ui .auth-wrapper {
+      background: #252525;
+      border-color: #3a3a3a;
+    }
+
+    .swagger-ui .auth-container {
+      background: transparent;
+    }
+
+    .swagger-ui .auth-btn-wrapper {
+      background: transparent;
+    }
+
+    .swagger-ui .dialog-ux .modal-ux {
+      background: #252525;
+    }
+
+    .swagger-ui .dialog-ux .modal-ux-header {
+      background: #2a2a2a;
+      border-color: #3a3a3a;
+    }
+
+    .swagger-ui .dialog-ux .modal-ux-header h3 {
+      color: #ffffff;
+    }
+
+    .swagger-ui .dialog-ux .modal-ux-content {
+      background: #252525;
+      color: #e1e1e1;
+    }
+
+    .swagger-ui .dialog-ux .modal-ux-content input,
+    .swagger-ui .dialog-ux .modal-ux-content textarea {
+      background: #1e1e1e;
+      border-color: #3a3a3a;
+      color: #e1e1e1;
+    }
+
+    .swagger-ui .authorization__btn {
+      background: #49cc90;
+      border-color: #49cc90;
+      color: #1e1e1e;
+    }
+
+    .swagger-ui .authorization__btn.locked {
+      background: #3a3a3a;
+      border-color: #3a3a3a;
+      color: #e1e1e1;
+    }
+  `,
   customSiteTitle: 'QAIT API Documentation',
   swaggerOptions: {
     persistAuthorization: true,
+    displayRequestDuration: true,
+    filter: true,
+    tryItOutEnabled: true,
   },
 }));
 
