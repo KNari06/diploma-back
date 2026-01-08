@@ -111,6 +111,181 @@ export class GoalDetector {
   }
 
   /**
+   * ✅ NEW: Build contextual hints for the AI prompt
+   * Provides hints for registration, login, and multi-step forms
+   * These hints help AI understand when to look for entry points vs direct actions
+   *
+   * @param snapshot - Current page snapshot
+   * @returns Array of contextual hint strings for the AI prompt
+   */
+  public buildContextualHints(snapshot: LiteSnapshot): string[] {
+    const hints: string[] = [];
+
+    // 1. Add registration/login hint if applicable
+    const regHint = this.buildRegistrationHintForSnapshot(snapshot);
+    if (regHint) {
+      hints.push(regHint);
+    }
+
+    // 2. Add multi-step form progress hint if applicable
+    const multiStepHint = this.buildMultiStepHint(snapshot);
+    if (multiStepHint) {
+      hints.push(multiStepHint);
+    }
+
+    // 3. Add entry point visibility hint
+    const entryPointHint = this.buildEntryPointVisibilityHint(snapshot);
+    if (entryPointHint) {
+      hints.push(entryPointHint);
+    }
+
+    logger.debug('[GOAL_DETECTOR] Built contextual hints', {
+      testId: this.testId,
+      hintsCount: hints.length,
+      hasRegHint: !!regHint,
+      hasMultiStepHint: !!multiStepHint,
+      hasEntryPointHint: !!entryPointHint,
+    });
+
+    return hints;
+  }
+
+  /**
+   * Build registration hint based on current snapshot state
+   * Helps AI find registration forms through entry points when form is not visible
+   *
+   * @param snapshot - Current page snapshot
+   * @returns Hint string or null
+   */
+  private buildRegistrationHintForSnapshot(snapshot: LiteSnapshot): string | null {
+    // Only for registration/login goals
+    if (!['register', 'login'].includes(this.parsedGoal.action || '')) {
+      return null;
+    }
+
+    // Check if form is already visible
+    const hasPasswordField = snapshot.elements.some(el => el.type === 'password');
+    const hasEmailField = snapshot.elements.some(
+      el => el.type === 'email' || (el.name?.toLowerCase().includes('email'))
+    );
+
+    // If form is visible, no hint needed
+    if (hasPasswordField && hasEmailField) {
+      return null;
+    }
+
+    // Check for entry points in current snapshot
+    const entryPointKeywords = this.parsedGoal.entryPointKeywords || [];
+    const visibleEntryPoints: string[] = [];
+
+    for (const el of snapshot.elements) {
+      const elName = (el.name || '').toLowerCase();
+      for (const keyword of entryPointKeywords) {
+        if (elName.includes(keyword.toLowerCase())) {
+          visibleEntryPoints.push(`"${el.name}" (ref: ${el.ref})`);
+          break;
+        }
+      }
+    }
+
+    // Build appropriate hint based on state
+    if (visibleEntryPoints.length > 0) {
+      const action = this.parsedGoal.action === 'register' ? 'registration' : 'login';
+      return `🔍 ENTRY POINTS FOUND for ${action}:\n` +
+        `   Found: ${visibleEntryPoints.slice(0, 3).join(', ')}\n` +
+        `   → Click one of these to open the auth modal/page containing the ${action} form.`;
+    }
+
+    // No entry points found - suggest exploration
+    const action = this.parsedGoal.action === 'register' ? 'registration' : 'login';
+    return `⚠️ ${action.toUpperCase()} FORM NOT VISIBLE:\n` +
+      `   → Look for: ${entryPointKeywords.slice(0, 5).join(', ')}\n` +
+      `   → Try clicking Profile/Account icons, or check navigation menu`;
+  }
+
+  /**
+   * Build hint for multi-step form progress
+   * Tells AI what step we're likely on and what to expect next
+   *
+   * @param snapshot - Current page snapshot
+   * @returns Hint string or null
+   */
+  private buildMultiStepHint(snapshot: LiteSnapshot): string | null {
+    // Only for forms that commonly have multi-step flows
+    if (!['register', 'checkout'].includes(this.parsedGoal.action || '')) {
+      return null;
+    }
+
+    // Detect current step indicators
+    const hasOTPField = snapshot.elements.some(el =>
+      ['otp', 'code', 'verification', 'код', 'подтверждение'].some(
+        kw => (el.name || '').toLowerCase().includes(kw) ||
+              (el.placeholder || '').toLowerCase().includes(kw)
+      )
+    );
+
+    const hasPasswordField = snapshot.elements.some(el => el.type === 'password');
+    const hasEmailField = snapshot.elements.some(
+      el => el.type === 'email' || (el.name?.toLowerCase().includes('email'))
+    );
+
+    // Step detection for registration
+    if (this.parsedGoal.action === 'register') {
+      if (hasOTPField) {
+        return '📍 MULTI-STEP: Step 3/4 - OTP/Code verification. Enter the code and submit.';
+      }
+      if (hasPasswordField && hasEmailField) {
+        return '📍 MULTI-STEP: Step 2/3 - Full registration form. Fill all fields and click Register/Continue.';
+      }
+      if (hasEmailField || snapshot.elements.some(el => el.type === 'tel')) {
+        return '📍 MULTI-STEP: Step 1 - Email/Phone entry. Enter data and click Continue to proceed.';
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Build hint about entry point visibility
+   * Helps AI understand if it needs to explore or can act directly
+   *
+   * @param snapshot - Current page snapshot
+   * @returns Hint string or null
+   */
+  private buildEntryPointVisibilityHint(snapshot: LiteSnapshot): string | null {
+    // Get entry point keywords from strategy
+    const entryPointKeywords = this.parsedGoal.entryPointKeywords;
+    if (!entryPointKeywords || entryPointKeywords.length === 0) {
+      return null;
+    }
+
+    // Check if any clickable entry points are visible
+    const clickableElements = snapshot.elements.filter(
+      el => el.tag === 'button' || el.tag === 'a' || el.role === 'button' || el.role === 'link'
+    );
+
+    const foundEntryPoints: Array<{ name: string; ref: string }> = [];
+
+    for (const el of clickableElements) {
+      const elName = (el.name || '').toLowerCase();
+      for (const keyword of entryPointKeywords) {
+        if (elName.includes(keyword.toLowerCase())) {
+          foundEntryPoints.push({ name: el.name || '', ref: el.ref });
+          break;
+        }
+      }
+    }
+
+    if (foundEntryPoints.length > 0) {
+      return `✅ CLICKABLE ENTRY POINTS:\n` +
+        foundEntryPoints.slice(0, 3).map(ep => `   - "${ep.name}" → ref: ${ep.ref}`).join('\n') +
+        `\n   → These can lead to the target form/page.`;
+    }
+
+    return null;
+  }
+
+  /**
    * Set test ID (for cases where constructor didn't have it)
    */
   setTestId(testId: string): void {

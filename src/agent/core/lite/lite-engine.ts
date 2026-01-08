@@ -435,7 +435,10 @@ export class LiteEngine {
         // 3. Screenshot BEFORE (for error debugging)
         await this.screenshotCollector.captureBefore(this.page, i);
 
-        // 4. Build prompt with stuck warning + progress signals + AI guidance
+        // ✅ NEW: Get contextual hints from GoalDetector for smarter navigation
+        const contextualHints = this.goalDetector.buildContextualHints(snapshotBefore);
+
+        // 4. Build prompt with stuck warning + progress signals + AI guidance + contextual hints
         const prompt = LitePromptBuilder.build({
           goal: this.config.goal,
           snapshot: SnapshotCollector.format(snapshotBefore),
@@ -449,6 +452,7 @@ export class LiteEngine {
           },
           guidance: this.currentGuidance || undefined,
           currentIteration: i,
+          contextualHints, // ✅ NEW: Pass dynamic hints for entry point exploration
         });
 
         // 5. Ask AI (returns JSON command, not code)

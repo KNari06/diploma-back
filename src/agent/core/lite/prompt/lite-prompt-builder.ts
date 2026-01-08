@@ -29,6 +29,7 @@ export class LitePromptBuilder {
    * NEW: Includes progress signals from GoalDetector
    * NEW: Includes AI guidance/nextSubgoal when provided (from AI fallback)
    * ✅ FIX: Truncates snapshot if too large to prevent token overflow
+   * ✅ NEW: Includes contextualHints from GoalDetector for smarter navigation
    *
    * @param params - Prompt parameters
    * @returns Complete prompt string
@@ -48,6 +49,8 @@ export class LitePromptBuilder {
     guidance?: GoalGuidance;
     /** Current iteration (for guidance lifetime check) */
     currentIteration?: number;
+    /** ✅ NEW: Contextual hints from GoalDetector */
+    contextualHints?: string[];
   }): string {
     // ✅ FIX: Truncate snapshot if too large (prevent token overflow)
     const MAX_SNAPSHOT_LENGTH = 100_000; // 100k chars (~25k tokens)
@@ -86,6 +89,11 @@ ${params.progressSignals.progressScore >= 0.5 ? '→ Getting close to goal! Look
     // ✅ NEW: Build registration hint if goal is register/login and form not found
     const registrationHint = LitePromptBuilder.buildRegistrationHint(params.goal, snapshot);
 
+    // ✅ NEW: Build contextual hints section from GoalDetector
+    const contextualHintsSection = params.contextualHints && params.contextualHints.length > 0
+      ? `\nCONTEXTUAL HINTS:\n${params.contextualHints.join('\n')}\n`
+      : '';
+
     // Build complete prompt with JSON-only response format
     return `You are a browser automation agent testing a web application.
 Your job is to REACH THE TARGET STATE through intermediate steps. Navigation is expected.
@@ -94,7 +102,7 @@ GOAL: ${params.goal}
 
 CURRENT PAGE:
 ${snapshot}
-${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}
+${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}
 HISTORY:
 ${params.history}
 
@@ -120,6 +128,7 @@ IMPORTANT RULES:
 8. If you detect "HTTP 429" / "Too Many Requests" / rate limiting, use "wait" (back off) before trying again.
 9. For multi-step forms: "Continue/Продолжить" button = step forward (keep going), "Register/Finish/Зарегистрироваться" = final step
 10. For Registration goal: If you see only "Login/Вход" form, look for "Register/Зарегистрироваться" toggle inside it - don't give up!
+11. ✅ EXPLORATION RULE: If your target form (e.g., registration, checkout) is not visible, look for entry points like "Login/Вход", "Profile/Профиль", "Account/Кабинет", or a user icon. Clicking these is a VALID and often NECESSARY step to reach your goal.
 
 RESPONSE FORMAT (JSON ONLY):
 {
