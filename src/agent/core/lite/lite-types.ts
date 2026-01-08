@@ -18,6 +18,7 @@ export interface LiteElement {
   disabled?: boolean;
   visible: boolean;
   context?: string; // "inside: Product Card 'iPhone 15'"
+  isInsideActiveModal?: boolean; // ✅ NEW: True if element is inside active modal
 }
 
 /**
@@ -28,6 +29,7 @@ export interface LiteSnapshot {
   title: string;
   elements: LiteElement[];
   timestamp: number;
+  activeModalRef?: string; // Ref of active modal container (if detected)
 }
 
 /**

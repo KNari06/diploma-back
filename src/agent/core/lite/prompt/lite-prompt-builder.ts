@@ -8,6 +8,20 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { logger } from '@/utils/core/logger';
 import type { AIDecision, GoalGuidance, StuckCheck } from '../lite-types';
 
+/**
+ * Options for askJson calls
+ */
+export interface AskJsonOptions {
+  /** Model to use: 'gpt-4o-mini' (cheap/fast) or 'gpt-4o' (accurate/expensive) */
+  model?: 'gpt-4o-mini' | 'gpt-4o';
+  /** Temperature (0-1, lower = more deterministic) */
+  temperature?: number;
+  /** Max tokens for response */
+  maxTokens?: number;
+  /** Timeout in ms (default: 15000) */
+  timeoutMs?: number;
+}
+
 export class LitePromptBuilder {
   /**
    * Build prompt for AI decision
@@ -69,6 +83,9 @@ ${params.progressSignals.progressScore >= 0.5 ? '→ Getting close to goal! Look
     // Only include if guidance is fresh (within 2 iterations of when it was added)
     const guidanceSection = LitePromptBuilder.buildGuidanceSection(params.guidance, params.currentIteration);
 
+    // ✅ NEW: Build registration hint if goal is register/login and form not found
+    const registrationHint = LitePromptBuilder.buildRegistrationHint(params.goal, snapshot);
+
     // Build complete prompt with JSON-only response format
     return `You are a browser automation agent testing a web application.
 Your job is to REACH THE TARGET STATE through intermediate steps. Navigation is expected.
@@ -77,7 +94,7 @@ GOAL: ${params.goal}
 
 CURRENT PAGE:
 ${snapshot}
-${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}
+${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}
 HISTORY:
 ${params.history}
 
@@ -97,10 +114,12 @@ IMPORTANT RULES:
 2. Look at parent context to understand element location
 3. If an action fails repeatedly, try a different approach
 4. Check for error messages or validation warnings
-5. If you see a modal/popup, interact with it first
+5. If you see a modal/popup (ACTIVE_MODAL), interact with it first - prioritize elements inside
 6. If the snapshot is empty or loading (< 3 elements), or if the page is clearly in a loading state (e.g., contains "Loading...", "Please wait", spinner elements), use the "wait" action
 7. Your job is to REACH the target state - intermediate navigation steps are expected!
 8. If you detect "HTTP 429" / "Too Many Requests" / rate limiting, use "wait" (back off) before trying again.
+9. For multi-step forms: "Continue/Продолжить" button = step forward (keep going), "Register/Finish/Зарегистрироваться" = final step
+10. For Registration goal: If you see only "Login/Вход" form, look for "Register/Зарегистрироваться" toggle inside it - don't give up!
 
 RESPONSE FORMAT (JSON ONLY):
 {
@@ -319,6 +338,65 @@ What should the agent do next? Respond with JSON:
   }
 
   /**
+   * Build registration hint if goal requires registration but form not found
+   * Provides strategy for finding registration through entry points
+   *
+   * @param goal - Test goal
+   * @param snapshot - Current page snapshot (formatted string)
+   * @returns Registration hint string or empty string
+   */
+  private static buildRegistrationHint(goal: string, snapshot: string): string {
+    const goalLower = goal.toLowerCase();
+
+    // Check if goal is registration
+    const isRegistrationGoal = /register|sign\s*up|create\s+account|registration|зарегистр|регистрац/i.test(goalLower);
+    const isLoginGoal = /login|sign\s*in|log\s*in|вход|войти/i.test(goalLower);
+
+    if (!isRegistrationGoal && !isLoginGoal) {
+      return '';
+    }
+
+    // Check if registration/login form is already present
+    const snapshotLower = snapshot.toLowerCase();
+    const hasPasswordField = /type=password/i.test(snapshotLower);
+    const hasEmailField = /type=email|email|почта/i.test(snapshotLower);
+    const hasRegisterButton = /register|sign up|create account|зарегистр/i.test(snapshotLower);
+    const hasLoginButton = /login|sign in|log in|вход|войти/i.test(snapshotLower);
+
+    // If form is already present, no hint needed
+    if (isRegistrationGoal && hasPasswordField && (hasEmailField || hasRegisterButton)) {
+      return '';
+    }
+    if (isLoginGoal && hasPasswordField && (hasEmailField || hasLoginButton)) {
+      return '';
+    }
+
+    // Form not found - provide navigation strategy
+    if (isRegistrationGoal) {
+      return `
+🎯 REGISTRATION STRATEGY (form not found yet):
+1. FIRST: Look for entry points: "Profile/Профиль", "Account/Кабинет", "Login/Вход", "Sign In/Войти" (user icon)
+2. CLICK entry point to open auth modal/page
+3. INSIDE auth modal: Look for "Register/Зарегистрироваться", "Sign Up", "Create Account/Создать аккаунт" toggle
+4. If you see "Login/Вход" form, DON'T GIVE UP - registration is often a tab/link inside it
+5. For multi-step: "By Email/По почте" is preferred over "By Phone"
+6. If no entry point found after scrolling, try menu button (☰) or scroll to footer
+`;
+    }
+
+    if (isLoginGoal) {
+      return `
+🎯 LOGIN STRATEGY (form not found yet):
+1. FIRST: Look for "Login/Вход", "Sign In/Войти", "Account/Кабинет", "Profile/Профиль" (user icon)
+2. CLICK to open login modal/page
+3. If no direct link found, try menu button (☰) or scroll to footer
+`;
+    }
+
+    return '';
+  }
+
+  /**
    * Truncate snapshot if too large to prevent token overflow
    * ✅ FIX: Prevents context window overflow when DOM tree is massive
    *
@@ -343,5 +421,95 @@ What should the agent do next? Respond with JSON:
     const warning = '\n\n[⚠️ SNAPSHOT TRUNCATED: Page is very large, showing first 100k chars. Focus on visible elements.]';
 
     return truncated + warning;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NEW: Generic JSON prompt helper for Strategy/Auditor
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Generic JSON prompt helper
+   * Supports strategy prompts (gpt-4o-mini) and auditor prompts (gpt-4o)
+   * Includes markdown cleanup and strict JSON response format
+   *
+   * @param prompt - Complete prompt string (must request JSON response)
+   * @param options - Model selection and other options
+   * @returns Parsed JSON response or null if failed
+   */
+  static async askJson<T>(
+    prompt: string,
+    options: AskJsonOptions = {}
+  ): Promise<T | null> {
+    const {
+      model = 'gpt-4o-mini',
+      temperature = 0.1,
+      maxTokens = 600,
+      timeoutMs = 15000,
+    } = options;
+
+    try {
+      logger.debug('[LITE_PROMPT] askJson request', {
+        model,
+        promptLength: prompt.length,
+        estimatedTokens: Math.ceil(prompt.length / 4),
+      });
+
+      // Create timeout promise
+      const timeoutPromise = new Promise<null>((resolve) => {
+        setTimeout(() => resolve(null), timeoutMs);
+      });
+
+      // Create AI call promise
+      const aiPromise = getChatCompletionWithMessages(
+        [{ role: 'user', content: prompt }],
+        {
+          model,
+          temperature,
+          response_format: { type: 'json_object' },
+          max_tokens: maxTokens,
+        }
+      );
+
+      // Race between AI call and timeout
+      const response = await Promise.race([aiPromise, timeoutPromise]);
+
+      if (!response) {
+        logger.warn('[LITE_PROMPT] askJson timed out', {
+          timeoutMs,
+          model,
+        });
+        return null;
+      }
+
+      const content = response.content;
+
+      if (!content) {
+        logger.warn('[LITE_PROMPT] askJson empty response');
+        return null;
+      }
+
+      // Clean markdown code blocks before parsing (handles models that ignore instructions)
+      const cleanContent = content.replace(/```json\s*|```\s*/g, '').trim();
+
+      logger.debug('[LITE_PROMPT] askJson response', {
+        model,
+        rawLength: content.length,
+        wasCleaned: cleanContent !== content,
+        preview: cleanContent.slice(0, 150),
+      });
+
+      // Parse JSON response
+      const parsed = JSON.parse(cleanContent) as T;
+
+      return parsed;
+    } catch (error) {
+      logger.error('[LITE_PROMPT] askJson failed', {
+        model,
+        error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof SyntaxError ? 'JSON_PARSE_ERROR' : 'UNKNOWN',
+        stack: error instanceof Error ? error.stack?.slice(0, 200) : undefined,
+      });
+      return null;
+    }
   }
 }

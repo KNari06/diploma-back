@@ -12,6 +12,7 @@ export class VisualStability {
   /**
    * Wait for page to become visually stable
    * Checks element count at intervals - if unchanged, page is stable
+   * ✅ FIX: Hard timeout (3 seconds max) to prevent hanging on infinite animations
    *
    * @param page - Playwright page instance
    * @param options - Configuration options
@@ -25,37 +26,56 @@ export class VisualStability {
     }
   ): Promise<void> {
     const interval = options?.checkInterval ?? 150; // 150ms between checks
-    const maxAttempts = options?.maxAttempts ?? 5;  // Max 5 attempts
+    const maxAttempts = options?.maxAttempts ?? 5;  // Max 5 attempts (750ms total)
+    const hardTimeout = 3000; // ✅ FIX: Absolute max wait time (3s)
 
     try {
-      let prevCount = await this.getElementCount(page);
+      // ✅ FIX: Set hard timeout to prevent hanging on infinite animations
+      const timeoutPromise = new Promise<'timeout'>((resolve) => {
+        setTimeout(() => resolve('timeout'), hardTimeout);
+      });
 
-      for (let i = 0; i < maxAttempts; i++) {
-        await page.waitForTimeout(interval);
-        const currCount = await this.getElementCount(page);
+      // Race between stability check and hard timeout
+      const stabilityPromise = (async () => {
+        let prevCount = await this.getElementCount(page);
 
-        if (currCount === prevCount) {
-          logger.debug('[VISUAL_STABILITY] Page stable', {
-            elementCount: currCount,
-            attempts: i + 1,
+        for (let i = 0; i < maxAttempts; i++) {
+          await page.waitForTimeout(interval);
+          const currCount = await this.getElementCount(page);
+
+          if (currCount === prevCount) {
+            logger.debug('[VISUAL_STABILITY] Page stable', {
+              elementCount: currCount,
+              attempts: i + 1,
+            });
+            return 'stable'; // Stable - element count unchanged
+          }
+
+          logger.debug('[VISUAL_STABILITY] Page still mutating', {
+            prevCount,
+            currCount,
+            attempt: i + 1,
           });
-          return; // Stable - element count unchanged
+
+          prevCount = currCount;
         }
 
-        logger.debug('[VISUAL_STABILITY] Page still mutating', {
-          prevCount,
-          currCount,
-          attempt: i + 1,
+        return 'max-attempts'; // Max attempts reached
+      })();
+
+      const result = await Promise.race([stabilityPromise, timeoutPromise]);
+
+      if (result === 'timeout') {
+        logger.warn('[VISUAL_STABILITY] Hard timeout reached (3s), proceeding anyway', {
+          hardTimeout,
+          reason: 'Page may have infinite animations (loader, cursor, etc.)',
         });
-
-        prevCount = currCount;
+      } else if (result === 'max-attempts') {
+        logger.warn('[VISUAL_STABILITY] Max attempts reached, proceeding anyway', {
+          maxAttempts,
+          interval,
+        });
       }
-
-      // Max attempts reached - log warning but don't fail
-      logger.warn('[VISUAL_STABILITY] Max attempts reached, proceeding anyway', {
-        maxAttempts,
-        interval,
-      });
     } catch (error) {
       logger.error('[VISUAL_STABILITY] Error checking stability', {
         error: error instanceof Error ? error.message : String(error),

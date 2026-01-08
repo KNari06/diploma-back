@@ -5,13 +5,21 @@
  */
 
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
-import type { Page, Locator } from 'playwright';
 import { logger } from '@/utils/core/logger';
-import type { AICommand, ExecutionResult, LiteSnapshot, ElementInfo } from '../lite-types';
+import type { Locator, Page } from 'playwright';
+import type { AICommand, ElementInfo, ExecutionResult, LiteSnapshot } from '../lite-types';
 
 export class ActionExecutor {
   private page: Page;
   private elementMap: Map<string, ElementInfo> = new Map();
+
+  // ✅ FIX: Configurable timeouts for different action types
+  private readonly DEFAULT_TIMEOUT = 10000; // 10s for most actions (increased from 5s)
+  private readonly NAVIGATION_TIMEOUT = 15000; // 15s for actions that may trigger navigation
+  private readonly FALLBACK_TIMEOUT = 8000; // 8s for fallback attempts
+
+  // ✅ REMOVED: Hardcoded ENTRY_POINT_KEYWORDS
+  // Now passed dynamically via execute() options from GoalDetector's AI-generated strategy
 
   constructor(page: Page) {
     this.page = page;
@@ -23,11 +31,13 @@ export class ActionExecutor {
    *
    * @param command - Structured AI command
    * @param snapshot - Current page snapshot for fallback
+   * @param options - Optional execution options (e.g., entryPointKeywords from AI strategy)
    * @returns Execution result with fallback info
    */
   async execute(
     command: AICommand,
-    snapshot: LiteSnapshot
+    snapshot: LiteSnapshot,
+    options?: { entryPointKeywords?: string[] }
   ): Promise<ExecutionResult> {
     const startTime = Date.now();
 
@@ -48,6 +58,21 @@ export class ActionExecutor {
 
       // Execute command
       await this.executeCommand(command);
+
+      // ✅ NEW: After click on entry point, wait for modal to appear and stabilize
+      // Uses dynamic keywords from AI strategy (no hardcoded keywords)
+      if (command.action === 'click' && command.ref) {
+        const elementInfo = this.elementMap.get(command.ref);
+        const dynamicKeywords = options?.entryPointKeywords || [];
+        if (elementInfo && this.isEntryPointElement(elementInfo.text || '', dynamicKeywords)) {
+          logger.debug('[ACTION_EXECUTOR] Click on entry point detected, waiting for modal', {
+            ref: command.ref,
+            text: elementInfo.text,
+            keywordsUsed: dynamicKeywords.length,
+          });
+          await this.waitForModalAfterClick();
+        }
+      }
 
       logger.info('[ACTION_EXECUTOR] Command executed successfully', {
         action: command.action,
@@ -165,12 +190,29 @@ export class ActionExecutor {
     switch (cmd.action) {
       case 'click':
         if (!locator) throw new Error('click requires ref');
-        await locator.click({ timeout: 5000 });
+        // ✅ FIX: Use longer timeout for clicks (may trigger navigation/modals)
+        await locator.click({ timeout: this.NAVIGATION_TIMEOUT });
         break;
 
       case 'fill':
         if (!locator || !cmd.value) throw new Error('fill requires ref and value');
-        await locator.fill(cmd.value, { timeout: 5000 });
+        // ✅ FIX: Use pressSequentially() for better compatibility with masked inputs
+        // This simulates real typing and works better with phone masks, date pickers, etc.
+        try {
+          // First, clear the field
+          await locator.clear({ timeout: this.DEFAULT_TIMEOUT });
+          // Then type character by character (more realistic)
+          await locator.pressSequentially(cmd.value, {
+            timeout: this.DEFAULT_TIMEOUT,
+            delay: 50, // 50ms between keystrokes (realistic typing speed)
+          });
+        } catch (error) {
+          // Fallback to fill() if pressSequentially() fails
+          logger.debug('[ACTION_EXECUTOR] pressSequentially failed, falling back to fill()', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await locator.fill(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
+        }
         break;
 
       case 'press':
@@ -190,7 +232,7 @@ export class ActionExecutor {
         // If a targetRef is provided, scroll that element into view.
         if (cmd.targetRef) {
           const target = this.page.locator(`[data-agent-ref="${cmd.targetRef}"]`);
-          await target.scrollIntoViewIfNeeded({ timeout: 5000 });
+          await target.scrollIntoViewIfNeeded({ timeout: this.DEFAULT_TIMEOUT });
 
           // ✅ EXPERT ADVICE: Add offset for sticky headers (100px up)
           // Many sites have sticky nav bars that cover the element after scrollIntoView
@@ -219,12 +261,12 @@ export class ActionExecutor {
 
       case 'select':
         if (!locator || !cmd.value) throw new Error('select requires ref and value');
-        await locator.selectOption(cmd.value, { timeout: 5000 });
+        await locator.selectOption(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
         break;
 
       case 'hover':
         if (!locator) throw new Error('hover requires ref');
-        await locator.hover({ timeout: 5000 });
+        await locator.hover({ timeout: this.DEFAULT_TIMEOUT });
         break;
 
       case 'wait':
@@ -326,23 +368,53 @@ export class ActionExecutor {
 
   /**
    * Execute action on fallback locator
+   * ✅ FIX: Uses force: true for clicks to handle overlapping elements
    */
   private async executeFallbackAction(cmd: AICommand, locator: Locator): Promise<void> {
     switch (cmd.action) {
       case 'click':
-        await locator.click({ timeout: 3000 });
+        // ✅ FIX: First try normal click, then try with force if it fails
+        try {
+          await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+        } catch (error) {
+          logger.debug('[ACTION_EXECUTOR] Normal fallback click failed, trying force click', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          // Force click at element coordinates even if obscured by overlay
+          await locator.click({ timeout: this.FALLBACK_TIMEOUT, force: true });
+        }
         break;
       case 'fill':
         if (cmd.value) {
-          await locator.fill(cmd.value, { timeout: 3000 });
+          // ✅ FIX: Use same pressSequentially() logic as primary execution
+          try {
+            await locator.clear({ timeout: this.FALLBACK_TIMEOUT });
+            await locator.pressSequentially(cmd.value, {
+              timeout: this.FALLBACK_TIMEOUT,
+              delay: 50,
+            });
+          } catch (error) {
+            logger.debug('[ACTION_EXECUTOR] pressSequentially failed in fallback, using fill()', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            await locator.fill(cmd.value, { timeout: this.FALLBACK_TIMEOUT });
+          }
         }
         break;
       case 'hover':
-        await locator.hover({ timeout: 3000 });
+        // ✅ FIX: Try force hover if normal hover fails
+        try {
+          await locator.hover({ timeout: this.FALLBACK_TIMEOUT });
+        } catch (error) {
+          logger.debug('[ACTION_EXECUTOR] Normal fallback hover failed, trying force hover', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await locator.hover({ timeout: this.FALLBACK_TIMEOUT, force: true });
+        }
         break;
       case 'select':
         if (cmd.value) {
-          await locator.selectOption(cmd.value, { timeout: 3000 });
+          await locator.selectOption(cmd.value, { timeout: this.FALLBACK_TIMEOUT });
         }
         break;
       default:
@@ -365,5 +437,149 @@ export class ActionExecutor {
 
     const msgLower = msg.toLowerCase();
     return notFoundIndicators.some((indicator) => msgLower.includes(indicator));
+  }
+
+  /**
+   * Check if element is likely an entry point (for modal detection)
+   * Uses dynamically provided keywords from AI strategy
+   *
+   * @param text - Element text to check
+   * @param keywords - Dynamic keywords from GoalDetector's AI-generated strategy
+   */
+  private isEntryPointElement(text: string, keywords: string[]): boolean {
+    if (keywords.length === 0) return false; // No keywords = no modal wait
+    const textLower = text.toLowerCase();
+    return keywords.some(keyword => textLower.includes(keyword.toLowerCase()));
+  }
+
+  /**
+   * Wait for modal to appear and stabilize after clicking entry point
+   * Polls every 300ms for up to 3 seconds
+   * Checks for overlay appearance and stability
+   */
+  private async waitForModalAfterClick(): Promise<void> {
+    const MAX_WAIT_TIME = 3000; // 3 seconds
+    const POLL_INTERVAL = 300; // 300ms
+    const STABILITY_CHECKS = 2; // Must be stable for 2 consecutive checks
+
+    const startTime = Date.now();
+    let lastModalState: { ref: string | null; rect: { x: number; y: number; width: number; height: number } | null } = {
+      ref: null,
+      rect: null,
+    };
+    let stableCount = 0;
+
+    logger.debug('[ACTION_EXECUTOR] Starting modal polling');
+
+    while (Date.now() - startTime < MAX_WAIT_TIME) {
+      // Check for modal in current page state
+      const currentModalState = await this.page.evaluate(() => {
+        // Find potential overlay/modal containers
+        const potentialModals = Array.from(document.querySelectorAll('*')).filter((el: Element) => {
+          const style = window.getComputedStyle(el);
+          const position = style.position;
+
+          if (position !== 'fixed' && position !== 'absolute') return false;
+          if (style.display === 'none' || style.visibility === 'hidden') return false;
+          if (parseFloat(style.opacity) < 0.1) return false;
+
+          // ✅ FIX: Use same z-index threshold as SnapshotCollector (zIndex >= 1)
+          const zIndex = parseInt(style.zIndex, 10);
+          if (isNaN(zIndex) || zIndex < 1) return false;
+
+          return true;
+        });
+
+        if (potentialModals.length === 0) return { ref: null, rect: null };
+
+        // Find highest z-index modal
+        let bestModal: Element | null = null;
+        let highestZIndex = 0;
+
+        for (const modal of potentialModals) {
+          const style = window.getComputedStyle(modal);
+          const zIndex = parseInt(style.zIndex, 10);
+          const rect = modal.getBoundingClientRect();
+
+          // @ts-expect-error - window available in browser context
+          const viewportArea = window.innerWidth * window.innerHeight;
+          const modalArea = rect.width * rect.height;
+          const coverage = modalArea / viewportArea;
+
+          const hasModalRole = modal.getAttribute('role') === 'dialog' ||
+                               modal.getAttribute('aria-modal') === 'true' ||
+                               modal.classList.contains('modal') ||
+                               modal.classList.contains('overlay');
+
+          const isModal = (hasModalRole && coverage > 0.2) || coverage > 0.4;
+
+          if (isModal && zIndex > highestZIndex) {
+            highestZIndex = zIndex;
+            bestModal = modal;
+          }
+        }
+
+        if (bestModal) {
+          const rect = bestModal.getBoundingClientRect();
+          return {
+            ref: bestModal.getAttribute('data-agent-ref') || 'modal-detected',
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          };
+        }
+
+        return { ref: null, rect: null };
+      });
+
+      // Check if modal appeared
+      if (currentModalState.ref && !lastModalState.ref) {
+        logger.debug('[ACTION_EXECUTOR] Modal appeared', {
+          ref: currentModalState.ref,
+          rect: currentModalState.rect,
+        });
+        lastModalState = currentModalState;
+        stableCount = 0;
+        await this.page.waitForTimeout(POLL_INTERVAL);
+        continue;
+      }
+
+      // Check if modal is stable (same position/size for consecutive checks)
+      if (currentModalState.ref && lastModalState.ref && currentModalState.rect && lastModalState.rect) {
+        const isSamePosition =
+          Math.abs(currentModalState.rect.x - lastModalState.rect.x) < 5 &&
+          Math.abs(currentModalState.rect.y - lastModalState.rect.y) < 5 &&
+          Math.abs(currentModalState.rect.width - lastModalState.rect.width) < 5 &&
+          Math.abs(currentModalState.rect.height - lastModalState.rect.height) < 5;
+
+        if (isSamePosition) {
+          stableCount++;
+          logger.debug('[ACTION_EXECUTOR] Modal stable check', { stableCount, required: STABILITY_CHECKS });
+
+          if (stableCount >= STABILITY_CHECKS) {
+            logger.info('[ACTION_EXECUTOR] Modal stabilized', {
+              ref: currentModalState.ref,
+              waitTime: Date.now() - startTime,
+            });
+            return; // Modal is stable, exit polling
+          }
+        } else {
+          stableCount = 0; // Reset if position changed
+        }
+      }
+
+      lastModalState = currentModalState;
+      await this.page.waitForTimeout(POLL_INTERVAL);
+    }
+
+    // Timeout reached - modal may or may not have appeared
+    if (lastModalState.ref) {
+      logger.warn('[ACTION_EXECUTOR] Modal polling timeout, but modal detected (may not be fully stable)', {
+        ref: lastModalState.ref,
+        waitTime: MAX_WAIT_TIME,
+      });
+    } else {
+      logger.debug('[ACTION_EXECUTOR] Modal polling timeout, no modal detected', {
+        waitTime: MAX_WAIT_TIME,
+      });
+    }
   }
 }

@@ -36,6 +36,92 @@ export class SnapshotCollector {
         }
 
         /**
+         * Detect active modal/overlay
+         * Visual detection: position fixed/absolute + viewport coverage + z-index
+         * Returns ref of modal container if found
+         */
+        const detectActiveModal = (): string | undefined => {
+          // Find all potential overlay containers
+          const potentialModals = Array.from(document.querySelectorAll('*')).filter((el: Element) => {
+            const style = window.getComputedStyle(el);
+            const position = style.position;
+
+            // Must be fixed or absolute
+            if (position !== 'fixed' && position !== 'absolute') return false;
+
+            // Must be visible
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if (parseFloat(style.opacity) < 0.1) return false;
+
+            // ✅ FIX: Get z-index (must be present, allow any positive value)
+            // Many sites use z-index: 10-50 for modals, not just 100+
+            const zIndex = parseInt(style.zIndex, 10);
+            if (isNaN(zIndex) || zIndex < 1) return false;
+
+            return true;
+          });
+
+          if (potentialModals.length === 0) return undefined;
+
+          // ✅ FIX: Find modal with highest RELATIVE z-index among all potential modals
+          // This works even if site uses low z-index values (10, 20, 50)
+          let bestModal: Element | null = null;
+          let highestZIndex = -1;
+
+          for (const modal of potentialModals) {
+            const style = window.getComputedStyle(modal);
+            const zIndex = parseInt(style.zIndex, 10);
+            const rect = modal.getBoundingClientRect();
+
+            // Calculate viewport coverage
+            // @ts-expect-error - window available in browser context
+            const viewportArea = window.innerWidth * window.innerHeight;
+            const modalArea = rect.width * rect.height;
+            const coverage = modalArea / viewportArea;
+
+            // Check for modal indicators
+            const hasModalRole = modal.getAttribute('role') === 'dialog' ||
+                                 modal.getAttribute('aria-modal') === 'true' ||
+                                 modal.classList.contains('modal') ||
+                                 modal.classList.contains('overlay') ||
+                                 modal.classList.contains('popup');
+
+            // Accept if:
+            // 1. Has modal role/class AND covers >20% viewport, OR
+            // 2. Covers >40% viewport with any z-index
+            const isModal = (hasModalRole && coverage > 0.2) || coverage > 0.4;
+
+            // ✅ FIX: Pick modal with highest z-index (relative comparison)
+            if (isModal && zIndex > highestZIndex) {
+              highestZIndex = zIndex;
+              bestModal = modal;
+            }
+          }
+
+          if (bestModal) {
+            // Assign ref to modal if not already present
+            const existingRef = bestModal.getAttribute('data-agent-ref');
+            if (existingRef) {
+              return existingRef;
+            }
+
+            const newRef = `e${win.__agentRefCounter++}`;
+            bestModal.setAttribute('data-agent-ref', newRef);
+            return newRef;
+          }
+
+          return undefined;
+        };
+
+        // Detect active modal first
+        const activeModalRef = detectActiveModal();
+
+        // ✅ FIX: Cache modal element for efficient lookup
+        const activeModalElement = activeModalRef
+          ? document.querySelector(`[data-agent-ref="${activeModalRef}"]`)
+          : null;
+
+        /**
          * Helper: get parent context for an element
          * Looks for semantic parent containers and extracts identifying info
          */
@@ -122,6 +208,11 @@ export class SnapshotCollector {
             const input = el as any;
             const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';
 
+            // ✅ FIX: Check if element is inside active modal
+            const isInsideActiveModal = activeModalElement
+              ? activeModalElement.contains(el)
+              : false;
+
             elements.push({
               ref,
               role: el.getAttribute('role') || el.tagName.toLowerCase(),
@@ -137,10 +228,11 @@ export class SnapshotCollector {
               disabled: input.disabled || el.hasAttribute('disabled'),
               visible: true,
               context: getParentContext(el),  // Parent context
+              isInsideActiveModal,  // ✅ NEW: Mark elements inside modal
             });
           } catch (err) {
             // Skip element if any error
-            console.error('Failed to process element:', err);
+            // No logging needed here - errors are expected for dynamic elements
           }
         });
 
@@ -151,6 +243,7 @@ export class SnapshotCollector {
           title: document.title,
           elements,
           timestamp: Date.now(),
+          activeModalRef, // Include detected modal ref
         };
       });
 
@@ -199,6 +292,12 @@ export class SnapshotCollector {
     const lines: string[] = [];
     lines.push(`URL: ${snapshot.url}`);
     lines.push(`Title: ${snapshot.title || '(no title)'}`);
+
+    // Add active modal indicator if present
+    if (snapshot.activeModalRef) {
+      lines.push(`ACTIVE_MODAL: ${snapshot.activeModalRef} (Focus on elements inside this modal)`);
+    }
+
     lines.push('');
 
     // Format each group
@@ -206,6 +305,12 @@ export class SnapshotCollector {
       lines.push(`[${role}S]`);
       elements.forEach((el) => {
         let line = `  ${el.ref}: "${el.name}"`;
+
+        // ✅ FIX: Mark elements inside active modal
+        if (el.isInsideActiveModal) {
+          line += ' [INSIDE_MODAL]';
+        }
+
         if (el.context) line += ` (${el.context})`;  // Parent context
         if (el.type) line += ` type=${el.type}`;
         if (el.placeholder) line += ` placeholder="${el.placeholder}"`;

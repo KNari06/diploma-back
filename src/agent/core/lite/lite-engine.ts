@@ -70,6 +70,14 @@ export class LiteEngine {
   private readonly MAX_RATE_LIMIT_BACKOFF_MS = 30000; // 30s max
   private readonly MAX_CONSECUTIVE_RATE_LIMITS = 3; // After 3 → blockedInfo
 
+  // ✅ NEW: Audit cooldown tracking (prevents expensive repeated gpt-4o calls)
+  // Cooldown: 3 iterations after auditor returns isDone=false
+  // Bypass: if state hash or URL changes significantly
+  private auditCooldownRemaining = 0;
+  private lastAuditStateHash: string | null = null;
+  private lastAuditUrl: string | null = null;
+  private readonly AUDIT_COOLDOWN_ITERATIONS = 3;
+
   constructor(page: Page, config: LiteEngineConfig) {
     this.page = page;
     this.config = config;
@@ -154,6 +162,25 @@ export class LiteEngine {
       status: 'running',
     });
 
+    // ✅ NEW: Initialize dynamic strategy using AI (one-time call before loop)
+    try {
+      await checkTestCancelled(this.config.testId);
+      await this.goalDetector.initializeDynamicStrategy();
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('cancelled')) {
+        logger.info('[LITE_ENGINE] Test cancelled during strategy init', {
+          testId: this.config.testId,
+        });
+        this.emitCompletion(false, 'Test cancelled by user');
+        return this.buildResult(false, 'Test cancelled by user');
+      }
+      // Strategy init failed - continue with fallback heuristics
+      logger.warn('[LITE_ENGINE] Strategy init failed, using fallback heuristics', {
+        testId: this.config.testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     // ✅ NEW: Emit start node to graph (like Pro)
     const startUpdate = this.graphBuilder.addStartNode();
     this.emitGraphUpdate(startUpdate);
@@ -206,19 +233,133 @@ export class LiteEngine {
         // ✅ NEW: Goal-first check BEFORE asking AI (using heuristic)
         const goalCheck = this.goalDetector.detectHeuristic(goalContext);
 
-        if (goalCheck.goalReached && goalCheck.confidence !== 'low') {
-          logger.info('[LITE_ENGINE] Goal detected as reached before AI', {
+        // ✅ NEW: Decrement audit cooldown each iteration
+        if (this.auditCooldownRemaining > 0) {
+          this.auditCooldownRemaining--;
+        }
+
+        // ✅ NEW: Check if audit cooldown should be bypassed (state changed significantly)
+        const currentStateHash = this.state.getCurrentStateHash();
+        const stateChangedSignificantly =
+          (this.lastAuditStateHash && currentStateHash !== this.lastAuditStateHash) ||
+          (this.lastAuditUrl && snapshotBefore.url !== this.lastAuditUrl);
+
+        if (stateChangedSignificantly && this.auditCooldownRemaining > 0) {
+          logger.debug('[LITE_ENGINE] Audit cooldown bypassed - state changed significantly', {
             testId: this.config.testId,
-            progressScore: Math.round(goalCheck.progressScore * 100) + '%',
-            confidence: goalCheck.confidence,
-            reason: goalCheck.reason,
-            iterations: i + 1,
+            oldHash: this.lastAuditStateHash?.slice(0, 16),
+            newHash: currentStateHash?.slice(0, 16),
+            urlChanged: this.lastAuditUrl !== snapshotBefore.url,
+            cooldownRemaining: this.auditCooldownRemaining,
           });
-          // ✅ FIX: Clear guidance when goal is reached
-          this.currentGuidance = null;
-          this.emitCompletion(true, goalCheck.reason || 'Goal reached');
-          await this.flushPendingGraphScreenshotUploads();
-          return this.buildResult(true, goalCheck.reason || 'Goal reached');
+          this.auditCooldownRemaining = 0; // Reset cooldown
+        }
+
+        // ✅ NEW: If heuristic claims done, validate with auditor (with cooldown)
+        if (goalCheck.goalReached && goalCheck.confidence !== 'low') {
+          const shouldCallAuditor = this.auditCooldownRemaining === 0;
+
+          if (!shouldCallAuditor) {
+            logger.debug('[LITE_ENGINE] Heuristic claims done but auditor on cooldown, skipping', {
+              testId: this.config.testId,
+              cooldownRemaining: this.auditCooldownRemaining,
+              progressScore: Math.round(goalCheck.progressScore * 100) + '%',
+            });
+            // Continue to next iteration without completing
+          } else {
+            // Call auditor (gpt-4o) for final validation
+            logger.info('[LITE_ENGINE] Heuristic claims done, calling auditor for validation', {
+              testId: this.config.testId,
+              progressScore: Math.round(goalCheck.progressScore * 100) + '%',
+              confidence: goalCheck.confidence,
+            });
+
+            try {
+              const auditResult = await this.goalDetector.auditDone(goalContext, this.state.getLastOutcome());
+
+              // Update cooldown tracking
+              this.lastAuditStateHash = currentStateHash;
+              this.lastAuditUrl = snapshotBefore.url;
+
+              if (auditResult.isBlocked) {
+                // ✅ BLOCKED: Stop test and return blocked result (same as existing hard-block path)
+                const blockedReason = auditResult.blockedReason || 'Test blocked';
+                logger.info('[LITE_ENGINE] Auditor detected hard block', {
+                  testId: this.config.testId,
+                  blockedReason,
+                  canUserHelp: auditResult.canUserHelp,
+                });
+
+                // Emit blocked progress via WebSocket (consistent with existing hard-block path)
+                try {
+                  webSocketService.emitTestProgress(this.config.testId, {
+                    testId: this.config.testId,
+                    browser: this.config.browser || 'chrome',
+                    progress: Math.round((i / this.MAX_ITERATIONS) * 70) + 20,
+                    phase: 'blocked',
+                    currentStep: `🚫 ${blockedReason}`,
+                    status: 'failed',
+                    timestamp: new Date().toISOString(),
+                  });
+                } catch {
+                  // Ignore WebSocket errors
+                }
+
+                this.emitCompletion(false, blockedReason);
+                await this.flushPendingGraphScreenshotUploads();
+                return this.buildResult(false, `Blocked: ${blockedReason}`);
+              }
+
+              if (auditResult.isDone && auditResult.confidence >= 0.5) {
+                // ✅ DONE: Complete the test
+                logger.info('[LITE_ENGINE] Auditor confirmed goal reached', {
+                  testId: this.config.testId,
+                  confidence: auditResult.confidence.toFixed(2),
+                  reason: auditResult.reason,
+                  iterations: i + 1,
+                });
+                this.currentGuidance = null;
+                this.emitCompletion(true, auditResult.reason || 'Goal reached');
+                await this.flushPendingGraphScreenshotUploads();
+                return this.buildResult(true, auditResult.reason || 'Goal reached');
+              } else {
+                // ✅ NOT DONE: Start cooldown and continue
+                logger.info('[LITE_ENGINE] Auditor rejected heuristic done claim, starting cooldown', {
+                  testId: this.config.testId,
+                  isDone: auditResult.isDone,
+                  confidence: auditResult.confidence.toFixed(2),
+                  reason: auditResult.reason,
+                  nextStep: auditResult.nextStepIfMissing,
+                  cooldownIterations: this.AUDIT_COOLDOWN_ITERATIONS,
+                });
+                this.auditCooldownRemaining = this.AUDIT_COOLDOWN_ITERATIONS;
+
+                // Optionally use nextStepIfMissing as guidance
+                if (auditResult.nextStepIfMissing) {
+                  this.currentGuidance = {
+                    guidance: auditResult.reason,
+                    nextSubgoal: auditResult.nextStepIfMissing,
+                    addedAtIteration: i,
+                  };
+                }
+                // Continue to next iteration
+              }
+            } catch (auditError) {
+              if (auditError instanceof Error && auditError.message.includes('cancelled')) {
+                logger.info('[LITE_ENGINE] Test cancelled during auditor', {
+                  testId: this.config.testId,
+                });
+                this.emitCompletion(false, 'Test cancelled by user');
+                await this.flushPendingGraphScreenshotUploads();
+                return this.buildResult(false, 'Test cancelled by user');
+              }
+              // Auditor failed - continue without completing (conservative)
+              logger.warn('[LITE_ENGINE] Auditor failed, continuing (conservative)', {
+                testId: this.config.testId,
+                error: auditError instanceof Error ? auditError.message : String(auditError),
+              });
+            }
+          }
         }
 
         // ✅ NEW: AI fallback for stuck recovery (when stuck for 2+ iterations)
@@ -248,6 +389,20 @@ export class LiteEngine {
                 nextSubgoal: stuckEval.nextSubgoal.slice(0, 50),
                 progressScore: Math.round(stuckEval.progressScore * 100) + '%',
               });
+            } else {
+              // ✅ NEW: AI fallback didn't help - try direct URL fallback
+              // Only for register/login goals
+              const urlFallbackResult = await this.tryDirectUrlFallback(snapshotBefore.url);
+              if (urlFallbackResult.navigated) {
+                logger.info('[LITE_ENGINE] Direct URL fallback successful', {
+                  testId: this.config.testId,
+                  newUrl: urlFallbackResult.finalUrl,
+                });
+                // Re-collect snapshot after navigation
+                snapshotBefore = await SnapshotCollector.collect(this.page);
+                // Reset stuck counter since we made progress
+                this.state.resetConsecutiveStuckCount();
+              }
             }
           } catch (stuckError) {
             // Check if cancelled
@@ -301,33 +456,95 @@ export class LiteEngine {
 
         // Check terminal states
         if (decision.done) {
-          // ✅ NEW: Validate done claim with GoalDetector + AI fallback
-          try {
-            const validation = await this.goalDetector.validateDoneWithContext(goalContext, decision.thought);
+          // ✅ NEW: Validate AI's done claim with auditor (gpt-4o) with cooldown
+          const shouldCallAuditorForAIDone = this.auditCooldownRemaining === 0;
 
-            if (validation.accepted) {
-              logger.info('[LITE_ENGINE] Goal achieved (validated)', {
+          if (!shouldCallAuditorForAIDone) {
+            logger.debug('[LITE_ENGINE] AI claims done but auditor on cooldown, skipping', {
+              testId: this.config.testId,
+              cooldownRemaining: this.auditCooldownRemaining,
+              thought: decision.thought?.slice(0, 50),
+            });
+            // Continue to next iteration
+            continue;
+          }
+
+          try {
+            logger.info('[LITE_ENGINE] AI claims done, calling auditor for validation', {
+              testId: this.config.testId,
+              thought: decision.thought?.slice(0, 50),
+            });
+
+            const auditResult = await this.goalDetector.auditDone(goalContext, decision.thought);
+
+            // Update cooldown tracking
+            const currentStateHash = this.state.getCurrentStateHash();
+            this.lastAuditStateHash = currentStateHash;
+            this.lastAuditUrl = snapshotBefore.url;
+
+            if (auditResult.isBlocked) {
+              // ✅ BLOCKED: Stop test and return blocked result (same as existing hard-block path)
+              const blockedReason = auditResult.blockedReason || 'Test blocked';
+              logger.info('[LITE_ENGINE] Auditor detected hard block (AI done path)', {
                 testId: this.config.testId,
-                thought: decision.thought,
-                usedAIFallback: validation.usedAIFallback,
+                blockedReason,
+                canUserHelp: auditResult.canUserHelp,
+              });
+
+              // Emit blocked progress via WebSocket (consistent with existing hard-block path)
+              try {
+                webSocketService.emitTestProgress(this.config.testId, {
+                  testId: this.config.testId,
+                  browser: this.config.browser || 'chrome',
+                  progress: Math.round((i / this.MAX_ITERATIONS) * 70) + 20,
+                  phase: 'blocked',
+                  currentStep: `🚫 ${blockedReason}`,
+                  status: 'failed',
+                  timestamp: new Date().toISOString(),
+                });
+              } catch {
+                // Ignore WebSocket errors
+              }
+
+              this.emitCompletion(false, blockedReason);
+              await this.flushPendingGraphScreenshotUploads();
+              return this.buildResult(false, `Blocked: ${blockedReason}`);
+            }
+
+            if (auditResult.isDone && auditResult.confidence >= 0.5) {
+              // ✅ DONE: Complete the test
+              logger.info('[LITE_ENGINE] Auditor confirmed AI done claim', {
+                testId: this.config.testId,
+                confidence: auditResult.confidence.toFixed(2),
+                reason: auditResult.reason,
+                thought: decision.thought?.slice(0, 50),
                 iterations: i + 1,
               });
-              // ✅ FIX: Clear guidance when goal is reached
               this.currentGuidance = null;
-              this.emitCompletion(true, decision.thought);
+              this.emitCompletion(true, decision.thought || auditResult.reason);
               await this.flushPendingGraphScreenshotUploads();
-              return this.buildResult(true, decision.thought);
+              return this.buildResult(true, decision.thought || auditResult.reason);
             } else {
-              // Reject false positive - continue loop
-              logger.warn('[LITE_ENGINE] Rejected done claim', {
+              // ✅ NOT DONE: Start cooldown and continue
+              logger.info('[LITE_ENGINE] Auditor rejected AI done claim, starting cooldown', {
                 testId: this.config.testId,
-                thought: decision.thought,
-                progressScore: Math.round(goalCheck.progressScore * 100) + '%',
-                usedAIFallback: validation.usedAIFallback,
-                aiConfidence: validation.aiEval?.confidence,
-                iteration: i,
+                isDone: auditResult.isDone,
+                confidence: auditResult.confidence.toFixed(2),
+                reason: auditResult.reason,
+                nextStep: auditResult.nextStepIfMissing,
+                cooldownIterations: this.AUDIT_COOLDOWN_ITERATIONS,
               });
-              // Continue to next iteration - AI will be asked again
+              this.auditCooldownRemaining = this.AUDIT_COOLDOWN_ITERATIONS;
+
+              // Optionally use nextStepIfMissing as guidance
+              if (auditResult.nextStepIfMissing) {
+                this.currentGuidance = {
+                  guidance: auditResult.reason,
+                  nextSubgoal: auditResult.nextStepIfMissing,
+                  addedAtIteration: i,
+                };
+              }
+              // Continue to next iteration
               continue;
             }
           } catch (doneError) {
@@ -340,8 +557,8 @@ export class LiteEngine {
               await this.flushPendingGraphScreenshotUploads();
               return this.buildResult(false, 'Test cancelled by user');
             }
-            // If validation failed, reject the done claim to be safe
-            logger.warn('[LITE_ENGINE] Done validation error, rejecting', {
+            // Auditor failed - continue without completing (conservative)
+            logger.warn('[LITE_ENGINE] Auditor failed for AI done claim, continuing', {
               testId: this.config.testId,
               error: doneError instanceof Error ? doneError.message : String(doneError),
             });
@@ -405,9 +622,12 @@ export class LiteEngine {
         }
 
         // 6. Execute command (safe switch/case, with fuzzy fallback)
+        // ✅ Pass dynamic entryPointKeywords from AI-generated strategy for modal detection
+        const parsedGoal = this.goalDetector.getParsedGoal();
         const execResult = await this.executor.execute(
           decision.command, // JSON command, not code
-          snapshotBefore
+          snapshotBefore,
+          { entryPointKeywords: parsedGoal.entryPointKeywords }
         );
 
         // 7. Wait for stability
@@ -740,6 +960,113 @@ export class LiteEngine {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  /**
+   * Try direct URL fallback for register/login goals when stuck
+   * Only called when stuck for 2+ iterations
+   *
+   * @param currentUrl - Current page URL
+   * @returns Object with navigation status and final URL
+   */
+  private async tryDirectUrlFallback(currentUrl: string): Promise<{
+    navigated: boolean;
+    finalUrl: string;
+    attemptedPath?: string;
+  }> {
+    const goalLower = this.config.goal.toLowerCase();
+
+    // Only for register/login goals
+    const isRegistrationGoal = /register|sign\s*up|create\s+account|registration|зарегистр|регистрац/i.test(goalLower);
+    const isLoginGoal = /login|sign\s*in|log\s*in|вход|войти/i.test(goalLower);
+
+    if (!isRegistrationGoal && !isLoginGoal) {
+      return { navigated: false, finalUrl: currentUrl };
+    }
+
+    // Extract base URL
+    let baseUrl: string;
+    try {
+      const url = new URL(currentUrl);
+      baseUrl = `${url.protocol}//${url.host}`;
+    } catch (error) {
+      logger.error('[LITE_ENGINE] Failed to parse URL for fallback', {
+        testId: this.config.testId,
+        currentUrl,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { navigated: false, finalUrl: currentUrl };
+    }
+
+    // Define URL paths to try
+    const pathsToTry = isRegistrationGoal
+      ? ['/register', '/signup', '/sign-up', '/create-account', '/join', '/registration']
+      : ['/login', '/signin', '/sign-in', '/auth/login', '/account/login'];
+
+    // Try each path
+    for (const path of pathsToTry) {
+      const targetUrl = `${baseUrl}${path}`;
+
+      logger.info('[LITE_ENGINE] Trying direct URL fallback', {
+        testId: this.config.testId,
+        targetUrl,
+        reason: 'stuck',
+        consecutiveStuckCount: this.state.getConsecutiveStuckCount(),
+      });
+
+      try {
+        const response = await this.page.goto(targetUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 10000,
+        });
+
+        const finalUrl = this.page.url();
+
+        // Check if navigation was successful (not 404/error)
+        if (response && response.ok() && finalUrl !== currentUrl) {
+          logger.info('[LITE_ENGINE] Direct URL fallback successful', {
+            testId: this.config.testId,
+            attemptedPath: path,
+            targetUrl,
+            finalUrl,
+            statusCode: response.status(),
+          });
+
+          // Wait a bit for page to load
+          await this.page.waitForTimeout(1000);
+
+          return {
+            navigated: true,
+            finalUrl,
+            attemptedPath: path,
+          };
+        }
+
+        logger.debug('[LITE_ENGINE] Direct URL fallback failed for path', {
+          testId: this.config.testId,
+          path,
+          statusCode: response?.status(),
+          finalUrl,
+        });
+      } catch (navError) {
+        logger.debug('[LITE_ENGINE] Direct URL navigation error', {
+          testId: this.config.testId,
+          path,
+          error: navError instanceof Error ? navError.message : String(navError),
+        });
+        // Continue to next path
+        continue;
+      }
+    }
+
+    // All paths failed
+    logger.warn('[LITE_ENGINE] All direct URL fallback paths failed', {
+      testId: this.config.testId,
+      attemptedPaths: pathsToTry,
+      currentUrl,
+    });
+
+    return { navigated: false, finalUrl: currentUrl };
   }
 
   /**

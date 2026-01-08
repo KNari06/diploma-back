@@ -181,6 +181,19 @@ export class LiteState {
   }
 
   /**
+   * Get the current state hash
+   * Used by LiteEngine for audit cooldown bypass detection
+   *
+   * @returns Current state hash or null if no iterations recorded
+   */
+  getCurrentStateHash(): string | null {
+    if (this.stateHashes.length === 0) {
+      return null;
+    }
+    return this.stateHashes[this.stateHashes.length - 1];
+  }
+
+  /**
    * Compute state hash from URL and element names
    * Used for accurate stuck detection
    * ✅ FIX: Filters out dynamic elements (clocks, ads, timers) to prevent false negatives
