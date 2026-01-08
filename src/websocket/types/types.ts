@@ -153,6 +153,7 @@ export interface TestStepCompletedPayload {
 export interface TestGraphUpdatePayload {
   testId: string;
   type: 'full' | 'incremental';
+  mode?: 'lite' | 'pro'; // ✅ NEW: Indicates test mode (Lite has no screenshots)
   data: {
     // For type='incremental': single node + edge update
     newNode?: {

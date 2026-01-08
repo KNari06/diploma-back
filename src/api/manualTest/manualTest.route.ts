@@ -438,16 +438,26 @@ router.get('/:id/result', requireAuth, asyncHandler(async (req: Request, res: Re
 
   // ✅ FIX: Convert base64 screenshots to URLs
   if (result.success && result.data && Array.isArray(result.data)) {
+    // Supabase returns snake_case fields; service types are camelCase.
+    // Treat results as raw DB rows here to avoid TypeScript mismatch.
+    const rawResults = result.data as any[];
+
     const screenshotUrlMap = await convertScreenshotsToUrls(
-      result.data.map(r => ({ id: r.id, screenshot: r.screenshot, browser: r.browser })),
+      rawResults.map(r => ({ id: r.id, screenshot: r.screenshot, browser: r.browser })),
       id,
       userId
     );
 
-    // Update results with converted URLs
-    result.data = result.data.map(r => ({
+    // Update results with converted URLs and ensure video/trace URLs are available
+    // ✅ FIX: Map snake_case (DB) to camelCase (TypeScript) for consistency
+    result.data = rawResults.map(r => ({
       ...r,
       screenshot: screenshotUrlMap.get(r.id) || undefined,
+      // ✅ NEW: Ensure video_url and trace_url are available (from DB snake_case)
+      videoUrl: r.video_url || r.videoUrl, // Support both formats
+      traceUrl: r.trace_url || r.traceUrl, // Support both formats
+      video_url: r.video_url || r.videoUrl, // Keep snake_case for API consistency
+      trace_url: r.trace_url || r.traceUrl, // Keep snake_case for API consistency
     }));
   }
 
@@ -1106,23 +1116,24 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
     );
 
     // Collect all screenshots from results using pre-converted URLs
-    const screenshots = results
+    const screenshots = (results as any[])
       .filter(r => r.screenshot)
       .map(r => ({
         browser: r.browser,
         screenshot: screenshotUrlMap.get(r.id) || null,
         status: r.status,
-        completed_at: r.completedAt,
+        completed_at: r.completedAt ?? r.completed_at,
       }))
       .filter(s => s.screenshot !== null);
 
     // 7. Collect all videos from results and trace files
+    // ✅ FIX: Use video_url from DB (snake_case) - Supabase returns snake_case
     const videos = [
-      ...results.filter(r => r.videoUrl).map(r => ({
+      ...(results as any[]).filter(r => r.video_url || r.videoUrl).map(r => ({
         browser: r.browser,
-        video_url: r.videoUrl,
+        video_url: r.video_url || r.videoUrl, // Support both formats for compatibility
         status: r.status,
-        completed_at: r.completedAt,
+        completed_at: r.completedAt ?? r.completed_at,
       })),
       ...(traceFiles || []).filter(tf => tf.public_url && tf.file_name?.endsWith('.webm')).map(tf => ({
         browser: tf.browser,
@@ -1179,22 +1190,23 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
         test_goal: test.testGoal,
       },
       // ✅ OPTIMIZED: Use pre-converted URLs (no duplicate conversion)
-      results: results.map(r => ({
+      // ✅ FIX: Use video_url/trace_url from DB (snake_case) - Supabase returns snake_case
+      results: (results as any[]).map(r => ({
         id: r.id,
-        test_id: r.testId,
+        test_id: r.test_id || r.testId,
         browser: r.browser,
         status: r.status,
         screenshot: screenshotUrlMap.get(r.id) || null,
         dom: r.dom,
-        video_url: r.videoUrl,
-        trace_url: r.traceUrl,
+        video_url: r.video_url || r.videoUrl, // Support both formats for compatibility
+        trace_url: r.trace_url || r.traceUrl, // Support both formats for compatibility
         performance: r.performance,
         ai_summary: r.aiSummary,
         logs: r.logs || [],
         network_logs: r.networkLogs || [],
         errors: r.errors || [],
-        created_at: r.createdAt,
-        completed_at: r.completedAt,
+        created_at: r.createdAt ?? r.created_at,
+        completed_at: r.completedAt ?? r.completed_at,
       })),
       report: report ? {
         generatedCode: report.generatedCode,

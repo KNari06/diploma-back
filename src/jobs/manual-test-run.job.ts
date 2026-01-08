@@ -332,6 +332,8 @@ export class ManualTestRunJobHandler {
         network_logs: result.networkLogs || [],
         errors: result.errors || [],
         performance: result.performance,
+        video_url: result.videoUrl, // ✅ NEW: Save video URL to test_results
+        trace_url: result.traceUrl, // ✅ NEW: Save trace URL to test_results
         completed_at: new Date().toISOString(),
       });
 
@@ -450,6 +452,8 @@ export class ManualTestRunJobHandler {
       network_logs: result?.networkLogs || [],
       errors: result?.errors || [],
       performance: result?.performance,
+      video_url: result?.videoUrl, // ✅ NEW: Save video URL to test_results (even for failed tests)
+      trace_url: result?.traceUrl, // ✅ NEW: Save trace URL to test_results (even for failed tests)
       completed_at: new Date().toISOString(),
     });
 

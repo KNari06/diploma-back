@@ -6,12 +6,13 @@
  * ✅ NEW: Full GraphBuilder integration (like Pro) for real-time graph streaming
  */
 
+import { TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { GraphBuilder, GraphUpdate } from '@/agent/utils/visualization/graph-builder.service';
 import { TestProgressEmitter } from '@/agent/utils/visualization/progress-emitter';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Page } from 'playwright';
-import { checkTestCancelled } from '../../playwright/utils/test-cancellation-checker';
+import { checkTestCancelled, cleanupCancellationState, withCancellation } from '../../playwright/utils/test-cancellation-checker';
 import { buildSnapshotSummary } from './analysis/ai-goal-evaluator';
 import { GoalDetector } from './analysis/goal-detector';
 import { StateDiffComputer } from './analysis/state-diff';
@@ -19,13 +20,12 @@ import { StateValidator } from './analysis/state-validator';
 import { ConsoleCollector } from './collectors/console-collector';
 import { ErrorCollector } from './collectors/error-collector';
 import { NetworkTracker } from './collectors/network-tracker';
-import { ScreenshotCollector } from './collectors/screenshot-collector';
 import { SnapshotCollector } from './collectors/snapshot-collector';
 import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
-import type { ActionOutcome, AIDecision, CollectedError, ExecutionResult, GoalContext, GoalGuidance, LiteEngineConfig, LiteSnapshot, LiteTestResult, StateDiff } from './lite-types';
+import type { AIDecision, ActionOutcome, CollectedError, ExecutionResult, GoalContext, GoalGuidance, LiteEngineConfig, LiteSnapshot, LiteTestResult, StateDiff } from './lite-types';
 import { LitePromptBuilder } from './prompt/lite-prompt-builder';
 
 export class LiteEngine {
@@ -35,7 +35,6 @@ export class LiteEngine {
   private executor: ActionExecutor;
   private networkTracker: NetworkTracker;
   private consoleCollector: ConsoleCollector;
-  private screenshotCollector: ScreenshotCollector;
   private progressEmitter: TestProgressEmitter;
   private graphBuilder: GraphBuilder; // ✅ NEW: Full graph like Pro
   private goalDetector: GoalDetector; // ✅ NEW: Goal-first detection
@@ -44,7 +43,6 @@ export class LiteEngine {
   // Track emitted node IDs to avoid duplicates
   private emittedNodeIds = new Set<string>();
   private emittedEdgeIds = new Set<string>();
-  private pendingGraphScreenshotUploads: Array<Promise<void>> = [];
 
   // Flag to prevent graph updates after test completion
   private isTestCompleted = false;
@@ -85,7 +83,6 @@ export class LiteEngine {
     this.executor = new ActionExecutor(page);
     this.networkTracker = new NetworkTracker(page);
     this.consoleCollector = new ConsoleCollector(page);
-    this.screenshotCollector = new ScreenshotCollector(config.testId);
     this.graphBuilder = new GraphBuilder(); // ✅ NEW: Initialize graph builder
     this.goalDetector = new GoalDetector(config.goal, config.testId); // ✅ NEW: Initialize goal detector with testId for AI fallback
 
@@ -132,7 +129,7 @@ export class LiteEngine {
         // ✅ FIX: Flush pending uploads before returning (so graphData has URLs)
         await this.flushPendingGraphScreenshotUploads();
 
-        return this.buildResult(false, `Time limit exceeded (${Math.round(timeoutMs / 60000)} minutes)`);
+        return await this.buildResult(false, `Time limit exceeded (${Math.round(timeoutMs / 60000)} minutes)`);
       }
 
       logger.error('[LITE_ENGINE] Unexpected error', {
@@ -163,16 +160,21 @@ export class LiteEngine {
     });
 
     // ✅ NEW: Initialize dynamic strategy using AI (one-time call before loop)
+    // ✅ FIX: Wrap with cancellation support for immediate abort
     try {
       await checkTestCancelled(this.config.testId);
-      await this.goalDetector.initializeDynamicStrategy();
+      await withCancellation(
+        this.config.testId,
+        this.goalDetector.initializeDynamicStrategy(),
+        'goalDetector.initializeDynamicStrategy'
+      );
     } catch (error) {
       if (error instanceof Error && error.message.includes('cancelled')) {
         logger.info('[LITE_ENGINE] Test cancelled during strategy init', {
           testId: this.config.testId,
         });
         this.emitCompletion(false, 'Test cancelled by user');
-        return this.buildResult(false, 'Test cancelled by user');
+        return await this.buildResult(false, 'Test cancelled by user');
       }
       // Strategy init failed - continue with fallback heuristics
       logger.warn('[LITE_ENGINE] Strategy init failed, using fallback heuristics', {
@@ -200,7 +202,7 @@ export class LiteEngine {
             });
             this.emitCompletion(false, 'Test cancelled by user');
             await this.flushPendingGraphScreenshotUploads();
-            return this.buildResult(false, 'Test cancelled by user');
+            return await this.buildResult(false, 'Test cancelled by user');
           }
           // If check failed (timeout, etc.), continue execution
         }
@@ -275,7 +277,11 @@ export class LiteEngine {
             });
 
             try {
-              const auditResult = await this.goalDetector.auditDone(goalContext, this.state.getLastOutcome());
+              const auditResult = await withCancellation(
+              this.config.testId,
+              this.goalDetector.auditDone(goalContext, this.state.getLastOutcome()),
+              'goalDetector.auditDone'
+            );
 
               // Update cooldown tracking
               this.lastAuditStateHash = currentStateHash;
@@ -307,7 +313,7 @@ export class LiteEngine {
 
                 this.emitCompletion(false, blockedReason);
                 await this.flushPendingGraphScreenshotUploads();
-                return this.buildResult(false, `Blocked: ${blockedReason}`);
+                return await this.buildResult(false, `Blocked: ${blockedReason}`);
               }
 
               if (auditResult.isDone && auditResult.confidence >= 0.5) {
@@ -321,7 +327,7 @@ export class LiteEngine {
                 this.currentGuidance = null;
                 this.emitCompletion(true, auditResult.reason || 'Goal reached');
                 await this.flushPendingGraphScreenshotUploads();
-                return this.buildResult(true, auditResult.reason || 'Goal reached');
+                return await this.buildResult(true, auditResult.reason || 'Goal reached');
               } else {
                 // ✅ NOT DONE: Start cooldown and continue
                 logger.info('[LITE_ENGINE] Auditor rejected heuristic done claim, starting cooldown', {
@@ -351,7 +357,7 @@ export class LiteEngine {
                 });
                 this.emitCompletion(false, 'Test cancelled by user');
                 await this.flushPendingGraphScreenshotUploads();
-                return this.buildResult(false, 'Test cancelled by user');
+                return await this.buildResult(false, 'Test cancelled by user');
               }
               // Auditor failed - continue without completing (conservative)
               logger.warn('[LITE_ENGINE] Auditor failed, continuing (conservative)', {
@@ -371,7 +377,11 @@ export class LiteEngine {
           });
 
           try {
-            const stuckEval = await this.goalDetector.evaluateForStuckRecovery(goalContext);
+            const stuckEval = await withCancellation(
+              this.config.testId,
+              this.goalDetector.evaluateForStuckRecovery(goalContext),
+              'goalDetector.evaluateForStuckRecovery'
+            );
 
             if (stuckEval?.nextSubgoal) {
               // Store guidance for next iterations
@@ -412,7 +422,7 @@ export class LiteEngine {
               });
               this.emitCompletion(false, 'Test cancelled by user');
               await this.flushPendingGraphScreenshotUploads();
-              return this.buildResult(false, 'Test cancelled by user');
+              return await this.buildResult(false, 'Test cancelled by user');
             }
             // If AI fallback failed, just continue with regular flow
             logger.warn('[LITE_ENGINE] Stuck recovery AI fallback failed, continuing', {
@@ -432,8 +442,7 @@ export class LiteEngine {
           this.currentGuidance = null;
         }
 
-        // 3. Screenshot BEFORE (for error debugging)
-        await this.screenshotCollector.captureBefore(this.page, i);
+        // 3. Screenshot BEFORE - REMOVED for Lite mode (no screenshots)
 
         // ✅ NEW: Get contextual hints from GoalDetector for smarter navigation
         const contextualHints = this.goalDetector.buildContextualHints(snapshotBefore);
@@ -456,7 +465,12 @@ export class LiteEngine {
         });
 
         // 5. Ask AI (returns JSON command, not code)
-        const decision = await LitePromptBuilder.askAI(prompt);
+        // ✅ FIX: Wrap AI call with cancellation support
+        const decision = await withCancellation(
+          this.config.testId,
+          LitePromptBuilder.askAI(prompt),
+          'LitePromptBuilder.askAI'
+        );
 
         // Check terminal states
         if (decision.done) {
@@ -479,7 +493,11 @@ export class LiteEngine {
               thought: decision.thought?.slice(0, 50),
             });
 
-            const auditResult = await this.goalDetector.auditDone(goalContext, decision.thought);
+            const auditResult = await withCancellation(
+              this.config.testId,
+              this.goalDetector.auditDone(goalContext, decision.thought),
+              'goalDetector.auditDone (AI done path)'
+            );
 
             // Update cooldown tracking
             const currentStateHash = this.state.getCurrentStateHash();
@@ -512,7 +530,7 @@ export class LiteEngine {
 
               this.emitCompletion(false, blockedReason);
               await this.flushPendingGraphScreenshotUploads();
-              return this.buildResult(false, `Blocked: ${blockedReason}`);
+              return await this.buildResult(false, `Blocked: ${blockedReason}`);
             }
 
             if (auditResult.isDone && auditResult.confidence >= 0.5) {
@@ -527,7 +545,7 @@ export class LiteEngine {
               this.currentGuidance = null;
               this.emitCompletion(true, decision.thought || auditResult.reason);
               await this.flushPendingGraphScreenshotUploads();
-              return this.buildResult(true, decision.thought || auditResult.reason);
+              return await this.buildResult(true, decision.thought || auditResult.reason);
             } else {
               // ✅ NOT DONE: Start cooldown and continue
               logger.info('[LITE_ENGINE] Auditor rejected AI done claim, starting cooldown', {
@@ -559,7 +577,7 @@ export class LiteEngine {
               });
               this.emitCompletion(false, 'Test cancelled by user');
               await this.flushPendingGraphScreenshotUploads();
-              return this.buildResult(false, 'Test cancelled by user');
+              return await this.buildResult(false, 'Test cancelled by user');
             }
             // Auditor failed - continue without completing (conservative)
             logger.warn('[LITE_ENGINE] Auditor failed for AI done claim, continuing', {
@@ -604,7 +622,7 @@ export class LiteEngine {
 
             this.emitCompletion(false, reason);
             await this.flushPendingGraphScreenshotUploads();
-            return this.buildResult(false, `Blocked: ${reason}`);
+            return await this.buildResult(false, `Blocked: ${reason}`);
           } else {
             // Soft block: just log and continue trying
             logger.info('[LITE_ENGINE] Soft block detected, continuing', {
@@ -634,9 +652,18 @@ export class LiteEngine {
           { entryPointKeywords: parsedGoal.entryPointKeywords }
         );
 
-        // 7. Wait for stability
-        await this.networkTracker.waitForNetworkIdle(5000);
-        await VisualStability.waitForStable(this.page);
+        // 7. Wait for stability (with cancellation support)
+        // ✅ FIX: Wrap stability waits with cancellation for immediate abort
+        await withCancellation(
+          this.config.testId,
+          this.networkTracker.waitForNetworkIdle(5000),
+          'networkTracker.waitForNetworkIdle'
+        );
+        await withCancellation(
+          this.config.testId,
+          VisualStability.waitForStable(this.page),
+          'VisualStability.waitForStable'
+        );
 
         // 7a. Check cancellation again after action (user might cancel during execution)
         try {
@@ -649,12 +676,11 @@ export class LiteEngine {
             });
             this.emitCompletion(false, 'Test cancelled by user');
             await this.flushPendingGraphScreenshotUploads();
-            return this.buildResult(false, 'Test cancelled by user');
+            return await this.buildResult(false, 'Test cancelled by user');
           }
         }
 
-        // 8. Screenshot AFTER
-        await this.screenshotCollector.captureAfter(this.page, i);
+        // 8. Screenshot AFTER - REMOVED for Lite mode (no screenshots)
 
         // 9. Collect after snapshot
         const snapshotAfter = await SnapshotCollector.collect(this.page);
@@ -760,7 +786,7 @@ export class LiteEngine {
 
             this.emitCompletion(false, 'Site rate limiting - please wait and try again');
             await this.flushPendingGraphScreenshotUploads();
-            return this.buildResult(false, 'Site temporarily restricted access (HTTP 429). Please wait a few minutes and try again.');
+            return await this.buildResult(false, 'Site temporarily restricted access (HTTP 429). Please wait a few minutes and try again.');
           }
 
           // Exponential backoff: 5s → 10s → 20s (capped at MAX)
@@ -789,36 +815,14 @@ export class LiteEngine {
           }
         }
 
-        // 12. On error - save error screenshot + A11y dump
+        // 12. On error - log error (screenshots removed for Lite mode)
         if (outcome === 'execution_error' || outcome === 'validation_error' || outcome === 'critical_error') {
-          const { screenshotBuffer } = await this.screenshotCollector.captureError(
-            this.page,
-            i,
-            snapshotAfter,
-            execResult.error || (outcome === 'critical_error' ? 'Page appears blank/crashed' : 'Unknown error')
-          );
-
-          // ✅ Ensure screenshotUrl is only set when upload is complete (URL is available)
-          if (screenshotBuffer) {
-            try {
-              const { uploadScreenshotBufferToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-              const uploadedUrl = await uploadScreenshotBufferToStorage(
-                screenshotBuffer,
-                this.config.testId,
-                this.config.userId || 'anonymous',
-                i * 3 + 2 // keep separate from before/after indices
-              );
-              if (uploadedUrl) {
-                this.attachScreenshotUrlToIterationErrors(i, uploadedUrl);
-              }
-            } catch (uploadError) {
-              logger.warn('[LITE_ENGINE] Failed to upload error screenshot', {
-                testId: this.config.testId,
-                iteration: i,
-                error: uploadError instanceof Error ? uploadError.message : String(uploadError),
-              });
-            }
-          }
+          logger.warn('[LITE_ENGINE] Error detected (screenshots disabled in Lite mode)', {
+            testId: this.config.testId,
+            iteration: i,
+            outcome,
+            error: execResult.error || (outcome === 'critical_error' ? 'Page appears blank/crashed' : 'Unknown error'),
+          });
         }
 
         // 12a. CRITICAL ERROR RECOVERY - reload page
@@ -882,7 +886,7 @@ export class LiteEngine {
       });
       this.emitCompletion(false, `Step limit reached (${this.MAX_ITERATIONS} iterations)`);
       await this.flushPendingGraphScreenshotUploads();
-      return this.buildResult(false, `Step limit reached (${this.MAX_ITERATIONS} iterations)`);
+      return await this.buildResult(false, `Step limit reached (${this.MAX_ITERATIONS} iterations)`);
     } catch (error) {
       logger.error('[LITE_ENGINE] Error in main loop', {
         testId: this.config.testId,
@@ -891,13 +895,14 @@ export class LiteEngine {
 
       this.emitCompletion(false, 'Engine error');
       await this.flushPendingGraphScreenshotUploads();
-      return this.buildResult(false, `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
+      return await this.buildResult(false, `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
   }
 
   /**
    * Emit iteration progress via WebSocket
    * Includes state diff for frontend element highlighting
+   * ✅ FIX: Checks for cancellation/completion before emitting
    */
   private emitIterationProgress(
     iteration: number,
@@ -905,6 +910,14 @@ export class LiteEngine {
     outcome: ActionOutcome,
     diff?: StateDiff
   ): void {
+    // ✅ FIX: Skip if test is cancelled or completed
+    if (this.isTestCompleted || this.isFinalizing) {
+      return;
+    }
+    if (TestRunRegistry.shouldSilenceEvents(this.config.testId)) {
+      return;
+    }
+
     try {
       const progress = Math.round((iteration / this.MAX_ITERATIONS) * 70) + 20;
       const emoji =
@@ -949,9 +962,33 @@ export class LiteEngine {
   }
 
   /**
-   * Emit completion event
+   * Emit finalizing state (progress=95, not 100)
+   * ✅ FIX: progress=100 is now only sent after flush via emitFinalCompletion
    */
   private emitCompletion(success: boolean, reason: string): void {
+    // ✅ FIX: Set isFinalizing flag BEFORE emitting
+    this.isFinalizing = true;
+
+    try {
+      // Emit progress=95 to indicate "finalizing" state (not 100 yet)
+      this.progressEmitter.emit({
+        progress: 95,
+        phase: 'finalization',
+        currentStep: success ? `⏳ Finalizing: ${reason}` : `⏳ Stopping: ${reason}`,
+        status: 'running', // Still running until truly done
+      });
+    } catch (error) {
+      logger.error('[LITE_ENGINE] Failed to emit completion', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Emit final completion (progress=100) AFTER all async operations are done
+   * ✅ NEW: Called from buildResult after flush
+   */
+  private emitFinalCompletion(success: boolean, reason: string): void {
     try {
       this.progressEmitter.emit({
         progress: 100,
@@ -960,7 +997,7 @@ export class LiteEngine {
         status: success ? 'completed' : 'failed',
       });
     } catch (error) {
-      logger.error('[LITE_ENGINE] Failed to emit completion', {
+      logger.error('[LITE_ENGINE] Failed to emit final completion', {
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -1141,46 +1178,22 @@ export class LiteEngine {
     });
   }
 
-  /**
-   * Attach uploaded screenshot URL to errors from a specific iteration.
-   * ✅ Important: screenshotUrl must only be set when the upload is COMPLETE and URL is usable by frontend.
-   */
-  private attachScreenshotUrlToIterationErrors(iteration: number, screenshotUrl: string): void {
-    let attached = 0;
-
-    // Walk backwards to attach to the most recent errors from that iteration.
-    for (let idx = this.collectedErrors.length - 1; idx >= 0; idx--) {
-      const err = this.collectedErrors[idx];
-      if (err.iteration !== iteration) continue;
-      if (err.screenshotUrl) continue;
-
-      err.screenshotUrl = screenshotUrl;
-      attached++;
-
-      // Limit attachments to avoid spamming the same URL across too many entries.
-      if (attached >= 3) break;
-    }
-
-    if (attached > 0) {
-      logger.debug('[LITE_ENGINE] Attached screenshotUrl to iteration errors', {
-        testId: this.config.testId,
-        iteration,
-        attached,
-      });
-    }
-  }
 
   /**
    * Build final test result
    * ✅ NEW: Now includes graphData (like Pro) and Pro-grade errors[]
+   * ✅ FIX: Emits progress=100 AFTER all finalization is complete
+   * ✅ FIX: Captures final page screenshot for results (not during test execution)
    */
-  private buildResult(success: boolean, reason: string): LiteTestResult {
+  private async buildResult(success: boolean, reason: string): Promise<LiteTestResult> {
     const duration = this.startTime > 0 ? Date.now() - this.startTime : 0;
     const iterations = this.state.getIterationCount();
 
+    // ✅ FIX: Clean up cancellation state
+    cleanupCancellationState(this.config.testId);
+
     // ✅ NEW: Add end node to graph and get full graph
-    // ✅ FIX: Start finalization BEFORE emitting endUpdate to prevent late async updates (e.g. screenshot uploads).
-    // We still force-emit the final endUpdate so frontend always receives the final full graph.
+    // ✅ FIX: Finalization flag should already be set by emitCompletion, but ensure it here
     this.isFinalizing = true;
 
     const endUpdate = this.graphBuilder.addEndNode(success, reason, {
@@ -1210,19 +1223,70 @@ export class LiteEngine {
       });
     }
 
+    // ✅ NEW: Capture final page screenshot for results (after test completion)
+    let finalScreenshotUrl: string | undefined;
+    try {
+      if (this.page && !this.page.isClosed()) {
+        const screenshotBuffer = await this.page.screenshot({
+          fullPage: true,
+          type: 'png',
+          timeout: 5000,
+        }).catch(() => null);
+
+        if (screenshotBuffer) {
+          const { uploadScreenshotBufferToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+          finalScreenshotUrl = await uploadScreenshotBufferToStorage(
+            screenshotBuffer,
+            this.config.testId,
+            this.config.userId || 'anonymous',
+            0 // Final screenshot index
+          ).catch(() => undefined);
+
+          if (finalScreenshotUrl) {
+            logger.info('[LITE_ENGINE] Final screenshot captured and uploaded', {
+              testId: this.config.testId,
+              url: finalScreenshotUrl,
+            });
+          }
+        }
+      }
+    } catch (screenshotError) {
+      logger.warn('[LITE_ENGINE] Failed to capture final screenshot', {
+        testId: this.config.testId,
+        error: screenshotError instanceof Error ? screenshotError.message : String(screenshotError),
+      });
+    }
+
     logger.info('[LITE_ENGINE] Building result with errors', {
       testId: this.config.testId,
       success,
       errorCount: this.collectedErrors.length,
       errorTypes: [...new Set(this.collectedErrors.map((e) => e.type))],
+      hasFinalScreenshot: !!finalScreenshotUrl,
     });
+
+    // ✅ FIX: Emit final progress=100 NOW that everything is truly done
+    // This is after flush (called before buildResult) and after endUpdate
+    this.emitFinalCompletion(success, reason);
+
+    // Build screenshots array (only final screenshot for Lite mode)
+    const screenshots: Array<{ url: string; screenshot: string }> = [];
+    if (finalScreenshotUrl) {
+      try {
+        const currentUrl = this.page?.url() || this.config.url;
+        screenshots.push({ url: currentUrl, screenshot: finalScreenshotUrl });
+      } catch {
+        // Fallback to config URL
+        screenshots.push({ url: this.config.url, screenshot: finalScreenshotUrl });
+      }
+    }
 
     return {
       success,
       reason,
       iterations,
       history: this.state.getFormattedHistory(10), // Include last 10 iterations
-      screenshots: this.screenshotCollector.getAll(),
+      screenshots, // ✅ Lite mode: only final screenshot (after completion)
       duration, // Track actual execution time
       errors: this.collectedErrors, // ✅ Pro-grade error collection
       graphData, // ✅ Full graph like Pro
@@ -1277,14 +1341,8 @@ export class LiteEngine {
       // Add action node to graph
       const graphUpdate = this.graphBuilder.addActionNode(dynamicAction, graphResult);
 
-      // Emit the graph update via WebSocket
+      // Emit the graph update via WebSocket (Lite mode - no screenshots)
       this.emitGraphUpdate(graphUpdate);
-
-      // ✅ Async: Upload screenshots and update node meta with URLs
-      const nodeId = graphUpdate.newNode?.id;
-      if (nodeId) {
-        this.pendingGraphScreenshotUploads.push(this.uploadAndUpdateNodeScreenshots(nodeId, iteration));
-      }
     } catch (error) {
       logger.error('[LITE_ENGINE] Failed to add graph action node', {
         testId: this.config.testId,
@@ -1296,166 +1354,34 @@ export class LiteEngine {
   }
 
   /**
-   * Async upload screenshots and update node meta
-   * ✅ NEW: Same pattern as Pro - upload then emit updatedNode
-   * ✅ FIX: Checks isTestCompleted before emitting updates
+   * Best-effort wait for pending operations to finish (no-op for Lite mode - no screenshots)
+   * Kept for API compatibility but does nothing in Lite mode
    */
-  private async uploadAndUpdateNodeScreenshots(nodeId: string, iteration: number): Promise<void> {
-    // ✅ FIX: Skip if test is already completed (prevents late events from async operations)
-    if (this.isTestCompleted || this.isFinalizing) {
-      logger.debug('[LITE_ENGINE] Skipping screenshot upload - test already completed', {
-        testId: this.config.testId,
-        nodeId,
-      });
-      return;
-    }
-
-    // Get screenshot buffers for this iteration
-    const screenshots = this.screenshotCollector.getAll();
-    const beforeScreenshot = screenshots.find(s => s.name === `${iteration}_before`);
-    const afterScreenshot = screenshots.find(s => s.name === `${iteration}_after`);
-
-    if (!beforeScreenshot?.buffer && !afterScreenshot?.buffer) {
-      return; // No screenshots to upload
-    }
-
-    try {
-      const { uploadScreenshotBufferToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-      const testId = this.config.testId;
-      const userId = this.config.userId || 'anonymous';
-
-      const [beforeUrl, afterUrl] = await Promise.all([
-        beforeScreenshot?.buffer
-          ? uploadScreenshotBufferToStorage(beforeScreenshot.buffer, testId, userId, iteration * 2)
-              .catch((e) => {
-                logger.warn('[LITE_ENGINE] Failed to upload screenshotBefore', {
-                  testId,
-                  nodeId,
-                  error: e instanceof Error ? e.message : String(e),
-                });
-                return undefined;
-              })
-          : Promise.resolve(undefined),
-        afterScreenshot?.buffer
-          ? uploadScreenshotBufferToStorage(afterScreenshot.buffer, testId, userId, iteration * 2 + 1)
-              .catch((e) => {
-                logger.warn('[LITE_ENGINE] Failed to upload screenshotAfter', {
-                  testId,
-                  nodeId,
-                  error: e instanceof Error ? e.message : String(e),
-                });
-                return undefined;
-              })
-          : Promise.resolve(undefined),
-      ]);
-
-      // Update node meta with URLs and emit updatedNode
-      if (beforeUrl || afterUrl) {
-        const metaPatch: Record<string, string> = {};
-        if (beforeUrl) metaPatch.screenshotBefore = beforeUrl;
-        if (afterUrl) metaPatch.screenshotAfter = afterUrl;
-
-        // ✅ FIX: Re-check finalization/completion before emitting (test may have finished during upload)
-        if (this.isTestCompleted || this.isFinalizing) {
-          return;
-        }
-
-        const update = this.graphBuilder.updateNodeMeta(nodeId, metaPatch);
-        if (update) {
-          this.emitGraphUpdate(update);
-        }
-      }
-    } catch (error) {
-      logger.error('[LITE_ENGINE] Failed to upload and update node screenshots', {
-        testId: this.config.testId,
-        nodeId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  /**
-   * Best-effort wait for pending screenshot uploads to finish, so graphData has URLs.
-   * Never blocks indefinitely.
-   * ✅ FIX: Enhanced with detailed logging and better error tracking
-   * This is CRITICAL - often tests fail and we lose last screenshots if they didn't upload to S3.
-   * Calling this in finally/timeout blocks ensures we don't lose important debugging data.
-   */
-  private async flushPendingGraphScreenshotUploads(maxWaitMs: number = 15000): Promise<void> {
-    const pending = this.pendingGraphScreenshotUploads.splice(0);
-    if (pending.length === 0) {
-      logger.debug('[LITE_ENGINE] No pending screenshot uploads to flush', {
-        testId: this.config.testId,
-      });
-      return;
-    }
-
-    logger.info('[LITE_ENGINE] Flushing pending screenshot uploads (CRITICAL for debugging)', {
+  private async flushPendingGraphScreenshotUploads(): Promise<void> {
+    // Lite mode has no screenshot uploads - this is a no-op
+    logger.debug('[LITE_ENGINE] No screenshot uploads to flush (Lite mode)', {
       testId: this.config.testId,
-      count: pending.length,
-      maxWaitMs,
-      reason: 'Ensure screenshots are uploaded to S3 before test completion',
     });
-
-    try {
-      let timedOut = false;
-
-      const results = await Promise.race([
-        Promise.allSettled(pending),
-        new Promise<null>((resolve) =>
-          setTimeout(() => {
-            timedOut = true;
-            resolve(null);
-          }, maxWaitMs)
-        ),
-      ]);
-
-      if (timedOut) {
-        logger.warn('[LITE_ENGINE] Flush timed out, some screenshots may not have URLs', {
-          testId: this.config.testId,
-          pendingCount: pending.length,
-          maxWaitMs,
-          impact: 'Graph nodes may be missing screenshot URLs - debugging will be harder',
-        });
-      } else if (results) {
-        const succeeded = results.filter((r) => r.status === 'fulfilled').length;
-        const failed = results.filter((r) => r.status === 'rejected').length;
-
-        if (failed > 0) {
-          logger.warn('[LITE_ENGINE] Some screenshot uploads failed', {
-            testId: this.config.testId,
-            total: pending.length,
-            succeeded,
-            failed,
-            impact: `${failed} graph nodes missing screenshots`,
-          });
-        } else {
-          logger.info('[LITE_ENGINE] All screenshot uploads completed successfully', {
-            testId: this.config.testId,
-            total: pending.length,
-            succeeded,
-          });
-        }
-      }
-    } catch (error) {
-      // Never throw from flush - but log the error for debugging
-      logger.error('[LITE_ENGINE] Unexpected error during flush', {
-        testId: this.config.testId,
-        error: error instanceof Error ? error.message : String(error),
-        pendingCount: pending.length,
-      });
-    }
   }
 
   /**
    * Emit graph update via WebSocket (like Pro)
    * ✅ NEW: Uses emitToUser for user-room delivery
    * ✅ FIX: Prevents emitting after test completion
+   * ✅ FIX: Also checks TestRunRegistry for cancelled/completed state
    */
   private emitGraphUpdate(update: GraphUpdate, options?: { force?: boolean }): void {
     // ✅ FIX: Skip if test is already completed (prevents late events from async operations)
     if (this.isTestCompleted) {
       logger.debug('[LITE_ENGINE] Skipping graph emit - test already completed', {
+        testId: this.config.testId,
+      });
+      return;
+    }
+
+    // ✅ FIX: Check TestRunRegistry for global cancellation/completion
+    if (TestRunRegistry.shouldSilenceEvents(this.config.testId)) {
+      logger.debug('[LITE_ENGINE] Skipping graph emit - registry says silence events', {
         testId: this.config.testId,
       });
       return;
@@ -1493,6 +1419,7 @@ export class LiteEngine {
       const payload = {
         testId: this.config.testId,
         type: normalized.type,
+        mode: 'lite' as const, // ✅ NEW: Indicate Lite mode (no screenshots)
         data: {
           newNode: normalized.newNode,
           newEdge: normalized.newEdge,

@@ -140,7 +140,9 @@ export interface LiteTestResult {
   reason: string;
   iterations: number;
   history: string;
-  screenshots: Array<{ name: string; buffer: Buffer; timestamp: number }>;
+  // ✅ FIX: Screenshots can be either Buffers (during execution) or URLs (after upload)
+  // For Lite mode: only final screenshot URL after completion
+  screenshots: Array<{ url: string; screenshot: string }> | Array<{ name: string; buffer: Buffer; timestamp: number }>;
   duration?: number; // Execution duration in milliseconds
   errors: CollectedError[]; // Pro-grade error collection
   graphData?: {

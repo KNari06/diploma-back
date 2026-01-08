@@ -1,3 +1,4 @@
+import { TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { dbService } from '@/db/supabase';
 import { ApiResponse, NotFoundError, Test, ValidationError } from '@/types';
 import { logger, logTestEvent } from '@/utils/core/logger';
@@ -294,6 +295,18 @@ export async function cancelTest(testId: string, userId?: string): Promise<ApiRe
 
     // Cancel all jobs in queue for this test
     await cancelTestJobs(testId, test.browsers || []);
+
+    // ✅ FIX: Abort test run in current worker process (immediate stop)
+    // This closes BrowserContext and stops video streaming
+    try {
+      await TestRunRegistry.abortTestRun(testId, 'cancelled');
+      logger.info(`[CANCEL_TEST] Aborted test run in current process: ${testId}`);
+    } catch (abortError) {
+      // Test might not be running in this process (runs in worker)
+      logger.debug(`[CANCEL_TEST] No active test run to abort in main process: ${testId}`, {
+        error: abortError instanceof Error ? abortError.message : String(abortError),
+      });
+    }
 
     // Emit WebSocket event
     const { webSocketService } = await import('@/websocket/core/websocket.service');

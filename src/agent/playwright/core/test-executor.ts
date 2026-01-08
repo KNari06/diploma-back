@@ -16,6 +16,7 @@ import { getBrowserWithProgress, setupBrowserContext } from '../setup/browser-se
 import { buildAllHintsWithMetadata } from '../setup/hints-builder';
 import { buildIntelligentTestConfig } from '../setup/test-config-builder';
 import { checkTestCancelled } from '../utils/test-cancellation-checker';
+import { TestRunRegistry } from './test-run-registry';
 
 /**
  * Execute Playwright test
@@ -66,6 +67,12 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       throw new Error('Failed to create page');
     }
 
+    // Register test run in global registry for abort capability
+    TestRunRegistry.register(testData.testId, {
+      context,
+      page,
+    });
+
     // Start video streaming for Chrome (CDP screencast)
     if (testData.browser.toLowerCase().includes('chrome') || testData.browser.toLowerCase().includes('chromium')) {
       try {
@@ -74,6 +81,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
         if (videoStreamService.isActive()) {
           VideoStreamRegistry.register(testData.testId, videoStreamService);
+          // Also update TestRunRegistry with video stream reference
+          TestRunRegistry.update(testData.testId, { videoStreamService });
           logger.info('[PLAYWRIGHT] Video streaming started', {
             testId: testData.testId,
             browser: testData.browser,
@@ -330,6 +339,10 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       return { videoUrl: undefined, traceUrl: undefined };
     });
 
+    // Unregister from TestRunRegistry (successful completion)
+    TestRunRegistry.setCompleted(testData.testId);
+    TestRunRegistry.unregister(testData.testId);
+
     // Format and return result
     return formatTestResult(intelligentResult, {
       videoUrl: uploadedArtifacts.videoUrl,
@@ -346,6 +359,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         testId: testData.testId,
         browser: testData.browser,
       });
+
+      // Mark as cancelled in registry (silences events)
+      TestRunRegistry.setCancelled(testData.testId);
 
       // Stop video streaming on cancellation
       if (videoStreamService?.isActive()) {
@@ -372,6 +388,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Upload artifacts (best-effort)
       const uploadedArtifacts = await uploadArtifacts(testData, artifacts.videoPath, artifacts.tracePath, [])
         .catch(() => ({ videoUrl: undefined, traceUrl: undefined }));
+
+      // Unregister from TestRunRegistry
+      TestRunRegistry.unregister(testData.testId);
 
       return {
         success: false,
@@ -403,6 +422,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       url: testData.url,
       intelligentMode: testData.intelligentMode || false,
     });
+
+    // Mark as completed in registry (silences events)
+    TestRunRegistry.setCompleted(testData.testId);
 
     // Stop video streaming on error
     if (videoStreamService?.isActive()) {
@@ -483,6 +505,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     // Upload artifacts (best-effort)
     const uploadedArtifacts = await uploadArtifacts(testData, artifacts.videoPath, artifacts.tracePath, [])
       .catch(() => ({ videoUrl: undefined, traceUrl: undefined }));
+
+    // Unregister from TestRunRegistry
+    TestRunRegistry.unregister(testData.testId);
 
     return {
       success: false,

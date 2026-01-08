@@ -1,4 +1,5 @@
 import { VideoStreamRegistry } from '@/agent/playwright/artifacts/video-stream-registry';
+import { TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { env } from '@/config/environment/env';
 import { connection, QUEUE_NAMES } from '@/config/infrastructure/queues';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
@@ -232,15 +233,25 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('stalled', async (jobId) => {
     logger.warn(`⚠️ ${workerName} worker stalled job: ${jobId}`);
 
-    // Stop all video streams when a job stalls (to prevent orphaned CDP sessions)
+    // Abort all test runs and stop video streams when a job stalls
     if (workerName === 'TestRun') {
+      const activeRuns = TestRunRegistry.getCount();
       const activeStreams = VideoStreamRegistry.getCount();
-      if (activeStreams > 0) {
-        logger.warn('[WORKER] Stopping video streams due to stalled job', {
+
+      if (activeRuns > 0 || activeStreams > 0) {
+        logger.warn('[WORKER] Aborting test runs due to stalled job', {
           jobId,
+          activeRuns,
           activeStreams,
         });
-        await VideoStreamRegistry.stopAll('stalled');
+
+        // Abort test runs first (this also stops video streams)
+        await TestRunRegistry.abortAll('error');
+
+        // Stop any remaining video streams
+        if (VideoStreamRegistry.getCount() > 0) {
+          await VideoStreamRegistry.stopAll('stalled');
+        }
       }
     }
   });
@@ -280,12 +291,26 @@ const gracefulShutdown = async (signal: string) => {
       aiAnalysisWorker.close(),
       notificationWorker.close(),
       webhookWorker.close(),
-      // Stop all video streams to prevent orphaned CDP sessions
+      // Abort all active test runs (closes contexts, stops video streams)
+      (async () => {
+        try {
+          const activeRuns = TestRunRegistry.getCount();
+          if (activeRuns > 0) {
+            logger.info('[WORKER] Aborting test runs', { activeRuns });
+            await TestRunRegistry.abortAll('shutdown');
+          }
+        } catch (error) {
+          logger.error('[WORKER] Failed to abort test runs', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      })(),
+      // Stop any remaining video streams (as backup)
       (async () => {
         try {
           const activeStreams = VideoStreamRegistry.getCount();
           if (activeStreams > 0) {
-            logger.info('[WORKER] Stopping video streams', { activeStreams });
+            logger.info('[WORKER] Stopping remaining video streams', { activeStreams });
             await VideoStreamRegistry.stopAll('shutdown');
           }
         } catch (error) {
@@ -311,7 +336,7 @@ const gracefulShutdown = async (signal: string) => {
     // Log any failures but continue shutdown
     closeResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'videoStreams', 'browserPool'];
+        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'testRunRegistry', 'videoStreams', 'browserPool'];
         logger.warn(`[WORKER] Failed to close ${workerNames[index]}`, {
           error: result.reason instanceof Error ? result.reason.message : String(result.reason),
         });

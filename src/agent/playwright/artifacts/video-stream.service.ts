@@ -17,6 +17,7 @@ import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import Redis from 'ioredis';
 import { CDPSession, Page } from 'playwright';
+import { TestRunRegistry } from '../core/test-run-registry';
 import { checkTestCancelled } from '../utils/test-cancellation-checker';
 
 // ============================================================================
@@ -324,6 +325,11 @@ export class VideoStreamService {
   }): Promise<void> {
     // Early exit checks
     if (!this.isStreaming || this.isStopped || this.cdpSessionClosed) {
+      return;
+    }
+
+    // ✅ FIX: Check TestRunRegistry for global cancellation/completion (event silencing)
+    if (TestRunRegistry.shouldSilenceEvents(this.testId)) {
       return;
     }
 
