@@ -15,6 +15,11 @@ const MAX_CONSECUTIVE_TIMEOUTS = 3;
 export async function checkTestCancelled(testId: string): Promise<void> {
   // 1. Fast path: Check in-process registry first (immediate, no DB call)
   if (TestRunRegistry.isCancelled(testId)) {
+    // Best-effort: make sure the run is actually aborted (context closed, video stopped)
+    const run = TestRunRegistry.get(testId);
+    if (run && !run.state.isTestCompleted) {
+      await TestRunRegistry.abortTestRun(testId, 'cancelled', 0).catch(() => {});
+    }
     throw new Error(`Test ${testId} was cancelled`);
   }
 
@@ -34,6 +39,8 @@ export async function checkTestCancelled(testId: string): Promise<void> {
     if (test?.status === 'cancelled') {
       // Mark in registry for fast future checks
       TestRunRegistry.setCancelled(testId);
+      // ✅ Red button: abort immediately in THIS worker process (closes context, stops video)
+      await TestRunRegistry.abortTestRun(testId, 'cancelled', 0).catch(() => {});
       throw new Error(`Test ${testId} was cancelled`);
     }
   } catch (error) {

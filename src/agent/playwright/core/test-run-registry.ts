@@ -318,7 +318,27 @@ class TestRunRegistryClass {
     }
 
     // 5. Cleanup
-    this.unregister(testId);
+    // ✅ IMPORTANT: Keep a short-lived tombstone entry for cancelled runs.
+    // This prevents late video/graph emits if some async sources keep running briefly.
+    if (reason === 'cancelled') {
+      const tombstoneCreatedAt = run.createdAt;
+      this.runs.set(testId, {
+        context: null,
+        page: null,
+        videoStreamService: null,
+        state: { ...run.state },
+        createdAt: tombstoneCreatedAt,
+      });
+
+      setTimeout(() => {
+        const current = this.runs.get(testId);
+        if (current && current.createdAt === tombstoneCreatedAt && current.state.isCancelled) {
+          this.unregister(testId);
+        }
+      }, 30000); // 30s tombstone
+    } else {
+      this.unregister(testId);
+    }
 
     logger.info('[TEST_RUN_REGISTRY] Test run aborted successfully', { testId, reason });
   }

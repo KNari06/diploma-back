@@ -40,7 +40,7 @@ const VIDEO_STREAM_CONFIG = {
 
   // Monitoring
   statsInterval: 10000, // ms
-  cancellationCheckInterval: 5000, // ms
+  cancellationCheckInterval: 1000, // ms - faster stop after /cancel
   heartbeatInterval: 30000, // ms - detect stale streams
   lockRenewalInterval: 60000, // ms - renew Redis lock for long tests
 
