@@ -1,20 +1,20 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 import { NavigationRequiresClarificationError } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { requestMissingInformation, runAutonomousExploration } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
-import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
 import { parseAnswers } from '@/services/utils/question-generator.service';
+import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
+import { webSocketService } from '@/websocket/core/websocket.service';
+import { ChatTestUpdatePayload } from '@/websocket/types/types';
 import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
-import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
-import { webSocketService } from '@/websocket/core/websocket.service';
-import { ChatTestUpdatePayload } from '@/websocket/types/types';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -615,7 +615,7 @@ export async function handlePlatformTest(
       emitProcessingStepWithLogging(chatSessionId, 'executing_test', '✅ Test started!', 100);
 
       // Step L8: Save to chat history (non-blocking)
-      const replyMessage = `🚀 **Lite Test Started!**\n\n` +
+      const replyMessage = `🚀 **Test Started in Lite Mode!**\n\n` +
         `I'm testing **${extractedUrl}** right now.\n\n` +
         `**Goal:** ${testGoal}\n\n` +
         `Watch the progress below. I'll navigate dynamically and report any issues I find.\n\n` +

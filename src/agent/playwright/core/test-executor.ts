@@ -9,7 +9,7 @@ import { saveIntelligentTestResults, uploadArtifacts, uploadIntelligentTestScree
 import { collectArtifactsAndCleanup } from '../artifacts/test-cleanup';
 import { formatTestResult } from '../artifacts/test-result-formatter';
 import { VideoStreamRegistry } from '../artifacts/video-stream-registry';
-import { createVideoStreamService, VideoStreamService } from '../artifacts/video-stream.service';
+import { VideoStreamService, createVideoStreamService } from '../artifacts/video-stream.service';
 import { navigateToUrl } from '../execution/navigation-handler';
 import { RequestTracker } from '../execution/request-tracker';
 import { getBrowserWithProgress, setupBrowserContext } from '../setup/browser-setup';
@@ -414,6 +414,60 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       }
     }
 
+    // ✅ FIX: Collect data from page before cleanup (if page is available)
+    // This ensures we save logs, screenshot, DOM even if test failed mid-execution
+    const collectedData: {
+      screenshot?: string;
+      dom?: string;
+      logs: string[];
+      networkLogs: any[];
+    } = {
+      logs: [],
+      networkLogs: [],
+    };
+
+    if (page && !page.isClosed()) {
+      try {
+        // Try to collect screenshot
+        try {
+          const screenshotBuffer = await page.screenshot({
+            fullPage: false,
+            type: 'png',
+          }).catch(() => null);
+          if (screenshotBuffer) {
+            collectedData.screenshot = `data:image/png;base64,${screenshotBuffer.toString('base64')}`;
+            logger.debug('[PLAYWRIGHT] Captured screenshot on error', { testId: testData.testId });
+          }
+        } catch (screenshotError) {
+          logger.debug('[PLAYWRIGHT] Failed to capture screenshot on error', {
+            testId: testData.testId,
+            error: screenshotError instanceof Error ? screenshotError.message : String(screenshotError),
+          });
+        }
+
+        // Try to collect DOM
+        try {
+          collectedData.dom = await page.content().catch(() => '');
+          if (collectedData.dom) {
+            logger.debug('[PLAYWRIGHT] Captured DOM on error', {
+              testId: testData.testId,
+              domLength: collectedData.dom.length,
+            });
+          }
+        } catch (domError) {
+          logger.debug('[PLAYWRIGHT] Failed to capture DOM on error', {
+            testId: testData.testId,
+            error: domError instanceof Error ? domError.message : String(domError),
+          });
+        }
+      } catch (collectError) {
+        logger.debug('[PLAYWRIGHT] Failed to collect data from page on error', {
+          testId: testData.testId,
+          error: collectError instanceof Error ? collectError.message : String(collectError),
+        });
+      }
+    }
+
     // Collect artifacts and cleanup (best-effort)
     let artifacts: { videoPath?: string; tracePath?: string } = {};
     try {
@@ -433,10 +487,10 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     return {
       success: false,
       status: 'failed',
-      screenshot: undefined,
-      dom: '',
-      logs: [],
-      networkLogs: [],
+      screenshot: collectedData.screenshot,
+      dom: collectedData.dom || '',
+      logs: collectedData.logs,
+      networkLogs: collectedData.networkLogs,
       errors: [{
         type: 'other',
         message: error instanceof Error ? error.message : 'Unknown error',

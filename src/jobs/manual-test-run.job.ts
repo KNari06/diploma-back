@@ -10,6 +10,7 @@ import {
   ResultReadyPayload,
   TestBrowserCompletedPayload,
   TestCancelledPayload,
+  TestCompletedPayload,
   TestFailedPayload,
   TestStartedPayload,
 } from '@/websocket/types/types';
@@ -148,6 +149,18 @@ export class ManualTestRunJobHandler {
 
         // Mark test as failed (final failure)
         await this.updateTestStatus(testId, 'failed', browser, undefined, new Date().toISOString());
+
+        // ✅ FIX: Persist failed run data to DB (test_results) so frontend can still load artifacts/logs
+        // This is best-effort and should not block failure handling.
+        try {
+          await this.handleFailedTest(testId, browser, result);
+        } catch (persistError) {
+          logger.error('[TEST-RUN] Failed to persist failed test result', {
+            testId,
+            browser,
+            error: persistError instanceof Error ? persistError.message : String(persistError),
+          });
+        }
 
         // Emit WebSocket events for failure
         this.emitTestFailed(testId, browser, new Error(result.error || 'Test execution failed'));
@@ -412,6 +425,84 @@ export class ManualTestRunJobHandler {
   }
 
   /**
+   * Handle failed test completion
+   * Persists test_results row and emits browser/result events so frontend can fetch data even on failures.
+   *
+   * @param testId - UUID of test
+   * @param browser - Browser name
+   * @param result - Agent result payload
+   */
+  private static async handleFailedTest(testId: string, browser: string, result: any): Promise<void> {
+    logger.info('[TEST-RUN] Persisting failed test result to database', {
+      testId,
+      browser,
+      status: result?.status,
+    });
+
+    // Create test result in database (failed run)
+    const testResultRecord = await dbAdminService.createTestResult({
+      test_id: testId,
+      browser,
+      status: (result?.status || 'failed') as any,
+      screenshot: result?.screenshot,
+      dom: result?.dom,
+      logs: result?.logs || [],
+      network_logs: result?.networkLogs || [],
+      errors: result?.errors || [],
+      performance: result?.performance,
+      completed_at: new Date().toISOString(),
+    });
+
+    if (!testResultRecord || !(testResultRecord as any).id) {
+      throw new Error(`Failed to create failed test result for ${testId} (${browser}) - invalid response from database`);
+    }
+
+    const resultId = (testResultRecord as any).id;
+
+    // Emit WebSocket: browser completed (failed)
+    const browserCompletedPayload: TestBrowserCompletedPayload = {
+      testId,
+      browser,
+      status: 'failed',
+      errorsCount: result?.errors?.length || 0,
+      timestamp: new Date().toISOString(),
+    };
+    webSocketService.emitTestBrowserCompleted(testId, browserCompletedPayload);
+
+    // Emit WebSocket: result ready (so frontend can fetch DB record even on failure)
+    const resultReadyPayload: ResultReadyPayload = {
+      testId,
+      browser,
+      resultId,
+      timestamp: new Date().toISOString(),
+    };
+    webSocketService.emitResultReady(testId, resultReadyPayload);
+
+    // Queue AI analysis (best-effort) - can be helpful even for failures
+    try {
+      await QueueManager.addAIAnalysisJob(resultId, testId);
+    } catch (aiJobError) {
+      logger.error('[TEST-RUN] Failed to queue AI analysis job for failed result', {
+        testId,
+        browser,
+        resultId,
+        error: aiJobError instanceof Error ? aiJobError.message : String(aiJobError),
+      });
+    }
+
+    // Update overall test status (best-effort)
+    try {
+      await ManualTestResultJobHandler.updateOverallTestStatus(testId);
+    } catch (statusError) {
+      logger.error('[TEST-RUN] Failed to update overall test status after failed result', {
+        testId,
+        browser,
+        error: statusError instanceof Error ? statusError.message : String(statusError),
+      });
+    }
+  }
+
+  /**
    * Send failure notification
    */
   private static async sendFailureNotification(testId: string, error: any) {
@@ -548,6 +639,13 @@ export class ManualTestResultJobHandler {
         return;
       }
 
+      // Don't re-run finalization once it's already fully completed.
+      // This prevents duplicate test:completed emits and redundant DB writes.
+      if (test.status === 'completed') {
+        logger.debug(`[TEST-RESULT] Skipping status update for already completed test: ${testId}`);
+        return;
+      }
+
       // Never override cancelled tests
       if (test.status === 'cancelled') {
         logger.info(`[TEST-RESULT] Skipping status update for cancelled test: ${testId}`);
@@ -622,6 +720,24 @@ export class ManualTestResultJobHandler {
         status,
         completed_at: allCompleted ? new Date().toISOString() : undefined,
       });
+
+      // ✅ NEW: Emit test:completed ONLY when final status is truly 'completed'
+      // (failed/cancelled have their own events and may already be emitted earlier).
+      if (allCompleted && status === 'completed') {
+        const completedBrowsers = finalResults.length;
+        const failedBrowsers = latestResults.filter((r: any) => r.status === 'failed').length;
+
+        const payload: TestCompletedPayload = {
+          testId,
+          status: 'completed',
+          totalBrowsers: expectedBrowsersCount,
+          completedBrowsers,
+          failedBrowsers,
+          timestamp: new Date().toISOString(),
+        };
+
+        webSocketService.emitTestCompleted(testId, payload);
+      }
 
       // Email notifications disabled - all data is available in DB via API
       // Real-time updates are sent via WebSocket events (emitTestBrowserCompleted, emitResultReady)
