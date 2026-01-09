@@ -75,8 +75,23 @@ export class ManualTestRunJobHandler {
       throw new TestCancelledError(testId, browser);
     }
 
-    // Check if job was marked for cancellation (via metadata or status)
-    // Note: cancelled flag is not in TestJobData type, but can be checked via test status
+    // ✅ GUARD: Skip if test already finalized (prevents restart on BullMQ retry)
+    // This protects against: stalled job retries, post-processing errors causing retries
+    const existingTest = await dbAdminService.getTest(testId) as any;
+    if (existingTest) {
+      const finalStatuses = ['completed', 'failed', 'cancelled'];
+      if (finalStatuses.includes(existingTest.status)) {
+        logger.info(`[TEST-RUN] Test already finalized, skipping job execution`, {
+          testId,
+          browser,
+          currentStatus: existingTest.status,
+          jobId: job.id,
+          jobAttempts: job.attemptsMade,
+        });
+        // Return without throwing - job completes as no-op
+        return;
+      }
+    }
 
     logger.info(`[TEST-RUN] Processing job for test: ${testId} (${browser})`, {
       hasCommands: !!commands,
@@ -134,7 +149,26 @@ export class ManualTestRunJobHandler {
       });
 
       if (result.success) {
-        await this.handleSuccessfulTest(testId, browser, result);
+        // ✅ FIX: Wrap in try-catch to prevent test restart on post-processing errors
+        // Test execution was successful - errors in result saving should NOT trigger BullMQ retry
+        try {
+          await this.handleSuccessfulTest(testId, browser, result);
+        } catch (postProcessError) {
+          logger.error(`[TEST-RUN] Post-processing failed but test was successful: ${testId}`, {
+            testId,
+            browser,
+            error: postProcessError instanceof Error ? {
+              message: postProcessError.message,
+              name: postProcessError.name,
+            } : String(postProcessError),
+          });
+          // Emit error event for frontend awareness
+          this.emitResultError(testId, browser,
+            postProcessError instanceof Error ? postProcessError : new Error(String(postProcessError))
+          );
+          // ✅ CRITICAL: Don't throw - job completes successfully, test was successful
+          // Post-processing can be retried manually if needed
+        }
       } else {
         // ✅ FIX: Don't throw exception - executePlaywrightTestWithRetry already exhausted all retries
         // Just handle the final failure result
