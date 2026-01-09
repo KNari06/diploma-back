@@ -116,6 +116,114 @@ export class SnapshotCollector {
         // Detect active modal first
         const activeModalRef = detectActiveModal();
 
+        /**
+         * Detect transient state (loading indicators)
+         * Checks for progressbar, aria-busy, aria-live, loading text, spinners
+         * Returns transient state info if page is loading
+         */
+        const detectTransientState = (): { isTransient: boolean; type?: string; ref?: string; text?: string } => {
+          // Loading text patterns (multi-language)
+          const loadingPatterns = [
+            'loading', 'загрузка', 'please wait', 'подождите',
+            'spinner', 'processing', 'обработка', 'loading...',
+            'загружается', 'пожалуйста, подождите'
+          ];
+
+          // 1. Check for role=progressbar
+          const progressbar = document.querySelector('[role="progressbar"]:not([aria-hidden="true"])');
+          if (progressbar) {
+            const style = window.getComputedStyle(progressbar);
+            if (style.display !== 'none' && style.visibility !== 'hidden') {
+              const existingRef = progressbar.getAttribute('data-agent-ref') || `e${win.__agentRefCounter++}`;
+              progressbar.setAttribute('data-agent-ref', existingRef);
+              return { isTransient: true, type: 'progressbar', ref: existingRef };
+            }
+          }
+
+          // 2. Check for aria-busy=true on any element
+          const busyElement = document.querySelector('[aria-busy="true"]');
+          if (busyElement) {
+            const style = window.getComputedStyle(busyElement);
+            if (style.display !== 'none' && style.visibility !== 'hidden') {
+              const existingRef = busyElement.getAttribute('data-agent-ref') || `e${win.__agentRefCounter++}`;
+              busyElement.setAttribute('data-agent-ref', existingRef);
+              return { isTransient: true, type: 'aria-busy', ref: existingRef };
+            }
+          }
+
+          // 3. Check for aria-live regions with "loading" text
+          const liveRegions = document.querySelectorAll('[aria-live]');
+          for (const region of liveRegions) {
+            const text = region.textContent?.toLowerCase() || '';
+            if (loadingPatterns.some(p => text.includes(p))) {
+              const existingRef = region.getAttribute('data-agent-ref') || `e${win.__agentRefCounter++}`;
+              region.setAttribute('data-agent-ref', existingRef);
+              return { isTransient: true, type: 'aria-live', ref: existingRef, text: text.slice(0, 50) };
+            }
+          }
+
+          // 4. Check for skeleton loaders (common pattern)
+          const skeleton = document.querySelector('.skeleton, .skeleton-loader, [data-skeleton], .placeholder-glow');
+          if (skeleton) {
+            const style = window.getComputedStyle(skeleton);
+            if (style.display !== 'none' && style.visibility !== 'hidden') {
+              const existingRef = skeleton.getAttribute('data-agent-ref') || `e${win.__agentRefCounter++}`;
+              skeleton.setAttribute('data-agent-ref', existingRef);
+              return { isTransient: true, type: 'skeleton', ref: existingRef };
+            }
+          }
+
+          // 5. Check for visible spinner elements
+          const spinnerSelectors = '.spinner, .loader, .loading, [class*="spinner"], [class*="loader"], [data-loading]';
+          const spinners = document.querySelectorAll(spinnerSelectors);
+          for (const spinner of spinners) {
+            const style = window.getComputedStyle(spinner);
+            if (style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0.3) {
+              // Check if it has animation (typical for spinners)
+              const animationName = style.animationName;
+              const animationDuration = parseFloat(style.animationDuration);
+              if (animationName && animationName !== 'none' && animationDuration > 0) {
+                const existingRef = spinner.getAttribute('data-agent-ref') || `e${win.__agentRefCounter++}`;
+                spinner.setAttribute('data-agent-ref', existingRef);
+                return { isTransient: true, type: 'spinner', ref: existingRef };
+              }
+            }
+          }
+
+          // 6. Check for loading text in visible elements
+          const allText = document.body?.innerText?.toLowerCase() || '';
+          for (const pattern of loadingPatterns) {
+            if (allText.includes(pattern)) {
+              // Find the element containing this text
+              const walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_TEXT,
+                null
+              );
+              let node: Node | null;
+              while ((node = walker.nextNode())) {
+                if (node.textContent?.toLowerCase().includes(pattern)) {
+                  const parent = node.parentElement;
+                  if (parent) {
+                    const style = window.getComputedStyle(parent);
+                    if (style.display !== 'none' && style.visibility !== 'hidden') {
+                      const existingRef = parent.getAttribute('data-agent-ref') || `e${win.__agentRefCounter++}`;
+                      parent.setAttribute('data-agent-ref', existingRef);
+                      return { isTransient: true, type: 'loading-text', ref: existingRef, text: pattern };
+                    }
+                  }
+                  break;
+                }
+              }
+            }
+          }
+
+          return { isTransient: false };
+        };
+
+        // Detect transient state
+        const transientState = detectTransientState();
+
         // ✅ FIX: Cache modal element for efficient lookup
         const activeModalElement = activeModalRef
           ? document.querySelector(`[data-agent-ref="${activeModalRef}"]`)
@@ -244,12 +352,16 @@ export class SnapshotCollector {
           elements,
           timestamp: Date.now(),
           activeModalRef, // Include detected modal ref
+          transientState, // Include transient state info (loading indicators)
         };
       });
 
       logger.debug('[SNAPSHOT_COLLECTOR] Collected snapshot', {
         url: snapshot.url,
         elementCount: snapshot.elements.length,
+        hasActiveModal: !!snapshot.activeModalRef,
+        isTransient: snapshot.transientState?.isTransient || false,
+        transientType: snapshot.transientState?.type,
       });
 
       return snapshot as LiteSnapshot;

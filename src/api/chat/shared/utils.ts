@@ -148,6 +148,7 @@ export async function getOrCreateChatSession(
 
 /**
  * Emit WebSocket processing step update
+ * ✅ FIX: Added validation to prevent sending events in wrong cases
  */
 export function emitProcessingStep(
   sessionId: string | undefined,
@@ -155,7 +156,42 @@ export function emitProcessingStep(
   message: string,
   progress: number
 ): void {
-  if (!sessionId) return;
+  // ✅ FIX: Skip if no sessionId (can't send to chat room)
+  if (!sessionId) {
+    logger.debug('[CHAT] Skipping emitProcessingStep - no sessionId', { step, message });
+    return;
+  }
+
+  // ✅ FIX: Validate sessionId format (must be UUID)
+  if (!isValidUUID(sessionId)) {
+    logger.warn('[CHAT] Skipping emitProcessingStep - invalid sessionId format', {
+      sessionId: sessionId.substring(0, 20) + '...',
+      step,
+      message,
+    });
+    return;
+  }
+
+  // ✅ FIX: Validate step and message (prevent empty/invalid data)
+  if (!step || !message || typeof message !== 'string' || message.trim().length === 0) {
+    logger.warn('[CHAT] Skipping emitProcessingStep - invalid step or message', {
+      sessionId,
+      step,
+      message: message?.substring(0, 50),
+    });
+    return;
+  }
+
+  // ✅ FIX: Validate progress (must be 0-100)
+  if (typeof progress !== 'number' || progress < 0 || progress > 100 || isNaN(progress)) {
+    logger.warn('[CHAT] Skipping emitProcessingStep - invalid progress', {
+      sessionId,
+      step,
+      message,
+      progress,
+    });
+    return;
+  }
 
   try {
     const payload: ChatProcessingStepPayload = {

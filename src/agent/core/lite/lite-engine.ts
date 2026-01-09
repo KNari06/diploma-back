@@ -15,8 +15,10 @@ import type { Page } from 'playwright';
 import { checkTestCancelled, cleanupCancellationState, withCancellation } from '../../playwright/utils/test-cancellation-checker';
 import { buildSnapshotSummary } from './analysis/ai-goal-evaluator';
 import { GoalDetector } from './analysis/goal-detector';
+import { PlanProgressEvaluator } from './analysis/plan-progress-evaluator';
 import { StateDiffComputer } from './analysis/state-diff';
 import { StateValidator } from './analysis/state-validator';
+import { TaskPlanBuilder, type TaskPlan } from './analysis/task-plan-builder';
 import { ConsoleCollector } from './collectors/console-collector';
 import { ErrorCollector } from './collectors/error-collector';
 import { NetworkTracker } from './collectors/network-tracker';
@@ -25,8 +27,8 @@ import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
-import type { AIDecision, ActionOutcome, CollectedError, ExecutionResult, GoalContext, GoalGuidance, LiteEngineConfig, LiteSnapshot, LiteTestResult, StateDiff } from './lite-types';
-import { LitePromptBuilder } from './prompt/lite-prompt-builder';
+import type { AIDecision, ActionOutcome, CollectedError, ExecutionResult, GoalContext, GoalGuidance, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, StateDiff } from './lite-types';
+import { LitePromptBuilder, type TaskPlanContext, type ValidationErrorContext } from './prompt/lite-prompt-builder';
 
 export class LiteEngine {
   private page: Page;
@@ -75,6 +77,16 @@ export class LiteEngine {
   private lastAuditStateHash: string | null = null;
   private lastAuditUrl: string | null = null;
   private readonly AUDIT_COOLDOWN_ITERATIONS = 3;
+
+  // ✅ NEW (Lite Autonomy v3): Task Plan and Progress
+  private taskPlanBuilder: TaskPlanBuilder | null = null;
+  private planProgressEvaluator: PlanProgressEvaluator | null = null;
+  private currentPlan: TaskPlan | null = null;
+  private lastModalDismissInfo: ModalDismissInfo | null = null;
+  private validationErrorContext: ValidationErrorContext | null = null;
+  private microCorrectionAttempted = false;
+  private transientWaitStartTime: number | null = null;
+  private readonly MAX_TRANSIENT_WAIT_MS = 15000; // 15 seconds max wait for loaders
 
   constructor(page: Page, config: LiteEngineConfig) {
     this.page = page;
@@ -183,6 +195,9 @@ export class LiteEngine {
       });
     }
 
+    // ✅ NEW (Lite Autonomy v3): Initialize Task Plan
+    await this.initializeTaskPlan();
+
     // ✅ NEW: Emit start node to graph (like Pro)
     const startUpdate = this.graphBuilder.addStartNode();
     this.emitGraphUpdate(startUpdate);
@@ -231,6 +246,51 @@ export class LiteEngine {
 
         // 2b. Build GoalContext for this iteration
         const goalContext = this.buildGoalContext(snapshotBefore, i, stuckCheck);
+
+        // ✅ NEW (Lite Autonomy v3): Evaluate task plan progress
+        // Used for guidance and context, but NOT as primary completion criterion
+        if (this.planProgressEvaluator) {
+          const planProgress = this.planProgressEvaluator.evaluate(snapshotBefore);
+
+          // Log plan progress for debugging
+          logger.debug('[LITE_ENGINE] Task plan progress', {
+            testId: this.config.testId,
+            currentStep: planProgress.currentStepIndex + 1,
+            totalSteps: this.currentPlan?.steps.length || 0,
+            stepCompleted: planProgress.stepCompleted,
+            overallProgress: Math.round(planProgress.overallProgress * 100) + '%',
+          });
+
+          // ⚠️ CRITICAL: Don't complete test only by plan - validate with GoalDetector
+          // Task plan might complete before actual goal (e.g., form submitted but validation error)
+          // Instead, use plan completion as a STRONG hint to GoalDetector
+          if (planProgress.planCompleted) {
+            logger.info('[LITE_ENGINE] Task plan reports completion, will validate with GoalDetector', {
+              testId: this.config.testId,
+              totalSteps: this.currentPlan?.steps.length || 0,
+            });
+            // Don't return here - let GoalDetector confirm below
+          }
+
+          // Check for system error from plan evaluation
+          // ⚠️ Only stop for STRONG system errors (500, crash, etc.)
+          if (planProgress.errorType === 'system' && planProgress.failSignals.length > 0) {
+            const errorMsg = planProgress.failSignals.join(', ');
+            logger.warn('[LITE_ENGINE] System error signals detected from plan', {
+              testId: this.config.testId,
+              error: errorMsg,
+            });
+            // Record as error but don't stop - let GoalDetector or AI decide if it's critical
+            this.addError({
+              message: `Potential system error: ${errorMsg}`,
+              page: snapshotBefore.url,
+              type: 'page',
+              iteration: i,
+              timestamp: Date.now(),
+            });
+            // Continue execution - system errors are also caught by ErrorCollector
+          }
+        }
 
         // ✅ NEW: Goal-first check BEFORE asking AI (using heuristic)
         const goalCheck = this.goalDetector.detectHeuristic(goalContext);
@@ -368,6 +428,31 @@ export class LiteEngine {
           }
         }
 
+        // ✅ NEW (Lite Autonomy v3): Handle transient state (loaders/spinners)
+        // If page is loading, skip stuck detection and wait
+        if (snapshotBefore.transientState?.isTransient) {
+          const shouldSkipStuck = await this.handleTransientState(snapshotBefore);
+          if (shouldSkipStuck) {
+            logger.debug('[LITE_ENGINE] Skipping iteration due to transient state', {
+              testId: this.config.testId,
+              transientType: snapshotBefore.transientState.type,
+              iteration: i,
+            });
+            continue;
+          }
+        }
+
+        // ✅ NEW (Lite Autonomy v3): Try micro-correction before expensive stuck recovery
+        if (stuckCheck.stuck && this.state.getConsecutiveStuckCount() >= this.STUCK_THRESHOLD && !this.microCorrectionAttempted) {
+          const corrected = await this.tryMicroCorrection();
+          if (corrected) {
+            logger.info('[LITE_ENGINE] Micro-correction successful, continuing', {
+              testId: this.config.testId,
+            });
+            continue;
+          }
+        }
+
         // ✅ NEW: AI fallback for stuck recovery (when stuck for 2+ iterations)
         if (stuckCheck.stuck && this.state.getConsecutiveStuckCount() >= this.STUCK_THRESHOLD) {
           logger.info('[LITE_ENGINE] Stuck for 2+ iterations, trying AI fallback', {
@@ -447,7 +532,10 @@ export class LiteEngine {
         // ✅ NEW: Get contextual hints from GoalDetector for smarter navigation
         const contextualHints = this.goalDetector.buildContextualHints(snapshotBefore);
 
-        // 4. Build prompt with stuck warning + progress signals + AI guidance + contextual hints
+        // ✅ NEW (Lite Autonomy v3): Build task plan context for prompt
+        const taskPlanContext = this.buildTaskPlanContext(stuckCheck.stuck);
+
+        // 4. Build prompt with stuck warning + progress signals + AI guidance + contextual hints + task plan
         const prompt = LitePromptBuilder.build({
           goal: this.config.goal,
           snapshot: SnapshotCollector.format(snapshotBefore),
@@ -462,6 +550,9 @@ export class LiteEngine {
           guidance: this.currentGuidance || undefined,
           currentIteration: i,
           contextualHints, // ✅ NEW: Pass dynamic hints for entry point exploration
+          taskPlanContext, // ✅ NEW (Lite Autonomy v3): Task plan context
+          modalDismissInfo: this.lastModalDismissInfo || undefined, // ✅ NEW: Modal dismiss info
+          validationErrorContext: this.validationErrorContext || undefined, // ✅ NEW: Validation error context
         });
 
         // 5. Ask AI (returns JSON command, not code)
@@ -644,13 +735,25 @@ export class LiteEngine {
         }
 
         // 6. Execute command (safe switch/case, with fuzzy fallback)
-        // ✅ Pass dynamic entryPointKeywords from AI-generated strategy for modal detection
+        // ✅ Pass dynamic keywords from AI-generated strategy for modal detection + self-healing
         const parsedGoal = this.goalDetector.getParsedGoal();
+        const modalKeywords = this.goalDetector.getModalKeywords();
         const execResult = await this.executor.execute(
           decision.command, // JSON command, not code
           snapshotBefore,
-          { entryPointKeywords: parsedGoal.entryPointKeywords }
+          {
+            entryPointKeywords: parsedGoal.entryPointKeywords,
+            modalKeywords, // ✅ NEW: Pass modal keywords for hybrid auto-dismiss
+          }
         );
+
+        // ✅ NEW (Lite Autonomy v3): Store modal dismiss info for next iteration's prompt
+        this.lastModalDismissInfo = execResult.modalDismissInfo || null;
+
+        // ✅ NEW (Lite Autonomy v3): Handle validation error modal (rollback)
+        if (execResult.modalDismissInfo?.modalType === 'validation') {
+          await this.handleValidationError(execResult.modalDismissInfo, snapshotBefore.url);
+        }
 
         // 7. Wait for stability (with cancellation support)
         // ✅ FIX: Wrap stability waits with cancellation for immediate abort
@@ -1485,5 +1588,246 @@ export class LiteEngine {
     }
 
     return normalized;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NEW (Lite Autonomy v3): Task Plan Methods
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Initialize task plan at the start of the test
+   */
+  private async initializeTaskPlan(): Promise<void> {
+    try {
+      // Get initial snapshot for plan generation
+      const initialSnapshot = await SnapshotCollector.collect(this.page);
+      const snapshotSummary = initialSnapshot.elements
+        .slice(0, 20)
+        .map(el => `${el.tag}[${el.role}]: ${el.name || el.placeholder || ''}`.slice(0, 60));
+
+      // Create task plan builder
+      this.taskPlanBuilder = new TaskPlanBuilder(this.config.goal, this.config.testId);
+
+      // Generate plan
+      this.currentPlan = await this.taskPlanBuilder.generatePlan(
+        this.config.url,
+        snapshotSummary
+      );
+
+      if (this.currentPlan) {
+        // Initialize progress evaluator
+        this.planProgressEvaluator = new PlanProgressEvaluator(
+          this.config.testId,
+          this.currentPlan
+        );
+
+        logger.info('[LITE_ENGINE] Task plan initialized', {
+          testId: this.config.testId,
+          stepsCount: this.currentPlan.steps.length,
+          isAIGenerated: this.currentPlan.isAIGenerated,
+        });
+      }
+    } catch (error) {
+      logger.warn('[LITE_ENGINE] Task plan initialization failed, continuing without plan', {
+        testId: this.config.testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Build task plan context for prompt
+   */
+  private buildTaskPlanContext(isStuck: boolean): TaskPlanContext | undefined {
+    if (!this.currentPlan || !this.planProgressEvaluator) {
+      return undefined;
+    }
+
+    const currentStep = this.planProgressEvaluator.getCurrentStep();
+    const nextStep = this.planProgressEvaluator.getNextStep();
+    const currentStepIndex = this.planProgressEvaluator.getCurrentStepIndex();
+
+    if (!currentStep) {
+      return undefined;
+    }
+
+    return {
+      currentStep,
+      nextStep: nextStep || undefined,
+      currentStepIndex,
+      totalSteps: this.currentPlan.steps.length,
+      isStuckOnStep: isStuck,
+    };
+  }
+
+  // Maximum validation error retries before giving up
+  private readonly MAX_VALIDATION_RETRIES = 3;
+
+  /**
+   * Handle validation error - rollback to previous step
+   * NOTE: Limited retries to avoid infinite loop on SPA edge cases
+   */
+  private async handleValidationError(
+    modalInfo: ModalDismissInfo,
+    currentUrl: string
+  ): Promise<void> {
+    if (!this.planProgressEvaluator) {
+      return;
+    }
+
+    const currentStepIndex = this.planProgressEvaluator.getCurrentStepIndex();
+
+    // Don't rollback if on first step
+    if (currentStepIndex === 0) {
+      logger.debug('[LITE_ENGINE] Validation error on first step, cannot rollback');
+      return;
+    }
+
+    // Track attempt count
+    const newAttemptCount = (this.validationErrorContext?.attemptCount || 0) + 1;
+
+    // Check if we've exceeded max retries (SPA edge case prevention)
+    if (newAttemptCount > this.MAX_VALIDATION_RETRIES) {
+      const deadlockError = modalInfo.modalTextPreview?.slice(0, 100) || 'Repeated validation error';
+
+      logger.warn('[LITE_ENGINE] Logic Deadlock detected - max validation retries exceeded', {
+        testId: this.config.testId,
+        attemptCount: newAttemptCount,
+        maxRetries: this.MAX_VALIDATION_RETRIES,
+        error: deadlockError,
+      });
+
+      // Record as Logic Deadlock in error collection
+      // This indicates: plan too ambitious OR site requires specific data agent doesn't know
+      this.addError({
+        message: `Logic Deadlock: Repeated validation error after ${this.MAX_VALIDATION_RETRIES} attempts. Error: "${deadlockError}". Site may require specific data (valid email, phone, etc.) that agent cannot guess.`,
+        page: currentUrl,
+        type: 'validation', // Use validation type for semantic clarity
+        iteration: this.state.getIterationCount(),
+        timestamp: Date.now(),
+        details: {
+          deadlockType: 'validation_retry_exceeded',
+          attemptCount: newAttemptCount,
+          lastError: deadlockError,
+          stepIndex: currentStepIndex,
+        },
+      });
+
+      // Clear context to stop retry cycle
+      this.validationErrorContext = null;
+      return;
+    }
+
+    // Rollback step in memory
+    const previousStepIndex = currentStepIndex - 1;
+    this.planProgressEvaluator.setCurrentStepIndex(previousStepIndex);
+
+    // Get last known good URL
+    const lastGoodUrl = this.planProgressEvaluator.getLastKnownGoodUrl();
+
+    // Set validation error context for prompt
+    this.validationErrorContext = {
+      errorText: modalInfo.modalTextPreview || 'Validation error',
+      previousStepGoal: this.currentPlan?.steps[previousStepIndex]?.goal,
+      attemptCount: newAttemptCount,
+    };
+
+    // Navigate back to clean state
+    if (lastGoodUrl && lastGoodUrl !== currentUrl) {
+      try {
+        logger.info('[LITE_ENGINE] Rolling back to previous step', {
+          testId: this.config.testId,
+          fromStep: currentStepIndex,
+          toStep: previousStepIndex,
+          navigatingTo: lastGoodUrl,
+        });
+
+        await this.page.goto(lastGoodUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 15000,
+        });
+      } catch (error) {
+        logger.warn('[LITE_ENGINE] Failed to navigate back, trying goBack()', {
+          testId: this.config.testId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+
+        try {
+          await this.page.goBack({ timeout: 10000 });
+        } catch {
+          // Ignore navigation errors
+        }
+      }
+    }
+  }
+
+  /**
+   * Check if page is in transient state and handle accordingly
+   * Returns true if should skip stuck detection
+   */
+  private async handleTransientState(snapshot: LiteSnapshot): Promise<boolean> {
+    if (!snapshot.transientState?.isTransient) {
+      // Reset transient wait tracking
+      this.transientWaitStartTime = null;
+      return false;
+    }
+
+    // Start tracking if not already
+    if (!this.transientWaitStartTime) {
+      this.transientWaitStartTime = Date.now();
+      logger.debug('[LITE_ENGINE] Transient state detected, entering wait mode', {
+        testId: this.config.testId,
+        type: snapshot.transientState.type,
+        ref: snapshot.transientState.ref,
+      });
+    }
+
+    const waitTime = Date.now() - this.transientWaitStartTime;
+
+    // Check if exceeded max wait
+    if (waitTime >= this.MAX_TRANSIENT_WAIT_MS) {
+      logger.warn('[LITE_ENGINE] Transient state exceeded max wait, treating as stuck', {
+        testId: this.config.testId,
+        waitTimeMs: waitTime,
+        maxWaitMs: this.MAX_TRANSIENT_WAIT_MS,
+      });
+      this.transientWaitStartTime = null;
+      return false; // Don't skip stuck detection
+    }
+
+    // Wait and retry
+    await this.page.waitForTimeout(2000);
+    return true; // Skip stuck detection
+  }
+
+  /**
+   * Try micro-correction (page refresh) before expensive plan refine
+   */
+  private async tryMicroCorrection(): Promise<boolean> {
+    if (this.microCorrectionAttempted) {
+      return false; // Only try once per test
+    }
+
+    this.microCorrectionAttempted = true;
+
+    logger.info('[LITE_ENGINE] Trying micro-correction (page refresh)', {
+      testId: this.config.testId,
+    });
+
+    try {
+      await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+      await this.page.waitForTimeout(2000);
+
+      // Reset stuck counter
+      this.state.resetConsecutiveStuckCount();
+
+      return true;
+    } catch (error) {
+      logger.warn('[LITE_ENGINE] Micro-correction failed', {
+        testId: this.config.testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
   }
 }

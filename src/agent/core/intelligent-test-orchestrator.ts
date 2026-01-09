@@ -3948,6 +3948,7 @@ export class IntelligentTestOrchestrator {
       const payload = {
         testId: this.testId,
         type: normalized.type,
+        mode: 'pro' as const, // ✅ Indicate Pro mode (has screenshots)
         data: {
           newNode: normalized.newNode,
           newEdge: normalized.newEdge,

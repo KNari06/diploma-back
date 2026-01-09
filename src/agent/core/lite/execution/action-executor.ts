@@ -7,7 +7,26 @@
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
 import { logger } from '@/utils/core/logger';
 import type { Locator, Page } from 'playwright';
-import type { AICommand, ElementInfo, ExecutionResult, LiteSnapshot } from '../lite-types';
+import type { AICommand, ElementInfo, ExecutionResult, LiteSnapshot, ModalDismissInfo } from '../lite-types';
+
+/**
+ * Modal keywords passed from GoalDetector for classification
+ */
+export interface ModalKeywords {
+  unexpectedModalKeywords: string[];
+  systemErrorKeywords: string[];
+  validationErrorKeywords: string[];
+  goalModalKeywords: string[];
+  goalKeywords: string[];
+}
+
+/**
+ * Execution options including modal keywords
+ */
+export interface ExecuteOptions {
+  entryPointKeywords?: string[];
+  modalKeywords?: ModalKeywords;
+}
 
 export class ActionExecutor {
   private page: Page;
@@ -31,15 +50,16 @@ export class ActionExecutor {
    *
    * @param command - Structured AI command
    * @param snapshot - Current page snapshot for fallback
-   * @param options - Optional execution options (e.g., entryPointKeywords from AI strategy)
-   * @returns Execution result with fallback info
+   * @param options - Optional execution options (e.g., entryPointKeywords, modalKeywords from AI strategy)
+   * @returns Execution result with fallback info and modal dismiss info
    */
   async execute(
     command: AICommand,
     snapshot: LiteSnapshot,
-    options?: { entryPointKeywords?: string[] }
+    options?: ExecuteOptions
   ): Promise<ExecutionResult> {
     const startTime = Date.now();
+    let modalDismissInfo: ModalDismissInfo | undefined;
 
     // Build element lookup map for fallback
     snapshot.elements.forEach((el) => {
@@ -59,9 +79,14 @@ export class ActionExecutor {
       // Execute command
       await this.executeCommand(command);
 
-      // ✅ NEW: After click on entry point, wait for modal to appear and stabilize
+      // ✅ NEW: After click, check for unexpected modal and try to dismiss (Lite Autonomy v3)
+      if (command.action === 'click' && options?.modalKeywords) {
+        modalDismissInfo = await this.handleUnexpectedModal(options.modalKeywords);
+      }
+
+      // ✅ LEGACY: After click on entry point, wait for modal to appear and stabilize
       // Uses dynamic keywords from AI strategy (no hardcoded keywords)
-      if (command.action === 'click' && command.ref) {
+      if (command.action === 'click' && command.ref && !modalDismissInfo?.attempted) {
         const elementInfo = this.elementMap.get(command.ref);
         const dynamicKeywords = options?.entryPointKeywords || [];
         if (elementInfo && this.isEntryPointElement(elementInfo.text || '', dynamicKeywords)) {
@@ -77,12 +102,16 @@ export class ActionExecutor {
       logger.info('[ACTION_EXECUTOR] Command executed successfully', {
         action: command.action,
         ref: command.ref,
+        modalDismissAttempted: modalDismissInfo?.attempted || false,
+        modalDismissed: modalDismissInfo?.dismissed || false,
       });
 
       return {
         success: true,
         duration: Date.now() - startTime,
         startTime,
+        modalDismissInfo,
+        usedForceClick: false, // Primary execution never uses force
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -95,10 +124,11 @@ export class ActionExecutor {
 
       // Try fallback for element-based actions
       if (this.isNotFoundError(errorMsg) && command.ref) {
-        const fallback = await this.tryFuzzyFallback(command);
+        const fallback = await this.tryFuzzyFallback(command, options);
         if (fallback.success) {
           logger.info('[ACTION_EXECUTOR] Fallback successful', {
             info: fallback.info,
+            usedForceClick: fallback.usedForceClick,
           });
           return {
             success: true,
@@ -106,6 +136,8 @@ export class ActionExecutor {
             startTime,
             usedFallback: true,
             fallbackInfo: fallback.info,
+            modalDismissInfo: fallback.modalDismissInfo,
+            usedForceClick: fallback.usedForceClick,
           };
         }
       }
@@ -120,6 +152,7 @@ export class ActionExecutor {
         error: errorMsg,
         duration: Date.now() - startTime,
         startTime,
+        modalDismissInfo,
       };
     }
   }
@@ -281,10 +314,17 @@ export class ActionExecutor {
   /**
    * Fuzzy fallback: find element by attributes if ref not found
    * Priority: placeholder → aria-label → text content → role+name
+   * NEW: Includes staged self-healing and modal handling
    */
   private async tryFuzzyFallback(
-    cmd: AICommand
-  ): Promise<{ success: boolean; info?: string }> {
+    cmd: AICommand,
+    options?: ExecuteOptions
+  ): Promise<{
+    success: boolean;
+    info?: string;
+    usedForceClick?: boolean;
+    modalDismissInfo?: ModalDismissInfo;
+  }> {
     const el = this.elementMap.get(cmd.ref!);
     if (!el) {
       return { success: false };
@@ -346,12 +386,20 @@ export class ActionExecutor {
       try {
         const count = await strategy.locator.count();
         if (count > 0) {
-          // Execute the original action on found element
-          await this.executeFallbackAction(cmd, strategy.locator);
+          // Execute the original action on found element with staged self-healing
+          const result = await this.executeFallbackActionWithSelfHealing(cmd, strategy.locator, options);
+
+          // Handle modal after successful click
+          let modalDismissInfo: ModalDismissInfo | undefined;
+          if (cmd.action === 'click' && options?.modalKeywords) {
+            modalDismissInfo = await this.handleUnexpectedModal(options.modalKeywords);
+          }
 
           return {
             success: true,
             info: `Ref ${cmd.ref} stale, found by ${strategy.name}: "${el.text?.slice(0, 30)}"`,
+            usedForceClick: result.usedForceClick,
+            modalDismissInfo,
           };
         }
       } catch (fallbackError) {
@@ -367,26 +415,27 @@ export class ActionExecutor {
   }
 
   /**
-   * Execute action on fallback locator
-   * ✅ FIX: Uses force: true for clicks to handle overlapping elements
+   * Execute action on fallback locator with staged self-healing
+   * NEW: Staged approach instead of force-default
+   * 1. Try normal click
+   * 2. If intercepted → try dismiss modal
+   * 3. If still intercepted → try scroll offset
+   * 4. If still intercepted → try wait (transient overlay)
+   * 5. Last resort → force click (and log it)
    */
-  private async executeFallbackAction(cmd: AICommand, locator: Locator): Promise<void> {
+  private async executeFallbackActionWithSelfHealing(
+    cmd: AICommand,
+    locator: Locator,
+    options?: ExecuteOptions
+  ): Promise<{ usedForceClick: boolean }> {
+    let usedForceClick = false;
+
     switch (cmd.action) {
       case 'click':
-        // ✅ FIX: First try normal click, then try with force if it fails
-        try {
-          await locator.click({ timeout: this.FALLBACK_TIMEOUT });
-        } catch (error) {
-          logger.debug('[ACTION_EXECUTOR] Normal fallback click failed, trying force click', {
-            error: error instanceof Error ? error.message : String(error),
-          });
-          // Force click at element coordinates even if obscured by overlay
-          await locator.click({ timeout: this.FALLBACK_TIMEOUT, force: true });
-        }
+        usedForceClick = await this.stagedClickWithSelfHealing(locator, options);
         break;
       case 'fill':
         if (cmd.value) {
-          // ✅ FIX: Use same pressSequentially() logic as primary execution
           try {
             await locator.clear({ timeout: this.FALLBACK_TIMEOUT });
             await locator.pressSequentially(cmd.value, {
@@ -420,6 +469,94 @@ export class ActionExecutor {
       default:
         throw new Error(`Fallback not supported for action: ${cmd.action}`);
     }
+
+    return { usedForceClick };
+  }
+
+  /**
+   * Staged click with self-healing (Lite Autonomy v3)
+   * Tries multiple strategies before falling back to force click
+   */
+  private async stagedClickWithSelfHealing(
+    locator: Locator,
+    options?: ExecuteOptions
+  ): Promise<boolean> {
+    // Stage 1: Normal click
+    try {
+      await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+      return false; // No force needed
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+
+      // If not an interception error, re-throw
+      if (!this.isInterceptedError(errorMsg)) {
+        throw error;
+      }
+
+      logger.debug('[ACTION_EXECUTOR] Click intercepted, starting self-healing', {
+        error: errorMsg.slice(0, 100),
+      });
+    }
+
+    // Stage 2: Try to dismiss modal if present
+    if (options?.modalKeywords) {
+      const dismissResult = await this.handleUnexpectedModal(options.modalKeywords);
+      if (dismissResult.dismissed) {
+        logger.info('[ACTION_EXECUTOR] Modal dismissed, retrying click');
+        try {
+          await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+          return false;
+        } catch {
+          // Continue to next stage
+        }
+      }
+    }
+
+    // Stage 3: Try scroll offset (for sticky headers)
+    try {
+      await this.page.evaluate(() => {
+        // @ts-expect-error
+        window.scrollBy(0, -150); // Scroll up to reveal element
+      });
+      await this.page.waitForTimeout(200);
+      await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+      logger.info('[ACTION_EXECUTOR] Click successful after scroll offset');
+      return false;
+    } catch {
+      // Continue to next stage
+    }
+
+    // Stage 4: Brief wait (for transient overlays)
+    try {
+      await this.page.waitForTimeout(1000);
+      await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+      logger.info('[ACTION_EXECUTOR] Click successful after brief wait');
+      return false;
+    } catch {
+      // Continue to force click
+    }
+
+    // Stage 5: Force click (last resort)
+    logger.warn('[ACTION_EXECUTOR] All self-healing attempts failed, using force click');
+    await locator.click({ timeout: this.FALLBACK_TIMEOUT, force: true });
+    return true; // Force was used
+  }
+
+  /**
+   * Check if error indicates element is intercepted/obscured
+   */
+  private isInterceptedError(msg: string): boolean {
+    const interceptedIndicators = [
+      'intercept',
+      'obscured',
+      'covered',
+      'overlapping',
+      'other element',
+      'receives pointer',
+    ];
+
+    const msgLower = msg.toLowerCase();
+    return interceptedIndicators.some((indicator) => msgLower.includes(indicator));
   }
 
   /**
@@ -450,6 +587,332 @@ export class ActionExecutor {
     if (keywords.length === 0) return false; // No keywords = no modal wait
     const textLower = text.toLowerCase();
     return keywords.some(keyword => textLower.includes(keyword.toLowerCase()));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HYBRID MODAL HANDLING (Lite Autonomy v3)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Handle unexpected modal after click (hybrid approach)
+   * 1. Detect modal
+   * 2. Classify: system error / validation error / unexpected / goal-relevant
+   * 3. Auto-dismiss if unexpected (Escape first, then safe close button)
+   * 4. Return info for AI if still present
+   */
+  private async handleUnexpectedModal(keywords: ModalKeywords): Promise<ModalDismissInfo> {
+    // Small delay for modal to appear
+    await this.page.waitForTimeout(500);
+
+    // Detect modal and get its text
+    const modalInfo = await this.detectActiveModalWithText();
+
+    if (!modalInfo.hasModal) {
+      return { attempted: false, dismissed: false, stillPresent: false };
+    }
+
+    const modalText = modalInfo.text || '';
+    const modalTextLower = modalText.toLowerCase();
+
+    logger.debug('[ACTION_EXECUTOR] Modal detected after click', {
+      ref: modalInfo.ref,
+      textPreview: modalText.slice(0, 100),
+    });
+
+    // Classify modal
+    const modalType = this.classifyModal(modalTextLower, keywords);
+
+    logger.info('[ACTION_EXECUTOR] Modal classified', {
+      type: modalType,
+      ref: modalInfo.ref,
+    });
+
+    // Handle based on classification
+    if (modalType === 'system') {
+      // System error - don't try to dismiss, report as error
+      return {
+        attempted: false,
+        dismissed: false,
+        stillPresent: true,
+        modalType: 'system',
+        reason: 'System error detected - test should fail',
+        modalTextPreview: modalText.slice(0, 150),
+      };
+    }
+
+    if (modalType === 'validation') {
+      // Validation error - don't dismiss, report for rollback
+      return {
+        attempted: false,
+        dismissed: false,
+        stillPresent: true,
+        modalType: 'validation',
+        reason: 'Validation error - rollback to previous step',
+        modalTextPreview: modalText.slice(0, 150),
+      };
+    }
+
+    if (modalType === 'goal') {
+      // Goal-relevant modal - don't dismiss
+      return {
+        attempted: false,
+        dismissed: false,
+        stillPresent: true,
+        modalType: 'goal',
+        reason: 'Modal is relevant to goal - do not dismiss',
+        modalTextPreview: modalText.slice(0, 150),
+      };
+    }
+
+    // modalType === 'unexpected' - try to dismiss
+    logger.info('[ACTION_EXECUTOR] Attempting to dismiss unexpected modal', {
+      ref: modalInfo.ref,
+    });
+
+    // Step 1: Try Escape
+    const escapeDismissed = await this.tryDismissWithEscape();
+    if (escapeDismissed) {
+      return {
+        attempted: true,
+        dismissed: true,
+        stillPresent: false,
+        method: 'escape',
+        modalType: 'unexpected',
+        reason: 'Dismissed unexpected modal with Escape',
+      };
+    }
+
+    // Step 2: Try safe close button
+    const buttonDismissed = await this.tryDismissWithSafeButton();
+    if (buttonDismissed) {
+      return {
+        attempted: true,
+        dismissed: true,
+        stillPresent: false,
+        method: 'button',
+        modalType: 'unexpected',
+        reason: 'Dismissed unexpected modal with close button',
+      };
+    }
+
+    // Could not dismiss - return info for AI
+    return {
+      attempted: true,
+      dismissed: false,
+      stillPresent: true,
+      method: 'none',
+      modalType: 'unexpected',
+      reason: 'Tried Escape and safe close button, modal still present',
+      modalTextPreview: modalText.slice(0, 150),
+    };
+  }
+
+  /**
+   * Detect active modal and get its text content
+   */
+  private async detectActiveModalWithText(): Promise<{
+    hasModal: boolean;
+    ref?: string;
+    text?: string;
+  }> {
+    return await this.page.evaluate(() => {
+      // Find potential modals
+      const potentialModals = Array.from(document.querySelectorAll('*')).filter((el: Element) => {
+        const style = window.getComputedStyle(el);
+        if (style.position !== 'fixed' && style.position !== 'absolute') return false;
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (parseFloat(style.opacity) < 0.1) return false;
+
+        const zIndex = parseInt(style.zIndex, 10);
+        if (isNaN(zIndex) || zIndex < 1) return false;
+
+        return true;
+      });
+
+      if (potentialModals.length === 0) return { hasModal: false };
+
+      // Find highest z-index modal
+      let bestModal: Element | null = null;
+      let highestZIndex = 0;
+
+      for (const modal of potentialModals) {
+        const style = window.getComputedStyle(modal);
+        const zIndex = parseInt(style.zIndex, 10);
+        const rect = modal.getBoundingClientRect();
+
+        // @ts-expect-error
+        const viewportArea = window.innerWidth * window.innerHeight;
+        const modalArea = rect.width * rect.height;
+        const coverage = modalArea / viewportArea;
+
+        const hasModalRole = modal.getAttribute('role') === 'dialog' ||
+                             modal.getAttribute('aria-modal') === 'true' ||
+                             modal.classList.contains('modal') ||
+                             modal.classList.contains('overlay') ||
+                             modal.classList.contains('popup');
+
+        const isModal = (hasModalRole && coverage > 0.1) || coverage > 0.3;
+
+        if (isModal && zIndex > highestZIndex) {
+          highestZIndex = zIndex;
+          bestModal = modal;
+        }
+      }
+
+      if (!bestModal) return { hasModal: false };
+
+      const ref = bestModal.getAttribute('data-agent-ref') || undefined;
+      const text = bestModal.textContent?.trim().slice(0, 500) || '';
+
+      return { hasModal: true, ref, text };
+    });
+  }
+
+  /**
+   * Classify modal based on text content and keywords
+   */
+  private classifyModal(
+    modalTextLower: string,
+    keywords: ModalKeywords
+  ): 'system' | 'validation' | 'unexpected' | 'goal' {
+    // 1. Check for system errors first (highest priority)
+    const hasSystemError = keywords.systemErrorKeywords.some(
+      kw => modalTextLower.includes(kw.toLowerCase())
+    );
+    if (hasSystemError) return 'system';
+
+    // 2. Check for validation errors
+    const hasValidationError = keywords.validationErrorKeywords.some(
+      kw => modalTextLower.includes(kw.toLowerCase())
+    );
+    if (hasValidationError) return 'validation';
+
+    // 3. Check if modal is goal-relevant (don't dismiss)
+    const isGoalRelevant = keywords.goalKeywords.some(
+      kw => modalTextLower.includes(kw.toLowerCase())
+    );
+    if (isGoalRelevant) return 'goal';
+
+    // 4. Check for unexpected/interruption keywords
+    const isUnexpected = keywords.unexpectedModalKeywords.some(
+      kw => modalTextLower.includes(kw.toLowerCase())
+    );
+    if (isUnexpected) return 'unexpected';
+
+    // Default: if modal appeared after click but doesn't match any pattern,
+    // treat as unexpected (safer to try dismiss)
+    return 'unexpected';
+  }
+
+  /**
+   * Try to dismiss modal with Escape key
+   * Returns true if modal was dismissed
+   */
+  private async tryDismissWithEscape(): Promise<boolean> {
+    await this.page.keyboard.press('Escape');
+    await this.page.waitForTimeout(500);
+
+    // Check if modal is still present
+    const stillPresent = await this.isModalStillPresent();
+    return !stillPresent;
+  }
+
+  /**
+   * Try to dismiss modal with safe close button
+   * Uses minimal keyword list for close buttons
+   */
+  private async tryDismissWithSafeButton(): Promise<boolean> {
+    // Close button patterns (minimal, safe list)
+    const closePatterns = [
+      'close', 'закрыть', 'dismiss', 'accept', 'agree',
+      'ok', 'понятно', 'allow', 'consent', 'got it', 'accept all',
+      '×', 'x', '✕', '✖'
+    ];
+
+    try {
+      // Find close button inside modal or at high z-index
+      const closeButton = await this.page.evaluate((patterns) => {
+        // Find buttons/links that match close patterns
+        const candidates = Array.from(document.querySelectorAll(
+          'button, a, [role="button"], [aria-label*="close" i], [aria-label*="dismiss" i]'
+        )).filter((el: Element) => {
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden') return false;
+          if (parseFloat(style.opacity) < 0.3) return false;
+
+          // Get text content and aria-label
+          const text = (el.textContent?.trim() || '').toLowerCase();
+          const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+          const title = (el.getAttribute('title') || '').toLowerCase();
+
+          // Check if matches any close pattern
+          return patterns.some(p =>
+            text.includes(p.toLowerCase()) ||
+            ariaLabel.includes(p.toLowerCase()) ||
+            title.includes(p.toLowerCase())
+          );
+        });
+
+        if (candidates.length === 0) return null;
+
+        // Score candidates (prefer aria-label matches and smaller buttons)
+        let bestCandidate: Element | null = null;
+        let bestScore = 0;
+
+        for (const candidate of candidates) {
+          let score = 0;
+          const ariaLabel = (candidate.getAttribute('aria-label') || '').toLowerCase();
+          const text = (candidate.textContent?.trim() || '').toLowerCase();
+
+          // Prefer aria-label with "close"
+          if (ariaLabel.includes('close') || ariaLabel.includes('закрыть')) score += 3;
+
+          // Prefer short text (likely just X or icon)
+          if (text.length <= 3) score += 2;
+
+          // Prefer role="button"
+          if (candidate.getAttribute('role') === 'button') score += 1;
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestCandidate = candidate;
+          }
+        }
+
+        if (bestCandidate) {
+          const ref = bestCandidate.getAttribute('data-agent-ref');
+          return ref || null;
+        }
+
+        return null;
+      }, closePatterns);
+
+      if (!closeButton) {
+        logger.debug('[ACTION_EXECUTOR] No close button found in modal');
+        return false;
+      }
+
+      // Click the close button
+      await this.page.locator(`[data-agent-ref="${closeButton}"]`).click({ timeout: 3000 });
+      await this.page.waitForTimeout(500);
+
+      // Check if modal is still present
+      const stillPresent = await this.isModalStillPresent();
+      return !stillPresent;
+    } catch (error) {
+      logger.debug('[ACTION_EXECUTOR] Failed to click close button', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Check if modal is still present
+   */
+  private async isModalStillPresent(): Promise<boolean> {
+    const modalInfo = await this.detectActiveModalWithText();
+    return modalInfo.hasModal;
   }
 
   /**

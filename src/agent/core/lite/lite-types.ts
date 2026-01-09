@@ -22,6 +22,20 @@ export interface LiteElement {
 }
 
 /**
+ * Transient state info (loading indicators)
+ */
+export interface TransientStateInfo {
+  /** Whether page is in transient/loading state */
+  isTransient: boolean;
+  /** Type of indicator detected */
+  type?: 'progressbar' | 'aria-busy' | 'aria-live' | 'loading-text' | 'spinner' | 'skeleton';
+  /** Ref of the loading indicator element */
+  ref?: string;
+  /** Text content of loading indicator (if any) */
+  text?: string;
+}
+
+/**
  * Snapshot of page state at a point in time
  */
 export interface LiteSnapshot {
@@ -30,6 +44,8 @@ export interface LiteSnapshot {
   elements: LiteElement[];
   timestamp: number;
   activeModalRef?: string; // Ref of active modal container (if detected)
+  /** Transient state info (loading indicators) - NEW: Lite Autonomy v3 */
+  transientState?: TransientStateInfo;
 }
 
 /**
@@ -61,6 +77,26 @@ export type ActionOutcome =
   | 'rate_limited';      // HTTP 429 / rate limiting detected - should back off and wait
 
 /**
+ * Modal dismiss attempt result
+ */
+export interface ModalDismissInfo {
+  /** Whether dismissal was attempted */
+  attempted: boolean;
+  /** Whether modal was successfully dismissed */
+  dismissed: boolean;
+  /** Whether modal is still present after attempts */
+  stillPresent: boolean;
+  /** Method used for dismissal (if attempted) */
+  method?: 'escape' | 'button' | 'none';
+  /** Classification of the modal */
+  modalType?: 'system' | 'validation' | 'unexpected' | 'goal';
+  /** Reason for the attempt */
+  reason?: string;
+  /** Preview of modal text (for AI context) */
+  modalTextPreview?: string;
+}
+
+/**
  * Result of action execution with fallback info
  */
 export interface ExecutionResult {
@@ -70,6 +106,10 @@ export interface ExecutionResult {
   startTime: number;
   usedFallback?: boolean;
   fallbackInfo?: string;
+  /** Modal dismiss attempt info (Lite Autonomy v3) */
+  modalDismissInfo?: ModalDismissInfo;
+  /** Whether force click was used (for QA tracking) */
+  usedForceClick?: boolean;
 }
 
 /**

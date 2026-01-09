@@ -6,7 +6,28 @@
 
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
-import type { AIDecision, GoalGuidance, StuckCheck } from '../lite-types';
+import type { AIDecision, GoalGuidance, ModalDismissInfo, StuckCheck } from '../lite-types';
+import type { TaskPlanStep } from '../analysis/task-plan-builder';
+
+/**
+ * Task plan context for prompt
+ */
+export interface TaskPlanContext {
+  currentStep: TaskPlanStep;
+  nextStep?: TaskPlanStep;
+  currentStepIndex: number;
+  totalSteps: number;
+  isStuckOnStep?: boolean;
+}
+
+/**
+ * Validation error context for prompt
+ */
+export interface ValidationErrorContext {
+  errorText: string;
+  previousStepGoal?: string;
+  attemptCount: number;
+}
 
 /**
  * Options for askJson calls
@@ -51,6 +72,12 @@ export class LitePromptBuilder {
     currentIteration?: number;
     /** ✅ NEW: Contextual hints from GoalDetector */
     contextualHints?: string[];
+    /** ✅ NEW (Lite Autonomy v3): Task plan context */
+    taskPlanContext?: TaskPlanContext;
+    /** ✅ NEW (Lite Autonomy v3): Modal dismiss info from last action */
+    modalDismissInfo?: ModalDismissInfo;
+    /** ✅ NEW (Lite Autonomy v3): Validation error context for rollback */
+    validationErrorContext?: ValidationErrorContext;
   }): string {
     // ✅ FIX: Truncate snapshot if too large (prevent token overflow)
     const MAX_SNAPSHOT_LENGTH = 100_000; // 100k chars (~25k tokens)
@@ -94,6 +121,15 @@ ${params.progressSignals.progressScore >= 0.5 ? '→ Getting close to goal! Look
       ? `\nCONTEXTUAL HINTS:\n${params.contextualHints.join('\n')}\n`
       : '';
 
+    // ✅ NEW (Lite Autonomy v3): Build task plan section
+    const taskPlanSection = LitePromptBuilder.buildTaskPlanSection(params.taskPlanContext);
+
+    // ✅ NEW (Lite Autonomy v3): Build modal dismiss info section
+    const modalDismissSection = LitePromptBuilder.buildModalDismissSection(params.modalDismissInfo);
+
+    // ✅ NEW (Lite Autonomy v3): Build validation error section
+    const validationErrorSection = LitePromptBuilder.buildValidationErrorSection(params.validationErrorContext);
+
     // Build complete prompt with JSON-only response format
     return `You are a browser automation agent testing a web application.
 Your job is to REACH THE TARGET STATE through intermediate steps. Navigation is expected.
@@ -102,7 +138,7 @@ GOAL: ${params.goal}
 
 CURRENT PAGE:
 ${snapshot}
-${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}
+${taskPlanSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${modalDismissSection}${validationErrorSection}
 HISTORY:
 ${params.history}
 
@@ -129,6 +165,7 @@ IMPORTANT RULES:
 9. For multi-step forms: "Continue/Продолжить" button = step forward (keep going), "Register/Finish/Зарегистрироваться" = final step
 10. For Registration goal: If you see only "Login/Вход" form, look for "Register/Зарегистрироваться" toggle inside it - don't give up!
 11. ✅ EXPLORATION RULE: If your target form (e.g., registration, checkout) is not visible, look for entry points like "Login/Вход", "Profile/Профиль", "Account/Кабинет", or a user icon. Clicking these is a VALID and often NECESSARY step to reach your goal.
+12. ✅ MODAL HANDLING: If ACTIVE_MODAL appears and blocks your goal, first try "press Escape", then look for close/dismiss buttons inside the modal. If modal contains your goal form, interact with it instead of dismissing.
 
 RESPONSE FORMAT (JSON ONLY):
 {
@@ -344,6 +381,112 @@ What should the agent do next? Respond with JSON:
     const GUIDANCE_MAX_LIFETIME = 2;
     const age = currentIteration - guidance.addedAtIteration;
     return age <= GUIDANCE_MAX_LIFETIME;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NEW (Lite Autonomy v3): Task Plan and Modal Sections
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build task plan section for prompt
+   * Shows current step, next step, and progress through plan
+   */
+  private static buildTaskPlanSection(context?: TaskPlanContext): string {
+    if (!context) {
+      return '';
+    }
+
+    let section = '\n📋 TASK PLAN:\n';
+    section += `Step ${context.currentStepIndex + 1}/${context.totalSteps}: ${context.currentStep.goal}\n`;
+
+    // Expected state
+    if (context.currentStep.expected_state.url_regex && context.currentStep.expected_state.url_regex !== '.*') {
+      section += `  Expected URL: matches ${context.currentStep.expected_state.url_regex}\n`;
+    }
+    if (context.currentStep.expected_state.required_text.length > 0) {
+      section += `  Look for: ${context.currentStep.expected_state.required_text.join(', ')}\n`;
+    }
+
+    // Next step preview
+    if (context.nextStep) {
+      section += `→ Next: ${context.nextStep.goal}\n`;
+    } else {
+      section += `→ This is the FINAL step!\n`;
+    }
+
+    // Stuck warning
+    if (context.isStuckOnStep) {
+      section += `⚠️ STUCK on this step! Try a different approach.\n`;
+    }
+
+    return section;
+  }
+
+  /**
+   * Build modal dismiss info section
+   * Informs AI about auto-dismiss attempts and remaining modals
+   */
+  private static buildModalDismissSection(info?: ModalDismissInfo): string {
+    if (!info || !info.attempted) {
+      return '';
+    }
+
+    if (info.dismissed) {
+      return `\n✅ Auto-dismissed unexpected modal (method: ${info.method})\n`;
+    }
+
+    if (info.stillPresent) {
+      let section = `\n⚠️ MODAL STILL PRESENT:\n`;
+      section += `Type: ${info.modalType || 'unknown'}\n`;
+      if (info.reason) {
+        section += `Tried: ${info.reason}\n`;
+      }
+      if (info.modalTextPreview) {
+        section += `Modal content: "${info.modalTextPreview.slice(0, 100)}..."\n`;
+      }
+
+      // Provide guidance based on modal type
+      if (info.modalType === 'system') {
+        section += `→ This is a SYSTEM ERROR. Report as blocked if cannot proceed.\n`;
+      } else if (info.modalType === 'validation') {
+        section += `→ This is a VALIDATION ERROR. Try different input or approach.\n`;
+      } else {
+        section += `→ Find a way to close this modal or interact with it.\n`;
+      }
+
+      return section;
+    }
+
+    return '';
+  }
+
+  /**
+   * Build validation error section
+   * Provides context when we rolled back to previous step due to validation error
+   * NOTE: On repeated errors, gives strict instruction to change input values (SPA edge case)
+   */
+  private static buildValidationErrorSection(context?: ValidationErrorContext): string {
+    if (!context) {
+      return '';
+    }
+
+    let section = `\n⚠️ VALIDATION ERROR OCCURRED:\n`;
+    section += `Error: "${context.errorText}"\n`;
+    if (context.previousStepGoal) {
+      section += `We returned to: "${context.previousStepGoal}"\n`;
+    }
+    section += `Attempt: ${context.attemptCount}\n`;
+
+    // Escalate instruction on repeated errors (SPA edge case)
+    if (context.attemptCount >= 2) {
+      section += `\n🚨 CRITICAL: Your previous input caused error "${context.errorText.slice(0, 50)}". `;
+      section += `You MUST change the input values - use different email, phone, or credentials. `;
+      section += `DO NOT submit the same data again!\n`;
+    } else {
+      section += `→ Try a different approach or input. Do not repeat the same action.\n`;
+    }
+
+    return section;
   }
 
   /**

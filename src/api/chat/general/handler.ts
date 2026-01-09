@@ -46,11 +46,6 @@ export async function handleGeneralChat(
     messageLength: message.length
   });
 
-  const emitProcessingStepWithLogging = functionLogger
-    ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
-    : emitProcessingStep;
-  emitProcessingStepWithLogging(chatSessionId, 'generating_response', '💬 Thinking...', 90);
-
   if (abortSignal) {
     const checkRequestAbortedWithLogging = functionLogger
       ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
@@ -308,6 +303,12 @@ export async function handleGeneralChat(
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: GET AI RESPONSE
   // ═══════════════════════════════════════════════════════════════════════
+  // ✅ FIX: Emit "Thinking..." only AFTER credit check and abort check
+  // This prevents sending event when request will fail (no credits, cancelled, etc.)
+  const emitProcessingStepWithLogging = functionLogger
+    ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
+    : emitProcessingStep;
+  emitProcessingStepWithLogging(chatSessionId, 'generating_response', '💬 Thinking...', 90);
 
   let gptResponse: { content: string; usage?: any };
   let shouldDeductCredits = false; // Track if we should deduct credits
