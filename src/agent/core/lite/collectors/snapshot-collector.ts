@@ -428,7 +428,9 @@ export class SnapshotCollector {
         if (el.placeholder) line += ` placeholder="${el.placeholder}"`;
         if (el.disabled) line += ' [DISABLED]';
         if (el.checked) line += ' [CHECKED]';
-        if (el.value) line += ` value="${el.value.slice(0, 30)}"`;
+        // SECURITY: Do not include raw input values in logs/prompts/traces.
+        // This avoids leaking emails, passwords, OTPs, or other sensitive data.
+        // If needed later, we can add a safe, type-aware mask (e.g., last 2 chars) behind a debug flag.
         lines.push(line);
       });
       lines.push('');

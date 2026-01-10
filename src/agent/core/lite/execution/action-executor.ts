@@ -26,6 +26,18 @@ export interface ModalKeywords {
 export interface ExecuteOptions {
   entryPointKeywords?: string[];
   modalKeywords?: ModalKeywords;
+  /**
+   * Optional trace hook for detailed action logging
+   * Called on key action execution points (without Playwright objects)
+   */
+  traceHook?: (event: {
+    stage: 'validation' | 'execution_start' | 'execution_end' | 'fallback' | 'modal_check';
+    action: string;
+    success?: boolean;
+    error?: string;
+    duration?: number;
+    details?: Record<string, any>;
+  }) => void;
 }
 
 export class ActionExecutor {
@@ -76,12 +88,55 @@ export class ActionExecutor {
       // Validate command
       this.validateCommand(command);
 
+      // ✅ NEW: Trace validation
+      options?.traceHook?.({
+        stage: 'validation',
+        action: command.action,
+        success: true,
+        details: {
+          ref: command.ref,
+          value: command.value ? '[REDACTED]' : undefined,
+          url: command.url,
+        },
+      });
+
+      // ✅ NEW: Trace execution start
+      options?.traceHook?.({
+        stage: 'execution_start',
+        action: command.action,
+        details: {
+          ref: command.ref,
+          target: command.targetRef,
+        },
+      });
+
       // Execute command
       await this.executeCommand(command);
 
       // ✅ NEW: After click, check for unexpected modal and try to dismiss (Lite Autonomy v3)
       if (command.action === 'click' && options?.modalKeywords) {
+        options?.traceHook?.({
+          stage: 'modal_check',
+          action: 'check_unexpected_modal',
+          details: {
+            hasModalKeywords: true,
+          },
+        });
+
         modalDismissInfo = await this.handleUnexpectedModal(options.modalKeywords);
+
+        if (modalDismissInfo?.attempted) {
+          options?.traceHook?.({
+            stage: 'modal_check',
+            action: 'modal_dismiss_attempted',
+            success: modalDismissInfo.dismissed,
+            details: {
+              dismissed: modalDismissInfo.dismissed,
+              stillPresent: modalDismissInfo.stillPresent,
+              modalType: modalDismissInfo.modalType,
+            },
+          });
+        }
       }
 
       // ✅ LEGACY: After click on entry point, wait for modal to appear and stabilize
@@ -106,6 +161,18 @@ export class ActionExecutor {
         modalDismissed: modalDismissInfo?.dismissed || false,
       });
 
+      // ✅ NEW: Trace execution end
+      options?.traceHook?.({
+        stage: 'execution_end',
+        action: command.action,
+        success: true,
+        duration: Date.now() - startTime,
+        details: {
+          modalDismissAttempted: modalDismissInfo?.attempted || false,
+          modalDismissed: modalDismissInfo?.dismissed || false,
+        },
+      });
+
       return {
         success: true,
         duration: Date.now() - startTime,
@@ -124,12 +191,33 @@ export class ActionExecutor {
 
       // Try fallback for element-based actions
       if (this.isNotFoundError(errorMsg) && command.ref) {
+        options?.traceHook?.({
+          stage: 'fallback',
+          action: 'fuzzy_fallback_attempt',
+          details: {
+            originalError: errorMsg.slice(0, 100),
+            ref: command.ref,
+          },
+        });
+
         const fallback = await this.tryFuzzyFallback(command, options);
         if (fallback.success) {
           logger.info('[ACTION_EXECUTOR] Fallback successful', {
             info: fallback.info,
             usedForceClick: fallback.usedForceClick,
           });
+
+          options?.traceHook?.({
+            stage: 'fallback',
+            action: 'fuzzy_fallback_success',
+            success: true,
+            duration: Date.now() - startTime,
+            details: {
+              info: fallback.info,
+              usedForceClick: fallback.usedForceClick,
+            },
+          });
+
           return {
             success: true,
             duration: Date.now() - startTime,
@@ -145,6 +233,15 @@ export class ActionExecutor {
       logger.error('[ACTION_EXECUTOR] Command failed', {
         action: command.action,
         error: errorMsg,
+      });
+
+      // ✅ NEW: Trace execution error
+      options?.traceHook?.({
+        stage: 'execution_end',
+        action: command.action,
+        success: false,
+        error: errorMsg,
+        duration: Date.now() - startTime,
       });
 
       return {

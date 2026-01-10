@@ -29,6 +29,7 @@ import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter
 import { LiteState } from './lite-state';
 import type { AIDecision, ActionOutcome, CollectedError, ExecutionResult, GoalContext, GoalGuidance, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, StateDiff } from './lite-types';
 import { LitePromptBuilder, type TaskPlanContext, type ValidationErrorContext } from './prompt/lite-prompt-builder';
+import { LiteTraceWriter } from './trace/lite-trace-writer';
 
 export class LiteEngine {
   private page: Page;
@@ -40,6 +41,7 @@ export class LiteEngine {
   private progressEmitter: TestProgressEmitter;
   private graphBuilder: GraphBuilder; // ✅ NEW: Full graph like Pro
   private goalDetector: GoalDetector; // ✅ NEW: Goal-first detection
+  private traceWriter: LiteTraceWriter; // ✅ NEW: Always-on JSONL trace for debugging
   private startTime: number = 0;
 
   // Track emitted node IDs to avoid duplicates
@@ -97,6 +99,7 @@ export class LiteEngine {
     this.consoleCollector = new ConsoleCollector(page);
     this.graphBuilder = new GraphBuilder(); // ✅ NEW: Initialize graph builder
     this.goalDetector = new GoalDetector(config.goal, config.testId); // ✅ NEW: Initialize goal detector with testId for AI fallback
+    this.traceWriter = new LiteTraceWriter({ testId: config.testId }); // ✅ NEW: Initialize trace writer
 
     // WebSocket progress
     this.progressEmitter = new TestProgressEmitter(
@@ -112,6 +115,7 @@ export class LiteEngine {
       timeout: this.TIMEOUT_MS,
       hasGraphBuilder: true,
       hasGoalDetector: true,
+      hasTraceWriter: true,
     });
   }
 
@@ -180,6 +184,18 @@ export class LiteEngine {
         this.goalDetector.initializeDynamicStrategy(),
         'goalDetector.initializeDynamicStrategy'
       );
+
+      // ✅ NEW: Trace strategy initialization success
+      this.traceWriter.write({
+        stage: 'initialization',
+        eventType: 'ai_strategy_initialized',
+        spanId: this.traceWriter.generateSpanId(),
+        parentSpanId: this.traceWriter.getRootSpanId(),
+        payload: {
+          success: true,
+          message: 'Dynamic strategy initialized successfully',
+        },
+      });
     } catch (error) {
       if (error instanceof Error && error.message.includes('cancelled')) {
         logger.info('[LITE_ENGINE] Test cancelled during strategy init', {
@@ -193,6 +209,19 @@ export class LiteEngine {
         testId: this.config.testId,
         error: error instanceof Error ? error.message : String(error),
       });
+
+      // ✅ NEW: Trace strategy initialization failure
+      this.traceWriter.write({
+        stage: 'initialization',
+        eventType: 'ai_strategy_failed',
+        spanId: this.traceWriter.generateSpanId(),
+        parentSpanId: this.traceWriter.getRootSpanId(),
+        payload: {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          fallback: 'Using fallback heuristics',
+        },
+      });
     }
 
     // ✅ NEW (Lite Autonomy v3): Initialize Task Plan
@@ -202,9 +231,58 @@ export class LiteEngine {
     const startUpdate = this.graphBuilder.addStartNode();
     this.emitGraphUpdate(startUpdate);
 
+    // ✅ NEW: Write trace run_start event
+    const rootSpanId = this.traceWriter.getRootSpanId();
+    this.traceWriter.write({
+      stage: 'initialization',
+      eventType: 'run_start',
+      spanId: rootSpanId,
+      payload: {
+        testId: this.config.testId,
+        goal: this.config.goal,
+        url: this.config.url,
+        browser: this.config.browser || 'chrome',
+        mode: 'lite',
+        limits: {
+          maxIterations: this.MAX_ITERATIONS,
+          timeoutMs: this.config.timeout || this.TIMEOUT_MS,
+        },
+        startTime: new Date(this.startTime).toISOString(),
+      },
+    });
+
     try {
       for (let i = 0; i < this.MAX_ITERATIONS; i++) {
         logger.debug('[LITE_ENGINE] Starting iteration', { iteration: i });
+
+        // ✅ NEW: Trace iteration start
+        const iterationSpanId = this.traceWriter.generateSpanId();
+        this.traceWriter.write({
+          iteration: i,
+          stage: 'iteration',
+          eventType: 'iteration_start',
+          spanId: iterationSpanId,
+          parentSpanId: this.traceWriter.getRootSpanId(),
+          payload: {
+            iteration: i,
+            maxIterations: this.MAX_ITERATIONS,
+          },
+        });
+
+        // ✅ NEW: Ensure iteration_end is always emitted (even on early continue/return)
+        let isIterationClosed = false;
+        const closeIteration = (payload: Record<string, any>) => {
+          if (isIterationClosed) return;
+          isIterationClosed = true;
+          this.traceWriter.write({
+            iteration: i,
+            stage: 'iteration',
+            eventType: 'iteration_end',
+            spanId: this.traceWriter.generateSpanId(),
+            parentSpanId: iterationSpanId,
+            payload,
+          });
+        };
 
         // 0. Check if test was cancelled (allows frontend to stop test)
         try {
@@ -217,6 +295,7 @@ export class LiteEngine {
             });
             this.emitCompletion(false, 'Test cancelled by user');
             await this.flushPendingGraphScreenshotUploads();
+            closeIteration({ skipped: true, reason: 'cancelled_by_user' });
             return await this.buildResult(false, 'Test cancelled by user');
           }
           // If check failed (timeout, etc.), continue execution
@@ -243,6 +322,25 @@ export class LiteEngine {
           await this.page.waitForTimeout(2000);
           snapshotBefore = await SnapshotCollector.collect(this.page);
         }
+
+        // ✅ NEW: Trace snapshot
+        const formattedSnapshot = SnapshotCollector.format(snapshotBefore);
+        this.traceWriter.write({
+          iteration: i,
+          stage: 'snapshot',
+          eventType: 'snapshot',
+          spanId: this.traceWriter.generateSpanId(),
+          parentSpanId: iterationSpanId,
+          payload: {
+            url: snapshotBefore.url,
+            title: snapshotBefore.title,
+            elementCount: snapshotBefore.elements.length,
+            hasActiveModal: !!snapshotBefore.activeModalRef,
+            isTransient: snapshotBefore.transientState?.isTransient || false,
+            formattedSnapshot, // Full formatted snapshot for AI context
+            liteSnapshot: snapshotBefore, // Raw LiteSnapshot object
+          },
+        });
 
         // 2b. Build GoalContext for this iteration
         const goalContext = this.buildGoalContext(snapshotBefore, i, stuckCheck);
@@ -337,11 +435,43 @@ export class LiteEngine {
             });
 
             try {
+              // ✅ NEW: Trace auditor prompt (heuristic path)
+              const auditorPromptSpanId = this.traceWriter.generateSpanId();
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'goal_validation',
+                eventType: 'ai_auditor_prompt',
+                spanId: auditorPromptSpanId,
+                parentSpanId: iterationSpanId,
+                payload: {
+                  trigger: 'heuristic_done',
+                  goalContext,
+                  lastOutcome: this.state.getLastOutcome(),
+                  model: 'gpt-4o', // Auditor uses gpt-4o
+                },
+              });
+
               const auditResult = await withCancellation(
               this.config.testId,
               this.goalDetector.auditDone(goalContext, this.state.getLastOutcome()),
               'goalDetector.auditDone'
             );
+
+              // ✅ NEW: Trace auditor response
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'goal_validation',
+                eventType: 'ai_auditor_response',
+                spanId: this.traceWriter.generateSpanId(),
+                parentSpanId: auditorPromptSpanId,
+                payload: {
+                  auditResult,
+                  isDone: auditResult.isDone,
+                  isBlocked: auditResult.isBlocked,
+                  confidence: auditResult.confidence,
+                  reason: auditResult.reason,
+                },
+              });
 
               // Update cooldown tracking
               this.lastAuditStateHash = currentStateHash;
@@ -438,6 +568,11 @@ export class LiteEngine {
               transientType: snapshotBefore.transientState.type,
               iteration: i,
             });
+            closeIteration({
+              skipped: true,
+              reason: 'transient_state',
+              transientType: snapshotBefore.transientState.type,
+            });
             continue;
           }
         }
@@ -449,6 +584,7 @@ export class LiteEngine {
             logger.info('[LITE_ENGINE] Micro-correction successful, continuing', {
               testId: this.config.testId,
             });
+            closeIteration({ skipped: true, reason: 'micro_correction' });
             continue;
           }
         }
@@ -538,7 +674,7 @@ export class LiteEngine {
         // 4. Build prompt with stuck warning + progress signals + AI guidance + contextual hints + task plan
         const prompt = LitePromptBuilder.build({
           goal: this.config.goal,
-          snapshot: SnapshotCollector.format(snapshotBefore),
+          snapshot: formattedSnapshot,
           history: this.state.getFormattedHistory(),
           stuckCheck,
           lastOutcome: this.state.getLastOutcome(),
@@ -555,6 +691,22 @@ export class LiteEngine {
           validationErrorContext: this.validationErrorContext || undefined, // ✅ NEW: Validation error context
         });
 
+        // ✅ NEW: Trace AI prompt
+        const aiPromptSpanId = this.traceWriter.generateSpanId();
+        this.traceWriter.write({
+          iteration: i,
+          stage: 'ai_decision',
+          eventType: 'ai_prompt',
+          spanId: aiPromptSpanId,
+          parentSpanId: iterationSpanId,
+          payload: {
+            prompt,
+            model: 'gpt-4o-mini', // Main decision model
+            promptLength: prompt.length,
+            estimatedTokens: Math.ceil(prompt.length / 4),
+          },
+        });
+
         // 5. Ask AI (returns JSON command, not code)
         // ✅ FIX: Wrap AI call with cancellation support
         const decision = await withCancellation(
@@ -562,6 +714,30 @@ export class LiteEngine {
           LitePromptBuilder.askAI(prompt),
           'LitePromptBuilder.askAI'
         );
+
+        // ✅ NEW: Trace AI response
+        const safeCommand = decision?.command
+          ? { ...decision.command, value: decision.command.value ? '[REDACTED]' : undefined }
+          : decision.command;
+        const safeDecision = {
+          ...decision,
+          command: safeCommand,
+        };
+        this.traceWriter.write({
+          iteration: i,
+          stage: 'ai_decision',
+          eventType: 'ai_response',
+          spanId: this.traceWriter.generateSpanId(),
+          parentSpanId: aiPromptSpanId,
+          payload: {
+            decision: safeDecision,
+            thought: decision.thought,
+            command: safeCommand,
+            done: decision.done || false,
+            blocked: decision.blocked,
+            blockedInfo: decision.blockedInfo,
+          },
+        });
 
         // Check terminal states
         if (decision.done) {
@@ -575,6 +751,7 @@ export class LiteEngine {
               thought: decision.thought?.slice(0, 50),
             });
             // Continue to next iteration
+            closeIteration({ skipped: true, reason: 'ai_done_auditor_cooldown' });
             continue;
           }
 
@@ -584,11 +761,43 @@ export class LiteEngine {
               thought: decision.thought?.slice(0, 50),
             });
 
+            // ✅ NEW: Trace auditor prompt (AI done path)
+            const auditorPromptSpanId2 = this.traceWriter.generateSpanId();
+            this.traceWriter.write({
+              iteration: i,
+              stage: 'goal_validation',
+              eventType: 'ai_auditor_prompt',
+              spanId: auditorPromptSpanId2,
+              parentSpanId: iterationSpanId,
+              payload: {
+                trigger: 'ai_done',
+                goalContext,
+                aiThought: decision.thought,
+                model: 'gpt-4o', // Auditor uses gpt-4o
+              },
+            });
+
             const auditResult = await withCancellation(
               this.config.testId,
               this.goalDetector.auditDone(goalContext, decision.thought),
               'goalDetector.auditDone (AI done path)'
             );
+
+            // ✅ NEW: Trace auditor response
+            this.traceWriter.write({
+              iteration: i,
+              stage: 'goal_validation',
+              eventType: 'ai_auditor_response',
+              spanId: this.traceWriter.generateSpanId(),
+              parentSpanId: auditorPromptSpanId2,
+              payload: {
+                auditResult,
+                isDone: auditResult.isDone,
+                isBlocked: auditResult.isBlocked,
+                confidence: auditResult.confidence,
+                reason: auditResult.reason,
+              },
+            });
 
             // Update cooldown tracking
             const currentStateHash = this.state.getCurrentStateHash();
@@ -658,6 +867,7 @@ export class LiteEngine {
                 };
               }
               // Continue to next iteration
+              closeIteration({ skipped: true, reason: 'ai_done_auditor_rejected' });
               continue;
             }
           } catch (doneError) {
@@ -675,6 +885,7 @@ export class LiteEngine {
               testId: this.config.testId,
               error: doneError instanceof Error ? doneError.message : String(doneError),
             });
+            closeIteration({ skipped: true, reason: 'ai_done_auditor_failed' });
             continue;
           }
         }
@@ -730,6 +941,7 @@ export class LiteEngine {
               timestamp: Date.now(),
             });
             // Continue to next iteration
+            closeIteration({ skipped: true, reason: 'soft_block', details: reason });
             continue;
           }
         }
@@ -738,14 +950,64 @@ export class LiteEngine {
         // ✅ Pass dynamic keywords from AI-generated strategy for modal detection + self-healing
         const parsedGoal = this.goalDetector.getParsedGoal();
         const modalKeywords = this.goalDetector.getModalKeywords();
+
+        // ✅ NEW: Trace action execute start
+        const actionSpanId = this.traceWriter.generateSpanId();
+        this.traceWriter.write({
+          iteration: i,
+          stage: 'action_execution',
+          eventType: 'action_execute_start',
+          spanId: actionSpanId,
+          parentSpanId: iterationSpanId,
+          payload: {
+            command: safeCommand,
+            thought: decision.thought,
+          },
+        });
+
         const execResult = await this.executor.execute(
           decision.command, // JSON command, not code
           snapshotBefore,
           {
             entryPointKeywords: parsedGoal.entryPointKeywords,
             modalKeywords, // ✅ NEW: Pass modal keywords for hybrid auto-dismiss
+            // ✅ NEW: Pass trace hook for detailed action logging
+            traceHook: (event) => {
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'action_execution_detail',
+                eventType: `action_${event.stage}`,
+                spanId: this.traceWriter.generateSpanId(),
+                parentSpanId: actionSpanId,
+                payload: {
+                  action: event.action,
+                  success: event.success,
+                  error: event.error,
+                  duration: event.duration,
+                  details: event.details,
+                },
+              });
+            },
           }
         );
+
+        // ✅ NEW: Trace action execute end
+        this.traceWriter.write({
+          iteration: i,
+          stage: 'action_execution',
+          eventType: 'action_execute_end',
+          spanId: this.traceWriter.generateSpanId(),
+          parentSpanId: actionSpanId,
+          payload: {
+            success: execResult.success,
+            error: execResult.error,
+            duration: execResult.duration,
+            usedFallback: execResult.usedFallback,
+            fallbackInfo: execResult.fallbackInfo,
+            modalDismissInfo: execResult.modalDismissInfo,
+            usedForceClick: execResult.usedForceClick,
+          },
+        });
 
         // ✅ NEW (Lite Autonomy v3): Store modal dismiss info for next iteration's prompt
         this.lastModalDismissInfo = execResult.modalDismissInfo || null;
@@ -867,6 +1129,30 @@ export class LiteEngine {
           networkErrorStrings
         );
 
+        // ✅ NEW: Trace state diff
+        this.traceWriter.write({
+          iteration: i,
+          stage: 'diff_validation',
+          eventType: 'state_diff',
+          spanId: this.traceWriter.generateSpanId(),
+          parentSpanId: iterationSpanId,
+          payload: {
+            urlChanged: diff.urlChanged,
+            urlBefore: diff.urlBefore,
+            urlAfter: diff.urlAfter,
+            addedElementsCount: diff.addedElements.length,
+            removedRefsCount: diff.removedRefs.length,
+            changedElementsCount: diff.changedElements.length,
+            newPageErrorsCount: diff.newPageErrors.length,
+            newConsoleErrorsCount: diff.newConsoleErrors.length,
+            newNetworkErrorsCount: diff.newNetworkErrors?.length || 0,
+            // Include subset of actual changes for debugging
+            addedElements: diff.addedElements.slice(0, 10),
+            removedRefs: diff.removedRefs.slice(0, 10),
+            changedElements: diff.changedElements.slice(0, 10),
+          },
+        });
+
         // 11. Validate outcome (with element counts for critical error detection)
         const outcome = StateValidator.validate(
           diff,
@@ -874,6 +1160,23 @@ export class LiteEngine {
           snapshotBefore.elements.length,
           snapshotAfter.elements.length
         );
+
+        // ✅ NEW: Trace validation
+        this.traceWriter.write({
+          iteration: i,
+          stage: 'diff_validation',
+          eventType: 'validation',
+          spanId: this.traceWriter.generateSpanId(),
+          parentSpanId: iterationSpanId,
+          payload: {
+            outcome,
+            isStateChanged: outcome === 'state_changed',
+            isValidationError: outcome === 'validation_error',
+            isCriticalError: outcome === 'critical_error',
+            isRateLimited: outcome === 'rate_limited',
+            hasExecutionError: !!execResult.error,
+          },
+        });
 
         // 11a. Exponential backoff on rate limit (HTTP 429) - do not hammer the site
         if (outcome === 'rate_limited') {
@@ -980,6 +1283,18 @@ export class LiteEngine {
             info: execResult.fallbackInfo,
           });
         }
+
+        // ✅ NEW: Trace iteration end (normal path)
+        closeIteration({
+          iteration: i,
+          outcome,
+          urlAfter: snapshotAfter.url,
+          stateChanged: outcome === 'state_changed',
+          hasErrors:
+            diff.newPageErrors.length > 0 ||
+            diff.newConsoleErrors.length > 0 ||
+            (diff.newNetworkErrors?.length || 0) > 0,
+        });
       }
 
       // Step limit reached
@@ -999,6 +1314,16 @@ export class LiteEngine {
       this.emitCompletion(false, 'Engine error');
       await this.flushPendingGraphScreenshotUploads();
       return await this.buildResult(false, `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
+    } finally {
+      // ✅ NEW: Always close trace writer (flushes pending writes)
+      try {
+        await this.traceWriter.close();
+      } catch (closeError) {
+        logger.error('[LITE_ENGINE] Failed to close trace writer', {
+          testId: this.config.testId,
+          error: closeError instanceof Error ? closeError.message : String(closeError),
+        });
+      }
     }
   }
 
@@ -1371,6 +1696,25 @@ export class LiteEngine {
     // ✅ FIX: Emit final progress=100 NOW that everything is truly done
     // This is after flush (called before buildResult) and after endUpdate
     this.emitFinalCompletion(success, reason);
+
+    // ✅ NEW: Write run_end trace event
+    this.traceWriter.write({
+      stage: 'completion',
+      eventType: 'run_end',
+      spanId: this.traceWriter.generateSpanId(),
+      parentSpanId: this.traceWriter.getRootSpanId(),
+      payload: {
+        success,
+        reason,
+        iterations,
+        duration,
+        durationSeconds: Math.round(duration / 1000),
+        errorCount: this.collectedErrors.length,
+        errorTypes: [...new Set(this.collectedErrors.map((e) => e.type))],
+        hasFinalScreenshot: !!finalScreenshotUrl,
+        endTime: new Date().toISOString(),
+      },
+    });
 
     // Build screenshots array (only final screenshot for Lite mode)
     const screenshots: Array<{ url: string; screenshot: string }> = [];
