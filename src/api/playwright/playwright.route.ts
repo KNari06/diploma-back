@@ -1,9 +1,9 @@
-import { asyncHandler } from '@/utils/core/error-handler';
 import { requireAuth } from '@/middleware/auth.middleware';
+import { asyncHandler } from '@/utils/core/error-handler';
 import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
-import { deleteTrace, getTrace, listTraces, uploadTrace, getTraceFilesByUser, getTraceSteps } from './playwright.controller';
+import { deleteTrace, getTrace, getTraceFilesByUser, getTraceSteps, listTraces, uploadTrace } from './playwright.controller';
 
 const router = Router();
 
@@ -121,7 +121,10 @@ router.post('/upload-trace', upload.single('trace'), asyncHandler(uploadTrace));
  * /api/v1/playwright/trace/{id}:
  *   get:
  *     summary: Get signed URL for trace file download
- *     description: Generate a signed URL to download trace file from Supabase Storage
+ *     description: |
+ *       Generate a signed URL to download trace file from Supabase Storage.
+ *       Supports both Playwright ZIP traces and Lite JSONL trace logs.
+ *       User ID is automatically extracted from authentication token.
  *     tags: [Playwright]
  *     parameters:
  *       - in: path
@@ -129,14 +132,8 @@ router.post('/upload-trace', upload.single('trace'), asyncHandler(uploadTrace));
  *         required: true
  *         schema:
  *           type: string
- *         description: The trace file ID
+ *         description: The trace file ID (UUID from trace_files table)
  *         example: "550e8400-e29b-41d4-a716-446655440000"
- *       - in: query
- *         name: userId
- *         schema:
- *           type: string
- *         description: User ID for security check (optional)
- *         example: "user_123"
  *     responses:
  *       200:
  *         description: Signed download URL generated
@@ -152,20 +149,25 @@ router.post('/upload-trace', upload.single('trace'), asyncHandler(uploadTrace));
  *                   properties:
  *                     id:
  *                       type: string
+ *                       description: Trace file ID
  *                     fileName:
  *                       type: string
+ *                       description: Original file name (e.g., trace-xxx.zip or lite_trace_xxx.jsonl)
  *                     downloadUrl:
  *                       type: string
- *                       description: Signed URL valid for 1 hour
+ *                       description: Signed URL valid for 1 hour (use this to download the file)
  *                     expiresIn:
  *                       type: number
+ *                       description: URL expiration time in seconds
  *                       example: 3600
  *                     fileSize:
  *                       type: number
+ *                       description: File size in bytes
  *                     createdAt:
  *                       type: string
+ *                       format: date-time
  *       404:
- *         description: Trace file not found
+ *         description: Trace file not found or access denied
  *       500:
  *         description: Server error
  */
@@ -176,7 +178,7 @@ router.get('/trace/:id', asyncHandler(getTrace));
  * /api/v1/playwright/traces:
  *   get:
  *     summary: List trace files
- *     description: Get a list of trace files filtered by testId or userId
+ *     description: Get a list of trace files filtered by testId, userId, or type (lite/playwright)
  *     tags: [Playwright]
  *     parameters:
  *       - in: query
@@ -191,6 +193,13 @@ router.get('/trace/:id', asyncHandler(getTrace));
  *           type: string
  *         description: Filter by user ID
  *         example: "user_123"
+ *       - in: query
+ *         name: type
+ *         schema:
+ *           type: string
+ *           enum: [lite, playwright]
+ *         description: Filter by trace type (lite for JSONL logs, playwright for ZIP traces)
+ *         example: "lite"
  *     responses:
  *       200:
  *         description: List of trace files

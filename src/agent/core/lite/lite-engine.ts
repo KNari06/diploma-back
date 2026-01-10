@@ -1716,6 +1716,104 @@ export class LiteEngine {
       },
     });
 
+    // ✅ NEW: Close trace writer and upload to Supabase Storage
+    try {
+      await this.traceWriter.close();
+
+      const traceFilePath = this.traceWriter.getFilePath();
+      const runId = this.traceWriter.getRunId();
+      const userId = this.config.userId;
+      const testId = this.config.testId;
+
+      // Validate UUIDs (trace_files requires UUID, not 'anonymous')
+      const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const isValidUserId = userId && UUID_REGEX.test(userId);
+      const isValidTestId = testId && UUID_REGEX.test(testId);
+
+      if (isValidUserId && isValidTestId) {
+        // Check if file exists and has content
+        const fs = await import('fs/promises');
+        const path = await import('path');
+
+        try {
+          await fs.access(traceFilePath);
+          const stats = await fs.stat(traceFilePath);
+
+          if (stats.size > 0) {
+            logger.info('[LITE_ENGINE] Uploading trace log to Storage', {
+              testId,
+              filePath: traceFilePath,
+              fileSize: `${Math.round(stats.size / 1024)}KB`,
+              runId,
+            });
+
+            const { uploadLiteTraceLogToStorage, insertTraceFileRecord } = await import(
+              '@/services/storage/test-artifacts-storage.service'
+            );
+
+            const fileName = path.basename(traceFilePath);
+            const { storagePath, fileSize } = await uploadLiteTraceLogToStorage(
+              traceFilePath,
+              userId,
+              fileName
+            );
+
+            const { id } = await insertTraceFileRecord({
+              userId,
+              testId,
+              fileName,
+              storagePath,
+              fileSize,
+              browser: 'lite-trace-log',
+              status: 'uploaded',
+            });
+
+            logger.info('[LITE_ENGINE] Trace log uploaded successfully', {
+              testId,
+              traceFileId: id,
+              storagePath,
+              runId,
+            });
+
+            // Clean up local file (best-effort)
+            try {
+              await fs.unlink(traceFilePath);
+              logger.debug('[LITE_ENGINE] Local trace log deleted', { traceFilePath });
+            } catch (cleanupError) {
+              logger.warn('[LITE_ENGINE] Failed to delete local trace log', {
+                traceFilePath,
+                error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+              });
+            }
+          } else {
+            logger.warn('[LITE_ENGINE] Trace log file is empty, skipping upload', {
+              testId,
+              traceFilePath,
+            });
+          }
+        } catch (fileError) {
+          logger.warn('[LITE_ENGINE] Trace log file not found or inaccessible, skipping upload', {
+            testId,
+            traceFilePath,
+            error: fileError instanceof Error ? fileError.message : String(fileError),
+          });
+        }
+      } else {
+        logger.warn('[LITE_ENGINE] Invalid userId or testId (not UUID), skipping trace log upload', {
+          testId,
+          userId: userId?.substring(0, 20) || 'undefined',
+          isValidUserId,
+          isValidTestId,
+        });
+      }
+    } catch (traceUploadError) {
+      // Don't fail the test if trace upload fails
+      logger.error('[LITE_ENGINE] Failed to upload trace log', {
+        testId: this.config.testId,
+        error: traceUploadError instanceof Error ? traceUploadError.message : String(traceUploadError),
+      });
+    }
+
     // Build screenshots array (only final screenshot for Lite mode)
     const screenshots: Array<{ url: string; screenshot: string }> = [];
     if (finalScreenshotUrl) {

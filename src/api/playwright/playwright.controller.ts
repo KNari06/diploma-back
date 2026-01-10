@@ -28,7 +28,7 @@ export const uploadTrace = async (
 
     // ✅ FIX #24: Use authenticated user ID from JWT token
     const userId = req.user!.id;
-    const { testId, browser, metadata } = req.body as Omit<TraceUploadRequest, 'userId'>;
+    const { testId, browser } = req.body as Omit<TraceUploadRequest, 'userId'>;
 
     // Validate testId format if provided (UUID)
     if (testId && !UUID_REGEX.test(testId)) {
@@ -277,9 +277,29 @@ export const getTrace = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // Determine bucket based on file type
+    // Lite trace logs: .jsonl files or browser='lite-trace-log'/'lite' → bucket 'lite-trace-logs'
+    // Playwright traces: .zip files → bucket 'traces'
+    let bucketName = 'traces'; // Default for Playwright .zip traces
+
+    if (
+      traceFile.file_name?.endsWith('.jsonl') ||
+      traceFile.browser === 'lite-trace-log' ||
+      traceFile.browser === 'lite'
+    ) {
+      bucketName = 'lite-trace-logs';
+    }
+
+    logger.debug('Selecting storage bucket for trace', {
+      traceId: id,
+      fileName: traceFile.file_name,
+      browser: traceFile.browser,
+      selectedBucket: bucketName,
+    });
+
     // Generate signed URL for private bucket (valid for 1 hour)
     const { data: signedUrlData, error: urlError } = await supabaseAdmin.storage
-      .from('traces')
+      .from(bucketName)
       .createSignedUrl(traceFile.storage_path, 3600);
 
     if (urlError || !signedUrlData) {
@@ -334,7 +354,7 @@ export const listTraces = async (req: Request, res: Response): Promise<void> => 
   try {
     // ✅ FIX #24: Always scope listing to authenticated user
     const authUserId = req.user!.id;
-    const { testId } = req.query as { testId?: string };
+    const { testId, type } = req.query as { testId?: string; type?: string };
 
     // Validate testId format if provided (UUID)
     if (testId && !UUID_REGEX.test(testId as string)) {
@@ -354,6 +374,15 @@ export const listTraces = async (req: Request, res: Response): Promise<void> => 
 
     if (testId) {
       query = query.eq('test_id', testId);
+    }
+
+    // Filter by type (lite or playwright)
+    if (type === 'lite') {
+      // Lite trace logs are marked explicitly via browser field (avoid fragile ilike/or encoding)
+      query = query.in('browser', ['lite-trace-log', 'lite']);
+    } else if (type === 'playwright') {
+      // Playwright traces: .zip files
+      query = query.ilike('file_name', '%.zip');
     }
 
     const { data: traces, error: fetchError } = await query;
@@ -443,9 +472,27 @@ export const deleteTrace = async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
+    // Determine bucket based on file type (same logic as getTrace)
+    let bucketName = 'traces'; // Default for Playwright .zip traces
+
+    if (
+      traceFile.file_name?.endsWith('.jsonl') ||
+      traceFile.browser === 'lite-trace-log' ||
+      traceFile.browser === 'lite'
+    ) {
+      bucketName = 'lite-trace-logs';
+    }
+
+    logger.debug('Selecting storage bucket for deletion', {
+      traceId: id,
+      fileName: traceFile.file_name,
+      browser: traceFile.browser,
+      selectedBucket: bucketName,
+    });
+
     // Delete from storage
     const { error: storageError } = await supabaseAdmin.storage
-      .from('traces')
+      .from(bucketName)
       .remove([traceFile.storage_path]);
 
     if (storageError) {
@@ -678,7 +725,7 @@ export const getTraceSteps = async (req: Request, res: Response<TraceStepsRespon
     const buffer = Buffer.from(await fileData.arrayBuffer());
 
     // Parse ZIP file
-    let steps: TraceStep[] = [];
+    const steps: TraceStep[] = [];
     try {
       const zip = new AdmZip(buffer);
       const zipEntries = zip.getEntries();

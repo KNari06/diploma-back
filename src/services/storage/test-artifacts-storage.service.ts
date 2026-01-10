@@ -330,3 +330,150 @@ export async function downloadFromStorage(storageUrl: string): Promise<Buffer> {
     throw error;
   }
 }
+
+/**
+ * Upload Lite trace log (JSONL) to Supabase Storage
+ * @param localPath - Path to local JSONL file
+ * @param userId - User ID (must be valid UUID)
+ * @param fileName - File name (e.g., lite_trace_<timestamp>_<testId>_<runId>.jsonl)
+ * @returns Object with storagePath and fileSize
+ */
+export async function uploadLiteTraceLogToStorage(
+  localPath: string,
+  userId: string,
+  fileName: string
+): Promise<{ storagePath: string; fileSize: number }> {
+  try {
+    // Check if file exists before reading
+    try {
+      await fs.access(localPath);
+    } catch (accessError) {
+      logger.error('[STORAGE] Lite trace log file does not exist', {
+        localPath,
+        fileName,
+        error: accessError instanceof Error ? accessError.message : String(accessError),
+      });
+      throw new Error(`Lite trace log file not found: ${localPath}`);
+    }
+
+    logger.info('[STORAGE] Uploading Lite trace log', {
+      localPath,
+      fileName,
+      userId,
+    });
+
+    // Read file
+    const fileBuffer = await fs.readFile(localPath);
+    const fileSize = fileBuffer.length;
+
+    if (fileSize === 0) {
+      logger.warn('[STORAGE] Lite trace log file is empty', { localPath, fileName });
+      throw new Error('Lite trace log file is empty');
+    }
+
+    logger.debug('[STORAGE] Lite trace log file read successfully', {
+      fileName,
+      fileSize: `${Math.round(fileSize / 1024)}KB`,
+    });
+
+    const storagePath = `trace-logs/${userId}/${fileName}`;
+
+    // Upload to Supabase Storage (bucket: lite-trace-logs)
+    const { error } = await supabaseAdmin.storage
+      .from('lite-trace-logs')
+      .upload(storagePath, fileBuffer, {
+        contentType: 'application/x-ndjson',
+        upsert: false,
+        cacheControl: '3600',
+      });
+
+    if (error) {
+      logger.error('[STORAGE] Failed to upload Lite trace log', {
+        error,
+        storagePath,
+        fileName,
+      });
+      throw new Error(`Failed to upload Lite trace log: ${error.message}`);
+    }
+
+    logger.info('[STORAGE] Lite trace log uploaded successfully', {
+      fileName,
+      storagePath,
+      fileSize,
+    });
+
+    return { storagePath, fileSize };
+  } catch (error) {
+    logger.error('[STORAGE] Lite trace log upload error', {
+      error: error instanceof Error ? error.message : String(error),
+      localPath,
+      fileName,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Insert trace file record into trace_files table
+ * @param params - Trace file metadata
+ * @returns Object with trace_files record id
+ */
+export async function insertTraceFileRecord(params: {
+  userId: string;
+  testId: string;
+  fileName: string;
+  storagePath: string;
+  fileSize: number;
+  browser: string;
+  status?: string;
+}): Promise<{ id: string }> {
+  try {
+    const { userId, testId, fileName, storagePath, fileSize, browser, status = 'uploaded' } = params;
+
+    logger.info('[STORAGE] Inserting trace file record', {
+      testId,
+      fileName,
+      browser,
+      fileSize,
+    });
+
+    const { data, error } = await supabaseAdmin
+      .from('trace_files')
+      .insert({
+        user_id: userId,
+        test_id: testId,
+        file_name: fileName,
+        storage_path: storagePath,
+        file_size: fileSize,
+        browser,
+        status,
+        public_url: null, // Private bucket, use signed URLs
+      })
+      .select('id')
+      .single();
+
+    if (error || !data) {
+      logger.error('[STORAGE] Failed to insert trace file record', {
+        error,
+        testId,
+        fileName,
+      });
+      throw new Error(`Failed to insert trace file record: ${error?.message || 'Unknown error'}`);
+    }
+
+    logger.info('[STORAGE] Trace file record inserted successfully', {
+      id: data.id,
+      testId,
+      fileName,
+    });
+
+    return { id: data.id };
+  } catch (error) {
+    logger.error('[STORAGE] Insert trace file record error', {
+      error: error instanceof Error ? error.message : String(error),
+      testId: params.testId,
+      fileName: params.fileName,
+    });
+    throw error;
+  }
+}
