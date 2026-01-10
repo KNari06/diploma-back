@@ -1,0 +1,96 @@
+flowchart TD
+    Start([🚀 Lite Test Starts]) --> CreateFile[📝 Create trace file<br/>test_logs/testId_date_runId.jsonl]
+    CreateFile --> WriteRunStart[✍️ Write: run_start<br/>goal, url, limits, startTime]
+
+    WriteRunStart --> InitStrategy[🤖 Initialize AI Strategy]
+    InitStrategy --> WriteStrategy[✍️ Write: ai_strategy_initialized<br/>or ai_strategy_failed]
+
+    WriteStrategy --> LoopStart{🔁 Iteration Loop<br/>max 20 iterations}
+
+    LoopStart --> WriteIterStart[✍️ Write: iteration_start<br/>iteration number]
+
+    WriteIterStart --> CheckCancel{❌ Cancelled?}
+    CheckCancel -->|Yes| WriteIterEndCancelled[✍️ Write: iteration_end<br/>skipped: cancelled]
+    WriteIterEndCancelled --> WriteRunEndCancelled[✍️ Write: run_end<br/>success: false]
+    WriteRunEndCancelled --> CloseFile[🔒 Close trace file<br/>flush all writes]
+
+    CheckCancel -->|No| CollectSnapshot[📸 Collect Snapshot<br/>url, title, elements<br/>NO input values]
+    CollectSnapshot --> WriteSnapshot[✍️ Write: snapshot<br/>formattedSnapshot + liteSnapshot]
+
+    WriteSnapshot --> CheckTransient{⏳ Transient State?}
+    CheckTransient -->|Yes| WriteIterEndTransient[✍️ Write: iteration_end<br/>skipped: transient]
+    WriteIterEndTransient --> LoopStart
+
+    CheckTransient -->|No| BuildPrompt[🧠 Build AI Prompt<br/>snapshot + history + stuckCheck]
+    BuildPrompt --> WriteAIPrompt[✍️ Write: ai_prompt<br/>full prompt string, model, tokens]
+
+    WriteAIPrompt --> CallAI[🤖 Call AI Model<br/>gpt-4o-mini]
+    CallAI --> GetDecision[📥 Get AI Decision<br/>thought, command, done?, blocked?]
+    GetDecision --> WriteAIResponse[✍️ Write: ai_response<br/>decision, thought, safeCommand<br/>value REDACTED]
+
+    WriteAIResponse --> CheckDone{✅ AI says done?}
+
+    CheckDone -->|Yes| CheckAuditorCooldown{⏱️ Auditor cooldown?}
+    CheckAuditorCooldown -->|Yes| WriteIterEndCooldown[✍️ Write: iteration_end<br/>skipped: auditor_cooldown]
+    WriteIterEndCooldown --> LoopStart
+
+    CheckAuditorCooldown -->|No| WriteAuditorPrompt[✍️ Write: ai_auditor_prompt<br/>goalContext, model: gpt-4o]
+    WriteAuditorPrompt --> CallAuditor[🔍 Call Auditor AI]
+    CallAuditor --> GetAuditResult[📥 Get Audit Result<br/>isDone, isBlocked, confidence]
+    GetAuditResult --> WriteAuditorResponse[✍️ Write: ai_auditor_response<br/>auditResult]
+
+    WriteAuditorResponse --> CheckAuditDone{✅ Auditor confirms done?}
+    CheckAuditDone -->|Yes| WriteRunEndSuccess[✍️ Write: run_end<br/>success: true]
+    WriteRunEndSuccess --> CloseFile
+
+    CheckAuditDone -->|No| WriteIterEndNotDone[✍️ Write: iteration_end<br/>skipped: auditor_not_confirmed]
+    WriteIterEndNotDone --> LoopStart
+
+    CheckDone -->|No| CheckBlocked{🚫 Blocked?}
+    CheckBlocked -->|Hard Block| WriteRunEndBlocked[✍️ Write: run_end<br/>success: false, blocked]
+    WriteRunEndBlocked --> CloseFile
+
+    CheckBlocked -->|Soft Block| WriteIterEndSoftBlock[✍️ Write: iteration_end<br/>skipped: soft_block]
+    WriteIterEndSoftBlock --> LoopStart
+
+    CheckBlocked -->|No| WriteActionStart[✍️ Write: action_execute_start<br/>safeCommand, thought]
+
+    WriteActionStart --> ExecuteAction[⚡ Execute Action<br/>click, fill, goto, etc.]
+    ExecuteAction --> WriteActionDetails[✍️ Write: action_* events<br/>validation, execution, modal_check, fallback]
+    WriteActionDetails --> WriteActionEnd[✍️ Write: action_execute_end<br/>success, error, duration, fallback]
+
+    WriteActionEnd --> CollectAfterSnapshot[📸 Collect After Snapshot<br/>+ errors from console/network]
+
+    CollectAfterSnapshot --> ComputeDiff[📊 Compute State Diff<br/>before vs after]
+    ComputeDiff --> WriteStateDiff[✍️ Write: state_diff<br/>urlChanged, added/removed/changed elements]
+
+    WriteStateDiff --> ValidateOutcome[✅ Validate Outcome<br/>state_changed, no_effect, error, etc.]
+    ValidateOutcome --> WriteValidation[✍️ Write: validation<br/>outcome, flags]
+
+    WriteValidation --> WriteIterEnd[✍️ Write: iteration_end<br/>outcome, urlAfter, hasErrors]
+
+    WriteIterEnd --> CheckLoopEnd{🔚 More iterations?<br/>OR goal reached?<br/>OR step limit?}
+
+    CheckLoopEnd -->|Continue| LoopStart
+    CheckLoopEnd -->|Step Limit| WriteRunEndLimit[✍️ Write: run_end<br/>success: false, step_limit]
+    WriteRunEndLimit --> CloseFile
+
+    CheckLoopEnd -->|Timeout| WriteRunEndTimeout[✍️ Write: run_end<br/>success: false, timeout]
+    WriteRunEndTimeout --> CloseFile
+
+    CloseFile --> End([✅ Trace Complete<br/>test_logs/testId_date_runId.jsonl<br/>ready for AI analysis])
+
+    style Start fill:#90EE90
+    style End fill:#90EE90
+    style WriteRunStart fill:#FFD700
+    style WriteIterStart fill:#87CEEB
+    style WriteSnapshot fill:#87CEEB
+    style WriteAIPrompt fill:#87CEEB
+    style WriteAIResponse fill:#87CEEB
+    style WriteActionStart fill:#87CEEB
+    style WriteActionEnd fill:#87CEEB
+    style WriteIterEnd fill:#87CEEB
+    style WriteRunEndSuccess fill:#FFD700
+    style WriteRunEndCancelled fill:#FFB6C1
+    style WriteRunEndBlocked fill:#FFB6C1
+    style CloseFile fill:#FFA500
