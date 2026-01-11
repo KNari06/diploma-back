@@ -123,7 +123,7 @@ export class UserCreditsService {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Give initial 5 credits to new free plan users
+    // Give initial 50 credits to new free plan users
     // ═══════════════════════════════════════════════════════════════════════
     try {
       // Check user's plan
@@ -142,14 +142,14 @@ export class UserCreditsService {
         planSlug = plan?.slug || null;
       }
 
-      // If user has no plan or has free plan, give initial 5 credits
+      // If user has no plan or has free plan, give initial 50 credits
       const isFreePlan = !planSlug || planSlug === 'free';
 
       if (isFreePlan && data.credits_balance === 0) {
-        logger.info('[USER_CREDITS] Giving initial 5 credits to new free plan user', { userId });
+        logger.info('[USER_CREDITS] Giving initial 50 credits to new free plan user', { userId });
         await this.addCredits(
           userId,
-          5,
+          50,
           'bonus',
           'Welcome bonus: Initial free credits for new user',
           { is_initial_bonus: true }

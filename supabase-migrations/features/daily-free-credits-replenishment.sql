@@ -1,12 +1,12 @@
 -- Daily Free Credits Replenishment
--- Purpose: Add 5 credits daily to free plan users, but only if they used at least 1 credit
+-- Purpose: Add 50 credits daily to free plan users, but only if they used at least 1 credit
 -- Logic:
 --   - If user used 0 credits → don't add anything
---   - If user used 1 credit → add 1 credit (to reach 5)
---   - If user used 2 credits → add 2 credits (to reach 5)
---   - If user used 3 credits → add 3 credits (to reach 5)
---   - If user used 4 credits → add 4 credits (to reach 5)
---   - If user used 5 credits → add 5 credits (to reach 5)
+--   - If user used 1 credit → add 1 credit (to reach 50)
+--   - If user used 2 credits → add 2 credits (to reach 50)
+--   - ...
+--   - If user used 50 credits → add 50 credits (to reach 50)
+--   - If user used 50+ credits → add only up to 50 credits (cap at 50 daily)
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- FUNCTION: Replenish daily free credits
@@ -60,8 +60,9 @@ BEGIN
 
         -- Calculate credits to add based on usage
         IF user_record.credits_used_today >= 1 THEN
-            -- User used at least 1 credit → add back what they used (to reach 5)
-            credits_to_add := user_record.credits_used_today;
+            -- User used at least 1 credit → add back what they used (to reach 50)
+            -- Cap at 50 credits per day (safety limit to prevent exploitation)
+            credits_to_add := LEAST(user_record.credits_used_today, 50);
 
             -- Add credits to balance
             new_balance_val := current_balance + credits_to_add;
@@ -170,7 +171,7 @@ $$ LANGUAGE plpgsql;
 -- ═══════════════════════════════════════════════════════════════════════════
 
 COMMENT ON FUNCTION replenish_daily_free_credits() IS
-'Replenishes daily free credits (up to 5) for free plan users. Only adds credits if user used at least 1 credit yesterday.';
+'Replenishes daily free credits (up to 50) for free plan users. Only adds credits if user used at least 1 credit yesterday.';
 
 COMMENT ON FUNCTION reset_daily_credits() IS
 'Resets daily credit usage counters. For free plan users, also replenishes credits based on usage.';
