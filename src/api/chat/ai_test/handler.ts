@@ -110,6 +110,42 @@ export async function handlePlatformTest(
       timeout: flowTimeout,
     });
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 0: EARLY CREDIT CHECK (before any processing)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Check credits immediately to prevent unnecessary processing
+    const effectiveMode = mode || 'lite';
+    const liteRequiredCredits = 15;
+    const proRequiredCredits = TokenCalculatorService.getTestCreditCost('intelligent'); // 20
+    const requiredCreditsForMode = effectiveMode === 'lite' ? liteRequiredCredits : proRequiredCredits;
+
+    const baseCreditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
+    const hasEnoughCreditsForMode = baseCreditCheck.available >= requiredCreditsForMode;
+    const shortageForMode = hasEnoughCreditsForMode ? 0 : requiredCreditsForMode - baseCreditCheck.available;
+
+    if (!hasEnoughCreditsForMode) {
+      logger.warn('[PLATFORM_TEST] Insufficient credits (early check)', {
+        userId,
+        mode: effectiveMode,
+        available: baseCreditCheck.available,
+        required: requiredCreditsForMode,
+        shortage: shortageForMode,
+      });
+
+      // Return error directly without saving to chat history
+      res.status(402).json({
+        success: false,
+        error: 'Insufficient credits',
+        message: `❌ Insufficient credits. You need ${requiredCreditsForMode} credits, but you only have ${baseCreditCheck.available}. Please purchase more credits to continue testing.`,
+        creditsRequired: requiredCreditsForMode,
+        creditsAvailable: baseCreditCheck.available,
+        shortage: shortageForMode,
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+      return;
+    }
+
     // FIX #4: Better progress updates
     const emitProcessingStepWithLogging = functionLogger
       ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
@@ -117,7 +153,7 @@ export async function handlePlatformTest(
     emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', '🤖 Analyzing your request...', 30);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 0: LOAD CHAT SESSION CONTEXT (FIX #1: Error handling)
+    // STEP 1: LOAD CHAT SESSION CONTEXT (FIX #1: Error handling)
     // ═══════════════════════════════════════════════════════════════════════
 
     let sessionProject: { id: string; name: string; settings?: { main_url?: string } } | null = null;
@@ -166,9 +202,6 @@ export async function handlePlatformTest(
     // STEP 1: PROCESS ANSWERS (if user provided them)
     // ═══════════════════════════════════════════════════════════════════════
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // STEP 1: PROCESS ANSWERS (if user provided them)
-    // ═══════════════════════════════════════════════════════════════════════
 
     let parsedAnswers: {
       url?: string;
@@ -436,8 +469,6 @@ export async function handlePlatformTest(
     // Pro mode continues with exploration → plan confirmation flow
     // ═══════════════════════════════════════════════════════════════════════
 
-    const effectiveMode = mode || 'lite';
-
     if (effectiveMode === 'lite') {
       // Check if request was cancelled before starting Lite test
       if (abortSignal) {
@@ -456,11 +487,7 @@ export async function handlePlatformTest(
 
       emitProcessingStepWithLogging(chatSessionId, 'executing_test', '🚀 Starting Lite test...', 50);
 
-      // Step L1: Check credits
-      const testType = 'intelligent';
-      const creditsRequired = TokenCalculatorService.getTestCreditCost(testType);
-
-      // Check cancellation before credit check
+      // Check cancellation before creating test request
       if (abortSignal) {
         const checkRequestAbortedWithLogging = functionLogger
           ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
@@ -468,41 +495,13 @@ export async function handlePlatformTest(
         checkRequestAbortedWithLogging(abortSignal);
       }
 
-      const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, testType);
-      if (!creditCheck.hasEnough) {
-        logger.warn('[PLATFORM_TEST] Lite mode: insufficient credits', {
-          userId,
-          available: creditCheck.available,
-          required: creditCheck.required,
-          shortage: creditCheck.shortage,
-        });
-
-        if (chatSessionId) {
-          ChatService.saveChatMessages(chatSessionId, [
-            { role: 'user', content: message },
-            { role: 'ai', content: `❌ Insufficient credits. You need ${creditCheck.required} credits, but you only have ${creditCheck.available}. Please purchase more credits to continue testing.` },
-          ]).catch(() => {});
-        }
-
-        res.json({
-          success: false,
-          error: 'Insufficient credits',
-          message: `You need ${creditCheck.required} credits, but you only have ${creditCheck.available}. Please purchase more credits.`,
-          creditsRequired: creditCheck.required,
-          creditsAvailable: creditCheck.available,
-          timestamp: new Date().toISOString(),
-          sessionId: chatSessionId,
-        });
-        return;
-      }
-
-      // Step L2: Build test goal from message + parsedIntent
+      // Step L1: Build test goal from message + parsedIntent
       const finalScope = parsedAnswers?.scope || parsedIntent.scope || 'general';
       const testGoal = parsedIntent.target
         ? `${parsedIntent.target} on ${extractedUrl} (${finalScope})`
         : `Test ${finalScope} functionality on ${extractedUrl}`;
 
-      // Step L3: Create test request
+      // Step L2: Create test request
       const testRequest = {
         url: extractedUrl.trim(),
         browsers: ['chrome' as const],
@@ -526,7 +525,7 @@ export async function handlePlatformTest(
         checkRequestAbortedWithLogging(abortSignal);
       }
 
-      // Step L4: Run test immediately
+      // Step L3: Run test immediately
       let testCreated: any;
       let actualTestId: string | null = null;
 
@@ -551,7 +550,7 @@ export async function handlePlatformTest(
         throw new Error(`Failed to start test: ${testError instanceof Error ? testError.message : 'Unknown error'}`);
       }
 
-      // Step L5: Deduct credits AFTER successful test creation
+      // Step L4: Deduct credits AFTER successful test creation
       emitProcessingStepWithLogging(chatSessionId, 'executing_test', '💳 Deducting credits...', 80);
 
       // Check cancellation before credit deduction
@@ -562,10 +561,13 @@ export async function handlePlatformTest(
         checkRequestAbortedWithLogging(abortSignal);
       }
 
+      const testTypeForDeduction = 'intelligent';
+      const creditsRequired = 15; // Lite mode cost
+
       try {
         await CreditCostTrackerService.deductCreditsForTest({
           userId,
-          testType,
+          testType: testTypeForDeduction,
           credits: creditsRequired,
           costUSD: 0.08, // Intelligent test cost
           testId: actualTestId!,
@@ -587,7 +589,7 @@ export async function handlePlatformTest(
         throw new Error('Failed to deduct credits - test cancelled');
       }
 
-      // Step L6: Save test-chat mapping (non-blocking)
+      // Step L5: Save test-chat mapping (non-blocking)
       if (chatSessionId && actualTestId) {
         TestChatMappingService.saveTestChatMapping({
           testId: actualTestId,
@@ -596,7 +598,7 @@ export async function handlePlatformTest(
         }).catch(() => {});
       }
 
-      // Step L7: Emit WebSocket event
+      // Step L6: Emit WebSocket event
       if (chatSessionId && actualTestId) {
         try {
           const payload: ChatTestUpdatePayload = {
@@ -614,7 +616,7 @@ export async function handlePlatformTest(
 
       emitProcessingStepWithLogging(chatSessionId, 'executing_test', '✅ Test started!', 100);
 
-      // Step L8: Save to chat history (non-blocking)
+      // Step L7: Save to chat history (non-blocking)
       const replyMessage = `🚀 **Test Started in Lite Mode!**\n\n` +
         `I'm testing **${extractedUrl}** right now.\n\n` +
         `**Goal:** ${testGoal}\n\n` +
@@ -637,7 +639,7 @@ export async function handlePlatformTest(
         ]).catch(() => {});
       }
 
-      // Step L9: Return response
+      // Step L8: Return response
       res.json({
         success: true,
         reply: replyMessage,
