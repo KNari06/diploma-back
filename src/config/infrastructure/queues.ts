@@ -101,16 +101,14 @@ export const QUEUE_NAMES = {
 } as const;
 
 // Test run queue - for executing tests
+// ✅ FIX: Disable BullMQ auto-retry (attempts=1) because internal retry is handled by executePlaywrightTestWithRetry
+// This prevents double-execution when post-processing fails after successful test completion
 export const testRunQueue = new Queue<TestJobData>(QUEUE_NAMES.TEST_RUN, {
   connection,
   defaultJobOptions: {
     removeOnComplete: 100,
     removeOnFail: 50,
-    attempts: env.QUEUE_RETRY_ATTEMPTS,
-    backoff: {
-      type: 'exponential',
-      delay: env.QUEUE_RETRY_DELAY,
-    },
+    attempts: 1, // No BullMQ retry - internal retry handled by agent
   },
 });
 

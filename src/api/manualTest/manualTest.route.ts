@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
+import { testRetryRateLimiter, testRunRateLimiter } from '@/middleware/rate-limiter.middleware';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { IntelligentTestStorageService } from '@/services/testing/results/intelligent-test-storage.service';
@@ -199,14 +200,49 @@ const paginationSchema = z.object({
 /**
  * POST /manual-test/run
  * Run a new manual test
+ * ✅ FIX: Added rate limiter to prevent rapid duplicate test creation
  */
-router.post('/run', requireAuth, requireCredits(1), asyncHandler(async (req: Request, res: Response) => {
+router.post('/run', requireAuth, testRunRateLimiter, asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
     const validatedData = testRunSchema.parse(req.body);
 
     // Use user ID from auth middleware
     const userId = req.user!.id;
+
+    // ✅ FIX: Active-test guard BEFORE credit deduction (prevents double-charging on duplicate start)
+    // If an identical test is already pending/running, return it without charging again.
+    try {
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+      const { data: existingActiveTest } = await supabaseAdmin
+        .from('tests')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('url', validatedData.url)
+        .eq('project_id', validatedData.projectId)
+        .in('status', ['pending', 'running'])
+        .gte('created_at', fiveMinutesAgo)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (existingActiveTest?.id) {
+        res.status(200).json({
+          success: true,
+          data: existingActiveTest,
+          message: 'ACTIVE_TEST_REUSED',
+          timestamp: new Date(),
+        });
+        return;
+      }
+    } catch (guardError) {
+      // Fail-open: if guard check fails, proceed with normal flow
+      logger.warn('[MANUAL_TEST_API] Active-test guard check failed, proceeding', {
+        error: guardError instanceof Error ? guardError.message : String(guardError),
+        userId,
+        url: validatedData.url,
+      });
+    }
 
     // Deduct credits BEFORE running test
     const uiTestType = validatedData.intelligentMode ? 'intelligent' : 'standard';
@@ -742,7 +778,8 @@ router.post('/cancel-all-chat', requireAuth, asyncHandler(async (req: Request, r
  *       404:
  *         description: Тест не найден
  */
-router.post('/:id/retry', requireAuth, requireCredits(1), asyncHandler(async (req: Request, res: Response) => {
+// ✅ FIX: Added rate limiter to prevent rapid retry spam
+router.post('/:id/retry', requireAuth, testRetryRateLimiter, requireCredits(1), asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = req.user!.id;
 

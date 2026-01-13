@@ -1,12 +1,59 @@
 import { QueueManager } from '@/config/infrastructure/queues';
+import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { ApiResponse, Test, TestRunRequest, ValidationError } from '@/types';
-import { logger, logTestEvent } from '@/utils/core/logger';
-import { TestCreatedPayload } from '@/websocket/types/types';
+import { logTestEvent, logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
-import { createTest } from './test-creator';
+import { TestCreatedPayload } from '@/websocket/types/types';
 import { cancelTestJobs } from './test-cancellation';
+import { createTest } from './test-creator';
 import { validateTestRequest } from './test-validator';
-import { dbAdminService } from '@/db/supabase';
+
+/**
+ * Find existing active test (pending/running) for same user/url/project
+ * Prevents duplicate test creation when frontend rapidly calls /run
+ *
+ * @param testRequest - Test request parameters
+ * @returns Existing test if found, null otherwise
+ */
+async function findExistingActiveTest(testRequest: TestRunRequest): Promise<Test | null> {
+  if (!testRequest.userId || !testRequest.url) {
+    return null;
+  }
+
+  try {
+    // Query for active tests matching: userId + url + projectId + status IN (pending, running)
+    // Time window: created in last 5 minutes (avoid matching very old stuck tests)
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+    const { data, error } = await supabaseAdmin
+      .from('tests')
+      .select('*')
+      .eq('user_id', testRequest.userId)
+      .eq('url', testRequest.url)
+      .eq('project_id', testRequest.projectId)
+      .in('status', ['pending', 'running'])
+      .gte('created_at', fiveMinutesAgo)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      logger.warn('[ACTIVE_TEST_GUARD] Failed to query existing tests', {
+        error: error.message,
+        userId: testRequest.userId,
+        url: testRequest.url,
+      });
+      return null; // On error, allow test creation (fail-open)
+    }
+
+    return data as Test | null;
+  } catch (error) {
+    logger.warn('[ACTIVE_TEST_GUARD] Exception checking for active test', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null; // Fail-open
+  }
+}
 
 /**
  * Create and run a new test
@@ -33,6 +80,26 @@ export async function runTest(testRequest: TestRunRequest): Promise<ApiResponse<
     // - Direct API: Done in /manual-test/run controller via CreditCostTrackerService
     // - Retry: Done in retryTest() method via checkUserCredits + deductCredits
     logger.info('🟢 [MANUAL_TEST_FLOW] Step 3: Credits check/deduction handled by caller');
+
+    // ✅ FIX: Active-test guard - prevent duplicate tests for same user/url/project
+    // If user already has a pending/running test for the same target, return it instead of creating new
+    const existingActiveTest = await findExistingActiveTest(testRequest);
+    if (existingActiveTest) {
+      logger.info('🟢 [MANUAL_TEST_FLOW] Active test exists, returning existing instead of creating duplicate', {
+        existingTestId: existingActiveTest.id,
+        status: existingActiveTest.status,
+        url: testRequest.url,
+        userId: testRequest.userId,
+      });
+
+      return {
+        success: true,
+        data: existingActiveTest,
+        // ✅ IMPORTANT: Callers that deduct credits must skip charging when we reuse an active test.
+        message: 'ACTIVE_TEST_REUSED',
+        timestamp: new Date(),
+      };
+    }
 
     // Create test record
     logger.info('🟢 [MANUAL_TEST_FLOW] Step 4: Creating test record in DB');

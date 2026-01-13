@@ -253,39 +253,49 @@ export async function executeUiTestFlow(
     });
 
     // ✅ FIX #1: Deduct credits AFTER successful queue job creation
-    // This ensures we only charge if test actually started
-    emitProcessingStep(chatSessionId, 'executing_test', '💳 Deducting credits...', 90);
-    try {
-      await CreditCostTrackerService.deductCreditsForTest({
-        userId,
-        testType: uiTestType,
-        credits: creditsRequired,
-        costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001,
-        testId: actualTestId,
-        description: `${uiTestType} UI test: ${plan.url}`,
-      });
-      logger.info('[UI_TEST] Credits deducted successfully', {
-        testId: actualTestId,
-        credits: creditsRequired,
-      });
-    } catch (creditError) {
-      // If credit deduction fails AFTER test creation, we need to cancel the test
-      logger.error('[UI_TEST] Failed to deduct credits after test creation - cancelling test', {
-        error: creditError instanceof Error ? creditError.message : String(creditError),
-        testId: actualTestId,
-      });
-
-      // Cancel the test to prevent running without payment
+    // ✅ FIX (duplicate start): If we reused an existing active test, DO NOT deduct credits again.
+    const reusedExistingTest = testCreated?.message === 'ACTIVE_TEST_REUSED';
+    if (!reusedExistingTest) {
+      // This ensures we only charge if test actually started
+      emitProcessingStep(chatSessionId, 'executing_test', '💳 Deducting credits...', 90);
       try {
-        await ManualTestService.cancelTest(actualTestId, userId);
-      } catch (cancelError) {
-        logger.error('[UI_TEST] Failed to cancel test after credit deduction failure', {
-          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+        await CreditCostTrackerService.deductCreditsForTest({
+          userId,
+          testType: uiTestType,
+          credits: creditsRequired,
+          costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001,
+          testId: actualTestId,
+          description: `${uiTestType} UI test: ${plan.url}`,
+        });
+        logger.info('[UI_TEST] Credits deducted successfully', {
+          testId: actualTestId,
+          credits: creditsRequired,
+        });
+      } catch (creditError) {
+        // If credit deduction fails AFTER test creation, we need to cancel the test
+        logger.error('[UI_TEST] Failed to deduct credits after test creation - cancelling test', {
+          error: creditError instanceof Error ? creditError.message : String(creditError),
           testId: actualTestId,
         });
-      }
 
-      throw new Error('Failed to deduct credits - test cancelled');
+        // Cancel the test to prevent running without payment
+        try {
+          await ManualTestService.cancelTest(actualTestId, userId);
+        } catch (cancelError) {
+          logger.error('[UI_TEST] Failed to cancel test after credit deduction failure', {
+            error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+            testId: actualTestId,
+          });
+        }
+
+        throw new Error('Failed to deduct credits - test cancelled');
+      }
+    } else {
+      logger.info('[UI_TEST] Reused existing active test, skipping credit deduction', {
+        testId: actualTestId,
+        url: plan.url,
+        userId,
+      });
     }
 
     emitProcessingStep(chatSessionId, 'executing_test', '✅ Test started successfully!', 100);

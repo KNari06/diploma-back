@@ -551,7 +551,11 @@ export async function handlePlatformTest(
       }
 
       // Step L4: Deduct credits AFTER successful test creation
-      emitProcessingStepWithLogging(chatSessionId, 'executing_test', '💳 Deducting credits...', 80);
+      // ✅ FIX: If we reused an existing active test, do NOT deduct credits again.
+      const reusedExistingTest = testCreated?.message === 'ACTIVE_TEST_REUSED';
+      if (!reusedExistingTest) {
+        emitProcessingStepWithLogging(chatSessionId, 'executing_test', '💳 Deducting credits...', 80);
+      }
 
       // Check cancellation before credit deduction
       if (abortSignal) {
@@ -561,32 +565,40 @@ export async function handlePlatformTest(
         checkRequestAbortedWithLogging(abortSignal);
       }
 
-      const testTypeForDeduction = 'intelligent';
-      const creditsRequired = 15; // Lite mode cost
-
-      try {
-        await CreditCostTrackerService.deductCreditsForTest({
-          userId,
-          testType: testTypeForDeduction,
-          credits: creditsRequired,
-          costUSD: 0.08, // Intelligent test cost
-          testId: actualTestId!,
-          description: `Lite UI test: ${extractedUrl}`,
-        });
-      } catch (creditError) {
-        // If credit deduction fails, cancel the test
-        logger.error('[PLATFORM_TEST] Lite mode: credit deduction failed, cancelling test', {
-          error: creditError instanceof Error ? creditError.message : String(creditError),
-          testId: actualTestId,
-        });
+      if (!reusedExistingTest) {
+        const testTypeForDeduction = 'intelligent';
+        const creditsRequired = 15; // Lite mode cost
 
         try {
-          await ManualTestService.cancelTest(actualTestId!, userId);
-        } catch {
-          // Ignore cancel errors
-        }
+          await CreditCostTrackerService.deductCreditsForTest({
+            userId,
+            testType: testTypeForDeduction,
+            credits: creditsRequired,
+            costUSD: 0.08, // Intelligent test cost
+            testId: actualTestId!,
+            description: `Lite UI test: ${extractedUrl}`,
+          });
+        } catch (creditError) {
+          // If credit deduction fails, cancel the test
+          logger.error('[PLATFORM_TEST] Lite mode: credit deduction failed, cancelling test', {
+            error: creditError instanceof Error ? creditError.message : String(creditError),
+            testId: actualTestId,
+          });
 
-        throw new Error('Failed to deduct credits - test cancelled');
+          try {
+            await ManualTestService.cancelTest(actualTestId!, userId);
+          } catch {
+            // Ignore cancel errors
+          }
+
+          throw new Error('Failed to deduct credits - test cancelled');
+        }
+      } else {
+        logger.info('[PLATFORM_TEST] Reused existing active test, skipping credit deduction', {
+          testId: actualTestId,
+          url: extractedUrl,
+          userId,
+        });
       }
 
       // Step L5: Save test-chat mapping (non-blocking)

@@ -149,8 +149,21 @@ export class ManualTestRunJobHandler {
       });
 
       if (result.success) {
-        // ✅ FIX: Wrap in try-catch to prevent test restart on post-processing errors
-        // Test execution was successful - errors in result saving should NOT trigger BullMQ retry
+        // ✅ FIX: Finalize test status FIRST (atomic) before any post-processing
+        // This prevents re-execution if post-processing fails - guard at line 78-93 will see 'completed'
+        try {
+          await this.updateTestStatus(testId, 'completed', browser, undefined, new Date().toISOString());
+          logger.info(`[TEST-RUN] Test status finalized to completed BEFORE post-processing: ${testId}`);
+        } catch (statusError) {
+          // Status update failed - log but continue with post-processing
+          // Guard will still protect against re-execution via DB check
+          logger.error(`[TEST-RUN] Failed to finalize test status, continuing with post-processing: ${testId}`, {
+            error: statusError instanceof Error ? statusError.message : String(statusError),
+          });
+        }
+
+        // ✅ FIX: Wrap post-processing in try-catch - errors here should NOT trigger job retry
+        // Test execution was successful - errors in result saving are non-critical
         try {
           await this.handleSuccessfulTest(testId, browser, result);
         } catch (postProcessError) {

