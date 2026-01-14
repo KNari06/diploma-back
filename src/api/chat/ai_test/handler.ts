@@ -16,6 +16,165 @@ import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CREDENTIAL EXTRACTION FROM USER MESSAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if a string looks like a phone number
+ * Improved detection with stricter rules to avoid false-positives
+ *
+ * Rules:
+ * - If starts with +: must have 7-15 digits (international format)
+ * - If starts with 8 (KZ/RU): must have 10-11 digits total
+ * - If only digits: must have 10-15 digits AND contain formatting (spaces/dashes/parentheses)
+ *   OR be exactly 11 digits (common phone length)
+ * - Must NOT contain letters (except + at start)
+ */
+function looksLikePhone(value: string): boolean {
+  if (!value || typeof value !== 'string') return false;
+
+  // Remove formatting characters but keep + for international format
+  const digitsOnly = value.replace(/[\s\-().]/g, '');
+  const digitCount = (digitsOnly.match(/\d/g) || []).length;
+
+  // Check for letters - if present, it's not a phone
+  if (/[a-zA-Zа-яёА-ЯЁ]/.test(value)) return false;
+
+  // International format: + followed by 7-15 digits
+  if (value.startsWith('+')) {
+    return digitCount >= 7 && digitCount <= 15;
+  }
+
+  // KZ/RU format: starts with 8, then 10 digits (8XXXXXXXXXX = 11 total)
+  if (value.startsWith('8') && /^8[\d\s\-()]+$/.test(value)) {
+    return digitCount >= 10 && digitCount <= 11;
+  }
+
+  // Other formats: must have formatting OR be exactly 11 digits
+  // This prevents pure numeric usernames like "1234567890" from being detected as phone
+  const hasFormatting = /[\s\-().]/.test(value);
+  const isExactly11Digits = digitCount === 11 && /^\d+$/.test(value.replace(/[\s\-().]/g, ''));
+
+  if (hasFormatting) {
+    // Has formatting (spaces, dashes, parentheses) - likely a phone
+    return digitCount >= 10 && digitCount <= 15;
+  }
+
+  // No formatting: only accept if exactly 11 digits (common phone length)
+  // This is a compromise - 10-digit numbers without formatting are ambiguous
+  return isExactly11Digits;
+}
+
+/**
+ * Classify a login value as email, phone, or username
+ * Priority: email > phone > username
+ */
+function classifyLoginValue(value: string): 'email' | 'phone' | 'username' {
+  if (!value || typeof value !== 'string') return 'username';
+
+  // Email check (highest priority)
+  if (value.includes('@')) return 'email';
+
+  // Phone check
+  if (looksLikePhone(value)) return 'phone';
+
+  // Default to username
+  return 'username';
+}
+
+/**
+ * Extract credentials from user message text
+ * Supports patterns like:
+ * - with "email@test.com" login and "password123" password
+ * - with "+77011234567" phone and "password123" password
+ * - email: "test@example.com", password: "mypass"
+ * - phone: "+77011234567", password: "mypass"
+ * - login "user@mail.com" password "secret"
+ *
+ * SECURITY: Never log the actual password/phone value
+ *
+ * @param message - User message text
+ * @returns Extracted credentials or null if not found
+ */
+function extractCredentialsFromMessage(message: string): { email?: string; username?: string; phone?: string; password: string } | null {
+  if (!message || typeof message !== 'string') {
+    return null;
+  }
+
+  // Pattern 1: with "value" (login|email|username|phone) and "password" password
+  const pattern1 = /(?:with\s+)?["']([^"']+)["']\s+(?:login|email|username|phone|tel|телефон)\s+(?:and\s+)?["']([^"']+)["']\s+(?:password|pass)/i;
+  const match1 = message.match(pattern1);
+  if (match1) {
+    const [, loginValue, passwordValue] = match1;
+    const type = classifyLoginValue(loginValue);
+    return {
+      email: type === 'email' ? loginValue : undefined,
+      phone: type === 'phone' ? loginValue : undefined,
+      username: type === 'username' ? loginValue : undefined,
+      password: passwordValue,
+    };
+  }
+
+  // Pattern 2: key: "value" format (email/login/username/phone: "value", password: "value")
+  const emailPattern = /(?:email|login|username)\s*[:=]\s*["']([^"']+)["']/i;
+  const phonePattern = /(?:phone|tel|mobile|телефон|номер)\s*[:=]\s*["']([^"']+)["']/i;
+  const passwordPattern = /(?:password|pass)\s*[:=]\s*["']([^"']+)["']/i;
+
+  const emailMatch = message.match(emailPattern);
+  const phoneMatch = message.match(phonePattern);
+  const passwordMatch = message.match(passwordPattern);
+
+  if (passwordMatch && (emailMatch || phoneMatch)) {
+    const passwordValue = passwordMatch[1];
+    const result: { email?: string; username?: string; phone?: string; password: string } = { password: passwordValue };
+
+    if (phoneMatch) {
+      result.phone = phoneMatch[1];
+    }
+
+    if (emailMatch) {
+      const loginValue = emailMatch[1];
+      const type = classifyLoginValue(loginValue);
+      if (type === 'email') result.email = loginValue;
+      else if (type === 'phone' && !result.phone) result.phone = loginValue;
+      else result.username = loginValue;
+    }
+
+    return result;
+  }
+
+  // Pattern 3: (login|email|username|phone) "user" password "pass" (simple quoted pairs)
+  const pattern3 = /(?:login|email|username|phone|tel)\s+["']([^"']+)["']\s+(?:password|pass)\s+["']([^"']+)["']/i;
+  const match3 = message.match(pattern3);
+  if (match3) {
+    const [, loginValue, passwordValue] = match3;
+    const type = classifyLoginValue(loginValue);
+    return {
+      email: type === 'email' ? loginValue : undefined,
+      phone: type === 'phone' ? loginValue : undefined,
+      username: type === 'username' ? loginValue : undefined,
+      password: passwordValue,
+    };
+  }
+
+  // Pattern 4: Reverse order - password first: password "pass" (login|phone) "user"
+  const pattern4 = /(?:password|pass)\s+["']([^"']+)["']\s+(?:login|email|username|phone|tel)\s+["']([^"']+)["']/i;
+  const match4 = message.match(pattern4);
+  if (match4) {
+    const [, passwordValue, loginValue] = match4;
+    const type = classifyLoginValue(loginValue);
+    return {
+      email: type === 'email' ? loginValue : undefined,
+      phone: type === 'phone' ? loginValue : undefined,
+      username: type === 'username' ? loginValue : undefined,
+      password: passwordValue,
+    };
+  }
+
+  return null;
+}
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════
  * HANDLER: PLATFORM TEST (UI Testing) - REFACTORED & FIXED
@@ -409,13 +568,27 @@ export async function handlePlatformTest(
     checkTimeout('find_or_create_project');
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 3: HANDLE CREDENTIALS (from answers OR saved in DB)
+    // STEP 3: HANDLE CREDENTIALS (from message text, answers, OR saved in DB)
+    // Priority: message text > answers > saved in DB
     // ═══════════════════════════════════════════════════════════════════════
 
     let finalCredentials: any = null;
 
-    // Priority 1: Credentials from user answers (fresh input)
-    if (parsedAnswers?.credentials) {
+    // Priority 0: Credentials from user message text (highest priority)
+    // Handles patterns like: with "email@test.com" login and "password123" password
+    const messageCredentials = extractCredentialsFromMessage(message);
+    if (messageCredentials) {
+      logger.info('[PLATFORM_TEST] Extracted credentials from message text', {
+        hasEmail: !!messageCredentials.email,
+        hasUsername: !!messageCredentials.username,
+        hasPhone: !!messageCredentials.phone,
+        // SECURITY: Never log actual password/phone values
+      });
+      finalCredentials = messageCredentials;
+    }
+
+    // Priority 1: Credentials from user answers (if not found in message)
+    if (!finalCredentials && parsedAnswers?.credentials) {
       // ✅ IMPROVEMENT: Validate credentials structure before use
       const creds = parsedAnswers.credentials;
       const hasIdentifier = (creds.email && typeof creds.email === 'string' && creds.email.trim().length > 0) ||
@@ -435,7 +608,7 @@ export async function handlePlatformTest(
       }
     }
 
-    // Priority 2: Saved credentials from DB (if not found in answers or invalid)
+    // Priority 2: Saved credentials from DB (if not found in message or answers)
     if (!finalCredentials) {
       try {
         emitProcessingStepWithLogging(chatSessionId, 'validating_credentials', '🔍 Getting saved credentials...', 45);

@@ -448,7 +448,7 @@ export class ProjectContextService {
 
       const { data, error } = await supabaseAdmin
         .from('test_credentials')
-        .select('email_encrypted, username_encrypted, password_encrypted, label, created_at')
+        .select('email_encrypted, username_encrypted, phone_encrypted, password_encrypted, label, created_at')
         .eq('project_id', projectId)
         .eq('user_id', userId)
         .order('created_at', { ascending: false })
@@ -471,9 +471,13 @@ export class ProjectContextService {
       // FIX #6: Safe credentials decryption with validation
       try {
         // Validate encrypted data exists (check for null/undefined)
-        if ((!data.email_encrypted || data.email_encrypted.trim().length === 0) &&
-            (!data.username_encrypted || data.username_encrypted.trim().length === 0)) {
-          logger.warn('[PROJECT] No encrypted credentials found', { projectId });
+        // Must have at least one identifier: email, username, or phone
+        const hasEmailEncrypted = data.email_encrypted && data.email_encrypted.trim().length > 0;
+        const hasUsernameEncrypted = data.username_encrypted && data.username_encrypted.trim().length > 0;
+        const hasPhoneEncrypted = data.phone_encrypted && data.phone_encrypted.trim().length > 0;
+
+        if (!hasEmailEncrypted && !hasUsernameEncrypted && !hasPhoneEncrypted) {
+          logger.warn('[PROJECT] No encrypted identifier found (email/username/phone)', { projectId });
           return null;
         }
 
@@ -485,6 +489,7 @@ export class ProjectContextService {
         const decrypted = CredentialsParserService.decryptCredentials({
           email_encrypted: data.email_encrypted || undefined,
           username_encrypted: data.username_encrypted || undefined,
+          phone_encrypted: data.phone_encrypted || undefined,
           password_encrypted: data.password_encrypted,
         });
 
@@ -497,7 +502,8 @@ export class ProjectContextService {
         // Validate at least one identifier exists and is not empty
         const hasEmail = decrypted.email && decrypted.email.trim().length > 0;
         const hasUsername = decrypted.username && decrypted.username.trim().length > 0;
-        if (!hasEmail && !hasUsername) {
+        const hasPhone = decrypted.phone && decrypted.phone.trim().length > 0;
+        if (!hasEmail && !hasUsername && !hasPhone) {
           logger.error('[PROJECT] Decrypted credentials missing identifier', { projectId });
           return null;
         }
@@ -512,6 +518,7 @@ export class ProjectContextService {
           projectId,
           hasEmail: !!decrypted.email,
           hasUsername: !!decrypted.username,
+          hasPhone: !!decrypted.phone,
           label: data.label,
         });
 
@@ -558,8 +565,8 @@ export class ProjectContextService {
       if (!credentials.password || typeof credentials.password !== 'string') {
         throw new Error('Invalid credentials: password is required');
       }
-      if (!credentials.email && !credentials.username) {
-        throw new Error('Invalid credentials: email or username is required');
+      if (!credentials.email && !credentials.username && !credentials.phone) {
+        throw new Error('Invalid credentials: email, username, or phone is required');
       }
 
       logger.info('[PROJECT] Saving credentials', {
@@ -567,6 +574,7 @@ export class ProjectContextService {
         userId,
         hasEmail: !!credentials.email,
         hasUsername: !!credentials.username,
+        hasPhone: !!credentials.phone,
         label: label || 'Test credentials',
       });
 

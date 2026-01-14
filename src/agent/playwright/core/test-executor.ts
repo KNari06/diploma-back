@@ -160,6 +160,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         goal,
         url: testData.url,
         timeout: 5 * 60 * 1000, // 5 minutes
+        // Pass credentials for secure fill (never sent to LLM)
+        credentials: testData.options?.credentials,
       });
 
       const liteResult = await liteEngine.execute();

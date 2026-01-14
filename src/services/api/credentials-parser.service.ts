@@ -1,13 +1,15 @@
-import crypto from 'crypto';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
+import crypto from 'crypto';
 
 /**
  * Credentials interface
+ * Supports email, username, phone, and password
  */
 export interface Credentials {
   email?: string;
   username?: string;
+  phone?: string;
   password: string;
 }
 
@@ -93,12 +95,28 @@ export class CredentialsParserService {
   }
 
   /**
+   * Check if a string looks like a phone number
+   * Supports formats: +7..., 8..., (XXX), etc.
+   */
+  private static looksLikePhone(value: string): boolean {
+    // Starts with + or contains mostly digits (at least 7 digits)
+    const digitsOnly = value.replace(/[\s\-()]/g, '');
+    const digitCount = (digitsOnly.match(/\d/g) || []).length;
+    return (
+      (value.startsWith('+') && digitCount >= 7) ||
+      (digitCount >= 7 && digitCount <= 15 && /^[\d\s\-()+]+$/.test(value))
+    );
+  }
+
+  /**
    * Parse key-value format: "email: test@test.com, password: 123"
+   * Now also supports phone: "+7..."
    */
   private static parseKeyValueFormat(text: string): Credentials | null {
     const patterns = {
       email: /email[:\s]+([^\s,;]+)/i,
       username: /username[:\s]+([^\s,;]+)/i,
+      phone: /(?:phone|tel|mobile|телефон|номер)[:\s]+([^\s,;]+)/i,
       password: /password[:\s]+([^\s,;]+)/i,
     };
 
@@ -120,7 +138,7 @@ export class CredentialsParserService {
   }
 
   /**
-   * Parse slash/pipe format: "test@test.com / 123" or "username | pass"
+   * Parse slash/pipe format: "test@test.com / 123" or "username | pass" or "+7... / pass"
    */
   private static parseSlashFormat(text: string): Credentials | null {
     const match = text.match(/([^\s/|]+)[\s]*[/|][\s]*([^\s]+)/);
@@ -136,6 +154,14 @@ export class CredentialsParserService {
         };
       }
 
+      // Check if first part is phone
+      if (this.looksLikePhone(firstPart)) {
+        return {
+          phone: firstPart,
+          password: secondPart,
+        };
+      }
+
       // Otherwise, treat as username
       return {
         username: firstPart,
@@ -147,7 +173,7 @@ export class CredentialsParserService {
   }
 
   /**
-   * Parse space format: "test@test.com 123456"
+   * Parse space format: "test@test.com 123456" or "+7... 123456"
    */
   private static parseSpaceFormat(text: string): Credentials | null {
     const parts = text.split(/\s+/).filter(p => p.length > 0);
@@ -159,10 +185,18 @@ export class CredentialsParserService {
 
     const [firstPart, secondPart] = parts;
 
-    // Check if first part looks like email or username
+    // Check if first part looks like email
     if (firstPart.includes('@')) {
       return {
         email: firstPart,
+        password: secondPart,
+      };
+    }
+
+    // Check if first part looks like phone
+    if (this.looksLikePhone(firstPart)) {
+      return {
+        phone: firstPart,
         password: secondPart,
       };
     }
@@ -189,6 +223,13 @@ export class CredentialsParserService {
         };
       }
 
+      if (this.looksLikePhone(firstLine)) {
+        return {
+          phone: firstLine,
+          password: secondLine,
+        };
+      }
+
       return {
         username: firstLine,
         password: secondLine,
@@ -204,6 +245,7 @@ export class CredentialsParserService {
   static encryptCredentials(credentials: Credentials): {
     email_encrypted?: string;
     username_encrypted?: string;
+    phone_encrypted?: string;
     password_encrypted: string;
   } {
     try {
@@ -215,6 +257,10 @@ export class CredentialsParserService {
 
       if (credentials.username) {
         result.username_encrypted = this.encrypt(credentials.username);
+      }
+
+      if (credentials.phone) {
+        result.phone_encrypted = this.encrypt(credentials.phone);
       }
 
       result.password_encrypted = this.encrypt(credentials.password);
@@ -232,6 +278,7 @@ export class CredentialsParserService {
   static decryptCredentials(encrypted: {
     email_encrypted?: string;
     username_encrypted?: string;
+    phone_encrypted?: string;
     password_encrypted: string;
   }): Credentials {
     try {
@@ -245,6 +292,10 @@ export class CredentialsParserService {
 
       if (encrypted.username_encrypted) {
         result.username = this.decrypt(encrypted.username_encrypted);
+      }
+
+      if (encrypted.phone_encrypted) {
+        result.phone = this.decrypt(encrypted.phone_encrypted);
       }
 
       return result;

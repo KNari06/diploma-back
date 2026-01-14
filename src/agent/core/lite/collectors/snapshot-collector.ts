@@ -336,7 +336,12 @@ export class SnapshotCollector {
               disabled: input.disabled || el.hasAttribute('disabled'),
               visible: true,
               context: getParentContext(el),  // Parent context
-              isInsideActiveModal,  // ✅ NEW: Mark elements inside modal
+              isInsideActiveModal,  // Mark elements inside modal
+              // Semantic attributes for field classification (Level 1 signals)
+              autocomplete: isInput ? el.getAttribute('autocomplete') || undefined : undefined,
+              inputmode: isInput ? el.getAttribute('inputmode') || undefined : undefined,
+              htmlName: el.getAttribute('name') || undefined,
+              htmlId: el.getAttribute('id') || undefined,
             });
           } catch (err) {
             // Skip element if any error

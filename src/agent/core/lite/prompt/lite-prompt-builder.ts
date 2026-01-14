@@ -6,8 +6,8 @@
 
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
-import type { AIDecision, GoalGuidance, ModalDismissInfo, StuckCheck } from '../lite-types';
 import type { TaskPlanStep } from '../analysis/task-plan-builder';
+import type { AIDecision, GoalGuidance, ModalDismissInfo, StuckCheck } from '../lite-types';
 
 /**
  * Task plan context for prompt
@@ -51,6 +51,7 @@ export class LitePromptBuilder {
    * NEW: Includes AI guidance/nextSubgoal when provided (from AI fallback)
    * ✅ FIX: Truncates snapshot if too large to prevent token overflow
    * ✅ NEW: Includes contextualHints from GoalDetector for smarter navigation
+   * ✅ NEW: Includes credential hint when user provided credentials
    *
    * @param params - Prompt parameters
    * @returns Complete prompt string
@@ -78,6 +79,8 @@ export class LitePromptBuilder {
     modalDismissInfo?: ModalDismissInfo;
     /** ✅ NEW (Lite Autonomy v3): Validation error context for rollback */
     validationErrorContext?: ValidationErrorContext;
+    /** ✅ NEW: Flag indicating user provided credentials (never include actual values!) */
+    hasCredentials?: boolean;
   }): string {
     // ✅ FIX: Truncate snapshot if too large (prevent token overflow)
     const MAX_SNAPSHOT_LENGTH = 100_000; // 100k chars (~25k tokens)
@@ -121,6 +124,19 @@ ${params.progressSignals.progressScore >= 0.5 ? '→ Getting close to goal! Look
       ? `\nCONTEXTUAL HINTS:\n${params.contextualHints.join('\n')}\n`
       : '';
 
+    // ✅ NEW: Build credential hint section (SECURITY: never include actual values!)
+    const credentialHintSection = params.hasCredentials
+      ? `
+🔐 CREDENTIALS PROVIDED:
+User has provided login credentials. The system will automatically fill them.
+- DO NOT invent or guess email/username/phone/password values
+- Only identify the correct input fields (email, username, phone/tel, password)
+- Use any placeholder value in your fill commands - the system will override with real credentials
+- When filling credential fields, set "isSensitive": true in your command
+- Focus on finding and clicking the correct form fields, not on what to type
+`
+      : '';
+
     // ✅ NEW (Lite Autonomy v3): Build task plan section
     const taskPlanSection = LitePromptBuilder.buildTaskPlanSection(params.taskPlanContext);
 
@@ -138,13 +154,14 @@ GOAL: ${params.goal}
 
 CURRENT PAGE:
 ${snapshot}
-${taskPlanSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${modalDismissSection}${validationErrorSection}
+${taskPlanSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${modalDismissSection}${validationErrorSection}
 HISTORY:
 ${params.history}
 
 AVAILABLE ACTIONS (choose ONE):
 - click: { "action": "click", "ref": "e5" }
 - fill: { "action": "fill", "ref": "e2", "value": "text to type" }
+- fill (credential): { "action": "fill", "ref": "e2", "value": "placeholder", "isSensitive": true }
 - press: { "action": "press", "key": "Enter" }
 - goto: { "action": "goto", "url": "https://..." }
 - scroll: { "action": "scroll", "direction": "down", "amount": 600 }

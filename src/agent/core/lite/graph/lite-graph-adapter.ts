@@ -2,10 +2,13 @@
  * Lite Graph Adapter
  * Converts Lite types (AICommand, ExecutionResult, etc.) to Pro-compatible types
  * for use with GraphBuilder (DynamicAction, GraphActionResult)
+ *
+ * SECURITY: Fill values are redacted for credential fields using shared field classifier
  */
 
 import type { DynamicAction } from '@/agent/types/intelligent-testing.types';
 import type { GraphActionResult } from '@/agent/utils/visualization/graph-builder.service';
+import { shouldRedactField } from '../analysis/field-classifier';
 import type { AICommand, AIDecision, ExecutionResult, LiteSnapshot, StateDiff } from '../lite-types';
 
 // DynamicAction.action union type (matches intelligent-testing.types.ts)
@@ -55,14 +58,20 @@ export function toDynamicAction(
   }
 
   // Build human-readable description
+  // SECURITY: Redact fill values for credential fields
   let description: string;
   switch (command.action) {
     case 'click':
       description = `Click${elementInfo || (ref ? ` element ${ref}` : '')}`;
       break;
-    case 'fill':
-      description = `Fill${elementInfo || (ref ? ` element ${ref}` : '')} with "${command.value?.slice(0, 20) || ''}"`;
+    case 'fill': {
+      // Find element and check if it's a credential field (validates isSensitive hint)
+      const targetElement = ref ? snapshotBefore.elements.find(el => el.ref === ref) : undefined;
+      const shouldRedact = targetElement ? shouldRedactField(targetElement, command.isSensitive) : !!command.isSensitive;
+      const displayValue = shouldRedact ? '[REDACTED]' : (command.value?.slice(0, 20) || '');
+      description = `Fill${elementInfo || (ref ? ` element ${ref}` : '')} with "${displayValue}"`;
       break;
+    }
     case 'press':
       description = `Press key "${command.key || ''}"`;
       break;
@@ -85,10 +94,19 @@ export function toDynamicAction(
       description = `${command.action}${elementInfo || ''}`;
   }
 
+  // SECURITY: Redact value for credential fields in the returned action (validates isSensitive hint)
+  let safeValue = command.value;
+  if (command.action === 'fill' && ref) {
+    const targetElement = snapshotBefore.elements.find(el => el.ref === ref);
+    if (targetElement ? shouldRedactField(targetElement, command.isSensitive) : command.isSensitive) {
+      safeValue = '[REDACTED]';
+    }
+  }
+
   return {
     action: mapActionType(command.action),
     selector,
-    value: command.value,
+    value: safeValue,
     description,
     // Optional fields for Pro compatibility
     optional: false,

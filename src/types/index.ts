@@ -47,6 +47,7 @@ export interface TestOptions {
   credentials?: {
     email?: string;
     username?: string;
+    phone?: string;
     password: string;
   };
   mode?: 'lite' | 'pro'; // Persisted execution mode (used by retry logic)

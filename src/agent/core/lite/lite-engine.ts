@@ -14,6 +14,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Page } from 'playwright';
 import { checkTestCancelled, cleanupCancellationState, withCancellation } from '../../playwright/utils/test-cancellation-checker';
 import { buildSnapshotSummary } from './analysis/ai-goal-evaluator';
+import { classifyField } from './analysis/field-classifier';
 import { GoalDetector } from './analysis/goal-detector';
 import { PlanProgressEvaluator } from './analysis/plan-progress-evaluator';
 import { StateDiffComputer } from './analysis/state-diff';
@@ -27,7 +28,7 @@ import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
-import type { AIDecision, ActionOutcome, CollectedError, ExecutionResult, GoalContext, GoalGuidance, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, StateDiff } from './lite-types';
+import type { AICommand, AIDecision, ActionOutcome, CollectedError, ExecutionResult, GoalContext, GoalGuidance, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, StateDiff } from './lite-types';
 import { LitePromptBuilder, type TaskPlanContext, type ValidationErrorContext } from './prompt/lite-prompt-builder';
 import { LiteTraceWriter } from './trace/lite-trace-writer';
 
@@ -116,7 +117,147 @@ export class LiteEngine {
       hasGraphBuilder: true,
       hasGoalDetector: true,
       hasTraceWriter: true,
+      hasCredentials: !!config.credentials, // Log if credentials provided (never log actual values)
     });
+  }
+
+  /**
+   * Override fill value for credential fields (email/username/phone/password)
+   * SECURITY: Never sends credentials to LLM - backend injects correct values
+   * Uses shared field classifier (3-level hierarchy) for reliable detection
+   *
+   * @param command - AI command to potentially override
+   * @param snapshotBefore - Current page snapshot for element detection
+   * @returns Modified command with credential value if applicable
+   */
+  private overrideCredentialFillValue(
+    command: AICommand,
+    snapshotBefore: LiteSnapshot
+  ): AICommand {
+    // Only process fill commands
+    if (command.action !== 'fill' || !command.ref) {
+      return command;
+    }
+
+    // No credentials available
+    if (!this.config.credentials) {
+      return command;
+    }
+
+    // Find target element in snapshot
+    const element = snapshotBefore.elements.find(el => el.ref === command.ref);
+    if (!element) {
+      return command;
+    }
+
+    // Use shared classifier (Level 1-3 hierarchy)
+    const classification = classifyField(element);
+    if (!classification.kind) {
+      return command;
+    }
+
+    const { credentials } = this.config;
+
+    // Map classified kind to credential value
+    switch (classification.kind) {
+      case 'password':
+        logger.debug('[LITE_ENGINE] Overriding password field with credential', {
+          testId: this.config.testId,
+          ref: command.ref,
+          confidence: classification.confidence,
+          reasons: classification.reasons,
+        });
+        return { ...command, value: credentials.password };
+
+      case 'phone':
+        if (credentials.phone) {
+          logger.debug('[LITE_ENGINE] Overriding phone field with credential', {
+            testId: this.config.testId,
+            ref: command.ref,
+            confidence: classification.confidence,
+            reasons: classification.reasons,
+          });
+          return { ...command, value: credentials.phone };
+        }
+        break;
+
+      case 'email':
+        if (credentials.email) {
+          logger.debug('[LITE_ENGINE] Overriding email field with credential', {
+            testId: this.config.testId,
+            ref: command.ref,
+            confidence: classification.confidence,
+            reasons: classification.reasons,
+          });
+          return { ...command, value: credentials.email };
+        }
+        break;
+
+      case 'username': {
+        // Fallback chain: username → email → phone
+        const usernameValue = credentials.username || credentials.email || credentials.phone;
+        if (usernameValue) {
+          logger.debug('[LITE_ENGINE] Overriding username field with credential', {
+            testId: this.config.testId,
+            ref: command.ref,
+            confidence: classification.confidence,
+            reasons: classification.reasons,
+          });
+          return { ...command, value: usernameValue };
+        }
+        break;
+      }
+    }
+
+    return command;
+  }
+
+  /**
+   * Build a safe command for trace logging (smart redaction)
+   * Only redacts fill values for credential fields; keeps other values visible for debugging
+   * Validates AI isSensitive hint - only honored if classifier agrees
+   *
+   * @param command - AI command to sanitize
+   * @param snapshot - Current page snapshot for field classification
+   * @returns Command with value redacted only if credential field or validated isSensitive
+   */
+  private buildSafeCommandForTrace(
+    command: AICommand | undefined,
+    snapshot: LiteSnapshot
+  ): AICommand | undefined {
+    if (!command) return command;
+
+    // Only redact fill commands with a ref
+    if (command.action !== 'fill' || !command.ref || !command.value) {
+      return command;
+    }
+
+    // Find target element and classify
+    const element = snapshot.elements.find(el => el.ref === command.ref);
+    if (!element) {
+      // Element not found - redact if AI marked as sensitive (better safe than sorry)
+      if (command.isSensitive) {
+        return { ...command, value: '[REDACTED]' };
+      }
+      return command;
+    }
+
+    // Use shared classifier to decide redaction (validates isSensitive hint)
+    const classification = classifyField(element);
+
+    // Redact if: credential field detected
+    if (classification.kind !== null) {
+      return { ...command, value: '[REDACTED]' };
+    }
+
+    // Honor isSensitive only if classifier has medium/high confidence
+    // This prevents AI from forcing redaction on arbitrary fields
+    if (command.isSensitive && (classification.confidence === 'medium' || classification.confidence === 'high')) {
+      return { ...command, value: '[REDACTED]' };
+    }
+
+    // Non-credential field - keep value visible for debugging
+    return command;
   }
 
   /**
@@ -689,6 +830,7 @@ export class LiteEngine {
           taskPlanContext, // ✅ NEW (Lite Autonomy v3): Task plan context
           modalDismissInfo: this.lastModalDismissInfo || undefined, // ✅ NEW: Modal dismiss info
           validationErrorContext: this.validationErrorContext || undefined, // ✅ NEW: Validation error context
+          hasCredentials: !!this.config.credentials, // ✅ NEW: Tell LLM not to invent credentials
         });
 
         // ✅ NEW: Trace AI prompt
@@ -715,10 +857,8 @@ export class LiteEngine {
           'LitePromptBuilder.askAI'
         );
 
-        // ✅ NEW: Trace AI response
-        const safeCommand = decision?.command
-          ? { ...decision.command, value: decision.command.value ? '[REDACTED]' : undefined }
-          : decision.command;
+        // ✅ NEW: Trace AI response (smart redaction: only credential fields)
+        const safeCommand = this.buildSafeCommandForTrace(decision?.command, snapshotBefore);
         const safeDecision = {
           ...decision,
           command: safeCommand,
@@ -951,6 +1091,10 @@ export class LiteEngine {
         const parsedGoal = this.goalDetector.getParsedGoal();
         const modalKeywords = this.goalDetector.getModalKeywords();
 
+        // ✅ CREDENTIAL OVERRIDE: Replace AI-generated fill values for credential fields
+        // SECURITY: Credentials never sent to LLM - backend injects correct values here
+        const commandWithCredentials = this.overrideCredentialFillValue(decision.command, snapshotBefore);
+
         // ✅ NEW: Trace action execute start
         const actionSpanId = this.traceWriter.generateSpanId();
         this.traceWriter.write({
@@ -960,13 +1104,13 @@ export class LiteEngine {
           spanId: actionSpanId,
           parentSpanId: iterationSpanId,
           payload: {
-            command: safeCommand,
+            command: safeCommand, // Always log redacted version
             thought: decision.thought,
           },
         });
 
         const execResult = await this.executor.execute(
-          decision.command, // JSON command, not code
+          commandWithCredentials, // Use command with credential override
           snapshotBefore,
           {
             entryPointKeywords: parsedGoal.entryPointKeywords,

@@ -5,6 +5,7 @@
 
 /**
  * Element with parent context for better AI understanding
+ * Includes semantic attributes for field classification (Level 1-3 hierarchy)
  */
 export interface LiteElement {
   ref: string;
@@ -18,7 +19,12 @@ export interface LiteElement {
   disabled?: boolean;
   visible: boolean;
   context?: string; // "inside: Product Card 'iPhone 15'"
-  isInsideActiveModal?: boolean; // ✅ NEW: True if element is inside active modal
+  isInsideActiveModal?: boolean; // True if element is inside active modal
+  // Semantic attributes for field classification (Level 1 signals)
+  autocomplete?: string;  // e.g., "current-password", "email", "tel", "username"
+  inputmode?: string;     // e.g., "tel", "email", "numeric"
+  htmlName?: string;      // HTML name attribute (e.g., "password", "email")
+  htmlId?: string;        // HTML id attribute (e.g., "login-email")
 }
 
 /**
@@ -135,6 +141,12 @@ export interface AICommand {
   amount?: number;
   /** For scroll: optional target element ref to scroll into view. */
   targetRef?: string;
+  /**
+   * AI hint: marks the field as containing sensitive data (password/email/phone/username).
+   * System validates this hint - it's only honored if the classifier agrees.
+   * Use this when filling credential fields to help with redaction.
+   */
+  isSensitive?: boolean;
 }
 
 /**
@@ -203,6 +215,17 @@ export interface LiteTestResult {
 }
 
 /**
+ * Credentials for Lite mode (secure: never sent to LLM)
+ * Used for automatic fill of login/password/phone fields
+ */
+export interface LiteCredentials {
+  email?: string;
+  username?: string;
+  phone?: string;
+  password: string;
+}
+
+/**
  * Engine configuration
  */
 export interface LiteEngineConfig {
@@ -212,6 +235,8 @@ export interface LiteEngineConfig {
   goal: string;
   url: string;
   timeout?: number;
+  /** User-provided credentials for login (SECURE: never sent to LLM, only used for field filling) */
+  credentials?: LiteCredentials;
 }
 
 /**
