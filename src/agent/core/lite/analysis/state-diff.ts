@@ -188,4 +188,81 @@ export class StateDiffComputer {
 
     return lines.join('\n');
   }
+
+  /**
+   * Format diff for AI prompt with actionable analysis
+   * Includes state drift reasoning to help AI understand what changed and what to do
+   *
+   * @param diff - State diff to format
+   * @param action - Action that was taken
+   * @returns Formatted string for AI with reasoning hints
+   */
+  static formatForAI(diff: StateDiff, action: string): string {
+    const lines: string[] = [];
+
+    // State Drift Analysis Header
+    lines.push('📊 STATE DRIFT ANALYSIS (what changed after last action):');
+
+    // URL Analysis
+    if (diff.urlChanged) {
+      lines.push(`✅ URL CHANGED: ${diff.urlBefore} → ${diff.urlAfter}`);
+      lines.push(`   → Good! Navigation happened. Check if this brings you closer to goal.`);
+    } else {
+      lines.push(`⚠️  URL UNCHANGED: Still on ${diff.urlAfter}`);
+      lines.push(`   → Action "${action}" did not navigate. If expected navigation, try different approach.`);
+    }
+
+    // DOM Changes Analysis
+    const totalChanges = diff.addedElements.length + diff.removedRefs.length + diff.changedElements.length;
+
+    if (totalChanges === 0 && !diff.urlChanged) {
+      lines.push(`❌ NO DOM CHANGES: Page looks identical before/after action.`);
+      lines.push(`   → This is a FAILURE. Action had NO EFFECT. Try different element or approach.`);
+    } else if (totalChanges > 0) {
+      lines.push(`✅ DOM CHANGED: +${diff.addedElements.length} added, -${diff.removedRefs.length} removed, ~${diff.changedElements.length} modified`);
+
+      // Show key added elements (forms, buttons, inputs)
+      const keyElements = diff.addedElements.filter(el =>
+        el.tag === 'form' || el.tag === 'button' || el.tag === 'input' || el.type === 'password'
+      ).slice(0, 3);
+
+      if (keyElements.length > 0) {
+        lines.push(`   Key new elements:`);
+        keyElements.forEach(el => {
+          const typeInfo = el.type ? ` type=${el.type}` : '';
+          lines.push(`   + ${el.ref}: "${el.name}"${typeInfo}`);
+        });
+      }
+    }
+
+    // Error Analysis
+    if (diff.newPageErrors.length > 0 || diff.newConsoleErrors.length > 0) {
+      lines.push(`❌ NEW ERRORS DETECTED:`);
+      [...diff.newPageErrors, ...diff.newConsoleErrors].slice(0, 2).forEach(err => {
+        lines.push(`   ! ${err.slice(0, 100)}`);
+      });
+      lines.push(`   → These errors may indicate why action failed. Check error messages.`);
+    }
+
+    // Network Error Analysis
+    if (diff.newNetworkErrors && diff.newNetworkErrors.length > 0) {
+      lines.push(`⚠️  NETWORK ERRORS:`);
+      diff.newNetworkErrors.slice(0, 2).forEach(err => {
+        lines.push(`   ! ${err.slice(0, 120)}`);
+      });
+      if (diff.newNetworkErrors.some(e => e.includes('429') || e.toLowerCase().includes('rate limit'))) {
+        lines.push(`   → Rate limiting detected. Use "wait" action to back off.`);
+      }
+    }
+
+    // Conclusion
+    lines.push('');
+    if (!diff.urlChanged && totalChanges === 0 && !diff.hasVisualChange) {
+      lines.push('🚨 CONCLUSION: Action had NO EFFECT. You MUST try a different approach or element.');
+    } else if (diff.hasVisualChange || diff.urlChanged) {
+      lines.push('✅ CONCLUSION: Action caused changes. Analyze new state and continue toward goal.');
+    }
+
+    return lines.join('\n');
+  }
 }

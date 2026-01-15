@@ -6,7 +6,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { StateDiffComputer } from './analysis/state-diff';
-import type { ActionOutcome, IterationRecord, StuckCheck } from './lite-types';
+import type { ActionOutcome, IterationRecord, StateDiff, StuckCheck } from './lite-types';
 
 export class LiteState {
   private iterations: IterationRecord[] = [];
@@ -425,6 +425,24 @@ export class LiteState {
    */
   getIterationCount(): number {
     return this.iterations.length;
+  }
+
+  /**
+   * Get last state diff for AI analysis
+   * Returns the state diff from the previous iteration to help AI understand what changed
+   *
+   * @returns Last state diff and action or undefined if no iterations yet
+   */
+  getLastStateDiff(): { diff: StateDiff; action: string } | undefined {
+    if (this.iterations.length === 0) {
+      return undefined;
+    }
+
+    const last = this.iterations[this.iterations.length - 1];
+    return {
+      diff: last.result.stateDiff,
+      action: last.decision.command.action,
+    };
   }
 
   /**

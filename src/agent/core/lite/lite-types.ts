@@ -159,9 +159,24 @@ export interface BlockedInfo {
 }
 
 /**
+ * Deep reasoning analysis (pre-action audit)
+ * Forces AI to analyze page state before deciding action
+ */
+export interface DeepAnalysis {
+  /** Current page state summary */
+  pageState: string;
+  /** Available relevant actions on current page */
+  availableActions: string[];
+  /** Detected obstacles (overlays, hidden elements, missing content) */
+  obstacles: string[];
+}
+
+/**
  * AI decision response
  */
 export interface AIDecision {
+  /** Optional pre-action analysis (Deep Reasoning Chain) */
+  analysis?: DeepAnalysis;
   thought: string;
   command: AICommand;  // CHANGED: structured command instead of code
   done?: boolean;

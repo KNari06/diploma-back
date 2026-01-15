@@ -81,6 +81,10 @@ export class LitePromptBuilder {
     validationErrorContext?: ValidationErrorContext;
     /** ✅ NEW: Flag indicating user provided credentials (never include actual values!) */
     hasCredentials?: boolean;
+    /** ✅ NEW: State drift analysis from last action (URL/DOM diff) */
+    stateDriftAnalysis?: string;
+    /** ✅ NEW: Last action for context in drift analysis */
+    lastAction?: string;
   }): string {
     // ✅ FIX: Truncate snapshot if too large (prevent token overflow)
     const MAX_SNAPSHOT_LENGTH = 100_000; // 100k chars (~25k tokens)
@@ -146,6 +150,11 @@ User has provided login credentials. The system will automatically fill them.
     // ✅ NEW (Lite Autonomy v3): Build validation error section
     const validationErrorSection = LitePromptBuilder.buildValidationErrorSection(params.validationErrorContext);
 
+    // ✅ NEW: Build state drift analysis section (helps AI understand what changed)
+    const stateDriftSection = params.stateDriftAnalysis
+      ? `\n${params.stateDriftAnalysis}\n`
+      : '';
+
     // Build complete prompt with JSON-only response format
     return `You are a browser automation agent testing a web application.
 Your job is to REACH THE TARGET STATE through intermediate steps. Navigation is expected.
@@ -154,7 +163,7 @@ GOAL: ${params.goal}
 
 CURRENT PAGE:
 ${snapshot}
-${taskPlanSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${modalDismissSection}${validationErrorSection}
+${taskPlanSection}${stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${modalDismissSection}${validationErrorSection}
 HISTORY:
 ${params.history}
 
@@ -183,18 +192,30 @@ IMPORTANT RULES:
 10. For Registration goal: If you see only "Login/Вход" form, look for "Register/Зарегистрироваться" toggle inside it - don't give up!
 11. ✅ EXPLORATION RULE: If your target form (e.g., registration, checkout) is not visible, look for entry points like "Login/Вход", "Profile/Профиль", "Account/Кабинет", or a user icon. Clicking these is a VALID and often NECESSARY step to reach your goal.
 12. ✅ MODAL HANDLING: If ACTIVE_MODAL appears and blocks your goal, first try "press Escape", then look for close/dismiss buttons inside the modal. If modal contains your goal form, interact with it instead of dismissing.
+13. ✅ SEMANTIC SEARCH: Use ARIA labels (aria-label="..."), placeholder text, and parent context (inside: Form "Login") to find correct elements. Don't rely only on visible text - custom UI frameworks often use hidden labels.
+14. ✅ OBSTACLE DETECTION: If action fails, check for:
+    - Overlays/modals blocking the element (look for ACTIVE_MODAL or z-index issues)
+    - Element outside viewport (use scroll_to with targetRef to bring into view)
+    - Element disabled or hidden (check [DISABLED] flag)
+    - If click fails on button, try pressing Enter on a focused input instead
+15. ✅ STATE DRIFT REASONING: Always analyze STATE DRIFT ANALYSIS section above. If URL and DOM unchanged after action, it FAILED - try different element/approach. Success = state changed.
 
 RESPONSE FORMAT (JSON ONLY):
+You MUST respond with a Deep Reasoning Chain format:
 {
-  "thought": "Brief reasoning (1 sentence)",
+  "analysis": {
+    "pageState": "Brief page summary (1 sentence)",
+    "availableActions": ["action1 on element", "action2 on element"],
+    "obstacles": ["detected obstacle 1", "detected obstacle 2"] or []
+  },
+  "thought": "Based on analysis, my reasoning (1 sentence)",
   "command": { "action": "click", "ref": "e5" }
 }
 
 Special responses:
 - If goal is achieved: { "done": true, "thought": "Goal completed because..." }
 - If blocked (login required, captcha, verification code needed):
-  Option 1: { "blocked": "Reason why blocked", "thought": "..." }
-  Option 2: { "blockedInfo": { "reason": "CAPTCHA detected", "canUserHelp": true }, "thought": "..." }
+  { "blockedInfo": { "reason": "CAPTCHA detected", "canUserHelp": true }, "thought": "..." }
 
 CRITICAL: Return ONLY a valid JSON object. NO markdown code blocks (\\\`\\\`\\\`json or \\\`\\\`\\\`), NO preamble, NO extra text.
 Analyze state changes after each action. Success = state changed.`;
@@ -267,6 +288,8 @@ Analyze state changes after each action. Success = state changed.`;
         thought: parsed.thought?.slice(0, 50),
         action: actionType,
         hasBlockedInfo: !!parsed.blockedInfo,
+        hasAnalysis: !!parsed.analysis, // ✅ NEW: Log if AI provided deep analysis
+        obstacles: parsed.analysis?.obstacles?.length || 0, // ✅ NEW: Log obstacle count
       });
 
       // Validate response structure
@@ -279,6 +302,7 @@ Analyze state changes after each action. Success = state changed.`;
           thought: parsed.thought,
           command: { action: 'wait' }, // Placeholder command
           done: true,
+          analysis: parsed.analysis, // ✅ NEW: Include analysis if provided
         };
       }
 
@@ -292,6 +316,7 @@ Analyze state changes after each action. Success = state changed.`;
             reason: parsed.blockedInfo.reason || 'Unknown reason',
             canUserHelp: parsed.blockedInfo.canUserHelp || false,
           },
+          analysis: parsed.analysis, // ✅ NEW: Include analysis if provided
         };
       }
 
@@ -300,6 +325,7 @@ Analyze state changes after each action. Success = state changed.`;
           thought: parsed.thought,
           command: { action: 'wait' }, // Placeholder command
           blocked: parsed.blocked,
+          analysis: parsed.analysis, // ✅ NEW: Include analysis if provided
         };
       }
 

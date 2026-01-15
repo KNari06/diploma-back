@@ -812,7 +812,13 @@ export class LiteEngine {
         // ✅ NEW (Lite Autonomy v3): Build task plan context for prompt
         const taskPlanContext = this.buildTaskPlanContext(stuckCheck.stuck);
 
-        // 4. Build prompt with stuck warning + progress signals + AI guidance + contextual hints + task plan
+        // ✅ NEW: Build state drift analysis from last iteration
+        const lastStateDiff = this.state.getLastStateDiff();
+        const stateDriftAnalysis = lastStateDiff
+          ? StateDiffComputer.formatForAI(lastStateDiff.diff, lastStateDiff.action)
+          : undefined;
+
+        // 4. Build prompt with stuck warning + progress signals + AI guidance + contextual hints + task plan + state drift
         const prompt = LitePromptBuilder.build({
           goal: this.config.goal,
           snapshot: formattedSnapshot,
@@ -831,6 +837,8 @@ export class LiteEngine {
           modalDismissInfo: this.lastModalDismissInfo || undefined, // ✅ NEW: Modal dismiss info
           validationErrorContext: this.validationErrorContext || undefined, // ✅ NEW: Validation error context
           hasCredentials: !!this.config.credentials, // ✅ NEW: Tell LLM not to invent credentials
+          stateDriftAnalysis, // ✅ NEW: State drift from last action
+          lastAction: lastStateDiff?.action, // ✅ NEW: Last action for context
         });
 
         // ✅ NEW: Trace AI prompt
@@ -876,6 +884,7 @@ export class LiteEngine {
             done: decision.done || false,
             blocked: decision.blocked,
             blockedInfo: decision.blockedInfo,
+            analysis: decision.analysis, // ✅ NEW: Include deep analysis if provided
           },
         });
 
