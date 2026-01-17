@@ -40,6 +40,8 @@
 - [**Руководство разработчика**](./development/README.md) - как разрабатывать
 - [**Стандарты кодирования**](./development/coding-standards.md) - правила написания кода
 - [**🤖 Intent Parsing Guide**](./development/INTENT_PARSING_GUIDE.md) - ✨ Context-First AI подход и трекинг изменений
+- [**Intent Parser Improvements**](./development/intent-parser-improvements.md) - рефакторинг intent parser service
+- [**🚀 Future Todos**](./development/future-todos.md) - roadmap идей и улучшений (Visual Anchors, Z-Index и др.)
 - [**❓ Needs Clarification Flow**](./development/needs-clarification-flow.md) - ✨ NEW! Как система спрашивает уточнения при низком confidence
 - [**🔍 Playwright Logging Improvements**](./development/PLAYWRIGHT_LOGGING_IMPROVEMENTS.md) - Детальное логирование всего testing flow
 - [**⚡ Intelligent Mode Optimization**](./development/INTELLIGENT_MODE_OPTIMIZATION.md) - Network & data collection оптимизация
@@ -65,6 +67,10 @@
 - [**Multi-Chat Deployment Checklist**](./deployment/DEPLOYMENT_CHECKLIST_MULTI_CHAT.md) - чеклист для деплоя мультичата
 - [**Конфигурация сервера**](./deployment/server-config.md) - настройка окружения (если файл существует)
 - [**Мониторинг**](./deployment/monitoring.md) - отслеживание состояния (если файл существует)
+
+### 🔧 Fixes & Plans
+
+- [**Jira Integration Fixes**](./fixes/jira-integration-fixes.md) - план исправления интеграции с Jira
 
 ## 🤝 Участие в проекте
 

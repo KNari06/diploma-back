@@ -85,6 +85,39 @@
 - ✅ Всегда следуй установленной структуре при создании новых файлов
 - ✅ Обновляй все импорты при перемещении файлов
 
+### 8. token-optimization-rules.mdc (auto)
+
+**Applied to: src/agent/core/lite/prompt/**, src/services/ai/**, src/agent/core/lite/**, src/agent/utils/ai/**, src/services/utils/**
+
+Правила оптимизации токенов:
+
+- 🎯 **Quality-first**: reduce tokens without reducing correctness
+- ✂️ **Truncate**: snapshot/history/logs → summaries + top-N signals
+- 🧾 **JSON-only**: strict schema when parsing is required
+- 🧠 **Model choice**: `gpt-4o-mini` for batch/heuristics; `gpt-4o` only for hard cases
+- ✅ **Caching/Batching**: LRU + 10–15 items per batch
+
+### 9. architecture-optimization-rules.mdc (auto)
+
+**Applied to: src/agent/core/**, src/services/**, src/agent/**, src/api/**
+
+Правила архитектурной оптимизации:
+
+- 🧱 **Maintainability-first**: avoid god-classes, circular deps, mixed concerns
+- ✅ **Boundaries**: follow `folder-structure.mdc` (agent/services/utils separation)
+- 🔁 **Incremental refactor**: small safe extractions, avoid risky big-bang changes
+
+### 10. performance-caching-rules.mdc (auto)
+
+**Applied to: src/services/ai/**, src/agent/utils/ai/**, src/agent/core/lite/analysis/**, src/services/core/**, src/services/utils/**
+
+Правила производительности и кэширования:
+
+- ⚡ **Fast path first**: heuristics → cache → optional AI fallback
+- ⏱️ **Timeout+fallback**: ~1500ms for `gpt-4o-mini`, then continue with heuristics
+- 🧠 **Batch AI**: 10–15 items; dedupe by stable key + context
+- 🚫 **Avoid**: N+1 queries, unbounded caches, user-blocking AI calls
+
 ## 🚨 Критически важное
 
 ### Перед КАЖДЫМ деплоем:

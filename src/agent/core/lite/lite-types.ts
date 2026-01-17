@@ -4,6 +4,19 @@
  */
 
 /**
+ * Bounding box for Visual Anchors (spatial lookup)
+ * Used for geometric element identification when selectors are unstable
+ */
+export interface ElementBounds {
+  /** Left position relative to viewport */
+  x: number;
+  /** Top position relative to viewport */
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
  * Element with parent context for better AI understanding
  * Includes semantic attributes for field classification (Level 1-3 hierarchy)
  */
@@ -20,11 +33,64 @@ export interface LiteElement {
   visible: boolean;
   context?: string; // "inside: Product Card 'iPhone 15'"
   isInsideActiveModal?: boolean; // True if element is inside active modal
+  isInsideShadowDOM?: boolean;   // PHASE D: True if element is inside a shadow DOM
   // Semantic attributes for field classification (Level 1 signals)
   autocomplete?: string;  // e.g., "current-password", "email", "tel", "username"
   inputmode?: string;     // e.g., "tel", "email", "numeric"
   htmlName?: string;      // HTML name attribute (e.g., "password", "email")
   htmlId?: string;        // HTML id attribute (e.g., "login-email")
+  // Z-Index / Layering signals for overlay/modal awareness (no hardcoded thresholds)
+  /** Parsed z-index from getComputedStyle (null if 'auto' or non-numeric) */
+  computedZIndex?: number | null;
+  /** True if position !== 'static' (participates in stacking context) */
+  isPositioned?: boolean;
+  /** True if element is the topmost at its center point (not covered by overlay) */
+  isTopMostAtCenter?: boolean;
+  // Visual Anchors: Bounding box for spatial lookup (fallback when selectors fail)
+  /** Element bounding box relative to viewport (for Visual Anchor matching) */
+  bounds?: ElementBounds;
+}
+
+/**
+ * Visual Anchor direction (relative position of anchor to target element)
+ */
+export type AnchorDirection = 'top' | 'bottom' | 'left' | 'right';
+
+/**
+ * Visual Anchor type (stable element categories)
+ */
+export type AnchorType = 'heading' | 'label' | 'icon' | 'text';
+
+/**
+ * Visual Anchor - a stable neighboring element used for spatial lookup
+ * Part of VisualSignature for identifying elements when selectors change
+ */
+export interface VisualAnchor {
+  /** Type of anchor element */
+  type: AnchorType;
+  /** Text content of anchor (heading text, label text, etc.) */
+  value: string;
+  /** Direction from target element to this anchor */
+  direction: AnchorDirection;
+  /** Distance in pixels from target element center to anchor center */
+  distance: number;
+}
+
+/**
+ * Visual Signature - spatial fingerprint of an element
+ * Used to re-identify elements when their selectors/refs change (dynamic sites)
+ */
+export interface VisualSignature {
+  /** Element's own text content */
+  ownText: string;
+  /** Element tag name */
+  tag: string;
+  /** Input type if applicable */
+  type?: string;
+  /** Nearby stable anchor elements (max 5) */
+  anchors: VisualAnchor[];
+  /** Timestamp when signature was created */
+  createdAt: number;
 }
 
 /**
@@ -69,6 +135,58 @@ export interface StateDiff {
   newConsoleErrors: string[];
   /** Network errors detected during action (e.g., HTTP 429/5xx). Already time-filtered by caller. */
   newNetworkErrors?: string[];
+  /** Semantic weight (State Change Index) - sum of weights of added/removed elements. Manus Style. */
+  semanticWeight: number;
+  /** Whether change is meaningful (>= 0.1, not noise like ads/counters). */
+  meaningfulChange: boolean;
+  /** Whether change is significant (>= 0.5, successful state shift). */
+  significantChange: boolean;
+  /** Progress sentiment for AI (Major Progress, Significant Change, Minor Change, No Effect, Negative Change). */
+  progressSentiment: ProgressSentiment;
+  /** Successful API responses detected during action (Manus Style: fetch/xhr, mutating methods + API patterns). */
+  successfulApiResponses?: NetworkSuccess[];
+  /** Validation errors from API (400-499 with extracted message/errors from response body). */
+  validationApiErrors?: NetworkValidationError[];
+}
+
+/**
+ * Progress sentiment for AI communication (Manus Style)
+ * Helps AI quickly understand what happened and adjust behavior
+ */
+export type ProgressSentiment =
+  | 'Major Progress'        // semanticWeight >= 0.5 OR URL changed OR goal-specific form appeared
+  | 'Significant Change'    // semanticWeight >= 0.5 OR network success without visual changes
+  | 'Minor Change'          // semanticWeight >= 0.1 && < 0.5 (meaningful but not significant)
+  | 'No Effect'             // semanticWeight < 0.1 (noise) AND no URL change AND no network success
+  | 'Negative Change';      // errors detected (page/console/network/validation)
+
+/**
+ * Successful network response (Manus Style)
+ * Tracks successful API calls as progress signal even before UI updates
+ */
+export interface NetworkSuccess {
+  url: string;
+  method: string;
+  status: number;
+  timestamp: number;
+  resourceType: 'fetch' | 'xhr';
+  iteration?: number;
+}
+
+/**
+ * Network validation error (400-499 with parsed body)
+ * Manus Style: extract message/errors from response body to help AI understand why validation failed
+ */
+export interface NetworkValidationError {
+  url: string;
+  method: string;
+  status: number;
+  timestamp: number;
+  /** Extracted from response body: body.message or body.error.message */
+  message?: string;
+  /** Extracted from response body: body.errors array */
+  errors?: string[];
+  iteration?: number;
 }
 
 /**
@@ -379,4 +497,84 @@ export interface GoalGuidance {
 
   /** Iteration when guidance was added (for lifetime tracking) */
   addedAtIteration: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L5 VISION TYPES (Manus Style)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Vision analysis hints for DOM-weak scenarios.
+ * Generated by GPT-4o Vision when:
+ * - Very few interactive elements detected
+ * - Canvas-heavy page
+ * - Consecutive "No Effect" actions
+ */
+export interface VisionHints {
+  /** Visible CTA buttons with location hints */
+  visibleButtons: Array<{
+    text: string;
+    location: string; // e.g., "top-right", "center"
+  }>;
+
+  /** Detected form fields */
+  formFields: Array<{
+    type: string;
+    label: string;
+  }>;
+
+  /** Active modals/dialogs */
+  modals: Array<{
+    description: string;
+    hasCloseButton: boolean;
+  }>;
+
+  /** Layout description for context */
+  layoutHint: string;
+
+  /**
+   * WORKSTREAM 5: Vision↔DOM conflict hints
+   * Populated when Vision sees an element but DOM reports issues
+   */
+  conflicts?: Array<{
+    /** Text Vision detected (button text, label, etc.) */
+    visionText: string;
+    /** DOM element ref if found */
+    domRef?: string;
+    /** DOM element name if found */
+    domName?: string;
+    /** Type of conflict detected */
+    issue: 'disabled' | 'covered' | 'hidden' | 'not_found';
+    /** Human-readable explanation */
+    note: string;
+  }>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WORKSTREAM 4: State Recovery Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * FunnelPhase type alias (imported from funnel-analyzer in LiteEngine)
+ * Re-declared here to avoid circular import in lite-types
+ */
+export type FunnelPhaseType = 'discovery' | 'selection' | 'pre_action' | 'conversion';
+
+/**
+ * Recovery point - a snapshot of "last known good" state
+ * Used for deterministic state restoration when agent gets stuck
+ */
+export interface RecoveryPoint {
+  /** URL at this recovery point */
+  url: string;
+  /** Snapshot at this recovery point (for element comparison) */
+  snapshot: LiteSnapshot;
+  /** Funnel phase when point was recorded */
+  funnelPhase: FunnelPhaseType;
+  /** Timestamp when point was recorded (for TTL checks) */
+  timestamp: number;
+  /** Iteration number when point was recorded */
+  iteration: number;
+  /** Whether this point has been invalidated (zombie) */
+  invalidated?: boolean;
 }

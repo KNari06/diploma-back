@@ -634,8 +634,14 @@ export interface TraceFile {
   parsed_at?: string;
 }
 
+/**
+ * Request body for trace upload API.
+ * NOTE: userId is NOT sent from client; it's extracted from JWT by the server.
+ * Client sends only testId, browser, and optional metadata.
+ */
 export interface TraceUploadRequest {
-  userId: string;
+  /** @deprecated Not used – userId extracted from auth token */
+  userId?: string;
   testId?: string;
   browser?: string;
   metadata?: Record<string, any>;
@@ -1074,4 +1080,32 @@ export interface FeedbackComparison {
   };
   improved_intents: string[];
   declined_intents: string[];
+}
+
+// ============================================================================
+// USER REPORT TYPES
+// ============================================================================
+
+export type ReportCategory = 'bug' | 'ui' | 'feature' | 'other';
+export type ReportStatus = 'pending' | 'in_progress' | 'resolved' | 'closed';
+
+export interface UserReport {
+  id: string;
+  user_id: string;
+  title: string;
+  category: ReportCategory;
+  details: string;
+  workspace_name?: string | null;
+  view?: string | null;
+  status: ReportStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateReportData {
+  title: string;
+  category: ReportCategory;
+  details: string;
+  workspace_name?: string;
+  view?: string;
 }

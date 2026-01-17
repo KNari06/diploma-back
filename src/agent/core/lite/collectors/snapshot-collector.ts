@@ -277,18 +277,89 @@ export class SnapshotCollector {
             : `inside: ${parentType}`;
         };
 
-        // Collect interactive elements
-        const selectors = [
+        // ═══════════════════════════════════════════════════════════════════════
+        // WORKSTREAM D: Shadow-Aware Element Collection (with depth + cache)
+        // Recursively traverse DOM including open shadow roots
+        // Performance bounded to prevent slowdowns on deep web-component pages
+        // ═══════════════════════════════════════════════════════════════════════
+        const interactiveSelectors = [
           'button', 'a', 'input', 'select', 'textarea',
           '[role="button"]', '[role="link"]', '[role="menuitem"]',
           '[role="checkbox"]', '[role="radio"]', '[role="tab"]',
           '[onclick]', '[tabindex]:not([tabindex="-1"])',
-          '[data-testid]', '[data-test]'
-        ].join(', ');
+          '[data-testid]', '[data-test]',
+          'canvas' // ✅ L5: Include canvas for vision escalation trigger
+        ];
 
-        const allElements = document.querySelectorAll(selectors);
+        // WORKSTREAM D: Performance limits
+        const MAX_SHADOW_DEPTH = 8; // Prevent infinite/deep recursion
+        const visitedRoots = new WeakSet<object>(); // Cache visited roots to avoid reprocessing
 
-        allElements.forEach((el: Element) => {
+        /**
+         * Recursively collect elements from a root (document or shadow root)
+         * Traverses open shadow DOMs for web component support
+         * WORKSTREAM D: Bounded by depth and visited cache
+         */
+        const collectFromRoot = (
+          root: Document | ShadowRoot | Element,
+          collected: Element[],
+          depth: number = 0
+        ): void => {
+          // WORKSTREAM D: Depth guard
+          if (depth > MAX_SHADOW_DEPTH) {
+            return;
+          }
+
+          // WORKSTREAM D: Visited cache guard
+          if (visitedRoots.has(root)) {
+            return;
+          }
+          visitedRoots.add(root);
+
+          // 1. Collect matching elements from this root
+          const selectorString = interactiveSelectors.join(', ');
+          try {
+            // Use querySelectorAll on the root
+            const matches = root.querySelectorAll?.(selectorString) || [];
+            for (const match of matches) {
+              collected.push(match);
+            }
+          } catch {
+            // querySelectorAll may fail on some shadow roots
+          }
+
+          // 2. Find all elements with open shadowRoot and recurse
+          try {
+            const allChildren = root.querySelectorAll?.('*') || [];
+            for (const child of allChildren) {
+              // Check for open shadow root
+              if (child.shadowRoot && !visitedRoots.has(child.shadowRoot)) {
+                // Mark shadow host for debugging
+                // @ts-expect-error - custom property
+                child.__hasShadowRoot = true;
+                // Recursively collect from shadow root (with incremented depth)
+                collectFromRoot(child.shadowRoot, collected, depth + 1);
+              }
+            }
+          } catch {
+            // Shadow root traversal may fail on closed roots - ignore
+          }
+        };
+
+        // Collect all elements starting from document (depth 0)
+        const allElements: Element[] = [];
+        collectFromRoot(document, allElements, 0);
+
+        // Deduplicate (element might be collected multiple times)
+        const seenElements = new Set<Element>();
+        const uniqueElements = allElements.filter(el => {
+          if (seenElements.has(el)) return false;
+          seenElements.add(el);
+          return true;
+        });
+
+        // Process each unique element (including shadow DOM elements)
+        uniqueElements.forEach((el: Element) => {
           try {
             // Skip hidden elements
             const style = window.getComputedStyle(el);
@@ -321,6 +392,49 @@ export class SnapshotCollector {
               ? activeModalElement.contains(el)
               : false;
 
+            // ═══════════════════════════════════════════════════════════════
+            // PHASE D: Detect if element is inside shadow DOM
+            // ═══════════════════════════════════════════════════════════════
+            let isInsideShadowDOM = false;
+            let current: Node | null = el;
+            while (current) {
+              if (current instanceof ShadowRoot) {
+                isInsideShadowDOM = true;
+                break;
+              }
+              current = current.parentNode;
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // Z-Index / Layering signals (no hardcoded thresholds)
+            // ═══════════════════════════════════════════════════════════════
+            // Parse computed z-index (null if 'auto' or non-numeric)
+            const rawZIndex = style.zIndex;
+            const parsedZIndex = parseInt(rawZIndex, 10);
+            const computedZIndex = isNaN(parsedZIndex) ? null : parsedZIndex;
+
+            // Check if element is positioned (participates in stacking context)
+            const isPositioned = style.position !== 'static';
+
+            // Check if element is topmost at its center point (coverage proxy)
+            // Only compute if element center is within viewport
+            let isTopMostAtCenter: boolean | undefined = undefined;
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+            // @ts-expect-error - window available in browser context
+            const inViewport = centerX >= 0 && centerX <= window.innerWidth &&
+                               centerY >= 0 && centerY <= window.innerHeight;
+
+            if (inViewport) {
+              try {
+                const topEl = document.elementFromPoint(centerX, centerY);
+                // Element is topmost if the found element is itself or its descendant
+                isTopMostAtCenter = topEl === el || el.contains(topEl);
+              } catch {
+                // elementFromPoint can fail in edge cases, leave undefined
+              }
+            }
+
             elements.push({
               ref,
               role: el.getAttribute('role') || el.tagName.toLowerCase(),
@@ -337,11 +451,23 @@ export class SnapshotCollector {
               visible: true,
               context: getParentContext(el),  // Parent context
               isInsideActiveModal,  // Mark elements inside modal
+              isInsideShadowDOM,    // PHASE D: Mark elements from shadow DOM
               // Semantic attributes for field classification (Level 1 signals)
               autocomplete: isInput ? el.getAttribute('autocomplete') || undefined : undefined,
               inputmode: isInput ? el.getAttribute('inputmode') || undefined : undefined,
               htmlName: el.getAttribute('name') || undefined,
               htmlId: el.getAttribute('id') || undefined,
+              // Z-Index / Layering signals (no hardcoded thresholds)
+              computedZIndex,
+              isPositioned,
+              isTopMostAtCenter,
+              // Visual Anchors: Bounding box for spatial lookup
+              bounds: {
+                x: rect.left,
+                y: rect.top,
+                width: rect.width,
+                height: rect.height,
+              },
             });
           } catch (err) {
             // Skip element if any error

@@ -43,6 +43,58 @@ export const INTELLIGENT_TEST_LIMITS = {
 } as const;
 
 /**
+ * Lite Engine Feature Flags (Manus L2-L4-L5 Alignment)
+ *
+ * Controls advanced AI agent behaviors:
+ * - L2: Goal structure (expansion, funnel analysis, refinement)
+ * - L4: Target audit (ref validation before execution)
+ * - L5: Vision escalation (fallback when DOM is weak)
+ */
+export const LITE_ENGINE_FLAGS = {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L2: GOAL STRUCTURE
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable GoalExpander to parse goal into structured keywords */
+  enableGoalExpander: true,
+
+  /** Enable FunnelAnalyzer to detect user journey phase */
+  enableFunnelAnalyzer: true,
+
+  /** Enable dynamic goal refinement on phase/URL change */
+  enableGoalRefinement: true,
+
+  /** Minimum time between goal refinements (ms) */
+  goalRefinementCooldownMs: 5000,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L4: TARGET AUDIT GUARD
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable L4 target audit for ref validation */
+  enableTargetAuditGuard: true,
+
+  /** Timeout for target audit AI call (ms) */
+  targetAuditTimeoutMs: 1500,
+
+  /** Number of top candidates to consider for audit */
+  topCandidatesCount: 5,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L5: VISION ESCALATION
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable vision escalation when DOM is weak */
+  enableVisionEscalation: true,
+
+  /** Consecutive "No Effect" count to trigger vision */
+  visionEscalationThreshold: 3,
+
+  /** Enable cross-check with iframes */
+  enableIframeCrosscheck: true,
+
+  /** Enable cross-check with Shadow DOM */
+  enableShadowDOMCrosscheck: true,
+} as const;
+
+/**
  * Get human-readable time from milliseconds
  */
 export function formatExecutionTime(ms: number): string {

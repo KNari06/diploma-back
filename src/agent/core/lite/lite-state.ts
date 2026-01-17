@@ -2,16 +2,48 @@
  * LiteState
  * Manages iteration history and stuck detection
  * CRITICAL: Prevents infinite loops and token waste
+ *
+ * WORKSTREAM 4: Also manages recovery anchors and attempt counters
  */
 
 import { logger } from '@/utils/core/logger';
 import { StateDiffComputer } from './analysis/state-diff';
-import type { ActionOutcome, IterationRecord, StateDiff, StuckCheck } from './lite-types';
+import type {
+  ActionOutcome,
+  FunnelPhaseType,
+  IterationRecord,
+  RecoveryPoint,
+  StateDiff,
+  StuckCheck,
+  VisualSignature,
+} from './lite-types';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WORKSTREAM 4: Recovery Constants
+// ═══════════════════════════════════════════════════════════════════════════
+const ANCHOR_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_RECOVERY_ATTEMPTS = 2;
 
 export class LiteState {
   private iterations: IterationRecord[] = [];
   private stateHashes: string[] = []; // Track state hashes for stuck detection
+  private focusedStateHashes: string[] = []; // PHASE C: Track goal-focused element hashes (semantic delta)
+  private focusedHighWeightCounts: number[] = []; // WORKSTREAM C: Track count of high-weight (>=0.8) elements
   private consecutiveStuckCount: number = 0; // Track consecutive stuck iterations for AI fallback trigger
+  // Visual Anchors: Store signatures for interacted elements (fallback when ref changes)
+  private visualSignatures: Map<string, VisualSignature> = new Map();
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // WORKSTREAM 4: Recovery State
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Recovery points by funnel phase (one per phase) */
+  private recoveryPointByPhase: Map<FunnelPhaseType, RecoveryPoint> = new Map();
+  /** Recovery attempts by key (goal + normalizedUrl) - loop-proof */
+  private recoveryAttemptsByKey: Map<string, number> = new Map();
+  /** Last recovery attempt key - for zombie detection */
+  private lastRecoveryAttemptKey: string | null = null;
+  /** Iteration when last recovery attempt happened */
+  private lastRecoveryAttemptIteration: number | null = null;
 
   /**
    * Record an iteration
@@ -36,6 +68,26 @@ export class LiteState {
       outcome: record.result.outcome,
       urlChanged: record.result.stateDiff.urlChanged,
       stateHash: hash,
+    });
+  }
+
+  /**
+   * WORKSTREAM C: Record focused semantic metrics
+   * Combines hash (for "false progress" detection) with high-weight count (for "no growth" detection)
+   *
+   * @param url - Current page URL
+   * @param goalRelevantElements - Array of element names with weight >= 0.5
+   * @param highWeightCount - Count of elements with weight >= 0.8 (top targets)
+   */
+  recordFocusedMetrics(url: string, goalRelevantElements: string[], highWeightCount: number): void {
+    const focusedHash = this.computeStateHash(url, goalRelevantElements);
+    this.focusedStateHashes.push(focusedHash);
+    this.focusedHighWeightCounts.push(highWeightCount);
+
+    logger.debug('[LITE_STATE] Recorded focused metrics', {
+      focusedHash,
+      elementCount: goalRelevantElements.length,
+      highWeightCount,
     });
   }
 
@@ -90,6 +142,72 @@ export class LiteState {
       last3Hashes.length === 3 &&
       last3Hashes[0] === last3Hashes[1] &&
       last3Hashes[1] === last3Hashes[2];
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PHASE C: Focused Semantic Hash Check (Semantic Delta)
+    // Detects "false progress" - ads/timers changing but goal zone is static
+    // ═══════════════════════════════════════════════════════════════════════════
+    const last3FocusedHashes = this.focusedStateHashes.slice(-3);
+    const sameFocusedHash =
+      last3FocusedHashes.length === 3 &&
+      last3FocusedHashes[0] === last3FocusedHashes[1] &&
+      last3FocusedHashes[1] === last3FocusedHashes[2];
+
+    // False progress: regular hash changes but focused hash stays the same
+    // This means ads/banners are changing but goal-relevant elements are static
+    if (!sameStateHash && sameFocusedHash && urlUnchanged) {
+      this.consecutiveStuckCount++;
+      logger.warn('[LITE_STATE] False progress detected via focused hash', {
+        regularHashChanges: true,
+        focusedHashStatic: true,
+        focusedHash: last3FocusedHashes[0],
+        consecutiveStuckCount: this.consecutiveStuckCount,
+      });
+
+      return {
+        stuck: true,
+        reason: 'False progress: dynamic content changing but goal zone is static',
+        suggestion:
+          'Ads, timers, or banners may be changing but no progress toward goal. Try interacting with elements in the goal-relevant area.',
+      };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // WORKSTREAM C: High-weight count growth check (for dynamic/lazy-load pages)
+    // Detects "dynamic churn" - focused hash changes but no NEW high-importance targets
+    // ═══════════════════════════════════════════════════════════════════════════
+    const last3HighCounts = this.focusedHighWeightCounts.slice(-3);
+    if (last3HighCounts.length === 3 && urlUnchanged && !sameFocusedHash) {
+      // Focused hash is changing (dynamic content) but we need to check if
+      // high-weight targets are actually growing
+      const maxPrevious = Math.max(last3HighCounts[0], last3HighCounts[1]);
+      const current = last3HighCounts[2];
+      const noGrowth = current <= maxPrevious;
+
+      // Additional gate: ensure we're actually seeing no progress (no major changes)
+      const noMajorChangesLocal = last3.every(
+        (i) =>
+          !i.result.stateDiff.urlChanged &&
+          i.result.stateDiff.addedElements.length < 3
+      );
+
+      if (noGrowth && noMajorChangesLocal) {
+        this.consecutiveStuckCount++;
+        logger.warn('[LITE_STATE] Dynamic churn without new targets detected', {
+          last3HighCounts,
+          focusedHashChanging: true,
+          noGrowth: true,
+          consecutiveStuckCount: this.consecutiveStuckCount,
+        });
+
+        return {
+          stuck: true,
+          reason: 'Dynamic content changing but no new high-importance targets (>=0.8) in 3 iterations',
+          suggestion:
+            'Page is loading new content but not surfacing relevant targets. Try scrolling, waiting, or looking for alternative navigation.',
+        };
+      }
+    }
 
     // Check 3: Same action on same target 3 times
     const sameAction = last3.every(
@@ -452,14 +570,79 @@ export class LiteState {
     return [...this.iterations];
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // VISUAL ANCHORS: Signature Storage
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Save visual signature for an element after successful interaction.
+   * Used as fallback when ref-based lookup fails on dynamic sites.
+   *
+   * @param ref Element ref that was interacted with
+   * @param signature Visual signature (spatial fingerprint)
+   */
+  saveSignature(ref: string, signature: VisualSignature): void {
+    this.visualSignatures.set(ref, signature);
+    logger.debug('[LITE_STATE] Saved visual signature', {
+      ref,
+      tag: signature.tag,
+      anchorCount: signature.anchors.length,
+      ownText: signature.ownText.slice(0, 30),
+    });
+  }
+
+  /**
+   * Get visual signature for an element.
+   * Used when ref-based lookup fails and we need to find element by spatial position.
+   *
+   * @param ref Element ref to look up
+   * @returns Visual signature if exists, undefined otherwise
+   */
+  getSignature(ref: string): VisualSignature | undefined {
+    return this.visualSignatures.get(ref);
+  }
+
+  /**
+   * Check if we have a signature for an element
+   *
+   * @param ref Element ref to check
+   * @returns True if signature exists
+   */
+  hasSignature(ref: string): boolean {
+    return this.visualSignatures.has(ref);
+  }
+
+  /**
+   * Get total number of stored signatures
+   */
+  getSignatureCount(): number {
+    return this.visualSignatures.size;
+  }
+
+  /**
+   * Clear all visual signatures (used for hard reload recovery)
+   */
+  clearVisualSignatures(): void {
+    this.visualSignatures.clear();
+    logger.debug('[LITE_STATE] Cleared visual signatures');
+  }
+
   /**
    * Clear all iterations and state hashes
    */
   clear(): void {
     this.iterations = [];
     this.stateHashes = [];
+    this.focusedStateHashes = []; // PHASE C: Clear focused hashes too
+    this.focusedHighWeightCounts = []; // WORKSTREAM C: Clear high-weight counts
     this.consecutiveStuckCount = 0;
-    logger.debug('[LITE_STATE] Cleared all iterations, hashes, and stuck count');
+    this.visualSignatures.clear();
+    // WORKSTREAM 4: Clear recovery state
+    this.recoveryPointByPhase.clear();
+    this.recoveryAttemptsByKey.clear();
+    this.lastRecoveryAttemptKey = null;
+    this.lastRecoveryAttemptIteration = null;
+    logger.debug('[LITE_STATE] Cleared all iterations, hashes, signatures, recovery state, and stuck count');
   }
 
   /**
@@ -544,5 +727,178 @@ export class LiteState {
     } catch {
       return url.slice(0, 50);
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // WORKSTREAM 4: Recovery Point Management
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a recovery key from goal and URL
+   * Used for loop-proof attempt counting
+   */
+  buildRecoveryKey(goal: string, url: string): string {
+    try {
+      const urlObj = new URL(url);
+      const normalizedUrl = urlObj.origin + urlObj.pathname + urlObj.hash; // Ignore query, include hash
+      const normalizedGoal = goal.toLowerCase().trim().slice(0, 100);
+      return `${normalizedGoal}|${normalizedUrl}`;
+    } catch {
+      return `${goal.slice(0, 100)}|${url.slice(0, 100)}`;
+    }
+  }
+
+  /**
+   * Set a recovery point for a funnel phase
+   * Only one point per phase (overwrite with fresher)
+   */
+  setRecoveryPoint(point: RecoveryPoint): void {
+    this.recoveryPointByPhase.set(point.funnelPhase, point);
+    logger.debug('[LITE_STATE] Set recovery point', {
+      phase: point.funnelPhase,
+      url: this.getShortUrl(point.url),
+      iteration: point.iteration,
+    });
+  }
+
+  /**
+   * Get a recovery point for a funnel phase
+   * Returns null if no point, stale (TTL), or invalidated (zombie)
+   */
+  getRecoveryPoint(phase: FunnelPhaseType): RecoveryPoint | null {
+    const point = this.recoveryPointByPhase.get(phase);
+    if (!point) return null;
+
+    // Check TTL
+    if (Date.now() - point.timestamp > ANCHOR_TTL_MS) {
+      logger.warn('[LITE_STATE] Recovery point stale (TTL exceeded)', {
+        phase,
+        age: Math.round((Date.now() - point.timestamp) / 1000) + 's',
+      });
+      return null;
+    }
+
+    // Check if invalidated (zombie)
+    if (point.invalidated) {
+      logger.warn('[LITE_STATE] Recovery point invalidated (zombie)', { phase });
+      return null;
+    }
+
+    return point;
+  }
+
+  /**
+   * Invalidate a recovery point (zombie detection)
+   * Called when recovery leads back to stuck
+   */
+  invalidateRecoveryPoint(phase: FunnelPhaseType): void {
+    const point = this.recoveryPointByPhase.get(phase);
+    if (point) {
+      point.invalidated = true;
+      logger.warn('[LITE_STATE] Invalidated recovery point (zombie)', { phase });
+    }
+    // Reset last recovery attempt tracking to avoid repeated invalidations
+    this.lastRecoveryAttemptKey = null;
+    this.lastRecoveryAttemptIteration = null;
+  }
+
+  /**
+   * Get current recovery attempts for a key
+   */
+  getRecoveryAttempts(goal: string, url: string): number {
+    const key = this.buildRecoveryKey(goal, url);
+    return this.recoveryAttemptsByKey.get(key) || 0;
+  }
+
+  /**
+   * Increment recovery attempts for a key
+   * Returns new count
+   */
+  incRecoveryAttempt(goal: string, url: string): number {
+    const key = this.buildRecoveryKey(goal, url);
+    const current = this.recoveryAttemptsByKey.get(key) || 0;
+    const newCount = current + 1;
+    this.recoveryAttemptsByKey.set(key, newCount);
+
+    logger.debug('[LITE_STATE] Incremented recovery attempt', {
+      key: key.slice(0, 50),
+      count: newCount,
+      max: MAX_RECOVERY_ATTEMPTS,
+    });
+
+    return newCount;
+  }
+
+  /**
+   * Check if recovery attempts are exhausted for a key
+   */
+  isRecoveryExhausted(goal: string, url: string): boolean {
+    return this.getRecoveryAttempts(goal, url) >= MAX_RECOVERY_ATTEMPTS;
+  }
+
+  /**
+   * Reset recovery attempts for a key
+   * Called on phase change or meaningful URL change
+   */
+  resetRecoveryAttempts(goal: string, url: string): void {
+    const key = this.buildRecoveryKey(goal, url);
+    if (this.recoveryAttemptsByKey.has(key)) {
+      this.recoveryAttemptsByKey.delete(key);
+      logger.debug('[LITE_STATE] Reset recovery attempts', { key: key.slice(0, 50) });
+    }
+  }
+
+  /**
+   * Reset all recovery attempts
+   * Called on FunnelPhase change (SPA-safe)
+   */
+  resetAllRecoveryAttempts(): void {
+    if (this.recoveryAttemptsByKey.size > 0) {
+      this.recoveryAttemptsByKey.clear();
+      logger.debug('[LITE_STATE] Reset all recovery attempts (phase change)');
+    }
+  }
+
+  /**
+   * Record recovery attempt info for zombie detection
+   *
+   * @param key Recovery key (goal + normalized URL)
+   * @param iteration Current iteration number
+   */
+  recordRecoveryAttempt(key: string, iteration: number): void {
+    this.lastRecoveryAttemptKey = key;
+    this.lastRecoveryAttemptIteration = iteration;
+    logger.debug('[LITE_STATE] Recorded recovery attempt', {
+      key: key.slice(0, 50),
+      iteration,
+    });
+  }
+
+  /**
+   * Check if we should invalidate the current phase's recovery point
+   * Returns true if we are stuck again within a short window for the same key
+   *
+   * @param key Recovery key for current attempt
+   * @param iteration Current iteration
+   */
+  shouldInvalidateRecoveryPoint(key: string, iteration: number): boolean {
+    if (!this.lastRecoveryAttemptKey || this.lastRecoveryAttemptIteration === null) {
+      return false;
+    }
+
+    const sameKey = this.lastRecoveryAttemptKey === key;
+    const withinWindow = iteration - this.lastRecoveryAttemptIteration <= 2;
+    return sameKey && withinWindow;
+  }
+
+  /**
+   * Clear recovery state
+   */
+  clearRecoveryState(): void {
+    this.recoveryPointByPhase.clear();
+    this.recoveryAttemptsByKey.clear();
+    this.lastRecoveryAttemptKey = null;
+    this.lastRecoveryAttemptIteration = null;
+    logger.debug('[LITE_STATE] Cleared recovery state');
   }
 }

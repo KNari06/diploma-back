@@ -7,7 +7,17 @@
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
 import { logger } from '@/utils/core/logger';
 import type { Locator, Page } from 'playwright';
-import type { AICommand, ElementInfo, ExecutionResult, LiteSnapshot, ModalDismissInfo } from '../lite-types';
+import { VisualAnchorManager } from '../analysis/visual-anchor-manager';
+import { ShadowDOMHandler } from './shadow-dom-handler';
+import type {
+  AICommand,
+  ElementInfo,
+  ExecutionResult,
+  LiteElement,
+  LiteSnapshot,
+  ModalDismissInfo,
+  VisualSignature,
+} from '../lite-types';
 
 /**
  * Modal keywords passed from GoalDetector for classification
@@ -27,6 +37,16 @@ export interface ExecuteOptions {
   entryPointKeywords?: string[];
   modalKeywords?: ModalKeywords;
   /**
+   * Visual Anchor support: Get signature for fallback lookup
+   * Called when ref-based lookup fails
+   */
+  getSignature?: (ref: string) => VisualSignature | undefined;
+  /**
+   * Visual Anchor support: Save signature after successful interaction
+   * Called with the target element after successful action
+   */
+  saveSignature?: (ref: string, signature: VisualSignature) => void;
+  /**
    * Optional trace hook for detailed action logging
    * Called on key action execution points (without Playwright objects)
    */
@@ -38,11 +58,20 @@ export interface ExecuteOptions {
     duration?: number;
     details?: Record<string, any>;
   }) => void;
+  /**
+   * L5 Vision Escalation: Active frame for iframe support
+   * If provided, actions will be executed in this frame instead of main page
+   */
+  activeFrame?: import('playwright').Frame;
 }
 
 export class ActionExecutor {
   private page: Page;
   private elementMap: Map<string, ElementInfo> = new Map();
+
+  // ✅ L5: Current execution context (page or frame)
+  // Set at the start of each execute() call for iframe support
+  private currentContext: Page | import('playwright').Frame;
 
   // ✅ FIX: Configurable timeouts for different action types
   private readonly DEFAULT_TIMEOUT = 10000; // 10s for most actions (increased from 5s)
@@ -54,6 +83,7 @@ export class ActionExecutor {
 
   constructor(page: Page) {
     this.page = page;
+    this.currentContext = page;
   }
 
   /**
@@ -72,6 +102,9 @@ export class ActionExecutor {
   ): Promise<ExecutionResult> {
     const startTime = Date.now();
     let modalDismissInfo: ModalDismissInfo | undefined;
+
+    // ✅ L5: Use active frame if provided (iframe support), otherwise use main page
+    this.currentContext = options?.activeFrame || this.page;
 
     // Build element lookup map for fallback
     snapshot.elements.forEach((el) => {
@@ -161,6 +194,21 @@ export class ActionExecutor {
         modalDismissed: modalDismissInfo?.dismissed || false,
       });
 
+      // ═══════════════════════════════════════════════════════════════════════
+      // VISUAL ANCHOR: Save signature for future fallback (if callback provided)
+      // ═══════════════════════════════════════════════════════════════════════
+      if (command.ref && options?.saveSignature) {
+        const targetElement = snapshot.elements.find(el => el.ref === command.ref);
+        if (targetElement) {
+          const signature = VisualAnchorManager.createSignature(targetElement, snapshot.elements);
+          options.saveSignature(command.ref, signature);
+          logger.debug('[ACTION_EXECUTOR] Saved visual signature for element', {
+            ref: command.ref,
+            anchorCount: signature.anchors.length,
+          });
+        }
+      }
+
       // ✅ NEW: Trace execution end
       options?.traceHook?.({
         stage: 'execution_end',
@@ -200,7 +248,7 @@ export class ActionExecutor {
           },
         });
 
-        const fallback = await this.tryFuzzyFallback(command, options);
+        const fallback = await this.tryFuzzyFallback(command, options, snapshot);
         if (fallback.success) {
           logger.info('[ACTION_EXECUTOR] Fallback successful', {
             info: fallback.info,
@@ -311,21 +359,30 @@ export class ActionExecutor {
 
   /**
    * Safe switch/case execution - only whitelisted Playwright methods
+   * PHASE B: Pre-scroll to ensure element is in viewport before interaction
    */
   private async executeCommand(cmd: AICommand): Promise<void> {
     const locator = cmd.ref
-      ? this.page.locator(`[data-agent-ref="${cmd.ref}"]`)
+      ? this.currentContext.locator(`[data-agent-ref="${cmd.ref}"]`)
       : null;
 
     switch (cmd.action) {
       case 'click':
         if (!locator) throw new Error('click requires ref');
+        // ═══════════════════════════════════════════════════════════════════
+        // PHASE B: Pre-scroll to ensure element is visible before click
+        // ═══════════════════════════════════════════════════════════════════
+        await this.ensureElementVisible(locator);
         // ✅ FIX: Use longer timeout for clicks (may trigger navigation/modals)
         await locator.click({ timeout: this.NAVIGATION_TIMEOUT });
         break;
 
       case 'fill':
         if (!locator || !cmd.value) throw new Error('fill requires ref and value');
+        // ═══════════════════════════════════════════════════════════════════
+        // PHASE B: Pre-scroll to ensure element is visible before fill
+        // ═══════════════════════════════════════════════════════════════════
+        await this.ensureElementVisible(locator);
         // ✅ FIX: Use pressSequentially() for better compatibility with masked inputs
         // This simulates real typing and works better with phone masks, date pickers, etc.
         try {
@@ -361,7 +418,7 @@ export class ActionExecutor {
       case 'scroll':
         // If a targetRef is provided, scroll that element into view.
         if (cmd.targetRef) {
-          const target = this.page.locator(`[data-agent-ref="${cmd.targetRef}"]`);
+          const target = this.currentContext.locator(`[data-agent-ref="${cmd.targetRef}"]`);
           await target.scrollIntoViewIfNeeded({ timeout: this.DEFAULT_TIMEOUT });
 
           // ✅ EXPERT ADVICE: Add offset for sticky headers (100px up)
@@ -391,11 +448,19 @@ export class ActionExecutor {
 
       case 'select':
         if (!locator || !cmd.value) throw new Error('select requires ref and value');
+        // ═══════════════════════════════════════════════════════════════════
+        // PHASE B: Pre-scroll to ensure element is visible before select
+        // ═══════════════════════════════════════════════════════════════════
+        await this.ensureElementVisible(locator);
         await locator.selectOption(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
         break;
 
       case 'hover':
         if (!locator) throw new Error('hover requires ref');
+        // ═══════════════════════════════════════════════════════════════════
+        // PHASE B: Pre-scroll to ensure element is visible before hover
+        // ═══════════════════════════════════════════════════════════════════
+        await this.ensureElementVisible(locator);
         await locator.hover({ timeout: this.DEFAULT_TIMEOUT });
         break;
 
@@ -410,18 +475,170 @@ export class ActionExecutor {
 
   /**
    * Fuzzy fallback: find element by attributes if ref not found
-   * Priority: placeholder → aria-label → text content → role+name
+   * Priority order (Manus Style):
+   * 1. Visual Anchor (spatial signature) - for dynamic ID sites
+   * 2. Shadow DOM - for elements inside shadow roots
+   * 3. Placeholder → aria-label → text content → role+name (legacy)
+   *
    * NEW: Includes staged self-healing and modal handling
    */
   private async tryFuzzyFallback(
     cmd: AICommand,
-    options?: ExecuteOptions
+    options?: ExecuteOptions,
+    snapshot?: LiteSnapshot
   ): Promise<{
     success: boolean;
     info?: string;
     usedForceClick?: boolean;
     modalDismissInfo?: ModalDismissInfo;
   }> {
+    // ═══════════════════════════════════════════════════════════════════════
+    // FALLBACK 1: Visual Anchor (spatial signature)
+    // Uses geometric relationship to stable anchor elements
+    // Includes "Gray Zone Recovery" for confidence 0.6-0.69 (Manus Pro Tip)
+    // ═══════════════════════════════════════════════════════════════════════
+    if (cmd.ref && options?.getSignature && snapshot) {
+      const signature = options.getSignature(cmd.ref);
+      if (signature) {
+        logger.debug('[ACTION_EXECUTOR] Trying Visual Anchor fallback', {
+          ref: cmd.ref,
+          signatureAnchors: signature.anchors.length,
+        });
+
+        let { element: foundElement, confidence } = VisualAnchorManager.findBySignature(
+          signature,
+          snapshot.elements
+        );
+
+        // ═══════════════════════════════════════════════════════════════════
+        // GRAY ZONE RECOVERY (Manus Pro Tip)
+        // If confidence is 0.6-0.69, elements might not have rendered yet
+        // Try: 1) Wait 500ms  2) Micro-scroll  3) Recalculate
+        // ═══════════════════════════════════════════════════════════════════
+        if (foundElement && confidence >= 0.6 && confidence < 0.7) {
+          logger.debug('[ACTION_EXECUTOR] Visual Anchor in gray zone, trying recovery', {
+            confidence: confidence.toFixed(2),
+            ref: cmd.ref,
+          });
+
+          // Step 1: Wait for potential lazy-loaded elements
+          await this.page.waitForTimeout(500);
+
+          // Step 2: Micro-scroll to trigger viewport-based rendering
+          await this.page.evaluate(() => {
+            // @ts-expect-error - window available in browser context
+            window.scrollBy(0, 50);
+            // @ts-expect-error
+            window.scrollBy(0, -50);
+          });
+          await this.page.waitForTimeout(200);
+
+          // Step 3: Re-collect snapshot and recalculate
+          const freshSnapshot = await this.page.evaluate(() => {
+            const elements: any[] = [];
+            // @ts-expect-error - document available in browser context
+            document.querySelectorAll('[data-agent-ref]').forEach((el: any) => {
+              const rect = el.getBoundingClientRect();
+              elements.push({
+                ref: el.getAttribute('data-agent-ref'),
+                name: el.getAttribute('aria-label') || el.textContent?.trim().slice(0, 50) || '',
+                tag: el.tagName.toLowerCase(),
+                type: el.type || undefined,
+                visible: true,
+                bounds: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+              });
+            });
+            return elements;
+          }) as LiteElement[];
+
+          // Recalculate confidence with fresh data
+          const retryResult = VisualAnchorManager.findBySignature(signature, freshSnapshot);
+
+          if (retryResult.confidence > confidence) {
+            logger.info('[ACTION_EXECUTOR] Gray zone recovery improved confidence', {
+              before: confidence.toFixed(2),
+              after: retryResult.confidence.toFixed(2),
+            });
+            foundElement = retryResult.element;
+            confidence = retryResult.confidence;
+          }
+        }
+
+        if (foundElement && confidence >= 0.7) {
+          logger.info('[ACTION_EXECUTOR] Visual Anchor found element', {
+            originalRef: cmd.ref,
+            newRef: foundElement.ref,
+            confidence: confidence.toFixed(2),
+          });
+
+          options?.traceHook?.({
+            stage: 'fallback',
+            action: 'visual_anchor_match',
+            success: true,
+            details: {
+              originalRef: cmd.ref,
+              newRef: foundElement.ref,
+              confidence,
+            },
+          });
+
+          // Execute on the found element
+          try {
+            const newLocator = this.currentContext.locator(`[data-agent-ref="${foundElement.ref}"]`);
+            const result = await this.executeFallbackActionWithSelfHealing(
+              { ...cmd, ref: foundElement.ref },
+              newLocator,
+              options
+            );
+
+            // Handle modal after successful click
+            let modalDismissInfo: ModalDismissInfo | undefined;
+            if (cmd.action === 'click' && options?.modalKeywords) {
+              modalDismissInfo = await this.handleUnexpectedModal(options.modalKeywords);
+            }
+
+            // Save new signature for the found element
+            if (options?.saveSignature) {
+              const newSignature = VisualAnchorManager.createSignature(foundElement, snapshot.elements);
+              options.saveSignature(foundElement.ref, newSignature);
+            }
+
+            return {
+              success: true,
+              info: `Visual Anchor: ref ${cmd.ref} → ${foundElement.ref} (confidence: ${confidence.toFixed(2)})`,
+              usedForceClick: result.usedForceClick,
+              modalDismissInfo,
+            };
+          } catch (visualAnchorError) {
+            logger.debug('[ACTION_EXECUTOR] Visual Anchor execution failed, trying next fallback', {
+              error: visualAnchorError instanceof Error ? visualAnchorError.message : String(visualAnchorError),
+            });
+          }
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // FALLBACK 2: Shadow DOM
+    // For elements inside shadow roots (web components)
+    // ═══════════════════════════════════════════════════════════════════════
+    if (cmd.ref) {
+      try {
+        const shadowResult = await this.tryShadowDOMFallback(cmd);
+        if (shadowResult.success) {
+          return shadowResult;
+        }
+      } catch (shadowError) {
+        logger.debug('[ACTION_EXECUTOR] Shadow DOM fallback failed', {
+          error: shadowError instanceof Error ? shadowError.message : String(shadowError),
+        });
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // FALLBACK 3: Legacy text-based matching
+    // placeholder → aria-label → text content → role+name
+    // ═══════════════════════════════════════════════════════════════════════
     const el = this.elementMap.get(cmd.ref!);
     if (!el) {
       return { success: false };
@@ -449,7 +666,7 @@ export class ActionExecutor {
       // 1. By placeholder
       el.placeholder
         ? {
-            locator: this.page.locator(`[placeholder="${el.placeholder}"]`),
+            locator: this.currentContext.locator(`[placeholder="${el.placeholder}"]`),
             name: 'placeholder',
           }
         : undefined,
@@ -506,6 +723,54 @@ export class ActionExecutor {
         });
         continue; // Try next strategy
       }
+    }
+
+    return { success: false };
+  }
+
+  /**
+   * Try Shadow DOM fallback for elements inside shadow roots
+   * Uses ShadowDOMHandler to penetrate shadow boundaries
+   */
+  private async tryShadowDOMFallback(
+    cmd: AICommand
+  ): Promise<{
+    success: boolean;
+    info?: string;
+    usedForceClick?: boolean;
+    modalDismissInfo?: ModalDismissInfo;
+  }> {
+    if (!cmd.ref) return { success: false };
+
+    logger.debug('[ACTION_EXECUTOR] Trying Shadow DOM fallback', { ref: cmd.ref });
+
+    switch (cmd.action) {
+      case 'click': {
+        const clicked = await ShadowDOMHandler.click(this.page, cmd.ref);
+        if (clicked) {
+          return {
+            success: true,
+            info: `Shadow DOM: clicked ${cmd.ref}`,
+            usedForceClick: false,
+          };
+        }
+        break;
+      }
+      case 'fill': {
+        if (!cmd.value) return { success: false };
+        const filled = await ShadowDOMHandler.fill(this.page, cmd.ref, cmd.value);
+        if (filled) {
+          return {
+            success: true,
+            info: `Shadow DOM: filled ${cmd.ref}`,
+            usedForceClick: false,
+          };
+        }
+        break;
+      }
+      default:
+        // Shadow DOM fallback only supports click and fill for now
+        break;
     }
 
     return { success: false };
@@ -611,8 +876,8 @@ export class ActionExecutor {
 
     // Stage 3: Try scroll offset (for sticky headers)
     try {
-      await this.page.evaluate(() => {
-        // @ts-expect-error
+      await locator.evaluate(() => {
+        // @ts-expect-error - window available in browser context
         window.scrollBy(0, -150); // Scroll up to reveal element
       });
       await this.page.waitForTimeout(200);
@@ -654,6 +919,50 @@ export class ActionExecutor {
 
     const msgLower = msg.toLowerCase();
     return interceptedIndicators.some((indicator) => msgLower.includes(indicator));
+  }
+
+  /**
+   * WORKSTREAM B: 2-stage center-scroll visibility
+   * Stage 1: Fast path with scrollIntoViewIfNeeded
+   * Stage 2: Center the element to avoid edge overlays (cookie bars, chat widgets)
+   *
+   * @param locator - Playwright locator for the target element
+   */
+  private async ensureElementVisible(locator: Locator): Promise<void> {
+    try {
+      // ═══════════════════════════════════════════════════════════════════════
+      // Stage 1: Fast path - scroll into view if needed
+      // ═══════════════════════════════════════════════════════════════════════
+      await locator.scrollIntoViewIfNeeded({ timeout: 3000 });
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // Stage 2: Center the element in viewport (reduces edge overlay issues)
+      // scrollIntoViewIfNeeded can place element at viewport edges where
+      // sticky headers/footers, cookie bars, or chat widgets can obscure it
+      // ═══════════════════════════════════════════════════════════════════════
+      try {
+        await locator.evaluate((el) => {
+          el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+        });
+      } catch {
+        // If evaluate fails (e.g., element detached), continue anyway
+      }
+
+      // Smaller sticky offset after centering (centering already reduces edge risk)
+      await locator.evaluate(() => {
+        const STICKY_HEADER_OFFSET = 60; // pixels (reduced from 100, since we're centered)
+        // @ts-expect-error - window available in browser context
+        window.scrollBy(0, -STICKY_HEADER_OFFSET);
+      });
+
+      // Brief wait for scroll to complete and any lazy-loaded content
+      await this.page.waitForTimeout(100);
+    } catch (error) {
+      // Log but don't fail - element might still be interactable
+      logger.debug('[ACTION_EXECUTOR] ensureElementVisible warning', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -990,7 +1299,7 @@ export class ActionExecutor {
       }
 
       // Click the close button
-      await this.page.locator(`[data-agent-ref="${closeButton}"]`).click({ timeout: 3000 });
+      await this.currentContext.locator(`[data-agent-ref="${closeButton}"]`).click({ timeout: 3000 });
       await this.page.waitForTimeout(500);
 
       // Check if modal is still present

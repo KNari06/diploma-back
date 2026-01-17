@@ -132,7 +132,8 @@ export class LiteTraceWriter {
     // Create file path: test_logs/<testId>_<date>_<runId>.jsonl
     // This avoids mixing multiple runs into one file when retries reuse the same testId.
     const datePart = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-    this.filePath = path.join(LOGS_DIR, `${this.testId}_${datePart}_${this.runId}.jsonl`);
+    const safeTestId = LiteTraceWriter.sanitizeFilePart(this.testId);
+    this.filePath = path.join(LOGS_DIR, `${safeTestId}_${datePart}_${this.runId}.jsonl`);
 
     // Generate root span ID
     this.rootSpanId = this.generateSpanId();
@@ -293,6 +294,17 @@ export class LiteTraceWriter {
     return `${ts}_${rand}`;
   }
 
+  /**
+   * Sanitize a string for safe use in filenames (prevents path traversal and invalid chars).
+   * Keeps only [a-zA-Z0-9_-], replaces everything else with '_', and caps length.
+   */
+  private static sanitizeFilePart(input: string): string {
+    const safe = (input || 'unknown')
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .slice(0, 80);
+    return safe.length > 0 ? safe : 'unknown';
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // PRIVATE HELPERS
   // ═══════════════════════════════════════════════════════════════════════════
@@ -363,19 +375,70 @@ export class LiteTraceWriter {
    * @returns Truncated string or object with truncated + hash
    */
   private truncateString(str: string): string | { truncated: string; hash: string; originalLength: number } {
-    if (str.length <= this.maxPayloadChars) {
-      return str;
+    const redacted = this.redactString(str);
+    if (redacted.length <= this.maxPayloadChars) {
+      return redacted;
     }
 
     // Truncate and add hash for correlation
-    const truncated = str.slice(0, this.maxPayloadChars);
+    const truncated = redacted.slice(0, this.maxPayloadChars);
     const hash = this.hashString(str);
 
     return {
       truncated,
       hash,
-      originalLength: str.length,
+      originalLength: redacted.length,
     };
+  }
+
+  /**
+   * Redact secrets based on string content (not only keys).
+   * Handles Bearer tokens, JWT-like strings, and sensitive query params in URLs/text.
+   */
+  private redactString(input: string): string {
+    let out = input;
+
+    // 1) Authorization headers / Bearer tokens
+    out = out.replace(/Bearer\\s+[A-Za-z0-9\\-_.=]+/g, 'Bearer [REDACTED]');
+    out = out.replace(/Basic\\s+[A-Za-z0-9\\/=+]+/g, 'Basic [REDACTED]');
+
+    // 2) JWT-like token strings (best-effort)
+    out = out.replace(/eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/g, '[JWT_REDACTED]');
+
+    // 3) Mask sensitive query params in URLs (only if parseable)
+    if (out.startsWith('http://') || out.startsWith('https://')) {
+      try {
+        const url = new URL(out);
+        const sensitiveParams = [
+          'token',
+          'access_token',
+          'refresh_token',
+          'api_key',
+          'apikey',
+          'key',
+          'secret',
+          'password',
+          'auth',
+          'session',
+        ];
+        for (const p of sensitiveParams) {
+          if (url.searchParams.has(p)) {
+            url.searchParams.set(p, '[REDACTED]');
+          }
+        }
+        out = url.toString();
+      } catch {
+        // ignore URL parsing failures
+      }
+    }
+
+    // 4) Mask common key=value secrets in any text
+    out = out.replace(
+      /\\b(token|access_token|refresh_token|api[_-]?key|apikey|key|secret|password)=([^&\\s]+)/gi,
+      (_m, k) => `${String(k)}=[REDACTED]`
+    );
+
+    return out;
   }
 
   /**

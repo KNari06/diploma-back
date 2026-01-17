@@ -157,25 +157,9 @@ export const uploadTrace = async (
       return;
     }
 
-    // Update test_results table if testId is provided
-    if (testId && browser) {
-      const { error: testResultError } = await supabaseAdmin
-        .from('test_results')
-        .update({
-          trace_file: fileName,
-          trace_uploaded_at: new Date().toISOString(),
-        })
-        .eq('test_id', testId)
-        .eq('browser', browser);
-
-      if (testResultError) {
-        logger.warn('Failed to update test_results with trace info', {
-          error: testResultError,
-          testId,
-          browser,
-        });
-      }
-    }
+    // NOTE: We no longer update test_results with trace_file/trace_uploaded_at columns.
+    // The trace_files table is the single source of truth for trace metadata.
+    // Linking is done via trace_files.test_id FK to tests.id.
 
     logger.info('Trace uploaded successfully', {
       traceId,
@@ -703,15 +687,31 @@ export const getTraceSteps = async (req: Request, res: Response<TraceStepsRespon
       return;
     }
 
+    // Determine file type: Lite JSONL or Playwright ZIP
+    const isLiteTrace = traceFile.file_name?.endsWith('.jsonl') ||
+                        traceFile.browser === 'lite-trace-log' ||
+                        traceFile.browser === 'lite';
+
+    const bucketName = isLiteTrace ? 'lite-trace-logs' : 'traces';
+
+    logger.debug('Trace file type detected', {
+      testId,
+      fileName: traceFile.file_name,
+      browser: traceFile.browser,
+      isLiteTrace,
+      bucketName,
+    });
+
     // Download trace file from Supabase Storage
     const { data: fileData, error: downloadError } = await supabaseAdmin.storage
-      .from('traces')
+      .from(bucketName)
       .download(traceFile.storage_path);
 
     if (downloadError || !fileData) {
       logger.error('Failed to download trace file', {
         error: downloadError,
         storagePath: traceFile.storage_path,
+        bucketName,
       });
       res.status(500).json({
         success: false,
@@ -724,68 +724,22 @@ export const getTraceSteps = async (req: Request, res: Response<TraceStepsRespon
     // Convert blob to buffer
     const buffer = Buffer.from(await fileData.arrayBuffer());
 
-    // Parse ZIP file
-    const steps: TraceStep[] = [];
+    // Parse trace file based on type
+    let steps: TraceStep[] = [];
     try {
-      const zip = new AdmZip(buffer);
-      const zipEntries = zip.getEntries();
-
-      // Look for trace file (trace.trace or similar)
-      const traceEntry = zipEntries.find(
-        (entry) => entry.entryName.includes('trace') && !entry.isDirectory
-      );
-
-      if (!traceEntry) {
-        throw new Error('No trace file found in ZIP');
-      }
-
-      // Extract trace data
-      const traceData = traceEntry.getData().toString('utf8');
-      const traceLines = traceData.split('\n').filter((line) => line.trim());
-
-      // Parse trace lines into steps
-      let stepId = 1;
-      for (const line of traceLines) {
-        try {
-          // Trace format is typically JSONL (one JSON object per line)
-          const event = JSON.parse(line);
-
-          // Filter and transform relevant events
-          if (event.type === 'action' || event.type === 'apiCall') {
-            const step: TraceStep = {
-              stepId: stepId++,
-              type: event.apiName || event.method || 'unknown',
-              timestamp: event.time || Date.now(),
-            };
-
-            // Extract additional info based on action type
-            if (event.params) {
-              if (event.params.url) {
-                step.url = event.params.url;
-              }
-              if (event.params.selector) {
-                step.selector = event.params.selector;
-              }
-              if (event.params.text) {
-                step.text = event.params.text;
-              }
-            }
-
-            // Add description
-            step.description = generateStepDescription(step);
-
-            steps.push(step);
-          }
-        } catch (parseError) {
-          // Skip invalid lines
-          continue;
-        }
+      if (isLiteTrace) {
+        // Parse Lite JSONL trace
+        steps = parseLiteTraceSteps(buffer);
+      } else {
+        // Parse Playwright ZIP trace
+        steps = parsePlaywrightTraceSteps(buffer);
       }
     } catch (parseError) {
       logger.error('Failed to parse trace file', {
         error: parseError,
         testId,
         fileName: traceFile.file_name,
+        isLiteTrace,
       });
       res.status(500).json({
         success: false,
@@ -846,7 +800,175 @@ export const getTraceSteps = async (req: Request, res: Response<TraceStepsRespon
 };
 
 /**
- * Helper function to generate human-readable step description
+ * Parse Lite JSONL trace into TraceStep[]
+ * Reads action_execute_start/end events from JSONL trace
+ */
+function parseLiteTraceSteps(buffer: Buffer): TraceStep[] {
+  const steps: TraceStep[] = [];
+  const text = buffer.toString('utf8');
+  const lines = text.split('\n').filter((line) => line.trim());
+
+  let stepId = 1;
+
+  for (const line of lines) {
+    try {
+      const event = JSON.parse(line);
+
+      // Prefer action_execute_start events: they contain payload.command in LiteEngine
+      if (event.eventType === 'action_execute_start') {
+        const cmd = event.payload?.command;
+        const action = cmd?.action || 'unknown';
+        const ref = cmd?.ref || cmd?.targetRef;
+        const url = cmd?.url;
+        const hasValue = typeof cmd?.value === 'string' && cmd.value.length > 0;
+
+        const ts = Date.parse(event.ts);
+        const timestamp = Number.isFinite(ts) ? ts : Date.now();
+
+        const step: TraceStep = {
+          stepId: stepId++,
+          type: action,
+          timestamp,
+        };
+
+        if (url) step.url = url;
+        if (ref) step.selector = ref;
+        if (hasValue) step.text = '[value provided]'; // Redacted
+
+        // Generate description based on action type
+        step.description = generateStepDescriptionFromLite(action, ref, url, hasValue ? '[redacted]' : undefined);
+
+        steps.push(step);
+        continue;
+      }
+
+      // Fallback: action_* detail events (LiteEngine writes these via traceHook)
+      // Only use if we couldn't get action_execute_start for some reason.
+      if (steps.length === 0 && typeof event.eventType === 'string' && event.eventType.startsWith('action_')) {
+        const action = event.payload?.action || 'unknown';
+        const ref = event.payload?.details?.ref;
+        const url = event.payload?.details?.url;
+
+        const ts = Date.parse(event.ts);
+        const timestamp = Number.isFinite(ts) ? ts : Date.now();
+
+        const step: TraceStep = {
+          stepId: stepId++,
+          type: action,
+          timestamp,
+        };
+
+        if (url) step.url = url;
+        if (ref) step.selector = ref;
+        step.description = generateStepDescriptionFromLite(action, ref, url);
+        steps.push(step);
+      }
+    } catch (parseError) {
+      // Skip invalid lines
+      continue;
+    }
+  }
+
+  return steps;
+}
+
+/**
+ * Parse Playwright ZIP trace into TraceStep[]
+ * Extracts trace.trace JSONL from ZIP and parses Playwright events
+ */
+function parsePlaywrightTraceSteps(buffer: Buffer): TraceStep[] {
+  const steps: TraceStep[] = [];
+  const zip = new AdmZip(buffer);
+  const zipEntries = zip.getEntries();
+
+  // Look for trace file (trace.trace or similar)
+  const traceEntry = zipEntries.find(
+    (entry) => entry.entryName.includes('trace') && !entry.isDirectory
+  );
+
+  if (!traceEntry) {
+    throw new Error('No trace file found in ZIP');
+  }
+
+  // Extract trace data
+  const traceData = traceEntry.getData().toString('utf8');
+  const traceLines = traceData.split('\n').filter((line) => line.trim());
+
+  // Parse trace lines into steps
+  let stepId = 1;
+  for (const line of traceLines) {
+    try {
+      // Trace format is typically JSONL (one JSON object per line)
+      const event = JSON.parse(line);
+
+      // Filter and transform relevant events
+      if (event.type === 'action' || event.type === 'apiCall') {
+        const step: TraceStep = {
+          stepId: stepId++,
+          type: event.apiName || event.method || 'unknown',
+          timestamp: event.time || Date.now(),
+        };
+
+        // Extract additional info based on action type
+        if (event.params) {
+          if (event.params.url) {
+            step.url = event.params.url;
+          }
+          if (event.params.selector) {
+            step.selector = event.params.selector;
+          }
+          if (event.params.text) {
+            step.text = event.params.text;
+          }
+        }
+
+        // Add description
+        step.description = generateStepDescription(step);
+
+        steps.push(step);
+      }
+    } catch (parseError) {
+      // Skip invalid lines
+      continue;
+    }
+  }
+
+  return steps;
+}
+
+/**
+ * Generate human-readable description for Lite trace action
+ */
+function generateStepDescriptionFromLite(
+  action: string,
+  ref?: string,
+  url?: string,
+  value?: string
+): string {
+  switch (action) {
+    case 'goto':
+      return `Navigate to ${url || 'page'}`;
+    case 'click':
+      return `Click on ${ref || 'element'}`;
+    case 'fill':
+      return `Fill input ${ref || 'field'}`;
+    case 'select':
+      return `Select option in ${ref || 'dropdown'}`;
+    case 'hover':
+      return `Hover over ${ref || 'element'}`;
+    case 'scroll':
+      return `Scroll page`;
+    case 'press':
+      return `Press key`;
+    case 'wait':
+      return `Wait`;
+    default:
+      return `${action}${ref ? ` (${ref})` : ''}`;
+  }
+}
+
+/**
+ * Helper function to generate human-readable step description (Playwright)
  */
 function generateStepDescription(step: TraceStep): string {
   switch (step.type) {

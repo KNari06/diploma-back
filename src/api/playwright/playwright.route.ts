@@ -39,8 +39,14 @@ const upload = multer({
  * /api/v1/playwright/upload-trace:
  *   post:
  *     summary: Upload Playwright trace file to Supabase Storage
- *     description: Upload a Playwright trace .zip file with metadata to Supabase Storage
+ *     description: |
+ *       Upload a Playwright trace .zip file with metadata to Supabase Storage.
+ *       User ID is automatically extracted from authentication token.
+ *       NOTE: This endpoint no longer updates test_results table.
+ *       Trace metadata is stored in trace_files table only.
  *     tags: [Playwright]
+ *     security:
+ *       - bearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -49,16 +55,11 @@ const upload = multer({
  *             type: object
  *             required:
  *               - trace
- *               - userId
  *             properties:
  *               trace:
  *                 type: string
  *                 format: binary
  *                 description: The trace .zip file
- *               userId:
- *                 type: string
- *                 description: User ID who ran the test (required)
- *                 example: "user_123"
  *               testId:
  *                 type: string
  *                 description: Test ID associated with this trace (optional)
@@ -67,9 +68,6 @@ const upload = multer({
  *                 type: string
  *                 description: Browser used for the test (optional)
  *                 example: "chrome"
- *               metadata:
- *                 type: object
- *                 description: Additional metadata (optional)
  *     responses:
  *       200:
  *         description: Trace uploaded successfully to Supabase Storage
@@ -110,7 +108,13 @@ const upload = multer({
  *                     userId:
  *                       type: string
  *       400:
- *         description: Bad request - missing file or userId
+ *         description: Bad request - missing file, invalid testId format, or file too large
+ *       401:
+ *         description: Unauthorized - authentication required
+ *       403:
+ *         description: Forbidden - testId does not belong to authenticated user
+ *       404:
+ *         description: Test not found (if testId provided)
  *       500:
  *         description: Server error during upload
  */
@@ -125,7 +129,10 @@ router.post('/upload-trace', upload.single('trace'), asyncHandler(uploadTrace));
  *       Generate a signed URL to download trace file from Supabase Storage.
  *       Supports both Playwright ZIP traces and Lite JSONL trace logs.
  *       User ID is automatically extracted from authentication token.
+ *       Users can only access their own trace files.
  *     tags: [Playwright]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -166,6 +173,10 @@ router.post('/upload-trace', upload.single('trace'), asyncHandler(uploadTrace));
  *                     createdAt:
  *                       type: string
  *                       format: date-time
+ *       401:
+ *         description: Unauthorized - authentication required
+ *       403:
+ *         description: Forbidden - user can only access their own files
  *       404:
  *         description: Trace file not found or access denied
  *       500:
@@ -178,21 +189,20 @@ router.get('/trace/:id', asyncHandler(getTrace));
  * /api/v1/playwright/traces:
  *   get:
  *     summary: List trace files
- *     description: Get a list of trace files filtered by testId, userId, or type (lite/playwright)
+ *     description: |
+ *       Get a list of trace files for the authenticated user.
+ *       Results are automatically filtered by user ID from authentication token.
+ *       Can be further filtered by testId or type (lite/playwright).
  *     tags: [Playwright]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: query
  *         name: testId
  *         schema:
  *           type: string
- *         description: Filter by test ID
+ *         description: Filter by test ID (optional)
  *         example: "test_456"
- *       - in: query
- *         name: userId
- *         schema:
- *           type: string
- *         description: Filter by user ID
- *         example: "user_123"
  *       - in: query
  *         name: type
  *         schema:
@@ -241,7 +251,9 @@ router.get('/trace/:id', asyncHandler(getTrace));
  *                 count:
  *                   type: number
  *       400:
- *         description: Bad request - testId or userId required
+ *         description: Bad request - invalid testId format
+ *       401:
+ *         description: Unauthorized - authentication required
  *       500:
  *         description: Server error
  */
@@ -251,20 +263,17 @@ router.get('/traces', asyncHandler(listTraces));
  * @swagger
  * /api/v1/playwright/trace-files:
  *   get:
- *     summary: Get all trace files for a user
- *     description: Retrieve list of all trace files uploaded by a specific user
+ *     summary: Get all trace files for authenticated user
+ *     description: |
+ *       Retrieve list of all trace files uploaded by the authenticated user.
+ *       User ID is automatically extracted from authentication token.
+ *       Query parameter userId is ignored (security: users can only see their own files).
  *     tags: [Playwright]
- *     parameters:
- *       - in: query
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *         description: User ID to filter trace files
- *         example: "user_123"
+ *     security:
+ *       - bearerAuth: []
  *     responses:
  *       200:
- *         description: List of trace files
+ *         description: List of trace files for authenticated user
  *         content:
  *           application/json:
  *             schema:
@@ -272,6 +281,7 @@ router.get('/traces', asyncHandler(listTraces));
  *               properties:
  *                 success:
  *                   type: boolean
+ *                   example: true
  *                 data:
  *                   type: array
  *                   items:
@@ -279,10 +289,12 @@ router.get('/traces', asyncHandler(listTraces));
  *                     properties:
  *                       id:
  *                         type: string
+ *                         format: uuid
  *                       fileName:
  *                         type: string
  *                       testId:
  *                         type: string
+ *                         format: uuid
  *                       uploadedAt:
  *                         type: string
  *                         format: date-time
@@ -293,12 +305,14 @@ router.get('/traces', asyncHandler(listTraces));
  *                         enum: [uploaded, parsing, parsed, failed]
  *                       browser:
  *                         type: string
+ *                       publicUrl:
+ *                         type: string
  *                 count:
  *                   type: number
  *                 message:
  *                   type: string
- *       400:
- *         description: Bad request - userId required
+ *       401:
+ *         description: Unauthorized - authentication required
  *       500:
  *         description: Server error
  */
@@ -309,8 +323,15 @@ router.get('/trace-files', asyncHandler(getTraceFilesByUser));
  * /api/v1/playwright/trace/{testId}/steps:
  *   get:
  *     summary: Parse trace file and get test steps
- *     description: Extract and return all test steps from Playwright trace file
+ *     description: |
+ *       Extract and return all test steps from trace file.
+ *       Supports both Playwright ZIP traces and Lite JSONL trace logs.
+ *       Automatically detects file type and parses accordingly.
+ *       User ID is automatically extracted from authentication token.
+ *       Users can only access steps for their own tests.
  *     tags: [Playwright]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: testId
@@ -338,6 +359,7 @@ router.get('/trace-files', asyncHandler(getTraceFilesByUser));
  *                       type: string
  *                     fileName:
  *                       type: string
+ *                       description: Original file name (.zip for Playwright, .jsonl for Lite)
  *                     totalSteps:
  *                       type: number
  *                     steps:
@@ -362,8 +384,14 @@ router.get('/trace-files', asyncHandler(getTraceFilesByUser));
  *                     parsedAt:
  *                       type: string
  *                       format: date-time
+ *       400:
+ *         description: Bad request - invalid testId format
+ *       401:
+ *         description: Unauthorized - authentication required
+ *       403:
+ *         description: Forbidden - test does not belong to authenticated user
  *       404:
- *         description: Trace file not found
+ *         description: Trace file or test not found
  *       500:
  *         description: Server error
  */
@@ -374,27 +402,40 @@ router.get('/trace/:testId/steps', asyncHandler(getTraceSteps));
  * /api/v1/playwright/trace/{id}:
  *   delete:
  *     summary: Delete a trace file
- *     description: Delete trace file from Supabase Storage and database
+ *     description: |
+ *       Delete trace file from Supabase Storage and database.
+ *       User ID is automatically extracted from authentication token.
+ *       Users can only delete their own trace files.
  *     tags: [Playwright]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
  *         required: true
  *         schema:
  *           type: string
- *         description: The trace file ID
- *     requestBody:
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               userId:
- *                 type: string
- *                 description: User ID for security check (optional)
+ *           format: uuid
+ *         description: The trace file ID (UUID)
+ *         example: "550e8400-e29b-41d4-a716-446655440000"
  *     responses:
  *       200:
  *         description: Trace file deleted successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Trace file deleted successfully"
+ *       401:
+ *         description: Unauthorized - authentication required
+ *       403:
+ *         description: Forbidden - user can only delete their own files
  *       404:
  *         description: Trace file not found
  *       500:

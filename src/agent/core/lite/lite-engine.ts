@@ -9,16 +9,21 @@
 import { TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { GraphBuilder, GraphUpdate } from '@/agent/utils/visualization/graph-builder.service';
 import { TestProgressEmitter } from '@/agent/utils/visualization/progress-emitter';
+import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Page } from 'playwright';
 import { checkTestCancelled, cleanupCancellationState, withCancellation } from '../../playwright/utils/test-cancellation-checker';
 import { buildSnapshotSummary } from './analysis/ai-goal-evaluator';
 import { classifyField } from './analysis/field-classifier';
+import { FunnelAnalyzer, FunnelPhase } from './analysis/funnel-analyzer';
 import { GoalDetector } from './analysis/goal-detector';
+import { GoalExpander, type ExpandedGoal } from './analysis/goal-expander';
+import { HybridSemanticWeightCalculator, matchesKeyword } from './analysis/hybrid-semantic-weight';
 import { PlanProgressEvaluator } from './analysis/plan-progress-evaluator';
 import { StateDiffComputer } from './analysis/state-diff';
 import { StateValidator } from './analysis/state-validator';
+import { TargetAudit, type RankedCandidate } from './analysis/target-audit';
 import { TaskPlanBuilder, type TaskPlan } from './analysis/task-plan-builder';
 import { ConsoleCollector } from './collectors/console-collector';
 import { ErrorCollector } from './collectors/error-collector';
@@ -26,9 +31,10 @@ import { NetworkTracker } from './collectors/network-tracker';
 import { SnapshotCollector } from './collectors/snapshot-collector';
 import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
+import { PageWatcher, type NewPageInfo } from './execution/page-watcher';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
-import type { AICommand, AIDecision, ActionOutcome, CollectedError, ExecutionResult, GoalContext, GoalGuidance, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, StateDiff } from './lite-types';
+import type { AICommand, AIDecision, ActionOutcome, CollectedError, ExecutionResult, FunnelPhaseType, GoalContext, GoalGuidance, LiteElement, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, RecoveryPoint, StateDiff, VisionHints } from './lite-types';
 import { LitePromptBuilder, type TaskPlanContext, type ValidationErrorContext } from './prompt/lite-prompt-builder';
 import { LiteTraceWriter } from './trace/lite-trace-writer';
 
@@ -43,6 +49,8 @@ export class LiteEngine {
   private graphBuilder: GraphBuilder; // ✅ NEW: Full graph like Pro
   private goalDetector: GoalDetector; // ✅ NEW: Goal-first detection
   private traceWriter: LiteTraceWriter; // ✅ NEW: Always-on JSONL trace for debugging
+  private semanticWeightCalculator: HybridSemanticWeightCalculator; // ✅ NEW: Hybrid semantic weight (Manus Style)
+  private pageWatcher: PageWatcher | null = null; // ✅ Phase A: Multi-tab/popup detection
   private startTime: number = 0;
 
   // Track emitted node IDs to avoid duplicates
@@ -90,6 +98,18 @@ export class LiteEngine {
   private microCorrectionAttempted = false;
   private transientWaitStartTime: number | null = null;
   private readonly MAX_TRANSIENT_WAIT_MS = 15000; // 15 seconds max wait for loaders
+  private lastGoalOrientedSummary: string | null = null; // ✅ NEW: Goal-Oriented Summary from last iteration (Hybrid Semantic Weight)
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L2-L4-L5 MANUS ALIGNMENT PROPERTIES
+  // ═══════════════════════════════════════════════════════════════════════════
+  private expandedGoal: ExpandedGoal | null = null;
+  private currentFunnelPhase: FunnelPhase = FunnelPhase.DISCOVERY;
+  private previousFunnelPhase: FunnelPhase | null = null;
+  private lastGoalRefinementTime: number = 0;
+  private readonly GOAL_REFINEMENT_COOLDOWN_MS = 5000; // Min time between refinements
+  private consecutiveNoEffectCount: number = 0;
+  private activeFrame: import('playwright').Frame | null = null; // L5: Store active frame for iframe execution
 
   constructor(page: Page, config: LiteEngineConfig) {
     this.page = page;
@@ -101,6 +121,7 @@ export class LiteEngine {
     this.graphBuilder = new GraphBuilder(); // ✅ NEW: Initialize graph builder
     this.goalDetector = new GoalDetector(config.goal, config.testId); // ✅ NEW: Initialize goal detector with testId for AI fallback
     this.traceWriter = new LiteTraceWriter({ testId: config.testId }); // ✅ NEW: Initialize trace writer
+    this.semanticWeightCalculator = new HybridSemanticWeightCalculator(config.goal, config.testId); // ✅ NEW: Initialize hybrid semantic weight calculator
 
     // WebSocket progress
     this.progressEmitter = new TestProgressEmitter(
@@ -260,6 +281,548 @@ export class LiteEngine {
     return command;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L4 TARGET AUDIT GUARD (MANUS STYLE)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Apply L4 Target Audit Guard before command execution.
+   * Validates AI-chosen ref against expanded goal keywords.
+   * If element doesn't match goal, triggers AI audit with top candidates.
+   *
+   * @param command AI command with proposed ref
+   * @param snapshot Current page snapshot
+   * @returns Command with potentially corrected ref
+   */
+  private async applyTargetAuditGuard(
+    command: AICommand,
+    snapshot: LiteSnapshot
+  ): Promise<AICommand> {
+    // Skip if no expanded goal or no ref
+    if (!this.expandedGoal || !command.ref) {
+      return command;
+    }
+
+    // Skip for wait commands (no element interaction)
+    if (command.action === 'wait') {
+      return command;
+    }
+
+    const targetElement = snapshot.elements.find(el => el.ref === command.ref);
+    if (!targetElement) {
+      return command; // Element not found, let executor handle
+    }
+
+    // Check if element is relevant to goal
+    const isRelevant = this.checkElementRelevance(targetElement);
+
+    if (isRelevant) {
+      return command; // Element passes relevance check
+    }
+
+    // Element not relevant → Trigger L4 Audit
+    logger.warn('[L4_GUARD] Command ref not relevant to goal, triggering audit', {
+      testId: this.config.testId,
+      ref: command.ref?.slice(0, 20),
+      elementName: targetElement.name?.slice(0, 30),
+    });
+
+    // Get top candidates ranked by composite score
+    const topCandidates = this.getTopRankedCandidates(snapshot, command.action, 5);
+
+    // Ask AI to pick correct ref
+    const auditResult = await TargetAudit.audit(
+      command,
+      topCandidates,
+      this.expandedGoal,
+      this.currentFunnelPhase
+    );
+
+    if (auditResult.correctedRef && auditResult.correctedRef !== command.ref) {
+      logger.info('[L4_GUARD] Corrected ref via audit', {
+        testId: this.config.testId,
+        original: command.ref?.slice(0, 20),
+        corrected: auditResult.correctedRef?.slice(0, 20),
+        reason: auditResult.reason?.slice(0, 50),
+        confidence: auditResult.confidence,
+      });
+      return { ...command, ref: auditResult.correctedRef };
+    }
+
+    return command;
+  }
+
+  /**
+   * Check if element is relevant to expanded goal.
+   * Returns true if element matches any goal keyword.
+   * Returns false if element matches negative keywords.
+   *
+   * @param element Element to check
+   * @returns True if element is relevant to goal
+   */
+  private checkElementRelevance(element: LiteElement): boolean {
+    if (!this.expandedGoal) return true; // No expanded goal, trust AI
+
+    const text = element.name || '';
+
+    // Check against negative keywords first (quick reject)
+    // ✅ FIX: Use token/boundary matching instead of includes() to prevent false positives
+    for (const kw of this.expandedGoal.negativeKeywords) {
+      if (matchesKeyword(text, kw, true)) {
+        return false; // Matches dead-end keyword
+      }
+    }
+
+    // Check against allKeywords
+    // ✅ FIX: Use token/boundary matching instead of includes() to prevent false positives
+    for (const kw of this.expandedGoal.allKeywords) {
+      if (matchesKeyword(text, kw, true)) {
+        return true; // Matches goal keyword
+      }
+    }
+
+    // Gray zone - not in either list
+    // For critical actions (submit, confirm), be strict
+    const criticalActions = ['submit', 'confirm', 'pay', 'order', 'checkout'];
+    if (criticalActions.some(a => matchesKeyword(text, a, true))) {
+      return true; // Critical actions always pass (safety)
+    }
+
+    return false; // Default: not relevant, trigger audit
+  }
+
+  /**
+   * Check if URL change is significant (different path).
+   * Query parameter changes are not considered significant.
+   *
+   * @param before URL before action
+   * @param after URL after action
+   * @returns True if path changed
+   */
+  private isSignificantUrlChange(before: string, after: string): boolean {
+    try {
+      const beforeUrl = new URL(before);
+      const afterUrl = new URL(after);
+
+      // Different path = significant
+      if (beforeUrl.pathname !== afterUrl.pathname) {
+        return true;
+      }
+
+      // Same path with different query = not significant
+      return false;
+    } catch {
+      // If URL parsing fails, compare as strings
+      return before !== after;
+    }
+  }
+
+  /**
+   * Get top ranked candidate elements for L4 audit.
+   * Ranks elements by composite score: heuristic * funnel * zIndex * goalRelevance.
+   *
+   * @param snapshot Current page snapshot
+   * @param actionType Action type (click, fill, etc.)
+   * @param count Number of candidates to return
+   * @returns Array of ranked candidates
+   */
+  private getTopRankedCandidates(
+    snapshot: LiteSnapshot,
+    actionType: string,
+    count: number
+  ): RankedCandidate[] {
+    // Filter by action type
+    const eligible = snapshot.elements.filter(el => {
+      if (actionType === 'click') {
+        return ['button', 'a', 'input'].includes(el.tag) || el.role === 'button' || el.role === 'link';
+      }
+      if (actionType === 'fill') {
+        return el.tag === 'input' || el.tag === 'textarea' || el.role === 'textbox';
+      }
+      if (actionType === 'select') {
+        return el.tag === 'select' || el.role === 'combobox' || el.role === 'listbox';
+      }
+      return true;
+    });
+
+    // Calculate composite score for each element
+    const scored: RankedCandidate[] = eligible.map(el => {
+      const heuristicResult = this.semanticWeightCalculator.calculateHeuristic(el);
+      const heuristicWeight = heuristicResult.weight;
+
+      const elementCategory = FunnelAnalyzer.categorizeElement(el);
+      const funnelMultipliers = FunnelAnalyzer.getMultipliers(this.currentFunnelPhase);
+      const funnelMultiplier = funnelMultipliers[elementCategory] ?? 1.0;
+
+      const zIndexBoost = el.isTopMostAtCenter ? 1.2 : (el.computedZIndex ?? 0) > 0 ? 1.1 : 1.0;
+      const goalRelevance = this.checkElementRelevance(el) ? 1.5 : 1.0;
+
+      const score = heuristicWeight * funnelMultiplier * zIndexBoost * goalRelevance;
+
+      return {
+        ref: el.ref,
+        name: el.name || '',
+        tag: el.tag,
+        score,
+        breakdown: {
+          heuristic: heuristicWeight,
+          funnelMultiplier,
+          zIndexBoost,
+          goalRelevance,
+        },
+      };
+    });
+
+    // Sort by score descending, take top N
+    return scored
+      .sort((a, b) => b.score - a.score)
+      .slice(0, count);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L5 VISION ESCALATION (MANUS STYLE)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Check if we should escalate to Vision mode.
+   * Triggers:
+   * 1. Very few interactive elements (< 5) after stability wait
+   * 2. Consecutive "No Effect" actions (>= 3)
+   * 3. Canvas-heavy page (> 50% coverage)
+   *
+   * @param snapshot Current page snapshot
+   * @returns True if vision escalation should be triggered
+   */
+  private shouldEscalateToVision(snapshot: LiteSnapshot): boolean {
+    // Trigger 1: Very few interactive elements
+    if (snapshot.elements.length < 5) {
+      logger.info('[L5_VISION] Trigger: too few elements', {
+        testId: this.config.testId,
+        elementCount: snapshot.elements.length,
+      });
+      return true;
+    }
+
+    // Trigger 2: Consecutive No Effect
+    if (this.consecutiveNoEffectCount >= LITE_ENGINE_FLAGS.visionEscalationThreshold) {
+      logger.info('[L5_VISION] Trigger: consecutive no effect', {
+        testId: this.config.testId,
+        count: this.consecutiveNoEffectCount,
+        threshold: LITE_ENGINE_FLAGS.visionEscalationThreshold,
+      });
+      return true;
+    }
+
+    // Trigger 3: Canvas-heavy page
+    const canvasCoverage = this.detectCanvasCoverage(snapshot);
+    if (canvasCoverage > 0.5) {
+      logger.info('[L5_VISION] Trigger: canvas covers >50%', {
+        testId: this.config.testId,
+        coverage: canvasCoverage.toFixed(2),
+      });
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Detect canvas coverage on page.
+   * Returns fraction of viewport covered by canvas elements.
+   *
+   * @param snapshot Current page snapshot
+   * @returns Canvas coverage (0-1)
+   */
+  private detectCanvasCoverage(snapshot: LiteSnapshot): number {
+    // Look for canvas elements in snapshot (they might have bounds)
+    const canvasElements = snapshot.elements.filter(el => el.tag === 'canvas');
+    if (canvasElements.length === 0) return 0;
+
+    // Sum up canvas areas
+    let totalCanvasArea = 0;
+    for (const canvas of canvasElements) {
+      if (canvas.bounds) {
+        totalCanvasArea += canvas.bounds.width * canvas.bounds.height;
+      }
+    }
+
+    // Estimate viewport size (use first element's context or default)
+    const viewportWidth = 1280;
+    const viewportHeight = 720;
+    const viewportArea = viewportWidth * viewportHeight;
+
+    return totalCanvasArea / viewportArea;
+  }
+
+  /**
+   * Try vision fallback when DOM is weak.
+   * Takes screenshot, analyzes with GPT-4o Vision, returns hints.
+   *
+   * @returns Vision hints or null if failed
+   */
+  private async tryVisionFallback(): Promise<VisionHints | null> {
+    try {
+      logger.info('[L5_VISION] Starting vision fallback', {
+        testId: this.config.testId,
+      });
+
+      // 1. Take screenshot
+      const screenshot = await this.page.screenshot({ type: 'png' });
+      const base64 = screenshot.toString('base64');
+
+      // 2. Call vision analyzer (import dynamically to avoid circular deps)
+      const { analyzeScreenshotWithVision } = await import('@/services/ai/analysis/vision-analyzer.service');
+      const analysis = await analyzeScreenshotWithVision(base64, {
+        scope: this.config.goal,
+        url: this.page.url(),
+      });
+
+      // 3. Cross-check: Vision sees element but DOM doesn't - populate conflicts
+      const conflicts = await this.crossCheckVisionWithDOM(analysis);
+
+      // 4. Convert to hints (with conflicts from cross-check)
+      const hints: VisionHints = {
+        visibleButtons: analysis.elements
+          .filter(e => e.isCTA)
+          .map(e => ({ text: e.text, location: e.location })),
+        formFields: analysis.elements
+          .filter(e => e.type === 'input')
+          .map(e => ({ type: e.type, label: e.text })),
+        modals: (analysis.modals || []).map(m => ({
+          description: m.description,
+          hasCloseButton: m.hasCloseButton,
+        })),
+        layoutHint: analysis.layout,
+        conflicts: conflicts.length > 0 ? conflicts : undefined,
+      };
+
+      logger.info('[L5_VISION] Vision fallback completed', {
+        testId: this.config.testId,
+        buttonCount: hints.visibleButtons.length,
+        fieldCount: hints.formFields.length,
+        modalCount: hints.modals.length,
+      });
+
+      return hints;
+    } catch (error) {
+      logger.error('[L5_VISION] Vision fallback failed', {
+        testId: this.config.testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * WORKSTREAM 5: Cross-check Vision results with DOM, Shadow DOM, and Iframes.
+   * Returns conflicts (disabled/covered/hidden/not_found) for prompt guidance.
+   *
+   * @param visionAnalysis Vision analysis result
+   * @returns Array of conflicts for VisionHints
+   */
+  private async crossCheckVisionWithDOM(visionAnalysis: {
+    elements: Array<{ text: string; isCTA?: boolean }>;
+  }): Promise<Array<{
+    visionText: string;
+    domRef?: string;
+    domName?: string;
+    issue: 'disabled' | 'covered' | 'hidden' | 'not_found';
+    note: string;
+  }>> {
+    const conflicts: Array<{
+      visionText: string;
+      domRef?: string;
+      domName?: string;
+      issue: 'disabled' | 'covered' | 'hidden' | 'not_found';
+      note: string;
+    }> = [];
+
+    for (const element of visionAnalysis.elements.filter(e => e.isCTA)) {
+      const buttonText = element.text;
+      if (!buttonText || buttonText.length < 2) continue;
+
+      try {
+        // Check if element exists in main DOM
+        const mainDomLocator = this.page.getByText(buttonText, { exact: false });
+        const existsInMainDom = (await mainDomLocator.count()) > 0;
+
+        if (existsInMainDom) {
+          // Element found - check for disabled/covered/hidden states
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const elementState = await mainDomLocator.first().evaluate((el: any) => {
+            const htmlEl = el;
+            const rect = htmlEl.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+
+            // Check if disabled
+            const isDisabled =
+              htmlEl.disabled ||
+              htmlEl.getAttribute('aria-disabled') === 'true' ||
+              htmlEl.classList?.contains('disabled');
+
+            // Check if visible in viewport
+            // @ts-expect-error - window available in browser context
+            const computedStyle = window.getComputedStyle(htmlEl);
+            // @ts-expect-error - window available in browser context
+            const isOffscreen = rect.bottom < 0 || rect.top > window.innerHeight;
+            const isHidden =
+              rect.width === 0 ||
+              rect.height === 0 ||
+              isOffscreen ||
+              computedStyle.display === 'none' ||
+              computedStyle.visibility === 'hidden' ||
+              parseFloat(computedStyle.opacity || '1') < 0.1;
+
+            // Check if covered by another element
+            // @ts-expect-error - document available in browser context
+            const topElement = document.elementFromPoint(centerX, centerY);
+            const isCovered = topElement !== el && !el.contains(topElement);
+
+            // Get ref if available
+            const ref = htmlEl.getAttribute('data-agent-ref') || undefined;
+
+            return { isDisabled, isHidden, isCovered, ref, name: htmlEl.textContent?.slice(0, 30) };
+          });
+
+          if (elementState.isDisabled) {
+            conflicts.push({
+              visionText: buttonText,
+              domRef: elementState.ref,
+              domName: elementState.name,
+              issue: 'disabled',
+              note: 'Vision sees this button, but DOM reports it as disabled. Do NOT click; look for alternate path.',
+            });
+            logger.debug('[L5_VISION_CONFLICT] Disabled element', { text: buttonText });
+          } else if (elementState.isCovered) {
+            conflicts.push({
+              visionText: buttonText,
+              domRef: elementState.ref,
+              domName: elementState.name,
+              issue: 'covered',
+              note: 'Vision sees this button, but another element is covering it. Try closing overlay or scrolling.',
+            });
+            logger.debug('[L5_VISION_CONFLICT] Covered element', { text: buttonText });
+          } else if (elementState.isHidden) {
+            conflicts.push({
+              visionText: buttonText,
+              domRef: elementState.ref,
+              domName: elementState.name,
+              issue: 'hidden',
+              note: 'Vision sees this button, but DOM reports it as hidden. Try scrolling or waiting for animation.',
+            });
+            logger.debug('[L5_VISION_CONFLICT] Hidden element', { text: buttonText });
+          }
+          // No conflict - element is good
+          continue;
+        }
+
+        logger.debug('[L5_VISION] Element visible in Vision but not in main DOM', {
+          testId: this.config.testId,
+          text: buttonText,
+        });
+
+        // Try Shadow DOM
+        const shadowFound = await this.tryFindInShadowDOM(buttonText);
+        if (shadowFound) {
+          logger.info('[L5_VISION] Found in Shadow DOM', { text: buttonText });
+          continue;
+        }
+
+        // Try Iframes
+        const iframeFound = await this.tryFindInIframes(buttonText);
+        if (iframeFound) {
+          logger.info('[L5_VISION] Found in Iframe', { text: buttonText });
+          continue;
+        }
+
+        // Not found anywhere
+        conflicts.push({
+          visionText: buttonText,
+          issue: 'not_found',
+          note: 'Vision sees this button, but not found in DOM, Shadow DOM, or Iframes. Element may require coordinate-based interaction.',
+        });
+        logger.warn('[L5_VISION_CONFLICT] Element not found', {
+          text: buttonText,
+          suggestion: 'May need coordinate-based click',
+        });
+      } catch {
+        // Skip on error (element might have special characters)
+        continue;
+      }
+    }
+
+    return conflicts;
+  }
+
+  /**
+   * Search for element text in Shadow DOM.
+   *
+   * @param text Text to search for
+   * @returns True if found
+   */
+  private async tryFindInShadowDOM(text: string): Promise<boolean> {
+    try {
+      const found = await this.page.evaluate((searchText: string) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        function findInNode(node: any): boolean {
+          if (node.nodeType === 1 && node.textContent?.includes(searchText)) {
+            return true;
+          }
+          if (node.shadowRoot) {
+            return findInNode(node.shadowRoot);
+          }
+          for (const child of node.children || []) {
+            if (findInNode(child)) return true;
+          }
+          return false;
+        }
+        // @ts-ignore - DOM types available in browser context
+        return findInNode(document.body);
+      }, text);
+
+      return found;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Search for element text in all iframes.
+   * If found, stores the frame in this.activeFrame for execution.
+   *
+   * @param text Text to search for
+   * @returns True if found
+   */
+  private async tryFindInIframes(text: string): Promise<boolean> {
+    const frames = this.page.frames();
+
+    for (const frame of frames) {
+      if (frame === this.page.mainFrame()) continue;
+
+      try {
+        const locator = frame.getByText(text, { exact: false });
+        const count = await locator.count();
+
+        if (count > 0) {
+          // ✅ L5: Store frame for execution
+          this.activeFrame = frame;
+          logger.debug('[L5_IFRAME] Found element in iframe, will execute in frame context', {
+            testId: this.config.testId,
+            text: text.slice(0, 30),
+            frameUrl: frame.url(),
+          });
+          return true;
+        }
+      } catch {
+        // Frame may be detached, skip
+        continue;
+      }
+    }
+
+    return false;
+  }
+
   /**
    * Main execution with DUAL TIMEOUT:
    * 1. Time limit: 5 minutes via Promise.race (or config.timeout)
@@ -283,18 +846,26 @@ export class LiteEngine {
         });
         this.emitCompletion(false, `Time limit exceeded (${Math.round(timeoutMs / 60000)} min)`);
 
-        // ✅ FIX: Flush pending uploads before returning (so graphData has URLs)
+        // Flush pending uploads before returning (so graphData has URLs)
         await this.flushPendingGraphScreenshotUploads();
 
         return await this.buildResult(false, `Time limit exceeded (${Math.round(timeoutMs / 60000)} minutes)`);
       }
 
-      logger.error('[LITE_ENGINE] Unexpected error', {
+      // ═══════════════════════════════════════════════════════════════════════
+      // HARDENING: Convert unexpected errors into a safe terminal path.
+      // This guarantees buildResult() runs (end node, final progress, watcher dispose).
+      // ═══════════════════════════════════════════════════════════════════════
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.error('[LITE_ENGINE] Unexpected error (terminating safely)', {
         testId: this.config.testId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage,
       });
 
-      throw error;
+      this.emitCompletion(false, 'Engine error');
+      await this.flushPendingGraphScreenshotUploads();
+
+      return await this.buildResult(false, `Engine error: ${errorMessage}`);
     }
   }
 
@@ -368,6 +939,38 @@ export class LiteEngine {
     // ✅ NEW (Lite Autonomy v3): Initialize Task Plan
     await this.initializeTaskPlan();
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // L2 MANUS: Initialize GoalExpander (one-time call before loop)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (LITE_ENGINE_FLAGS.enableGoalExpander) {
+      try {
+        this.expandedGoal = await GoalExpander.expand(this.config.goal);
+        // Update semantic weight calculator with expanded goal
+        this.semanticWeightCalculator = new HybridSemanticWeightCalculator(
+          this.expandedGoal,
+          this.config.testId
+        );
+        logger.info('[L2_INIT] GoalExpander initialized', {
+          testId: this.config.testId,
+          keywordCount: this.expandedGoal.allKeywords.size,
+          negativeCount: this.expandedGoal.negativeKeywords.size,
+          language: this.expandedGoal.language,
+        });
+      } catch (error) {
+        logger.warn('[L2_INIT] GoalExpander failed, using fallback', {
+          testId: this.config.testId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PHASE A: Initialize PageWatcher for multi-tab/popup detection
+    // ═══════════════════════════════════════════════════════════════════════════
+    const browserContext = this.page.context();
+    this.pageWatcher = new PageWatcher(browserContext);
+    logger.debug('[LITE_ENGINE] PageWatcher initialized for multi-tab detection');
+
     // ✅ NEW: Emit start node to graph (like Pro)
     const startUpdate = this.graphBuilder.addStartNode();
     this.emitGraphUpdate(startUpdate);
@@ -395,6 +998,9 @@ export class LiteEngine {
     try {
       for (let i = 0; i < this.MAX_ITERATIONS; i++) {
         logger.debug('[LITE_ENGINE] Starting iteration', { iteration: i });
+
+        // ✅ L5: Clear active frame at start of each iteration
+        this.activeFrame = null;
 
         // ✅ NEW: Trace iteration start
         const iterationSpanId = this.traceWriter.generateSpanId();
@@ -479,7 +1085,6 @@ export class LiteEngine {
             hasActiveModal: !!snapshotBefore.activeModalRef,
             isTransient: snapshotBefore.transientState?.isTransient || false,
             formattedSnapshot, // Full formatted snapshot for AI context
-            liteSnapshot: snapshotBefore, // Raw LiteSnapshot object
           },
         });
 
@@ -730,9 +1335,45 @@ export class LiteEngine {
           }
         }
 
-        // ✅ NEW: AI fallback for stuck recovery (when stuck for 2+ iterations)
+        // ═══════════════════════════════════════════════════════════════════════
+        // WORKSTREAM 4: State Recovery Ladder (before AI fallback)
+        // ═══════════════════════════════════════════════════════════════════════
         if (stuckCheck.stuck && this.state.getConsecutiveStuckCount() >= this.STUCK_THRESHOLD) {
-          logger.info('[LITE_ENGINE] Stuck for 2+ iterations, trying AI fallback', {
+          // Try recovery ladder
+          const allIterations = this.state.getAllIterations();
+          const lastCommand = allIterations.length > 0
+            ? allIterations[allIterations.length - 1].decision.command
+            : undefined;
+          const recoveryResult = await this.attemptStateRecovery({
+            reason: stuckCheck.reason || 'stuck',
+            lastCommand,
+            snapshotBefore,
+            iteration: i,
+          });
+
+          if (recoveryResult.shouldEscalate) {
+            // Tier4: need_help - recovery exhausted
+            logger.warn('[RECOVERY] Escalating to Tier4 (need_help)', {
+              testId: this.config.testId,
+              reason: 'Recovery exhausted for this URL+goal',
+            });
+            // Return need_help to end the test with user intervention request
+            this.emitCompletion(false, 'Recovery exhausted - need help');
+            await this.flushPendingGraphScreenshotUploads();
+            return await this.buildResult(false, 'Recovery exhausted - need help');
+          }
+
+          if (recoveryResult.recovered && recoveryResult.newSnapshot) {
+            snapshotBefore = recoveryResult.newSnapshot;
+            // Reset stuck counter since recovery succeeded
+            this.state.resetConsecutiveStuckCount();
+            logger.info('[RECOVERY] Recovery successful, continuing', {
+              testId: this.config.testId,
+              method: recoveryResult.method,
+            });
+          } else {
+            // Recovery didn't help, try AI fallback
+            logger.info('[LITE_ENGINE] Recovery failed, trying AI fallback', {
             testId: this.config.testId,
             consecutiveStuckCount: this.state.getConsecutiveStuckCount(),
             iteration: i,
@@ -762,8 +1403,7 @@ export class LiteEngine {
                 progressScore: Math.round(stuckEval.progressScore * 100) + '%',
               });
             } else {
-              // ✅ NEW: AI fallback didn't help - try direct URL fallback
-              // Only for register/login goals
+                // AI fallback didn't help - try direct URL fallback
               const urlFallbackResult = await this.tryDirectUrlFallback(snapshotBefore.url);
               if (urlFallbackResult.navigated) {
                 logger.info('[LITE_ENGINE] Direct URL fallback successful', {
@@ -791,6 +1431,7 @@ export class LiteEngine {
               testId: this.config.testId,
               error: stuckError instanceof Error ? stuckError.message : String(stuckError),
             });
+            }
           }
         }
 
@@ -818,6 +1459,42 @@ export class LiteEngine {
           ? StateDiffComputer.formatForAI(lastStateDiff.diff, lastStateDiff.action)
           : undefined;
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // L2 MANUS: Detect Funnel Phase
+        // ═══════════════════════════════════════════════════════════════════════
+        if (LITE_ENGINE_FLAGS.enableFunnelAnalyzer) {
+          this.previousFunnelPhase = this.currentFunnelPhase;
+          this.currentFunnelPhase = FunnelAnalyzer.analyze(snapshotBefore.url, snapshotBefore.elements);
+          this.semanticWeightCalculator.updateFunnelPhase(this.currentFunnelPhase);
+
+          if (FunnelAnalyzer.hasPhaseChanged(this.previousFunnelPhase, this.currentFunnelPhase)) {
+            logger.info('[L2_FUNNEL] Phase changed', {
+              testId: this.config.testId,
+              from: this.previousFunnelPhase,
+              to: this.currentFunnelPhase,
+              iteration: i,
+            });
+
+            // WORKSTREAM 4: Reset recovery attempts on phase change (SPA-safe)
+            this.state.resetAllRecoveryAttempts();
+          }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // L5 MANUS: Check Vision Escalation
+        // ═══════════════════════════════════════════════════════════════════════
+        let visionHints: VisionHints | null = null;
+        if (LITE_ENGINE_FLAGS.enableVisionEscalation && this.shouldEscalateToVision(snapshotBefore)) {
+          visionHints = await this.tryVisionFallback();
+          if (visionHints) {
+            logger.info('[L5_VISION] Vision hints acquired', {
+              testId: this.config.testId,
+              buttonCount: visionHints.visibleButtons.length,
+              fieldCount: visionHints.formFields.length,
+            });
+          }
+        }
+
         // 4. Build prompt with stuck warning + progress signals + AI guidance + contextual hints + task plan + state drift
         const prompt = LitePromptBuilder.build({
           goal: this.config.goal,
@@ -839,6 +1516,8 @@ export class LiteEngine {
           hasCredentials: !!this.config.credentials, // ✅ NEW: Tell LLM not to invent credentials
           stateDriftAnalysis, // ✅ NEW: State drift from last action
           lastAction: lastStateDiff?.action, // ✅ NEW: Last action for context
+          goalOrientedSummary: this.lastGoalOrientedSummary || undefined, // ✅ NEW: Goal-Oriented Summary (Secret Sauce)
+          visionHints: visionHints || undefined, // ✅ NEW: L5 Vision hints when DOM is weak
         });
 
         // ✅ NEW: Trace AI prompt
@@ -1102,7 +1781,31 @@ export class LiteEngine {
 
         // ✅ CREDENTIAL OVERRIDE: Replace AI-generated fill values for credential fields
         // SECURITY: Credentials never sent to LLM - backend injects correct values here
-        const commandWithCredentials = this.overrideCredentialFillValue(decision.command, snapshotBefore);
+        let commandWithCredentials = this.overrideCredentialFillValue(decision.command, snapshotBefore);
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // L4 MANUS: Apply Target Audit Guard
+        // ═══════════════════════════════════════════════════════════════════════
+        if (LITE_ENGINE_FLAGS.enableTargetAuditGuard) {
+          const guardedCommand = await this.applyTargetAuditGuard(commandWithCredentials, snapshotBefore);
+          if (guardedCommand.ref !== commandWithCredentials.ref) {
+            logger.info('[L4_GUARD] Command ref corrected by audit', {
+              testId: this.config.testId,
+              original: commandWithCredentials.ref?.slice(0, 20),
+              corrected: guardedCommand.ref?.slice(0, 20),
+              iteration: i,
+            });
+            // Re-apply credential override for new ref
+            commandWithCredentials = this.overrideCredentialFillValue(guardedCommand, snapshotBefore);
+          }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // PHASE A: Prepare for popup detection before click
+        // ═══════════════════════════════════════════════════════════════════════
+        if (commandWithCredentials.action === 'click' && this.pageWatcher) {
+          this.pageWatcher.prepareForPopup();
+        }
 
         // ✅ NEW: Trace action execute start
         const actionSpanId = this.traceWriter.generateSpanId();
@@ -1124,6 +1827,7 @@ export class LiteEngine {
           {
             entryPointKeywords: parsedGoal.entryPointKeywords,
             modalKeywords, // ✅ NEW: Pass modal keywords for hybrid auto-dismiss
+            activeFrame: this.activeFrame || undefined, // ✅ L5: Pass active frame if found in iframe
             // ✅ NEW: Pass trace hook for detailed action logging
             traceHook: (event) => {
               this.traceWriter.write({
@@ -1170,6 +1874,43 @@ export class LiteEngine {
           await this.handleValidationError(execResult.modalDismissInfo, snapshotBefore.url);
         }
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // PHASE A: Detect and switch to new tab/popup after action
+        // ═══════════════════════════════════════════════════════════════════════
+        if (commandWithCredentials.action === 'click' && this.pageWatcher) {
+          const newPageInfo = await this.pageWatcher.detectNewPage(1500);
+          if (newPageInfo) {
+            logger.info('[LITE_ENGINE] New page detected after click, switching context', {
+              testId: this.config.testId,
+              iteration: i,
+              newUrl: newPageInfo.url,
+              isPopup: newPageInfo.isPopup,
+            });
+
+            // Switch active page
+            this.page = newPageInfo.page;
+            this.activeFrame = null; // Reset active frame on page switch
+
+            // Re-initialize per-page services with new page
+            this.executor = new ActionExecutor(this.page);
+            this.networkTracker = new NetworkTracker(this.page);
+            this.consoleCollector = new ConsoleCollector(this.page);
+
+            // Trace page switch
+            this.traceWriter.write({
+              iteration: i,
+              stage: 'page_switch',
+              eventType: 'new_page_detected',
+              spanId: this.traceWriter.generateSpanId(),
+              parentSpanId: actionSpanId,
+              payload: {
+                newUrl: newPageInfo.url,
+                isPopup: newPageInfo.isPopup,
+              },
+            });
+          }
+        }
+
         // 7. Wait for stability (with cancellation support)
         // ✅ FIX: Wrap stability waits with cancellation for immediate abort
         await withCancellation(
@@ -1209,6 +1950,10 @@ export class LiteEngine {
           const statusPart = e.status ? ` ${e.status}` : '';
           return `${e.error}${statusPart} ${e.url}`;
         });
+
+        // ✅ NEW (Manus Style): Collect successful API responses and validation errors
+        const successfulResponses = this.networkTracker.getSuccessfulResponsesSince(execResult.startTime);
+        const validationErrors = this.networkTracker.getValidationErrorsSince(execResult.startTime);
 
         // 9a. Collect UI errors (Pro-grade)
         const uiErrors = await ErrorCollector.collectUIErrors(this.page, i);
@@ -1272,15 +2017,87 @@ export class LiteEngine {
           });
         }
 
-        // 10. Compute diff
-        const diff = StateDiffComputer.compute(
+        // 10. Compute diff (Manus Style: with semantic weights, progress sentiment, network-awareness)
+        const baseDiff = StateDiffComputer.compute(
           snapshotBefore,
           snapshotAfter,
           pageErrorsBefore,
           pageErrorsAfter,
           consoleErrors,
-          networkErrorStrings
+          networkErrorStrings,
+          successfulResponses, // ✅ NEW: Successful API responses
+          validationErrors, // ✅ NEW: Validation errors (400-499 with parsed body)
+          this.config.goal // ✅ NEW: Goal for dynamic semantic weight priority
         );
+
+        // 10.1 ✅ NEW: Enrich with AI (async) for gray zone elements (Hybrid Semantic Weight)
+        // This improves semantic weight accuracy for ambiguous elements (buttons, links, headers)
+        const removedElements = snapshotBefore.elements.filter(el => baseDiff.removedRefs.includes(el.ref));
+        const enrichedDiff = await this.semanticWeightCalculator.enrichWithAI(baseDiff, removedElements);
+
+        // 10.2 ✅ NEW: Build Goal-Oriented Summary (Secret Sauce for Core Brain)
+        const goalOrientedSummary = this.semanticWeightCalculator.buildGoalOrientedSummary(enrichedDiff);
+
+        // ✅ Store for next iteration prompt (Secret Sauce for Core Brain)
+        this.lastGoalOrientedSummary = goalOrientedSummary;
+
+        // Use enriched diff for rest of processing
+        const diff = enrichedDiff;
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // L5 MANUS: Track consecutive "No Effect" for vision escalation
+        // ═══════════════════════════════════════════════════════════════════════
+        if (enrichedDiff.progressSentiment === 'No Effect') {
+          this.consecutiveNoEffectCount++;
+          logger.debug('[L5_VISION] No Effect detected', {
+            testId: this.config.testId,
+            consecutiveCount: this.consecutiveNoEffectCount,
+            iteration: i,
+          });
+        } else {
+          this.consecutiveNoEffectCount = 0; // Reset on any progress
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // L2 MANUS: Goal Refinement on significant change
+        // ═══════════════════════════════════════════════════════════════════════
+        if (LITE_ENGINE_FLAGS.enableGoalRefinement && this.expandedGoal) {
+          const shouldRefine =
+            (enrichedDiff.urlChanged && this.isSignificantUrlChange(enrichedDiff.urlBefore || '', enrichedDiff.urlAfter || '')) ||
+            enrichedDiff.progressSentiment === 'Major Progress' ||
+            FunnelAnalyzer.hasPhaseChanged(this.previousFunnelPhase, this.currentFunnelPhase);
+
+          const now = Date.now();
+          const cooldownElapsed = now - this.lastGoalRefinementTime > LITE_ENGINE_FLAGS.goalRefinementCooldownMs;
+
+          if (shouldRefine && cooldownElapsed) {
+            try {
+              const refinedGoal = await GoalExpander.refine(
+                this.config.goal,
+                this.expandedGoal,
+                snapshotAfter.url,
+                snapshotAfter.elements,
+                this.currentFunnelPhase,
+                i
+              );
+              this.expandedGoal = refinedGoal;
+              this.semanticWeightCalculator.updateGoal(refinedGoal);
+              this.lastGoalRefinementTime = now;
+
+              logger.info('[L2_REFINE] Goal refined for new phase', {
+                testId: this.config.testId,
+                phase: this.currentFunnelPhase,
+                newKeywordCount: refinedGoal.allKeywords.size,
+                iteration: i,
+              });
+            } catch (refineError) {
+              logger.warn('[L2_REFINE] Goal refinement failed', {
+                testId: this.config.testId,
+                error: refineError instanceof Error ? refineError.message : String(refineError),
+              });
+            }
+          }
+        }
 
         // ✅ NEW: Trace state diff
         this.traceWriter.write({
@@ -1313,6 +2130,31 @@ export class LiteEngine {
           snapshotBefore.elements.length,
           snapshotAfter.elements.length
         );
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // WORKSTREAM 4: Set recovery point on progress
+        // ═══════════════════════════════════════════════════════════════════════
+        const hasProgress =
+          enrichedDiff.progressSentiment === 'Major Progress' ||
+          enrichedDiff.urlChanged ||
+          outcome === 'state_changed';
+
+        if (hasProgress) {
+          this.setRecoveryPointForCurrentState(snapshotAfter, i);
+        }
+
+        // WORKSTREAM 4: Reset recovery attempts on meaningful URL/hash change or strong progress
+        if (enrichedDiff.urlChanged) {
+          const beforeKey = this.normalizeUrl(enrichedDiff.urlBefore || '');
+          const afterKey = this.normalizeUrl(enrichedDiff.urlAfter || '');
+          if (beforeKey && afterKey && beforeKey !== afterKey) {
+            this.state.resetRecoveryAttempts(this.config.goal, enrichedDiff.urlAfter || snapshotAfter.url);
+          }
+        }
+
+        if (enrichedDiff.progressSentiment === 'Major Progress') {
+          this.state.resetRecoveryAttempts(this.config.goal, snapshotAfter.url);
+        }
 
         // ✅ NEW: Trace validation
         this.traceWriter.write({
@@ -1420,6 +2262,25 @@ export class LiteEngine {
             pageErrors: pageErrorsAfter,
           },
         });
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
+        // WORKSTREAM C: Record focused semantic metrics (goal-relevant + high-weight count)
+        // ═══════════════════════════════════════════════════════════════════════
+        let highWeightCount = 0;
+        const goalRelevantElements = snapshotAfter.elements
+          .filter(el => {
+            // Get weight from HybridSemanticWeightCalculator (uses L2 ExpandedGoal)
+            const heuristic = this.semanticWeightCalculator.calculateHeuristic(el);
+            // Count high-weight elements (>=0.8) for "no growth" stuck detection
+            if (heuristic.weight >= 0.8) {
+              highWeightCount++;
+            }
+            return heuristic.weight >= 0.5; // Only include elements with >= 50% weight (significant)
+          })
+          .map(el => el.name || el.ref);
+
+        this.state.recordFocusedMetrics(snapshotAfter.url, goalRelevantElements, highWeightCount);
 
         // 14. Emit progress via WebSocket (with diff for frontend highlighting)
         this.emitIterationProgress(i, decision, outcome, diff);
@@ -1591,16 +2452,22 @@ export class LiteEngine {
    * @param currentUrl - Current page URL
    * @returns Object with navigation status and final URL
    */
-  private async tryDirectUrlFallback(currentUrl: string): Promise<{
+  private async tryDirectUrlFallback(
+    currentUrl: string,
+    options?: { forceLogin?: boolean }
+  ): Promise<{
     navigated: boolean;
     finalUrl: string;
     attemptedPath?: string;
   }> {
     const goalLower = this.config.goal.toLowerCase();
+    const forceLogin = options?.forceLogin === true;
 
     // Only for register/login goals
-    const isRegistrationGoal = /register|sign\s*up|create\s+account|registration|зарегистр|регистрац/i.test(goalLower);
-    const isLoginGoal = /login|sign\s*in|log\s*in|вход|войти/i.test(goalLower);
+    const isRegistrationGoal = !forceLogin &&
+      /register|sign\s*up|create\s+account|registration|зарегистр|регистрац/i.test(goalLower);
+    const isLoginGoal = forceLogin ||
+      /login|sign\s*in|log\s*in|вход|войти/i.test(goalLower);
 
     if (!isRegistrationGoal && !isLoginGoal) {
       return { navigated: false, finalUrl: currentUrl };
@@ -1773,6 +2640,23 @@ export class LiteEngine {
     // ✅ FIX: Clean up cancellation state
     cleanupCancellationState(this.config.testId);
 
+    // ✅ HARDENING: Dispose PageWatcher to prevent listener leaks
+    this.pageWatcher?.dispose();
+
+    // ✅ NEW: Clear semantic weight cache and log stats
+    const semanticStats = this.semanticWeightCalculator.getStats();
+    this.semanticWeightCalculator.clearCache();
+    logger.info('[LITE_ENGINE] Semantic weight stats', {
+      testId: this.config.testId,
+      cacheHits: semanticStats.cacheStats.hits,
+      cacheMisses: semanticStats.cacheStats.misses,
+      cacheSize: semanticStats.cacheStats.size,
+      aiCalls: semanticStats.aiCalls,
+      aiTimeouts: semanticStats.aiTimeouts,
+      errorElementsDetected: semanticStats.errorElementsDetected,
+      avgLatencyMs: semanticStats.aiCalls > 0 ? Math.round(semanticStats.totalLatencyMs / semanticStats.aiCalls) : 0,
+    });
+
     // ✅ NEW: Add end node to graph and get full graph
     // ✅ FIX: Finalization flag should already be set by emitCompletion, but ensure it here
     this.isFinalizing = true;
@@ -1900,7 +2784,7 @@ export class LiteEngine {
               runId,
             });
 
-            const { uploadLiteTraceLogToStorage, insertTraceFileRecord } = await import(
+            const { uploadLiteTraceLogToStorage, insertTraceFileRecord, deleteLiteTraceLogFromStorage } = await import(
               '@/services/storage/test-artifacts-storage.service'
             );
 
@@ -1911,6 +2795,8 @@ export class LiteEngine {
               fileName
             );
 
+            let traceFileId: string | undefined;
+            try {
             const { id } = await insertTraceFileRecord({
               userId,
               testId,
@@ -1920,10 +2806,16 @@ export class LiteEngine {
               browser: 'lite-trace-log',
               status: 'uploaded',
             });
+              traceFileId = id;
+            } catch (insertError) {
+              // Prevent orphan files in Storage if DB insert fails (best-effort cleanup)
+              await deleteLiteTraceLogFromStorage(storagePath);
+              throw insertError;
+            }
 
             logger.info('[LITE_ENGINE] Trace log uploaded successfully', {
               testId,
-              traceFileId: id,
+              traceFileId,
               storagePath,
               runId,
             });
@@ -1952,12 +2844,50 @@ export class LiteEngine {
           });
         }
       } else {
-        logger.warn('[LITE_ENGINE] Invalid userId or testId (not UUID), skipping trace log upload', {
+        // Non-UUID / anonymous runs: upload to Storage without trace_files record
+        const fs = await import('fs/promises');
+        const path = await import('path');
+
+        try {
+          await fs.access(traceFilePath);
+          const stats = await fs.stat(traceFilePath);
+
+          if (stats.size > 0) {
+            const { uploadLiteTraceLogToStorageAnonymous } = await import(
+              '@/services/storage/test-artifacts-storage.service'
+            );
+
+            const fileName = path.basename(traceFilePath);
+            const { storagePath } = await uploadLiteTraceLogToStorageAnonymous(traceFilePath, fileName);
+
+            logger.info('[LITE_ENGINE] Trace log uploaded for non-UUID run (no DB record)', {
           testId,
           userId: userId?.substring(0, 20) || 'undefined',
-          isValidUserId,
-          isValidTestId,
-        });
+              storagePath,
+              runId,
+            });
+
+            // Clean up local file only if upload succeeded
+            try {
+              await fs.unlink(traceFilePath);
+              logger.debug('[LITE_ENGINE] Local trace log deleted (non-UUID run)', { traceFilePath });
+            } catch (cleanupError) {
+              logger.warn('[LITE_ENGINE] Failed to delete local trace log (non-UUID run)', {
+                traceFilePath,
+                error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+              });
+            }
+          } else {
+            logger.warn('[LITE_ENGINE] Trace log file is empty, skipping upload (non-UUID run)', {
+              traceFilePath,
+            });
+          }
+        } catch (fileError) {
+          logger.warn('[LITE_ENGINE] Trace log file not found or inaccessible (non-UUID run)', {
+            traceFilePath,
+            error: fileError instanceof Error ? fileError.message : String(fileError),
+          });
+        }
       }
     } catch (traceUploadError) {
       // Don't fail the test if trace upload fails
@@ -1989,6 +2919,269 @@ export class LiteEngine {
       errors: this.collectedErrors, // ✅ Pro-grade error collection
       graphData, // ✅ Full graph like Pro
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // WORKSTREAM 4: STATE RECOVERY LADDER
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Attempt state recovery using the priority ladder:
+   * 1. Reload + retry last safe command
+   * 2. GoBack / goto recoveryPoint URL (if we "flew away")
+   * 3. Re-auth (if login pattern detected or anchor stale/zombie)
+   * 4. Tier4 escalation (return need_help)
+   *
+   * @returns Object with recovery result and whether to continue or escalate
+   */
+  private async attemptStateRecovery(params: {
+    reason: string;
+    lastCommand?: AICommand;
+    snapshotBefore: LiteSnapshot;
+    iteration: number;
+  }): Promise<{
+    recovered: boolean;
+    method: 'reload' | 'goBack' | 'goto' | 're-auth' | 'exhausted' | 'none';
+    newSnapshot?: LiteSnapshot;
+    shouldEscalate: boolean;
+  }> {
+    const { reason, lastCommand, snapshotBefore, iteration } = params;
+    const goal = this.config.goal;
+    const currentUrl = this.page.url();
+    const recoveryKey = this.state.buildRecoveryKey(goal, currentUrl);
+
+    // Check if recovery attempts are exhausted
+    if (this.state.isRecoveryExhausted(goal, currentUrl)) {
+      logger.warn('[RECOVERY] Attempts exhausted, escalating to Tier4', {
+        testId: this.config.testId,
+        reason,
+      });
+      return { recovered: false, method: 'exhausted', shouldEscalate: true };
+    }
+
+    // Get current funnel phase as type
+    const currentPhaseType = this.currentFunnelPhase as unknown as FunnelPhaseType;
+
+    // Check if we should use anchor-based recovery
+    const recoveryPoint = this.state.getRecoveryPoint(currentPhaseType);
+
+    // Check for zombie anchor (recovery led back to stuck quickly)
+    if (this.state.shouldInvalidateRecoveryPoint(recoveryKey, iteration)) {
+      if (recoveryPoint) {
+        this.state.invalidateRecoveryPoint(currentPhaseType);
+        logger.warn('[RECOVERY] Invalidated zombie anchor', {
+          testId: this.config.testId,
+          phase: currentPhaseType,
+        });
+      }
+
+      // Hard reload path for zombie anchors
+      const hardReloadSnapshot = await this.hardReload();
+      return {
+        recovered: true,
+        method: 'reload',
+        newSnapshot: hardReloadSnapshot,
+        shouldEscalate: false,
+      };
+    }
+
+    // Record recovery attempt for zombie detection
+    this.state.recordRecoveryAttempt(recoveryKey, iteration);
+
+    // Increment attempt counter
+    const attemptCount = this.state.incRecoveryAttempt(goal, currentUrl);
+    logger.info('[RECOVERY] Starting recovery attempt', {
+      testId: this.config.testId,
+      attempt: attemptCount,
+      reason,
+      url: currentUrl.slice(0, 50),
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Priority 1: Reload + retry last safe command
+    // ═══════════════════════════════════════════════════════════════════════
+    try {
+      logger.info('[RECOVERY] Priority 1: Reload + retry', { testId: this.config.testId });
+
+      await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+      await this.networkTracker.waitForNetworkIdle(5000);
+      await VisualStability.waitForStable(this.page);
+
+      const newSnapshot = await SnapshotCollector.collect(this.page);
+
+      // Check if last command is safe to retry
+      const safeActions = ['click', 'fill', 'select', 'scroll', 'wait', 'hover'];
+      const canRetry = lastCommand && safeActions.includes(lastCommand.action);
+
+      if (canRetry && lastCommand) {
+        logger.debug('[RECOVERY] Retrying last command after reload', {
+          action: lastCommand.action,
+          ref: lastCommand.ref,
+        });
+
+        // Re-apply credential override if fill
+        const commandWithCreds = this.overrideCredentialFillValue(lastCommand, newSnapshot);
+
+        try {
+          await this.executor.execute(commandWithCreds, newSnapshot);
+          logger.info('[RECOVERY] Reload + retry successful', { testId: this.config.testId });
+          return { recovered: true, method: 'reload', newSnapshot, shouldEscalate: false };
+        } catch (retryError) {
+          logger.debug('[RECOVERY] Retry failed after reload', {
+            error: retryError instanceof Error ? retryError.message : String(retryError),
+          });
+        }
+      }
+
+      // Only treat as recovered if state changed meaningfully
+      const meaningfulChange = this.isMeaningfulSnapshotChange(snapshotBefore, newSnapshot);
+      if (meaningfulChange) {
+        return { recovered: true, method: 'reload', newSnapshot, shouldEscalate: false };
+      }
+    } catch (reloadError) {
+      logger.warn('[RECOVERY] Reload failed, trying Priority 2', {
+        error: reloadError instanceof Error ? reloadError.message : String(reloadError),
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Priority 2: GoBack / goto recoveryPoint URL (if we "flew away")
+    // ═══════════════════════════════════════════════════════════════════════
+    const currentUrlNormalized = this.normalizeUrl(currentUrl);
+    const originalUrlNormalized = this.normalizeUrl(this.config.url);
+    const recoveryUrlNormalized = recoveryPoint ? this.normalizeUrl(recoveryPoint.url) : null;
+
+    // Check if we "flew away" from expected path
+    const flewAway = currentUrlNormalized !== originalUrlNormalized &&
+                     recoveryUrlNormalized &&
+                     currentUrlNormalized !== recoveryUrlNormalized;
+
+    if (flewAway && recoveryPoint) {
+      try {
+        logger.info('[RECOVERY] Priority 2: GoBack/goto recovery URL', {
+          testId: this.config.testId,
+          currentUrl: currentUrl.slice(0, 50),
+          recoveryUrl: recoveryPoint.url.slice(0, 50),
+        });
+
+        // Try goBack first
+        try {
+          await this.page.goBack({ timeout: 10000 });
+          await this.networkTracker.waitForNetworkIdle(5000);
+          await VisualStability.waitForStable(this.page);
+
+          const newSnapshot = await SnapshotCollector.collect(this.page);
+          logger.info('[RECOVERY] GoBack successful', { testId: this.config.testId });
+          return { recovered: true, method: 'goBack', newSnapshot, shouldEscalate: false };
+        } catch {
+          // GoBack failed, try direct goto
+          await this.page.goto(recoveryPoint.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await this.networkTracker.waitForNetworkIdle(5000);
+          await VisualStability.waitForStable(this.page);
+
+          const newSnapshot = await SnapshotCollector.collect(this.page);
+          logger.info('[RECOVERY] Goto recovery URL successful', { testId: this.config.testId });
+          return { recovered: true, method: 'goto', newSnapshot, shouldEscalate: false };
+        }
+      } catch (navError) {
+        logger.warn('[RECOVERY] Navigation recovery failed', {
+          error: navError instanceof Error ? navError.message : String(navError),
+        });
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Priority 3: Re-auth (if login pattern detected or anchor stale/zombie)
+    // ═══════════════════════════════════════════════════════════════════════
+    const isAuthUrl = /\/login|\/signin|\/auth\/login|вход|войти/i.test(currentUrl);
+    const anchorStaleOrZombie = !recoveryPoint; // null means stale or zombie
+
+    if (isAuthUrl || anchorStaleOrZombie) {
+      logger.info('[RECOVERY] Priority 3: Re-auth', {
+        testId: this.config.testId,
+        isAuthUrl,
+        anchorStaleOrZombie,
+      });
+
+      // Deterministic re-auth: navigate to login URL if possible
+      if (this.config.credentials) {
+        const fallbackResult = await this.tryDirectUrlFallback(currentUrl, { forceLogin: true });
+        if (fallbackResult.navigated) {
+          const newSnapshot = await SnapshotCollector.collect(this.page);
+          return { recovered: true, method: 're-auth', newSnapshot, shouldEscalate: false };
+        }
+
+        // If already on auth URL, just proceed with current page
+        if (isAuthUrl) {
+          const newSnapshot = await SnapshotCollector.collect(this.page);
+          return { recovered: true, method: 're-auth', newSnapshot, shouldEscalate: false };
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Nothing worked - return for main loop to continue
+    // ═══════════════════════════════════════════════════════════════════════
+    logger.warn('[RECOVERY] All recovery methods failed for this attempt', {
+      testId: this.config.testId,
+      attemptCount,
+    });
+
+    return { recovered: false, method: 'none', shouldEscalate: false };
+  }
+
+  /**
+   * Normalize URL for comparison (origin + pathname, no query/hash)
+   */
+  private normalizeUrl(url: string): string {
+    try {
+      const urlObj = new URL(url);
+      return urlObj.origin + urlObj.pathname + urlObj.hash;
+    } catch {
+      return url;
+    }
+  }
+
+  /**
+   * Check if snapshot changed meaningfully after recovery
+   */
+  private isMeaningfulSnapshotChange(before: LiteSnapshot, after: LiteSnapshot): boolean {
+    if (before.url !== after.url) return true;
+    if (before.title !== after.title) return true;
+    const elementDelta = Math.abs(before.elements.length - after.elements.length);
+    return elementDelta >= 3;
+  }
+
+  /**
+   * WORKSTREAM 4: Best-effort hard reload (clears runtime caches)
+   */
+  private async hardReload(): Promise<LiteSnapshot> {
+    try {
+      this.semanticWeightCalculator.clearCache();
+      this.state.clearVisualSignatures();
+    } catch {
+      // Best-effort cache clearing
+    }
+
+    await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+    await this.networkTracker.waitForNetworkIdle(5000);
+    await VisualStability.waitForStable(this.page);
+    return await SnapshotCollector.collect(this.page);
+  }
+
+  /**
+   * Set a recovery point for the current state (called on progress)
+   */
+  private setRecoveryPointForCurrentState(snapshot: LiteSnapshot, iteration: number): void {
+    const phaseType = this.currentFunnelPhase as unknown as FunnelPhaseType;
+    const point: RecoveryPoint = {
+      url: snapshot.url,
+      snapshot,
+      funnelPhase: phaseType,
+      timestamp: Date.now(),
+      iteration,
+    };
+    this.state.setRecoveryPoint(point);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

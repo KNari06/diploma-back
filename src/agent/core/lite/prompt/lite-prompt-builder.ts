@@ -7,7 +7,7 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import type { TaskPlanStep } from '../analysis/task-plan-builder';
-import type { AIDecision, GoalGuidance, ModalDismissInfo, StuckCheck } from '../lite-types';
+import type { AIDecision, GoalGuidance, ModalDismissInfo, StuckCheck, VisionHints } from '../lite-types';
 
 /**
  * Task plan context for prompt
@@ -85,6 +85,10 @@ export class LitePromptBuilder {
     stateDriftAnalysis?: string;
     /** ✅ NEW: Last action for context in drift analysis */
     lastAction?: string;
+    /** ✅ NEW: Goal-Oriented Summary from HybridSemanticWeightCalculator (Secret Sauce) */
+    goalOrientedSummary?: string;
+    /** ✅ NEW: Vision hints from GPT-4o Vision when DOM is weak */
+    visionHints?: VisionHints;
   }): string {
     // ✅ FIX: Truncate snapshot if too large (prevent token overflow)
     const MAX_SNAPSHOT_LENGTH = 100_000; // 100k chars (~25k tokens)
@@ -141,6 +145,27 @@ User has provided login credentials. The system will automatically fill them.
 `
       : '';
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // WORKSTREAM 5: Build vision hints section with conflicts
+    // ═══════════════════════════════════════════════════════════════════════
+    const visionHintsSection = params.visionHints
+      ? `
+👁️ VISION ANALYSIS (DOM was weak, using screenshot):
+DOM snapshot had insufficient elements, so GPT-4o Vision analyzed the screenshot.
+Visible buttons: ${params.visionHints.visibleButtons.map(b => `"${b.text}" (${b.location})`).join(', ') || 'none'}
+Form fields: ${params.visionHints.formFields.map(f => `${f.label} (${f.type})`).join(', ') || 'none'}
+${params.visionHints.modals.length > 0 ? `Active modal: ${params.visionHints.modals[0].description}${params.visionHints.modals[0].hasCloseButton ? ' (has close button)' : ''}` : ''}
+Layout: ${params.visionHints.layoutHint}
+${params.visionHints.conflicts && params.visionHints.conflicts.length > 0
+? `
+⚠️ VISION↔DOM CONFLICTS (do NOT interact with these elements):
+${params.visionHints.conflicts.map(c => `- "${c.visionText}" → ${c.issue.toUpperCase()}: ${c.note}`).join('\n')}
+`
+: ''}
+NOTE: Some elements may be in Shadow DOM or Iframes. The system will handle context switching.
+`
+      : '';
+
     // ✅ NEW (Lite Autonomy v3): Build task plan section
     const taskPlanSection = LitePromptBuilder.buildTaskPlanSection(params.taskPlanContext);
 
@@ -155,6 +180,17 @@ User has provided login credentials. The system will automatically fill them.
       ? `\n${params.stateDriftAnalysis}\n`
       : '';
 
+    // ✅ NEW: Goal-Oriented Summary section (Secret Sauce from HybridSemanticWeightCalculator)
+    // Shows semantic analysis of changes: errors, forms, goal-relevant elements
+    const goalOrientedSummarySection = params.goalOrientedSummary
+      ? `
+📊 WHAT CHANGED (Goal-Oriented Summary):
+${params.goalOrientedSummary}
+
+Use this summary to understand what's relevant to your goal. Key changes are highlighted.
+`
+      : '';
+
     // Build complete prompt with JSON-only response format
     return `You are a browser automation agent testing a web application.
 Your job is to REACH THE TARGET STATE through intermediate steps. Navigation is expected.
@@ -163,7 +199,7 @@ GOAL: ${params.goal}
 
 CURRENT PAGE:
 ${snapshot}
-${taskPlanSection}${stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${modalDismissSection}${validationErrorSection}
+${taskPlanSection}${goalOrientedSummarySection}${stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${visionHintsSection}${modalDismissSection}${validationErrorSection}
 HISTORY:
 ${params.history}
 

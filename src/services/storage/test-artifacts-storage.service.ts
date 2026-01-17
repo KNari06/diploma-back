@@ -414,6 +414,95 @@ export async function uploadLiteTraceLogToStorage(
 }
 
 /**
+ * Upload Lite trace log (JSONL) to Supabase Storage for non-UUID / anonymous runs.
+ * This intentionally does NOT create a trace_files record.
+ */
+export async function uploadLiteTraceLogToStorageAnonymous(
+  localPath: string,
+  fileName: string
+): Promise<{ storagePath: string; fileSize: number }> {
+  try {
+    // Check if file exists before reading
+    try {
+      await fs.access(localPath);
+    } catch (accessError) {
+      logger.error('[STORAGE] Lite trace log file does not exist (anonymous upload)', {
+        localPath,
+        fileName,
+        error: accessError instanceof Error ? accessError.message : String(accessError),
+      });
+      throw new Error(`Lite trace log file not found: ${localPath}`);
+    }
+
+    // Read file
+    const fileBuffer = await fs.readFile(localPath);
+    const fileSize = fileBuffer.length;
+
+    if (fileSize === 0) {
+      logger.warn('[STORAGE] Lite trace log file is empty (anonymous upload)', { localPath, fileName });
+      throw new Error('Lite trace log file is empty');
+    }
+
+    const storagePath = `trace-logs/anonymous/${fileName}`;
+
+    const { error } = await supabaseAdmin.storage
+      .from('lite-trace-logs')
+      .upload(storagePath, fileBuffer, {
+        contentType: 'application/x-ndjson',
+        upsert: false,
+        cacheControl: '3600',
+      });
+
+    if (error) {
+      logger.error('[STORAGE] Failed to upload Lite trace log (anonymous)', {
+        error,
+        storagePath,
+        fileName,
+      });
+      throw new Error(`Failed to upload Lite trace log: ${error.message}`);
+    }
+
+    logger.info('[STORAGE] Lite trace log uploaded successfully (anonymous)', {
+      fileName,
+      storagePath,
+      fileSize,
+    });
+
+    return { storagePath, fileSize };
+  } catch (error) {
+    logger.error('[STORAGE] Lite trace log upload error (anonymous)', {
+      error: error instanceof Error ? error.message : String(error),
+      localPath,
+      fileName,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Best-effort removal of Lite trace log from Storage (cleanup for partial failures).
+ */
+export async function deleteLiteTraceLogFromStorage(storagePath: string): Promise<void> {
+  try {
+    const { error } = await supabaseAdmin.storage
+      .from('lite-trace-logs')
+      .remove([storagePath]);
+
+    if (error) {
+      logger.warn('[STORAGE] Failed to delete Lite trace log from storage', {
+        error,
+        storagePath,
+      });
+    }
+  } catch (err) {
+    logger.warn('[STORAGE] Exception while deleting Lite trace log from storage', {
+      error: err instanceof Error ? err.message : String(err),
+      storagePath,
+    });
+  }
+}
+
+/**
  * Insert trace file record into trace_files table
  * @param params - Trace file metadata
  * @returns Object with trace_files record id

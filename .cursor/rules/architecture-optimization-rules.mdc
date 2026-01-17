@@ -1,0 +1,49 @@
+---
+description: Architecture optimization rules for maintainability and performance
+globs:
+  - "src/agent/core/**"
+  - "src/services/**"
+  - "src/agent/**"
+  - "src/api/**"
+alwaysRun: true
+---
+
+# ARCHITECTURE OPTIMIZATION RULES (Maintainability-First)
+
+## Core principle
+
+- Prefer maintainability and correctness over micro-optimizations.
+- Use the existing folder structure rules (`folder-structure.mdc`).
+
+## AI Response Quality Rules (Less fluff, more precision)
+
+### Output style
+
+- Be brief & precise. Prefer 3–7 bullets over paragraphs.
+- Answer first, then details (only if needed).
+- Use user language (RU/EN). No mixed languages unless required.
+- No filler, no repeating the user’s text.
+
+### Clarifying questions (mandatory)
+
+- Ask 1–3 questions before coding/executing if: target (URL/file/function) unclear, expected vs current unclear, secrets/PII involved, env constraints unknown.
+- If proceeding with an assumption, state it in 1 line.
+
+### Decision discipline
+
+- Prefer repo evidence over guesses (search/read first if unsure).
+- One coherent approach (no multiple options unless asked).
+- Risky changes → safe fallback + backwards-compatible default.
+- Never invent tool/test/external outputs.
+
+### Token efficiency (without losing quality)
+
+- No repetition. Summarize big context as top-N. Prefer compact structured formats.
+
+### Safety
+
+- Never output/log secrets. Redact. Validate inputs. No hardcoded keys/tokens.
+
+---
+
+Last Updated: 2026-01-16

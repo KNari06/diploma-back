@@ -1,22 +1,33 @@
 /**
  * StateDiff
- * Computes difference between two snapshots to detect state changes
+ * Computes structural difference between two snapshots to detect state changes
+ *
+ * NOTE: Semantic weights, progress sentiment, and goal-aware logic are computed
+ * by HybridSemanticWeightCalculator.enrichWithAI() AFTER this structural diff.
+ * This module is intentionally kept structural-only to avoid duplication.
  */
 
 import { logger } from '@/utils/core/logger';
-import type { LiteSnapshot, StateDiff } from '../lite-types';
+import type { LiteElement, LiteSnapshot, NetworkSuccess, NetworkValidationError, StateDiff } from '../lite-types';
 
 export class StateDiffComputer {
   /**
-   * Compute difference between two snapshots
+   * Compute structural difference between two snapshots
    * Detects URL changes, added/removed elements, and property changes
+   *
+   * Semantic fields (semanticWeight, meaningfulChange, significantChange, progressSentiment)
+   * are set to safe defaults here. They will be enriched by HybridSemanticWeightCalculator.
    *
    * @param before - Snapshot before action
    * @param after - Snapshot after action
    * @param pageErrorsBefore - Page errors before action
    * @param pageErrorsAfter - Page errors after action
    * @param consoleErrors - Console errors during action
-   * @returns State diff
+   * @param networkErrors - Network errors during action (already time-filtered)
+   * @param successfulResponses - Successful API responses (fetch/xhr, 200-299)
+   * @param validationErrors - Validation errors from API (400-499 with parsed body)
+   * @param goal - Unused here; kept for API compatibility (goal used by enrichWithAI)
+   * @returns Structural state diff with safe semantic defaults
    */
   static compute(
     before: LiteSnapshot,
@@ -24,8 +35,13 @@ export class StateDiffComputer {
     pageErrorsBefore: string[],
     pageErrorsAfter: string[],
     consoleErrors: string[],
-    networkErrors: string[] = []
+    networkErrors: string[] = [],
+    successfulResponses: NetworkSuccess[] = [],
+    validationErrors: NetworkValidationError[] = [],
+    goal?: string
   ): StateDiff {
+    // Goal is unused here; semantic weight calculation moved to HybridSemanticWeightCalculator
+    void goal;
     try {
       // Check URL change
       const urlChanged = before.url !== after.url;
@@ -53,7 +69,7 @@ export class StateDiffComputer {
         if (!afterEl) return;
 
         // Check each property for changes
-        const fieldsToCheck: Array<keyof typeof beforeEl> = [
+        const fieldsToCheck: Array<keyof LiteElement> = [
           'name', 'value', 'checked', 'disabled', 'visible'
         ];
 
@@ -69,18 +85,18 @@ export class StateDiffComputer {
         });
       });
 
-      // Determine if there's a visual change
+      // Find new page errors
+      const newPageErrors = pageErrorsAfter.filter((err) => !pageErrorsBefore.includes(err));
+
+      // Determine if there's a structural visual change
       const hasVisualChange =
         urlChanged ||
         addedElements.length > 0 ||
         removedRefs.length > 0 ||
         changedElements.length > 0;
 
-      // Find new page errors
-      const newPageErrors = pageErrorsAfter.filter((err) => !pageErrorsBefore.includes(err));
-
-      // Console errors are already filtered by time in ConsoleCollector
-
+      // Build diff with safe semantic defaults
+      // These will be enriched by HybridSemanticWeightCalculator.enrichWithAI()
       const diff: StateDiff = {
         urlChanged,
         urlBefore: before.url,
@@ -92,9 +108,16 @@ export class StateDiffComputer {
         newPageErrors,
         newConsoleErrors: consoleErrors,
         newNetworkErrors: networkErrors,
+        // Safe semantic defaults (enriched later by HybridSemanticWeightCalculator)
+        semanticWeight: 0,
+        meaningfulChange: false,
+        significantChange: false,
+        progressSentiment: 'No Effect',
+        successfulApiResponses: successfulResponses.length > 0 ? successfulResponses : undefined,
+        validationApiErrors: validationErrors.length > 0 ? validationErrors : undefined,
       };
 
-      logger.debug('[STATE_DIFF] Computed state diff', {
+      logger.debug('[STATE_DIFF] Computed structural diff', {
         urlChanged,
         addedCount: addedElements.length,
         removedCount: removedRefs.length,
@@ -103,6 +126,8 @@ export class StateDiffComputer {
         newPageErrors: newPageErrors.length,
         newConsoleErrors: consoleErrors.length,
         newNetworkErrors: networkErrors.length,
+        successfulApiCount: successfulResponses.length,
+        validationErrorCount: validationErrors.length,
       });
 
       return diff;
@@ -123,6 +148,12 @@ export class StateDiffComputer {
         newPageErrors: [],
         newConsoleErrors: [],
         newNetworkErrors: [],
+        semanticWeight: 0,
+        meaningfulChange: false,
+        significantChange: false,
+        progressSentiment: 'No Effect',
+        successfulApiResponses: undefined,
+        validationApiErrors: undefined,
       };
     }
   }
@@ -191,9 +222,10 @@ export class StateDiffComputer {
 
   /**
    * Format diff for AI prompt with actionable analysis
-   * Includes state drift reasoning to help AI understand what changed and what to do
+   * Uses semantic weights, progress sentiment, and network-awareness
+   * (these fields are enriched by HybridSemanticWeightCalculator before this is called)
    *
-   * @param diff - State diff to format
+   * @param diff - Enriched state diff to format
    * @param action - Action that was taken
    * @returns Formatted string for AI with reasoning hints
    */
@@ -202,6 +234,19 @@ export class StateDiffComputer {
 
     // State Drift Analysis Header
     lines.push('📊 STATE DRIFT ANALYSIS (what changed after last action):');
+    lines.push('');
+
+    // Progress Sentiment
+    const sentimentEmoji: Record<string, string> = {
+      'Major Progress': '🎯',
+      'Significant Change': '✅',
+      'Minor Change': '↗️',
+      'No Effect': '❌',
+      'Negative Change': '⚠️',
+    };
+    lines.push(`${sentimentEmoji[diff.progressSentiment] || '❓'} PROGRESS SENTIMENT: ${diff.progressSentiment}`);
+    lines.push(`   Semantic Weight: ${diff.semanticWeight.toFixed(2)} (Meaningful: ${diff.meaningfulChange}, Significant: ${diff.significantChange})`);
+    lines.push('');
 
     // URL Analysis
     if (diff.urlChanged) {
@@ -211,28 +256,68 @@ export class StateDiffComputer {
       lines.push(`⚠️  URL UNCHANGED: Still on ${diff.urlAfter}`);
       lines.push(`   → Action "${action}" did not navigate. If expected navigation, try different approach.`);
     }
+    lines.push('');
 
     // DOM Changes Analysis
     const totalChanges = diff.addedElements.length + diff.removedRefs.length + diff.changedElements.length;
 
-    if (totalChanges === 0 && !diff.urlChanged) {
+    if (totalChanges === 0 && !diff.urlChanged && !diff.meaningfulChange) {
       lines.push(`❌ NO DOM CHANGES: Page looks identical before/after action.`);
       lines.push(`   → This is a FAILURE. Action had NO EFFECT. Try different element or approach.`);
-    } else if (totalChanges > 0) {
+    } else if (totalChanges > 0 || diff.meaningfulChange) {
       lines.push(`✅ DOM CHANGED: +${diff.addedElements.length} added, -${diff.removedRefs.length} removed, ~${diff.changedElements.length} modified`);
 
       // Show key added elements (forms, buttons, inputs)
-      const keyElements = diff.addedElements.filter(el =>
-        el.tag === 'form' || el.tag === 'button' || el.tag === 'input' || el.type === 'password'
-      ).slice(0, 3);
+      const keyElements = diff.addedElements
+        .filter(el =>
+          el.tag === 'form' || el.tag === 'button' || el.tag === 'input' || el.type === 'password'
+        )
+        .slice(0, 3);
 
       if (keyElements.length > 0) {
-        lines.push(`   Key new elements:`);
+        lines.push(`   Key new elements (high semantic weight):`);
         keyElements.forEach(el => {
           const typeInfo = el.type ? ` type=${el.type}` : '';
           lines.push(`   + ${el.ref}: "${el.name}"${typeInfo}`);
         });
       }
+
+      if (diff.meaningfulChange) {
+        lines.push(`   → Meaningful change detected (weight >= 0.1). Not just noise/ads.`);
+      }
+      if (diff.significantChange) {
+        lines.push(`   → Significant change detected (weight >= 0.5). Successful state shift!`);
+      }
+    }
+    lines.push('');
+
+    // Network Success
+    if (diff.successfulApiResponses && diff.successfulApiResponses.length > 0) {
+      lines.push(`✅ API SUCCESS: Server confirmed action.`);
+      diff.successfulApiResponses.slice(0, 2).forEach(resp => {
+        lines.push(`   ✓ ${resp.method} ${resp.status} ${resp.url}`);
+      });
+      if (diff.successfulApiResponses.length > 2) {
+        lines.push(`   ... and ${diff.successfulApiResponses.length - 2} more`);
+      }
+      lines.push(`   → Server responded successfully. If page hasn't updated yet — just wait.`);
+      lines.push('');
+    }
+
+    // Validation Errors
+    if (diff.validationApiErrors && diff.validationApiErrors.length > 0) {
+      lines.push(`⚠️  VALIDATION ERRORS: Server rejected action.`);
+      diff.validationApiErrors.slice(0, 2).forEach(err => {
+        lines.push(`   ! ${err.method} ${err.status} ${err.url}`);
+        if (err.message) {
+          lines.push(`     Message: ${err.message}`);
+        }
+        if (err.errors && err.errors.length > 0) {
+          lines.push(`     Errors: ${err.errors.slice(0, 3).join(', ')}`);
+        }
+      });
+      lines.push(`   → These validation errors explain why action failed. Check error messages.`);
+      lines.push('');
     }
 
     // Error Analysis
@@ -242,25 +327,41 @@ export class StateDiffComputer {
         lines.push(`   ! ${err.slice(0, 100)}`);
       });
       lines.push(`   → These errors may indicate why action failed. Check error messages.`);
+      lines.push('');
     }
 
     // Network Error Analysis
     if (diff.newNetworkErrors && diff.newNetworkErrors.length > 0) {
-      lines.push(`⚠️  NETWORK ERRORS:`);
+      lines.push(`🔴 NETWORK ERRORS:`);
       diff.newNetworkErrors.slice(0, 2).forEach(err => {
         lines.push(`   ! ${err.slice(0, 120)}`);
       });
       if (diff.newNetworkErrors.some(e => e.includes('429') || e.toLowerCase().includes('rate limit'))) {
         lines.push(`   → Rate limiting detected. Use "wait" action to back off.`);
+      } else if (diff.newNetworkErrors.some(e => e.includes('500') || e.includes('502') || e.includes('503'))) {
+        lines.push(`   → SERVER ERROR. Critical blocker — stop and report.`);
       }
+      lines.push('');
     }
 
-    // Conclusion
+    // Conclusion based on Progress Sentiment
     lines.push('');
-    if (!diff.urlChanged && totalChanges === 0 && !diff.hasVisualChange) {
-      lines.push('🚨 CONCLUSION: Action had NO EFFECT. You MUST try a different approach or element.');
-    } else if (diff.hasVisualChange || diff.urlChanged) {
-      lines.push('✅ CONCLUSION: Action caused changes. Analyze new state and continue toward goal.');
+    switch (diff.progressSentiment) {
+      case 'Major Progress':
+        lines.push('🎯 CONCLUSION: MAJOR PROGRESS! Form appeared or navigation happened. You are on the right track.');
+        break;
+      case 'Significant Change':
+        lines.push('✅ CONCLUSION: SIGNIFICANT CHANGE detected. Analyze new state and continue toward goal.');
+        break;
+      case 'Minor Change':
+        lines.push('↗️ CONCLUSION: Minor change detected. Some progress, but not significant yet.');
+        break;
+      case 'No Effect':
+        lines.push('❌ CONCLUSION: Action had NO EFFECT. You MUST try a different approach or element.');
+        break;
+      case 'Negative Change':
+        lines.push('⚠️ CONCLUSION: ERRORS detected. Check error messages and adjust strategy.');
+        break;
     }
 
     return lines.join('\n');

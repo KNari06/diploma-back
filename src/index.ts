@@ -14,6 +14,7 @@ import playwrightRoutes from '@/api/playwright/playwright.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
+import supportRoutes from '@/api/support/support.routes';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
@@ -1207,6 +1208,7 @@ app.use(`/api/${env.API_VERSION}/user`, userRoutes);
 app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications
 app.use(`/api/${env.API_VERSION}/queue`, queueStatusRoutes); // Queue monitoring
+app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // ✅ NEW: User issue reports
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
