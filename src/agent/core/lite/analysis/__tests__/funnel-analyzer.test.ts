@@ -5,8 +5,8 @@
  * work correctly for both EN and RU patterns.
  */
 
-import { FunnelAnalyzer, FunnelPhase } from '../funnel-analyzer';
 import type { LiteElement } from '../../lite-types';
+import { FunnelAnalyzer, FunnelPhase } from '../funnel-analyzer';
 
 describe('FunnelAnalyzer', () => {
   describe('analyze() - URL-based detection', () => {
@@ -20,6 +20,11 @@ describe('FunnelAnalyzer', () => {
       expect(phase).toBe(FunnelPhase.CONVERSION);
     });
 
+    it('should detect CONVERSION phase from URL (KZ)', () => {
+      const phase = FunnelAnalyzer.analyze('https://example.com/төлем', []);
+      expect(phase).toBe(FunnelPhase.CONVERSION);
+    });
+
     it('should detect PRE_ACTION phase from URL (EN)', () => {
       const phase = FunnelAnalyzer.analyze('https://example.com/cart', []);
       expect(phase).toBe(FunnelPhase.PRE_ACTION);
@@ -30,6 +35,11 @@ describe('FunnelAnalyzer', () => {
       expect(phase).toBe(FunnelPhase.PRE_ACTION);
     });
 
+    it('should detect PRE_ACTION phase from URL (KZ)', () => {
+      const phase = FunnelAnalyzer.analyze('https://example.com/себет', []);
+      expect(phase).toBe(FunnelPhase.PRE_ACTION);
+    });
+
     it('should detect SELECTION phase from URL (EN)', () => {
       const phase = FunnelAnalyzer.analyze('https://example.com/product/123', []);
       expect(phase).toBe(FunnelPhase.SELECTION);
@@ -37,6 +47,11 @@ describe('FunnelAnalyzer', () => {
 
     it('should detect SELECTION phase from URL (RU)', () => {
       const phase = FunnelAnalyzer.analyze('https://example.com/товар/123', []);
+      expect(phase).toBe(FunnelPhase.SELECTION);
+    });
+
+    it('should detect SELECTION phase from URL (KZ)', () => {
+      const phase = FunnelAnalyzer.analyze('https://example.com/тауар/456', []);
       expect(phase).toBe(FunnelPhase.SELECTION);
     });
 
@@ -165,6 +180,45 @@ describe('FunnelAnalyzer', () => {
       };
       const category = FunnelAnalyzer.categorizeElement(element);
       expect(category).toBe('add-to-cart');
+    });
+
+    it('should categorize add-to-cart button (KZ)', () => {
+      const element: LiteElement = {
+        ref: 'btn1',
+        tag: 'button',
+        role: 'button',
+        name: 'Себетке қосу',
+        visible: true,
+        bounds: { x: 0, y: 0, width: 100, height: 40 },
+      };
+      const category = FunnelAnalyzer.categorizeElement(element);
+      expect(category).toBe('add-to-cart');
+    });
+
+    it('should categorize submit button (KZ)', () => {
+      const element: LiteElement = {
+        ref: 'btn1',
+        tag: 'button',
+        role: 'button',
+        name: 'Жіберу',
+        visible: true,
+        bounds: { x: 0, y: 0, width: 100, height: 40 },
+      };
+      const category = FunnelAnalyzer.categorizeElement(element);
+      expect(category).toBe('submit-button');
+    });
+
+    it('should categorize checkout button (KZ)', () => {
+      const element: LiteElement = {
+        ref: 'btn1',
+        tag: 'button',
+        role: 'button',
+        name: 'Тапсырыс беру',
+        visible: true,
+        bounds: { x: 0, y: 0, width: 100, height: 40 },
+      };
+      const category = FunnelAnalyzer.categorizeElement(element);
+      expect(category).toBe('checkout-button');
     });
 
     it('should categorize input field', () => {

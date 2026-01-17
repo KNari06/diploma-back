@@ -20,9 +20,19 @@ export const ERROR_KEYWORDS = [
   // English
   'error', 'alert', 'warning', 'danger', 'invalid', 'failed', 'failure',
   'incorrect', 'wrong', 'required', 'missing', 'validation',
+  // English - auth/session/common blockers
+  'unauthorized', 'forbidden', 'expired', 'timeout', 'timed out', 'blocked',
+  'too many attempts', 'rate limit', 'captcha', '2fa', 'otp',
   // Russian
   'ошибка', 'предупреждение', 'неверно', 'некорректно', 'отказ',
   'неправильно', 'обязательно', 'отсутствует',
+  // Russian - auth/session/common blockers
+  'не удалось', 'доступ запрещен', 'нет доступа', 'истек', 'истекло',
+  'таймаут', 'превышено', 'заблокирован', 'слишком много попыток',
+  'капча', 'подтвердите', 'код подтверждения', 'одноразовый код',
+  // Kazakh (KZ)
+  'қате', 'қателік', 'дұрыс емес', 'міндетті', 'толтырылмаған',
+  'сәтсіз', 'ескерту',
 ] as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -38,12 +48,23 @@ export const PRIMARY_ACTION_KEYWORDS = [
   'submit', 'login', 'pay', 'register', 'checkout', 'order',
   'confirm', 'save', 'send', 'continue', 'next', 'create',
   'add', 'delete', 'remove', 'update', 'apply', 'proceed',
+  // English - additional high-signal actions
+  'verify', 'approve', 'accept', 'agree', 'finish', 'done',
+  'start', 'launch', 'open', 'close', 'dismiss',
+  'reset', 'change', 'retry', 'try again',
   // English - multi-word (matched as token sequences)
   'sign up', 'sign in', 'log in', 'log out', 'sign out',
   // Russian - core actions
   'войти', 'зарегистрироваться', 'оплатить', 'подтвердить',
   'сохранить', 'отправить', 'далее', 'продолжить', 'создать',
   'добавить', 'удалить', 'обновить', 'применить',
+  // Russian - additional high-signal actions
+  'подтверждаю', 'принять', 'согласиться', 'разрешить',
+  'начать', 'завершить', 'готово', 'проверить',
+  'сбросить', 'сменить', 'повторить', 'попробовать снова',
+  // Kazakh (KZ) - core actions
+  'кіру', 'тіркелу', 'төлеу', 'растау', 'сақтау', 'жіберу',
+  'жалғастыру', 'келесі', 'қосу', 'жою', 'жаңарту',
 ] as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -56,8 +77,16 @@ export const PRIMARY_ACTION_KEYWORDS = [
 export const NAVIGATION_KEYWORDS = [
   // English
   'profile', 'account', 'menu', 'settings', 'dashboard', 'home',
+  'help', 'support', 'faq', 'contact', 'about',
+  'pricing', 'plans', 'billing', 'docs', 'documentation',
+  'terms', 'privacy',
   // Russian
   'профиль', 'аккаунт', 'кабинет', 'меню', 'настройки', 'главная',
+  'помощь', 'поддержка', 'вопросы', 'контакты', 'о нас',
+  'цены', 'тарифы', 'оплата', 'документы', 'документация',
+  'условия', 'политика',
+  // Kazakh (KZ) - minimal, high-confidence only
+  'жеке кабинет', 'профиль', 'параметрлер', 'басты бет',
 ] as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -70,19 +99,40 @@ export const NAVIGATION_KEYWORDS = [
  */
 export const GOAL_KEYWORD_MAP: Record<string, readonly string[]> = {
   // English
-  login: ['login', 'sign in', 'signin', 'log in', 'auth', 'authenticate'],
-  register: ['register', 'sign up', 'signup', 'create account', 'join', 'new account'],
-  checkout: ['checkout', 'payment', 'pay', 'order', 'purchase', 'buy', 'cart', 'basket'],
-  search: ['search', 'find', 'look for', 'query', 'lookup'],
-  profile: ['profile', 'account', 'settings', 'preferences'],
-  logout: ['logout', 'sign out', 'log out', 'exit'],
+  login: [
+    'login', 'logon', 'sign in', 'signin', 'log in',
+    'auth', 'authenticate', 'authorization', 'session',
+    'password', 'username',
+  ],
+  register: [
+    'register', 'sign up', 'signup', 'create account', 'create profile',
+    'join', 'new account',
+  ],
+  checkout: [
+    'checkout', 'payment', 'pay', 'order', 'purchase', 'buy',
+    'cart', 'basket', 'billing', 'shipping', 'delivery', 'address',
+    'place order',
+  ],
+  search: ['search', 'find', 'look for', 'query', 'lookup', 'filter', 'sort'],
+  profile: ['profile', 'account', 'my account', 'settings', 'preferences', 'personal info'],
+  logout: ['logout', 'sign out', 'log out', 'signoff', 'exit'],
   // Russian
-  вход: ['вход', 'войти', 'авторизация', 'логин', 'авторизоваться'],
-  регистрация: ['регистрация', 'зарегистрироваться', 'создать аккаунт', 'новый аккаунт'],
-  оплата: ['оплата', 'заказ', 'купить', 'корзина', 'оформить', 'платёж'],
-  поиск: ['поиск', 'найти', 'искать'],
-  профиль: ['профиль', 'аккаунт', 'настройки'],
-  выход: ['выход', 'выйти'],
+  вход: ['вход', 'войти', 'авторизация', 'логин', 'авторизоваться', 'войти в аккаунт'],
+  регистрация: ['регистрация', 'зарегистрироваться', 'создать аккаунт', 'новый аккаунт', 'создать профиль'],
+  оплата: [
+    'оплата', 'заказ', 'купить', 'корзина', 'оформить', 'оформление',
+    'платёж', 'платеж', 'доставка', 'адрес', 'оформление заказа',
+  ],
+  поиск: ['поиск', 'найти', 'искать', 'фильтр', 'сортировка'],
+  профиль: ['профиль', 'аккаунт', 'кабинет', 'настройки', 'личные данные'],
+  выход: ['выход', 'выйти', 'выйти из аккаунта'],
+  // Kazakh (KZ)
+  кіру: ['кіру', 'жүйеге кіру', 'авторизация', 'логин'],
+  тіркелу: ['тіркелу', 'тіркеу', 'аккаунт ашу', 'жаңа аккаунт'],
+  төлем: ['төлем', 'төлеу', 'тапсырыс', 'себет', 'сатып алу', 'ресімдеу'],
+  іздеу: ['іздеу', 'табу', 'қарау'],
+  профиль_kz: ['жеке кабинет', 'профиль', 'параметрлер'],
+  шығу: ['шығу', 'шығып кету', 'жүйеден шығу'],
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -93,8 +143,12 @@ export const GOAL_KEYWORD_MAP: Record<string, readonly string[]> = {
  * Keywords that indicate decorative/low-importance elements
  */
 export const DECORATIVE_KEYWORDS = [
+  // English
   'icon', 'social', 'footer', 'copyright', 'logo', 'banner',
+  // Russian
   'иконка', 'соцсети', 'футер', 'копирайт', 'логотип', 'баннер',
+  // Kazakh (KZ) - minimal
+  'белгіше', 'логотип', 'төменгі колонтитул',
 ] as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -109,17 +163,24 @@ export const FUNNEL_URL_PATTERNS = {
   /** Conversion phase: checkout, payment, final submission */
   conversion: [
     'checkout', 'payment', 'pay', 'confirm', 'order', 'complete',
-    'оплата', 'заказ', 'подтвержд', 'оформл',
+    'billing', 'shipping', 'delivery', 'address',
+    'оплата', 'заказ', 'подтвержд', 'оформл', 'доставка', 'адрес',
+    // KZ (high-confidence only)
+    'төлем', 'тапсырыс', 'растау',
   ],
   /** Pre-action phase: cart, review, summary */
   pre_action: [
     'cart', 'basket', 'bag', 'review', 'summary',
-    'корзина', 'итого', 'проверк',
+    'корзина', 'итого', 'проверк', 'обзор', 'сводка',
+    // KZ
+    'себет', 'қорытынды',
   ],
   /** Selection phase: product details, item view */
   selection: [
-    'product', 'item', 'detail', 'view',
-    'товар', 'продукт',
+    'product', 'item', 'detail', 'view', 'catalog', 'category',
+    'товар', 'продукт', 'каталог', 'категория',
+    // KZ
+    'тауар', 'өнім',
   ],
 } as const;
 
@@ -131,17 +192,26 @@ export const FUNNEL_ELEMENT_PATTERNS = {
   /** Add to cart buttons */
   add_to_cart: [
     'add to cart', 'add to bag', 'buy now', 'add to basket',
-    'в корзину', 'купить', 'добавить',
+    'buy', 'purchase',
+    'в корзину', 'купить', 'добавить', 'добавить в корзину',
+    // KZ
+    'себетке қосу', 'сатып алу',
   ],
   /** Checkout/proceed buttons */
   checkout: [
     'checkout', 'proceed', 'continue to', 'place order',
-    'оформить', 'продолжить', 'заказать',
+    'review order', 'go to checkout',
+    'оформить', 'продолжить', 'заказать', 'перейти к оплате', 'оформление заказа',
+    // KZ
+    'ресімдеу', 'жалғастыру', 'тапсырыс беру',
   ],
   /** Submit/confirm buttons */
   submit: [
     'submit', 'confirm', 'pay', 'complete', 'send', 'finish',
-    'отправить', 'подтвердить', 'оплатить', 'завершить',
+    'save', 'done', 'approve', 'verify',
+    'отправить', 'подтвердить', 'оплатить', 'завершить', 'сохранить', 'готово',
+    // KZ
+    'жіберу', 'растау', 'төлеу', 'аяқтау',
   ],
 } as const;
 
