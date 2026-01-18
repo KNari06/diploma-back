@@ -1,7 +1,9 @@
 import { env } from '@/config/environment/env';
+import { redisConnection } from '@/config/infrastructure/queues';
 import { supabase, supabaseAdmin } from '@/db/supabase';
 import { AuthTokens, AuthUser } from '@/types';
 import { logger } from '@/utils/core/logger';
+import * as crypto from 'crypto';
 
 /**
  * Sign up with email and password
@@ -137,8 +139,8 @@ export async function signInWithEmail(
       // Check if Supabase returned HTML instead of JSON (503/500 errors)
       const errorMessage = error.message || '';
       const isSupabaseDown = errorMessage.includes('not valid JSON') ||
-                              errorMessage.includes('Unexpected token') ||
-                              errorMessage.includes('Internal server error');
+        errorMessage.includes('Unexpected token') ||
+        errorMessage.includes('Internal server error');
 
       logger.error('[AUTH] Sign in error', {
         error: error.message,
@@ -193,9 +195,9 @@ export async function signInWithEmail(
       stack: errorStack,
       // Check if it's a network/Supabase infrastructure error
       isNetworkError: errorMessage.includes('fetch') ||
-                       errorMessage.includes('network') ||
-                       errorMessage.includes('ECONNREFUSED') ||
-                       errorMessage.includes('ETIMEDOUT'),
+        errorMessage.includes('network') ||
+        errorMessage.includes('ECONNREFUSED') ||
+        errorMessage.includes('ETIMEDOUT'),
     });
     throw error;
   }
@@ -252,15 +254,45 @@ export async function signInWithMagicLink(
 }
 
 /**
+ * Generate PKCE code verifier and challenge
+ * @returns Object with code_verifier and code_challenge
+ */
+function generatePKCE(): { code_verifier: string; code_challenge: string } {
+  // Generate 32 random bytes (256 bits) for code_verifier
+  const codeVerifier = crypto.randomBytes(32).toString('base64url');
+
+  // Generate code_challenge: SHA256(code_verifier) encoded as base64url
+  const codeChallenge = crypto
+    .createHash('sha256')
+    .update(codeVerifier)
+    .digest('base64url');
+
+  return {
+    code_verifier: codeVerifier,
+    code_challenge: codeChallenge,
+  };
+}
+
+/**
+ * Generate random state token
+ * @returns Base64url encoded random string
+ */
+function generateStateToken(): string {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+/**
  * Get OAuth URL for provider
  * @param provider - OAuth provider (google, github, etc.)
  * @param redirectTo - Required redirect URL after OAuth
- * @returns OAuth URL (Supabase handles state internally)
+ * @param usePKCE - Whether to use PKCE flow (default: false for web, true for desktop)
+ * @returns OAuth URL with state and optionally PKCE
  */
 export async function getOAuthUrl(
   provider: 'google' | 'github' | 'gitlab' | 'bitbucket',
-  redirectTo: string
-): Promise<{ url: string }> {
+  redirectTo: string,
+  usePKCE: boolean = false
+): Promise<{ url: string; state?: string }> {
   // Validate inputs
   if (!provider || !['google', 'github', 'gitlab', 'bitbucket'].includes(provider)) {
     throw new Error('Invalid OAuth provider');
@@ -271,11 +303,55 @@ export async function getOAuthUrl(
   }
 
   try {
+    let pkceData: { code_verifier: string; code_challenge: string } | null = null;
+    let state: string | null = null;
+
+    // Generate PKCE if needed (for desktop OAuth)
+    if (usePKCE) {
+      pkceData = generatePKCE();
+      state = generateStateToken();
+
+      // Store state + code_verifier in Redis with 10 minute TTL
+      const stateKey = `oauth_state:${state}`;
+      const stateData = {
+        code_verifier: pkceData.code_verifier,
+        redirect_uri: redirectTo,
+        provider,
+        created_at: new Date().toISOString(),
+      };
+
+      try {
+        await redisConnection.setex(stateKey, 600, JSON.stringify(stateData)); // 10 minutes
+        logger.info('[AUTH] OAuth state stored in Redis', {
+          state: state.substring(0, 8) + '...',
+          provider,
+        });
+      } catch (redisError) {
+        logger.error('[AUTH] Failed to store OAuth state in Redis', {
+          error: redisError instanceof Error ? redisError.message : String(redisError),
+          provider,
+        });
+        throw new Error('Failed to store OAuth state');
+      }
+    }
+
+    // Build OAuth options
+    const oauthOptions: any = {
+      redirectTo,
+    };
+
+    // Add PKCE parameters if using PKCE
+    if (usePKCE && pkceData && state) {
+      oauthOptions.queryParams = {
+        code_challenge: pkceData.code_challenge,
+        code_challenge_method: 'S256',
+        state,
+      };
+    }
+
     const { data, error } = await supabase.auth.signInWithOAuth({
       provider,
-      options: {
-        redirectTo,
-      },
+      options: oauthOptions,
     });
 
     if (error) {
@@ -283,6 +359,7 @@ export async function getOAuthUrl(
         error: error.message,
         code: error.status,
         provider,
+        usePKCE,
       });
       throw error;
     }
@@ -292,13 +369,194 @@ export async function getOAuthUrl(
       throw new Error('No OAuth URL returned');
     }
 
-    logger.info('[AUTH] OAuth URL generated', { provider });
+    logger.info('[AUTH] OAuth URL generated', {
+      provider,
+      usePKCE,
+      hasState: !!state,
+    });
 
-    return { url: data.url };
+    return {
+      url: data.url,
+      state: state || undefined,
+    };
   } catch (error) {
     logger.error('[AUTH] OAuth URL generation error', {
       error: error instanceof Error ? error.message : String(error),
       provider,
+      usePKCE,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Exchange authorization code for session tokens (with PKCE support)
+ * @param code - Authorization code from OAuth callback
+ * @param codeVerifier - PKCE code verifier (required for desktop OAuth)
+ * @param redirectUri - Redirect URI used in OAuth flow (must match)
+ * @returns Auth tokens and user data
+ */
+export async function exchangeCodeForSession(
+  code: string,
+  codeVerifier?: string,
+  redirectUri?: string
+): Promise<{ user: AuthUser; tokens: AuthTokens }> {
+  // Validate inputs
+  if (!code || typeof code !== 'string' || code.length < 10) {
+    throw new Error('Invalid authorization code');
+  }
+
+  try {
+    // If code_verifier is provided, use PKCE flow via REST API
+    if (codeVerifier) {
+      const supabaseUrl = env.SUPABASE_URL;
+      const supabaseAnonKey = env.SUPABASE_ANON_KEY;
+
+      if (!supabaseUrl || !supabaseAnonKey) {
+        throw new Error('Supabase configuration is missing');
+      }
+
+      logger.info('[AUTH] Exchanging code for tokens (PKCE)', {
+        codeLength: code.length,
+        hasRedirectUri: !!redirectUri,
+      });
+
+      // Supabase/Auth flows can vary depending on provider/setup.
+      // We try the most common GoTrue PKCE exchange first and fallback to OAuth token endpoint.
+      const tryPkceTokenExchange = async (): Promise<Response> => {
+        const tokenUrl = `${supabaseUrl}/auth/v1/token?grant_type=pkce`;
+        const formData = new URLSearchParams();
+        formData.append('auth_code', code);
+        formData.append('code_verifier', codeVerifier);
+        if (redirectUri) formData.append('redirect_uri', redirectUri);
+
+        return fetch(tokenUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            apikey: supabaseAnonKey,
+            Authorization: `Bearer ${supabaseAnonKey}`,
+          },
+          body: formData.toString(),
+        });
+      };
+
+      const tryOauthTokenExchange = async (): Promise<Response> => {
+        const tokenUrl = `${supabaseUrl}/auth/v1/oauth/token`;
+        const formData = new URLSearchParams();
+        formData.append('grant_type', 'authorization_code');
+        formData.append('code', code);
+        formData.append('code_verifier', codeVerifier);
+        if (redirectUri) formData.append('redirect_uri', redirectUri);
+
+        return fetch(tokenUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            apikey: supabaseAnonKey,
+            Authorization: `Bearer ${supabaseAnonKey}`,
+          },
+          body: formData.toString(),
+        });
+      };
+
+      let response = await tryPkceTokenExchange();
+      if (!response.ok) {
+        // Fallback to alternate endpoint
+        response = await tryOauthTokenExchange();
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.error('[AUTH] Token exchange failed', {
+          status: response.status,
+          error: errorText,
+        });
+        throw new Error(`Token exchange failed: ${response.status} ${errorText}`);
+      }
+
+      const tokenData = (await response.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+        token_type?: string;
+        user?: any;
+      };
+
+      if (!tokenData.access_token || !tokenData.refresh_token) {
+        logger.error('[AUTH] Token exchange returned invalid data');
+        throw new Error('Invalid token response');
+      }
+
+      // Get user data from access token
+      const { data: userData, error: userError } = await supabase.auth.getUser(
+        tokenData.access_token
+      );
+
+      if (userError || !userData.user) {
+        logger.error('[AUTH] Failed to get user from token', {
+          error: userError?.message,
+        });
+        throw new Error('Failed to get user data');
+      }
+
+      logger.info('[AUTH] Code exchanged for tokens (PKCE)', {
+        userId: userData.user.id,
+      });
+
+      return {
+        user: {
+          id: userData.user.id,
+          email: userData.user.email || '',
+          name: userData.user.user_metadata?.name || userData.user.email?.split('@')[0] || 'User',
+          role: 'user',
+          avatar: userData.user.user_metadata?.avatar_url,
+        },
+        tokens: {
+          access_token: tokenData.access_token,
+          refresh_token: tokenData.refresh_token,
+          expires_in: tokenData.expires_in || 3600,
+        },
+      };
+    } else {
+      // Use Supabase client method (for web OAuth without PKCE)
+      const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+
+      if (error) {
+        logger.error('[AUTH] Code exchange error', {
+          error: error.message,
+          code: error.status,
+        });
+        throw error;
+      }
+
+      if (!data.session || !data.user) {
+        logger.error('[AUTH] Code exchange failed: no session or user returned');
+        throw new Error('Code exchange failed: no session or user returned');
+      }
+
+      logger.info('[AUTH] Code exchanged for tokens', {
+        userId: data.user.id,
+      });
+
+      return {
+        user: {
+          id: data.user.id,
+          email: data.user.email || '',
+          name: data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
+          role: 'user',
+          avatar: data.user.user_metadata?.avatar_url,
+        },
+        tokens: {
+          access_token: data.session.access_token,
+          refresh_token: data.session.refresh_token,
+          expires_in: data.session.expires_in || 3600,
+        },
+      };
+    }
+  } catch (error) {
+    logger.error('[AUTH] Code exchange error', {
+      error: error instanceof Error ? error.message : String(error),
     });
     throw error;
   }

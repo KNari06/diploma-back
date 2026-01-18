@@ -1,5 +1,6 @@
 import { env, isDevelopment } from '@/config/environment/env';
 import {
+  exchangeCodeForSession,
   getCurrentUser,
   getOAuthUrl,
   refreshAccessToken,
@@ -13,6 +14,17 @@ import {
 } from '@/services/auth/auth.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
+
+// Simple in-memory per-IP rate limiting for OAuth completion endpoint
+// This endpoint is unauthenticated (desktop needs to exchange code), so we limit by IP.
+const OAUTH_COMPLETE_RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const OAUTH_COMPLETE_RATE_LIMIT_MAX = 5; // 5 requests per minute per IP
+const oauthCompleteRateLimit = new Map<string, { count: number; windowStart: number }>();
+
+function getClientIp(req: Request): string {
+  const forwarded = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim();
+  return forwarded || req.ip || 'unknown';
+}
 
 /**
  * Sign up with email and password
@@ -92,7 +104,7 @@ export const sendMagicLink = async (req: Request, res: Response): Promise<void> 
 export const getOAuthUrlHandler = async (req: Request, res: Response): Promise<void> => {
   try {
     const { provider } = req.params;
-    const { redirect_uri } = req.query;
+    const { redirect_uri, use_pkce } = req.query;
 
     if (!['google', 'github', 'gitlab', 'bitbucket'].includes(provider)) {
       res.status(400).json({
@@ -109,9 +121,13 @@ export const getOAuthUrlHandler = async (req: Request, res: Response): Promise<v
       finalRedirect = `${origin}/oauth/callback`;
     }
 
+    // Use PKCE for desktop OAuth (when use_pkce=true)
+    const usePKCE = use_pkce === 'true' || use_pkce === '1';
+
     const result = await getOAuthUrl(
       provider as 'google' | 'github' | 'gitlab' | 'bitbucket',
-      finalRedirect
+      finalRedirect,
+      usePKCE
     );
 
     res.json({
@@ -123,6 +139,167 @@ export const getOAuthUrlHandler = async (req: Request, res: Response): Promise<v
     res.status(400).json({
       success: false,
       error: error.message || 'Failed to generate OAuth URL',
+    });
+  }
+};
+
+/**
+ * Complete OAuth flow - exchange authorization code for tokens
+ * POST /auth/oauth/complete
+ */
+export const completeOAuthHandler = async (req: Request, res: Response): Promise<void> => {
+  try {
+    // Rate limit by IP
+    const ip = getClientIp(req);
+    const now = Date.now();
+    const entry = oauthCompleteRateLimit.get(ip);
+    if (!entry || now - entry.windowStart >= OAUTH_COMPLETE_RATE_LIMIT_WINDOW_MS) {
+      oauthCompleteRateLimit.set(ip, { count: 1, windowStart: now });
+    } else {
+      entry.count += 1;
+      oauthCompleteRateLimit.set(ip, entry);
+      if (entry.count > OAUTH_COMPLETE_RATE_LIMIT_MAX) {
+        const retryAfterSec = Math.ceil((OAUTH_COMPLETE_RATE_LIMIT_WINDOW_MS - (now - entry.windowStart)) / 1000);
+        res.status(429).json({
+          success: false,
+          error: 'Too many requests',
+        });
+        return;
+      }
+    }
+
+    const { provider, code, state } = req.body;
+
+    // Validate provider
+    if (!provider || provider !== 'google') {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid provider',
+      });
+      return;
+    }
+
+    // Validate code
+    if (!code || typeof code !== 'string' || code.length < 10) {
+      res.status(400).json({
+        success: false,
+        error: 'Authorization code is required',
+      });
+      return;
+    }
+
+    let codeVerifier: string | undefined;
+    let redirectUri: string | undefined;
+
+    // If state is provided, validate and get PKCE data from Redis
+    if (state) {
+      const { redisConnection } = await import('@/config/infrastructure/queues');
+      const stateKey = `oauth_state:${state}`;
+
+      try {
+        const stateDataStr = await redisConnection.get(stateKey);
+
+        if (!stateDataStr) {
+          res.status(400).json({
+            success: false,
+            error: 'Invalid or expired state',
+          });
+          return;
+        }
+
+        const stateData = JSON.parse(stateDataStr) as {
+          code_verifier: string;
+          redirect_uri: string;
+          provider: string;
+          created_at: string;
+        };
+
+        // Validate provider matches
+        if (stateData.provider !== provider) {
+          res.status(400).json({
+            success: false,
+            error: 'Invalid or expired state',
+          });
+          return;
+        }
+
+        // Check expiration (10 minutes)
+        const createdAt = new Date(stateData.created_at).getTime();
+        const now = Date.now();
+        const age = now - createdAt;
+
+        if (age > 600000) { // 10 minutes in milliseconds
+          // Delete expired state
+          await redisConnection.del(stateKey);
+          res.status(400).json({
+            success: false,
+            error: 'Invalid or expired state',
+          });
+          return;
+        }
+
+        codeVerifier = stateData.code_verifier;
+        redirectUri = stateData.redirect_uri;
+
+        // Delete state after use (one-time use)
+        await redisConnection.del(stateKey);
+
+        logger.info('[AUTH] OAuth state validated and removed', {
+          state: state.substring(0, 8) + '...',
+          provider,
+        });
+      } catch (redisError) {
+        logger.error('[AUTH] Failed to get OAuth state from Redis', {
+          error: redisError instanceof Error ? redisError.message : String(redisError),
+          state: state.substring(0, 8) + '...',
+        });
+        res.status(500).json({
+          success: false,
+          error: 'OAuth exchange failed',
+        });
+        return;
+      }
+    }
+
+    // Exchange code for tokens
+    const result = await exchangeCodeForSession(code, codeVerifier, redirectUri);
+
+    res.json({
+      success: true,
+      data: {
+        tokens: {
+          access_token: result.tokens.access_token,
+          refresh_token: result.tokens.refresh_token,
+          expires_in: result.tokens.expires_in,
+        },
+        user: {
+          id: result.user.id,
+          email: result.user.email,
+          name: result.user.name,
+          avatar: result.user.avatar,
+          role: result.user.role,
+        },
+      },
+    });
+  } catch (error: any) {
+    logger.error('OAuth complete error', error);
+
+    // Handle specific error cases
+    const errorMessage = error.message || 'OAuth exchange failed';
+
+    if (errorMessage.includes('Invalid authorization code') ||
+      errorMessage.includes('code already used') ||
+      errorMessage.includes('expired')) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid authorization code',
+      });
+      return;
+    }
+
+    res.status(500).json({
+      success: false,
+      error: errorMessage,
     });
   }
 };

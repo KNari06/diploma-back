@@ -2,6 +2,7 @@ import { asyncHandler, handleValidationError } from '@/utils/core/error-handler'
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import {
+  completeOAuthHandler,
   getOAuthUrlHandler,
   login,
   logout,
@@ -48,6 +49,12 @@ const passwordUpdateSchema = z.object({
 
 const updateProfileSchema = z.object({
   name: z.string().min(1, 'Name is required').max(255, 'Name must be less than 255 characters'),
+});
+
+const completeOAuthSchema = z.object({
+  provider: z.enum(['google'], { errorMap: () => ({ message: 'Provider must be "google"' }) }),
+  code: z.string().min(10, 'Authorization code is required'),
+  state: z.string().optional(),
 });
 
 /**
@@ -248,13 +255,132 @@ router.post('/magic-link', asyncHandler(async (req: Request, res: Response) => {
  *           type: string
  *           format: uri
  *         description: URL для редиректа после OAuth
+ *       - in: query
+ *         name: use_pkce
+ *         schema:
+ *           type: boolean
+ *         description: Использовать PKCE flow (для desktop приложений)
  *     responses:
- *       302:
- *         description: Редирект на OAuth провайдера
+ *       200:
+ *         description: OAuth URL сгенерирован
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     url:
+ *                       type: string
+ *                       example: "https://accounts.google.com/o/oauth2/v2/auth?..."
+ *                     state:
+ *                       type: string
+ *                       description: State token (только при use_pkce=true)
  *       400:
  *         description: Неверный провайдер
  */
 router.get('/oauth/:provider', asyncHandler(getOAuthUrlHandler));
+
+/**
+ * @swagger
+ * /api/v1/auth/oauth/complete:
+ *   post:
+ *     summary: Завершить OAuth flow
+ *     description: Обменяет authorization code на access/refresh токены (для desktop приложений с PKCE)
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - provider
+ *               - code
+ *             properties:
+ *               provider:
+ *                 type: string
+ *                 enum: [google]
+ *                 example: "google"
+ *                 description: OAuth провайдер
+ *               code:
+ *                 type: string
+ *                 example: "4/0AeanS..."
+ *                 description: Authorization code от OAuth провайдера
+ *               state:
+ *                 type: string
+ *                 example: "abc123xyz..."
+ *                 description: State token (опционально, но рекомендуется для PKCE)
+ *     responses:
+ *       200:
+ *         description: Токены получены успешно
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     tokens:
+ *                       type: object
+ *                       properties:
+ *                         access_token:
+ *                           type: string
+ *                           example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+ *                         refresh_token:
+ *                           type: string
+ *                           example: "v1.abc123..."
+ *                         expires_in:
+ *                           type: number
+ *                           example: 3600
+ *                     user:
+ *                       type: object
+ *                       properties:
+ *                         id:
+ *                           type: string
+ *                           format: uuid
+ *                         email:
+ *                           type: string
+ *                         name:
+ *                           type: string
+ *                         avatar:
+ *                           type: string
+ *                           nullable: true
+ *                         role:
+ *                           type: string
+ *       400:
+ *         description: Ошибка валидации или неверный код
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Invalid authorization code"
+ *       500:
+ *         description: Ошибка обмена токенов
+ */
+router.post('/oauth/complete', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = completeOAuthSchema.parse(req.body);
+    req.body = validatedData;
+    await completeOAuthHandler(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
 
 /**
  * @swagger
