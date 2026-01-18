@@ -39,6 +39,22 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
         ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
       });
     }
+  } else if (process.env.FRONTEND_URL && process.env.FRONTEND_URL.trim().length > 0) {
+    // Safe fallback: allow a single configured frontend origin if provided explicitly
+    corsOrigin = [process.env.FRONTEND_URL.trim()];
+  } else {
+    /**
+     * IMPORTANT:
+     * If ALLOWED_ORIGINS is not configured in production, blocking all origins will break Socket.IO handshake
+     * for any cross-origin frontend deployments (e.g. app subdomain → api root domain).
+     *
+     * Since we enforce JWT auth at the Socket.IO middleware level, allowing all origins here is acceptable
+     * as a resilience default; set ALLOWED_ORIGINS to tighten it.
+     */
+    corsOrigin = true;
+    logger.warn('[WebSocket] ALLOWED_ORIGINS not set; allowing all origins for Socket.IO', {
+      note: 'Set ALLOWED_ORIGINS (comma-separated) to restrict CORS in production',
+    });
   }
 
   // Optimize transport configuration:

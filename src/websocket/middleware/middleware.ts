@@ -20,7 +20,13 @@ export const authenticateSocket = async (
     // Get token from auth handshake or query params
     const authToken = socket.handshake.auth?.token as string | undefined;
     const queryToken = socket.handshake.query?.token as string | undefined;
-    const token = authToken || queryToken;
+    const headerAuth = socket.handshake.headers?.authorization as string | undefined;
+    const headerToken =
+      headerAuth && typeof headerAuth === 'string' && headerAuth.startsWith('Bearer ')
+        ? headerAuth.replace('Bearer ', '')
+        : undefined;
+
+    const token = authToken || queryToken || headerToken;
 
     // Validate token exists and is a string
     if (!token || typeof token !== 'string' || token.trim().length === 0) {
@@ -28,6 +34,7 @@ export const authenticateSocket = async (
         socketId: socket.id,
         hasAuthToken: !!authToken,
         hasQueryToken: !!queryToken,
+        hasHeaderToken: !!headerToken,
         origin: socket.handshake.headers?.origin,
         userAgent: socket.handshake.headers?.['user-agent'],
       });
