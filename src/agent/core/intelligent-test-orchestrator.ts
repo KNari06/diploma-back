@@ -153,7 +153,7 @@ export class IntelligentTestOrchestrator {
     // Initialize progress emitter if testId is provided
     if (this.testId) {
       const browser = this.config.browser || 'chrome';
-      this.progressEmitter = new TestProgressEmitter(this.testId, browser, this.userId);
+      this.progressEmitter = new TestProgressEmitter(this.testId, browser, this.userId, this.config.chatSessionId);
     }
   }
 
@@ -958,6 +958,7 @@ export class IntelligentTestOrchestrator {
         status: 'running',
         timestamp: new Date().toISOString(),
         userId: this.userId, // Include userId for WebSocket user room broadcast
+        sessionId: this.config.chatSessionId,
       });
     }
 
@@ -1059,6 +1060,7 @@ export class IntelligentTestOrchestrator {
         status: 'running',
         timestamp: new Date().toISOString(),
         userId: this.userId, // Include userId for WebSocket user room broadcast
+        sessionId: this.config.chatSessionId,
       });
     }
 
@@ -1101,6 +1103,7 @@ export class IntelligentTestOrchestrator {
         status: 'running',
         timestamp: new Date().toISOString(),
         userId: this.userId, // Include userId for WebSocket user room broadcast
+        sessionId: this.config.chatSessionId,
       });
     }
 
@@ -1229,6 +1232,7 @@ export class IntelligentTestOrchestrator {
         status: 'running',
         timestamp: new Date().toISOString(),
         userId: this.userId, // Include userId for WebSocket user room broadcast
+        sessionId: this.config.chatSessionId,
       });
     }
 
@@ -1370,6 +1374,7 @@ export class IntelligentTestOrchestrator {
           status: actionExecution.main.success ? 'running' : 'failed',
             timestamp: new Date().toISOString(),
           userId: this.userId,
+          sessionId: this.config.chatSessionId,
           });
         }
 
@@ -3956,9 +3961,16 @@ export class IntelligentTestOrchestrator {
           fullGraph: normalized.fullGraph,
         },
         timestamp: new Date().toISOString(),
+        sessionId: this.config.chatSessionId,
       };
 
-      webSocketService.emitToUser(this.userId, 'test:graph-update', payload);
+      // ✅ Use centralized emitter for proper routing (test room + chat room)
+      webSocketService.emitTestGraphUpdate(this.testId, payload as any);
+
+      // Backward compatibility: if no chat session, still emit to user room
+      if (!this.config.chatSessionId) {
+        webSocketService.emitToUser(this.userId, 'test:graph-update', payload);
+      }
     } catch (error) {
       logger.error('[INTELLIGENT_ORCHESTRATOR] Failed to emit graph update', {
         testId: this.testId,

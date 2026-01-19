@@ -31,7 +31,7 @@ import { NetworkTracker } from './collectors/network-tracker';
 import { SnapshotCollector } from './collectors/snapshot-collector';
 import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
-import { PageWatcher, type NewPageInfo } from './execution/page-watcher';
+import { PageWatcher } from './execution/page-watcher';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
 import type { AICommand, AIDecision, ActionOutcome, CollectedError, ExecutionResult, FunnelPhaseType, GoalContext, GoalGuidance, LiteElement, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, RecoveryPoint, StateDiff, VisionHints } from './lite-types';
@@ -127,7 +127,8 @@ export class LiteEngine {
     this.progressEmitter = new TestProgressEmitter(
       config.testId,
       config.browser || 'chrome',
-      config.userId
+      config.userId,
+      config.chatSessionId
     );
 
     logger.info('[LITE_ENGINE] Initialized', {
@@ -1198,10 +1199,10 @@ export class LiteEngine {
               });
 
               const auditResult = await withCancellation(
-              this.config.testId,
-              this.goalDetector.auditDone(goalContext, this.state.getLastOutcome()),
-              'goalDetector.auditDone'
-            );
+                this.config.testId,
+                this.goalDetector.auditDone(goalContext, this.state.getLastOutcome()),
+                'goalDetector.auditDone'
+              );
 
               // ✅ NEW: Trace auditor response
               this.traceWriter.write({
@@ -1242,6 +1243,8 @@ export class LiteEngine {
                     currentStep: `🚫 ${blockedReason}`,
                     status: 'failed',
                     timestamp: new Date().toISOString(),
+                    userId: this.config.userId,
+                    sessionId: this.config.chatSessionId,
                   });
                 } catch {
                   // Ignore WebSocket errors
@@ -1374,63 +1377,63 @@ export class LiteEngine {
           } else {
             // Recovery didn't help, try AI fallback
             logger.info('[LITE_ENGINE] Recovery failed, trying AI fallback', {
-            testId: this.config.testId,
-            consecutiveStuckCount: this.state.getConsecutiveStuckCount(),
-            iteration: i,
-          });
-
-          try {
-            const stuckEval = await withCancellation(
-              this.config.testId,
-              this.goalDetector.evaluateForStuckRecovery(goalContext),
-              'goalDetector.evaluateForStuckRecovery'
-            );
-
-            if (stuckEval?.nextSubgoal) {
-              // Store guidance for next iterations
-              this.currentGuidance = {
-                guidance: stuckEval.reason || '',
-                nextSubgoal: stuckEval.nextSubgoal,
-                addedAtIteration: i,
-              };
-
-              // Reset stuck counter since we got new guidance
-              this.state.resetConsecutiveStuckCount();
-
-              logger.info('[LITE_ENGINE] Got AI guidance for stuck recovery', {
-                testId: this.config.testId,
-                nextSubgoal: stuckEval.nextSubgoal.slice(0, 50),
-                progressScore: Math.round(stuckEval.progressScore * 100) + '%',
-              });
-            } else {
-                // AI fallback didn't help - try direct URL fallback
-              const urlFallbackResult = await this.tryDirectUrlFallback(snapshotBefore.url);
-              if (urlFallbackResult.navigated) {
-                logger.info('[LITE_ENGINE] Direct URL fallback successful', {
-                  testId: this.config.testId,
-                  newUrl: urlFallbackResult.finalUrl,
-                });
-                // Re-collect snapshot after navigation
-                snapshotBefore = await SnapshotCollector.collect(this.page);
-                // Reset stuck counter since we made progress
-                this.state.resetConsecutiveStuckCount();
-              }
-            }
-          } catch (stuckError) {
-            // Check if cancelled
-            if (stuckError instanceof Error && stuckError.message.includes('cancelled')) {
-              logger.info('[LITE_ENGINE] Test cancelled during stuck recovery', {
-                testId: this.config.testId,
-              });
-              this.emitCompletion(false, 'Test cancelled by user');
-              await this.flushPendingGraphScreenshotUploads();
-              return await this.buildResult(false, 'Test cancelled by user');
-            }
-            // If AI fallback failed, just continue with regular flow
-            logger.warn('[LITE_ENGINE] Stuck recovery AI fallback failed, continuing', {
               testId: this.config.testId,
-              error: stuckError instanceof Error ? stuckError.message : String(stuckError),
+              consecutiveStuckCount: this.state.getConsecutiveStuckCount(),
+              iteration: i,
             });
+
+            try {
+              const stuckEval = await withCancellation(
+                this.config.testId,
+                this.goalDetector.evaluateForStuckRecovery(goalContext),
+                'goalDetector.evaluateForStuckRecovery'
+              );
+
+              if (stuckEval?.nextSubgoal) {
+                // Store guidance for next iterations
+                this.currentGuidance = {
+                  guidance: stuckEval.reason || '',
+                  nextSubgoal: stuckEval.nextSubgoal,
+                  addedAtIteration: i,
+                };
+
+                // Reset stuck counter since we got new guidance
+                this.state.resetConsecutiveStuckCount();
+
+                logger.info('[LITE_ENGINE] Got AI guidance for stuck recovery', {
+                  testId: this.config.testId,
+                  nextSubgoal: stuckEval.nextSubgoal.slice(0, 50),
+                  progressScore: Math.round(stuckEval.progressScore * 100) + '%',
+                });
+              } else {
+                // AI fallback didn't help - try direct URL fallback
+                const urlFallbackResult = await this.tryDirectUrlFallback(snapshotBefore.url);
+                if (urlFallbackResult.navigated) {
+                  logger.info('[LITE_ENGINE] Direct URL fallback successful', {
+                    testId: this.config.testId,
+                    newUrl: urlFallbackResult.finalUrl,
+                  });
+                  // Re-collect snapshot after navigation
+                  snapshotBefore = await SnapshotCollector.collect(this.page);
+                  // Reset stuck counter since we made progress
+                  this.state.resetConsecutiveStuckCount();
+                }
+              }
+            } catch (stuckError) {
+              // Check if cancelled
+              if (stuckError instanceof Error && stuckError.message.includes('cancelled')) {
+                logger.info('[LITE_ENGINE] Test cancelled during stuck recovery', {
+                  testId: this.config.testId,
+                });
+                this.emitCompletion(false, 'Test cancelled by user');
+                await this.flushPendingGraphScreenshotUploads();
+                return await this.buildResult(false, 'Test cancelled by user');
+              }
+              // If AI fallback failed, just continue with regular flow
+              logger.warn('[LITE_ENGINE] Stuck recovery AI fallback failed, continuing', {
+                testId: this.config.testId,
+                error: stuckError instanceof Error ? stuckError.message : String(stuckError),
+              });
             }
           }
         }
@@ -1651,6 +1654,8 @@ export class LiteEngine {
                   currentStep: `🚫 ${blockedReason}`,
                   status: 'failed',
                   timestamp: new Date().toISOString(),
+                  userId: this.config.userId,
+                  sessionId: this.config.chatSessionId,
                 });
               } catch {
                 // Ignore WebSocket errors
@@ -1745,6 +1750,8 @@ export class LiteEngine {
                 currentStep: `🚫 ${reason}`,
                 status: 'failed', // Use 'failed' for blocked state
                 timestamp: new Date().toISOString(),
+                userId: this.config.userId,
+                sessionId: this.config.chatSessionId,
               });
             } catch {
               // Ignore WebSocket errors
@@ -2356,7 +2363,7 @@ export class LiteEngine {
     if (this.isTestCompleted || this.isFinalizing) {
       return;
     }
-    if (TestRunRegistry.shouldSilenceEvents(this.config.testId)) {
+    if (TestRunRegistry.shouldSilenceEventsByTestId(this.config.testId)) {
       return;
     }
 
@@ -2366,14 +2373,14 @@ export class LiteEngine {
         outcome === 'state_changed'
           ? '✅'
           : outcome === 'validation_error'
-          ? '⚠️'
-          : outcome === 'rate_limited'
-          ? '⏳'
-          : outcome === 'no_effect'
-          ? '➖'
-          : outcome === 'critical_error'
-          ? '🔴'
-          : '❌';
+            ? '⚠️'
+            : outcome === 'rate_limited'
+              ? '⏳'
+              : outcome === 'no_effect'
+                ? '➖'
+                : outcome === 'critical_error'
+                  ? '🔴'
+                  : '❌';
 
       this.progressEmitter.emit({
         progress: Math.min(90, progress),
@@ -2797,15 +2804,15 @@ export class LiteEngine {
 
             let traceFileId: string | undefined;
             try {
-            const { id } = await insertTraceFileRecord({
-              userId,
-              testId,
-              fileName,
-              storagePath,
-              fileSize,
-              browser: 'lite-trace-log',
-              status: 'uploaded',
-            });
+              const { id } = await insertTraceFileRecord({
+                userId,
+                testId,
+                fileName,
+                storagePath,
+                fileSize,
+                browser: 'lite-trace-log',
+                status: 'uploaded',
+              });
               traceFileId = id;
             } catch (insertError) {
               // Prevent orphan files in Storage if DB insert fails (best-effort cleanup)
@@ -2861,8 +2868,8 @@ export class LiteEngine {
             const { storagePath } = await uploadLiteTraceLogToStorageAnonymous(traceFilePath, fileName);
 
             logger.info('[LITE_ENGINE] Trace log uploaded for non-UUID run (no DB record)', {
-          testId,
-          userId: userId?.substring(0, 20) || 'undefined',
+              testId,
+              userId: userId?.substring(0, 20) || 'undefined',
               storagePath,
               runId,
             });
@@ -3053,8 +3060,8 @@ export class LiteEngine {
 
     // Check if we "flew away" from expected path
     const flewAway = currentUrlNormalized !== originalUrlNormalized &&
-                     recoveryUrlNormalized &&
-                     currentUrlNormalized !== recoveryUrlNormalized;
+      recoveryUrlNormalized &&
+      currentUrlNormalized !== recoveryUrlNormalized;
 
     if (flewAway && recoveryPoint) {
       try {
@@ -3271,7 +3278,7 @@ export class LiteEngine {
     }
 
     // ✅ FIX: Check TestRunRegistry for global cancellation/completion
-    if (TestRunRegistry.shouldSilenceEvents(this.config.testId)) {
+    if (TestRunRegistry.shouldSilenceEventsByTestId(this.config.testId)) {
       logger.debug('[LITE_ENGINE] Skipping graph emit - registry says silence events', {
         testId: this.config.testId,
       });
@@ -3318,10 +3325,16 @@ export class LiteEngine {
           fullGraph: normalized.fullGraph,
         },
         timestamp: new Date().toISOString(),
+        sessionId: this.config.chatSessionId, // Chat session for routing isolation
       };
 
-      // Emit to user room (like Pro)
-      webSocketService.emitToUser(this.config.userId, 'test:graph-update', payload);
+      // ✅ Use webSocketService.emitTestGraphUpdate for proper routing (test room + chat room)
+      webSocketService.emitTestGraphUpdate(this.config.testId, payload as any);
+
+      // Fallback: also emit to user room if no sessionId (backward compatibility)
+      if (!this.config.chatSessionId) {
+        webSocketService.emitToUser(this.config.userId, 'test:graph-update', payload);
+      }
 
       logger.debug('[LITE_ENGINE] Graph update emitted', {
         testId: this.config.testId,
@@ -3330,6 +3343,7 @@ export class LiteEngine {
         hasNewEdge: !!normalized.newEdge,
         hasUpdatedNode: !!normalized.updatedNode,
         hasFullGraph: !!normalized.fullGraph,
+        hasSessionId: !!this.config.chatSessionId,
       });
     } catch (error) {
       logger.error('[LITE_ENGINE] Failed to emit graph update', {

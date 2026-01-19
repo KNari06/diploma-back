@@ -3,7 +3,7 @@
  */
 
 import { supabaseAdmin } from '../src/db/supabase';
-import { logger } from '../src/utils/logger';
+import { logger } from '../src/utils/core/logger';
 
 const EMAIL = process.argv[2] || 'baukaa@gmail.com';
 
@@ -11,28 +11,7 @@ async function verifyCredits(): Promise<void> {
   try {
     logger.info('[VERIFY] Checking credits for...', { email: EMAIL });
 
-    // Direct SQL query to check user_credits
-    const { data: creditsData, error: creditsError } = await supabaseAdmin
-      .rpc('exec_sql', {
-        query: `
-          SELECT
-            u.id as user_id,
-            u.email,
-            u.credits as users_table_credits,
-            uc.id as user_credits_id,
-            uc.credits_balance,
-            uc.total_purchased,
-            uc.total_used,
-            uc.subscription_plan,
-            uc.subscription_status,
-            uc.updated_at
-          FROM users u
-          LEFT JOIN user_credits uc ON uc.user_id = u.id
-          WHERE u.email = '${EMAIL}'
-        `
-      });
-
-    // Alternative: use direct select
+    // Get user from users table
     const { data: user } = await supabaseAdmin
       .from('users')
       .select('id, email, credits')
@@ -86,7 +65,10 @@ async function verifyCredits(): Promise<void> {
         throw createError;
       }
 
-      logger.info('[VERIFY] ✅ Created user_credits with 1000 credits');
+      logger.info('[VERIFY] ✅ Created user_credits with 1000 credits', {
+        userCreditsId: newCredits?.id,
+        creditsBalance: newCredits?.credits_balance,
+      });
     } else if (userCredits.credits_balance === 0) {
       logger.warn('[VERIFY] ⚠️ Balance is 0, updating to 1000...');
 

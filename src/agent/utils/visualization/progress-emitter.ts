@@ -26,6 +26,7 @@ export class TestProgressEmitter {
   private testId: string;
   private browser: string;
   private userId?: string;
+  private sessionId?: string; // Chat session for routing isolation
   private startTime: number;
   private totalActions: number = 0;
   private lastLoggedPhase: string = '';
@@ -35,16 +36,18 @@ export class TestProgressEmitter {
   private lastEmitTime: number = 0;
   private EMIT_THROTTLE_MS: number = 300; // Min 300ms between emits
 
-  constructor(testId: string, browser: string, userId?: string) {
+  constructor(testId: string, browser: string, userId?: string, sessionId?: string) {
     this.testId = testId;
     this.browser = browser;
     this.userId = userId;
+    this.sessionId = sessionId;
     this.startTime = Date.now();
 
     logger.info('[PROGRESS] Test progress tracking started', {
       testId,
       browser,
       userId,
+      sessionId,
     });
   }
 
@@ -122,6 +125,7 @@ export class TestProgressEmitter {
         elapsedTime,
         estimatedRemaining,
         userId: this.userId,
+        sessionId: this.sessionId, // Chat session for routing isolation
         diff: params.diff, // State diff for frontend highlighting
       });
 

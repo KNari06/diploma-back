@@ -20,6 +20,7 @@ export function buildIntelligentTestConfig(
     goal,
     startUrl: testData.url,
     browser: testData.browser,
+    chatSessionId: testData.chatSessionId,
     credentials: testData.options?.credentials,
     userContext: {
       projectId: testData.projectId,

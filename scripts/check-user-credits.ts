@@ -6,7 +6,7 @@
  */
 
 import { supabaseAdmin } from '../src/db/supabase';
-import { logger } from '../src/utils/logger';
+import { logger } from '../src/utils/core/logger';
 
 const EMAIL = process.argv[2] || 'baukaa@gmail.com';
 

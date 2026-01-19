@@ -1,7 +1,7 @@
 import { VideoStreamRegistry } from '@/agent/playwright/artifacts/video-stream-registry';
-import { TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
+import { createRunKey, TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { env } from '@/config/environment/env';
-import { connection, QUEUE_NAMES } from '@/config/infrastructure/queues';
+import { connection, QUEUE_NAMES, testRunQueue } from '@/config/infrastructure/queues';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
 import { logger } from '@/utils/core/logger';
@@ -30,6 +30,7 @@ const queueConcurrency = Math.max(1, Math.min(100, getValidatedConcurrency())); 
 // ✅ FIX: Increased lockDuration to 6 minutes (> Lite timeout of 5 min) to prevent false stalled detection
 const workerOptions = {
   connection,
+  prefix: env.QUEUE_PREFIX,
   concurrency: queueConcurrency,
   removeOnComplete: { count: 100 },
   removeOnFail: { count: 50 },
@@ -234,25 +235,61 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('stalled', async (jobId) => {
     logger.warn(`⚠️ ${workerName} worker stalled job: ${jobId}`);
 
-    // Abort all test runs and stop video streams when a job stalls
+    // Only abort the specific stalled test run, not all runs
     if (workerName === 'TestRun') {
-      const activeRuns = TestRunRegistry.getCount();
-      const activeStreams = VideoStreamRegistry.getCount();
+      try {
+        // Get the job to extract testId and browser
+        const job = await testRunQueue.getJob(jobId);
+        if (job && job.data) {
+          const { testId, browser } = job.data as { testId?: string; browser?: string };
 
-      if (activeRuns > 0 || activeStreams > 0) {
-        logger.warn('[WORKER] Aborting test runs due to stalled job', {
-          jobId,
-          activeRuns,
-          activeStreams,
-        });
+          if (testId && browser) {
+            const runKey = createRunKey(testId, browser);
 
-        // Abort test runs first (this also stops video streams)
-        await TestRunRegistry.abortAll('error');
+            logger.warn('[WORKER] Aborting only stalled test run', {
+              jobId,
+              testId,
+              browser,
+              runKey,
+            });
 
-        // Stop any remaining video streams
-        if (VideoStreamRegistry.getCount() > 0) {
-          await VideoStreamRegistry.stopAll('stalled');
+            // Abort only the stalled run
+            await TestRunRegistry.abortRun(runKey, 'error', 0);
+
+            // Stop video stream for this run only
+            await VideoStreamRegistry.stopByRunKey(runKey, 'error');
+
+            logger.info('[WORKER] Stalled test run aborted', {
+              jobId,
+              testId,
+              browser,
+              runKey,
+            });
+          } else if (testId) {
+            // Fallback: if browser is missing, abort by testId
+            logger.warn('[WORKER] Aborting stalled test by testId (browser unknown)', {
+              jobId,
+              testId,
+            });
+            await TestRunRegistry.abortByTestId(testId, 'error', 0);
+            await VideoStreamRegistry.stopByTestId(testId, 'error');
+          } else {
+            logger.warn('[WORKER] Stalled job missing testId, cannot abort specific run', {
+              jobId,
+              jobData: JSON.stringify(job.data).substring(0, 200),
+            });
+          }
+        } else {
+          logger.warn('[WORKER] Could not retrieve stalled job data', {
+            jobId,
+            hasJob: !!job,
+          });
         }
+      } catch (error) {
+        logger.error('[WORKER] Error handling stalled job', {
+          jobId,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
   });

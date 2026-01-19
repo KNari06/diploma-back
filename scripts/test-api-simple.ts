@@ -12,8 +12,7 @@
  *   npx ts-node -r tsconfig-paths/register scripts/test-api-simple.ts https://jsonplaceholder.typicode.com/users POST
  */
 
-import { executeApiTest } from '@/services/testing/api/apiTest.service';
-import { logger } from '@/utils/logger';
+import { executeApiTest } from '../src/services/testing/api/apiTest.service';
 
 // Parse command line arguments
 const args = process.argv.slice(2);

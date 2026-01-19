@@ -4,7 +4,8 @@ import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { AgentResponse, TestJobData } from '@/types';
 import { calculateRetryDelay, handleAgentError, shouldRetry } from '@/utils/core/error-handler';
-import { logger, logQueueEvent } from '@/utils/core/logger';
+import { logQueueEvent, logger } from '@/utils/core/logger';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import {
   ResultErrorPayload,
   ResultReadyPayload,
@@ -14,7 +15,6 @@ import {
   TestFailedPayload,
   TestStartedPayload,
 } from '@/websocket/types/types';
-import { webSocketService } from '@/websocket/core/websocket.service';
 import { Job } from 'bullmq';
 
 // Constants
@@ -379,8 +379,8 @@ export class ManualTestRunJobHandler {
         network_logs: result.networkLogs || [],
         errors: result.errors || [],
         performance: result.performance,
-        video_url: result.videoUrl, // ✅ NEW: Save video URL to test_results
-        trace_url: result.traceUrl, // ✅ NEW: Save trace URL to test_results
+        video_url: result.videoUrl, // Supabase Storage URL
+        trace_url: result.traceUrl, // Supabase Storage URL
         completed_at: new Date().toISOString(),
       });
 
@@ -499,8 +499,8 @@ export class ManualTestRunJobHandler {
       network_logs: result?.networkLogs || [],
       errors: result?.errors || [],
       performance: result?.performance,
-      video_url: result?.videoUrl, // ✅ NEW: Save video URL to test_results (even for failed tests)
-      trace_url: result?.traceUrl, // ✅ NEW: Save trace URL to test_results (even for failed tests)
+      video_url: result?.videoUrl, // Supabase Storage URL (even for failed tests)
+      trace_url: result?.traceUrl, // Supabase Storage URL (even for failed tests)
       completed_at: new Date().toISOString(),
     });
 

@@ -7,9 +7,9 @@
  *   npx ts-node -r tsconfig-paths/register scripts/test-api-flow.ts
  */
 
-import { executeApiTest } from '@/services/testing/api/apiTest.service';
-import { ApiTestPlanService } from '@/services/testing/api/api-test-plan.service';
-import { logger } from '@/utils/logger';
+import { ApiTestPlanService } from '../src/services/testing/api/api-test-plan.service';
+import { executeApiTest } from '../src/services/testing/api/apiTest.service';
+import { logger } from '../src/utils/core/logger';
 
 // Test scenarios
 const TEST_SCENARIOS = [

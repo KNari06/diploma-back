@@ -370,6 +370,8 @@ export interface LiteEngineConfig {
   timeout?: number;
   /** User-provided credentials for login (SECURE: never sent to LLM, only used for field filling) */
   credentials?: LiteCredentials;
+  /** Chat session ID for WebSocket routing isolation */
+  chatSessionId?: string;
 }
 
 /**

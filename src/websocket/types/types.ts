@@ -138,6 +138,7 @@ export interface TestProgressPayload {
   elapsedTime?: number; // Milliseconds since test start
   estimatedRemaining?: number; // Estimated milliseconds remaining
   diff?: StateDiffSummary; // State diff for frontend highlighting
+  sessionId?: string; // Chat session ID for routing isolation
 }
 
 export interface TestStepCompletedPayload {
@@ -221,6 +222,7 @@ export interface TestGraphUpdatePayload {
     };
   };
   timestamp: string;
+  sessionId?: string; // Chat session ID for routing isolation
 }
 
 export interface TestBrowserCompletedPayload {
@@ -271,6 +273,7 @@ export interface TestVideoFramePayload {
   testId: string;
   browser: string;
   sessionId: string; // Unique stream ID (per worker run)
+  chatSessionId?: string; // Chat session ID for routing isolation
   seq: number; // Monotonic frame number
   format: 'jpeg';
   data: string; // base64 without prefix
@@ -288,6 +291,7 @@ export interface TestVideoFramePayload {
 export interface TestVideoStatsPayload {
   testId: string;
   sessionId: string;
+  chatSessionId?: string; // Chat session ID for routing isolation
   currentFPS: number;
   framesEmitted: number;
   framesDropped: number;
@@ -303,6 +307,7 @@ export interface TestVideoStatsPayload {
 export interface TestVideoPausedPayload {
   testId: string;
   sessionId: string;
+  chatSessionId?: string; // Chat session ID for routing isolation
   reason: 'backpressure' | 'redis_timeout' | 'circuit_breaker';
   timestamp: string;
 }
@@ -314,6 +319,7 @@ export interface TestVideoPausedPayload {
 export interface TestVideoResumedPayload {
   testId: string;
   sessionId: string;
+  chatSessionId?: string; // Chat session ID for routing isolation
   timestamp: string;
 }
 
@@ -324,6 +330,7 @@ export interface TestVideoResumedPayload {
 export interface TestVideoStoppedPayload {
   testId: string;
   sessionId: string;
+  chatSessionId?: string; // Chat session ID for routing isolation
   reason: 'completed' | 'cancelled' | 'error' | 'timeout';
   timestamp: string;
 }
@@ -334,6 +341,7 @@ export interface TestVideoStoppedPayload {
  */
 export interface TestVideoUnavailablePayload {
   testId: string;
+  chatSessionId?: string; // Chat session ID for routing isolation
   reason: string; // Error message
   timestamp: string;
 }
@@ -345,6 +353,7 @@ export interface TestVideoUnavailablePayload {
 export interface TestVideoStartedPayload {
   testId: string;
   sessionId: string;
+  chatSessionId?: string; // Chat session ID for routing isolation
   url: string;
   width: number;
   height: number;

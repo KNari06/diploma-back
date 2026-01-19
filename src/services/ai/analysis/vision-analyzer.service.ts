@@ -3,7 +3,8 @@ import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 
-const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+// ✅ IMPORTANT: Set timeout to prevent hanging Vision calls (matches core OpenAI service).
+const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY, timeout: 60000, maxRetries: 2 });
 
 /**
  * Analyze screenshot using GPT-4o Vision
@@ -134,75 +135,8 @@ export async function analyzeScreenshotWithVision(
 
 /**
  * Build prompt for vision analysis based on scope
+ * @see src/ai/prompts/intelligent-testing-prompts.ts - buildVisionPrompt()
  */
-// Moved to src/ai/prompts/index.ts
-
-// Legacy function for backward compatibility (currently unused)
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function buildVisionPromptLegacy(scope: string, url: string): string {
-  let basePrompt = `Analyze this screenshot of a web page (URL: ${url}).
-
-Your task: Identify all interactive elements and provide testing recommendations.
-
-Focus on: ${scope}
-
-Please analyze and return JSON in this exact format:
-{
-  "elements": [
-    {
-      "type": "input|button|link|select|checkbox|etc",
-      "purpose": "What this element does (e.g., 'email input', 'submit button')",
-      "location": "Where on page (e.g., 'top-left form', 'center of page')",
-      "required": true/false (if applicable)
-    }
-  ],
-  "layout": "Brief description of page layout and structure",
-  "suggestions": [
-    "Specific test case suggestions based on what you see"
-  ]
-}
-
-Important:
-- Identify ALL form fields, buttons, and interactive elements
-- Note which fields appear to be required (asterisk, 'required' label, red border)
-- Suggest specific test cases based on visible elements
-- Pay attention to validation messages, error states, or hints
-- Note any accessibility features (aria labels, alt text)`;
-
-  // Add scope-specific instructions
-  if (scope.toLowerCase().includes('регистрац') || scope.toLowerCase().includes('register')) {
-    basePrompt += `\n\nFor registration forms, specifically identify:
-- Email/username field
-- Password field(s)
-- Confirm password field
-- Any additional required fields
-- Submit button
-- Terms/privacy policy checkboxes
-- Social login buttons`;
-  }
-
-  if (scope.toLowerCase().includes('логин') || scope.toLowerCase().includes('login')) {
-    basePrompt += `\n\nFor login forms, specifically identify:
-- Email/username field
-- Password field
-- "Remember me" checkbox
-- "Forgot password" link
-- Submit button
-- Social login options`;
-  }
-
-  if (scope.toLowerCase().includes('форм') || scope.toLowerCase().includes('form')) {
-    basePrompt += `\n\nFor forms, specifically identify:
-- All input fields and their types
-- Required vs optional fields
-- Validation rules (if visible)
-- Submit and cancel buttons
-- Any file upload fields
-- Dropdown/select fields`;
-  }
-
-  return basePrompt;
-}
 
 /**
  * Analyze multiple screenshots (for multi-page flows)

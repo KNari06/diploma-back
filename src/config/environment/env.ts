@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import dotenv from 'dotenv';
+import os from 'os';
 import { z } from 'zod';
 
 // Load environment variables
@@ -34,6 +35,8 @@ const envSchema = z.object({
   QUEUE_CONCURRENCY: z.string().transform(Number).default('5'),
   QUEUE_RETRY_ATTEMPTS: z.string().transform(Number).default('3'),
   QUEUE_RETRY_DELAY: z.string().transform(Number).default('5000'),
+  // BullMQ prefix (namespace) to avoid cross-environment collisions when sharing Redis
+  QUEUE_PREFIX: z.string().min(1).optional(),
 
   // Agent
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
@@ -86,6 +89,15 @@ if (!parseResult.success) {
 
 // Generate secrets for development if not provided
 const parsedEnv = parseResult.data;
+
+// Set default BullMQ prefix if not provided.
+// IMPORTANT: Must be deterministic across processes on the same host (server + worker),
+// otherwise queues won't match.
+if (!parsedEnv.QUEUE_PREFIX) {
+  parsedEnv.QUEUE_PREFIX = parsedEnv.NODE_ENV === 'production'
+    ? 'qait'
+    : `qait-dev-${os.hostname()}`;
+}
 
 if (parsedEnv.NODE_ENV === 'development') {
   if (!parsedEnv.JWT_SECRET) {

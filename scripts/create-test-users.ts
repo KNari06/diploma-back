@@ -7,7 +7,7 @@
  * 3. Updates public.users with correct credits and subscription
  *
  * Usage:
- *   npm run ts-node scripts/create-test-users.ts
+ *   npm run create-test-users
  *
  * Or compile and run:
  *   npm run build
@@ -15,9 +15,9 @@
  */
 
 import { supabaseAdmin } from '../src/db/supabase';
-import { logger } from '../src/utils/logger';
 import { UserCreditsService } from '../src/services/core/user-credits.service';
 import { WorkspaceService } from '../src/services/core/workspace.service';
+import { logger } from '../src/utils/core/logger';
 
 // Test users configuration
 // All users have: professional plan, 1000 credits

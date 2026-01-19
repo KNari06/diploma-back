@@ -7,9 +7,9 @@
  */
 
 import { supabaseAdmin } from '../src/db/supabase';
-import { logger } from '../src/utils/logger';
 import { UserCreditsService } from '../src/services/core/user-credits.service';
 import { WorkspaceService } from '../src/services/core/workspace.service';
+import { logger } from '../src/utils/core/logger';
 
 const TEST_USER_EMAILS = [
   'test1@qai-test.local',

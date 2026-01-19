@@ -8,8 +8,8 @@
  * 4. Creates user_credits and workspace
  *
  * Usage:
- *   npm run ts-node scripts/create-admin-user.ts
- *   npm run ts-node scripts/create-admin-user.ts admin@qait.dev SecurePassword123
+ *   npm run create-admin-user
+ *   npm run create-admin-user -- admin@qait.dev SecurePassword123 "Admin User"
  *
  * Or compile and run:
  *   npm run build
@@ -17,9 +17,9 @@
  */
 
 import { supabaseAdmin } from '../src/db/supabase';
-import { logger } from '../src/utils/logger';
 import { UserCreditsService } from '../src/services/core/user-credits.service';
 import { WorkspaceService } from '../src/services/core/workspace.service';
+import { logger } from '../src/utils/core/logger';
 
 // Get email and password from command line arguments or use defaults
 const email = process.argv[2] || 'admin@qait.dev';

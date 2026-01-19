@@ -108,7 +108,8 @@ export async function getBrowserWithProgress(testData: TestJobData): Promise<Bro
       icon: getActionIcon(undefined, 'initialization'),
       status: 'running',
       timestamp: new Date().toISOString(),
-      userId: testData.userId, // ✅ FIX: Include userId for user room broadcast
+      userId: testData.userId,
+      sessionId: testData.chatSessionId, // Chat session for routing isolation
     });
   } catch (wsError) {
     // Non-critical: WebSocket errors shouldn't break test execution
@@ -145,7 +146,8 @@ export async function getBrowserWithProgress(testData: TestJobData): Promise<Bro
         icon: getActionIcon(undefined, 'initialization'),
         status: 'running',
         timestamp: new Date().toISOString(),
-        userId: testData.userId, // ✅ FIX: Include userId for user room broadcast
+        userId: testData.userId,
+        sessionId: testData.chatSessionId, // Chat session for routing isolation
       });
     } catch (wsError) {
       // Non-critical: WebSocket errors shouldn't break test execution
@@ -166,10 +168,10 @@ export async function getBrowserWithProgress(testData: TestJobData): Promise<Bro
         phase: 'initialization',
         currentStep: `❌ Failed to launch browser: ${error instanceof Error ? error.message : 'Unknown error'}`,
         icon: getActionIcon(undefined, 'initialization'),
-        // Align with client expectations: 'queued' | 'running' | 'completed' | 'failed'
         status: 'failed',
         timestamp: new Date().toISOString(),
         userId: testData.userId,
+        sessionId: testData.chatSessionId, // Chat session for routing isolation
       });
     } catch (wsError) {
       // Ignore WebSocket errors during error handling

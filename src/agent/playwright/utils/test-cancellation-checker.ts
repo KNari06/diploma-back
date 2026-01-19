@@ -5,25 +5,39 @@ import { logger } from '@/utils/core/logger';
 // Track consecutive DB timeouts per testId
 const dbTimeoutCounter = new Map<string, number>();
 const MAX_CONSECUTIVE_TIMEOUTS = 3;
+// If DB is unstable/unreachable, temporarily disable DB cancellation checks for this testId.
+// We still keep the in-process cancellation fast-path via TestRunRegistry.
+const dbCancelCheckDisabledUntil = new Map<string, number>();
+const DISABLE_DB_CANCEL_CHECK_MS = 60_000; // 60s cooldown
 
 /**
  * Check if test is cancelled and throw error if so
  * ✅ FIX: Added timeout to prevent hanging on DB issues
  * ✅ FIX: Increased timeout to 5s, tracks consecutive timeouts to surface persistent issues
  * ✅ FIX: Also checks in-process registry for immediate cancellation detection
+ * ✅ Uses testId-level methods (checks ALL browser runs for this test)
  */
 export async function checkTestCancelled(testId: string): Promise<void> {
   // 1. Fast path: Check in-process registry first (immediate, no DB call)
-  if (TestRunRegistry.isCancelled(testId)) {
-    // Best-effort: make sure the run is actually aborted (context closed, video stopped)
-    const run = TestRunRegistry.get(testId);
-    if (run && !run.state.isTestCompleted) {
-      await TestRunRegistry.abortTestRun(testId, 'cancelled', 0).catch(() => {});
+  if (TestRunRegistry.isCancelledByTestId(testId)) {
+    // Best-effort: make sure all runs for this test are aborted
+    const runKeys = TestRunRegistry.getRunKeysByTestId(testId);
+    for (const runKey of runKeys) {
+      const run = TestRunRegistry.get(runKey);
+      if (run && !run.state.isTestCompleted) {
+        await TestRunRegistry.abortRun(runKey, 'cancelled', 0).catch(() => { });
+      }
     }
     throw new Error(`Test ${testId} was cancelled`);
   }
 
   try {
+    // If DB cancellation checks are temporarily disabled, skip DB call.
+    const disabledUntil = dbCancelCheckDisabledUntil.get(testId);
+    if (disabledUntil && Date.now() < disabledUntil) {
+      return;
+    }
+
     // 2. Slow path: Check DB for cancellation (with timeout)
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error('Cancellation check timeout')), 5000); // Increased to 5s
@@ -37,10 +51,10 @@ export async function checkTestCancelled(testId: string): Promise<void> {
     dbTimeoutCounter.delete(testId);
 
     if (test?.status === 'cancelled') {
-      // Mark in registry for fast future checks
-      TestRunRegistry.setCancelled(testId);
-      // ✅ Red button: abort immediately in THIS worker process (closes context, stops video)
-      await TestRunRegistry.abortTestRun(testId, 'cancelled', 0).catch(() => {});
+      // Mark in registry for fast future checks (all runs for this test)
+      TestRunRegistry.setCancelledByTestId(testId);
+      // ✅ Red button: abort all runs for this test (closes contexts, stops video)
+      await TestRunRegistry.abortByTestId(testId, 'cancelled', 0).catch(() => { });
       throw new Error(`Test ${testId} was cancelled`);
     }
   } catch (error) {
@@ -60,10 +74,15 @@ export async function checkTestCancelled(testId: string): Promise<void> {
         maxAllowed: MAX_CONSECUTIVE_TIMEOUTS,
       });
 
-      // After N consecutive timeouts, throw to surface the issue
+      // After N consecutive timeouts, disable DB cancellation checks temporarily.
+      // IMPORTANT: This must NOT fail the test run. It only means "remote cancel can't be detected right now".
       if (currentCount >= MAX_CONSECUTIVE_TIMEOUTS) {
         dbTimeoutCounter.delete(testId);
-        throw new Error(`Test ${testId} cancellation check failed: DB unreachable (${currentCount} timeouts)`);
+        dbCancelCheckDisabledUntil.set(testId, Date.now() + DISABLE_DB_CANCEL_CHECK_MS);
+        logger.warn('[PLAYWRIGHT] Disabling DB cancellation checks temporarily', {
+          testId,
+          disableMs: DISABLE_DB_CANCEL_CHECK_MS,
+        });
       }
 
       // Don't block execution on occasional timeouts
@@ -79,10 +98,10 @@ export async function checkTestCancelled(testId: string): Promise<void> {
  * Create a cancellation promise that rejects when test is cancelled
  * Use with Promise.race to add cancellation points to long-running operations
  */
-export function createCancellationPromise(testId: string): Promise<never> {
+export function createCancellationPromise(testId: string, abortSignal?: AbortSignal): Promise<never> {
   return new Promise((_, reject) => {
     // Check immediately
-    if (TestRunRegistry.isCancelled(testId)) {
+    if (TestRunRegistry.isCancelledByTestId(testId)) {
       reject(new Error(`Test ${testId} was cancelled`));
       return;
     }
@@ -98,7 +117,22 @@ export function createCancellationPromise(testId: string): Promise<never> {
     }, 500);
 
     // Clean up interval after 5 minutes (safety limit)
-    setTimeout(() => clearInterval(interval), 5 * 60 * 1000);
+    const cleanupTimeout = setTimeout(() => clearInterval(interval), 5 * 60 * 1000);
+
+    // ✅ CRITICAL FIX: prevent interval leaks.
+    // When the main operation finishes (race resolves), caller will abort this signal.
+    // Without this, intervals accumulate and spam DB + logs, and can starve timers.
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        clearInterval(interval);
+        clearTimeout(cleanupTimeout);
+        return;
+      }
+      abortSignal.addEventListener('abort', () => {
+        clearInterval(interval);
+        clearTimeout(cleanupTimeout);
+      }, { once: true });
+    }
   });
 }
 
@@ -112,11 +146,13 @@ export async function withCancellation<T>(
   operationName?: string
 ): Promise<T> {
   // Fast check before starting
-  if (TestRunRegistry.isCancelled(testId)) {
+  if (TestRunRegistry.isCancelledByTestId(testId)) {
     throw new Error(`Test ${testId} was cancelled`);
   }
 
-  const cancellationPromise = createCancellationPromise(testId);
+  // ✅ FIX: Ensure cancellation polling is disposed when operation settles.
+  const controller = new AbortController();
+  const cancellationPromise = createCancellationPromise(testId, controller.signal);
 
   try {
     return await Promise.race([operation, cancellationPromise]);
@@ -127,6 +163,10 @@ export async function withCancellation<T>(
       });
     }
     throw error;
+  } finally {
+    // Abort polling interval to avoid leaks
+    // (createCancellationPromise listens to this abortSignal)
+    controller.abort();
   }
 }
 
@@ -135,4 +175,5 @@ export async function withCancellation<T>(
  */
 export function cleanupCancellationState(testId: string): void {
   dbTimeoutCounter.delete(testId);
+  dbCancelCheckDisabledUntil.delete(testId);
 }

@@ -16,7 +16,7 @@ import { getBrowserWithProgress, setupBrowserContext } from '../setup/browser-se
 import { buildAllHintsWithMetadata } from '../setup/hints-builder';
 import { buildIntelligentTestConfig } from '../setup/test-config-builder';
 import { checkTestCancelled } from '../utils/test-cancellation-checker';
-import { TestRunRegistry } from './test-run-registry';
+import { createRunKey, TestRunRegistry } from './test-run-registry';
 
 /**
  * Execute Playwright test
@@ -41,6 +41,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   let tracePath: string | undefined;
   let videoStreamService: VideoStreamService | null = null;
 
+  // Create runKey for isolation of parallel browser runs (defined here for access in catch block)
+  const runKey = createRunKey(testData.testId, testData.browser);
+
   try {
     // Pre-flight checks
     await checkTestCancelled(testData.testId);
@@ -54,6 +57,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       projectId: testData.projectId,
       userId: testData.userId,
       retryCount,
+      runKey,
     });
 
     // Setup browser and page
@@ -68,7 +72,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     }
 
     // Register test run in global registry for abort capability
-    TestRunRegistry.register(testData.testId, {
+    TestRunRegistry.register(runKey, testData.testId, testData.browser, {
       context,
       page,
     });
@@ -77,15 +81,23 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     if (testData.browser.toLowerCase().includes('chrome') || testData.browser.toLowerCase().includes('chromium')) {
       try {
         videoStreamService = createVideoStreamService();
-        await videoStreamService.start(page, testData.testId, testData.browser, testData.userId, testData.url);
+        await videoStreamService.start(
+          page,
+          testData.testId,
+          testData.browser,
+          testData.userId,
+          testData.url,
+          testData.chatSessionId
+        );
 
         if (videoStreamService.isActive()) {
-          VideoStreamRegistry.register(testData.testId, videoStreamService);
+          VideoStreamRegistry.register(runKey, videoStreamService);
           // Also update TestRunRegistry with video stream reference
-          TestRunRegistry.update(testData.testId, { videoStreamService });
+          TestRunRegistry.update(runKey, { videoStreamService });
           logger.info('[PLAYWRIGHT] Video streaming started', {
             testId: testData.testId,
             browser: testData.browser,
+            runKey,
           });
         }
       } catch (videoError) {
@@ -124,6 +136,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       status: 'running',
       timestamp: new Date().toISOString(),
       userId: testData.userId,
+      sessionId: testData.chatSessionId, // Chat session for routing isolation
     });
 
     const requestTracker = new RequestTracker(page);
@@ -162,6 +175,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         timeout: 5 * 60 * 1000, // 5 minutes
         // Pass credentials for secure fill (never sent to LLM)
         credentials: testData.options?.credentials,
+        chatSessionId: testData.chatSessionId, // Chat session for routing isolation
       });
 
       const liteResult = await liteEngine.execute();
@@ -305,7 +319,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     if (videoStreamService?.isActive()) {
       try {
         await videoStreamService.stop('completed');
-        VideoStreamRegistry.unregister(testData.testId);
+        VideoStreamRegistry.unregister(runKey);
       } catch (videoError) {
         logger.warn('[PLAYWRIGHT] Failed to stop video streaming', {
           testId: testData.testId,
@@ -342,8 +356,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     });
 
     // Unregister from TestRunRegistry (successful completion)
-    TestRunRegistry.setCompleted(testData.testId);
-    TestRunRegistry.unregister(testData.testId);
+    TestRunRegistry.setCompleted(runKey);
+    TestRunRegistry.unregister(runKey);
 
     // Format and return result
     return formatTestResult(intelligentResult, {
@@ -360,16 +374,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       logger.info('[PLAYWRIGHT] Test was cancelled', {
         testId: testData.testId,
         browser: testData.browser,
+        runKey,
       });
 
       // Mark as cancelled in registry (silences events)
-      TestRunRegistry.setCancelled(testData.testId);
+      TestRunRegistry.setCancelled(runKey);
 
       // Stop video streaming on cancellation
       if (videoStreamService?.isActive()) {
         try {
           await videoStreamService.stop('cancelled');
-          VideoStreamRegistry.unregister(testData.testId);
+          VideoStreamRegistry.unregister(runKey);
         } catch {
           // Ignore cleanup errors
         }
@@ -392,7 +407,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         .catch(() => ({ videoUrl: undefined, traceUrl: undefined }));
 
       // Unregister from TestRunRegistry
-      TestRunRegistry.unregister(testData.testId);
+      TestRunRegistry.unregister(runKey);
 
       return {
         success: false,
@@ -416,6 +431,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     logger.error('Playwright test failed', {
       testId: testData.testId,
       browser: testData.browser,
+      runKey,
       error: error instanceof Error ? {
         message: error.message,
         name: error.name,
@@ -426,13 +442,13 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     });
 
     // Mark as completed in registry (silences events)
-    TestRunRegistry.setCompleted(testData.testId);
+    TestRunRegistry.setCompleted(runKey);
 
     // Stop video streaming on error
     if (videoStreamService?.isActive()) {
       try {
         await videoStreamService.stop('error');
-        VideoStreamRegistry.unregister(testData.testId);
+        VideoStreamRegistry.unregister(runKey);
       } catch {
         // Ignore cleanup errors
       }
@@ -509,7 +525,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       .catch(() => ({ videoUrl: undefined, traceUrl: undefined }));
 
     // Unregister from TestRunRegistry
-    TestRunRegistry.unregister(testData.testId);
+    TestRunRegistry.unregister(runKey);
 
     return {
       success: false,

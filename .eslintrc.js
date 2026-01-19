@@ -3,7 +3,7 @@ module.exports = {
   parserOptions: {
     ecmaVersion: 2022,
     sourceType: 'module',
-    project: './tsconfig.json',
+    project: './tsconfig.eslint.json',
   },
   plugins: ['@typescript-eslint'],
   extends: [
@@ -17,7 +17,7 @@ module.exports = {
     '@typescript-eslint/no-explicit-any': 'off',
     '@typescript-eslint/no-non-null-assertion': 'off',
     '@typescript-eslint/no-var-requires': 'off',
-    
+
     // General rules
     'no-console': 'warn',
     'no-debugger': 'error',
@@ -26,7 +26,7 @@ module.exports = {
     'prefer-const': 'warn',
     'no-var': 'warn',
     'no-undef': 'off',
-    
+
     // Code style - relaxed
     'indent': 'off',
     'quotes': 'off',

@@ -1,6 +1,6 @@
 import { AgentResponse, TestJobData } from '@/types';
 import { handleQueueError } from '@/utils/core/error-handler';
-import { logger, logQueueEvent } from '@/utils/core/logger';
+import { logQueueEvent, logger } from '@/utils/core/logger';
 import { Queue, QueueEvents } from 'bullmq';
 import IORedis from 'ioredis';
 import { env } from '../environment/env';
@@ -105,6 +105,7 @@ export const QUEUE_NAMES = {
 // This prevents double-execution when post-processing fails after successful test completion
 export const testRunQueue = new Queue<TestJobData>(QUEUE_NAMES.TEST_RUN, {
   connection,
+  prefix: env.QUEUE_PREFIX,
   defaultJobOptions: {
     removeOnComplete: 100,
     removeOnFail: 50,
@@ -115,6 +116,7 @@ export const testRunQueue = new Queue<TestJobData>(QUEUE_NAMES.TEST_RUN, {
 // Test result queue - for processing test results
 export const testResultQueue = new Queue<AgentResponse>(QUEUE_NAMES.TEST_RESULT, {
   connection,
+  prefix: env.QUEUE_PREFIX,
   defaultJobOptions: {
     removeOnComplete: 100,
     removeOnFail: 50,
@@ -129,6 +131,7 @@ export const testResultQueue = new Queue<AgentResponse>(QUEUE_NAMES.TEST_RESULT,
 // AI analysis queue - for AI processing
 export const aiAnalysisQueue = new Queue<{ testResultId: string; testId: string }>(QUEUE_NAMES.AI_ANALYSIS, {
   connection,
+  prefix: env.QUEUE_PREFIX,
   defaultJobOptions: {
     removeOnComplete: 50,
     removeOnFail: 25,
@@ -149,6 +152,7 @@ export const notificationQueue = new Queue<{
   data?: any;
 }>(QUEUE_NAMES.NOTIFICATION, {
   connection,
+  prefix: env.QUEUE_PREFIX,
   defaultJobOptions: {
     removeOnComplete: 50,
     removeOnFail: 25,
@@ -168,6 +172,7 @@ export const webhookQueue = new Queue<{
   headers?: Record<string, string>;
 }>(QUEUE_NAMES.WEBHOOK, {
   connection,
+  prefix: env.QUEUE_PREFIX,
   defaultJobOptions: {
     removeOnComplete: 50,
     removeOnFail: 25,
@@ -180,9 +185,9 @@ export const webhookQueue = new Queue<{
 });
 
 // Queue events for monitoring
-export const testRunQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RUN, { connection });
-export const testResultQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RESULT, { connection });
-export const aiAnalysisQueueEvents = new QueueEvents(QUEUE_NAMES.AI_ANALYSIS, { connection });
+export const testRunQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RUN, { connection, prefix: env.QUEUE_PREFIX });
+export const testResultQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RESULT, { connection, prefix: env.QUEUE_PREFIX });
+export const aiAnalysisQueueEvents = new QueueEvents(QUEUE_NAMES.AI_ANALYSIS, { connection, prefix: env.QUEUE_PREFIX });
 
 // Queue event listeners
 testRunQueueEvents.on('completed', (args: { jobId: string; returnvalue: string; prev?: string }) => {

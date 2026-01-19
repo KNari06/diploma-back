@@ -686,6 +686,7 @@ export async function handlePlatformTest(
         intelligentMode: true, // Always intelligent for Lite
         testGoal,
         mode: 'lite' as const,
+        chatSessionId, // Pass chat session ID for WebSocket routing isolation
       };
 
       emitProcessingStepWithLogging(chatSessionId, 'executing_test', '⚙️ Launching browser...', 60);

@@ -132,6 +132,7 @@ export async function runTest(testRequest: TestRunRequest): Promise<ApiResponse<
           intelligentMode: testRequest.intelligentMode,
           testGoal: testRequest.testGoal,
           mode: effectiveMode, // Test execution mode (supports fallback to options.mode)
+          chatSessionId: testRequest.chatSessionId, // Pass chat session ID for WebSocket routing isolation
         });
 
         queuedBrowsers.push(browser);

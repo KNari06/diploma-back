@@ -70,6 +70,7 @@ export class VideoStreamService {
   private browser: string;
   private userId?: string;
   private url: string = '';
+  private chatSessionId?: string;
 
   // Metrics
   private framesEmitted = 0;
@@ -124,7 +125,8 @@ export class VideoStreamService {
     testId: string,
     browser: string,
     userId?: string,
-    url?: string
+    url?: string,
+    chatSessionId?: string
   ): Promise<void> {
     // Only Chrome/Chromium supports CDP screencast
     if (!browser.toLowerCase().includes('chrome') && !browser.toLowerCase().includes('chromium')) {
@@ -136,6 +138,7 @@ export class VideoStreamService {
     this.browser = browser;
     this.userId = userId;
     this.url = url || '';
+    this.chatSessionId = chatSessionId;
     this.sessionId = `${testId}-${process.pid}-${Date.now()}`;
     this.testStartTime = Date.now();
 
@@ -233,6 +236,7 @@ export class VideoStreamService {
       webSocketService.emitTestVideoStarted(testId, {
         testId,
         sessionId: this.sessionId,
+        chatSessionId: this.chatSessionId,
         url: this.url,
         width: VIDEO_STREAM_CONFIG.maxWidth,
         height: Math.round(VIDEO_STREAM_CONFIG.maxWidth * 0.5625), // 16:9 ratio
@@ -258,6 +262,7 @@ export class VideoStreamService {
       // Emit unavailable event
       webSocketService.emitTestVideoUnavailable(testId, {
         testId,
+        chatSessionId: this.chatSessionId,
         reason: error instanceof Error ? error.message : 'Unknown error',
         timestamp: new Date().toISOString(),
       });
@@ -306,6 +311,7 @@ export class VideoStreamService {
       webSocketService.emitTestVideoStopped(this.testId, {
         testId: this.testId,
         sessionId: this.sessionId,
+        chatSessionId: this.chatSessionId,
         reason,
         timestamp: new Date().toISOString(),
       });
@@ -329,7 +335,7 @@ export class VideoStreamService {
     }
 
     // ✅ FIX: Check TestRunRegistry for global cancellation/completion (event silencing)
-    if (TestRunRegistry.shouldSilenceEvents(this.testId)) {
+    if (TestRunRegistry.shouldSilenceEventsByTestId(this.testId)) {
       return;
     }
 
@@ -423,6 +429,7 @@ export class VideoStreamService {
         webSocketService.emitTestVideoResumed(this.testId, {
           testId: this.testId,
           sessionId: this.sessionId,
+          chatSessionId: this.chatSessionId,
           timestamp: new Date().toISOString(),
         });
       }
@@ -436,6 +443,7 @@ export class VideoStreamService {
         webSocketService.emitTestVideoPaused(this.testId, {
           testId: this.testId,
           sessionId: this.sessionId,
+          chatSessionId: this.chatSessionId,
           reason: 'circuit_breaker',
           timestamp: new Date().toISOString(),
         });
@@ -461,6 +469,7 @@ export class VideoStreamService {
       testId: this.testId,
       browser: this.browser,
       sessionId: this.sessionId,
+      chatSessionId: this.chatSessionId,
       seq: this.seq,
       format: 'jpeg' as const,
       data,
@@ -584,6 +593,7 @@ export class VideoStreamService {
       webSocketService.emitTestVideoStats(this.testId, {
         testId: this.testId,
         sessionId: this.sessionId,
+        chatSessionId: this.chatSessionId,
         currentFPS,
         framesEmitted: this.framesEmitted,
         framesDropped: this.framesDropped,

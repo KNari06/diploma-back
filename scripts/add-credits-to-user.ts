@@ -7,8 +7,8 @@
  */
 
 import { supabaseAdmin } from '../src/db/supabase';
-import { logger } from '../src/utils/logger';
 import { UserCreditsService } from '../src/services/core/user-credits.service';
+import { logger } from '../src/utils/core/logger';
 
 const EMAIL = process.argv[2] || 'baukaa@gmail.com';
 const AMOUNT = parseInt(process.argv[3] || '1000', 10);

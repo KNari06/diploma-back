@@ -5,9 +5,9 @@
  *   npx ts-node -r tsconfig-paths/register scripts/verify-test-users-auth.ts
  */
 
-import { supabaseAdmin, supabase } from '../src/db/supabase';
-import { logger } from '../src/utils/logger';
+import { supabase, supabaseAdmin } from '../src/db/supabase';
 import { UserCreditsService } from '../src/services/core/user-credits.service';
+import { logger } from '../src/utils/core/logger';
 
 const TEST_USER_EMAILS = [
   'test1@qai-test.local',

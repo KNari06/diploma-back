@@ -32,6 +32,7 @@ export interface TestRunRequest {
   commands?: PlaywrightCommand[]; // Playwright commands to execute
   intent?: string; // Original user intent for context
   mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
+  chatSessionId?: string; // Chat session ID for WebSocket routing isolation
 }
 
 export interface TestOptions {
@@ -265,6 +266,7 @@ export interface TestJobData {
   intelligentMode?: boolean; // NEW: Enable intelligent/adaptive testing
   testGoal?: string; // NEW: Testing goal for intelligent mode
   mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
+  chatSessionId?: string; // Chat session ID for WebSocket routing isolation
 }
 
 export interface AgentResponse {

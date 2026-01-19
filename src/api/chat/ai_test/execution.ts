@@ -206,6 +206,7 @@ export async function executeUiTestFlow(
         testGoal: intelligentMode ? planSummary : undefined, // ✅ Safe: always string or undefined
         estimatedCost: plan.estimatedCost, // Optional field
         mode: plan.mode || 'lite', // Test execution mode (default: 'lite')
+        chatSessionId, // Pass chat session ID for WebSocket routing isolation
       };
 
       /// Here we run the main UI/UX manual test

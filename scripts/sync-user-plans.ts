@@ -9,8 +9,8 @@
  */
 
 import { supabaseAdmin } from '../src/db/supabase';
-import { logger } from '../src/utils/logger';
 import { UserCreditsService } from '../src/services/core/user-credits.service';
+import { logger } from '../src/utils/core/logger';
 
 // Map pricing_plans slug to user_credits subscription_plan values
 const PLAN_MAPPING: Record<string, 'free' | 'basic' | 'pro' | 'enterprise'> = {

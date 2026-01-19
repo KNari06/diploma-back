@@ -378,15 +378,20 @@ class WebSocketService {
           currentStep: payload.currentStep,
           action: payload.action?.type,
           userId: payload.userId,
+          sessionId: payload.sessionId,
         });
-        // ✅ FIX: Emit to test room
+        // ✅ Emit to test room (always)
         this.emitToTest(testId, 'test:progress', payload);
-        // ✅ FIX: Also emit to user room if userId is provided (client may only be subscribed to user room)
-        if (payload.userId) {
+        // ✅ FIX: If sessionId is provided, emit to chat room for isolation (not user-room)
+        // This prevents mixing progress from multiple tests in different chats
+        if (payload.sessionId) {
+          this.emitToChat(payload.sessionId, 'test:progress', payload);
+        } else if (payload.userId) {
+          // Fallback: emit to user room if no sessionId (backward compatibility)
           this.emitToUser(payload.userId, 'test:progress', payload);
         }
       },
-      { testId, userId: payload.userId }
+      { testId, userId: payload.userId, sessionId: payload.sessionId }
     );
   }
 
@@ -429,9 +434,14 @@ class WebSocketService {
       'test:graph-update',
       payload,
       () => {
+        // ✅ Emit to test room (always)
         this.emitToTest(testId, 'test:graph-update', payload);
+        // ✅ FIX: If sessionId is provided, emit to chat room for isolation
+        if (payload.sessionId) {
+          this.emitToChat(payload.sessionId, 'test:graph-update', payload);
+        }
       },
-      { testId }
+      { testId, sessionId: payload.sessionId }
     );
   }
 
@@ -526,7 +536,12 @@ class WebSocketService {
     this.emitWithFallback(
       'test:video:frame',
       payload,
-      () => this.emitToTest(testId, 'test:video:frame', payload),
+      () => {
+        this.emitToTest(testId, 'test:video:frame', payload);
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'test:video:frame', payload);
+        }
+      },
       { testId }
     );
   }
@@ -539,7 +554,12 @@ class WebSocketService {
     this.emitWithFallback(
       'test:video:stats',
       payload,
-      () => this.emitToTest(testId, 'test:video:stats', payload),
+      () => {
+        this.emitToTest(testId, 'test:video:stats', payload);
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'test:video:stats', payload);
+        }
+      },
       { testId }
     );
   }
@@ -558,6 +578,9 @@ class WebSocketService {
           reason: payload.reason,
         });
         this.emitToTest(testId, 'test:video:paused', payload);
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'test:video:paused', payload);
+        }
       },
       { testId }
     );
@@ -574,6 +597,9 @@ class WebSocketService {
       () => {
         logger.info('[WebSocketService] Video stream resumed', { testId });
         this.emitToTest(testId, 'test:video:resumed', payload);
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'test:video:resumed', payload);
+        }
       },
       { testId }
     );
@@ -593,6 +619,9 @@ class WebSocketService {
           reason: payload.reason,
         });
         this.emitToTest(testId, 'test:video:stopped', payload);
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'test:video:stopped', payload);
+        }
       },
       { testId }
     );
@@ -612,6 +641,9 @@ class WebSocketService {
           reason: payload.reason,
         });
         this.emitToTest(testId, 'test:video:unavailable', payload);
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'test:video:unavailable', payload);
+        }
       },
       { testId }
     );
@@ -632,6 +664,9 @@ class WebSocketService {
           fps: payload.fps,
         });
         this.emitToTest(testId, 'test:video:started', payload);
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'test:video:started', payload);
+        }
       },
       { testId }
     );

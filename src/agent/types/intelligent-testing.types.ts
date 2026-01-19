@@ -371,6 +371,8 @@ export interface IntelligentTestConfig {
   goal: string;
   startUrl: string;
   browser?: string; // Browser type for progress tracking (e.g., 'chrome', 'firefox')
+  /** Chat session ID for WebSocket routing isolation */
+  chatSessionId?: string;
   credentials?: {
     username?: string;
     email?: string;

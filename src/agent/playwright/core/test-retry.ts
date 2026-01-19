@@ -61,6 +61,17 @@ export async function executePlaywrightTestWithRetry(
         return result;
       }
 
+      // ✅ IMPORTANT: Do not retry "valid test failures" (goal not reached / assertions failed)
+      // Retry is reserved for transient infra errors where `executePlaywrightTest` reports an explicit error string.
+      if (result.status === 'failed' && (!result.error || String(result.error).trim().length === 0)) {
+        logger.info('[PLAYWRIGHT_RETRY] Not retrying failed test without explicit error (treated as deterministic failure)', {
+          testId: testData.testId,
+          attempt: attempt + 1,
+          status: result.status,
+        });
+        return result;
+      }
+
       lastError = result.error;
       logger.warn('[PLAYWRIGHT_RETRY] Test attempt returned failure', {
         testId: testData.testId,

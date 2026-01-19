@@ -79,9 +79,9 @@ export const testSupabaseAuthHealth = async (): Promise<{
       // Check for HTML error response (503/500)
       const errorMessage = error.message || '';
       const isSupabaseDown = errorMessage.includes('not valid JSON') ||
-                              errorMessage.includes('Unexpected token') ||
-                              errorMessage.includes('Internal server error') ||
-                              errorMessage.includes('Service Unavailable');
+        errorMessage.includes('Unexpected token') ||
+        errorMessage.includes('Internal server error') ||
+        errorMessage.includes('Service Unavailable');
 
       if (isSupabaseDown) {
         logger.error('[AUTH_HEALTH] Supabase Auth service is down', {
@@ -339,13 +339,48 @@ export class SupabaseService {
       status: resultData.status,
     });
 
-    const { data, error } = await this.client
-      .from('test_results')
-      .insert(resultData)
-      .select()
-      .maybeSingle(); // Use maybeSingle() for safety
+    const insertOnce = async (payload: any) =>
+      this.client
+        .from('test_results')
+        .insert(payload)
+        .select()
+        .maybeSingle(); // Use maybeSingle() for safety
+
+    const { data, error } = await insertOnce(resultData);
 
     if (error) {
+      // Backward-compatible fallback: some Supabase instances may not have the artifact columns yet.
+      // PostgREST returns PGRST204 when a column is missing.
+      const errorCode = (error as any)?.code;
+      if (errorCode === 'PGRST204' && (resultData?.video_url !== undefined || resultData?.trace_url !== undefined)) {
+        const { video_url: _videoUrl, trace_url: _traceUrl, ...withoutArtifacts } = resultData || {};
+        logger.warn('[DB] test_results schema missing artifact columns; retrying insert without video_url/trace_url', {
+          testId: resultData.test_id,
+          browser: resultData.browser,
+          originalError: (error as any)?.message,
+        });
+
+        const retry = await insertOnce(withoutArtifacts);
+        if (retry.error) {
+          logger.error('[DB] Failed to create test result (retry without artifacts also failed)', {
+            testId: resultData.test_id,
+            browser: resultData.browser,
+            error: retry.error.message,
+            code: (retry.error as any)?.code,
+          });
+          throw retry.error;
+        }
+        if (!retry.data) {
+          logger.error('[DB] Test result insert retry returned no data', {
+            testId: resultData.test_id,
+            browser: resultData.browser,
+          });
+          throw new Error('Test result insert returned no data');
+        }
+        logger.info('[DB] Test result created successfully (without artifacts)', { resultId: (retry.data as any).id });
+        return retry.data;
+      }
+
       logger.error('[DB] Failed to create test result', {
         testId: resultData.test_id,
         browser: resultData.browser,
