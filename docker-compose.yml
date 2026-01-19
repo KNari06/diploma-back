@@ -10,10 +10,9 @@ services:
     env_file:
       - .env
     volumes:
-      # Mount logs directory to persist error.log
-      # Docker will create the directory if it doesn't exist
-      # If you have permission issues, ensure ./logs exists and is writable on host
       - ./logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: always
 
   worker:
@@ -26,8 +25,7 @@ services:
     env_file:
       - .env
     volumes:
-      # Mount logs directory to persist error.log
-      # Docker will create the directory if it doesn't exist
-      # If you have permission issues, ensure ./logs exists and is writable on host
       - ./logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: always
