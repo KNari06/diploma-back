@@ -15,6 +15,7 @@ import projectRoutes from '@/api/project/project.routes';
 import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
 import supportRoutes from '@/api/support/support.routes';
+import gitIntegrationRoutes from '@/api/gitIntegration/git-integration.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
@@ -139,7 +140,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     const originalStatus = res.status;
 
     // Override res.status to ensure CORS headers are set
-    res.status = function(code: number) {
+    res.status = function (code: number) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -148,7 +149,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     };
 
     // Override res.json to ensure CORS headers
-    res.json = function(body: any) {
+    res.json = function (body: any) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -157,7 +158,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     };
 
     // Override res.send to ensure CORS headers
-    res.send = function(body?: any) {
+    res.send = function (body?: any) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -185,6 +186,8 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
 // app.use(limiter); // Disabled - using custom rate limiter in middleware
 
 // Body parsing middleware
+// IMPORTANT: GitHub webhook signature requires raw body (Buffer)
+app.use(`/api/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -1137,9 +1140,9 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
     const queueHealth = queueResult.status === 'fulfilled'
       ? queueResult.value
       : {
-          status: 'unhealthy' as const,
-          error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason),
-        };
+        status: 'unhealthy' as const,
+        error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason),
+      };
 
     // Log failures
     if (dbResult.status === 'rejected') {
@@ -1204,6 +1207,7 @@ app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, reportsRoutes); // ✅ NEW: Test reports & Jira integration
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 app.use(`/api/${env.API_VERSION}/regression`, regressionRoutes); // ✅ NEW: Regression testing
+app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes); // ✅ NEW: Git integrations (CRUD)
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
 app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications

@@ -2,6 +2,7 @@ import { VideoStreamRegistry } from '@/agent/playwright/artifacts/video-stream-r
 import { createRunKey, TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { env } from '@/config/environment/env';
 import { connection, QUEUE_NAMES, testRunQueue } from '@/config/infrastructure/queues';
+import { GitWebhookJobHandler } from '@/jobs/git-webhook.job';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
 import { logger } from '@/utils/core/logger';
@@ -182,6 +183,27 @@ const webhookWorker = new Worker(
   workerOptions
 );
 
+const gitWebhookWorker = new Worker(
+  QUEUE_NAMES.GIT_WEBHOOK,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[GIT_WEBHOOK_WORKER] Processing job: ${job.id}`, {
+      provider: job.data?.provider,
+      deliveryId: job.data?.deliveryId,
+    });
+
+    if (!GitWebhookJobHandler || typeof GitWebhookJobHandler.process !== 'function') {
+      throw new Error('GitWebhookJobHandler.process is not a function');
+    }
+
+    return await GitWebhookJobHandler.process(job as any);
+  },
+  workerOptions
+);
+
 // Worker event listeners
 const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('ready', () => {
@@ -301,6 +323,7 @@ setupWorkerEvents(testResultWorker, 'TestResult');
 setupWorkerEvents(aiAnalysisWorker, 'AIAnalysis');
 setupWorkerEvents(notificationWorker, 'Notification');
 setupWorkerEvents(webhookWorker, 'Webhook');
+setupWorkerEvents(gitWebhookWorker, 'GitWebhook');
 
 // Graceful shutdown
 let isShuttingDown = false;
@@ -329,6 +352,7 @@ const gracefulShutdown = async (signal: string) => {
       aiAnalysisWorker.close(),
       notificationWorker.close(),
       webhookWorker.close(),
+      gitWebhookWorker.close(),
       // Abort all active test runs (closes contexts, stops video streams)
       (async () => {
         try {
@@ -434,6 +458,7 @@ logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`
 
 export {
   aiAnalysisWorker,
+  gitWebhookWorker,
   notificationWorker,
   testResultWorker,
   testRunWorker,
