@@ -3,6 +3,7 @@ import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import authRoutes from '@/api/auth/auth.route';
 import chatRoutes from '@/api/chat/chat.route';
 import feedbackRoutes from '@/api/chat/feedback.route';
+import gitIntegrationRoutes from '@/api/gitIntegration/git-integration.route';
 import intelligentTestRoutes from '@/api/intelligentTest/intelligentTest.route';
 import jiraRoutes from '@/api/jira/jira.route';
 import kbRoutes from '@/api/kb/kb.route';
@@ -15,7 +16,6 @@ import projectRoutes from '@/api/project/project.routes';
 import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
 import supportRoutes from '@/api/support/support.routes';
-import gitIntegrationRoutes from '@/api/gitIntegration/git-integration.route';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
@@ -86,25 +86,38 @@ app.use(['/api/features', '/api/architecture'], (req: express.Request, res: expr
 });
 
 // CORS configuration
+const DEV_ALLOWED_ORIGINS = [
+  'http://localhost:8080',
+  'http://127.0.0.1:8080',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+];
+
+const uniqueOrigins = (origins: string[]): string[] => Array.from(new Set(origins));
+
 const getCorsOrigins = (): boolean | string[] => {
   if (isDevelopment) {
     return true;
   }
 
   const allowedOrigins = process.env.ALLOWED_ORIGINS;
-  if (!allowedOrigins || typeof allowedOrigins !== 'string') {
-    return false;
-  }
+  const devOrigins = DEV_ALLOWED_ORIGINS;
 
   try {
-    const origins = allowedOrigins.split(',').map(origin => origin.trim()).filter(Boolean);
-    return origins.length > 0 ? origins : false;
+    const configuredOrigins = (allowedOrigins && typeof allowedOrigins === 'string')
+      ? allowedOrigins.split(',').map(origin => origin.trim()).filter(Boolean)
+      : [];
+    const merged = uniqueOrigins([...configuredOrigins, ...devOrigins]);
+    return merged.length > 0 ? merged : false;
   } catch (error) {
     logger.warn('Failed to parse ALLOWED_ORIGINS, disabling CORS', {
       error: error instanceof Error ? error.message : String(error),
       ALLOWED_ORIGINS: allowedOrigins, // Use local variable instead of undefined
     });
-    return false;
+    // Keep dev origins allowed even if parsing failed
+    return devOrigins;
   }
 };
 

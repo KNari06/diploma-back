@@ -23,6 +23,15 @@ let io: SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, Socke
 export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
   logger.info('[WebSocket] Initializing WebSocket server...');
 
+  const devAllowedOrigins = [
+    'http://localhost:8080',
+    'http://127.0.0.1:8080',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+  ];
+
   // Parse CORS origins
   let corsOrigin: boolean | string[] = false;
   if (isDevelopment) {
@@ -31,7 +40,7 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
     try {
       const origins = process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean);
       if (origins.length > 0) {
-        corsOrigin = origins;
+        corsOrigin = Array.from(new Set([...origins, ...devAllowedOrigins]));
       }
     } catch (error) {
       logger.warn('[WebSocket] Failed to parse ALLOWED_ORIGINS, disabling CORS', {
@@ -41,7 +50,7 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
     }
   } else if (process.env.FRONTEND_URL && process.env.FRONTEND_URL.trim().length > 0) {
     // Safe fallback: allow a single configured frontend origin if provided explicitly
-    corsOrigin = [process.env.FRONTEND_URL.trim()];
+    corsOrigin = Array.from(new Set([process.env.FRONTEND_URL.trim(), ...devAllowedOrigins]));
   } else {
     /**
      * IMPORTANT:
