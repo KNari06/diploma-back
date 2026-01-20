@@ -56,7 +56,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // STEP 0: INPUT VALIDATION (FIX #1 & #2)
     // ═══════════════════════════════════════════════════════════════════════
     const validateInputWithLogging = withFunctionLogging(validateInput, 'validateInput', functionLogger);
-    const inputResult = validateInputWithLogging(req, res, checkConnection, functionLogger);
+    const inputResult = validateInputWithLogging(req, res, checkConnection);
     if (!inputResult) {
       return; // Response already sent in validateInput
     }
@@ -69,7 +69,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // STEP 1: WORKSPACE CHECK (MANDATORY!) (FIX #3)
     // ═══════════════════════════════════════════════════════════════════════
     const checkWorkspaceWithLogging = withFunctionLogging(checkWorkspace, 'checkWorkspace', functionLogger);
-    const workspace_id = await checkWorkspaceWithLogging(userId, functionLogger);
+    const workspace_id = await checkWorkspaceWithLogging(userId, sessionId);
     checkRequestTimeout();
 
     // ═══════════════════════════════════════════════════════════════════════

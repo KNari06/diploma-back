@@ -7,6 +7,134 @@ import { logger } from '@/utils/core/logger';
  */
 export class WorkspaceService {
   /**
+   * Resolve "active workspace" for a user.
+   *
+   * Priority:
+   * 1) Latest chat session workspace (most recent activity)
+   * 2) Latest project workspace
+   * 3) Oldest workspace (fallback if user has workspaces but no activity)
+   */
+  static async getActiveWorkspaceForUser(userId: string): Promise<string | null> {
+    try {
+      if (!userId || typeof userId !== 'string') {
+        return null;
+      }
+
+      // 1) Latest chat session workspace
+      const { data: chatSession, error: chatSessionError } = await supabaseAdmin
+        .from('chat_sessions')
+        .select('workspace_id, updated_at, created_at')
+        .eq('user_id', userId)
+        .not('workspace_id', 'is', null)
+        .order('updated_at', { ascending: false })
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (chatSessionError) {
+        logger.warn('[WORKSPACE] Failed to resolve active workspace from chat_sessions', {
+          userId,
+          code: (chatSessionError as any)?.code,
+          message: (chatSessionError as any)?.message,
+          details: (chatSessionError as any)?.details,
+        });
+      } else if (Array.isArray(chatSession) && chatSession[0]?.workspace_id) {
+        return String(chatSession[0].workspace_id);
+      }
+
+      // 2) Latest project workspace
+      const { data: project, error: projectError } = await supabaseAdmin
+        .from('projects')
+        .select('workspace_id, updated_at, created_at')
+        .eq('user_id', userId)
+        .not('workspace_id', 'is', null)
+        .order('updated_at', { ascending: false })
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (projectError) {
+        logger.warn('[WORKSPACE] Failed to resolve active workspace from projects', {
+          userId,
+          code: (projectError as any)?.code,
+          message: (projectError as any)?.message,
+          details: (projectError as any)?.details,
+        });
+      } else if (Array.isArray(project) && project[0]?.workspace_id) {
+        return String(project[0].workspace_id);
+      }
+
+      // 3) Fallback to oldest workspace
+      const { data: workspace, error: workspaceError } = await supabaseAdmin
+        .from('workspaces')
+        .select('id, created_at')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: true })
+        .limit(1);
+
+      if (workspaceError) {
+        logger.warn('[WORKSPACE] Failed to resolve fallback workspace', {
+          userId,
+          code: (workspaceError as any)?.code,
+          message: (workspaceError as any)?.message,
+          details: (workspaceError as any)?.details,
+        });
+        return null;
+      }
+
+      if (Array.isArray(workspace) && workspace[0]?.id) {
+        return String(workspace[0].id);
+      }
+
+      return null;
+    } catch (error) {
+      logger.error('[WORKSPACE] Exception resolving active workspace', { error, userId });
+      return null;
+    }
+  }
+
+  /**
+   * Create a workspace for a user.
+   */
+  static async createWorkspaceForUser(
+    userId: string
+  ): Promise<{
+    workspace_id: string;
+  }> {
+    logger.info('[WORKSPACE] Creating new workspace for user', { userId });
+
+    const workspaceName = this.generateWorkspaceName();
+
+    const { data: newWorkspace, error: insertError } = await supabaseAdmin
+      .from('workspaces')
+      .insert({
+        name: workspaceName,
+        user_id: userId,
+        platforms: [],
+        api_testing: true,
+        settings: {
+          created_from_chat: true,
+          created_at: new Date().toISOString(),
+        },
+      })
+      .select('id, name')
+      .single();
+
+    if (insertError) {
+      logger.error('[WORKSPACE] Error creating workspace', {
+        error: insertError,
+        userId,
+      });
+      throw insertError;
+    }
+
+    logger.info('[WORKSPACE] Created new workspace', {
+      workspace_id: newWorkspace.id,
+      name: newWorkspace.name,
+    });
+
+    return { workspace_id: newWorkspace.id };
+  }
+
+  /**
    * Check if user has a workspace, create if not
    * Every user MUST have a workspace
    */
@@ -19,67 +147,24 @@ export class WorkspaceService {
     try {
       logger.info('[WORKSPACE] Checking workspace for user', { userId });
 
-      // 1. Check if workspace exists
-      const { data: existing, error: selectError } = await supabaseAdmin
-        .from('workspaces')
-        .select('id, name')
-        .eq('user_id', userId)
-        .maybeSingle();
+      // Multi-workspace: resolve active workspace (do NOT use maybeSingle by user_id)
+      const activeWorkspaceId = await this.getActiveWorkspaceForUser(userId);
 
-      if (selectError) {
-        logger.error('[WORKSPACE] Error checking workspace', {
-          error: selectError,
-          userId,
-        });
-        throw selectError;
-      }
-
-      if (existing) {
-        logger.info('[WORKSPACE] Found existing workspace', {
-          workspace_id: existing.id,
-          name: existing.name,
+      if (activeWorkspaceId) {
+        logger.info('[WORKSPACE] Resolved active workspace', {
+          workspace_id: activeWorkspaceId,
         });
         return {
-          workspace_id: existing.id,
+          workspace_id: activeWorkspaceId,
           is_new: false,
         };
       }
 
-      // 2. Create new workspace
-      logger.info('[WORKSPACE] Creating new workspace for user', { userId });
-
-      const workspaceName = this.generateWorkspaceName(userId);
-
-      const { data: newWorkspace, error: insertError } = await supabaseAdmin
-        .from('workspaces')
-        .insert({
-          name: workspaceName,
-          user_id: userId,
-          platforms: [],
-          api_testing: true,
-          settings: {
-            created_from_chat: true,
-            created_at: new Date().toISOString(),
-          },
-        })
-        .select('id, name')
-        .single();
-
-      if (insertError) {
-        logger.error('[WORKSPACE] Error creating workspace', {
-          error: insertError,
-          userId,
-        });
-        throw insertError;
-      }
-
-      logger.info('[WORKSPACE] Created new workspace', {
-        workspace_id: newWorkspace.id,
-        name: newWorkspace.name,
-      });
+      // No active workspace found -> create one
+      const { workspace_id } = await this.createWorkspaceForUser(userId);
 
       return {
-        workspace_id: newWorkspace.id,
+        workspace_id,
         is_new: true,
       };
     } catch (error) {
@@ -96,18 +181,8 @@ export class WorkspaceService {
    */
   static async getWorkspaceByUserId(userId: string): Promise<string | null> {
     try {
-      const { data, error } = await supabaseAdmin
-        .from('workspaces')
-        .select('id')
-        .eq('user_id', userId)
-        .maybeSingle();
-
-      if (error) {
-        logger.error('[WORKSPACE] Error getting workspace', { error, userId });
-        return null;
-      }
-
-      return data?.id || null;
+      // Multi-workspace: return active workspace
+      return await this.getActiveWorkspaceForUser(userId);
     } catch (error) {
       logger.error('[WORKSPACE] Failed to get workspace', { error, userId });
       return null;
@@ -147,11 +222,9 @@ export class WorkspaceService {
 
   /**
    * Generate workspace name - default to "Untitled"
+   * Note: Can be extended in future to generate unique names per user if needed
    */
-  private static generateWorkspaceName(
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    _userId: string
-  ): string {
+  private static generateWorkspaceName(): string {
     return 'Untitled';
   }
 
