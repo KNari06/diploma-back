@@ -1,11 +1,11 @@
+import { OverallBuilderService } from '@/services/testing/visualization/overall-builder.service';
+import { logger } from '@/utils/core/logger';
+import { exportGraph, parsePlaywrightTestSteps } from '@/utils/parsing/playwrightParser';
 import { Request, Response } from 'express';
 import { supabaseAdmin } from '../../db/supabase';
 import { IntelligentTestStorageService } from '../../services/testing/results/intelligent-test-storage.service';
 import { TestReportGeneratorService } from '../../services/testing/results/test-report-generator.service';
 import { PlaywrightStep, PlaywrightStepType } from '../../types/playwright.types';
-import { logger } from '@/utils/core/logger';
-import { exportGraph, parsePlaywrightTestSteps } from '@/utils/parsing/playwrightParser';
-import { OverallBuilderService } from '@/services/testing/visualization/overall-builder.service';
 
 // UUID validation regex
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -538,13 +538,14 @@ async function getComprehensiveTestData(testId: string, userId?: string): Promis
     }
 
     // 2. Get test results with all details
-    // Note: video_url and trace_url may not exist in test_results table
-    // They are typically stored in trace_files table
-    const { data: results, error: resultsError} = await supabaseAdmin
+    // Backward compatibility: older DBs may not expose video_url/trace_url (schema cache or not migrated).
+    // In that case, artifacts may still be discoverable via trace_files or Storage listing.
+    const { data: results, error: resultsError } = await supabaseAdmin
       .from('test_results')
       .select(`
         id, test_id, browser, status, screenshot, dom, logs,
         network_logs, errors, performance, ai_summary,
+        video_url, trace_url,
         created_at, completed_at
       `)
       .eq('test_id', testId)
@@ -677,7 +678,7 @@ async function extractTestSteps(testData: {
   report: any;
   apiConfigs: any[];
 }): Promise<PlaywrightStep[]> {
-  const steps: PlaywrightStep[] = [];
+  // const steps: PlaywrightStep[] = [];
 
   // Priority 1: Trace files (most detailed)
   if (testData.traceFiles.length > 0) {
@@ -727,7 +728,7 @@ async function extractTestSteps(testData: {
 
   // Priority 5: API test configurations
   if (testData.apiConfigs.length > 0) {
-    const apiSteps = convertApiConfigsToPlaywright(testData.apiConfigs, testData.test);
+    const apiSteps = convertApiConfigsToPlaywright(testData.apiConfigs,);
     if (apiSteps.length > 0) {
       logger.info('[TEST_VISUALIZATION] Using steps from API configs', { count: apiSteps.length });
       return apiSteps;
@@ -852,7 +853,7 @@ function extractStepsFromAISummary(results: any[]): PlaywrightStep[] {
 /**
  * Convert API configs to Playwright format
  */
-function convertApiConfigsToPlaywright(apiConfigs: any[], test: any): PlaywrightStep[] {
+function convertApiConfigsToPlaywright(apiConfigs: any[]): PlaywrightStep[] {
   const steps: PlaywrightStep[] = [];
 
   apiConfigs.forEach((config, configIndex) => {

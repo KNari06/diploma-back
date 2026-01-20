@@ -328,8 +328,8 @@ export async function handleGeneralChat(
   } catch (openaiError: any) {
     // Check if request was aborted (client closed connection)
     if (openaiError?.message?.includes('cancelled') ||
-        openaiError?.message?.includes('aborted') ||
-        openaiError?.message?.includes('signal')) {
+      openaiError?.message?.includes('aborted') ||
+      openaiError?.message?.includes('signal')) {
       logger.warn('[GENERAL_CHAT] Request was cancelled by client', {
         error: openaiError instanceof Error ? openaiError.message : String(openaiError),
         userId,

@@ -358,6 +358,7 @@ export class SupabaseService {
           testId: resultData.test_id,
           browser: resultData.browser,
           originalError: (error as any)?.message,
+          hint: 'Apply DB migration adding video_url/trace_url (supabase-migrations/20260121_test_results_artifact_columns.sql) and restart Supabase API to refresh PostgREST schema cache.',
         });
 
         const retry = await insertOnce(withoutArtifacts);

@@ -7,6 +7,7 @@
  * - Worker Process: Publishes to Redis Pub/Sub → Main Process → WebSocket
  */
 
+import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { redisWebSocketBridge } from '@/services/websocket/redis-bridge.service';
 import { logger } from '@/utils/core/logger';
 import {
@@ -148,6 +149,17 @@ class WebSocketService {
     }
 
     try {
+      // Store executed progress events in Redis for restore while running (main process only).
+      // Avoid double-store for structured progress (those are stored via emitTestProgress).
+      if (
+        this.isReady() &&
+        event === 'test:progress' &&
+        data?.testId &&
+        !(typeof data?.progress === 'number' && typeof data?.phase === 'string')
+      ) {
+        void TestExecutedStepsRedisService.appendProgress(data.testId, data);
+      }
+
       const room = createRoomName('user', userId.trim());
       getIO().to(room).emit(event, data);
 
@@ -371,6 +383,7 @@ class WebSocketService {
       'test:progress',
       payload,
       () => {
+        void TestExecutedStepsRedisService.appendProgress(testId, payload);
         logger.info('[WebSocketService] Emitting test progress', {
           testId,
           progress: payload.progress,
@@ -449,7 +462,10 @@ class WebSocketService {
     this.emitWithFallback(
       'test:step:completed',
       payload,
-      () => this.emitToTest(testId, 'test:step:completed', payload),
+      () => {
+        void TestExecutedStepsRedisService.appendStepCompleted(testId, payload);
+        this.emitToTest(testId, 'test:step:completed', payload);
+      },
       { testId }
     );
   }
@@ -468,6 +484,9 @@ class WebSocketService {
       'test:completed',
       payload,
       () => {
+        // Finalize executed steps: move Redis → Postgres and cleanup Redis.
+        void TestExecutedStepsRedisService.finalizeToDb(testId);
+
         logger.info('[WebSocketService] Emitting test completed', {
           testId,
           status: payload.status,
@@ -484,6 +503,9 @@ class WebSocketService {
       'test:failed',
       payload,
       () => {
+        // Finalize executed steps: move Redis → Postgres and cleanup Redis.
+        void TestExecutedStepsRedisService.finalizeToDb(testId);
+
         logger.error('[WebSocketService] Emitting test failed', {
           testId,
           error: payload.error,
@@ -499,7 +521,11 @@ class WebSocketService {
     this.emitWithFallback(
       'test:cancelled',
       payload,
-      () => this.emitToTest(testId, 'test:cancelled', payload),
+      () => {
+        // Finalize executed steps: move Redis → Postgres and cleanup Redis.
+        void TestExecutedStepsRedisService.finalizeToDb(testId);
+        this.emitToTest(testId, 'test:cancelled', payload);
+      },
       { testId }
     );
   }
