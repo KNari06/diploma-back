@@ -14,12 +14,15 @@ import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Page } from 'playwright';
 import { checkTestCancelled, cleanupCancellationState, withCancellation } from '../../playwright/utils/test-cancellation-checker';
+import { ClarificationService } from '../../utils/context/clarification.service';
 import { buildSnapshotSummary } from './analysis/ai-goal-evaluator';
+import { isDownloadText, isFileUploadTarget, isPaymentContext } from './analysis/clarification-gates';
 import { classifyField } from './analysis/field-classifier';
 import { FunnelAnalyzer, FunnelPhase } from './analysis/funnel-analyzer';
 import { GoalDetector } from './analysis/goal-detector';
 import { GoalExpander, type ExpandedGoal } from './analysis/goal-expander';
 import { HybridSemanticWeightCalculator, matchesKeyword } from './analysis/hybrid-semantic-weight';
+import { extractPageCredentials, parseCredentialsFromResponse } from './analysis/page-credentials-extractor';
 import { PlanProgressEvaluator } from './analysis/plan-progress-evaluator';
 import { StateDiffComputer } from './analysis/state-diff';
 import { StateValidator } from './analysis/state-validator';
@@ -110,6 +113,23 @@ export class LiteEngine {
   private readonly GOAL_REFINEMENT_COOLDOWN_MS = 5000; // Min time between refinements
   private consecutiveNoEffectCount: number = 0;
   private activeFrame: import('playwright').Frame | null = null; // L5: Store active frame for iframe execution
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L6: PAGE CREDENTIALS EXTRACTION (one-time for login goals)
+  // ═══════════════════════════════════════════════════════════════════════════
+  private pageCredentialsAttempted = false; // Only try once per test
+  private credentialClarificationAttempted = false; // Only ask user once per test
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L7: ADDITIONAL CLARIFICATION GATES
+  // ═══════════════════════════════════════════════════════════════════════════
+  private paymentApprovalAsked = false; // Only ask once per test
+  private fileUploadApprovalAskedForRefs = new Set<string>(); // Track which file inputs we've asked about
+  private skippedFileUploadRefs = new Set<string>(); // Track file upload refs user chose to skip
+  private approvedExternalOrigins = new Set<string>(); // Cache approved external origins
+  private deniedExternalOrigins = new Set<string>(); // Cache denied external origins (avoid repeated prompts)
+  private downloadApprovalAskedForRefs = new Set<string>(); // Track which download refs we've asked about
+  private deniedDownloadRefs = new Set<string>(); // Track denied download refs (avoid executing later)
 
   constructor(page: Page, config: LiteEngineConfig) {
     this.page = page;
@@ -1137,6 +1157,181 @@ export class LiteEngine {
           }
         }
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // L6: PAGE CREDENTIALS EXTRACTION (one-time for login goals)
+        // ═══════════════════════════════════════════════════════════════════════
+        const goalForCredentials = this.goalDetector.getParsedGoal();
+        if (
+          LITE_ENGINE_FLAGS.enablePageCredentialsExtraction &&
+          !this.pageCredentialsAttempted &&
+          !this.config.credentials &&
+          goalForCredentials?.action === 'login'
+        ) {
+          this.pageCredentialsAttempted = true;
+          const extractedCreds = extractPageCredentials(snapshotBefore, this.config.testId);
+
+          if (extractedCreds.confidence !== 'none' && extractedCreds.password) {
+            // Set credentials from page (SECURITY: never log actual values)
+            this.config.credentials = {
+              password: extractedCreds.password,
+              ...(extractedCreds.username && { username: extractedCreds.username }),
+            };
+
+            logger.info('[LITE_ENGINE] Page credentials extracted', {
+              testId: this.config.testId,
+              hasUsername: !!extractedCreds.username,
+              hasPassword: !!extractedCreds.password,
+              confidence: extractedCreds.confidence,
+              sourcePattern: extractedCreds.sourcePattern,
+              // SECURITY: Never log actual credential values
+            });
+          } else {
+            logger.debug('[LITE_ENGINE] No page credentials found', {
+              testId: this.config.testId,
+              confidence: extractedCreds.confidence,
+            });
+          }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // L6: CREDENTIAL CLARIFICATION FALLBACK (ask user if login form visible but no creds)
+        // ═══════════════════════════════════════════════════════════════════════
+        if (
+          LITE_ENGINE_FLAGS.enableCredentialClarification &&
+          !this.credentialClarificationAttempted &&
+          goalForCredentials?.action === 'login'
+        ) {
+          // Check if login form is visible (password field present)
+          const hasPasswordField = snapshotBefore.elements.some(
+            el => el.type === 'password' && el.visible && !el.disabled
+          );
+
+          // Check if username/email field is present (common for login)
+          // NOTE: Require strong signals to avoid false positives from search boxes, etc.
+          const hasUsernameLikeField = snapshotBefore.elements.some(el => {
+            const type = (el.type || '').toLowerCase();
+            const ac = (el.autocomplete || '').toLowerCase();
+            const n = (el.htmlName || '').toLowerCase();
+            const id = (el.htmlId || '').toLowerCase();
+            const label = (el.name || '').toLowerCase();
+
+            if (!el.visible || el.disabled) return false;
+            if (type === 'password') return false;
+
+            // Strong signal: email type
+            if (type === 'email') return true;
+
+            // Strong signal: autocomplete hints
+            if (ac.includes('username') || ac.includes('email')) return true;
+
+            // Strong signal: name/id/label contains login-related keywords
+            const hasLoginKeyword =
+              /user|username|login|email|userid/.test(n) ||
+              /user|username|login|email|userid/.test(id) ||
+              /user|username|login|email/.test(label);
+
+            // For type=text, require additional login-related keyword (avoid search boxes)
+            if (type === 'text' && hasLoginKeyword) return true;
+
+            return false;
+          });
+
+          const hasAnyCredentialIdentifier = !!(
+            this.config.credentials?.username ||
+            this.config.credentials?.email ||
+            this.config.credentials?.phone
+          );
+
+          const needsIdentifier = hasUsernameLikeField && !hasAnyCredentialIdentifier;
+          const needsPassword = !this.config.credentials?.password;
+
+          // We ask if there is a login form and we don't have enough creds to proceed reliably.
+          const shouldAskForCredentials = hasPasswordField && (needsPassword || needsIdentifier);
+
+          if (shouldAskForCredentials) {
+            this.credentialClarificationAttempted = true;
+
+            // Build dynamic question based on what's missing
+            let question: string;
+            let expectingField: 'username' | 'password' | 'both';
+
+            if (needsPassword && needsIdentifier) {
+              question =
+                'I found a login form but need credentials to proceed. Please provide login credentials (username/email and password).\n\n' +
+                'You can respond in formats like:\n• username: xxx, password: yyy\n• xxx / yyy\n• or just: username password';
+              expectingField = 'both';
+            } else if (needsIdentifier) {
+              question =
+                'I have a password but need a username/email to complete login. Please provide the username or email.';
+              expectingField = 'username';
+            } else {
+              question =
+                'I have a username but need a password to complete login. Please provide the password.';
+              expectingField = 'password';
+            }
+
+            logger.info('[LITE_ENGINE] Login form detected but credentials incomplete, asking user', {
+              testId: this.config.testId,
+              needsPassword,
+              needsIdentifier,
+            });
+
+            try {
+              const response = await ClarificationService.requestClarification({
+                testId: this.config.testId,
+                userId: this.config.userId,
+                question,
+                type: 'credentials',
+                required: true,
+                timeout: LITE_ENGINE_FLAGS.credentialClarificationTimeoutMs,
+              });
+
+              if (response) {
+                const parsed = parseCredentialsFromResponse(response, expectingField);
+                if (parsed && (parsed.username || parsed.password)) {
+                  // Merge with existing credentials instead of full overwrite
+                  const mergedPassword = parsed.password || this.config.credentials?.password;
+                  if (mergedPassword) {
+                    this.config.credentials = {
+                      password: mergedPassword,
+                      ...(this.config.credentials?.email && { email: this.config.credentials.email }),
+                      ...(this.config.credentials?.phone && { phone: this.config.credentials.phone }),
+                      ...(parsed.username
+                        ? { username: parsed.username }
+                        : this.config.credentials?.username && { username: this.config.credentials.username }),
+                    };
+
+                    logger.info('[LITE_ENGINE] Credentials received from user', {
+                      testId: this.config.testId,
+                      receivedUsername: !!parsed.username,
+                      receivedPassword: !!parsed.password,
+                      // SECURITY: Never log actual credential values
+                    });
+                  } else {
+                    logger.warn('[LITE_ENGINE] Received credentials but still missing password', {
+                      testId: this.config.testId,
+                    });
+                  }
+                } else {
+                  logger.warn('[LITE_ENGINE] Could not parse credentials from user response', {
+                    testId: this.config.testId,
+                    responseLength: response.length,
+                  });
+                }
+              } else {
+                logger.warn('[LITE_ENGINE] No response from user for credential clarification', {
+                  testId: this.config.testId,
+                });
+              }
+            } catch (clarificationError) {
+              logger.warn('[LITE_ENGINE] Credential clarification failed', {
+                testId: this.config.testId,
+                error: clarificationError instanceof Error ? clarificationError.message : String(clarificationError),
+              });
+            }
+          }
+        }
+
         // ✅ NEW: Goal-first check BEFORE asking AI (using heuristic)
         const goalCheck = this.goalDetector.detectHeuristic(goalContext);
 
@@ -1808,7 +2003,247 @@ export class LiteEngine {
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // PHASE A: Prepare for popup detection before click
+        // L7: CLARIFICATION GATES (payment, upload, external/download)
+        // ═══════════════════════════════════════════════════════════════════════
+
+        // Gate 1: Payment/Checkout Approval
+        if (LITE_ENGINE_FLAGS.enablePaymentApprovalGate && !this.paymentApprovalAsked) {
+          const targetElement = snapshotBefore.elements.find(el => el.ref === commandWithCredentials.ref);
+          const targetText = targetElement?.name || '';
+
+          if (commandWithCredentials.action === 'click' && isPaymentContext(snapshotBefore, targetText)) {
+            this.paymentApprovalAsked = true;
+
+            logger.info('[LITE_ENGINE] Payment/checkout context detected, asking user', {
+              testId: this.config.testId,
+              targetText: targetText.slice(0, 50),
+            });
+
+            try {
+              const response = await ClarificationService.requestClarification({
+                testId: this.config.testId,
+                userId: this.config.userId,
+                question: `I detected a payment/checkout action: "${targetText}". How should I proceed?\n\nOptions:\n• proceed - Continue with the payment flow\n• stop_here - Stop the test successfully at this point\n• cancel_test - Cancel the entire test`,
+                type: 'payment_approval',
+                required: true,
+                options: ['proceed', 'stop_here', 'cancel_test'],
+                timeout: LITE_ENGINE_FLAGS.paymentApprovalTimeoutMs,
+              });
+              const normalized = response?.trim().toLowerCase();
+
+              if (normalized === 'stop_here') {
+                logger.info('[LITE_ENGINE] User chose to stop at checkout', {
+                  testId: this.config.testId,
+                });
+                this.emitCompletion(true, 'Stopped by user at checkout');
+                await this.flushPendingGraphScreenshotUploads();
+                closeIteration({ skipped: true, reason: 'payment_stop_here' });
+                return await this.buildResult(true, 'Test stopped at checkout (user choice)');
+              } else if (normalized === 'cancel_test' || !normalized) {
+                logger.info('[LITE_ENGINE] User cancelled test at checkout', {
+                  testId: this.config.testId,
+                });
+                this.emitCompletion(false, 'Cancelled by user at checkout');
+                await this.flushPendingGraphScreenshotUploads();
+                closeIteration({ skipped: true, reason: 'payment_cancel_test' });
+                return await this.buildResult(false, 'Test cancelled at checkout (user choice)');
+              }
+              // If 'proceed', continue normally
+            } catch (clarificationError) {
+              logger.warn('[LITE_ENGINE] Payment approval clarification failed', {
+                testId: this.config.testId,
+                error: clarificationError instanceof Error ? clarificationError.message : String(clarificationError),
+              });
+              // Continue on error (fail-open for usability)
+            }
+          }
+        }
+
+        // Gate 2: File Upload Clarification
+        if (LITE_ENGINE_FLAGS.enableFileUploadGate && commandWithCredentials.ref) {
+          if (this.skippedFileUploadRefs.has(commandWithCredentials.ref)) {
+            closeIteration({ skipped: true, reason: 'file_upload_skipped_cached', ref: commandWithCredentials.ref });
+            continue;
+          }
+
+          const isUploadTarget = isFileUploadTarget(commandWithCredentials.ref, snapshotBefore);
+
+          if (isUploadTarget && !this.fileUploadApprovalAskedForRefs.has(commandWithCredentials.ref)) {
+            this.fileUploadApprovalAskedForRefs.add(commandWithCredentials.ref);
+
+            logger.info('[LITE_ENGINE] File upload target detected, asking user', {
+              testId: this.config.testId,
+              ref: commandWithCredentials.ref.slice(0, 30),
+            });
+
+            try {
+              const response = await ClarificationService.requestClarification({
+                testId: this.config.testId,
+                userId: this.config.userId,
+                question: 'I detected a file upload input. Lite mode cannot upload files. How should I proceed?\n\nOptions:\n• skip_upload - Skip this upload and continue\n• stop_test - Stop the test here',
+                type: 'test_data',
+                required: true,
+                options: ['skip_upload', 'stop_test'],
+                timeout: LITE_ENGINE_FLAGS.fileUploadTimeoutMs,
+              });
+              const normalized = response?.trim().toLowerCase();
+
+              if (normalized === 'stop_test' || !normalized) {
+                logger.info('[LITE_ENGINE] User chose to stop at file upload', {
+                  testId: this.config.testId,
+                });
+                this.emitCompletion(false, 'File upload requires manual input');
+                await this.flushPendingGraphScreenshotUploads();
+                closeIteration({ skipped: true, reason: 'file_upload_stop_test', ref: commandWithCredentials.ref });
+                return await this.buildResult(false, 'Stopped: File upload requires manual input');
+              }
+              // If 'skip_upload', skip this action and continue to next iteration
+              if (normalized === 'skip_upload') {
+                logger.info('[LITE_ENGINE] Skipping file upload as requested', {
+                  testId: this.config.testId,
+                });
+                this.skippedFileUploadRefs.add(commandWithCredentials.ref);
+                closeIteration({ skipped: true, reason: 'file_upload_skip_upload', ref: commandWithCredentials.ref });
+                continue; // Skip to next iteration without executing this command
+              }
+            } catch (clarificationError) {
+              logger.warn('[LITE_ENGINE] File upload clarification failed', {
+                testId: this.config.testId,
+                error: clarificationError instanceof Error ? clarificationError.message : String(clarificationError),
+              });
+              // On error, skip the upload action (safe default)
+              closeIteration({ skipped: true, reason: 'file_upload_gate_error', ref: commandWithCredentials.ref });
+              continue;
+            }
+          }
+        }
+
+        // Gate 3: External Domain Navigation Approval
+        if (LITE_ENGINE_FLAGS.enableExternalDomainGate && commandWithCredentials.action === 'goto') {
+          const currentUrl = snapshotBefore.url;
+          const targetUrl = commandWithCredentials.url || '';
+
+          let currentOrigin: string | null = null;
+          let targetOrigin: string | null = null;
+          let resolvedTargetUrl: string | null = null;
+          try {
+            const current = new URL(currentUrl);
+            const target = new URL(targetUrl, current);
+            currentOrigin = current.origin;
+            targetOrigin = target.origin;
+            resolvedTargetUrl = target.toString();
+          } catch {
+            // If URL parsing fails, don't gate
+          }
+
+          if (currentOrigin && targetOrigin && resolvedTargetUrl && currentOrigin !== targetOrigin) {
+            if (this.deniedExternalOrigins.has(targetOrigin)) {
+              closeIteration({ skipped: true, reason: 'external_nav_denied_cached', origin: targetOrigin });
+              continue;
+            }
+
+            if (!this.approvedExternalOrigins.has(targetOrigin)) {
+              logger.info('[LITE_ENGINE] External domain navigation detected, asking user', {
+                testId: this.config.testId,
+                from: currentUrl.slice(0, 50),
+                to: targetUrl.slice(0, 50),
+              });
+
+              try {
+                const response = await ClarificationService.requestClarification({
+                  testId: this.config.testId,
+                  userId: this.config.userId,
+                  question: `I'm about to navigate to a different domain: ${resolvedTargetUrl}\n\nCurrent domain: ${currentOrigin}\nNew domain: ${targetOrigin}\n\nOptions:\n• allow_once - Allow this navigation\n• deny - Stay on current domain`,
+                  type: 'url',
+                  required: true,
+                  options: ['allow_once', 'deny'],
+                  timeout: LITE_ENGINE_FLAGS.externalDownloadApprovalTimeoutMs,
+                });
+                const normalized = response?.trim().toLowerCase();
+
+                if (normalized === 'deny' || !normalized) {
+                  logger.info('[LITE_ENGINE] External navigation denied by user', {
+                    testId: this.config.testId,
+                  });
+                  this.deniedExternalOrigins.add(targetOrigin);
+                  closeIteration({ skipped: true, reason: 'external_nav_denied', origin: targetOrigin });
+                  continue; // Skip this navigation, continue to next iteration
+                }
+
+                // Allow and cache the origin
+                this.approvedExternalOrigins.add(targetOrigin);
+              } catch (clarificationError) {
+                logger.warn('[LITE_ENGINE] External navigation clarification failed', {
+                  testId: this.config.testId,
+                  error: clarificationError instanceof Error ? clarificationError.message : String(clarificationError),
+                });
+                // On error, deny navigation (safe default)
+                if (targetOrigin) {
+                  this.deniedExternalOrigins.add(targetOrigin);
+                  closeIteration({ skipped: true, reason: 'external_nav_gate_error', origin: targetOrigin });
+                } else {
+                  closeIteration({ skipped: true, reason: 'external_nav_gate_error' });
+                }
+                continue;
+              }
+            }
+          }
+        }
+
+        // Gate 4: Download/Export Click Approval
+        if (LITE_ENGINE_FLAGS.enableDownloadApprovalGate && commandWithCredentials.action === 'click' && commandWithCredentials.ref) {
+          if (this.deniedDownloadRefs.has(commandWithCredentials.ref)) {
+            closeIteration({ skipped: true, reason: 'download_denied_cached', ref: commandWithCredentials.ref });
+            continue;
+          }
+
+          const targetElement = snapshotBefore.elements.find(el => el.ref === commandWithCredentials.ref);
+          const targetText = targetElement?.name || '';
+
+          if (isDownloadText(targetText) && !this.downloadApprovalAskedForRefs.has(commandWithCredentials.ref)) {
+            this.downloadApprovalAskedForRefs.add(commandWithCredentials.ref);
+
+            logger.info('[LITE_ENGINE] Download/export action detected, asking user', {
+              testId: this.config.testId,
+              targetText: targetText.slice(0, 50),
+            });
+
+            try {
+              const response = await ClarificationService.requestClarification({
+                testId: this.config.testId,
+                userId: this.config.userId,
+                question: `I detected a download/export action: "${targetText}". Should I proceed?\n\nOptions:\n• allow - Proceed with download\n• deny - Skip this action`,
+                type: 'url',
+                required: true,
+                options: ['allow', 'deny'],
+                timeout: LITE_ENGINE_FLAGS.externalDownloadApprovalTimeoutMs,
+              });
+              const normalized = response?.trim().toLowerCase();
+
+              if (normalized === 'deny' || !normalized) {
+                logger.info('[LITE_ENGINE] Download action denied by user', {
+                  testId: this.config.testId,
+                });
+                this.deniedDownloadRefs.add(commandWithCredentials.ref);
+                closeIteration({ skipped: true, reason: 'download_denied', ref: commandWithCredentials.ref });
+                continue; // Skip this action, continue to next iteration
+              }
+              // If 'allow', continue normally
+            } catch (clarificationError) {
+              logger.warn('[LITE_ENGINE] Download approval clarification failed', {
+                testId: this.config.testId,
+                error: clarificationError instanceof Error ? clarificationError.message : String(clarificationError),
+              });
+              // On error, deny download (safe default)
+              this.deniedDownloadRefs.add(commandWithCredentials.ref);
+              closeIteration({ skipped: true, reason: 'download_gate_error', ref: commandWithCredentials.ref });
+              continue;
+            }
+          }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // PHASE A: Prepare for popup detection before click (only if we will execute click)
         // ═══════════════════════════════════════════════════════════════════════
         if (commandWithCredentials.action === 'click' && this.pageWatcher) {
           this.pageWatcher.prepareForPopup();
@@ -3632,4 +4067,5 @@ export class LiteEngine {
       return false;
     }
   }
+
 }

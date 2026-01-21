@@ -81,10 +81,10 @@ export class SnapshotCollector {
 
             // Check for modal indicators
             const hasModalRole = modal.getAttribute('role') === 'dialog' ||
-                                 modal.getAttribute('aria-modal') === 'true' ||
-                                 modal.classList.contains('modal') ||
-                                 modal.classList.contains('overlay') ||
-                                 modal.classList.contains('popup');
+              modal.getAttribute('aria-modal') === 'true' ||
+              modal.classList.contains('modal') ||
+              modal.classList.contains('overlay') ||
+              modal.classList.contains('popup');
 
             // Accept if:
             // 1. Has modal role/class AND covers >20% viewport, OR
@@ -252,8 +252,8 @@ export class SnapshotCollector {
           );
 
           let titleText = title?.textContent?.trim() ||
-                         parent.getAttribute('aria-label') ||
-                         parent.getAttribute('data-title');
+            parent.getAttribute('aria-label') ||
+            parent.getAttribute('data-title');
 
           if (titleText) {
             titleText = titleText.slice(0, 50);
@@ -262,15 +262,15 @@ export class SnapshotCollector {
           // Determine parent type
           const parentType =
             parent.matches('.card, .product, .item, [data-product], [data-item]') ? 'Card' :
-            parent.matches('article, [role="article"]') ? 'Article' :
-            parent.matches('form') ? 'Form' :
-            parent.matches('.modal, [role="dialog"]') ? 'Modal' :
-            parent.matches('section') ? 'Section' :
-            parent.matches('header') ? 'Header' :
-            parent.matches('footer') ? 'Footer' :
-            parent.matches('nav') ? 'Navigation' :
-            parent.matches('aside') ? 'Aside' :
-            'Container';
+              parent.matches('article, [role="article"]') ? 'Article' :
+                parent.matches('form') ? 'Form' :
+                  parent.matches('.modal, [role="dialog"]') ? 'Modal' :
+                    parent.matches('section') ? 'Section' :
+                      parent.matches('header') ? 'Header' :
+                        parent.matches('footer') ? 'Footer' :
+                          parent.matches('nav') ? 'Navigation' :
+                            parent.matches('aside') ? 'Aside' :
+                              'Container';
 
           return titleText
             ? `inside: ${parentType} "${titleText}"`
@@ -423,7 +423,7 @@ export class SnapshotCollector {
             const centerY = rect.top + rect.height / 2;
             // @ts-expect-error - window available in browser context
             const inViewport = centerX >= 0 && centerX <= window.innerWidth &&
-                               centerY >= 0 && centerY <= window.innerHeight;
+              centerY >= 0 && centerY <= window.innerHeight;
 
             if (inViewport) {
               try {
@@ -435,16 +435,35 @@ export class SnapshotCollector {
               }
             }
 
+            // SECURITY: Redact sensitive input values to prevent credential leakage
+            // Password fields and credential-related inputs should never have values in snapshot
+            const isSensitiveInput = isInput && (
+              input.type === 'password' ||
+              el.getAttribute('autocomplete')?.includes('password') ||
+              el.getAttribute('autocomplete')?.includes('current-password') ||
+              el.getAttribute('autocomplete')?.includes('new-password') ||
+              // Also redact common identifier fields (username/email/phone) to avoid leaking PII/autofill to LLM
+              el.getAttribute('autocomplete')?.includes('username') ||
+              el.getAttribute('autocomplete')?.includes('email') ||
+              el.getAttribute('autocomplete')?.includes('tel') ||
+              el.getAttribute('autocomplete')?.includes('phone') ||
+              /password|passwd|pwd|secret|credential/i.test(el.getAttribute('name') || '') ||
+              /password|passwd|pwd|secret|credential/i.test(el.getAttribute('id') || '') ||
+              /user|username|login|email|phone|tel|mobile/i.test(el.getAttribute('name') || '') ||
+              /user|username|login|email|phone|tel|mobile/i.test(el.getAttribute('id') || '')
+            );
+
             elements.push({
               ref,
               role: el.getAttribute('role') || el.tagName.toLowerCase(),
               name: el.getAttribute('aria-label') ||
-                    el.getAttribute('title') ||
-                    el.getAttribute('placeholder') ||
-                    el.textContent?.trim().slice(0, 50) || '',
+                el.getAttribute('title') ||
+                el.getAttribute('placeholder') ||
+                el.textContent?.trim().slice(0, 50) || '',
               tag: el.tagName.toLowerCase(),
               type: isInput ? input.type : undefined,
-              value: isInput ? input.value : undefined,
+              // SECURITY: Redact value for sensitive fields (password, credentials)
+              value: (isInput && !isSensitiveInput) ? input.value : undefined,
               placeholder: isInput ? input.placeholder : undefined,
               checked: input.checked || undefined,
               disabled: input.disabled || el.hasAttribute('disabled'),
