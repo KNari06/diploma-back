@@ -354,6 +354,9 @@ export class SupabaseService {
       const errorCode = (error as any)?.code;
       if (errorCode === 'PGRST204' && (resultData?.video_url !== undefined || resultData?.trace_url !== undefined)) {
         const { video_url: _videoUrl, trace_url: _traceUrl, ...withoutArtifacts } = resultData || {};
+        // Keep explicit destructuring for clarity, but avoid unused-vars lint errors
+        void _videoUrl;
+        void _traceUrl;
         logger.warn('[DB] test_results schema missing artifact columns; retrying insert without video_url/trace_url', {
           testId: resultData.test_id,
           browser: resultData.browser,

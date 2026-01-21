@@ -148,7 +148,10 @@ export class IntelligentTestStorageService {
             visited_at: visit.timestamp
               ? new Date(visit.timestamp).toISOString()
               : new Date().toISOString(), // ✅ Fallback if timestamp missing
-            // Note: vision_analysis, dom_analysis, screenshot can be added later if PageVisit type is extended
+            // ✅ NEW: Store DOM analysis for step editor linting
+            dom_analysis: visit.domAnalysis || null,
+            // Screenshot (base64 or URL)
+            screenshot: visit.screenshot || null,
           })
           .select('id')
           .single();

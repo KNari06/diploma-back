@@ -14,6 +14,14 @@ export interface ClientToServerEvents {
   'subscribe:chat': (data: { sessionId: string }) => void;
   'unsubscribe:chat': (data: { sessionId: string }) => void;
 
+  // Preview subscriptions
+  'subscribe:preview': (data: { previewSessionId: string }) => void;
+  'unsubscribe:preview': (data: { previewSessionId: string }) => void;
+
+  // Preview step operations
+  'preview:step:lint': (data: PreviewStepLintRequest) => void;
+  'preview:step:apply': (data: PreviewStepApplyRequest) => void;
+
   // Clarification
   'test:clarification:response': (data: { testId: string; questionId: string; answer: string }) => void;
 
@@ -70,6 +78,11 @@ export interface ServerToClientEvents {
   // System events
   'system:error': (data: SystemErrorPayload) => void;
   'system:maintenance': (data: SystemMaintenancePayload) => void;
+
+  // Preview events
+  'preview:page': (data: PreviewPagePayload) => void;
+  'preview:step:lint:result': (data: PreviewStepLintResultPayload) => void;
+  'preview:step:apply:result': (data: PreviewStepApplyResultPayload) => void;
 
   // Heartbeat response
   pong: () => void;
@@ -480,12 +493,12 @@ export interface ChatTestUpdatePayload {
 export interface ChatProcessingStepPayload {
   sessionId: string;
   step: 'parsing_intent' | 'enriching_context' | 'checking_autonomous' |
-        'generating_questions' | 'exploring_site' | 'generating_plan' |
-        'executing_test' | 'analyzing_results' | 'generating_response' |
-        'generating_scenarios' | 'executing_tests' |
-        // NEW: Added for better clarity
-        'preparing_workspace' | 'checking_project' | 'validating_credentials' |
-        'creating_test_plan' | 'waiting_approval' ;
+  'generating_questions' | 'exploring_site' | 'generating_plan' |
+  'executing_test' | 'analyzing_results' | 'generating_response' |
+  'generating_scenarios' | 'executing_tests' |
+  // NEW: Added for better clarity
+  'preparing_workspace' | 'checking_project' | 'validating_credentials' |
+  'creating_test_plan' | 'waiting_approval';
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;
@@ -507,6 +520,130 @@ export interface SystemMaintenancePayload {
 }
 
 // ============================================================================
+// PREVIEW EVENTS (Step Editor)
+// ============================================================================
+
+/**
+ * Bounding box for element highlighting
+ */
+export interface PreviewBoundingBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Interactive node from page snapshot
+ */
+export interface PreviewInteractiveNode {
+  ref?: string;
+  tag: string;
+  role?: string;
+  type?: string;
+  text?: string;
+  labelText?: string;
+  ariaLabel?: string;
+  placeholder?: string;
+  boundingBox?: PreviewBoundingBox;
+  isVisible?: boolean;
+  isDisabled?: boolean;
+}
+
+/**
+ * Intent step draft for linting
+ */
+export interface PreviewIntentStep {
+  id: string;
+  type: 'fill' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close';
+  description: string;
+  value?: string;
+  bindingHints?: {
+    role?: string;
+    label?: string;
+    placeholder?: string;
+    nearText?: string;
+    autocomplete?: string;
+    type?: string;
+  };
+}
+
+/**
+ * Request to lint a step
+ */
+export interface PreviewStepLintRequest {
+  previewSessionId: string;
+  stepDraft: PreviewIntentStep;
+  pageRef?: string; // Optional page reference (for cached context)
+}
+
+/**
+ * Request to apply (execute) a step
+ */
+export interface PreviewStepApplyRequest {
+  previewSessionId: string;
+  stepDraft: PreviewIntentStep;
+  pageRef?: string;
+}
+
+/**
+ * Candidate element from linting
+ */
+export interface PreviewLintCandidate {
+  ref?: string;
+  label: string;
+  reason: string;
+  confidence: number;
+  boundingBox?: PreviewBoundingBox;
+}
+
+/**
+ * Highlight instruction for UI
+ */
+export interface PreviewHighlight {
+  ref?: string;
+  boundingBox?: PreviewBoundingBox;
+  type: 'success' | 'warning' | 'error';
+}
+
+/**
+ * Page snapshot payload
+ */
+export interface PreviewPagePayload {
+  previewSessionId: string;
+  url: string;
+  domNodes: PreviewInteractiveNode[];
+  screenshot?: string;
+  timestamp: string;
+}
+
+/**
+ * Step lint result payload
+ */
+export interface PreviewStepLintResultPayload {
+  status: 'resolved' | 'ambiguous' | 'not_found' | 'error';
+  message: string;
+  confidence: number;
+  candidates: PreviewLintCandidate[];
+  highlight: PreviewHighlight[];
+  timestamp: string;
+}
+
+/**
+ * Step apply result payload
+ */
+export interface PreviewStepApplyResultPayload {
+  success: boolean;
+  error?: string;
+  appliedStep?: PreviewIntentStep;
+  urlChanged?: boolean;
+  url?: string;
+  highlight?: PreviewHighlight[];
+  attempts?: number;
+  timestamp: string;
+}
+
+// ============================================================================
 // SOCKET DATA
 // ============================================================================
 
@@ -520,7 +657,7 @@ export interface SocketData {
 // ROOM TYPES
 // ============================================================================
 
-export type RoomType = 'test' | 'chat' | 'user';
+export type RoomType = 'test' | 'chat' | 'user' | 'preview';
 
 export interface RoomIdentifier {
   type: RoomType;
@@ -530,8 +667,8 @@ export interface RoomIdentifier {
 // Helper to create room names
 export const createRoomName = (type: RoomType, id: string): string => {
   // Validate inputs
-  if (!type || !['test', 'chat', 'user'].includes(type)) {
-    throw new Error(`Invalid room type: ${type}. Must be 'test', 'chat', or 'user'`);
+  if (!type || !['test', 'chat', 'user', 'preview'].includes(type)) {
+    throw new Error(`Invalid room type: ${type}. Must be 'test', 'chat', 'user', or 'preview'`);
   }
 
   if (!id || typeof id !== 'string' || id.trim().length === 0) {

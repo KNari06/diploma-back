@@ -35,6 +35,8 @@ import { getLocator, normalizeSelector } from '../utils/selectors/selector-utils
 import { GraphBuilder } from '../utils/visualization/graph-builder.service'; // Graph builder for real-time test visualization
 import { TestProgressEmitter } from '../utils/visualization/progress-emitter';
 import { MainLoopService } from './main-loop.service'; // Main testing loop service (analyze → generate → execute → decide)
+import { SnapshotCollector } from './lite/collectors/snapshot-collector'; // Snapshot collector for DOM analysis
+import { DomAnalysisExtractorService } from '@/services/testing/ui/preview/dom-analysis-extractor.service'; // DOM analysis extractor for step editor linting
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS - AI Cost Estimation
@@ -1501,6 +1503,21 @@ export class IntelligentTestOrchestrator {
       }
     }
 
+    // ✅ NEW: Capture DOM analysis for step editor linting
+    let domAnalysis;
+    try {
+      const snapshot = await SnapshotCollector.collect(this.page);
+      domAnalysis = DomAnalysisExtractorService.extract(snapshot);
+      logger.debug('[INTELLIGENT_ORCHESTRATOR] DOM analysis captured for step editor', {
+        nodeCount: domAnalysis.interactiveNodes.length,
+        url: context.url,
+      });
+    } catch (error) {
+      logger.warn('[INTELLIGENT_ORCHESTRATOR] Failed to capture DOM analysis', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     return {
       url: context.url,
       pageType: context.pageType,
@@ -1508,6 +1525,7 @@ export class IntelligentTestOrchestrator {
       actions,
       actionResults: completedActions,
       success,
+      domAnalysis,
     };
   }
 

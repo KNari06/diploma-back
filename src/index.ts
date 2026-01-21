@@ -12,6 +12,7 @@ import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import notificationsRoutes from '@/api/notifications/notifications.routes';
 import playwrightRoutes from '@/api/playwright/playwright.route';
+import previewRoutes from '@/api/preview/preview.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
@@ -1226,6 +1227,7 @@ app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications
 app.use(`/api/${env.API_VERSION}/queue`, queueStatusRoutes); // Queue monitoring
 app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // ✅ NEW: User issue reports
+app.use(`/api/${env.API_VERSION}/preview`, previewRoutes); // ✅ NEW: Step editor preview
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
@@ -1497,6 +1499,20 @@ const startServer = async () => {
                   });
                 }
               })(),
+
+              // ✅ NEW: Close preview sessions (step editor browsers)
+              (async () => {
+                try {
+                  const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+                  await getPreviewSessionService().shutdown();
+                  logger.info('[SERVER] Preview sessions closed');
+                } catch (error) {
+                  logger.error('[SERVER] Error closing preview sessions:', {
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              })(),
+
               // Close queue connections
               (async () => {
                 try {
@@ -1526,7 +1542,7 @@ const startServer = async () => {
             // Log any failures
             cleanupResults.forEach((result, index) => {
               if (result.status === 'rejected') {
-                const serviceNames = ['browser pool', 'queues', 'websocket'];
+                const serviceNames = ['redis subscriber', 'browser pool', 'preview sessions', 'queues', 'websocket'];
                 logger.warn(`[SERVER] Failed to close ${serviceNames[index]}`, {
                   error: result.reason instanceof Error ? result.reason.message : String(result.reason),
                 });

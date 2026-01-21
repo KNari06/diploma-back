@@ -13,6 +13,7 @@ import {
   SocketData,
 } from '../types/types';
 import { handleHeartbeat } from './heartbeat.handler';
+import { handlePreviewEvents } from './preview.handler';
 import { handleSubscriptions } from './subscription.handler';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
@@ -102,6 +103,7 @@ export const handleConnection = async (socket: TypedSocket): Promise<void> => {
     // Setup event handlers
     handleSubscriptions(socket);
     handleHeartbeat(socket);
+    handlePreviewEvents(socket);
   } catch (error) {
     logger.error('[WebSocket] Error setting up connection handlers', {
       socketId: socket.id,

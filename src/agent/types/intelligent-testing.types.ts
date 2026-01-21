@@ -289,6 +289,8 @@ export interface PageVisit {
   actionResults?: ActionResult[]; // Actual execution results
   success: boolean;
   screenshot?: string; // ✅ NEW: Base64 screenshot from page analysis
+  /** DOM analysis data for step editor linting (interactive nodes) */
+  domAnalysis?: import('@/services/testing/ui/preview/preview.types').DomAnalysisData;
 }
 
 /**
