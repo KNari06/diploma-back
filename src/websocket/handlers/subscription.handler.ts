@@ -1,9 +1,11 @@
 /**
  * Subscription Handler
  * Handles room subscriptions for tests and chats
+ * ✅ FIX: Added ownership verification to prevent cross-user event leakage
  */
 
 import { connection } from '@/config/infrastructure/queues';
+import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import Redis from 'ioredis';
 import { Socket } from 'socket.io';
@@ -241,7 +243,8 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
   }
 
   // Subscribe to test updates
-  socket.on('subscribe:test', ({ testId }) => {
+  // ✅ FIX: Added async ownership verification to prevent cross-user event leakage
+  socket.on('subscribe:test', async ({ testId }) => {
     try {
       // Validate input
       if (!testId || typeof testId !== 'string' || testId.trim().length === 0) {
@@ -264,6 +267,97 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           socketId: socket.id,
           userId: userId || 'anonymous',
           testId,
+        });
+        return;
+      }
+
+      // ✅ SECURITY: Require authenticated user for subscriptions
+      if (!userId) {
+        socket.emit('error', {
+          code: 'AUTH_REQUIRED',
+          message: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // ✅ SECURITY: Verify test ownership before allowing subscription (fail-closed)
+      // This prevents users from subscribing to other users' test events.
+      try {
+        const { data: test, error: testError } = await supabaseAdmin
+          .from('tests')
+          .select('user_id')
+          .eq('id', testId.trim())
+          .maybeSingle();
+
+        if (testError) {
+          logger.warn('[WebSocket] Failed to verify test ownership (denying subscription)', {
+            socketId: socket.id,
+            userId,
+            testId,
+            error: testError.message,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'Authorization check failed',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        if (!test) {
+          logger.warn('[WebSocket] Test not found for subscription', {
+            socketId: socket.id,
+            userId,
+            testId,
+          });
+          socket.emit('error', {
+            code: 'TEST_NOT_FOUND',
+            message: 'Test not found',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        if (!test.user_id) {
+          logger.warn('[WebSocket] Test owner is missing (denying subscription)', {
+            socketId: socket.id,
+            userId,
+            testId,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'You do not have access to this test',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        if (test.user_id !== userId) {
+          logger.warn('[WebSocket] Subscription denied: test belongs to different user', {
+            socketId: socket.id,
+            requestingUserId: userId,
+            testOwnerId: test.user_id.substring(0, 8) + '...',
+            testId,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'You do not have access to this test',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+      } catch (verifyError) {
+        logger.warn('[WebSocket] Exception verifying test ownership (denying subscription)', {
+          socketId: socket.id,
+          userId,
+          testId,
+          error: verifyError instanceof Error ? verifyError.message : String(verifyError),
+        });
+        socket.emit('error', {
+          code: 'ACCESS_DENIED',
+          message: 'Authorization check failed',
+          timestamp: new Date().toISOString(),
         });
         return;
       }
@@ -360,7 +454,8 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
   });
 
   // Subscribe to chat updates
-  socket.on('subscribe:chat', ({ sessionId }) => {
+  // ✅ FIX: Added async ownership verification to prevent cross-user event leakage
+  socket.on('subscribe:chat', async ({ sessionId }) => {
     try {
       // Validate input
       if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
@@ -383,6 +478,97 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           socketId: socket.id,
           userId: userId || 'anonymous',
           sessionId,
+        });
+        return;
+      }
+
+      // ✅ SECURITY: Require authenticated user for subscriptions
+      if (!userId) {
+        socket.emit('error', {
+          code: 'AUTH_REQUIRED',
+          message: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // ✅ SECURITY: Verify chat session ownership before allowing subscription (fail-closed)
+      // This prevents users from subscribing to other users' chat events.
+      try {
+        const { data: chatSession, error: sessionError } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('user_id')
+          .eq('id', sessionId.trim())
+          .maybeSingle();
+
+        if (sessionError) {
+          logger.warn('[WebSocket] Failed to verify chat session ownership (denying subscription)', {
+            socketId: socket.id,
+            userId,
+            sessionId,
+            error: sessionError.message,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'Authorization check failed',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        if (!chatSession) {
+          logger.warn('[WebSocket] Chat session not found for subscription', {
+            socketId: socket.id,
+            userId,
+            sessionId,
+          });
+          socket.emit('error', {
+            code: 'SESSION_NOT_FOUND',
+            message: 'Chat session not found',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        if (!chatSession.user_id) {
+          logger.warn('[WebSocket] Chat session owner is missing (denying subscription)', {
+            socketId: socket.id,
+            userId,
+            sessionId,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'You do not have access to this chat session',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        if (chatSession.user_id !== userId) {
+          logger.warn('[WebSocket] Subscription denied: chat session belongs to different user', {
+            socketId: socket.id,
+            requestingUserId: userId,
+            sessionOwnerId: chatSession.user_id.substring(0, 8) + '...',
+            sessionId,
+          });
+          socket.emit('error', {
+            code: 'ACCESS_DENIED',
+            message: 'You do not have access to this chat session',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+      } catch (verifyError) {
+        logger.warn('[WebSocket] Exception verifying chat session ownership (denying subscription)', {
+          socketId: socket.id,
+          userId,
+          sessionId,
+          error: verifyError instanceof Error ? verifyError.message : String(verifyError),
+        });
+        socket.emit('error', {
+          code: 'ACCESS_DENIED',
+          message: 'Authorization check failed',
+          timestamp: new Date().toISOString(),
         });
         return;
       }
