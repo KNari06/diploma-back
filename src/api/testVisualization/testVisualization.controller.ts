@@ -577,6 +577,7 @@ async function getComprehensiveTestData(testId: string, userId?: string): Promis
         .from('intelligent_test_sessions')
         .select('id, graph_data') // ✅ NEW: Include graph_data
         .eq('test_id', testId)
+        .order('started_at', { ascending: false }) // ✅ FIX: Deterministic order (latest first)
         .limit(1);
 
       if (!sessionError && sessions && sessions.length > 0) {

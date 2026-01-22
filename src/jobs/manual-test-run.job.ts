@@ -185,13 +185,22 @@ export class ManualTestRunJobHandler {
       } else {
         // ✅ FIX: Don't throw exception - executePlaywrightTestWithRetry already exhausted all retries
         // Just handle the final failure result
+        // ✅ IMPROVED: Log first error details for better debugging
+        const firstError = result.errors?.[0];
+        const errorDetails = firstError ? {
+          type: firstError.type,
+          message: firstError.message,
+          stack: firstError.stack?.substring(0, 500), // Truncate stack for readability
+        } : null;
+
         logger.error(`[TEST-RUN] Test execution failed after all retries: ${testId}`, {
           testId,
           browser,
           url,
           status: result.status,
           error: result.error,
-          errors: result.errors?.length || 0,
+          errorsCount: result.errors?.length || 0,
+          firstError: errorDetails,
         });
 
         // Mark test as failed (final failure)
@@ -406,11 +415,12 @@ export class ManualTestRunJobHandler {
       };
       webSocketService.emitTestBrowserCompleted(testId, browserCompletedPayload);
 
-      // Emit WebSocket: result ready
+      // Emit WebSocket: result ready (success case)
       const resultReadyPayload: ResultReadyPayload = {
         testId,
         browser,
         resultId,
+        status: 'completed', // ✅ NEW: Indicate success
         timestamp: new Date().toISOString(),
       };
       webSocketService.emitResultReady(testId, resultReadyPayload);
@@ -525,6 +535,7 @@ export class ManualTestRunJobHandler {
       testId,
       browser,
       resultId,
+      status: 'failed', // ✅ NEW: Indicate failure
       timestamp: new Date().toISOString(),
     };
     webSocketService.emitResultReady(testId, resultReadyPayload);

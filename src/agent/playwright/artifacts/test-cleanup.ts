@@ -5,6 +5,7 @@ import { stopTracingAndGetVideo } from './artifacts-handler';
 
 /**
  * Cleanup browser resources (page and context)
+ * ✅ NOTE: Page may already be closed by stopTracingAndGetVideo (for video finalization)
  */
 export async function cleanupBrowserResources(
   page: Page | null,
@@ -13,12 +14,17 @@ export async function cleanupBrowserResources(
 ): Promise<void> {
   void _tracePath; // Cleanup is best-effort; trace file is handled by artifact collector/uploader
 
-  if (page) {
+  // ✅ Page may already be closed by stopTracingAndGetVideo - check isClosed()
+  if (page && !page.isClosed()) {
     try {
       await page.close();
       logger.debug('[PLAYWRIGHT] Page closed');
     } catch (pageError) {
-      logger.warn('[PLAYWRIGHT] Failed to close page', { error: pageError });
+      // Ignore "already closed" errors
+      const msg = pageError instanceof Error ? pageError.message : String(pageError);
+      if (!msg.includes('closed') && !msg.includes('Target closed')) {
+        logger.warn('[PLAYWRIGHT] Failed to close page', { error: msg });
+      }
     }
   }
 
@@ -27,7 +33,11 @@ export async function cleanupBrowserResources(
       await context.close();
       logger.debug('[PLAYWRIGHT] Context closed');
     } catch (contextError) {
-      logger.warn('[PLAYWRIGHT] Failed to close context', { error: contextError });
+      // Ignore "already closed" errors
+      const msg = contextError instanceof Error ? contextError.message : String(contextError);
+      if (!msg.includes('closed') && !msg.includes('Target closed')) {
+        logger.warn('[PLAYWRIGHT] Failed to close context', { error: msg });
+      }
     }
   }
 }
@@ -49,7 +59,10 @@ export async function collectArtifactsAndCleanup(
 
   // Stop tracing and get video path before closing
   try {
-    const artifacts = await stopTracingAndGetVideo(context, page, tracePath);
+    const artifacts = await stopTracingAndGetVideo(context, page, tracePath, {
+      testId: testData.testId,
+      browser: testData.browser,
+    });
     videoPath = artifacts.videoPath;
     tracePathResult = artifacts.tracePath;
   } catch (artifactError) {

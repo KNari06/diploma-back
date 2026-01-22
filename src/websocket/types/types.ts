@@ -398,6 +398,7 @@ export interface ResultReadyPayload {
   testId: string;
   browser: string;
   resultId: string;
+  status: 'completed' | 'failed'; // ✅ NEW: Indicate if this is a success or failure result
   timestamp: string;
 }
 
