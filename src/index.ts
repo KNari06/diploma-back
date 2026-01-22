@@ -1378,6 +1378,7 @@ const startServer = async () => {
       server = app.listen(env.PORT, () => {
         logger.info(`🚀 QAIT Backend API started on port ${env.PORT}`);
         logger.info(`📊 Environment: ${env.NODE_ENV}`);
+        logger.info(`🏷️ Queue prefix: ${env.QUEUE_PREFIX}`);
         logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
         logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
       });

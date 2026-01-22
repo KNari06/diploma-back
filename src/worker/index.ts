@@ -429,6 +429,7 @@ logger.info('🚀 QAIT Worker started');
 logger.info(`📊 Concurrency: ${queueConcurrency}`);
 logger.info(`🔧 Environment: ${env.NODE_ENV}`);
 logger.info(`🔌 Redis: ${env.REDIS_HOST}:${env.REDIS_PORT}`);
+logger.info(`🏷️ Queue prefix: ${env.QUEUE_PREFIX}`);
 logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`);
 
 // Test Redis connection
