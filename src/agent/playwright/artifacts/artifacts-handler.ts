@@ -200,6 +200,10 @@ export async function saveIntelligentTestResults(
 ): Promise<void> {
   try {
     const { IntelligentTestStorageService } = await import('@/services/testing/results/intelligent-test-storage.service');
+    const resolvedStartUrl =
+      intelligentConfig?.startUrl ||
+      intelligentResult?.startUrl ||
+      testData.url;
 
     logger.info('[PLAYWRIGHT] Saving test session with graph data', {
       testId: testData.testId,
@@ -215,7 +219,7 @@ export async function saveIntelligentTestResults(
       result: intelligentResult,
       config: {
         goal: intelligentConfig.goal,
-        startUrl: intelligentConfig.startUrl,
+        startUrl: resolvedStartUrl,
         mode: intelligentConfig.mode,
         browser: testData.browser || 'chrome',
         viewport: testData.options?.viewport,
@@ -236,7 +240,7 @@ export async function saveIntelligentTestResults(
       userId: testData.userId,
       projectId: testData.projectId,
       hasGoal: !!intelligentConfig?.goal,
-      hasStartUrl: !!intelligentConfig?.startUrl,
+      hasStartUrl: !!(intelligentConfig?.startUrl || intelligentResult?.startUrl || testData.url),
       error: storageError instanceof Error ? {
         message: storageError.message,
         name: storageError.name,
