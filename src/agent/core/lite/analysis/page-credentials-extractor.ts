@@ -238,10 +238,37 @@ export function extractPageCredentials(
     .map(el => ({ el, kind: classifyInputKind(el) }))
     .filter((x): x is { el: LiteElement; kind: FieldKind } => !!x.kind);
 
-  // 2) Build candidate pool (proximity + global + placeholder + title)
+  // 2) Build candidate pool (proximity + global + placeholder + title + pageText)
   const candidates: TextCandidate[] = [];
 
-  // 2a) Placeholder candidates (safe input attributes)
+  // 2a) Page text for extraction (highest priority if available)
+  // This is the full visible text captured specifically for credential extraction
+  if (snapshot.pageTextForExtraction) {
+    // Split into lines and process each that might contain credentials
+    const lines = snapshot.pageTextForExtraction.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Only consider lines that might contain credential patterns
+      if (trimmed.length < 8 || trimmed.length > 200) continue;
+
+      // Quick filter: must contain credential-related keywords
+      if (!/username|user|login|email|password|pass|pwd|credential/i.test(trimmed)) continue;
+
+      const extracted = extractFromText(trimmed);
+      if (extracted.username || extracted.password) {
+        // High weight for page text extraction (similar to pre/code elements)
+        const weight = 5 + tagBoost('pre'); // Treat as high-signal source
+        candidates.push({
+          text: trimmed,
+          source: 'global_text',
+          tag: 'body',
+          weight,
+        });
+      }
+    }
+  }
+
+  // 2b) Placeholder candidates (safe input attributes)
   for (const { el, kind } of inputs) {
     if (el.placeholder && el.placeholder.trim().length >= 3) {
       const baseWeight = 2; // placeholder bonus (plan)
@@ -257,7 +284,7 @@ export function extractPageCredentials(
     }
   }
 
-  // 2b) Text candidates from non-input elements
+  // 2c) Text candidates from non-input elements
   const textElements = snapshot.elements.filter(el => el.visible && el.tag !== 'input' && el.tag !== 'textarea');
 
   for (const el of textElements) {
@@ -309,7 +336,7 @@ export function extractPageCredentials(
     });
   }
 
-  // 2c) Page title (very low priority)
+  // 2d) Page title (very low priority)
   if (snapshot.title && snapshot.title.trim().length >= 3) {
     candidates.push({
       text: snapshot.title,
@@ -367,10 +394,52 @@ export function extractPageCredentials(
     }
   }
 
-  const foundUsername = bestUsername?.value;
-  const foundPassword = bestPassword?.value;
+  let foundUsername = bestUsername?.value;
+  let foundPassword = bestPassword?.value;
 
-  // 4) Multi-factor confidence scoring
+  // 4) Stricter validation guards to prevent false positives
+  // Only apply if we have at least one credential
+  if (foundUsername || foundPassword) {
+    // Guard: disallow credentials with internal spaces (likely not real credentials)
+    if (foundUsername && /\s/.test(foundUsername)) {
+      logger.debug('[PAGE_CREDS_EXTRACTOR] Rejected username with spaces', { testId });
+      foundUsername = undefined;
+      bestUsername = null;
+    }
+    if (foundPassword && /\s/.test(foundPassword)) {
+      logger.debug('[PAGE_CREDS_EXTRACTOR] Rejected password with spaces', { testId });
+      foundPassword = undefined;
+      bestPassword = null;
+    }
+
+    // Guard: disallow obviously non-credential tokens (URLs, emails as username, etc.)
+    if (foundUsername) {
+      const looksInvalid =
+        foundUsername.startsWith('http') ||
+        foundUsername.startsWith('www.') ||
+        foundUsername.length > 100 || // Too long
+        foundUsername.length < 2; // Too short
+      if (looksInvalid) {
+        logger.debug('[PAGE_CREDS_EXTRACTOR] Rejected invalid username pattern', { testId, length: foundUsername.length });
+        foundUsername = undefined;
+        bestUsername = null;
+      }
+    }
+    if (foundPassword) {
+      const looksInvalid =
+        foundPassword.startsWith('http') ||
+        foundPassword.startsWith('www.') ||
+        foundPassword.length > 100 || // Too long
+        foundPassword.length < 2; // Too short
+      if (looksInvalid) {
+        logger.debug('[PAGE_CREDS_EXTRACTOR] Rejected invalid password pattern', { testId, length: foundPassword.length });
+        foundPassword = undefined;
+        bestPassword = null;
+      }
+    }
+  }
+
+  // 5) Multi-factor confidence scoring
   let score = 0;
 
   // Proximity factors

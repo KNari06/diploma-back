@@ -156,6 +156,8 @@ export interface LiteSnapshot {
   activeModalRef?: string; // Ref of active modal container (if detected)
   /** Transient state info (loading indicators) - NEW: Lite Autonomy v3 */
   transientState?: TransientStateInfo;
+  /** Truncated page text for credential extraction only (never sent to LLM/logs) */
+  pageTextForExtraction?: string;
 }
 
 /**

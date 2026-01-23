@@ -32,6 +32,91 @@ function createSnapshot(elements: LiteElement[], title = 'Test Page'): LiteSnaps
 }
 
 describe('extractPageCredentials', () => {
+  describe('pageTextForExtraction feature', () => {
+    it('should extract credentials from pageTextForExtraction (PracticeTestAutomation scenario)', () => {
+      const pageText = `
+Practice Test Automation
+
+Test login
+
+This is a simple Login page. Students can use this page to practice writing simple positive and negative LogIn tests.
+Use next credentials to execute Login:
+Username: student
+Password: Password123
+
+Test case 1: Positive LogIn test
+1. Open page
+2. Type username student into Username field
+3. Type password Password123 into Password field
+      `.trim();
+
+      const snapshot: LiteSnapshot = {
+        url: 'https://practicetestautomation.com/practice-test-login/',
+        title: 'Test Login | Practice Test Automation',
+        elements: [
+          createElement({
+            ref: 'u_input',
+            tag: 'input',
+            type: 'text',
+            name: 'Username',
+            bounds: bounds(100, 160),
+            htmlId: 'username',
+          }),
+          createElement({
+            ref: 'p_input',
+            tag: 'input',
+            type: 'password',
+            name: 'Password',
+            bounds: bounds(100, 210),
+            htmlId: 'password',
+          }),
+        ],
+        timestamp: Date.now(),
+        pageTextForExtraction: pageText,
+      };
+
+      const result = extractPageCredentials(snapshot, 'practice-test-automation');
+
+      expect(result.username).toBe('student');
+      expect(result.password).toBe('Password123');
+      expect(result.confidence).not.toBe('none');
+      expect(['low', 'medium', 'high']).toContain(result.confidence);
+    });
+
+    it('should work without pageTextForExtraction (backward compatibility)', () => {
+      const snapshot = createSnapshot([
+        createElement({
+          ref: 'u_input',
+          tag: 'input',
+          type: 'text',
+          name: 'Username',
+          bounds: bounds(100, 160),
+          autocomplete: 'username',
+        }),
+        createElement({
+          ref: 'p_input',
+          tag: 'input',
+          type: 'password',
+          name: 'Password',
+          bounds: bounds(100, 210),
+          autocomplete: 'current-password',
+        }),
+        createElement({
+          ref: 'creds_text',
+          name: 'Username: admin Password: secret123',
+          tag: 'div',
+          bounds: bounds(100, 120),
+        }),
+      ]);
+
+      const result = extractPageCredentials(snapshot);
+
+      expect(result.username).toBe('admin');
+      expect(result.password).toBe('secret123');
+      expect(result.confidence).toBe('high');
+    });
+  });
+
   describe('practicetestautomation.com format', () => {
     it('should extract credentials from "username is student" format', () => {
       const snapshot = createSnapshot([
@@ -465,6 +550,118 @@ describe('extractPageCredentials', () => {
 
       const result = extractPageCredentials(snapshot);
 
+      expect(result.confidence).toBe('none');
+    });
+  });
+
+  describe('validation guards', () => {
+    it('should extract only first word when text has spaces', () => {
+      const snapshot = createSnapshot([
+        createElement({
+          ref: 'u_input',
+          tag: 'input',
+          type: 'text',
+          name: 'Username',
+          bounds: bounds(100, 160),
+          autocomplete: 'username',
+        }),
+        createElement({
+          ref: 'p_input',
+          tag: 'input',
+          type: 'password',
+          name: 'Password',
+          bounds: bounds(100, 210),
+          autocomplete: 'current-password',
+        }),
+        createElement({
+          ref: 'creds_text',
+          name: 'Username: invalid user name Password: invalid pass word',
+          tag: 'div',
+          bounds: bounds(100, 120),
+        }),
+      ]);
+
+      const result = extractPageCredentials(snapshot);
+
+      // Regex patterns stop at spaces, so extracts first word only
+      expect(result.username).toBe('invalid');
+      expect(result.password).toBe('invalid');
+      expect(result.confidence).not.toBe('none');
+    });
+
+    it('should cap extracted credential length', () => {
+      const longValue = 'a'.repeat(150);
+      const snapshot = createSnapshot([
+        createElement({
+          ref: 'p_input',
+          tag: 'input',
+          type: 'password',
+          name: 'Password',
+          bounds: bounds(100, 210),
+          autocomplete: 'current-password',
+        }),
+        createElement({
+          ref: 'p_text',
+          name: `Password: ${longValue}`,
+          tag: 'div',
+          bounds: bounds(100, 120),
+        }),
+      ]);
+
+      const result = extractPageCredentials(snapshot);
+
+      // Pattern limits to 50 chars, then cleanCredentialValue caps at 100
+      expect(result.password).toBeDefined();
+      expect(result.password!.length).toBeLessThanOrEqual(100);
+    });
+
+    it('should reject URL-like credentials', () => {
+      const snapshot = createSnapshot([
+        createElement({
+          ref: 'u_input',
+          tag: 'input',
+          type: 'text',
+          name: 'Username',
+          bounds: bounds(100, 160),
+          autocomplete: 'username',
+        }),
+        createElement({
+          ref: 'u_text',
+          name: 'Username: http://example.com',
+          tag: 'div',
+          bounds: bounds(100, 120),
+        }),
+      ]);
+
+      const result = extractPageCredentials(snapshot);
+
+      // Pattern extracts "http" which then gets rejected by guard
+      expect(result.username).toBeUndefined();
+      expect(result.confidence).toBe('none');
+    });
+
+    it('should reject www. prefix credentials', () => {
+      const snapshot = createSnapshot([
+        createElement({
+          ref: 'p_input',
+          tag: 'input',
+          type: 'password',
+          name: 'Password',
+          bounds: bounds(100, 210),
+          autocomplete: 'current-password',
+        }),
+        createElement({
+          ref: 'p_text',
+          name: 'Password: www.example',
+          tag: 'div',
+          bounds: bounds(100, 120),
+        }),
+      ]);
+
+      const result = extractPageCredentials(snapshot);
+
+      // Should reject www. prefix
+      expect(result.password).toBeUndefined();
       expect(result.confidence).toBe('none');
     });
   });

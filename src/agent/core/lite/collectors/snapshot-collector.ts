@@ -651,6 +651,11 @@ export class SnapshotCollector {
           }
         });
 
+        // Extract truncated page text for credential extraction (never sent to LLM)
+        // @ts-expect-error - document available in browser context
+        const pageText = document.body?.innerText || '';
+        const pageTextForExtraction = pageText.slice(0, 10000); // Max 10k chars
+
         return {
           // @ts-expect-error - window and document available in browser context
           url: window.location.href,
@@ -660,6 +665,7 @@ export class SnapshotCollector {
           timestamp: Date.now(),
           activeModalRef, // Include detected modal ref
           transientState, // Include transient state info (loading indicators)
+          pageTextForExtraction, // For credential extraction only
         };
       });
 
