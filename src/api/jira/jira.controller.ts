@@ -10,6 +10,7 @@ import {
   ensureValidToken,
   getJiraProjects,
 } from '@/services/api/jira.service';
+import { supabaseAdmin } from '@/db/supabase';
 
 // In-memory store for OAuth states (in production, use Redis)
 const oauthStates = new Map<string, { userId?: string; expiresAt: number }>();
@@ -58,8 +59,32 @@ export const startJiraAuth = async (req: Request, res: Response): Promise<void> 
 };
 
 /**
+ * Get OAuth URL for Jira connect (for SPA: fetch with Bearer, then redirect)
+ * GET /api/v1/jira/connect/url
+ */
+export const getConnectUrl = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const state = generateOAuthState();
+    const authUrl = buildJiraAuthUrl(state);
+    oauthStates.set(state, {
+      userId,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+    logger.info('Jira OAuth URL issued', { userId, state });
+    res.json({ success: true, url: authUrl });
+  } catch (error) {
+    logger.error('Jira connect URL error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to get connect URL',
+    });
+  }
+};
+
+/**
  * Handle Jira OAuth callback
- * GET /api/jira/callback
+ * GET /api/v1/jira/callback
  */
 export const handleJiraCallback = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -212,5 +237,84 @@ export const getProjects = async (req: Request, res: Response): Promise<void> =>
       success: false,
       error: error instanceof Error ? error.message : 'Failed to get projects',
     });
+  }
+};
+
+/**
+ * Get Jira connection status
+ * GET /api/v1/jira/status
+ */
+export const getConnectionStatus = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const { data, error } = await supabaseAdmin
+      .from('jira_tokens')
+      .select('cloud_id, site_url')
+      .eq('user_id', userId);
+    if (error) {
+      logger.error('Failed to get Jira connection status', error);
+      res.status(500).json({ success: false, error: 'Failed to get Jira connection status' });
+      return;
+    }
+    res.json({
+      success: true,
+      connections: data || [],
+      connected: !!data && data.length > 0,
+    });
+  } catch (error) {
+    logger.error('Get Jira connection status error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get Jira connection status' });
+  }
+};
+
+/**
+ * Disconnect Jira account(s)
+ * DELETE /api/v1/jira/disconnect
+ */
+export const disconnectJira = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const cloudId = req.query.cloudId as string | undefined;
+    let query = supabaseAdmin.from('jira_tokens').delete().eq('user_id', userId);
+    if (cloudId) {
+      query = query.eq('cloud_id', cloudId);
+    }
+    const { error } = await query;
+    if (error) {
+      logger.error('Failed to disconnect Jira', error);
+      res.status(500).json({ success: false, error: 'Failed to disconnect Jira' });
+      return;
+    }
+    res.json({ success: true, message: 'Jira disconnected' });
+  } catch (error) {
+    logger.error('Disconnect Jira error:', error);
+    res.status(500).json({ success: false, error: 'Failed to disconnect Jira' });
+  }
+};
+
+/**
+ * Get all Jira connections
+ * GET /api/v1/jira/connections
+ */
+export const getConnections = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const { data, error } = await supabaseAdmin
+      .from('jira_tokens')
+      .select('cloud_id, site_url, created_at')
+      .eq('user_id', userId);
+    if (error) {
+      logger.error('Failed to get Jira connections', error);
+      res.status(500).json({ success: false, error: 'Failed to get Jira connections' });
+      return;
+    }
+    res.json({
+      success: true,
+      connections: data || [],
+      count: data ? data.length : 0,
+    });
+  } catch (error) {
+    logger.error('Get Jira connections error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get Jira connections' });
   }
 };

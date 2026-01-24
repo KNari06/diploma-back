@@ -26,7 +26,7 @@ export function generateOAuthState(): string {
  */
 export function buildJiraAuthUrl(state: string): string {
   const clientId = env.JIRA_CLIENT_ID;
-  const callbackUrl = env.JIRA_CALLBACK_URL || `http://localhost:${env.PORT}/api/jira/callback`;
+  const callbackUrl = env.JIRA_CALLBACK_URL || `http://localhost:${env.PORT}/api/v1/jira/callback`;
 
   if (!clientId) {
     throw new Error('JIRA_CLIENT_ID is not configured');
@@ -55,7 +55,7 @@ export async function exchangeCodeForToken(
 ): Promise<JiraTokenResponse> {
   const clientId = env.JIRA_CLIENT_ID;
   const clientSecret = env.JIRA_CLIENT_SECRET;
-  const callbackUrl = env.JIRA_CALLBACK_URL || `http://localhost:${env.PORT}/api/jira/callback`;
+  const callbackUrl = env.JIRA_CALLBACK_URL || `http://localhost:${env.PORT}/api/v1/jira/callback`;
 
   if (!clientId || !clientSecret) {
     throw new Error('JIRA_CLIENT_ID and JIRA_CLIENT_SECRET must be configured');
@@ -256,7 +256,12 @@ export async function getJiraToken(
       query = query.eq('cloud_id', cloudId);
     }
 
-    const { data, error } = await query.maybeSingle();
+    // Return the most recently added token if multiple exist (and no cloudId specified)
+    // Use limit(1) to avoid error with maybeSingle if multiple rows exist
+    const { data, error } = await query
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (error) throw error;
     return data as JiraTokenData | null;
