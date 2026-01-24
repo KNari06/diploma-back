@@ -8,6 +8,8 @@ import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep } from '../shared/utils';
 import { convertApiTestPlanToTestPlan } from './formatting';
+import { executeApiAgentTestFlow } from './agent-execution';
+import { isValidLevel } from '@/services/testing/api/agent';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -87,12 +89,53 @@ export async function handleApiTest(
       url: parsedIntent?.apiUrl,
       hasParsedIntent: !!parsedIntent,
       hasAnswers: !!answers,
+      agentLevel: parsedIntent?.agentLevel,
     });
 
     const emitProcessingStepWithLogging = functionLogger
       ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
       : emitProcessingStep;
     emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', '🔍 Analyzing API request...', 30);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // NEW: CHECK FOR AGENT LEVEL - REDIRECT TO AGENT FLOW IF PROVIDED
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const agentLevel = parsedIntent?.agentLevel || parsedIntent?.metadata?.agentLevel;
+    if (agentLevel && isValidLevel(agentLevel)) {
+      // Validate required fields for agent flow
+      if (!parsedIntent?.apiUrl) {
+        logger.warn('[API_TEST] Agent flow missing URL', { agentLevel });
+        res.status(400).json({
+          success: false,
+          error: 'URL is required for API Agent testing',
+          needsMoreInfo: true,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      logger.info('[API_TEST] Redirecting to agent flow', {
+        level: agentLevel,
+        url: parsedIntent.apiUrl,
+        method: parsedIntent.apiMethod,
+      });
+
+      // Execute agent flow directly
+      await executeApiAgentTestFlow(res, {
+        level: agentLevel,
+        url: parsedIntent.apiUrl,
+        method: parsedIntent.apiMethod || 'GET',
+        headers: parsedIntent.apiHeaders,
+        body: parsedIntent.apiBody,
+        expectedStatus: parsedIntent.expectedStatus,
+        userId,
+        chatSessionId,
+        projectId: workspace_id,
+        userMessage: message,
+      });
+      return;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 1: VALIDATE API INFO - ASK FOR MISSING DETAILS
