@@ -308,6 +308,7 @@ export class UserCreditsService {
     metadata: Record<string, any> = {}
   ): Promise<{ success: boolean; newBalance: number }> {
     try {
+      logger.info('[USER_CREDITS] addCredits', { userId, amount, type, description, metadata });
       // Validate inputs
       if (!userId || typeof userId !== 'string') {
         logger.error('[USER_CREDITS] Invalid userId in addCredits', { userId });
@@ -330,22 +331,22 @@ export class UserCreditsService {
       }
 
       const credits = await this.getOrCreateUserCredits(userId);
-
+      logger.info('[USER_CREDITS] credits', { credits });
       // Round amount to 2 decimal places to match NUMERIC(10,2) in DB
       const roundedAmount = Math.round(amount * 100) / 100;
-
+      logger.info('[USER_CREDITS] roundedAmount', { roundedAmount });
       const currentBalance = Number.isFinite(credits.credits_balance)
         ? (credits.credits_balance || 0)
         : 0;
-
+      logger.info('[USER_CREDITS] currentBalance', { currentBalance });
       const newBalance = Math.round((currentBalance + roundedAmount) * 100) / 100;
-
+      logger.info('[USER_CREDITS] newBalance', { newBalance });
       // Update balance
       const updateData: any = {
         credits_balance: newBalance,
         updated_at: new Date().toISOString(),
       };
-
+      logger.info('[USER_CREDITS] updateData', { updateData });
       if (type === 'purchase') {
         const previousTotalPurchased = Number.isFinite(credits.total_purchased)
           ? (credits.total_purchased || 0)
@@ -353,7 +354,7 @@ export class UserCreditsService {
         updateData.total_purchased = Math.round((previousTotalPurchased + roundedAmount) * 100) / 100;
         updateData.credits_purchased_at = new Date().toISOString();
       }
-
+      logger.info('[USER_CREDITS] updateData', { updateData });
       const { error: updateError } = await supabaseAdmin
         .from('user_credits')
         .update(updateData)

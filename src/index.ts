@@ -17,6 +17,7 @@ import projectRoutes from '@/api/project/project.routes';
 import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
 import supportRoutes from '@/api/support/support.routes';
+import stripeRoutes from '@/api/stripe/stripe.routes';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
@@ -198,6 +199,9 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
 // });
 
 // app.use(limiter); // Disabled - using custom rate limiter in middleware
+
+// Raw body parser for Stripe webhook (must be before express.json())
+app.use(`/api/${env.API_VERSION}/stripe/webhook`, express.raw({ type: 'application/json' }));
 
 // Body parsing middleware
 // IMPORTANT: GitHub webhook signature requires raw body (Buffer)
@@ -1227,6 +1231,8 @@ app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications
 app.use(`/api/${env.API_VERSION}/queue`, queueStatusRoutes); // Queue monitoring
 app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // ✅ NEW: User issue reports
+app.use(`/api/${env.API_VERSION}/billing`, stripeRoutes); // Stripe billing endpoints
+app.use(`/api/${env.API_VERSION}/stripe`, stripeRoutes); // Stripe webhook endpoint
 app.use(`/api/${env.API_VERSION}/preview`, previewRoutes); // ✅ NEW: Step editor preview
 
 // Root endpoint
