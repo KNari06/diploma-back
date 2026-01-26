@@ -71,6 +71,8 @@ export interface TraceWriterConfig {
   maxPayloadChars?: number; // Default: 50k chars per field
   /** Optional run identifier for correlating a specific execution (auto-generated if omitted) */
   runId?: string;
+  /** Optional logs directory (defaults to <cwd>/test_logs) */
+  logsDir?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -79,7 +81,7 @@ export interface TraceWriterConfig {
 
 const DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
 const DEFAULT_MAX_PAYLOAD_CHARS = 50_000; // 50k chars per field
-const LOGS_DIR = path.join(process.cwd(), 'test_logs');
+const DEFAULT_LOGS_DIR = path.join(process.cwd(), 'test_logs');
 
 // Sensitive field patterns (case-insensitive)
 const SENSITIVE_PATTERNS = [
@@ -103,6 +105,7 @@ export class LiteTraceWriter {
   private testId: string;
   private runId: string;
   private filePath: string;
+  private logsDir: string;
   private maxFileSizeBytes: number;
   private maxPayloadChars: number;
   private currentFileSize: number = 0;
@@ -123,17 +126,18 @@ export class LiteTraceWriter {
     this.runId = config.runId || LiteTraceWriter.generateRunId();
     this.maxFileSizeBytes = config.maxFileSizeBytes || DEFAULT_MAX_FILE_SIZE;
     this.maxPayloadChars = config.maxPayloadChars || DEFAULT_MAX_PAYLOAD_CHARS;
+    this.logsDir = config.logsDir || DEFAULT_LOGS_DIR;
 
     // Ensure logs directory exists
-    if (!fs.existsSync(LOGS_DIR)) {
-      fs.mkdirSync(LOGS_DIR, { recursive: true });
+    if (!fs.existsSync(this.logsDir)) {
+      fs.mkdirSync(this.logsDir, { recursive: true });
     }
 
     // Create file path: test_logs/<testId>_<date>_<runId>.jsonl
     // This avoids mixing multiple runs into one file when retries reuse the same testId.
     const datePart = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
     const safeTestId = LiteTraceWriter.sanitizeFilePart(this.testId);
-    this.filePath = path.join(LOGS_DIR, `${safeTestId}_${datePart}_${this.runId}.jsonl`);
+    this.filePath = path.join(this.logsDir, `${safeTestId}_${datePart}_${this.runId}.jsonl`);
 
     // Generate root span ID
     this.rootSpanId = this.generateSpanId();
@@ -142,6 +146,7 @@ export class LiteTraceWriter {
       testId: this.testId,
       runId: this.runId,
       filePath: this.filePath,
+      logsDir: this.logsDir,
       maxFileSizeMB: Math.round(this.maxFileSizeBytes / 1024 / 1024),
     });
   }

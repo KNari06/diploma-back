@@ -1,3 +1,4 @@
+import { supabaseAdmin } from '@/db/supabase';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
@@ -25,7 +26,7 @@ export function validateInput(
   res: Response,
   checkConnection: () => void,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _functionLogger?: FunctionLogger
+  // _functionLogger?: FunctionLogger
 ): Step0Result | null {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 0: INPUT VALIDATION (FIX #1 & #2)
@@ -98,29 +99,102 @@ export function validateInput(
 /**
  * STEP 1: WORKSPACE CHECK (MANDATORY!) (FIX #3)
  */
-export async function checkWorkspace(userId: string, functionLogger?: FunctionLogger): Promise<string> {
+export async function checkWorkspace(
+  userId: string,
+  sessionId?: string,
+  // functionLogger?: FunctionLogger
+): Promise<string> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 1: WORKSPACE CHECK (MANDATORY!) (FIX #3)
   // ═══════════════════════════════════════════════════════════════════════
 
   try {
-    const checkOrCreateWorkspaceWithLogging = functionLogger
-      ? withFunctionLogging(WorkspaceService.checkOrCreateWorkspace.bind(WorkspaceService), 'WorkspaceService.checkOrCreateWorkspace', functionLogger)
-      : WorkspaceService.checkOrCreateWorkspace.bind(WorkspaceService);
-    const workspaceResult = await checkOrCreateWorkspaceWithLogging(userId);
-    const workspace_id = workspaceResult.workspace_id;
+    // 1) If sessionId is provided, treat chat_sessions.workspace_id as the source of truth
+    if (sessionId) {
+      const { data: session, error: sessionError } = await supabaseAdmin
+        .from('chat_sessions')
+        .select('id, workspace_id')
+        .eq('id', sessionId)
+        .eq('user_id', userId)
+        .maybeSingle();
 
-    if (workspaceResult.is_new) {
-      logger.info('[CHAT] Created new workspace', { userId, workspace_id });
+      if (sessionError) {
+        logger.warn('[CHAT] Failed to read chat session workspace_id', {
+          userId,
+          sessionId,
+          code: (sessionError as any)?.code,
+          message: (sessionError as any)?.message,
+          details: (sessionError as any)?.details,
+        });
+      } else if (session?.workspace_id) {
+        return String(session.workspace_id);
+      }
+
+      // If the session exists but has no workspace_id (legacy/bad data), attach it once and keep it fixed
+      if (session?.id && !session.workspace_id) {
+        const activeWorkspaceId = await WorkspaceService.getActiveWorkspaceForUser(userId);
+        const fallbackWorkspaceId = activeWorkspaceId
+          ? activeWorkspaceId
+          : (await WorkspaceService.createWorkspaceForUser(userId)).workspace_id;
+
+        const { error: updateError } = await supabaseAdmin
+          .from('chat_sessions')
+          .update({ workspace_id: fallbackWorkspaceId })
+          .eq('id', sessionId)
+          .eq('user_id', userId);
+
+        if (updateError) {
+          logger.warn('[CHAT] Failed to backfill chat_sessions.workspace_id (non-fatal)', {
+            userId,
+            sessionId,
+            workspaceId: fallbackWorkspaceId,
+            code: (updateError as any)?.code,
+            message: (updateError as any)?.message,
+            details: (updateError as any)?.details,
+          });
+        }
+
+        return fallbackWorkspaceId;
+      }
     }
 
+    // 2) No sessionId (or session not found): resolve active workspace (multi-workspace aware)
+    const activeWorkspaceId = await WorkspaceService.getActiveWorkspaceForUser(userId);
+    if (activeWorkspaceId) {
+      return activeWorkspaceId;
+    }
+
+    // 3) No workspaces at all -> create one
+    const { workspace_id } = await WorkspaceService.createWorkspaceForUser(userId);
+    logger.info('[CHAT] Created new workspace for chat', { userId, workspace_id });
     return workspace_id;
   } catch (workspaceError) {
+    // Better error logging for PostgREST/Supabase errors
+    const errorDetails = workspaceError instanceof Error
+      ? {
+        message: workspaceError.message,
+        stack: workspaceError.stack,
+      }
+      : (workspaceError as any)?.code || (workspaceError as any)?.message
+        ? {
+          code: (workspaceError as any)?.code,
+          message: (workspaceError as any)?.message,
+          details: (workspaceError as any)?.details,
+          hint: (workspaceError as any)?.hint,
+        }
+        : { raw: String(workspaceError) };
+
     logger.error('[CHAT] WorkspaceService failed', {
-      error: workspaceError instanceof Error ? workspaceError.message : String(workspaceError),
+      error: errorDetails,
       userId,
     });
-    throw new Error(`Failed to initialize workspace: ${workspaceError instanceof Error ? workspaceError.message : 'Unknown error'}`);
+
+    // Extract readable error message for user
+    const errorMessage = workspaceError instanceof Error
+      ? workspaceError.message
+      : (workspaceError as any)?.message || (workspaceError as any)?.code || 'Unknown error';
+
+    throw new Error(`Failed to initialize workspace: ${errorMessage}`);
   }
 }
 

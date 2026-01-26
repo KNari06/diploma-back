@@ -40,7 +40,26 @@ export class IntelligentTestStorageService {
 
       // ✅ FIX #2: Validate required fields before insert
       if (!testId || !userId || !projectId || !config.goal || !config.startUrl) {
-        throw new Error('Missing required fields for test session');
+        // ✅ IMPROVED: Log which fields are missing for easier debugging
+        const missingFields = [
+          !testId && 'testId',
+          !userId && 'userId',
+          !projectId && 'projectId',
+          !config.goal && 'goal',
+          !config.startUrl && 'startUrl',
+        ].filter((v): v is string => typeof v === 'string');
+
+        logger.error('[INTELLIGENT_STORAGE] Missing required fields for test session', {
+          testId,
+          missingFields,
+          hasTestId: !!testId,
+          hasUserId: !!userId,
+          hasProjectId: !!projectId,
+          hasGoal: !!config.goal,
+          hasStartUrl: !!config.startUrl,
+        });
+
+        throw new Error(`Missing required fields for test session: ${missingFields.join(', ')}`);
       }
 
       // ✅ FIX #3: Ensure duration is valid (can be 0 for very fast tests)
@@ -77,6 +96,14 @@ export class IntelligentTestStorageService {
         .single();
 
       if (sessionError || !session) {
+        // ✅ IMPROVED: Detailed Supabase error logging
+        logger.error('[INTELLIGENT_STORAGE] Supabase insert failed', {
+          testId,
+          errorMessage: sessionError?.message,
+          errorCode: (sessionError as any)?.code,
+          errorDetails: (sessionError as any)?.details,
+          errorHint: (sessionError as any)?.hint,
+        });
         throw new Error(`Failed to create session: ${sessionError?.message}`);
       }
 
@@ -148,7 +175,10 @@ export class IntelligentTestStorageService {
             visited_at: visit.timestamp
               ? new Date(visit.timestamp).toISOString()
               : new Date().toISOString(), // ✅ Fallback if timestamp missing
-            // Note: vision_analysis, dom_analysis, screenshot can be added later if PageVisit type is extended
+            // ✅ NEW: Store DOM analysis for step editor linting
+            dom_analysis: visit.domAnalysis || null,
+            // Screenshot (base64 or URL)
+            screenshot: visit.screenshot || null,
           })
           .select('id')
           .single();

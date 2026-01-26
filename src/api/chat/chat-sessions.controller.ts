@@ -76,14 +76,16 @@ export const listUserChatSessions = async (req: Request, res: Response): Promise
     const userId = req.user!.id;
     const limit = Math.min(Number(req.query.limit) || 50, 100);
     const offset = Number(req.query.offset) || 0;
+    const workspaceId = typeof req.query.workspaceId === 'string' ? req.query.workspaceId : undefined;
 
     logger.info('[CHAT_SESSIONS] Listing user chat sessions', {
       userId,
       limit,
       offset,
+      workspaceId: workspaceId || 'all',
     });
 
-    const result = await ChatService.getUserChatSessions(userId, limit, offset);
+    const result = await ChatService.getUserChatSessions(userId, limit, offset, workspaceId);
 
     logger.info('[CHAT_SESSIONS] User chat sessions retrieved', {
       userId,

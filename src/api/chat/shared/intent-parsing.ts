@@ -182,6 +182,7 @@ export async function parseIntent(
     let validApiBody: any;
     let validApiHeaders: Record<string, string> | undefined;
     let validAssertions: any;
+    let validAgentLevel: 'light' | 'medium' | 'hard' | undefined;
 
     if (apiTestData) {
       // ✅ FIX: Validate HTTP method
@@ -222,6 +223,16 @@ export async function parseIntent(
       if (apiTestData.assertions !== undefined) {
         validAssertions = apiTestData.assertions;
       }
+
+      // ✅ NEW: Validate agent level (light/medium/hard) from UI
+      if (apiTestData.level) {
+        const levelLower = String(apiTestData.level).toLowerCase();
+        if (levelLower === 'light' || levelLower === 'medium' || levelLower === 'hard') {
+          validAgentLevel = levelLower;
+        } else {
+          logger.warn('[CHAT] Invalid agent level', { level: apiTestData.level });
+        }
+      }
     }
 
     // ✅ FIX: Check if required fields are present
@@ -242,11 +253,14 @@ export async function parseIntent(
         apiUrl: validApiUrl,
         apiBody: validApiBody,
         apiHeaders: validApiHeaders,
+        // ✅ NEW: Agent level from UI (light/medium/hard)
+        agentLevel: validAgentLevel,
         // Keep assertions in metadata (IntentResult does not define this field)
         metadata: {
           source: 'explicit_keyword',
           parsedAt: new Date().toISOString(),
           assertions: validAssertions,
+          agentLevel: validAgentLevel,
         },
       };
     }

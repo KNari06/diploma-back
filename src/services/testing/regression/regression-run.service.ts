@@ -43,7 +43,7 @@ export class RegressionRunService {
   static async runSavedTestCase(params: {
     savedTestCaseId: string;
     userId: string;
-    trigger: 'manual' | 'chat';
+    trigger: 'manual' | 'chat' | 'scheduled';
     parameters?: Record<string, any>;
   }): Promise<{
     runId: string;
@@ -137,7 +137,7 @@ export class RegressionRunService {
   static async runSuite(params: {
     suiteId: string;
     userId: string;
-    trigger: 'manual' | 'chat';
+    trigger: 'manual' | 'chat' | 'scheduled';
     parameters?: Record<string, any>;
   }): Promise<{
     runId: string;

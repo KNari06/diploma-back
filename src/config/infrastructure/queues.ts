@@ -98,6 +98,7 @@ export const QUEUE_NAMES = {
   AI_ANALYSIS: 'ai-analysis',
   NOTIFICATION: 'notification',
   WEBHOOK: 'webhook',
+  GIT_WEBHOOK: 'git-webhook',
 } as const;
 
 // Test run queue - for executing tests
@@ -177,6 +178,24 @@ export const webhookQueue = new Queue<{
     removeOnComplete: 50,
     removeOnFail: 25,
     attempts: 3,
+    backoff: {
+      type: 'exponential',
+      delay: 5000,
+    },
+  },
+});
+
+// Git webhook queue - for receiving Git provider webhooks (async processing)
+export const gitWebhookQueue = new Queue<{
+  provider: 'github' | 'gitlab';
+  deliveryId: string;
+}>(QUEUE_NAMES.GIT_WEBHOOK, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 200,
+    removeOnFail: 100,
+    attempts: 5,
     backoff: {
       type: 'exponential',
       delay: 5000,
@@ -350,6 +369,24 @@ export class QueueManager {
   }
 
   /**
+   * Add git webhook processing job
+   */
+  static async addGitWebhookJob(jobData: { provider: 'github' | 'gitlab'; deliveryId: string }) {
+    try {
+      const job = await gitWebhookQueue.add('git-webhook', jobData, {
+        priority: 1,
+        jobId: `${jobData.provider}:${jobData.deliveryId}`,
+      });
+
+      logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.GIT_WEBHOOK, deliveryId: jobData.deliveryId });
+      return job;
+    } catch (error) {
+      logger.error('Failed to add git webhook job:', error);
+      throw handleQueueError(error);
+    }
+  }
+
+  /**
    * Get queue statistics
    */
   static async getQueueStats() {
@@ -361,17 +398,18 @@ export class QueueManager {
         aiAnalysisQueue.getJobCounts(),
         notificationQueue.getJobCounts(),
         webhookQueue.getJobCounts(),
+        gitWebhookQueue.getJobCounts(),
       ]);
 
       // Extract successful results, use empty object for failed ones
-      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats] = results.map(
+      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats, gitWebhookStats] = results.map(
         (result) => result.status === 'fulfilled' ? result.value : {}
       );
 
       // Log any failures but don't fail the whole operation
       results.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook'];
           logger.warn(`Failed to get stats for ${queueNames[index]} queue`, { error: result.reason });
         }
       });
@@ -382,6 +420,7 @@ export class QueueManager {
         aiAnalysis: aiAnalysisStats,
         notification: notificationStats,
         webhook: webhookStats,
+        gitWebhook: gitWebhookStats,
       };
     } catch (error) {
       logger.error('Failed to get queue stats:', error);
@@ -446,6 +485,8 @@ export class QueueManager {
         return notificationQueue;
       case QUEUE_NAMES.WEBHOOK:
         return webhookQueue;
+      case QUEUE_NAMES.GIT_WEBHOOK:
+        return gitWebhookQueue;
       default:
         throw new Error(`Unknown queue: ${queueName}`);
     }
@@ -515,11 +556,12 @@ export const gracefulShutdown = async () => {
         aiAnalysisQueue.close(),
         notificationQueue.close(),
         webhookQueue.close(),
+        gitWebhookQueue.close(),
       ]);
 
       closeQueueResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook'];
           logger.warn(`Failed to close ${queueNames[index]} queue`, { error: result.reason });
         }
       });

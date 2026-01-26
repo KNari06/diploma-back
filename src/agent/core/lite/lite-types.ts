@@ -49,6 +49,44 @@ export interface LiteElement {
   // Visual Anchors: Bounding box for spatial lookup (fallback when selectors fail)
   /** Element bounding box relative to viewport (for Visual Anchor matching) */
   bounds?: ElementBounds;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STEP EDITOR V2: ARIA state, validation, labels, hierarchy
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ARIA state (for non-native widgets like custom dropdowns, checkboxes, toggles)
+  /** aria-expanded state (for dropdowns, accordions, menus) */
+  ariaExpanded?: boolean;
+  /** aria-pressed state (for toggle buttons) */
+  ariaPressed?: boolean;
+  /** aria-selected state (for tabs, listbox options) */
+  ariaSelected?: boolean;
+  /** aria-checked for custom checkboxes/switches (native `checked` takes priority) */
+  ariaChecked?: boolean | 'mixed';
+
+  // Validation state
+  /** HTML required attribute */
+  required?: boolean;
+  /** HTML readonly attribute or aria-readonly */
+  readOnly?: boolean;
+  /** aria-invalid or :invalid pseudo-class */
+  invalid?: boolean;
+  /** True if input has a non-empty value (for state-aware actions) */
+  hasValue?: boolean;
+
+  // Label extraction (separate fields for better scoring)
+  /** Direct aria-label attribute */
+  ariaLabel?: string;
+  /** Computed label text (from <label for=>, wrapping <label>, aria-labelledby) */
+  labelText?: string;
+
+  // Hierarchy (parent chain for disambiguation)
+  /** Refs of key ancestor containers (closest-first, max depth 6) */
+  parentRefChain?: string[];
+  /** Ref of nearest form/dialog/section container */
+  containerRef?: string;
+  /** Titles of key containers (form legend, fieldset legend, section heading) */
+  containerTitles?: string[];
 }
 
 /**
@@ -118,6 +156,8 @@ export interface LiteSnapshot {
   activeModalRef?: string; // Ref of active modal container (if detected)
   /** Transient state info (loading indicators) - NEW: Lite Autonomy v3 */
   transientState?: TransientStateInfo;
+  /** Truncated page text for credential extraction only (never sent to LLM/logs) */
+  pageTextForExtraction?: string;
 }
 
 /**

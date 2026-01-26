@@ -3,37 +3,98 @@ import { logger } from '@/utils/core/logger';
 import { BrowserContext, Page } from 'playwright';
 
 /**
- * Stop tracing and get video path before closing resources
+ * Stop tracing and get video path
+ * ✅ CRITICAL: video.path() only works AFTER page is closed!
+ * This function now:
+ * 1. Stops tracing (must be done before context close)
+ * 2. Gets video reference
+ * 3. Closes page (finalizes video)
+ * 4. Gets video path after page is closed
  */
 export async function stopTracingAndGetVideo(
   context: BrowserContext | null,
   page: Page | null,
-  tracePath: string | undefined
+  tracePath: string | undefined,
+  meta?: { testId?: string; browser?: string }
 ): Promise<{ videoPath?: string; tracePath?: string }> {
   const result: { videoPath?: string; tracePath?: string } = {};
 
-  // ✅ CRITICAL FIX: Stop tracing before closing
+  // ✅ Step 1: Stop tracing before closing context
   if (context && tracePath) {
     try {
       await context.tracing.stop({ path: tracePath });
       result.tracePath = tracePath;
       logger.info('[PLAYWRIGHT] Trace saved', { tracePath });
     } catch (traceError) {
-      logger.warn('[PLAYWRIGHT] Failed to stop tracing', { error: traceError });
+      logger.warn('[PLAYWRIGHT] Failed to stop tracing', {
+        error: traceError instanceof Error ? traceError.message : String(traceError),
+      });
     }
   }
 
-  // ✅ CRITICAL FIX: Get video path before closing page
+  // ✅ Step 2: Get video reference BEFORE closing page
   if (page) {
     try {
       const video = page.video();
       if (video) {
-        result.videoPath = await video.path();
-        logger.info('[PLAYWRIGHT] Video saved', { videoPath: result.videoPath });
+        // ✅ Step 3: Close page FIRST to finalize video recording (preferred path)
+        // video.path() is reliable only after page is closed.
+        try {
+          await page.close();
+          logger.debug('[PLAYWRIGHT] Page closed for video finalization', {
+            testId: meta?.testId,
+            browser: meta?.browser,
+          });
+        } catch (closeError) {
+          logger.warn('[PLAYWRIGHT] Failed to close page for video finalization', {
+            testId: meta?.testId,
+            browser: meta?.browser,
+            error: closeError instanceof Error ? closeError.message : String(closeError),
+          });
+        }
+
+        // ✅ Step 4: Get video path if page is closed; otherwise fallback to saveAs
+        if (page.isClosed()) {
+          result.videoPath = await video.path();
+          logger.info('[PLAYWRIGHT] Video path resolved (after page close)', {
+            testId: meta?.testId,
+            browser: meta?.browser,
+            videoPath: result.videoPath,
+          });
+        } else {
+          // Fallback: saveAs is safe even while recording; it waits until video is ready.
+          const fs = await import('fs/promises');
+          const path = await import('path');
+          const videosDir = path.join(process.cwd(), 'test-results', 'videos');
+          await fs.mkdir(videosDir, { recursive: true });
+
+          const fileName = `video-${meta?.testId || 'unknown'}-${Date.now()}.webm`;
+          const fallbackPath = path.join(videosDir, fileName);
+          await video.saveAs(fallbackPath);
+          result.videoPath = fallbackPath;
+
+          logger.info('[PLAYWRIGHT] Video saved via saveAs fallback (page not closed)', {
+            testId: meta?.testId,
+            browser: meta?.browser,
+            videoPath: result.videoPath,
+          });
+        }
+      } else {
+        logger.warn('[PLAYWRIGHT] No video recording available (page.video() returned null)', {
+          testId: meta?.testId,
+          browser: meta?.browser,
+          hint: 'Check if recordVideo is enabled in browser context options',
+        });
       }
     } catch (videoError) {
-      logger.warn('[PLAYWRIGHT] Failed to get video path', { error: videoError });
+      logger.warn('[PLAYWRIGHT] Failed to get video path', {
+        testId: meta?.testId,
+        browser: meta?.browser,
+        error: videoError instanceof Error ? videoError.message : String(videoError),
+      });
     }
+  } else {
+    logger.warn('[PLAYWRIGHT] Cannot get video path - page is null');
   }
 
   return result;
@@ -139,6 +200,10 @@ export async function saveIntelligentTestResults(
 ): Promise<void> {
   try {
     const { IntelligentTestStorageService } = await import('@/services/testing/results/intelligent-test-storage.service');
+    const resolvedStartUrl =
+      intelligentConfig?.startUrl ||
+      intelligentResult?.startUrl ||
+      testData.url;
 
     logger.info('[PLAYWRIGHT] Saving test session with graph data', {
       testId: testData.testId,
@@ -154,7 +219,7 @@ export async function saveIntelligentTestResults(
       result: intelligentResult,
       config: {
         goal: intelligentConfig.goal,
-        startUrl: intelligentConfig.startUrl,
+        startUrl: resolvedStartUrl,
         mode: intelligentConfig.mode,
         browser: testData.browser || 'chrome',
         viewport: testData.options?.viewport,
@@ -169,9 +234,18 @@ export async function saveIntelligentTestResults(
       graphDataSaved: !!intelligentResult.graphData,
     });
   } catch (storageError) {
-    logger.error('[PLAYWRIGHT] Failed to save test data', {
+    // ✅ IMPROVED: More detailed error logging for debugging session save failures
+    logger.error('[PLAYWRIGHT] Failed to save test data to intelligent_test_sessions', {
       testId: testData.testId,
-      error: storageError instanceof Error ? storageError.message : 'Unknown error',
+      userId: testData.userId,
+      projectId: testData.projectId,
+      hasGoal: !!intelligentConfig?.goal,
+      hasStartUrl: !!(intelligentConfig?.startUrl || intelligentResult?.startUrl || testData.url),
+      error: storageError instanceof Error ? {
+        message: storageError.message,
+        name: storageError.name,
+        stack: storageError.stack?.substring(0, 500),
+      } : String(storageError),
     });
     // Don't fail the test if storage fails
   }

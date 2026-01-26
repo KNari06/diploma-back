@@ -92,6 +92,42 @@ export const LITE_ENGINE_FLAGS = {
 
   /** Enable cross-check with Shadow DOM */
   enableShadowDOMCrosscheck: true,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L6: PAGE CREDENTIALS EXTRACTION
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable extraction of demo credentials from page text (e.g., "username is student") */
+  enablePageCredentialsExtraction: true,
+
+  /** Enable asking user for credentials when login form detected but no creds available */
+  enableCredentialClarification: true,
+
+  /** Timeout for credential clarification request (ms) */
+  credentialClarificationTimeoutMs: 60000,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // L7: ADDITIONAL CLARIFICATION GATES
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable payment/checkout approval gate (ask before proceeding with payment actions) */
+  enablePaymentApprovalGate: true,
+
+  /** Timeout for payment approval clarification (ms) */
+  paymentApprovalTimeoutMs: 120000, // 2 minutes
+
+  /** Enable file upload clarification gate (stop/skip when file input detected) */
+  enableFileUploadGate: true,
+
+  /** Timeout for file upload clarification (ms) */
+  fileUploadTimeoutMs: 60000,
+
+  /** Enable external domain navigation approval gate (ask before cross-origin navigation) */
+  enableExternalDomainGate: true,
+
+  /** Enable download/export click approval gate (ask before download actions) */
+  enableDownloadApprovalGate: true,
+
+  /** Timeout for external/download approval clarification (ms) */
+  externalDownloadApprovalTimeoutMs: 60000,
 } as const;
 
 /**

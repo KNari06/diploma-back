@@ -105,12 +105,22 @@ export async function getOrCreateChatSession(
   if (providedSessionId) {
     const { data: existing } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id')
+      .select('id, workspace_id')
       .eq('id', providedSessionId)
       .eq('user_id', userId)
       .maybeSingle();
 
     if (existing) {
+      // Workspace is fixed per chat session; prefer the provided session as-is.
+      // If caller passed a different workspaceId, we keep the session anyway (caller should resolve workspace by sessionId).
+      if (existing.workspace_id && workspaceId && existing.workspace_id !== workspaceId) {
+        logger.warn('[CHAT_SESSION] Provided session workspace mismatch (using session workspace)', {
+          sessionId: existing.id,
+          userId,
+          sessionWorkspaceId: existing.workspace_id,
+          requestedWorkspaceId: workspaceId,
+        });
+      }
       logger.info('[CHAT_SESSION] Using provided session', { sessionId: existing.id, userId });
       return existing.id;
     } else {
@@ -132,6 +142,8 @@ export async function getOrCreateChatSession(
     .from('chat_sessions')
     .select('id')
     .eq('user_id', userId)
+    // Multi-workspace: do not accidentally reuse a chat session from another workspace
+    .eq('workspace_id', workspaceId)
     .order('updated_at', { ascending: false }) // Sort by updated_at for recent activity
     .limit(1)
     .maybeSingle();

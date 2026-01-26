@@ -1,3 +1,4 @@
+import { redisConnection } from '@/config/infrastructure/queues';
 import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
@@ -15,6 +16,32 @@ import { ChatTestUpdatePayload } from '@/websocket/types/types';
 import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REDIS LOCK HELPER: Prevents concurrent test starts for the same chat session
+// ═══════════════════════════════════════════════════════════════════════════
+const CHAT_TEST_LOCK_PREFIX = 'lock:chat_test_start:';
+const CHAT_TEST_LOCK_TTL_SECONDS = 10; // Short TTL to prevent stuck locks
+
+async function acquireChatTestLock(chatSessionId: string): Promise<boolean> {
+  try {
+    const lockKey = `${CHAT_TEST_LOCK_PREFIX}${chatSessionId}`;
+    const result = await redisConnection.set(lockKey, '1', 'EX', CHAT_TEST_LOCK_TTL_SECONDS, 'NX');
+    return result === 'OK';
+  } catch {
+    // If Redis is unavailable, fail-open (allow the request)
+    return true;
+  }
+}
+
+async function releaseChatTestLock(chatSessionId: string): Promise<void> {
+  try {
+    const lockKey = `${CHAT_TEST_LOCK_PREFIX}${chatSessionId}`;
+    await redisConnection.del(lockKey);
+  } catch {
+    // Best-effort release
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CREDENTIAL EXTRACTION FROM USER MESSAGE
@@ -255,6 +282,9 @@ export async function handlePlatformTest(
     }
   };
 
+  // Track Redis lock state for cleanup in error handler
+  let lockAcquired = false;
+
   try {
     logger.info('[PLATFORM_TEST] Starting UI test flow', {
       userId,
@@ -303,6 +333,66 @@ export async function handlePlatformTest(
         sessionId: chatSessionId,
       });
       return;
+    }
+
+    // ✅ GUARD: Only 1 active test per chat session - REJECT if one already exists
+    // This prevents duplicate tests from rapid clicks or concurrent requests
+    // Uses Redis lock to prevent race conditions between concurrent requests
+    if (chatSessionId) {
+      // Step 1: Acquire distributed lock to prevent race conditions
+      lockAcquired = await acquireChatTestLock(chatSessionId);
+      if (!lockAcquired) {
+        logger.warn('[PLATFORM_TEST] Rejected: concurrent request already in progress', {
+          chatSessionId,
+          userId,
+        });
+
+        if (!res.headersSent) {
+          res.status(409).json({
+            success: false,
+            error: 'CONCURRENT_REQUEST',
+            message: 'Another test request is already being processed for this chat. Please wait a moment.',
+            timestamp: new Date().toISOString(),
+          });
+        }
+        return;
+      }
+
+      // Step 2: Check for active tests (now under lock)
+      try {
+        const runningTests = await ManualTestService.getRunningTestsForChatSession(chatSessionId);
+        if (runningTests.length > 0) {
+          const existingTest = runningTests[0];
+          logger.warn('[PLATFORM_TEST] Rejected: chat session already has an active test', {
+            chatSessionId,
+            userId,
+            existingTestId: existingTest.id,
+            existingTestStatus: existingTest.status,
+          });
+
+          // Release lock before returning
+          await releaseChatTestLock(chatSessionId);
+
+          if (!res.headersSent) {
+            res.status(409).json({
+              success: false,
+              error: 'TEST_ALREADY_RUNNING',
+              message: 'A test is already running in this chat. Please wait for it to complete or cancel it first.',
+              existingTestId: existingTest.id,
+              timestamp: new Date().toISOString(),
+            });
+          }
+          return; // Exit early - do not create new test
+        }
+      } catch (guardError) {
+        // Log but don't block - fail-open to avoid breaking flow if mapping query fails
+        logger.warn('[PLATFORM_TEST] Failed to check for active tests in chat session', {
+          error: guardError instanceof Error ? guardError.message : String(guardError),
+          chatSessionId,
+          userId,
+        });
+        // Don't release lock here - continue with test creation
+      }
     }
 
     // FIX #4: Better progress updates
@@ -775,13 +865,37 @@ export async function handlePlatformTest(
         });
       }
 
-      // Step L5: Save test-chat mapping (non-blocking)
+      // ✅ FIX: Save test-chat mapping SYNCHRONOUSLY (awaited)
+      // This is critical for the "1 active test per chat" guard to work reliably
       if (chatSessionId && actualTestId) {
-        TestChatMappingService.saveTestChatMapping({
-          testId: actualTestId,
-          chatSessionId,
-          userId,
-        }).catch(() => {});
+        let mappingSaved = false;
+        try {
+          await TestChatMappingService.saveTestChatMapping({
+            testId: actualTestId,
+            chatSessionId,
+            userId,
+          });
+          mappingSaved = true;
+          logger.debug('[PLATFORM_TEST] Test-chat mapping saved', {
+            testId: actualTestId,
+            chatSessionId,
+          });
+        } catch (mappingError) {
+          // Log error but don't fail the flow - test is already created
+          logger.error('[PLATFORM_TEST] Failed to save test-chat mapping', {
+            error: mappingError instanceof Error ? mappingError.message : String(mappingError),
+            testId: actualTestId,
+          });
+        } finally {
+          // ✅ Release Redis lock ONLY if mapping was saved successfully.
+          // If mapping failed, keep the lock until TTL to reduce chances of creating duplicates.
+          if (lockAcquired && mappingSaved) {
+            await releaseChatTestLock(chatSessionId);
+          }
+        }
+      } else if (chatSessionId && lockAcquired) {
+        // Release lock if we didn't save mapping (edge case: no actualTestId)
+        await releaseChatTestLock(chatSessionId);
       }
 
       // Step L6: Emit WebSocket event
@@ -1123,6 +1237,11 @@ export async function handlePlatformTest(
     });
 
   } catch (error) {
+    // ✅ Release Redis lock on error to prevent stuck locks
+    if (lockAcquired && chatSessionId) {
+      await releaseChatTestLock(chatSessionId);
+    }
+
     // Check if response already sent
     if (res.headersSent) {
       logger.warn('[PLATFORM_TEST] Response already sent, cannot send error', {

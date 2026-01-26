@@ -3,6 +3,7 @@ import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import authRoutes from '@/api/auth/auth.route';
 import chatRoutes from '@/api/chat/chat.route';
 import feedbackRoutes from '@/api/chat/feedback.route';
+import gitIntegrationRoutes from '@/api/gitIntegration/git-integration.route';
 import intelligentTestRoutes from '@/api/intelligentTest/intelligentTest.route';
 import jiraRoutes from '@/api/jira/jira.route';
 import kbRoutes from '@/api/kb/kb.route';
@@ -11,6 +12,7 @@ import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import notificationsRoutes from '@/api/notifications/notifications.routes';
 import playwrightRoutes from '@/api/playwright/playwright.route';
+import previewRoutes from '@/api/preview/preview.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
@@ -86,25 +88,38 @@ app.use(['/api/features', '/api/architecture'], (req: express.Request, res: expr
 });
 
 // CORS configuration
+const DEV_ALLOWED_ORIGINS = [
+  'http://localhost:8080',
+  'http://127.0.0.1:8080',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+];
+
+const uniqueOrigins = (origins: string[]): string[] => Array.from(new Set(origins));
+
 const getCorsOrigins = (): boolean | string[] => {
   if (isDevelopment) {
     return true;
   }
 
   const allowedOrigins = process.env.ALLOWED_ORIGINS;
-  if (!allowedOrigins || typeof allowedOrigins !== 'string') {
-    return false;
-  }
+  const devOrigins = DEV_ALLOWED_ORIGINS;
 
   try {
-    const origins = allowedOrigins.split(',').map(origin => origin.trim()).filter(Boolean);
-    return origins.length > 0 ? origins : false;
+    const configuredOrigins = (allowedOrigins && typeof allowedOrigins === 'string')
+      ? allowedOrigins.split(',').map(origin => origin.trim()).filter(Boolean)
+      : [];
+    const merged = uniqueOrigins([...configuredOrigins, ...devOrigins]);
+    return merged.length > 0 ? merged : false;
   } catch (error) {
     logger.warn('Failed to parse ALLOWED_ORIGINS, disabling CORS', {
       error: error instanceof Error ? error.message : String(error),
       ALLOWED_ORIGINS: allowedOrigins, // Use local variable instead of undefined
     });
-    return false;
+    // Keep dev origins allowed even if parsing failed
+    return devOrigins;
   }
 };
 
@@ -140,7 +155,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     const originalStatus = res.status;
 
     // Override res.status to ensure CORS headers are set
-    res.status = function(code: number) {
+    res.status = function (code: number) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -149,7 +164,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     };
 
     // Override res.json to ensure CORS headers
-    res.json = function(body: any) {
+    res.json = function (body: any) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -158,7 +173,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     };
 
     // Override res.send to ensure CORS headers
-    res.send = function(body?: any) {
+    res.send = function (body?: any) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -189,6 +204,8 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
 app.use(`/api/${env.API_VERSION}/stripe/webhook`, express.raw({ type: 'application/json' }));
 
 // Body parsing middleware
+// IMPORTANT: GitHub webhook signature requires raw body (Buffer)
+app.use(`/api/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -1141,9 +1158,9 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
     const queueHealth = queueResult.status === 'fulfilled'
       ? queueResult.value
       : {
-          status: 'unhealthy' as const,
-          error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason),
-        };
+        status: 'unhealthy' as const,
+        error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason),
+      };
 
     // Log failures
     if (dbResult.status === 'rejected') {
@@ -1208,6 +1225,7 @@ app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, reportsRoutes); // ✅ NEW: Test reports & Jira integration
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 app.use(`/api/${env.API_VERSION}/regression`, regressionRoutes); // ✅ NEW: Regression testing
+app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes); // ✅ NEW: Git integrations (CRUD)
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
 app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications
@@ -1215,6 +1233,7 @@ app.use(`/api/${env.API_VERSION}/queue`, queueStatusRoutes); // Queue monitoring
 app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // ✅ NEW: User issue reports
 app.use(`/api/${env.API_VERSION}/billing`, stripeRoutes); // Stripe billing endpoints
 app.use(`/api/${env.API_VERSION}/stripe`, stripeRoutes); // Stripe webhook endpoint
+app.use(`/api/${env.API_VERSION}/preview`, previewRoutes); // ✅ NEW: Step editor preview
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
@@ -1365,6 +1384,7 @@ const startServer = async () => {
       server = app.listen(env.PORT, () => {
         logger.info(`🚀 QAIT Backend API started on port ${env.PORT}`);
         logger.info(`📊 Environment: ${env.NODE_ENV}`);
+        logger.info(`🏷️ Queue prefix: ${env.QUEUE_PREFIX}`);
         logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
         logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
       });
@@ -1486,6 +1506,20 @@ const startServer = async () => {
                   });
                 }
               })(),
+
+              // ✅ NEW: Close preview sessions (step editor browsers)
+              (async () => {
+                try {
+                  const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+                  await getPreviewSessionService().shutdown();
+                  logger.info('[SERVER] Preview sessions closed');
+                } catch (error) {
+                  logger.error('[SERVER] Error closing preview sessions:', {
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              })(),
+
               // Close queue connections
               (async () => {
                 try {
@@ -1515,7 +1549,7 @@ const startServer = async () => {
             // Log any failures
             cleanupResults.forEach((result, index) => {
               if (result.status === 'rejected') {
-                const serviceNames = ['browser pool', 'queues', 'websocket'];
+                const serviceNames = ['redis subscriber', 'browser pool', 'preview sessions', 'queues', 'websocket'];
                 logger.warn(`[SERVER] Failed to close ${serviceNames[index]}`, {
                   error: result.reason instanceof Error ? result.reason.message : String(result.reason),
                 });

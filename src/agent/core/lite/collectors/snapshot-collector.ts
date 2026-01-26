@@ -81,10 +81,10 @@ export class SnapshotCollector {
 
             // Check for modal indicators
             const hasModalRole = modal.getAttribute('role') === 'dialog' ||
-                                 modal.getAttribute('aria-modal') === 'true' ||
-                                 modal.classList.contains('modal') ||
-                                 modal.classList.contains('overlay') ||
-                                 modal.classList.contains('popup');
+              modal.getAttribute('aria-modal') === 'true' ||
+              modal.classList.contains('modal') ||
+              modal.classList.contains('overlay') ||
+              modal.classList.contains('popup');
 
             // Accept if:
             // 1. Has modal role/class AND covers >20% viewport, OR
@@ -252,8 +252,8 @@ export class SnapshotCollector {
           );
 
           let titleText = title?.textContent?.trim() ||
-                         parent.getAttribute('aria-label') ||
-                         parent.getAttribute('data-title');
+            parent.getAttribute('aria-label') ||
+            parent.getAttribute('data-title');
 
           if (titleText) {
             titleText = titleText.slice(0, 50);
@@ -262,19 +262,107 @@ export class SnapshotCollector {
           // Determine parent type
           const parentType =
             parent.matches('.card, .product, .item, [data-product], [data-item]') ? 'Card' :
-            parent.matches('article, [role="article"]') ? 'Article' :
-            parent.matches('form') ? 'Form' :
-            parent.matches('.modal, [role="dialog"]') ? 'Modal' :
-            parent.matches('section') ? 'Section' :
-            parent.matches('header') ? 'Header' :
-            parent.matches('footer') ? 'Footer' :
-            parent.matches('nav') ? 'Navigation' :
-            parent.matches('aside') ? 'Aside' :
-            'Container';
+              parent.matches('article, [role="article"]') ? 'Article' :
+                parent.matches('form') ? 'Form' :
+                  parent.matches('.modal, [role="dialog"]') ? 'Modal' :
+                    parent.matches('section') ? 'Section' :
+                      parent.matches('header') ? 'Header' :
+                        parent.matches('footer') ? 'Footer' :
+                          parent.matches('nav') ? 'Navigation' :
+                            parent.matches('aside') ? 'Aside' :
+                              'Container';
 
           return titleText
             ? `inside: ${parentType} "${titleText}"`
             : `inside: ${parentType}`;
+        };
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP EDITOR V2: Label extraction helper
+        // ═══════════════════════════════════════════════════════════════════════
+        const getLabelText = (el: Element): string | undefined => {
+          // 1. Try aria-labelledby
+          const labelledBy = el.getAttribute('aria-labelledby');
+          if (labelledBy) {
+            const labelParts = labelledBy.split(/\s+/).map(id => {
+              const labelEl = document.getElementById(id);
+              return labelEl?.textContent?.trim();
+            }).filter(Boolean);
+            if (labelParts.length > 0) {
+              return labelParts.join(' ').slice(0, 100);
+            }
+          }
+
+          // 2. Try <label for="id">
+          const elId = el.getAttribute('id');
+          if (elId) {
+            const labelFor = document.querySelector(`label[for="${elId}"]`);
+            if (labelFor?.textContent?.trim()) {
+              return labelFor.textContent.trim().slice(0, 100);
+            }
+          }
+
+          // 3. Try wrapping <label> ancestor
+          const wrappingLabel = el.closest('label');
+          if (wrappingLabel) {
+            // Get label text excluding the input's own text
+            const clone = wrappingLabel.cloneNode(true) as HTMLElement;
+            const inputs = clone.querySelectorAll('input, select, textarea');
+            inputs.forEach(inp => inp.remove());
+            const text = clone.textContent?.trim();
+            if (text) return text.slice(0, 100);
+          }
+
+          // 4. Try implicit label (text in same form-group/container)
+          const formGroup = el.closest('.form-group, .form-field, .field, .input-group, .form-control, [data-field]');
+          if (formGroup) {
+            const labelEl = formGroup.querySelector('label, .label, [class*="label"]');
+            if (labelEl && !labelEl.contains(el)) {
+              const text = labelEl.textContent?.trim();
+              if (text) return text.slice(0, 100);
+            }
+          }
+
+          return undefined;
+        };
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STEP EDITOR V2: Parent chain extraction helper
+        // ═══════════════════════════════════════════════════════════════════════
+        const CONTAINER_SELECTORS = 'form, dialog, [role="dialog"], section, article, aside, nav, header, footer, main, fieldset, .card, .modal, .panel';
+        const MAX_PARENT_CHAIN_DEPTH = 6;
+
+        const getParentRefChain = (el: Element): { chain: string[]; containerRef?: string; containerTitles: string[] } => {
+          const chain: string[] = [];
+          const containerTitles: string[] = [];
+          let containerRef: string | undefined;
+          let current: Element | null = el.parentElement;
+          let depth = 0;
+
+          while (current && depth < MAX_PARENT_CHAIN_DEPTH) {
+            const ref = current.getAttribute('data-agent-ref');
+            if (ref) {
+              chain.push(ref);
+
+              // Check if this is a key container
+              if (!containerRef && current.matches(CONTAINER_SELECTORS)) {
+                containerRef = ref;
+
+                // Try to get container title
+                const legend = current.querySelector(':scope > legend, :scope > .legend');
+                const heading = current.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > [class*="title"], :scope > [class*="heading"]');
+                const title = legend?.textContent?.trim() || heading?.textContent?.trim() ||
+                  current.getAttribute('aria-label') || current.getAttribute('title');
+                if (title) {
+                  containerTitles.push(title.slice(0, 50));
+                }
+              }
+            }
+            current = current.parentElement;
+            depth++;
+          }
+
+          return { chain, containerRef, containerTitles };
         };
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -423,7 +511,7 @@ export class SnapshotCollector {
             const centerY = rect.top + rect.height / 2;
             // @ts-expect-error - window available in browser context
             const inViewport = centerX >= 0 && centerX <= window.innerWidth &&
-                               centerY >= 0 && centerY <= window.innerHeight;
+              centerY >= 0 && centerY <= window.innerHeight;
 
             if (inViewport) {
               try {
@@ -435,21 +523,89 @@ export class SnapshotCollector {
               }
             }
 
+            // SECURITY: Redact sensitive input values to prevent credential leakage
+            // Password fields and credential-related inputs should never have values in snapshot
+            const isSensitiveInput = isInput && (
+              input.type === 'password' ||
+              el.getAttribute('autocomplete')?.includes('password') ||
+              el.getAttribute('autocomplete')?.includes('current-password') ||
+              el.getAttribute('autocomplete')?.includes('new-password') ||
+              // Also redact common identifier fields (username/email/phone) to avoid leaking PII/autofill to LLM
+              el.getAttribute('autocomplete')?.includes('username') ||
+              el.getAttribute('autocomplete')?.includes('email') ||
+              el.getAttribute('autocomplete')?.includes('tel') ||
+              el.getAttribute('autocomplete')?.includes('phone') ||
+              /password|passwd|pwd|secret|credential/i.test(el.getAttribute('name') || '') ||
+              /password|passwd|pwd|secret|credential/i.test(el.getAttribute('id') || '') ||
+              /user|username|login|email|phone|tel|mobile/i.test(el.getAttribute('name') || '') ||
+              /user|username|login|email|phone|tel|mobile/i.test(el.getAttribute('id') || '')
+            );
+
+            // ═══════════════════════════════════════════════════════════════
+            // STEP EDITOR V2: Extract ARIA state
+            // ═══════════════════════════════════════════════════════════════
+            const ariaExpandedRaw = el.getAttribute('aria-expanded');
+            const ariaExpanded = ariaExpandedRaw === 'true' ? true : ariaExpandedRaw === 'false' ? false : undefined;
+
+            const ariaPressedRaw = el.getAttribute('aria-pressed');
+            const ariaPressed = ariaPressedRaw === 'true' ? true : ariaPressedRaw === 'false' ? false : undefined;
+
+            const ariaSelectedRaw = el.getAttribute('aria-selected');
+            const ariaSelected = ariaSelectedRaw === 'true' ? true : ariaSelectedRaw === 'false' ? false : undefined;
+
+            const ariaCheckedRaw = el.getAttribute('aria-checked');
+            const ariaChecked = ariaCheckedRaw === 'true' ? true :
+              ariaCheckedRaw === 'false' ? false :
+                ariaCheckedRaw === 'mixed' ? 'mixed' : undefined;
+
+            // ═══════════════════════════════════════════════════════════════
+            // STEP EDITOR V2: Extract validation state
+            // ═══════════════════════════════════════════════════════════════
+            const required = input.required || el.hasAttribute('required') || el.getAttribute('aria-required') === 'true';
+            const readOnly = input.readOnly || el.hasAttribute('readonly') || el.getAttribute('aria-readonly') === 'true';
+
+            // Check invalid via aria-invalid or :invalid pseudo-class
+            const ariaInvalid = el.getAttribute('aria-invalid');
+            let invalid = ariaInvalid === 'true';
+            if (!invalid && isInput) {
+              try {
+                invalid = (el as HTMLInputElement).validity?.valid === false;
+              } catch {
+                // validity may not be available
+              }
+            }
+
+            // hasValue (for state-aware actions - don't store actual value for privacy)
+            const hasValue = isInput && !isSensitiveInput && !!input.value;
+
+            // ═══════════════════════════════════════════════════════════════
+            // STEP EDITOR V2: Extract labels
+            // ═══════════════════════════════════════════════════════════════
+            const ariaLabel = el.getAttribute('aria-label') || undefined;
+            const labelText = getLabelText(el);
+
+            // ═══════════════════════════════════════════════════════════════
+            // STEP EDITOR V2: Extract parent chain
+            // ═══════════════════════════════════════════════════════════════
+            const { chain: parentRefChain, containerRef, containerTitles } = getParentRefChain(el);
+
             elements.push({
               ref,
               role: el.getAttribute('role') || el.tagName.toLowerCase(),
-              name: el.getAttribute('aria-label') ||
-                    el.getAttribute('title') ||
-                    el.getAttribute('placeholder') ||
-                    el.textContent?.trim().slice(0, 50) || '',
+              name: ariaLabel ||
+                el.getAttribute('title') ||
+                el.getAttribute('placeholder') ||
+                el.textContent?.trim().slice(0, 50) || '',
               tag: el.tagName.toLowerCase(),
               type: isInput ? input.type : undefined,
-              value: isInput ? input.value : undefined,
+              // SECURITY: Never include raw input values in snapshots.
+              // Use `hasValue` for state-aware logic (privacy-safe).
+              value: undefined,
               placeholder: isInput ? input.placeholder : undefined,
               checked: input.checked || undefined,
               disabled: input.disabled || el.hasAttribute('disabled'),
               visible: true,
-              context: getParentContext(el),  // Parent context
+              context: getParentContext(el),  // Parent context (legacy, keep for compatibility)
               isInsideActiveModal,  // Mark elements inside modal
               isInsideShadowDOM,    // PHASE D: Mark elements from shadow DOM
               // Semantic attributes for field classification (Level 1 signals)
@@ -468,12 +624,37 @@ export class SnapshotCollector {
                 width: rect.width,
                 height: rect.height,
               },
+              // ═══════════════════════════════════════════════════════════════
+              // STEP EDITOR V2: New fields
+              // ═══════════════════════════════════════════════════════════════
+              // ARIA state
+              ariaExpanded,
+              ariaPressed,
+              ariaSelected,
+              ariaChecked,
+              // Validation state
+              required: required || undefined,
+              readOnly: readOnly || undefined,
+              invalid: invalid || undefined,
+              hasValue: hasValue || undefined,
+              // Labels
+              ariaLabel,
+              labelText,
+              // Hierarchy
+              parentRefChain: parentRefChain.length > 0 ? parentRefChain : undefined,
+              containerRef,
+              containerTitles: containerTitles.length > 0 ? containerTitles : undefined,
             });
           } catch (err) {
             // Skip element if any error
             // No logging needed here - errors are expected for dynamic elements
           }
         });
+
+        // Extract truncated page text for credential extraction (never sent to LLM)
+        // @ts-expect-error - document available in browser context
+        const pageText = document.body?.innerText || '';
+        const pageTextForExtraction = pageText.slice(0, 10000); // Max 10k chars
 
         return {
           // @ts-expect-error - window and document available in browser context
@@ -484,6 +665,7 @@ export class SnapshotCollector {
           timestamp: Date.now(),
           activeModalRef, // Include detected modal ref
           transientState, // Include transient state info (loading indicators)
+          pageTextForExtraction, // For credential extraction only
         };
       });
 

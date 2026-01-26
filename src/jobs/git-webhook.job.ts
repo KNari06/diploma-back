@@ -1,0 +1,153 @@
+import { Job } from 'bullmq';
+import { supabaseAdmin } from '@/db/supabase';
+import { logger } from '@/utils/core/logger';
+import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
+import { GitWebhookService } from '@/services/integrations/git-webhook.service';
+
+export class GitWebhookJobHandler {
+  static async process(
+    job: Job<{
+      provider: 'github' | 'gitlab';
+      deliveryId: string;
+    }>
+  ): Promise<void> {
+    const { provider, deliveryId } = job.data;
+
+    // Load delivery record
+    const { data: delivery, error: deliveryError } = await supabaseAdmin
+      .from('git_webhook_deliveries')
+      .select('*')
+      .eq('provider', provider)
+      .eq('delivery_id', deliveryId)
+      .maybeSingle();
+
+    if (deliveryError || !delivery) {
+      throw new Error(`Delivery not found: ${provider}:${deliveryId}`);
+    }
+
+    if (['processed', 'ignored', 'failed'].includes(delivery.status)) {
+      logger.info('[GIT_WEBHOOK_JOB] Delivery already handled', {
+        provider,
+        deliveryId,
+        status: delivery.status,
+      });
+      return;
+    }
+
+    const integrationId = delivery.integration_id as string | null;
+    if (!integrationId) {
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'integration_not_found',
+      });
+      return;
+    }
+
+    const { data: integration, error: integrationError } = await supabaseAdmin
+      .from('git_integrations')
+      .select('*')
+      .eq('id', integrationId)
+      .maybeSingle();
+
+    if (integrationError || !integration) {
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'integration_deleted',
+      });
+      return;
+    }
+
+    if (!integration.enabled) {
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'integration_disabled',
+      });
+      return;
+    }
+
+    // Map gitlab merge_request → pull_request config event
+    const deliveryEventType = String(delivery.event_type || '');
+    const configEvent =
+      provider === 'gitlab' && deliveryEventType === 'merge_request' ? 'pull_request' : deliveryEventType;
+
+    const allowedEvents = (integration.events || []) as string[];
+    if (!allowedEvents.includes(configEvent)) {
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'event_not_enabled',
+      });
+      return;
+    }
+
+    // Decide if we should trigger regression based on payload + branch filters
+    const decision = GitWebhookService.shouldTrigger({
+      provider,
+      eventType: deliveryEventType as any,
+      payload: delivery.payload,
+    });
+
+    if (!decision.trigger) {
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: decision.reason,
+      });
+      return;
+    }
+
+    if (!integration.suite_id) {
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'suite_not_configured',
+      });
+      return;
+    }
+
+    // Resolve project owner for RegressionRunService access checks
+    const { data: project, error: projectError } = await supabaseAdmin
+      .from('projects')
+      .select('user_id')
+      .eq('id', integration.project_id)
+      .maybeSingle();
+
+    if (projectError || !project?.user_id) {
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'failed',
+        error: 'project_not_found',
+      });
+      throw new Error('Project not found for integration');
+    }
+
+    logger.info('[GIT_WEBHOOK_JOB] Triggering regression suite', {
+      provider,
+      deliveryId,
+      suiteId: integration.suite_id,
+      branch: decision.branch,
+      reason: decision.reason,
+    });
+
+    try {
+      await RegressionRunService.runSuite({
+        suiteId: integration.suite_id,
+        userId: project.user_id,
+        trigger: 'scheduled',
+        parameters: {
+          provider,
+          eventType: deliveryEventType,
+          repositoryUrl: delivery.repository_url,
+          branch: decision.branch,
+          deliveryId,
+          triggerReason: decision.reason,
+        },
+      });
+
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, { status: 'processed' });
+    } catch (error) {
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+}
+

@@ -1,10 +1,16 @@
 import crypto from 'crypto';
 import dotenv from 'dotenv';
+import { existsSync } from 'fs';
 import os from 'os';
+import { resolve } from 'path';
 import { z } from 'zod';
 
 // Load environment variables
+// First load .env, then .env.local (if exists) which will override .env values
 dotenv.config();
+if (existsSync(resolve(process.cwd(), '.env.local'))) {
+  dotenv.config({ path: '.env.local', override: true });
+}
 
 // Environment schema validation
 const envSchema = z.object({

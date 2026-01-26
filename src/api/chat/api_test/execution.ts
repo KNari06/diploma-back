@@ -1,4 +1,5 @@
 import { Response } from 'express';
+import { redisConnection } from '@/config/infrastructure/queues';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { confirmTestPlan } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
@@ -11,6 +12,32 @@ import { ChatService } from '@/services/utils/chat.service';
 import { emitProcessingStep } from '../shared/utils';
 import { runApiFuzzing } from './fuzzing';
 import { formatApiResponse } from './formatting';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REDIS LOCK HELPER: Prevents concurrent test starts for the same chat session
+// ═══════════════════════════════════════════════════════════════════════════
+const CHAT_TEST_LOCK_PREFIX = 'lock:chat_test_start:';
+const CHAT_TEST_LOCK_TTL_SECONDS = 10; // Short TTL to prevent stuck locks
+
+async function acquireChatTestLock(chatSessionId: string): Promise<boolean> {
+  try {
+    const lockKey = `${CHAT_TEST_LOCK_PREFIX}${chatSessionId}`;
+    const result = await redisConnection.set(lockKey, '1', 'EX', CHAT_TEST_LOCK_TTL_SECONDS, 'NX');
+    return result === 'OK';
+  } catch {
+    // If Redis is unavailable, fail-open (allow the request)
+    return true;
+  }
+}
+
+async function releaseChatTestLock(chatSessionId: string): Promise<void> {
+  try {
+    const lockKey = `${CHAT_TEST_LOCK_PREFIX}${chatSessionId}`;
+    await redisConnection.del(lockKey);
+  } catch {
+    // Best-effort release
+  }
+}
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -63,6 +90,9 @@ export async function executeApiTestFlow(
     timeout: flowTimeout,
   });
 
+  // Track Redis lock state for cleanup in error handler
+  let lockAcquired = false;
+
   try {
     // FIX #13: Consistent progress starting from 0%
     emitProcessingStep(chatSessionId, 'executing_test', '🚀 Starting API test execution...', 0);
@@ -92,30 +122,66 @@ export async function executeApiTestFlow(
     emitProcessingStep(chatSessionId, 'executing_test', '💳 Checking credits...', 10);
     checkTimeout();
 
-    // ✅ CRITICAL: Check if user sent new message (cancel running tests first)
-    // This prevents creating new test if user already sent another message
+    // ✅ GUARD: Only 1 active test per chat session - REJECT if one already exists
+    // This prevents duplicate tests from rapid clicks or concurrent requests
+    // Uses Redis lock to prevent race conditions between concurrent requests
     if (chatSessionId) {
-      try {
-        const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
-        const cancelResult = await ManualTestService.cancelAllRunningTestsForChatSession(
+      // Step 1: Acquire distributed lock to prevent race conditions
+      lockAcquired = await acquireChatTestLock(chatSessionId);
+      if (!lockAcquired) {
+        logger.warn('[API_TEST] Rejected: concurrent request already in progress', {
           chatSessionId,
-          userId
-        );
-        if (cancelResult.cancelledCount > 0) {
-          logger.info('[API_TEST] Cancelled running tests before executing new test', {
-            chatSessionId,
-            userId,
-            cancelledCount: cancelResult.cancelledCount,
-            planId,
+          userId,
+          planId,
+        });
+
+        if (!res.headersSent) {
+          res.status(409).json({
+            success: false,
+            error: 'CONCURRENT_REQUEST',
+            message: 'Another test request is already being processed for this chat. Please wait a moment.',
+            timestamp: new Date().toISOString(),
           });
         }
-      } catch (cancelError) {
-        // Don't fail if cancellation fails, but log it
-        logger.warn('[API_TEST] Failed to cancel running tests before executing new test', {
-          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+        return;
+      }
+
+      // Step 2: Check for active tests (now under lock)
+      try {
+        const { ManualTestService } = await import('@/services/testing/ui/manualTest.service');
+        const runningTests = await ManualTestService.getRunningTestsForChatSession(chatSessionId);
+        if (runningTests.length > 0) {
+          const existingTest = runningTests[0];
+          logger.warn('[API_TEST] Rejected: chat session already has an active test', {
+            chatSessionId,
+            userId,
+            existingTestId: existingTest.id,
+            existingTestStatus: existingTest.status,
+            planId,
+          });
+
+          // Release lock before returning
+          await releaseChatTestLock(chatSessionId);
+
+          if (!res.headersSent) {
+            res.status(409).json({
+              success: false,
+              error: 'TEST_ALREADY_RUNNING',
+              message: 'A test is already running in this chat. Please wait for it to complete or cancel it first.',
+              existingTestId: existingTest.id,
+              timestamp: new Date().toISOString(),
+            });
+          }
+          return; // Exit early - do not create new test
+        }
+      } catch (guardError) {
+        // Log but don't block - fail-open to avoid breaking flow if mapping query fails
+        logger.warn('[API_TEST] Failed to check for active tests in chat session', {
+          error: guardError instanceof Error ? guardError.message : String(guardError),
           chatSessionId,
           userId,
         });
+        // Don't release lock here - continue with test creation
       }
     }
 
@@ -204,18 +270,38 @@ export async function executeApiTestFlow(
 
     checkTimeout();
 
-    // Save test-chat mapping (non-blocking)
+    // ✅ FIX: Save test-chat mapping SYNCHRONOUSLY (awaited)
+    // This is critical for the "1 active test per chat" guard to work reliably
+    // Without await, concurrent requests could both pass the guard before mapping is saved
     if (chatSessionId && userId) {
-      TestChatMappingService.saveTestChatMapping({
-        testId: apiTestId,
-        chatSessionId,
-        userId,
-      }).catch(mappingError => {
+      let mappingSaved = false;
+      try {
+        await TestChatMappingService.saveTestChatMapping({
+          testId: apiTestId,
+          chatSessionId,
+          userId,
+        });
+        mappingSaved = true;
+        logger.debug('[API_TEST] Test-chat mapping saved', {
+          testId: apiTestId,
+          chatSessionId,
+        });
+      } catch (mappingError) {
+        // Log error but don't fail the flow - test is already created
         logger.error('[API_TEST] Failed to save test-chat mapping', {
           error: mappingError instanceof Error ? mappingError.message : String(mappingError),
           testId: apiTestId,
         });
-      });
+      } finally {
+        // ✅ Release Redis lock ONLY if mapping was saved successfully.
+        // If mapping failed, keep the lock until TTL to reduce chances of creating duplicates.
+        if (lockAcquired && mappingSaved) {
+          await releaseChatTestLock(chatSessionId);
+        }
+      }
+    } else if (chatSessionId && lockAcquired) {
+      // Release lock if we didn't save mapping (edge case)
+      await releaseChatTestLock(chatSessionId);
     }
 
     // ✅ FIX #3: Wrap formatApiResponse in try-catch
@@ -381,6 +467,11 @@ export async function executeApiTestFlow(
       planId,
       userId,
     });
+
+    // ✅ Release Redis lock on error to prevent stuck locks
+    if (lockAcquired && chatSessionId) {
+      await releaseChatTestLock(chatSessionId);
+    }
 
     // If response not sent yet, send error
     if (!res.headersSent) {

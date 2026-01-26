@@ -498,7 +498,8 @@ export class ChatService {
   static async getUserChatSessions(
     userId: string,
     limit: number = 50,
-    offset: number = 0
+    offset: number = 0,
+    workspaceId?: string
   ): Promise<{
     sessions: Array<{
       id: string;
@@ -524,14 +525,13 @@ export class ChatService {
     const validOffset = Math.max(0, Math.floor(offset || 0));
 
     try {
-      // Get total count
-      const { count } = await supabaseAdmin
+      // Build query with optional workspace filter
+      let countQuery = supabaseAdmin
         .from('chat_sessions')
         .select('id', { count: 'exact', head: true })
         .eq('user_id', userId);
 
-      // Get sessions with message count
-      const { data: sessions, error } = await supabaseAdmin
+      let sessionsQuery = supabaseAdmin
         .from('chat_sessions')
         .select(`
           id,
@@ -545,7 +545,19 @@ export class ChatService {
             created_at
           )
         `)
-        .eq('user_id', userId)
+        .eq('user_id', userId);
+
+      // Multi-workspace: filter by workspace_id if provided
+      if (workspaceId) {
+        countQuery = countQuery.eq('workspace_id', workspaceId);
+        sessionsQuery = sessionsQuery.eq('workspace_id', workspaceId);
+      }
+
+      // Get total count
+      const { count } = await countQuery;
+
+      // Get sessions with message count
+      const { data: sessions, error } = await sessionsQuery
         .order('updated_at', { ascending: false })
         .range(validOffset, validOffset + validLimit - 1);
 
@@ -575,10 +587,10 @@ export class ChatService {
 
           const lastMessage =
             sortedMessages.length > 0 &&
-            sortedMessages[0] &&
-            sortedMessages[0].role &&
-            sortedMessages[0].content &&
-            sortedMessages[0].created_at
+              sortedMessages[0] &&
+              sortedMessages[0].role &&
+              sortedMessages[0].content &&
+              sortedMessages[0].created_at
               ? sortedMessages[0]
               : null;
 
@@ -593,10 +605,10 @@ export class ChatService {
             last_message:
               lastMessage && typeof lastMessage.content === 'string'
                 ? {
-                    role: lastMessage.role,
-                    content: lastMessage.content.substring(0, 200), // Truncate for preview
-                    created_at: lastMessage.created_at,
-                  }
+                  role: lastMessage.role,
+                  content: lastMessage.content.substring(0, 200), // Truncate for preview
+                  created_at: lastMessage.created_at,
+                }
                 : undefined,
           };
         });

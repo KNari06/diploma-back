@@ -151,6 +151,7 @@ export interface Test {
   startedAt?: Date;
   completedAt?: Date;
   results?: TestResult[];
+  executedSteps?: any; // JSONB: persisted after completion
   // ✅ Intelligent testing fields (from DB migration)
   intelligentMode?: boolean;
   testGoal?: string;

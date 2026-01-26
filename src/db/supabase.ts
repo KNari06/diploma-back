@@ -354,10 +354,14 @@ export class SupabaseService {
       const errorCode = (error as any)?.code;
       if (errorCode === 'PGRST204' && (resultData?.video_url !== undefined || resultData?.trace_url !== undefined)) {
         const { video_url: _videoUrl, trace_url: _traceUrl, ...withoutArtifacts } = resultData || {};
+        // Keep explicit destructuring for clarity, but avoid unused-vars lint errors
+        void _videoUrl;
+        void _traceUrl;
         logger.warn('[DB] test_results schema missing artifact columns; retrying insert without video_url/trace_url', {
           testId: resultData.test_id,
           browser: resultData.browser,
           originalError: (error as any)?.message,
+          hint: 'Apply DB migration adding video_url/trace_url (supabase-migrations/20260121_test_results_artifact_columns.sql) and restart Supabase API to refresh PostgREST schema cache.',
         });
 
         const retry = await insertOnce(withoutArtifacts);

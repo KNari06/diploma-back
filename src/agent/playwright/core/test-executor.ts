@@ -288,7 +288,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     // Save results and upload artifacts
     // For Lite mode, create a minimal config for compatibility
     const finalConfig = modeSelection.mode === 'lite'
-      ? { mode: 'lite', goal, hints: [] }
+      ? { mode: 'lite', goal, startUrl: testData.url, hints: [] }
       : buildIntelligentTestConfig(testData, goal, hints, retryCount);
 
     await saveIntelligentTestResults(testData, intelligentResult, finalConfig);

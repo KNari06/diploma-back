@@ -9,6 +9,8 @@ services:
       - "3000:3000"
     env_file:
       - .env
+    environment:
+      - QUEUE_PREFIX=${QUEUE_PREFIX:-qait-prod}
     volumes:
       - ./logs:/app/logs
     extra_hosts:
@@ -24,6 +26,8 @@ services:
     command: ["node", "-r", "tsconfig-paths/register", "dist/worker/index.js"]
     env_file:
       - .env
+    environment:
+      - QUEUE_PREFIX=${QUEUE_PREFIX:-qait-prod}
     volumes:
       - ./logs:/app/logs
     extra_hosts:

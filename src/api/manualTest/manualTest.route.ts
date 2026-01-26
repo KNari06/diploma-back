@@ -4,6 +4,7 @@ import { testRetryRateLimiter, testRunRateLimiter } from '@/middleware/rate-limi
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { IntelligentTestStorageService } from '@/services/testing/results/intelligent-test-storage.service';
+import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { NotFoundError, TestRunRequest, ValidationError } from '@/types';
@@ -1208,6 +1209,13 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
         status: r.status,
       }));
 
+    // 10.5 Live executed steps fallback (Redis) for running tests
+    const rawExecutedSteps = (test as any).executedSteps ?? (test as any).executed_steps ?? null;
+    const isRunning = test.status === 'running' || test.status === 'pending';
+    const executedSteps = (isRunning && (!rawExecutedSteps || (Array.isArray(rawExecutedSteps) && rawExecutedSteps.length === 0)))
+      ? await TestExecutedStepsRedisService.getLive(id)
+      : rawExecutedSteps;
+
     // Build comprehensive response
     // Note: Convert TypeScript camelCase to snake_case for API response (DB format)
     const fullTestData = {
@@ -1225,6 +1233,7 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
         completed_at: test.completedAt,
         intelligent_mode: test.intelligentMode,
         test_goal: test.testGoal,
+        executed_steps: executedSteps,
       },
       // ✅ OPTIMIZED: Use pre-converted URLs (no duplicate conversion)
       // ✅ FIX: Use video_url/trace_url from DB (snake_case) - Supabase returns snake_case
