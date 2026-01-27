@@ -67,18 +67,7 @@ const MIN_API_URL_LENGTH = 7; // Minimum valid URL length ("http://x")
 //   }
 // }, 300000); // 5 minutes
 
-/**
- * Timeout helper for Promise.race (currently unused)
- */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-const withTimeout = <T>(promise: Promise<T>, ms: number, errorMsg: string): Promise<T> => {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(errorMsg)), ms)
-    ),
-  ]);
-};
+
 
 /**
  * Simple language detection (heuristic)
@@ -118,12 +107,12 @@ function detectLanguageSimple(message: string): 'en' | 'ru' | 'neutral' {
  * TODO: Cache temporarily disabled
  */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-const setCacheEntry = (
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _key: string,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _result: IntentResult
-): void => {
+// const setCacheEntry = (
+//   // eslint-disable-next-line @typescript-eslint/no-unused-vars
+//   _key: string,
+//   // eslint-disable-next-line @typescript-eslint/no-unused-vars
+//   _result: IntentResult
+// ): void => {
   // Cache disabled - no-op
   // TODO: Re-enable when needed
   // if (intentCache.size >= MAX_CACHE_SIZE) {
@@ -137,7 +126,7 @@ const setCacheEntry = (
   //   }
   // }
   // intentCache.set(key, { result, timestamp: Date.now() });
-};
+// };
 
 /**
  * Parse user's natural language message into structured intent
@@ -243,35 +232,35 @@ function validateAndPrepareMessage(message: string): string | null {
   return trimmedMessage;
 }
 
-/**
- * Build cache key for intent result
- * Includes availableIntents to prevent cache collision when intent set changes
- * TODO: Cache temporarily disabled
- */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function buildCacheKey(message: string, projectId?: string, availableIntents?: string[]): string {
-  const intentsKey = availableIntents?.sort().join(',') || 'default';
-  return `${message.toLowerCase()}|${projectId || 'global'}|${intentsKey}`;
-}
+// /**
+//  * Build cache key for intent result
+//  * Includes availableIntents to prevent cache collision when intent set changes
+//  * TODO: Cache temporarily disabled
+//  */
+// // eslint-disable-next-line @typescript-eslint/no-unused-vars
+// function buildCacheKey(message: string, projectId?: string, availableIntents?: string[]): string {
+//   const intentsKey = availableIntents?.sort().join(',') || 'default';
+//   return `${message.toLowerCase()}|${projectId || 'global'}|${intentsKey}`;
+// }
 
 /**
  * Get cached result if available and not expired
  * TODO: Cache temporarily disabled
  */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-function getCachedResult(
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _cacheKey: string
-): IntentResult | null {
-  // Cache disabled - always return null
-  // TODO: Re-enable when needed
-  // const cached = intentCache.get(cacheKey);
-  // if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-  //   logger.info('[INTENT_PARSER] Using cached result', { cacheKey });
-  //   return { ...cached.result };
-  // }
-  return null;
-}
+// function getCachedResult(
+//   // eslint-disable-next-line @typescript-eslint/no-unused-vars
+//   _cacheKey: string
+// ): IntentResult | null {
+//   // Cache disabled - always return null
+//   // TODO: Re-enable when needed
+//   // const cached = intentCache.get(cacheKey);
+//   // if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+//   //   logger.info('[INTENT_PARSER] Using cached result', { cacheKey });
+//   //   return { ...cached.result };
+//   // }
+//   return null;
+// }
 
 /**
  * Get KB rules context using FAST path (cache) or SLOW path (searchKB)
@@ -606,8 +595,17 @@ function createFallbackResult(
 
   // For very low confidence (< 0.6) on actionable intents, consider asking for clarification
   // But only if the intent is truly unclear, not just low confidence
+  const hasRequiredActionFields =
+    (intentResult.intent === 'api_test' &&
+      typeof intentResult.apiUrl === 'string' &&
+      intentResult.apiUrl.trim().length > 0) ||
+    (intentResult.intent === 'platform_test' &&
+      typeof intentResult.page === 'string' &&
+      intentResult.page.trim().length > 0);
+
   if (confidence < MIN_CONFIDENCE_FOR_CLARIFICATION &&
-      (intentResult.intent === 'api_test' || intentResult.intent === 'platform_test')) {
+      (intentResult.intent === 'api_test' || intentResult.intent === 'platform_test') &&
+      !hasRequiredActionFields) {
     logger.info('[INTENT_PARSER] Very low confidence on actionable intent, requesting clarification', {
       originalIntent: intentResult.intent,
       confidence,
@@ -664,74 +662,74 @@ function getFallbackClarificationQuestion(intentResult: IntentResult): string {
  * Currently unused - may be used in future
  */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-function checkIfResponseToClarification(
-  context?: IntentParserContext
-): boolean {
-  if (!context?.chatHistory || !Array.isArray(context.chatHistory)) {
-    return false;
-  }
+// function checkIfResponseToClarification(
+//   context?: IntentParserContext
+// ): boolean {
+//   if (!context?.chatHistory || !Array.isArray(context.chatHistory)) {
+//     return false;
+//   }
 
-  const history = context.chatHistory;
-  if (history.length < 2) {
-    return false; // Need at least user message + AI clarification
-  }
+//   const history = context.chatHistory;
+//   if (history.length < 2) {
+//     return false; // Need at least user message + AI clarification
+//   }
 
-  // Get last assistant message
-  const lastAssistantMessage = history
-    .slice()
-    .reverse()
-    .find(msg => msg.role === 'assistant' || msg.role === 'ai');
+//   // Get last assistant message
+//   const lastAssistantMessage = history
+//     .slice()
+//     .reverse()
+//     .find(msg => msg.role === 'assistant' || msg.role === 'ai');
 
-  if (!lastAssistantMessage) {
-    return false;
-  }
+//   if (!lastAssistantMessage) {
+//     return false;
+//   }
 
-  // Check metadata for clarification indicators (more reliable than text matching)
-  const metadata = (lastAssistantMessage as any).metadata;
+//   // Check metadata for clarification indicators (more reliable than text matching)
+//   const metadata = (lastAssistantMessage as any).metadata;
 
-  // Method 1: Check if metadata explicitly marks this as clarification
-  if (metadata) {
-    // From needs_clarification handler
-    if (metadata.requiresAnswers === true) {
-      logger.debug('[INTENT_PARSER] Detected clarification via metadata.requiresAnswers', {
-        hasQuestions: !!metadata.questions,
-      });
-      return true;
-    }
+//   // Method 1: Check if metadata explicitly marks this as clarification
+//   if (metadata) {
+//     // From needs_clarification handler
+//     if (metadata.requiresAnswers === true) {
+//       logger.debug('[INTENT_PARSER] Detected clarification via metadata.requiresAnswers', {
+//         hasQuestions: !!metadata.questions,
+//       });
+//       return true;
+//     }
 
-    // From API/Platform test handlers (questions array)
-    if (metadata.questions && Array.isArray(metadata.questions) && metadata.questions.length > 0) {
-      logger.debug('[INTENT_PARSER] Detected clarification via metadata.questions', {
-        questionsCount: metadata.questions.length,
-      });
-      return true;
-    }
+//     // From API/Platform test handlers (questions array)
+//     if (metadata.questions && Array.isArray(metadata.questions) && metadata.questions.length > 0) {
+//       logger.debug('[INTENT_PARSER] Detected clarification via metadata.questions', {
+//         questionsCount: metadata.questions.length,
+//       });
+//       return true;
+//     }
 
-    // From needsMoreInfo flag
-    if (metadata.needsMoreInfo === true) {
-      logger.debug('[INTENT_PARSER] Detected clarification via metadata.needsMoreInfo');
-      return true;
-    }
-  }
+//     // From needsMoreInfo flag
+//     if (metadata.needsMoreInfo === true) {
+//       logger.debug('[INTENT_PARSER] Detected clarification via metadata.needsMoreInfo');
+//       return true;
+//     }
+//   }
 
-  // Method 2: Fallback - check message content structure
-  // Only if no metadata found (backward compatibility)
-  const content = lastAssistantMessage.content || '';
+//   // Method 2: Fallback - check message content structure
+//   // Only if no metadata found (backward compatibility)
+//   const content = lastAssistantMessage.content || '';
 
-  // Check for structured question format (emoji + question pattern)
-  const hasStructuredQuestion =
-    (content.includes('📋') || content.includes('🌐') || content.includes('📡') || content.includes('❓')) &&
-    (content.includes('?') || content.includes('provide') || content.includes('clarify'));
+//   // Check for structured question format (emoji + question pattern)
+//   const hasStructuredQuestion =
+//     (content.includes('📋') || content.includes('🌐') || content.includes('📡') || content.includes('❓')) &&
+//     (content.includes('?') || content.includes('provide') || content.includes('clarify'));
 
-  if (hasStructuredQuestion) {
-    logger.debug('[INTENT_PARSER] Detected clarification via structured question format (fallback)', {
-      contentPreview: content.substring(0, 100),
-    });
-    return true;
-  }
+//   if (hasStructuredQuestion) {
+//     logger.debug('[INTENT_PARSER] Detected clarification via structured question format (fallback)', {
+//       contentPreview: content.substring(0, 100),
+//     });
+//     return true;
+//   }
 
-  return false;
-}
+//   return false;
+// }
 
 /**
  * Get possible intents based on current result
@@ -1211,32 +1209,32 @@ function extractJSONFromText(text: string): IntentResult | null {
   return null;
 }
 
-/**
- * Strategy 4: Fix common issues and try parsing
- * Fixes: single quotes → double quotes, trailing commas, comments
- */
-function extractWithQuoteFix(text: string): IntentResult | null {
-  try {
-    let fixed = text;
+// /**
+//  * Strategy 4: Fix common issues and try parsing
+//  * Fixes: single quotes → double quotes, trailing commas, comments
+//  */
+// function extractWithQuoteFix(text: string): IntentResult | null {
+//   try {
+//     let fixed = text;
 
-    // Remove single-line comments (// ...)
-    fixed = fixed.replace(/\/\/.*$/gm, '');
+//     // Remove single-line comments (// ...)
+//     fixed = fixed.replace(/\/\/.*$/gm, '');
 
-    // Remove trailing commas before } or ]
-    fixed = fixed.replace(/,(\s*[}\]])/g, '$1');
+//     // Remove trailing commas before } or ]
+//     fixed = fixed.replace(/,(\s*[}\]])/g, '$1');
 
-    // Replace single quotes with double quotes (carefully)
-    // ⚠️ WARNING: This doesn't handle apostrophes in strings properly
-    // Only works for simple cases without apostrophes
-    fixed = fixed
-      .replace(/:\s*'([^']*)'/g, ': "$1"')  // Fix string values
-      .replace(/'([^']+)':/g, '"$1":');     // Fix property names
+//     // Replace single quotes with double quotes (carefully)
+//     // ⚠️ WARNING: This doesn't handle apostrophes in strings properly
+//     // Only works for simple cases without apostrophes
+//     fixed = fixed
+//       .replace(/:\s*'([^']*)'/g, ': "$1"')  // Fix string values
+//       .replace(/'([^']+)':/g, '"$1":');     // Fix property names
 
-    return JSON.parse(fixed);
-  } catch {
-    return null;
-  }
-}
+//     return JSON.parse(fixed);
+//   } catch {
+//     return null;
+//   }
+// }
 
 /**
  * Strategy 5: Extract from markdown THEN fix quotes
@@ -1244,23 +1242,23 @@ function extractWithQuoteFix(text: string): IntentResult | null {
  * Currently unused - may be used in future
  */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-function extractMarkdownWithQuoteFix(text: string): IntentResult | null {
-  // First extract from markdown
-  const extracted = extractMarkdownJSON(text);
-  if (!extracted) {
-    // Try to extract markdown content and then fix quotes
-    let match = text.match(/```json\s*([\s\S]*?)\s*```/);
-    if (!match) {
-      match = text.match(/```\s*([\s\S]*?)\s*```/);
-    }
+// function extractMarkdownWithQuoteFix(text: string): IntentResult | null {
+//   // First extract from markdown
+//   const extracted = extractMarkdownJSON(text);
+//   if (!extracted) {
+//     // Try to extract markdown content and then fix quotes
+//     let match = text.match(/```json\s*([\s\S]*?)\s*```/);
+//     if (!match) {
+//       match = text.match(/```\s*([\s\S]*?)\s*```/);
+//     }
 
-    if (match) {
-      // Apply quote fix to markdown content
-      return extractWithQuoteFix(match[1]);
-    }
-  }
-  return extracted;
-}
+//     if (match) {
+//       // Apply quote fix to markdown content
+//       return extractWithQuoteFix(match[1]);
+//     }
+//   }
+//   return extracted;
+// }
 
 /**
  * Validate parsed intent result structure
@@ -1307,13 +1305,35 @@ function validateIntentResult(parsed: any): IntentResult | null {
       parsed.apiUrl = null;
     }
 
-    // FIX #2: apiMethod validation using centralized constant
+    // FIX #2: apiMethod validation using centralized constant (+ soft normalization)
     if (parsed.apiMethod !== undefined) {
-      if (typeof parsed.apiMethod === 'string' && !VALID_HTTP_METHODS.includes(parsed.apiMethod.toUpperCase() as any)) {
-        logger.warn('[INTENT_PARSER] Invalid HTTP method', {
-          method: parsed.apiMethod,
-          validMethods: VALID_HTTP_METHODS,
-        });
+      if (typeof parsed.apiMethod === 'string') {
+        const upper = parsed.apiMethod.trim().toUpperCase();
+        const map: Record<string, string> = {
+          PST: 'POST',
+          DEL: 'DELETE',
+          GTE: 'GET',
+          GETT: 'GET',
+          PUTT: 'PUT',
+          PATC: 'PATCH',
+        };
+        const normalized = map[upper] || upper;
+        parsed.apiMethod = normalized;
+        if (!VALID_HTTP_METHODS.includes(normalized as any)) {
+          logger.warn('[INTENT_PARSER] Invalid HTTP method', {
+            method: parsed.apiMethod,
+            validMethods: VALID_HTTP_METHODS,
+          });
+        }
+      }
+    }
+
+    // Soft fallback: if model returned api_test but missed apiUrl, try to extract a relative path from rawText.
+    if ((!parsed.apiUrl || String(parsed.apiUrl).trim().length === 0) && typeof parsed.rawText === 'string') {
+      const rel = parsed.rawText.match(/(^|\s)(\/[A-Za-z0-9\-._~!$&'()*+,;=:@/%]+)(?=\s|$)/);
+      if (rel?.[2]) {
+        parsed.apiUrl = rel[2];
+        parsed.isRelativePath = true;
       }
     }
   }
@@ -1411,18 +1431,87 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
 
   // Step 5: Normalize and clean fields based on intent type
   if (parsed.intent === 'api_test') {
+    const extractAgentLevelFromText = (text: string): 'light' | 'medium' | 'hard' | undefined => {
+      const lower = (text || '').toLowerCase();
+      if (/\b(hard|хард)\b/i.test(lower)) return 'hard';
+      if (/\b(medium|медиум)\b/i.test(lower)) return 'medium';
+      if (/\b(light|лайт)\b/i.test(lower)) return 'light';
+      return undefined;
+    };
+
+    const normalizeMethod = (m: string | undefined): string | undefined => {
+      if (!m) return undefined;
+      const upper = m.trim().toUpperCase();
+      if (VALID_HTTP_METHODS.includes(upper as any)) return upper;
+      // Common typos/short forms
+      const map: Record<string, string> = {
+        GETT: 'GET',
+        GTE: 'GET',
+        PST: 'POST',
+        POS: 'POST',
+        PUTT: 'PUT',
+        DEL: 'DELETE',
+        DELETEE: 'DELETE',
+        PATC: 'PATCH',
+      };
+      const mapped = map[upper];
+      return mapped && VALID_HTTP_METHODS.includes(mapped as any) ? mapped : undefined;
+    };
+
+    const extractApiUrlFromText = (text: string): { url?: string; isRelativePath: boolean } => {
+      const t = text || '';
+      // 1) Absolute URL
+      const abs = t.match(/\bhttps?:\/\/[^\s)]+/i);
+      if (abs?.[0]) {
+        return { url: abs[0].replace(/[),.]+$/g, ''), isRelativePath: false };
+      }
+
+      // 2) Relative path starting with /
+      const rel = t.match(/(^|\s)(\/[A-Za-z0-9\-._~!$&'()*+,;=:@/%]+)(?=\s|$)/);
+      if (rel?.[2]) {
+        return { url: rel[2].replace(/[),.]+$/g, ''), isRelativePath: true };
+      }
+
+      // 3) Hostname without scheme (api.example.com/users)
+      const host = t.match(/\b([a-z0-9.-]+\.[a-z]{2,})(\/[^\s)]*)?/i);
+      if (host?.[0]) {
+        const candidate = host[0].replace(/[),.]+$/g, '');
+        return { url: `https://${candidate}`, isRelativePath: false };
+      }
+
+      return { url: undefined, isRelativePath: false };
+    };
+
     // Clean and normalize apiMethod
     if (parsed.apiMethod) {
-      parsed.apiMethod = parsed.apiMethod.trim().toUpperCase();
-
-      // Validate HTTP method
-      if (parsed.apiMethod === '' || !VALID_HTTP_METHODS.includes(parsed.apiMethod as any)) {
+      const normalized = normalizeMethod(parsed.apiMethod);
+      if (normalized) {
+        parsed.apiMethod = normalized as any;
+      } else {
         logger.warn('[INTENT_PARSER] Invalid HTTP method, resetting', {
           method: parsed.apiMethod,
           validMethods: VALID_HTTP_METHODS,
         });
         parsed.apiMethod = undefined;
       }
+    } else {
+      // Try to infer method from text if missing
+      const methodMatch = trimmedMessage.match(/\b(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\b/i);
+      const normalized = normalizeMethod(methodMatch?.[1]);
+      if (normalized) {
+        parsed.apiMethod = normalized as any;
+      }
+    }
+
+    // Extract agent level (optional): prefer explicit field, fallback to text.
+    const parsedAny2 = parsed as any;
+    const explicitLevel =
+      typeof parsedAny2.agentLevel === 'string'
+        ? extractAgentLevelFromText(parsedAny2.agentLevel)
+        : undefined;
+    const inferredLevel = explicitLevel || extractAgentLevelFromText(trimmedMessage);
+    if (inferredLevel) {
+      parsed.metadata = { ...(parsed.metadata || {}), agentLevel: inferredLevel };
     }
 
     // Clean apiUrl and detect relative paths
@@ -1434,18 +1523,24 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
         parsed.apiUrl = undefined;
         parsed.isRelativePath = false;
       } else {
-        // Detect if it's a relative path (doesn't start with http)
-        if (!parsed.apiUrl.startsWith('http://') && !parsed.apiUrl.startsWith('https://')) {
-          parsed.isRelativePath = true;
-          logger.debug('[INTENT_PARSER] Detected relative API path', {
-            apiUrl: parsed.apiUrl,
-          });
-        } else {
+        // isRelativePath should only mean "path without base host"
+        parsed.isRelativePath = parsed.apiUrl.startsWith('/');
+
+        // If it looks like a hostname without scheme, normalize to https://
+        if (!parsed.apiUrl.startsWith('http://') && !parsed.apiUrl.startsWith('https://') && !parsed.apiUrl.startsWith('/')) {
+          parsed.apiUrl = `https://${parsed.apiUrl}`;
           parsed.isRelativePath = false;
         }
       }
     } else {
-      parsed.isRelativePath = false;
+      // Try to salvage apiUrl from raw message (absolute URL, /path, or hostname)
+      const extracted = extractApiUrlFromText(trimmedMessage);
+      if (extracted.url) {
+        parsed.apiUrl = extracted.url;
+        parsed.isRelativePath = extracted.isRelativePath;
+      } else {
+        parsed.isRelativePath = false;
+      }
     }
 
     // Convert empty strings to undefined for consistency

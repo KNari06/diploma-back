@@ -174,16 +174,26 @@ AVAILABLE INTENTS: ${intents.join(', ')}
    - It's a COMMAND/REQUEST or APPROVAL, not a question
    - OR: System provided URL + user approved ("yes", "go ahead")
 
+   RELATIVE API PATHS (IMPORTANT):
+   - If user provides a path like "/test" or "/api/v1/users" WITHOUT a base host:
+     • Treat it as api_test
+     • Set apiUrl to the path (e.g., "/test")
+     • Set isRelativePath = true
+     • Do NOT ask for clarification just because protocol/domain is missing (downstream may resolve base URL)
+
    URL PATTERNS:
    • https://api.example.com/users → api_test
    • https://example.com/api/v1/data → api_test
    • https://example.com/endpoint (if message mentions "API") → api_test
+   • /api/v1/users → api_test (relative path, isRelativePath=true)
+   • /test → api_test (relative path, isRelativePath=true)
 
    Keywords (Secondary): "API", "endpoint", "HTTP", GET/POST/PUT/DELETE
 
    Examples:
    - "Test this API https://api.example.com/users"
    - "Call GET https://..."
+   - "test this api /test in light mode"
    - "yes, execute it" (when test plan exists)
 
 3. "general_chat" - User wants to TALK, ASK, or DISCUSS
@@ -379,6 +389,8 @@ OPTIONAL FIELDS (include if relevant):
   "apiUrl": string | null,
   "apiBody": object | null,
   "apiHeaders": object | null,
+  "isRelativePath": boolean | null,
+  "agentLevel": "light" | "medium" | "hard" | null,
   "urgency": "high" | "normal" | null,
 
   // Regression-specific fields
@@ -416,6 +428,12 @@ Ex2: "repetino.kz try to register"
 
 Ex3: System: "URL FOUND IN HISTORY: https://api.example.com, Method: GET", User: "yes, execute it now"
 → {"intent": "api_test", "intent_confidence": 0.90, "apiMethod": "GET", "apiUrl": "https://api.example.com", "rawText": "yes, execute it now"}
+
+Ex3b: "test this api /test in light mode"
+→ {"intent": "api_test", "intent_confidence": 0.90, "apiMethod": null, "apiUrl": "/test", "isRelativePath": true, "agentLevel": "light", "rawText": "test this api /test in light mode"}
+
+Ex3c: "tset pst /api/v1/users"
+→ {"intent": "api_test", "intent_confidence": 0.80, "apiMethod": "POST", "apiUrl": "/api/v1/users", "isRelativePath": true, "rawText": "tset pst /api/v1/users"}
 
 Ex4: "So, did you run API test already?"
 → {"intent": "general_chat", "intent_confidence": 0.85, "rawText": "So, did you run API test already?"}

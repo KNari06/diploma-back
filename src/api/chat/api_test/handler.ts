@@ -1,15 +1,26 @@
-import { ApiTestPlanService } from '@/services/testing/api/api-test-plan.service';
-import { saveTestPlan } from '@/services/testing/plans/exploration-cache.service';
 import { ChatService } from '@/services/utils/chat.service';
-import { ProjectContextService } from '@/services/utils/project-context.service';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep } from '../shared/utils';
-import { convertApiTestPlanToTestPlan } from './formatting';
 import { executeApiAgentTestFlow } from './agent-execution';
 import { isValidLevel } from '@/services/testing/api/agent';
+
+function parseAgentLevelFromText(message: string): 'light' | 'medium' | 'hard' | undefined {
+  if (!message || typeof message !== 'string') return undefined;
+
+  const text = message.toLowerCase();
+  // Keep parsing conservative: only explicit level keywords.
+  const hard = /\b(hard|хард)\b/i.test(text);
+  const medium = /\b(medium|медиум)\b/i.test(text);
+  const light = /\b(light|лайт)\b/i.test(text);
+
+  if (hard) return 'hard';
+  if (medium) return 'medium';
+  if (light) return 'light';
+  return undefined;
+}
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -89,7 +100,7 @@ export async function handleApiTest(
       url: parsedIntent?.apiUrl,
       hasParsedIntent: !!parsedIntent,
       hasAnswers: !!answers,
-      agentLevel: parsedIntent?.agentLevel,
+      agentLevel: parsedIntent?.agentLevel || parsedIntent?.metadata?.agentLevel,
     });
 
     const emitProcessingStepWithLogging = functionLogger
@@ -98,49 +109,12 @@ export async function handleApiTest(
     emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', '🔍 Analyzing API request...', 30);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // NEW: CHECK FOR AGENT LEVEL - REDIRECT TO AGENT FLOW IF PROVIDED
-    // ═══════════════════════════════════════════════════════════════════════
-
-    const agentLevel = parsedIntent?.agentLevel || parsedIntent?.metadata?.agentLevel;
-    if (agentLevel && isValidLevel(agentLevel)) {
-      // Validate required fields for agent flow
-      if (!parsedIntent?.apiUrl) {
-        logger.warn('[API_TEST] Agent flow missing URL', { agentLevel });
-        res.status(400).json({
-          success: false,
-          error: 'URL is required for API Agent testing',
-          needsMoreInfo: true,
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
-
-      logger.info('[API_TEST] Redirecting to agent flow', {
-        level: agentLevel,
-        url: parsedIntent.apiUrl,
-        method: parsedIntent.apiMethod,
-      });
-
-      // Execute agent flow directly
-      await executeApiAgentTestFlow(res, {
-        level: agentLevel,
-        url: parsedIntent.apiUrl,
-        method: parsedIntent.apiMethod || 'GET',
-        headers: parsedIntent.apiHeaders,
-        body: parsedIntent.apiBody,
-        expectedStatus: parsedIntent.expectedStatus,
-        expectedBehavior: parsedIntent.expectedBehavior || parsedIntent?.metadata?.expectedBehavior,
-        userId,
-        chatSessionId,
-        projectId: workspace_id,
-        userMessage: message,
-      });
-      return;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
     // STEP 1: VALIDATE API INFO - ASK FOR MISSING DETAILS
     // ═══════════════════════════════════════════════════════════════════════
+
+    if (parsedIntent?.apiMethod && typeof parsedIntent.apiMethod === 'string') {
+      parsedIntent.apiMethod = parsedIntent.apiMethod.toUpperCase();
+    }
 
     const hasMethod = !!parsedIntent?.apiMethod;
     const hasUrl = !!parsedIntent?.apiUrl;
@@ -208,100 +182,34 @@ export async function handleApiTest(
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 2: FIND OR CREATE PROJECT
+    // NEW: ALWAYS RUN API-AGENT FOR CHAT-BASED API TESTING
     // ═══════════════════════════════════════════════════════════════════════
 
-    const findOrCreateProjectWithLogging = functionLogger
-      ? withFunctionLogging(ProjectContextService.findOrCreateProject.bind(ProjectContextService), 'ProjectContextService.findOrCreateProject', functionLogger)
-      : ProjectContextService.findOrCreateProject.bind(ProjectContextService);
-    const { project_id } = await findOrCreateProjectWithLogging(
-      workspace_id,
-      parsedIntent.apiUrl,
-      userId
-    );
+    const candidateLevel =
+      (parsedIntent?.agentLevel || parsedIntent?.metadata?.agentLevel) ??
+      parseAgentLevelFromText(message) ??
+      'light';
+    const agentLevel = isValidLevel(candidateLevel) ? candidateLevel : 'light';
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // STEP 3: GENERATE API TEST PLAN
-    // ═══════════════════════════════════════════════════════════════════════
-
-    emitProcessingStepWithLogging(chatSessionId, 'generating_plan', '📋 Creating test plan...', 60);
-
-    const generateApiTestPlanWithLogging = functionLogger
-      ? withFunctionLogging(ApiTestPlanService.generateApiTestPlan.bind(ApiTestPlanService), 'ApiTestPlanService.generateApiTestPlan', functionLogger)
-      : ApiTestPlanService.generateApiTestPlan.bind(ApiTestPlanService);
-    const apiTestPlan = await generateApiTestPlanWithLogging({
-      method: parsedIntent.apiMethod,
+    logger.info('[API_TEST] Routing to API agent flow', {
+      level: agentLevel,
       url: parsedIntent.apiUrl,
-      body: parsedIntent.apiBody,
+      method: parsedIntent.apiMethod,
+      hasExplicitLevel: !!(parsedIntent?.agentLevel || parsedIntent?.metadata?.agentLevel),
+    });
+
+    await executeApiAgentTestFlow(res, {
+      level: agentLevel,
+      url: parsedIntent.apiUrl,
+      method: parsedIntent.apiMethod || 'GET',
       headers: parsedIntent.apiHeaders,
+      body: parsedIntent.apiBody,
+      expectedStatus: parsedIntent.expectedStatus,
+      expectedBehavior: parsedIntent.expectedBehavior || parsedIntent?.metadata?.expectedBehavior,
+      userId,
+      chatSessionId,
+      projectId: workspace_id,
       userMessage: message,
-    });
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // STEP 4: CONVERT API TEST PLAN TO UNIFIED TEST PLAN FORMAT
-    // ═══════════════════════════════════════════════════════════════════════
-
-    // Convert ApiTestPlan to TestPlan for storage and execution
-    const convertApiTestPlanToTestPlanWithLogging = functionLogger
-      ? withFunctionLogging(convertApiTestPlanToTestPlan, 'convertApiTestPlanToTestPlan', functionLogger)
-      : convertApiTestPlanToTestPlan;
-    const testPlan = convertApiTestPlanToTestPlanWithLogging(apiTestPlan);
-
-    // Save test plan to database for approval tracking
-    // Note: userId/projectId are shortened for logs (privacy + readability)
-    logger.info('[API_TEST] Saving test plan to database', {
-      planId: testPlan.id,
-      userId: userId.substring(0, 8) + '...', // First 8 chars only (privacy)
-      projectId: project_id.substring(0, 8) + '...', // First 8 chars only (privacy)
-      scope: testPlan.scope,
-      status: testPlan.status,
-    });
-
-    const saveTestPlanWithLogging = functionLogger
-      ? withFunctionLogging(saveTestPlan, 'saveTestPlan', functionLogger)
-      : saveTestPlan;
-    const saveResult = await saveTestPlanWithLogging(testPlan, userId, project_id);
-
-    logger.info('[API_TEST] Test plan save result', {
-      planId: testPlan.id,
-      success: saveResult.success,
-    });
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // STEP 5: SHOW TEST PLAN TO USER FOR APPROVAL
-    // ═══════════════════════════════════════════════════════════════════════
-
-    const formatApiTestPlanForConfirmationWithLogging = functionLogger
-      ? withFunctionLogging(ApiTestPlanService.formatApiTestPlanForConfirmation.bind(ApiTestPlanService), 'ApiTestPlanService.formatApiTestPlanForConfirmation', functionLogger)
-      : ApiTestPlanService.formatApiTestPlanForConfirmation.bind(ApiTestPlanService);
-    const formattedPlan = formatApiTestPlanForConfirmationWithLogging(apiTestPlan);
-
-    // Save chat messages
-    if (chatSessionId) {
-      const saveChatMessagesWithLogging = functionLogger
-        ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
-        : ChatService.saveChatMessages.bind(ChatService);
-      await saveChatMessagesWithLogging(chatSessionId, [
-        { role: 'user', content: message },
-        {
-          role: 'ai',
-          content: formattedPlan,
-          metadata: {
-            testPlan: apiTestPlan,
-            requiresApproval: true,
-          },
-        },
-      ]);
-    }
-
-    res.json({
-      success: true, // ← Frontend expects this!
-      reply: formattedPlan,
-      testPlan: apiTestPlan,
-      conversationId: testPlan.id, // Use this to track approval
-      requiresApproval: true,
-      timestamp: new Date().toISOString(),
-      sessionId: chatSessionId,
     });
   } catch (error) {
     logger.error('[API_TEST] Error in API test flow', {

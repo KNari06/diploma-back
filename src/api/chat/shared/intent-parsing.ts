@@ -154,6 +154,44 @@ export async function parseIntent(
   // ═══════════════════════════════════════════════════════════════════════
   let parsedIntent: any;
 
+  const extractAgentLevelFromText = (text: string): 'light' | 'medium' | 'hard' | undefined => {
+    if (!text) return undefined;
+    const lower = text.toLowerCase();
+
+    // 1) Direct explicit keywords (most reliable)
+    if (/\b(hard|хард|хардкор|сложн(?:ый|ая|ое)?|тяжел(?:ый|ая|ое)?)\b/i.test(lower)) return 'hard';
+    if (/\b(medium|медиум|средн(?:ий|яя|ее)?)\b/i.test(lower)) return 'medium';
+    if (/\b(light|лайт|лёгк(?:ий|ая|ое)?|легк(?:ий|ая|ое)?)\b/i.test(lower)) return 'light';
+
+    // 2) Combined forms: "hard mode", "lightmode", "medium-level", etc.
+    const combined = lower.match(/\b(light|medium|hard)(?:\s*|[-_])?(mode|level)\b/i);
+    if (combined?.[1]) {
+      const base = combined[1].toLowerCase();
+      if (base === 'hard') return 'hard';
+      if (base === 'medium') return 'medium';
+      if (base === 'light') return 'light';
+    }
+
+    // 3) Numeric levels: "level 1/2/3", "lvl2", "L1/L2/L3"
+    const lvl = lower.match(/\b(level|lvl)\s*([123])\b/i) || lower.match(/\b(l[123])\b/i);
+    if (lvl) {
+      const digit = (lvl[2] || lvl[1]?.slice(1)) as '1' | '2' | '3' | undefined;
+      if (digit === '1') return 'light';
+      if (digit === '2') return 'medium';
+      if (digit === '3') return 'hard';
+    }
+
+    // 4) Contextual synonyms (only when user explicitly talks about mode/level/difficulty)
+    const hasLevelContext = /\b(mode|level|difficulty)\b/i.test(lower);
+    if (hasLevelContext) {
+      if (/\b(advanced|pro|strict|deep)\b/i.test(lower)) return 'hard';
+      if (/\b(standard|normal)\b/i.test(lower)) return 'medium';
+      if (/\b(easy|simple)\b/i.test(lower)) return 'light';
+    }
+
+    return undefined;
+  };
+
   // ✅ FIX: Improved type guard for context object (exclude arrays)
   const contextObj =
     typeof context === 'object' &&
@@ -233,6 +271,11 @@ export async function parseIntent(
           logger.warn('[CHAT] Invalid agent level', { level: apiTestData.level });
         }
       }
+    }
+
+    // If UI didn't pass explicit level, try to infer from message text (fallback).
+    if (!validAgentLevel) {
+      validAgentLevel = extractAgentLevelFromText(validMessage);
     }
 
     // ✅ FIX: Check if required fields are present
@@ -372,6 +415,19 @@ export async function parseIntent(
       });
       // Fallback to general_chat if intent parsing fails
       parsedIntent = { intent: 'general_chat', confidence: 0 };
+    }
+  }
+
+  // Post-process: infer agent level from text for api_test when not provided.
+  // Chat handler defaults to LIGHT anyway, but keeping it here helps consistency across flows.
+  if (parsedIntent?.intent === 'api_test' && !parsedIntent?.agentLevel) {
+    const inferred = extractAgentLevelFromText(validMessage);
+    if (inferred) {
+      parsedIntent.agentLevel = inferred;
+      parsedIntent.metadata = {
+        ...(parsedIntent.metadata || {}),
+        agentLevel: inferred,
+      };
     }
   }
 
