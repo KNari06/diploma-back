@@ -2,6 +2,7 @@ import { logger } from '@/utils/core/logger';
 import { FinalTestReport, JiraIssueRequest, JiraIssue, JiraAttachment } from '@/types';
 import { supabaseAdmin } from '@/db/supabase';
 import { downloadFromStorage } from '@/services/storage/test-artifacts-storage.service';
+import { getJiraToken, ensureValidToken } from '@/services/api/jira.service';
 
 /**
  * Service for creating Jira issues from test reports
@@ -319,7 +320,7 @@ ${report.artifacts.trace ? `• 📊 Trace: Available` : '• 📊 Trace: Not av
             buffer: traceBuffer,
             mimeType: 'application/zip',
           });
-        } catch (error) {
+        } catch (error) { 
           logger.warn('[JIRA_REPORT] Failed to download trace', { error });
         }
       }
@@ -474,21 +475,15 @@ ${report.artifacts.trace ? `• 📊 Trace: Available` : '• 📊 Trace: Not av
     cloudId: string;
   } | null> {
     try {
-      const { data, error } = await supabaseAdmin
-        .from('jira_tokens')
-        .select('access_token, cloud_id')
-        .eq('user_id', userId)
-        .eq('active', true)
-        .single();
-
-      if (error || !data) {
-        logger.warn('[JIRA_REPORT] No active Jira tokens found', { userId, error });
+      const tokenData = await getJiraToken(userId);
+      if (!tokenData) {
+        logger.warn('[JIRA_REPORT] No Jira tokens found', { userId });
         return null;
       }
-
+      const accessToken = await ensureValidToken(tokenData);
       return {
-        accessToken: data.access_token,
-        cloudId: data.cloud_id,
+        accessToken,
+        cloudId: tokenData.cloud_id!,
       };
     } catch (error) {
       logger.error('[JIRA_REPORT] Error getting Jira auth', {
