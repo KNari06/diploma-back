@@ -7,6 +7,7 @@
 - [**Обзор API**](#обзор-api)
 - [**Аутентификация**](./authentication.md)
 - [**Примеры использования**](./examples.md)
+- [**API Agent тесты по уровням (LIGHT/MEDIUM/HARD)**](./API_AGENT_TEST_LEVELS.md)
 - [**Endpoints**](#endpoints)
 - [**Коды ошибок**](#коды-ошибок)
 - [**API Fuzzing**](#api-fuzzing)

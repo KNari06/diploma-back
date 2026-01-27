@@ -44,6 +44,7 @@ export function createInitialState(
       aiTokens: 0,
       endpointsConsidered: 0,
     },
+    expectationModel: undefined,
   };
 }
 

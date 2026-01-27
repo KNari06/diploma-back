@@ -110,17 +110,7 @@ const apiTestRequestSchema = z.object({
 router.post('/run', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   try {
     // Validate request body
-    const validatedData = apiTestRequestSchema.parse(req.body);
-
-    // Build request with validated data
-    const apiTestRequest = {
-      method: validatedData.method,
-      url: validatedData.url,
-      headers: validatedData.headers,
-      body: validatedData.body,
-      expectedStatus: validatedData.expectedStatus,
-      timeout: validatedData.timeout,
-    };
+    apiTestRequestSchema.parse(req.body);
 
     await runApiTest(req, res);
   } catch (error) {
@@ -209,43 +199,6 @@ router.get('/', requireAuth, asyncHandler(async (req: Request, res: Response) =>
 
 /**
  * @swagger
- * /api/v1/api-test/{id}:
- *   get:
- *     summary: Get API test details by ID
- *     description: |
- *       Returns detailed information about a specific API test including:
- *       - Request details (method, URL, headers, body)
- *       - Response details (status, headers, body)
- *       - Execution metadata
- *       - Fuzzing report (if available)
- *     tags: [API Test]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *         description: Test ID
- *     responses:
- *       200:
- *         description: API test details retrieved successfully
- *       404:
- *         description: API test not found
- *       401:
- *         description: Unauthorized
- */
-/**
- * GET /api-test/:id
- * Get API test by ID
- */
-router.get('/:id', requireAuth, asyncHandler(async (req: Request, res: Response) => {
-  await getApiTestById(req, res);
-}));
-
-/**
- * @swagger
  * /api/v1/api-test/project/{projectId}:
  *   get:
  *     summary: Get API tests by project
@@ -282,10 +235,47 @@ router.get('/:id', requireAuth, asyncHandler(async (req: Request, res: Response)
  */
 /**
  * GET /api-test/project/:projectId
- * Get API tests by project
+ * IMPORTANT: must be defined before '/:id' to avoid route shadowing.
  */
 router.get('/project/:projectId', requireAuth, asyncHandler(async (req: Request, res: Response) => {
   await getApiTestsByProject(req, res);
+}));
+
+/**
+ * @swagger
+ * /api/v1/api-test/{id}:
+ *   get:
+ *     summary: Get API test details by ID
+ *     description: |
+ *       Returns detailed information about a specific API test including:
+ *       - Request details (method, URL, headers, body)
+ *       - Response details (status, headers, body)
+ *       - Execution metadata
+ *       - Fuzzing report (if available)
+ *     tags: [API Test]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Test ID
+ *     responses:
+ *       200:
+ *         description: API test details retrieved successfully
+ *       404:
+ *         description: API test not found
+ *       401:
+ *         description: Unauthorized
+ */
+/**
+ * GET /api-test/:id
+ * Get API test by ID
+ */
+router.get('/:id', requireAuth, asyncHandler(async (req: Request, res: Response) => {
+  await getApiTestById(req, res);
 }));
 
 export default router;

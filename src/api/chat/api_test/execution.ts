@@ -10,7 +10,6 @@ import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapp
 import { ApiTestStorageService } from '@/services/testing/api/api-test-storage.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { emitProcessingStep } from '../shared/utils';
-import { runApiFuzzing } from './fuzzing';
 import { formatApiResponse } from './formatting';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -72,8 +71,8 @@ export async function executeApiTestFlow(
     throw new Error('Invalid userId - userId is required');
   }
 
-  // FIX #12: Global timeout for entire API test flow
-  const flowTimeout = 60000; // 60 seconds
+  // Global timeout for entire API test flow (must be <= CHAT_REQUEST_TIMEOUT)
+  const flowTimeout = 180000; // 180 seconds
   const flowStartTime = Date.now();
 
   const checkTimeout = () => {
@@ -256,17 +255,8 @@ export async function executeApiTestFlow(
 
     checkTimeout();
 
-    // FIX #2: Wrap runApiFuzzing in try-catch (already has internal try-catch, but double-check)
-    let fuzzingReport: any = null;
-    try {
-      fuzzingReport = await runApiFuzzing(apiTestResult, apiDetails, plan.url, chatSessionId);
-    } catch (fuzzingError) {
-      // Fuzzing is optional, don't fail the entire test
-      logger.warn('[API_TEST] Fuzzing failed, continuing without it', {
-        error: fuzzingError instanceof Error ? fuzzingError.message : String(fuzzingError),
-      });
-      // fuzzingReport stays null
-    }
+    // Legacy flow: fuzzing disabled (moved to API Agent HARD level)
+    const fuzzingReport: any = null;
 
     checkTimeout();
 

@@ -5,6 +5,26 @@ import { AuthTokens, AuthUser } from '@/types';
 import { logger } from '@/utils/core/logger';
 import * as crypto from 'crypto';
 
+// Supabase JWT expiry is configured in Supabase Dashboard (Auth settings).
+// This is only a fallback for cases when expires_in is missing.
+const DEFAULT_ACCESS_TOKEN_EXPIRES_IN_SECONDS = 30 * 24 * 60 * 60; // 30 days
+
+function normalizeExpiresIn(expiresIn?: number): number {
+  const v = typeof expiresIn === 'number' && Number.isFinite(expiresIn) ? Math.floor(expiresIn) : 0;
+  return v > 0 ? v : DEFAULT_ACCESS_TOKEN_EXPIRES_IN_SECONDS;
+}
+
+function warnIfUnexpectedJwtExpiry(expiresIn?: number): void {
+  // If Supabase still returns ~1h, it means the dashboard setting wasn't updated.
+  if (typeof expiresIn === 'number' && expiresIn > 0 && expiresIn < DEFAULT_ACCESS_TOKEN_EXPIRES_IN_SECONDS) {
+    logger.warn('[AUTH] Supabase JWT expiry appears lower than expected', {
+      expiresInSeconds: expiresIn,
+      expectedSeconds: DEFAULT_ACCESS_TOKEN_EXPIRES_IN_SECONDS,
+      hint: 'Update Supabase Auth setting: JWT expiry limit',
+    });
+  }
+}
+
 /**
  * Sign up with email and password
  * @param email - User email
@@ -98,7 +118,7 @@ export async function signUpWithEmail(
       tokens: {
         access_token: data.session.access_token,
         refresh_token: data.session.refresh_token,
-        expires_in: data.session.expires_in || 3600, // Default 1 hour if not provided
+        expires_in: normalizeExpiresIn(data.session.expires_in),
       },
     };
   } catch (error) {
@@ -171,6 +191,8 @@ export async function signInWithEmail(
       email: data.user.email || email.substring(0, 5) + '***',
     });
 
+    warnIfUnexpectedJwtExpiry(data.session.expires_in);
+
     return {
       user: {
         id: data.user.id,
@@ -181,7 +203,7 @@ export async function signInWithEmail(
       tokens: {
         access_token: data.session.access_token,
         refresh_token: data.session.refresh_token,
-        expires_in: data.session.expires_in || 3600, // Default 1 hour if not provided
+        expires_in: normalizeExpiresIn(data.session.expires_in),
       },
     };
   } catch (error) {
@@ -515,7 +537,7 @@ export async function exchangeCodeForSession(
         tokens: {
           access_token: tokenData.access_token,
           refresh_token: tokenData.refresh_token,
-          expires_in: tokenData.expires_in || 3600,
+          expires_in: normalizeExpiresIn(tokenData.expires_in),
         },
       };
     } else {
@@ -539,6 +561,8 @@ export async function exchangeCodeForSession(
         userId: data.user.id,
       });
 
+      warnIfUnexpectedJwtExpiry(data.session.expires_in);
+
       return {
         user: {
           id: data.user.id,
@@ -550,7 +574,7 @@ export async function exchangeCodeForSession(
         tokens: {
           access_token: data.session.access_token,
           refresh_token: data.session.refresh_token,
-          expires_in: data.session.expires_in || 3600,
+          expires_in: normalizeExpiresIn(data.session.expires_in),
         },
       };
     }
@@ -564,15 +588,24 @@ export async function exchangeCodeForSession(
 
 /**
  * Sign out user
- * Note: Supabase signOut invalidates all sessions for the user
+ * Revokes the CURRENT session refresh token (scope=local).
  * @returns Success status
  */
-export async function signOut(): Promise<{ success: boolean }> {
+export async function signOut(accessToken: string): Promise<{ success: boolean }> {
   try {
-    // Note: signOut() works without session - it just clears local storage
-    // But in server context, we don't need to do anything special
-    // The client should handle token removal
-    logger.info('[AUTH] User signed out (server-side)');
+    if (!accessToken || typeof accessToken !== 'string' || accessToken.trim().length < 10) {
+      throw new Error('Invalid access token');
+    }
+
+    // Server-side: revoke refresh token for THIS session.
+    // Note: Supabase cannot revoke the access token JWT before it expires.
+    const { error } = await supabaseAdmin.auth.admin.signOut(accessToken.trim(), 'local');
+    if (error) {
+      logger.warn('[AUTH] Sign out failed', { error: error.message });
+      throw new Error(error.message || 'Logout failed');
+    }
+
+    logger.info('[AUTH] User signed out (session revoked)');
 
     return { success: true };
   } catch (error) {
@@ -618,10 +651,12 @@ export async function refreshAccessToken(
       userId: data.user?.id,
     });
 
+    warnIfUnexpectedJwtExpiry(data.session.expires_in);
+
     return {
       access_token: data.session.access_token,
       refresh_token: data.session.refresh_token,
-      expires_in: data.session.expires_in || 3600, // Default 1 hour if not provided
+      expires_in: normalizeExpiresIn(data.session.expires_in),
     };
   } catch (error) {
     logger.error('[AUTH] Token refresh error', {
@@ -1196,10 +1231,12 @@ export async function verifyEmail(
       type,
     });
 
+    warnIfUnexpectedJwtExpiry(data.session.expires_in);
+
     return {
       access_token: data.session.access_token,
       refresh_token: data.session.refresh_token,
-      expires_in: data.session.expires_in || 3600, // Default 1 hour if not provided
+      expires_in: normalizeExpiresIn(data.session.expires_in),
     };
   } catch (error) {
     logger.error('[AUTH] Email verification error', {
