@@ -35,6 +35,7 @@ export async function executeApiAgentTestFlow(
     headers?: Record<string, string>;
     body?: any;
     expectedStatus?: number;
+    expectedBehavior?: string;
     userId: string;
     chatSessionId?: string;
     projectId?: string;
@@ -48,11 +49,19 @@ export async function executeApiAgentTestFlow(
     headers,
     body,
     expectedStatus,
+    expectedBehavior,
     userId,
     chatSessionId,
     projectId,
     userMessage,
   } = params;
+
+  // If UI didn't provide explicit expectedBehavior, fallback to a trimmed user message.
+  // This keeps expectation validation working for "verify X in response" prompts.
+  const expectedBehaviorFallback =
+    !expectedBehavior || expectedBehavior.trim().length === 0
+      ? (userMessage || '').trim().slice(0, 800) || undefined
+      : expectedBehavior;
 
   logger.info('[API_AGENT_FLOW] Starting agent test flow', {
     level,
@@ -127,6 +136,7 @@ export async function executeApiAgentTestFlow(
       headers,
       body,
       expectedStatus,
+      expectedBehavior: expectedBehaviorFallback,
       userId,
       chatSessionId,
       projectId,
@@ -310,7 +320,14 @@ function formatAgentResponse(response: ApiAgentResponse): string {
 
   message += `**Endpoint:** \`${summary.method}\` ${summary.url}\n`;
   message += `**Duration:** ${summary.durationMs}ms | **Steps:** ${summary.stepsExecuted}\n`;
-  message += `**Security Score:** ${summary.securityScore}/10\n\n`;
+  message += `**Security Score:** ${summary.securityScore}/10\n`;
+  if (summary.finalVerdict) {
+    message += `**Verdict:** ${summary.finalVerdict}\n`;
+  }
+  if (typeof summary.expectationSatisfied === 'boolean') {
+    message += `**Expectation:** ${summary.expectationSatisfied ? 'satisfied' : 'violated'}\n`;
+  }
+  message += '\n';
 
   // Findings summary
   const totalFindings =

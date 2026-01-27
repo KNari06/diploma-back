@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 import { ApiTestStorageService } from './api-test-storage.service';
 
 export interface ApiTestHistoryItem {
@@ -308,6 +309,62 @@ export class ApiTestHistoryService {
     data: ApiTestDetails | null;
   }> {
     try {
+      // Fast path: allow fetching by executionId (UUID) directly.
+      // This makes GET /api-test/:id work for both list.id (executionId) and list.testId.
+      if (isValidUUID(testId)) {
+        const execution = await ApiTestStorageService.getApiTestExecution(testId, userId);
+        if (!execution) {
+          return { success: true, data: null };
+        }
+
+        const fuzzingData = execution.validation_results?.fuzzing;
+
+        const details: ApiTestDetails = {
+          id: execution.id,
+          testId: testId,
+          method: execution.request_data?.method || 'GET',
+          url: execution.request_data?.url || '',
+          status: execution.status_code || 0,
+          statusText: execution.response_data?.statusText || '',
+          durationMs: execution.duration_ms || 0,
+          success: execution.success !== false,
+          executedAt: execution.executed_at,
+          chatSessionId: execution.chat_session_id || '',
+          request: {
+            method: execution.request_data?.method || 'GET',
+            url: execution.request_data?.url || '',
+            headers: execution.request_data?.headers || {},
+            body: execution.request_data?.body,
+          },
+          response: {
+            status: execution.response_data?.status || 0,
+            statusText: execution.response_data?.statusText || '',
+            headers: execution.response_data?.headers || {},
+            body: execution.response_data?.body,
+          },
+          metadata: {
+            testType: execution.validation_results?.testType || 'api',
+            is_test_runned: execution.success !== false,
+            fuzzingReport: fuzzingData
+              ? {
+                  summary: fuzzingData.summary,
+                  issues: fuzzingData.issues || [],
+                  securityScore: fuzzingData.securityScore,
+                  hadFollowOn: fuzzingData.hadFollowOn,
+                  phases: fuzzingData.phases,
+                }
+              : undefined,
+          },
+          chatMessage: {
+            id: '',
+            content: '',
+            created_at: execution.executed_at,
+          },
+        };
+
+        return { success: true, data: details };
+      }
+
       // ═══════════════════════════════════════════════════════════════════
       // STEP 1: Try to find in api_test_executions by chat_session_id + testId pattern
       // ═══════════════════════════════════════════════════════════════════

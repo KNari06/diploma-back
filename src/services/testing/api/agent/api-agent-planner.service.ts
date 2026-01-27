@@ -12,6 +12,7 @@ import type {
   ApiAgentPlannedStep,
   ApiAgentStepType,
   ApiAgentRequest,
+  ApiAgentStopReason,
 } from './api-agent.types';
 import { getAllowedStepTypes, checkSafetyGate } from './api-agent-policy';
 
@@ -31,29 +32,32 @@ export class ApiAgentPlannerService {
   ): Promise<{ decision: ApiAgentAIDecision; tokensUsed: number }> {
     const allowedStepTypes = getAllowedStepTypes(policy.level);
 
-    // Rule-based planning for initial steps (saves AI tokens)
-    const ruleBasedDecision = this.tryRuleBasedPlanning(request, state, policy, allowedStepTypes);
-    if (ruleBasedDecision) {
-      return { decision: ruleBasedDecision, tokensUsed: 0 };
-    }
-
-    // AI-based planning for complex decisions
-    return this.aiBasedPlanning(request, state, policy, allowedStepTypes);
+    // AI-driven on all levels:
+    // - deterministic logic only provides a suggestedNextStep to guide the model
+    // - AI is still invoked iteratively to confirm/adjust the plan based on results
+    const suggestion = this.getSuggestedNextStep(request, state, policy, allowedStepTypes);
+    return this.aiBasedPlanning(request, state, policy, allowedStepTypes, suggestion);
   }
 
   /**
-   * Rule-based planning for predictable steps
+   * Deterministic suggestions for predictable steps
+   * (Used as a hint for the AI planner, not as a bypass.)
    */
-  private static tryRuleBasedPlanning(
+  private static getSuggestedNextStep(
     request: ApiAgentRequest,
     state: ApiAgentRunState,
     policy: ApiAgentLevelPolicy,
     allowedStepTypes: ApiAgentStepType[]
-  ): ApiAgentAIDecision | null {
+  ): {
+    suggestedNextStep: ApiAgentPlannedStep | null;
+    suggestedShouldStop?: boolean;
+    suggestedStopReason?: ApiAgentStopReason;
+    suggestedReasoning?: string;
+  } {
     // Step 0: Always start with happy path
     if (state.consumed.steps === 0) {
       return {
-        nextStep: {
+        suggestedNextStep: {
           stepType: 'happy_path',
           description: `Execute ${request.method} ${request.url} with provided data`,
           request: {
@@ -65,9 +69,8 @@ export class ApiAgentPlannerService {
           expectedOutcome: `Expect ${request.expectedStatus || 200} response`,
           riskLevel: 'safe',
         },
-        reasoning: 'Starting with happy path test',
-        shouldStop: false,
-        noveltyEstimate: 1.0,
+        suggestedShouldStop: false,
+        suggestedReasoning: 'Starting with happy path test',
       };
     }
 
@@ -88,7 +91,7 @@ export class ApiAgentPlannerService {
       if (methodsToTest.length > 0) {
         const nextMethod = methodsToTest[0];
         return {
-          nextStep: {
+          suggestedNextStep: {
             stepType: 'method_contract',
             description: `Test ${nextMethod} method on endpoint (expect 405/4xx)`,
             request: {
@@ -99,9 +102,8 @@ export class ApiAgentPlannerService {
             expectedOutcome: 'Expect 405 Method Not Allowed or 4xx error',
             riskLevel: nextMethod === 'GET' ? 'safe' : 'low',
           },
-          reasoning: `Testing method contract for ${nextMethod}`,
-          shouldStop: false,
-          noveltyEstimate: state.novelty,
+          suggestedShouldStop: false,
+          suggestedReasoning: `Testing method contract for ${nextMethod}`,
         };
       }
     }
@@ -109,16 +111,61 @@ export class ApiAgentPlannerService {
     // For LIGHT level: stop after method contracts
     if (policy.level === 'light' && methodContractDone) {
       return {
-        nextStep: null,
-        reasoning: 'LIGHT level complete: happy path + method contracts done',
-        shouldStop: true,
-        stopReason: 'completed',
-        noveltyEstimate: state.novelty,
+        suggestedNextStep: null,
+        suggestedShouldStop: true,
+        suggestedStopReason: 'completed',
+        suggestedReasoning: 'LIGHT level complete: happy path + method contracts done',
       };
     }
 
-    // For MEDIUM/HARD: continue with AI-based planning
-    return null;
+    // MEDIUM/HARD: suggest parameter probing via negative_case (one probe at a time)
+    // This is a hint only; AI still decides whether to execute it.
+    if (policy.level !== 'light' && allowedStepTypes.includes('negative_case') && happyPathDone) {
+      const baseUrl = request.url;
+      const tried = new Set(
+        state.steps
+          .filter((s) => s.stepType === 'negative_case')
+          .map((s) => s.request.url)
+      );
+
+      const probes = [
+        { key: 'page', value: '-1' },
+        { key: 'limit', value: '100000' },
+        { key: 'limit', value: '-1' },
+        { key: 'unexpected', value: 'true' },
+      ];
+
+      for (const p of probes) {
+        try {
+          const u = new URL(baseUrl);
+          u.searchParams.set(p.key, p.value);
+          const probeUrl = u.toString();
+          if (!tried.has(probeUrl)) {
+            return {
+              suggestedNextStep: {
+                stepType: 'negative_case',
+                description: `Probe invalid/edge parameter: ${p.key}=${p.value} (expect controlled 4xx)`,
+                request: {
+                  method: request.method,
+                  url: probeUrl,
+                  headers: request.headers,
+                  body: request.body,
+                },
+                expectedOutcome: 'Expect controlled 4xx (not 5xx/timeout)',
+                riskLevel: 'low',
+              },
+              suggestedShouldStop: false,
+              suggestedReasoning: 'Parameter probing to detect invalid input handling issues',
+            };
+          }
+        } catch {
+          // If URL parsing fails, skip probing suggestions
+          break;
+        }
+      }
+    }
+
+    return { suggestedNextStep: null };
   }
 
   /**
@@ -128,9 +175,15 @@ export class ApiAgentPlannerService {
     request: ApiAgentRequest,
     state: ApiAgentRunState,
     policy: ApiAgentLevelPolicy,
-    allowedStepTypes: ApiAgentStepType[]
+    allowedStepTypes: ApiAgentStepType[],
+    suggestion?: {
+      suggestedNextStep: ApiAgentPlannedStep | null;
+      suggestedShouldStop?: boolean;
+      suggestedStopReason?: ApiAgentStopReason;
+      suggestedReasoning?: string;
+    }
   ): Promise<{ decision: ApiAgentAIDecision; tokensUsed: number }> {
-    const prompt = this.buildPlanningPrompt(request, state, policy, allowedStepTypes);
+    const prompt = this.buildPlanningPrompt(request, state, policy, allowedStepTypes, suggestion);
 
     try {
       const response = await getChatCompletionWithMessages(
@@ -146,6 +199,7 @@ export class ApiAgentPlannerService {
         ],
         {
           temperature: 0.3,
+          max_tokens: policy.level === 'light' ? 650 : 1000,
           response_format: { type: 'json_object' },
           model: 'gpt-4o-mini', // Cost-effective for planning
         }
@@ -156,6 +210,21 @@ export class ApiAgentPlannerService {
 
       // Validate and build decision
       const decision = this.parseAIResponse(parsed, request, state, policy);
+
+      // LIGHT guardrail: if deterministic suggestion says stop, do not allow AI to continue.
+      // We still call AI to keep the loop AI-driven, but we enforce bounded LIGHT behavior.
+      if (policy.level === 'light' && suggestion?.suggestedShouldStop === true) {
+        return {
+          decision: {
+            nextStep: null,
+            reasoning: `LIGHT level complete. AI reasoning: ${decision.reasoning}`.trim(),
+            shouldStop: true,
+            stopReason: suggestion.suggestedStopReason || 'completed',
+            noveltyEstimate: decision.noveltyEstimate,
+          },
+          tokensUsed,
+        };
+      }
 
       logger.debug('[API_AGENT_PLANNER] AI planning complete', {
         tokensUsed,
@@ -190,7 +259,13 @@ export class ApiAgentPlannerService {
     request: ApiAgentRequest,
     state: ApiAgentRunState,
     policy: ApiAgentLevelPolicy,
-    allowedStepTypes: ApiAgentStepType[]
+    allowedStepTypes: ApiAgentStepType[],
+    suggestion?: {
+      suggestedNextStep: ApiAgentPlannedStep | null;
+      suggestedShouldStop?: boolean;
+      suggestedStopReason?: ApiAgentStopReason;
+      suggestedReasoning?: string;
+    }
   ): string {
     const recentSteps = state.steps.slice(-5).map((s) => ({
       type: s.stepType,
@@ -205,6 +280,19 @@ export class ApiAgentPlannerService {
       severity: f.severity,
       title: f.title,
     }));
+
+    const suggestedBlock = suggestion
+      ? `\n## Suggested Next Step (deterministic hint)\n${JSON.stringify(
+          {
+            suggestedNextStep: suggestion.suggestedNextStep,
+            suggestedShouldStop: suggestion.suggestedShouldStop,
+            suggestedStopReason: suggestion.suggestedStopReason,
+            suggestedReasoning: suggestion.suggestedReasoning,
+          },
+          null,
+          2
+        )}\n`
+      : '';
 
     return `## Current State
 - Level: ${policy.level}
@@ -228,8 +316,12 @@ ${JSON.stringify(findingsSummary, null, 2)}
 - Known IDs: ${state.knownIds.slice(0, 5).join(', ') || 'none'}
 - Schema inferred: ${state.inferredSchema ? 'yes' : 'no'}
 
+## Expectation Model
+${state.expectationModel ? JSON.stringify(state.expectationModel, null, 2) : 'none'}
+
 ## Allowed Step Types for ${policy.level}
 ${allowedStepTypes.join(', ')}
+${suggestedBlock}
 
 ## Task
 Decide the next step to execute. Consider:

@@ -4,12 +4,12 @@
  */
 
 import type {
+  ApiAgentBudget,
   ApiAgentLevel,
   ApiAgentLevelPolicy,
-  ApiAgentBudget,
+  ApiAgentStepType,
   SafetyGateContext,
   SafetyGateResult,
-  ApiAgentStepType,
 } from './api-agent.types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -19,21 +19,21 @@ import type {
 const LIGHT_BUDGET: ApiAgentBudget = {
   maxSteps: 8,
   maxSeconds: 60,
-  maxAiTokens: 5000,
+  maxAiTokens: 15000,
   maxEndpointsConsidered: 1,
 };
 
 const MEDIUM_BUDGET: ApiAgentBudget = {
   maxSteps: 20,
   maxSeconds: 180,
-  maxAiTokens: 15000,
+  maxAiTokens: 35000,
   maxEndpointsConsidered: 5,
 };
 
 const HARD_BUDGET: ApiAgentBudget = {
   maxSteps: 35,
   maxSeconds: 300,
-  maxAiTokens: 30000,
+  maxAiTokens: 50000,
   maxEndpointsConsidered: 5,
 };
 
@@ -197,6 +197,12 @@ export function checkSafetyGate(context: SafetyGateContext): SafetyGateResult {
 
   // Gate 2: Mutation methods on production-looking hosts
   if (MUTATION_METHODS.includes(method.toUpperCase())) {
+    // Method contract probing is allowed at all levels (it is designed to expect 405/4xx).
+    // We still rely on other guards (SSRF protection in executeApiTest) and budgets.
+    if (stepType === 'method_contract') {
+      return { allowed: true };
+    }
+
     if (!policy.allowMutations) {
       return {
         allowed: false,

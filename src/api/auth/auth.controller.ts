@@ -160,6 +160,7 @@ export const completeOAuthHandler = async (req: Request, res: Response): Promise
       oauthCompleteRateLimit.set(ip, entry);
       if (entry.count > OAUTH_COMPLETE_RATE_LIMIT_MAX) {
         const retryAfterSec = Math.ceil((OAUTH_COMPLETE_RATE_LIMIT_WINDOW_MS - (now - entry.windowStart)) / 1000);
+        res.setHeader('Retry-After', String(retryAfterSec));
         res.status(429).json({
           success: false,
           error: 'Too many requests',
@@ -310,7 +311,21 @@ export const completeOAuthHandler = async (req: Request, res: Response): Promise
  */
 export const logout = async (req: Request, res: Response): Promise<void> => {
   try {
-    await signOut();
+    const authHeader = req.headers.authorization;
+    const accessToken =
+      authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+        ? authHeader.replace('Bearer ', '').trim()
+        : '';
+
+    if (!accessToken) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized: No token provided',
+      });
+      return;
+    }
+
+    await signOut(accessToken);
 
     res.json({
       success: true,
@@ -318,7 +333,7 @@ export const logout = async (req: Request, res: Response): Promise<void> => {
     });
   } catch (error: any) {
     logger.error('Logout error', error);
-    res.status(400).json({
+    res.status(401).json({
       success: false,
       error: error.message || 'Logout failed',
     });

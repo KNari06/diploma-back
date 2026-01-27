@@ -52,6 +52,8 @@ export interface ApiAgentRequest {
   body?: any;
   /** Expected status code (default inferred from method) */
   expectedStatus?: number;
+  /** User expectation / expected behavior (free-text or JSON string) */
+  expectedBehavior?: string;
   /** Optional budget overrides */
   budgetOverrides?: Partial<ApiAgentBudget>;
   /** User ID (for billing/storage) */
@@ -62,6 +64,24 @@ export interface ApiAgentRequest {
   projectId?: string;
   /** User's original message/intent */
   userMessage?: string;
+}
+
+export type ApiAgentExpectationResponseType = 'list' | 'object' | 'primitive' | 'unknown';
+
+/**
+ * Normalized expectation model derived from user's expectedBehavior (text or JSON).
+ * This model is used for deterministic validation and as context for AI planning.
+ */
+export interface ApiAgentExpectationModel {
+  responseType?: ApiAgentExpectationResponseType;
+  entity?: string;
+  allowedMethods?: string[];
+  requiredFields?: string[];
+  /**
+   * High-level invariants (can be used by deterministic checks and/or AI judge hints).
+   * Examples: "non_empty_list", "unique_id", "pagination_stable"
+   */
+  invariants?: string[];
 }
 
 export interface ApiAgentStepResult {
@@ -121,6 +141,10 @@ export type ApiAgentFindingType =
   | 'unexpected_status'
   | 'schema_mismatch'
   | 'validation_bypass'
+  | 'network_error'
+  | 'invalid_method_handling'
+  | 'expectation_violation'
+  | 'invalid_input_handling'
   | 'security_issue'
   | 'performance_anomaly'
   | 'consistency_error'
@@ -161,6 +185,9 @@ export interface ApiAgentRunState {
   };
   /** Stop reason if stopped early */
   stopReason?: ApiAgentStopReason;
+
+  /** Parsed expectation model (derived once per run from request.expectedBehavior) */
+  expectationModel?: ApiAgentExpectationModel;
 }
 
 export type ApiAgentStopReason =
@@ -207,6 +234,11 @@ export interface ApiAgentSummary {
   aiTokensUsed: number;
   /** Trace log reference */
   traceLogPath?: string;
+
+  /** Whether the agent considers the expectation satisfied */
+  expectationSatisfied?: boolean;
+  /** Single source-of-truth final verdict */
+  finalVerdict?: 'pass' | 'pass_with_risks' | 'fail';
 }
 
 export interface ApiAgentResponse {

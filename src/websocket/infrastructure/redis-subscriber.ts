@@ -152,6 +152,12 @@ class WebSocketRedisSubscriber {
           }
           break;
 
+        case 'api:agent:step':
+          if (target?.sessionId || payload.sessionId) {
+            wsService.emitApiAgentStep(target?.sessionId || payload.sessionId, payload);
+          }
+          break;
+
         // ✅ FIX #4: Removed duplicate 'test:progress' case
         // This case was already handled above in test lifecycle events (line 70-72)
         // Keeping only the first occurrence to avoid dead code

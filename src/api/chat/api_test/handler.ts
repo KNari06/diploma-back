@@ -129,6 +129,7 @@ export async function handleApiTest(
         headers: parsedIntent.apiHeaders,
         body: parsedIntent.apiBody,
         expectedStatus: parsedIntent.expectedStatus,
+        expectedBehavior: parsedIntent.expectedBehavior || parsedIntent?.metadata?.expectedBehavior,
         userId,
         chatSessionId,
         projectId: workspace_id,

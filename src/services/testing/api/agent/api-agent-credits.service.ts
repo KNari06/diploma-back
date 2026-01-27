@@ -206,9 +206,10 @@ export class ApiAgentCreditsService {
 
     // Estimate max based on typical AI token usage per level
     const estimatedTokens: Record<ApiAgentLevel, number> = {
-      light: 3000, // Minimal AI usage
-      medium: 10000, // Moderate AI usage
-      hard: 25000, // Heavy AI usage
+      // With always-AI planning, LIGHT now uses more tokens than the old rule-based bootstrap.
+      light: 7000,
+      medium: 15000,
+      hard: 30000,
     };
 
     const maxTokens = estimatedTokens[level];

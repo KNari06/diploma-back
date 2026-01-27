@@ -27,6 +27,33 @@ const CORRELATION_ID_HEADER = 'x-qai-correlation-id';
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class ApiAgentStepExecutorService {
+  private static isTimeoutError(error?: string): boolean {
+    return (error || '').toLowerCase().includes('timeout');
+  }
+
+  private static isNetworkUnreachableError(error?: string): boolean {
+    const e = (error || '').toLowerCase();
+    if (!e) return false;
+    if (this.isTimeoutError(error)) return false;
+
+    // Common network/DNS/socket errors (axios/node/fetch variants)
+    const patterns = [
+      'network error',
+      'unable to reach server',
+      'getaddrinfo enotfound',
+      'enotfound',
+      'econnrefused',
+      'econnreset',
+      'socket hang up',
+      'fetch failed',
+      'failed to fetch',
+      'connection refused',
+      'connection reset',
+      'dns',
+    ];
+    return patterns.some((p) => e.includes(p));
+  }
+
   /**
    * Execute a single planned step
    */
@@ -84,7 +111,7 @@ export class ApiAgentStepExecutorService {
         stepId,
         success: result.success,
         status: result.status,
-        findingsCount: findings.length,
+        baseFindingsCount: findings.length,
       });
 
       return stepResult;
@@ -252,6 +279,21 @@ export class ApiAgentStepExecutorService {
     const findings: ApiAgentFinding[] = [];
     const findingId = () => `finding_${Date.now()}_${Math.random().toString(36).substring(7)}`;
 
+    // Network failures (status=0 from executeApiTest)
+    if (result.status === 0 && this.isNetworkUnreachableError(result.error)) {
+      findings.push({
+        id: findingId(),
+        type: 'network_error',
+        severity: 'high',
+        title: 'Network error',
+        description: result.error || 'Network error - unable to reach server',
+        evidence: {
+          request: step.request,
+        },
+        recommendation: 'Verify host availability, DNS, firewall rules, and request routing',
+      });
+    }
+
     // Check for server errors (5xx)
     if (result.status >= 500) {
       findings.push({
@@ -280,7 +322,7 @@ export class ApiAgentStepExecutorService {
           description: `Endpoint responded with ${result.status} for ${step.request.method} method`,
           evidence: { request: step.request, response: { status: result.status } },
         });
-      } else if (result.status !== 405 && result.status < 400) {
+      } else if (result.status > 0 && result.status !== 405 && result.status < 400) {
         // Not 405 and not an error - unusual
         findings.push({
           id: findingId(),

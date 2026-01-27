@@ -5,8 +5,11 @@
 
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import type { ApiAgentStepPayload } from '@/websocket/types/types';
 import { randomUUID } from 'crypto';
 import { ApiAgentEvaluatorService } from './api-agent-evaluator.service';
+import { ApiAgentExpectationService } from './api-agent-expectation.service';
+import { ApiAgentExpectationValidatorService } from './api-agent-expectation-validator.service';
 import { ApiAgentPlannerService } from './api-agent-planner.service';
 import {
   getBaselineCredits,
@@ -85,6 +88,16 @@ export class ApiAgentOrchestratorService {
     this.emitProgress(request.chatSessionId, 'Starting API agent test...', 0);
 
     try {
+      // Interpretation stage: build expectation model once per run (JSON-first, 1 AI fallback)
+      if (request.expectedBehavior) {
+        const maxTokens = policy.level === 'light' ? 250 : 350;
+        const { model, tokensUsed } = await ApiAgentExpectationService.buildExpectationModel(request, {
+          maxTokens,
+        });
+        state.expectationModel = model || undefined;
+        addAiTokens(state, tokensUsed);
+      }
+
       // Main execution loop with trace service
       await this.executeLoop(request, state, policy, startTime, traceService);
 
@@ -205,7 +218,7 @@ export class ApiAgentOrchestratorService {
       traceService.writeStepPlanning(state.consumed.steps, decision);
 
       // Check if AI decided to stop
-      if (decision.shouldStop || !decision.nextStep) {
+      if (decision.shouldStop) {
         logger.info('[API_AGENT] Planner decided to stop', {
           reason: decision.reasoning,
           stopReason: decision.stopReason,
@@ -213,6 +226,30 @@ export class ApiAgentOrchestratorService {
         markStopped(state, decision.stopReason || 'completed');
         return;
       }
+
+      // If AI produced no actionable nextStep (e.g., safety gate blocked), continue planning.
+      // This prevents premature termination when shouldStop=false but nextStep=null.
+      if (!decision.nextStep) {
+        logger.info('[API_AGENT] Planner returned no nextStep, retrying planning', {
+          reason: decision.reasoning,
+        });
+        continue;
+      }
+
+      // Emit planning step to frontend (only for real nextStep)
+      this.emitStepEvent(request.chatSessionId, state.testId, state.runId, {
+        stepIndex: state.consumed.steps,
+        stepType: decision.nextStep.stepType,
+        stage: 'planning',
+        description: decision.nextStep.description,
+        expectedOutcome: decision.nextStep.expectedOutcome,
+        reasoning: decision.reasoning,
+        noveltyEstimate: decision.noveltyEstimate,
+        riskLevel: decision.nextStep.riskLevel,
+        novelty: state.novelty,
+        totalFindings: state.findings.length,
+        aiTokensUsed: tokensUsed,
+      });
 
       // EXECUTE: Run the planned step
       this.emitProgress(
@@ -223,6 +260,25 @@ export class ApiAgentOrchestratorService {
 
       // Write step start to trace
       traceService.writeStepStart(state.consumed.steps, decision.nextStep);
+
+      // Emit executing step to frontend
+      this.emitStepEvent(request.chatSessionId, state.testId, state.runId, {
+        stepIndex: state.consumed.steps,
+        stepType: decision.nextStep.stepType,
+        stage: 'executing',
+        description: decision.nextStep.description,
+        expectedOutcome: decision.nextStep.expectedOutcome,
+        request: {
+          method: decision.nextStep.request.method,
+          url: decision.nextStep.request.url,
+          headers: this.redactHeadersForUi(decision.nextStep.request.headers),
+          bodyPreview: this.toPreview(decision.nextStep.request.body),
+        },
+        riskLevel: decision.nextStep.riskLevel,
+        novelty: state.novelty,
+        totalFindings: state.findings.length,
+        aiTokensUsed: tokensUsed,
+      });
 
       // Execute with automatic retry on high-risk signals (HARD policy)
       // Requirement: if 5xx/high-risk → re-attack 3–5 times (bounded by policy.maxRetryOnHighRisk)
@@ -256,6 +312,19 @@ export class ApiAgentOrchestratorService {
       // Update step with AI tokens from planning
       stepResult.aiTokensUsed = tokensUsed;
 
+      // Expectation-driven validator (adds additional findings, severity assigned by code)
+      if (state.expectationModel || request.expectedBehavior) {
+        const extra = ApiAgentExpectationValidatorService.validateStep({
+          plannedStep: decision.nextStep,
+          stepResult,
+          expectationModel: state.expectationModel,
+          expectedBehaviorRaw: request.expectedBehavior,
+        });
+        if (extra.findings.length > 0) {
+          stepResult.findings.push(...extra.findings);
+        }
+      }
+
       // Write step result to trace
       traceService.writeStepResult(state.consumed.steps, stepResult);
 
@@ -268,11 +337,90 @@ export class ApiAgentOrchestratorService {
       // Write state update to trace
       traceService.writeStateUpdate(state);
 
+      // Emit completed step to frontend
+      const completedIndex = state.steps.length - 1;
+      const correlationIdHeader = 'x-qai-correlation-id';
+      const correlationId =
+        stepResult.request?.headers?.[correlationIdHeader] ||
+        stepResult.request?.headers?.[correlationIdHeader.toLowerCase()] ||
+        undefined;
+
+      const httpOk = stepResult.success;
+      const status = stepResult.response?.status ?? 0;
+      const bugFindingTypes = new Set([
+        'invalid_method_handling',
+        'invalid_input_handling',
+        'expectation_violation',
+        'validation_bypass',
+        'schema_mismatch',
+        'network_error',
+        'server_error',
+      ]);
+      const hasBugFinding = stepResult.findings.some((f) => bugFindingTypes.has(f.type as any));
+      const hasTimeout = (stepResult.error || '').toLowerCase().includes('timeout');
+      const isBug =
+        hasBugFinding ||
+        hasTimeout ||
+        status === 0 ||
+        status >= 500 ||
+        (decision.nextStep.stepType === 'happy_path' && status >= 400);
+
+      const isExpectedErrorStep =
+        decision.nextStep.stepType === 'method_contract' || decision.nextStep.stepType === 'negative_case';
+      const isExpectedError = isExpectedErrorStep && status >= 400 && status < 500 && !isBug;
+      const stepVerdict: 'pass' | 'expected_error' | 'bug' = isBug ? 'bug' : isExpectedError ? 'expected_error' : 'pass';
+
+      this.emitStepEvent(request.chatSessionId, state.testId, state.runId, {
+        stepIndex: Math.max(0, completedIndex),
+        stepType: stepResult.stepType,
+        stage: 'completed',
+        description: stepResult.description,
+        expectedOutcome: decision.nextStep.expectedOutcome,
+        summary: stepResult.response
+          ? `${stepResult.response.status} ${stepResult.response.statusText}`.trim()
+          : (stepResult.error || 'No response'),
+        // `success` for UI: expected 4xx should not render as failure
+        success: stepVerdict !== 'bug',
+        httpOk,
+        stepVerdict,
+        isBug,
+        error: stepResult.error,
+        response: stepResult.response
+          ? {
+              status: stepResult.response.status,
+              statusText: stepResult.response.statusText,
+              durationMs: stepResult.response.durationMs,
+              bodyPreview: this.toPreview(stepResult.response.body),
+            }
+          : undefined,
+        findingsCount: stepResult.findings.length,
+        findings: stepResult.findings.slice(0, 5).map((f) => ({
+          severity: f.severity,
+          title: f.title,
+          type: f.type,
+        })),
+        novelty: state.novelty,
+        totalFindings: state.findings.length,
+        aiTokensUsed: stepResult.aiTokensUsed,
+        isRetry: execResult.retryCount > 0,
+        retryAttempt: execResult.retryCount,
+        maxRetries: policy.maxRetryOnHighRisk,
+        request: correlationId
+          ? {
+              method: stepResult.request.method,
+              url: stepResult.request.url,
+              headers: this.redactHeadersForUi(stepResult.request.headers),
+              bodyPreview: this.toPreview(stepResult.request.body),
+              correlationId,
+            }
+          : undefined,
+      });
+
       logger.debug('[API_AGENT] Step completed', {
         stepId: stepResult.stepId,
         success: stepResult.success,
         novelty: state.novelty,
-        findingsAdded: stepResult.findings.length,
+        totalFindings: stepResult.findings.length,
       });
     }
 
@@ -288,6 +436,23 @@ export class ApiAgentOrchestratorService {
     const findingsCounts = getFindingsCounts(state);
     const topFindings = getTopFindings(state, 5);
     const securityScore = ApiAgentEvaluatorService.computeSecurityScore(state);
+    const hasExpectedBehavior = !!request.expectedBehavior && request.expectedBehavior.trim().length > 0;
+    const expectationSatisfied = !state.findings.some((f) => f.type === 'expectation_violation');
+
+    const hasFailingExpectation =
+      state.findings.some((f) => f.type === 'expectation_violation') ||
+      state.findings.some((f) => f.type === 'invalid_method_handling') ||
+      state.findings.some((f) => f.type === 'invalid_input_handling');
+
+    const hasHighOrCritical = state.findings.some((f) => f.severity === 'high' || f.severity === 'critical');
+    const hasMedium = state.findings.some((f) => f.severity === 'medium');
+
+    const finalVerdict: 'pass' | 'pass_with_risks' | 'fail' =
+      (hasExpectedBehavior && !expectationSatisfied) || hasFailingExpectation || hasHighOrCritical
+        ? 'fail'
+        : hasMedium
+          ? 'pass_with_risks'
+          : 'pass';
 
     return {
       level: state.level,
@@ -305,6 +470,8 @@ export class ApiAgentOrchestratorService {
       stopReason: state.stopReason || 'completed',
       creditsCharged: getBaselineCredits(state.level), // Base, incremental added later
       aiTokensUsed: state.consumed.aiTokens,
+      expectationSatisfied: hasExpectedBehavior ? expectationSatisfied : undefined,
+      finalVerdict,
     };
   }
 
@@ -358,6 +525,58 @@ export class ApiAgentOrchestratorService {
       step: 'executing_test',
       message,
       progress,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private static toPreview(value: unknown, maxLen: number = 200): string | undefined {
+    if (value === null || value === undefined) return undefined;
+    try {
+      const str = typeof value === 'string' ? value : JSON.stringify(value);
+      return str.length > maxLen ? `${str.slice(0, maxLen)}...` : str;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private static redactHeadersForUi(
+    headers?: Record<string, string>
+  ): Record<string, string> | undefined {
+    if (!headers) return undefined;
+
+    const redactedKeys = new Set([
+      'authorization',
+      'cookie',
+      'set-cookie',
+      'x-api-key',
+      'api-key',
+      'x-auth-token',
+    ]);
+
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(headers)) {
+      const lower = k.toLowerCase();
+      out[k] = redactedKeys.has(lower) ? '[REDACTED]' : v;
+    }
+    return out;
+  }
+
+  /**
+   * Emit detailed API agent step event via WebSocket (for frontend step cards)
+   */
+  private static emitStepEvent(
+    chatSessionId: string | undefined,
+    testId: string,
+    runId: string,
+    payload: Omit<ApiAgentStepPayload, 'testId' | 'runId' | 'sessionId' | 'timestamp'>
+  ): void {
+    if (!chatSessionId) return;
+
+    webSocketService.emitApiAgentStep(chatSessionId, {
+      ...payload,
+      testId,
+      runId,
+      sessionId: chatSessionId,
       timestamp: new Date().toISOString(),
     });
   }

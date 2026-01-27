@@ -74,6 +74,7 @@ export interface ServerToClientEvents {
   'chat:message': (data: ChatMessagePayload) => void;
   'chat:test:update': (data: ChatTestUpdatePayload) => void;
   'chat:processing:step': (data: ChatProcessingStepPayload) => void;
+  'api:agent:step': (data: ApiAgentStepPayload) => void;
 
   // System events
   'system:error': (data: SystemErrorPayload) => void;
@@ -503,6 +504,70 @@ export interface ChatProcessingStepPayload {
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;
+  timestamp: string;
+}
+
+export interface ApiAgentStepPayload {
+  testId: string;
+  runId: string;
+  sessionId: string;
+  stepIndex: number;
+  stepType: string;
+  stage: 'planning' | 'executing' | 'completed';
+
+  /** Human-readable description of the real step being executed */
+  description?: string;
+  /** Human-readable expected outcome for this step */
+  expectedOutcome?: string;
+  /** Optional short summary for UI cards */
+  summary?: string;
+
+  // Planning stage
+  reasoning?: string;
+  shouldStop?: boolean;
+  stopReason?: string;
+  noveltyEstimate?: number;
+  riskLevel?: 'safe' | 'low' | 'medium' | 'high';
+
+  // Executing stage
+  request?: {
+    method: string;
+    url: string;
+    headers?: Record<string, string>;
+    bodyPreview?: string;
+    correlationId?: string;
+  };
+  isRetry?: boolean;
+  retryAttempt?: number;
+  maxRetries?: number;
+
+  // Completed stage
+  success?: boolean;
+  /** Raw HTTP ok flag (response.ok). Useful to differentiate expected 4xx from real bugs. */
+  httpOk?: boolean;
+  /** Step-level verdict for UI: pass | expected_error | bug */
+  stepVerdict?: 'pass' | 'expected_error' | 'bug';
+  /** Convenience flag: true when stepVerdict === 'bug' */
+  isBug?: boolean;
+  error?: string;
+  response?: {
+    status: number;
+    statusText: string;
+    durationMs: number;
+    bodyPreview?: string;
+  };
+  findingsCount?: number;
+  findings?: Array<{
+    severity: string;
+    title: string;
+    type: string;
+  }>;
+
+  // State updates (all stages)
+  novelty?: number;
+  totalFindings?: number;
+  aiTokensUsed?: number;
+
   timestamp: string;
 }
 

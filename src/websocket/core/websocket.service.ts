@@ -15,6 +15,7 @@ import {
   AIAnalysisProgressPayload,
   AIAnalysisStartedPayload,
   AIBugFoundPayload,
+  ApiAgentStepPayload,
   ChatMessagePayload,
   ChatTestUpdatePayload,
   createRoomName,
@@ -820,6 +821,28 @@ class WebSocketService {
       return;
     }
     this.emitToChat(sessionId, 'chat:processing:step', payload);
+  }
+
+  /**
+   * Emit API agent step update to chat room
+   * Used for detailed step-by-step visualization in frontend
+   */
+  public emitApiAgentStep(sessionId: string, payload: ApiAgentStepPayload): void {
+    if (!this.isReady()) {
+      logger.debug('[WebSocketService] Using Redis Pub/Sub fallback for emitApiAgentStep (worker process)', {
+        sessionId,
+        stage: payload.stage,
+      });
+      redisWebSocketBridge.publishEvent('api:agent:step', payload, { sessionId }).catch((error) => {
+        logger.error('[WebSocketService] Failed to publish api:agent:step to Redis', {
+          sessionId,
+          stage: payload.stage,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return;
+    }
+    this.emitToChat(sessionId, 'api:agent:step', payload);
   }
 
   // ============================================================================

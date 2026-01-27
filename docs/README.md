@@ -24,6 +24,7 @@
 - [**API Reference**](./api/README.md) - полная документация API
 - [**Примеры использования**](./api/examples.md) - практические примеры
 - [**Аутентификация**](./api/authentication.md) - работа с токенами и ключами
+- [**API Agent тесты по уровням (LIGHT/MEDIUM/HARD)**](./api/API_AGENT_TEST_LEVELS.md) - как работает агентское API тестирование и чем отличаются уровни
 - [**Multi-Chat Sessions**](./api/multi-chat-sessions.md) - ✨ NEW! Мультичат как в ChatGPT
 - [**Playwright API**](./api/playwright.md) - загрузка trace файлов
 - [**Real-Time Graph Visualization**](./api/real-time-graph-visualization.md) - ✨ NEW! Потоковая визуализация тестов в режиме реального времени
