@@ -74,12 +74,16 @@ export function emitInputSuccess(
 /**
  * Emit preview:page snapshot to caller + subscribers
  * Used after input actions that may have changed the page
+ * @param options.forceEmit - If true, always emit even if change-detection says unchanged (for clicks etc.)
  */
 export async function emitSnapshotIfChanged(
   socket: TypedSocket,
   previewSessionId: string,
-  userId: string
+  userId: string,
+  options?: { forceEmit?: boolean }
 ): Promise<void> {
+  const forceEmit = options?.forceEmit ?? false;
+
   try {
     const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
     const sessionService = getPreviewSessionService();
@@ -87,10 +91,11 @@ export async function emitSnapshotIfChanged(
     const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
       force: true,
       includeScreenshot: true,
-      onlyIfChanged: true,
+      onlyIfChanged: !forceEmit, // Skip change-gate when forceEmit=true
     });
 
-    if (snapshot && snapshot.changed !== false) {
+    // Emit when forceEmit or when change was detected
+    if (snapshot && (forceEmit || snapshot.changed !== false)) {
       const room = createRoomName('preview', previewSessionId);
       const payload = {
         previewSessionId,
@@ -109,6 +114,7 @@ export async function emitSnapshotIfChanged(
         socketId: socket.id,
         previewSessionId,
         hasScreenshot: !!snapshot.screenshot,
+        forceEmit,
       });
     }
   } catch (snapshotError) {
@@ -118,4 +124,16 @@ export async function emitSnapshotIfChanged(
       error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError),
     });
   }
+}
+
+/**
+ * Emit preview:page unconditionally (always send new snapshot + screenshot)
+ * Used after click/up/wheel where user expects visual feedback regardless of "detected change"
+ */
+export async function emitSnapshotAlways(
+  socket: TypedSocket,
+  previewSessionId: string,
+  userId: string
+): Promise<void> {
+  return emitSnapshotIfChanged(socket, previewSessionId, userId, { forceEmit: true });
 }

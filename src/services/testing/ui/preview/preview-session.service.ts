@@ -29,6 +29,28 @@ const SCREENSHOT_CONFIG = {
 const INPUT_THROTTLE_MS = 50; // Min 50ms between input events (20 events/sec max)
 
 /**
+ * Sanitize Playwright close errors.
+ * Playwright sometimes appends huge Chromium "Browser logs" to the error message.
+ * Those logs are rarely actionable for our backend cleanup logic and can spam logs.
+ */
+function formatPlaywrightCloseError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const withoutBrowserLogs = raw.split('\nBrowser logs:\n')[0] || raw;
+  const singleLine = withoutBrowserLogs.replace(/\s+/g, ' ').trim();
+  // Cap to keep logs readable
+  return singleLine.length > 300 ? `${singleLine.slice(0, 300)}…` : singleLine;
+}
+
+/**
+ * Heuristic: close errors that commonly happen when the page/context/browser
+ * is already closed (benign during cleanup).
+ */
+function isBenignAlreadyClosedError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /Target page, context or browser has been closed/i.test(msg);
+}
+
+/**
  * Internal session state (extends PreviewSession with Playwright objects)
  */
 interface InternalSession extends PreviewSession {
@@ -108,24 +130,27 @@ export class PreviewSessionService {
 
     if (page) {
       closePromises.push(page.close().catch((error) => {
-        logger.warn('[PREVIEW_SESSION] Error closing page', {
-          error: error instanceof Error ? error.message : String(error),
+        const level = isBenignAlreadyClosedError(error) ? 'debug' : 'warn';
+        logger[level]('[PREVIEW_SESSION] Error closing page', {
+          error: formatPlaywrightCloseError(error),
         });
       }));
     }
 
     if (context) {
       closePromises.push(context.close().catch((error) => {
-        logger.warn('[PREVIEW_SESSION] Error closing context', {
-          error: error instanceof Error ? error.message : String(error),
+        const level = isBenignAlreadyClosedError(error) ? 'debug' : 'warn';
+        logger[level]('[PREVIEW_SESSION] Error closing context', {
+          error: formatPlaywrightCloseError(error),
         });
       }));
     }
 
     if (browser) {
       closePromises.push(browser.close().catch((error) => {
-        logger.warn('[PREVIEW_SESSION] Error closing browser', {
-          error: error instanceof Error ? error.message : String(error),
+        const level = isBenignAlreadyClosedError(error) ? 'debug' : 'warn';
+        logger[level]('[PREVIEW_SESSION] Error closing browser', {
+          error: formatPlaywrightCloseError(error),
         });
       }));
     }
@@ -613,6 +638,84 @@ export class PreviewSessionService {
           await session.page.keyboard.up(mod).catch(() => { });
         }
       }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DEBUG / PROBE METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Probe element at given viewport coordinates (debug tool)
+   * Returns element info at (x, y) to verify coordinate mapping from frontend
+   */
+  async probeElementAt(params: {
+    sessionId: string;
+    userId: string;
+    x: number;
+    y: number;
+  }): Promise<{
+    element?: {
+      tag: string;
+      id?: string;
+      className?: string;
+      text?: string;
+      ariaLabel?: string;
+      ref?: string;
+    };
+  }> {
+    const { sessionId, userId, x, y } = params;
+    const session = this.getAuthorizedSession(sessionId, userId);
+
+    if (!session) {
+      return {};
+    }
+
+    try {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return {};
+      }
+
+      const viewport = session.page.viewportSize();
+      if (!viewport) {
+        return {};
+      }
+
+      // Clamp coordinates to viewport bounds
+      const clampedX = Math.max(0, Math.min(x, viewport.width - 1));
+      const clampedY = Math.max(0, Math.min(y, viewport.height - 1));
+
+      // Query element at point in page context
+      const elementInfo = await session.page.evaluate(
+        ({ px, py }) => {
+          // @ts-ignore - document is available in browser context
+          const el = document.elementFromPoint(px, py);
+          if (!el) return null;
+
+          // Extract basic info
+          const tag = el.tagName?.toLowerCase() || '';
+          const id = el.id || undefined;
+          const className = el.className && typeof el.className === 'string'
+            ? el.className.slice(0, 100)
+            : undefined;
+          const text = el.textContent?.trim().slice(0, 50) || undefined;
+          const ariaLabel = el.getAttribute('aria-label') || undefined;
+          const ref = el.getAttribute('data-agent-ref') || undefined;
+
+          return { tag, id, className, text, ariaLabel, ref };
+        },
+        { px: clampedX, py: clampedY }
+      );
+
+      return { element: elementInfo || undefined };
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] Probe element failed', {
+        sessionId,
+        x,
+        y,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {};
     }
   }
 

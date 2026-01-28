@@ -19,6 +19,7 @@ import {
 import {
   emitInputError,
   emitInputSuccess,
+  emitSnapshotAlways,
   emitSnapshotIfChanged,
   validateInputRequest,
 } from './preview-input-helpers';
@@ -27,6 +28,26 @@ type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, So
 
 // Track subscribed preview sessions per socket
 const previewSubscriptions = new Map<string, Set<string>>();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Snapshot streaming registry (V6: continuous preview:page emission)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Active streaming intervals keyed by previewSessionId
+const activePreviewStreams = new Map<string, NodeJS.Timeout>();
+
+// Subscriber refcount per room (preview:<sessionId>)
+const previewRoomRefCount = new Map<string, number>();
+
+// Stream context to remember userId/room for snapshot emission
+interface StreamContext {
+  previewSessionId: string;
+  userId: string;
+  room: string;
+}
+const previewStreamContext = new Map<string, StreamContext>();
+
+const SNAPSHOT_STREAM_INTERVAL_MS = 500;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // V3: Pending clarifications cache
@@ -144,6 +165,75 @@ const cleanupPreviewSubscriptions = (socketId: string): void => {
 };
 
 /**
+ * Start snapshot streaming for a preview session
+ * Emits preview:page every ~500ms to all subscribers in the room
+ */
+const startSnapshotStream = (context: StreamContext, nsp: any): void => {
+  const { previewSessionId, userId, room } = context;
+
+  // Don't start if already streaming
+  if (activePreviewStreams.has(previewSessionId)) {
+    return;
+  }
+
+  logger.info('[SNAPSHOT_STREAM] Starting stream', { previewSessionId, room });
+
+  const interval = setInterval(async () => {
+    try {
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
+        includeScreenshot: true,
+        onlyIfChanged: false, // Always emit, don't gate on change detection
+      });
+
+      if (snapshot) {
+        const payload: PreviewPagePayload = {
+          previewSessionId,
+          url: snapshot.url,
+          domNodes: snapshot.domNodes,
+          screenshot: snapshot.screenshot,
+          timestamp: new Date().toISOString(),
+        };
+
+        // Emit to entire room (including sender)
+        nsp.to(room).emit('preview:page', payload);
+
+        logger.debug('[SNAPSHOT_STREAM] Emitted preview:page', {
+          previewSessionId,
+          room,
+          hasScreenshot: !!snapshot.screenshot,
+          nodeCount: snapshot.domNodes.length,
+        });
+      }
+    } catch (error) {
+      logger.error('[SNAPSHOT_STREAM] Failed to emit snapshot', {
+        previewSessionId,
+        room,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, SNAPSHOT_STREAM_INTERVAL_MS);
+
+  activePreviewStreams.set(previewSessionId, interval);
+  previewStreamContext.set(previewSessionId, context);
+};
+
+/**
+ * Stop snapshot streaming for a preview session
+ */
+const stopSnapshotStream = (previewSessionId: string): void => {
+  const interval = activePreviewStreams.get(previewSessionId);
+  if (interval) {
+    clearInterval(interval);
+    activePreviewStreams.delete(previewSessionId);
+    previewStreamContext.delete(previewSessionId);
+    logger.info('[SNAPSHOT_STREAM] Stopped stream', { previewSessionId });
+  }
+};
+
+/**
  * Handle preview-related events
  */
 export const handlePreviewEvents = (socket: TypedSocket): void => {
@@ -230,11 +320,28 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       socket.join(room);
       subs.add(room);
 
+      // V6: Start snapshot streaming on first subscriber
+      const currentCount = previewRoomRefCount.get(room) || 0;
+      previewRoomRefCount.set(room, currentCount + 1);
+
+      if (currentCount === 0 && !activePreviewStreams.has(normalizedPreviewSessionId)) {
+        // First subscriber - start streaming
+        startSnapshotStream(
+          {
+            previewSessionId: normalizedPreviewSessionId,
+            userId: ensuredUserId,
+            room,
+          },
+          socket.nsp
+        );
+      }
+
       logger.info('[WebSocket] Subscribed to preview', {
         socketId: socket.id,
         userId: ensuredUserId,
         previewSessionId,
         room,
+        subscriberCount: currentCount + 1,
       });
 
       // V4: Emit initial preview:page with screenshot after subscribe
@@ -324,15 +431,28 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      const room = createRoomName('preview', previewSessionId.trim());
+      const normalizedPreviewSessionId = previewSessionId.trim();
+      const room = createRoomName('preview', normalizedPreviewSessionId);
       socket.leave(room);
       const subs = getPreviewSubs(socket.id);
       subs.delete(room);
+
+      // V6: Stop snapshot streaming when last subscriber leaves
+      const currentCount = previewRoomRefCount.get(room) || 0;
+      const newCount = Math.max(0, currentCount - 1);
+      previewRoomRefCount.set(room, newCount);
+
+      if (newCount === 0) {
+        // Last subscriber left - stop streaming
+        stopSnapshotStream(normalizedPreviewSessionId);
+        previewRoomRefCount.delete(room);
+      }
 
       logger.info('[WebSocket] Unsubscribed from preview', {
         socketId: socket.id,
         userId: ensuredUserId,
         previewSessionId,
+        subscriberCount: newCount,
       });
     } catch (error) {
       logger.error('[WebSocket] Error in unsubscribe:preview', {
@@ -814,7 +934,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (result.success) {
         emitInputSuccess(socket, previewSessionId, 'click');
         if (result.needsSnapshot) {
-          setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+          // Always emit snapshot after click so user always sees visual feedback
+          setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
         }
       } else {
         emitInputError(socket, previewSessionId, 'click', result.error || 'Click failed');
@@ -913,7 +1034,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (result.success) {
         emitInputSuccess(socket, previewSessionId, 'up');
         if (result.needsSnapshot) {
-          setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+          // Always emit snapshot after mouse up (drag end) so user sees visual feedback
+          setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
         }
       } else {
         emitInputError(socket, previewSessionId, 'up', result.error || 'Mouse up failed');
@@ -961,8 +1083,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result.success) {
         emitInputSuccess(socket, previewSessionId, 'wheel');
-        // Scroll may reveal lazy-loaded content
-        setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+        // Scroll may reveal lazy-loaded content – always emit for visual feedback
+        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
       } else {
         emitInputError(socket, previewSessionId, 'wheel', result.error || 'Wheel failed');
       }
@@ -1067,8 +1189,79 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // Handle mouse probe (debug: element under point)
+  socket.on('preview:mouse:probe', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      // Use mouse rate limit for probe as well
+      if (!checkRateLimit(socket.id, 'mouse')) {
+        return; // Silently drop - this is debug tool, no error needed
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        return; // Silently drop - debug tool
+      }
+
+      const { x, y } = data;
+      if (x === undefined || y === undefined) {
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.probeElementAt({
+        sessionId: previewSessionId,
+        userId: ensuredUserId,
+        x,
+        y,
+      });
+
+      socket.emit('preview:mouse:probe:result', {
+        previewSessionId,
+        x,
+        y,
+        element: result.element,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.debug('[WebSocket] Error in preview:mouse:probe', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // Cleanup on disconnect
   socket.on('disconnect', () => {
+    // V6: Cleanup snapshot streams for all rooms the socket was subscribed to
+    const subs = previewSubscriptions.get(socket.id);
+    if (subs) {
+      for (const room of subs) {
+        // Decrement refcount for this room
+        const currentCount = previewRoomRefCount.get(room) || 0;
+        const newCount = Math.max(0, currentCount - 1);
+
+        if (newCount === 0) {
+          // Extract previewSessionId from room name (format: "preview:<sessionId>")
+          const previewSessionId = room.replace('preview:', '');
+          stopSnapshotStream(previewSessionId);
+          previewRoomRefCount.delete(room);
+
+          logger.debug('[WebSocket] Stopped stream on disconnect', {
+            socketId: socket.id,
+            room,
+            previewSessionId,
+          });
+        } else {
+          previewRoomRefCount.set(room, newCount);
+        }
+      }
+    }
+
     cleanupPreviewSubscriptions(socket.id);
     cleanupRateLimits(socket.id); // V2: Cleanup rate limit data
   });

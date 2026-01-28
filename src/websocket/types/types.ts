@@ -29,6 +29,7 @@ export interface ClientToServerEvents {
   'preview:mouse:down': (data: PreviewMouseButtonRequest) => void;
   'preview:mouse:up': (data: PreviewMouseButtonRequest) => void;
   'preview:mouse:wheel': (data: PreviewMouseWheelRequest) => void;
+  'preview:mouse:probe': (data: PreviewMouseProbeRequest) => void;
   'preview:keyboard:type': (data: PreviewKeyboardTypeRequest) => void;
   'preview:keyboard:press': (data: PreviewKeyboardPressRequest) => void;
 
@@ -99,6 +100,7 @@ export interface ServerToClientEvents {
   // Preview interactive control responses
   'preview:viewport': (data: PreviewViewportPayload) => void;
   'preview:mouse:result': (data: PreviewMouseResultPayload) => void;
+  'preview:mouse:probe:result': (data: PreviewMouseProbeResultPayload) => void;
 
   // Heartbeat response
   pong: () => void;
@@ -848,6 +850,34 @@ export interface PreviewMouseResultPayload {
   success: boolean;
   action: 'move' | 'click' | 'down' | 'up' | 'wheel' | 'type' | 'press';
   error?: string;
+  timestamp: string;
+}
+
+/**
+ * Mouse probe request (debug: element under point)
+ */
+export interface PreviewMouseProbeRequest {
+  previewSessionId: string;
+  x: number;
+  y: number;
+}
+
+/**
+ * Mouse probe result (debug: element info at given coordinates)
+ * Allows frontend to verify coordinate mapping by showing what element backend sees
+ */
+export interface PreviewMouseProbeResultPayload {
+  previewSessionId: string;
+  x: number;
+  y: number;
+  element?: {
+    tag: string;
+    id?: string;
+    className?: string;
+    text?: string;
+    ariaLabel?: string;
+    ref?: string;
+  };
   timestamp: string;
 }
 
