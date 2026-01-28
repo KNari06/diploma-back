@@ -18,6 +18,16 @@ const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // Check every minute
 const SNAPSHOT_THROTTLE_MS = 500; // Min time between snapshot emissions
 const MAX_SESSIONS = 20; // Safety limit (balanced: ~2-4GB RAM max)
 
+// Screenshot configuration
+const SCREENSHOT_CONFIG = {
+  quality: 60,           // JPEG quality (0-100)
+  maxSizeBytes: 900_000, // Skip if larger than 900KB
+  throttleMs: 500,       // Min time between screenshot emissions per session
+};
+
+// Input throttle (anti-flood for mouse/keyboard events)
+const INPUT_THROTTLE_MS = 50; // Min 50ms between input events (20 events/sec max)
+
 /**
  * Internal session state (extends PreviewSession with Playwright objects)
  */
@@ -26,6 +36,9 @@ interface InternalSession extends PreviewSession {
   context: BrowserContext;
   page: Page;
   lastSnapshotEmit: number;
+  lastScreenshotEmitAt: number;  // Last screenshot emission timestamp
+  lastPageSignature: string;      // Hash for diff detection (url+domMetrics)
+  lastInputAt: number;            // Input throttling timestamp
 }
 
 /**
@@ -216,6 +229,9 @@ export class PreviewSessionService {
           context,
           page,
           lastSnapshotEmit: 0,
+          lastScreenshotEmitAt: 0,
+          lastPageSignature: '',
+          lastInputAt: 0,
         };
 
         // Store session
@@ -337,43 +353,387 @@ export class PreviewSessionService {
     return this.getSession(sessionId);
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // INTERACTIVE CONTROL METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get viewport metadata for coordinate mapping
+   */
+  getViewportMetadata(
+    sessionId: string,
+    userId?: string
+  ): { width: number; height: number; devicePixelRatio: number } | null {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+
+    const viewport = session.page.viewportSize();
+    if (!viewport) {
+      return { width: 1280, height: 720, devicePixelRatio: 1 };
+    }
+
+    return {
+      width: viewport.width,
+      height: viewport.height,
+      devicePixelRatio: 1, // Always 1 for headless (no deviceScaleFactor)
+    };
+  }
+
+  /**
+   * Execute mouse action in preview session
+   * @returns {success, needsSnapshot} - needsSnapshot=true if action likely changed page
+   */
+  async executeMouseAction(params: {
+    sessionId: string;
+    userId: string;
+    action: 'move' | 'click' | 'down' | 'up';
+    x: number;
+    y: number;
+    button?: 'left' | 'right' | 'middle';
+    clickCount?: number;
+  }): Promise<{ success: boolean; error?: string; needsSnapshot: boolean }> {
+    const { sessionId, userId, action, x, y, button = 'left', clickCount = 1 } = params;
+    const session = this.getAuthorizedSession(sessionId, userId);
+
+    if (!session) {
+      return { success: false, error: 'Session not found or unauthorized', needsSnapshot: false };
+    }
+
+    const now = Date.now();
+
+    // Throttle input events (anti-DoS)
+    if (now - session.lastInputAt < INPUT_THROTTLE_MS) {
+      return { success: false, error: 'Input throttled', needsSnapshot: false };
+    }
+
+    session.lastInputAt = now;
+    session.lastSeenAt = now;
+
+    try {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return { success: false, error: 'Invalid coordinates', needsSnapshot: false };
+      }
+
+      const viewport = session.page.viewportSize();
+      if (!viewport) {
+        return { success: false, error: 'Viewport unavailable', needsSnapshot: false };
+      }
+
+      // Clamp coordinates to viewport bounds
+      const clampedX = Math.max(0, Math.min(x, viewport.width - 1));
+      const clampedY = Math.max(0, Math.min(y, viewport.height - 1));
+      const safeButton: 'left' | 'right' | 'middle' = button === 'right' || button === 'middle' ? button : 'left';
+      const safeClickCount = Number.isInteger(clickCount) && clickCount > 0 && clickCount <= 2 ? clickCount : 1;
+
+      switch (action) {
+        case 'move':
+          await session.page.mouse.move(clampedX, clampedY);
+          return { success: true, needsSnapshot: false };
+
+        case 'click':
+          await session.page.mouse.click(clampedX, clampedY, { button: safeButton, clickCount: safeClickCount });
+          return { success: true, needsSnapshot: true };
+
+        case 'down':
+          await session.page.mouse.move(clampedX, clampedY);
+          await session.page.mouse.down({ button: safeButton });
+          return { success: true, needsSnapshot: false };
+
+        case 'up':
+          await session.page.mouse.move(clampedX, clampedY);
+          await session.page.mouse.up({ button: safeButton });
+          return { success: true, needsSnapshot: true };
+
+        default:
+          return { success: false, error: `Unknown action: ${action}`, needsSnapshot: false };
+      }
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] Mouse action failed', {
+        sessionId,
+        action,
+        x,
+        y,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Mouse action failed',
+        needsSnapshot: false,
+      };
+    }
+  }
+
+  /**
+   * Execute mouse wheel scroll
+   */
+  async executeMouseWheel(params: {
+    sessionId: string;
+    userId: string;
+    deltaX: number;
+    deltaY: number;
+  }): Promise<{ success: boolean; error?: string }> {
+    const { sessionId, userId, deltaX, deltaY } = params;
+    const session = this.getAuthorizedSession(sessionId, userId);
+
+    if (!session) {
+      return { success: false, error: 'Session not found or unauthorized' };
+    }
+
+    const now = Date.now();
+
+    if (now - session.lastInputAt < INPUT_THROTTLE_MS) {
+      return { success: false, error: 'Input throttled' };
+    }
+
+    session.lastInputAt = now;
+    session.lastSeenAt = now;
+
+    try {
+      if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) {
+        return { success: false, error: 'Invalid wheel delta' };
+      }
+
+      // Prevent extreme values (accidental or abuse)
+      const safeDeltaX = Math.max(-2000, Math.min(2000, deltaX));
+      const safeDeltaY = Math.max(-2000, Math.min(2000, deltaY));
+
+      await session.page.mouse.wheel(safeDeltaX, safeDeltaY);
+      return { success: true };
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] Mouse wheel failed', {
+        sessionId,
+        deltaX,
+        deltaY,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Wheel action failed',
+      };
+    }
+  }
+
+  /**
+   * Execute keyboard type (insert text)
+   */
+  async executeKeyboardType(params: {
+    sessionId: string;
+    userId: string;
+    text: string;
+  }): Promise<{ success: boolean; error?: string }> {
+    const { sessionId, userId, text } = params;
+    const session = this.getAuthorizedSession(sessionId, userId);
+
+    if (!session) {
+      return { success: false, error: 'Session not found or unauthorized' };
+    }
+
+    // Length limit (prevent abuse)
+    if (text.length > 500) {
+      return { success: false, error: 'Text too long (max 500 chars)' };
+    }
+
+    const now = Date.now();
+    if (now - session.lastInputAt < INPUT_THROTTLE_MS) {
+      return { success: false, error: 'Input throttled' };
+    }
+
+    session.lastInputAt = now;
+    session.lastSeenAt = now;
+
+    try {
+      await session.page.keyboard.type(text);
+      return { success: true };
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] Keyboard type failed', {
+        sessionId,
+        textLength: text.length,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Type action failed',
+      };
+    }
+  }
+
+  /**
+   * Execute keyboard key press with modifiers
+   */
+  async executeKeyboardPress(params: {
+    sessionId: string;
+    userId: string;
+    key: string;
+    modifiers?: ('Control' | 'Shift' | 'Alt' | 'Meta')[];
+  }): Promise<{ success: boolean; error?: string }> {
+    const { sessionId, userId, key, modifiers } = params;
+    const session = this.getAuthorizedSession(sessionId, userId);
+
+    if (!session) {
+      return { success: false, error: 'Session not found or unauthorized' };
+    }
+
+    const now = Date.now();
+    if (now - session.lastInputAt < INPUT_THROTTLE_MS) {
+      return { success: false, error: 'Input throttled' };
+    }
+
+    session.lastInputAt = now;
+    session.lastSeenAt = now;
+
+    const safeModifiers = Array.isArray(modifiers) ? modifiers : [];
+
+    try {
+      // Hold modifiers
+      if (safeModifiers.length > 0) {
+        for (const mod of safeModifiers) {
+          await session.page.keyboard.down(mod);
+        }
+      }
+
+      // Press key
+      await session.page.keyboard.press(key);
+
+      return { success: true };
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] Keyboard press failed', {
+        sessionId,
+        key,
+        modifiers,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Press action failed',
+      };
+    } finally {
+      // Ensure we always release modifiers (avoid sticky modifier state after errors)
+      if (safeModifiers.length > 0) {
+        for (const mod of [...safeModifiers].reverse()) {
+          await session.page.keyboard.up(mod).catch(() => { });
+        }
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SNAPSHOT METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Compute page signature for diff detection
+   * Returns hash of URL + DOM node count + interactive element count
+   */
+  private computePageSignature(url: string, domNodes: InteractiveNode[]): string {
+    const data = `${url}|${domNodes.length}|${domNodes.map(n => n.ref).join(',')}`;
+    // Simple hash - just use first 16 chars of base64
+    return Buffer.from(data).toString('base64').substring(0, 32);
+  }
+
+  /**
+   * Capture screenshot as JPEG base64 (no data: prefix)
+   * Returns null if capture fails or size exceeds limit
+   */
+  private async captureScreenshot(page: Page): Promise<string | null> {
+    try {
+      const buffer = await page.screenshot({
+        type: 'jpeg',
+        quality: SCREENSHOT_CONFIG.quality,
+        fullPage: false, // Viewport only
+      });
+
+      // Check size limit
+      if (buffer.length > SCREENSHOT_CONFIG.maxSizeBytes) {
+        logger.debug('[PREVIEW_SESSION] Screenshot too large, skipping', {
+          size: buffer.length,
+          maxSize: SCREENSHOT_CONFIG.maxSizeBytes,
+        });
+        return null;
+      }
+
+      return buffer.toString('base64');
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] Screenshot capture failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
   /**
    * Get current page snapshot
+   * @param options.force - Skip throttling
+   * @param options.includeScreenshot - Include JPEG screenshot (default: true)
+   * @param options.onlyIfChanged - Only return if page signature changed (for apply)
    */
   async getSnapshot(
     sessionId: string,
     userId?: string,
-    options?: { force?: boolean }
+    options?: { force?: boolean; includeScreenshot?: boolean; onlyIfChanged?: boolean }
   ): Promise<{
     url: string;
     domNodes: InteractiveNode[];
     screenshot?: string;
+    changed?: boolean;
   } | null> {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
 
-    // Throttle snapshot collection
     const now = Date.now();
+    const includeScreenshot = options?.includeScreenshot !== false;
+
+    // Throttle snapshot collection (unless forced)
     if (!options?.force && now - session.lastSnapshotEmit < SNAPSHOT_THROTTLE_MS) {
       return {
         url: session.pageState.url,
         domNodes: session.pageState.domNodes,
+        changed: false,
       };
     }
 
     try {
       const snapshot = await SnapshotCollector.collect(session.page);
       const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
+      const currentUrl = session.page.url();
 
       session.pageState = {
-        url: session.page.url(),
+        url: currentUrl,
         domNodes: domAnalysis.interactiveNodes,
       };
       session.lastSnapshotEmit = now;
 
+      // Compute signature for diff detection
+      const newSignature = this.computePageSignature(currentUrl, domAnalysis.interactiveNodes);
+      const changed = newSignature !== session.lastPageSignature;
+      session.lastPageSignature = newSignature;
+
+      // If onlyIfChanged and no change, skip
+      if (options?.onlyIfChanged && !changed) {
+        return {
+          url: session.pageState.url,
+          domNodes: session.pageState.domNodes,
+          changed: false,
+        };
+      }
+
+      // Capture screenshot if requested and throttle allows
+      let screenshot: string | undefined;
+      if (includeScreenshot) {
+        const canEmitScreenshot = now - session.lastScreenshotEmitAt >= SCREENSHOT_CONFIG.throttleMs;
+        if (canEmitScreenshot || options?.force) {
+          const captured = await this.captureScreenshot(session.page);
+          if (captured) {
+            screenshot = captured;
+            session.lastScreenshotEmitAt = now;
+          }
+        }
+      }
+
       return {
         url: session.pageState.url,
         domNodes: session.pageState.domNodes,
+        screenshot,
+        changed,
       };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Failed to get snapshot', {

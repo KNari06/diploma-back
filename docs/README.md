@@ -25,6 +25,7 @@
 - [**Примеры использования**](./api/examples.md) - практические примеры
 - [**Аутентификация**](./api/authentication.md) - работа с токенами и ключами
 - [**API Agent тесты по уровням (LIGHT/MEDIUM/HARD)**](./api/API_AGENT_TEST_LEVELS.md) - как работает агентское API тестирование и чем отличаются уровни
+- [**AI Editor (Preview Step Editor) — Frontend Integration**](./api/AI_EDITOR_WEBSOCKET_GUIDE.md) - как фронтенду работать с AI editor (WS события, логика, поля)
 - [**Multi-Chat Sessions**](./api/multi-chat-sessions.md) - ✨ NEW! Мультичат как в ChatGPT
 - [**Playwright API**](./api/playwright.md) - загрузка trace файлов
 - [**Real-Time Graph Visualization**](./api/real-time-graph-visualization.md) - ✨ NEW! Потоковая визуализация тестов в режиме реального времени

@@ -1,7 +1,7 @@
 /**
- * Preview Handler V2
+ * Preview Handler V3
  * Handles WebSocket events for step editor preview sessions
- * Features: ownership enforcement, rate limiting, consistent error codes
+ * Features: ownership enforcement, rate limiting, AI semantic matching, clarification flow
  */
 
 import { logger } from '@/utils/core/logger';
@@ -10,15 +10,67 @@ import { getUserId } from '../middleware/middleware';
 import {
   ClientToServerEvents,
   createRoomName,
+  PreviewIntentStep,
+  PreviewLintCandidate,
   PreviewPagePayload,
   ServerToClientEvents,
   SocketData,
 } from '../types/types';
+import {
+  emitInputError,
+  emitInputSuccess,
+  emitSnapshotIfChanged,
+  validateInputRequest,
+} from './preview-input-helpers';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 
 // Track subscribed preview sessions per socket
 const previewSubscriptions = new Map<string, Set<string>>();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3: Pending clarifications cache
+// ═══════════════════════════════════════════════════════════════════════════
+interface PendingClarification {
+  candidates: PreviewLintCandidate[];
+  stepDraft: PreviewIntentStep;
+  userId: string;
+  timestamp: number;
+}
+
+// Key: `${previewSessionId}:${stepId}` -> PendingClarification
+const pendingClarifications = new Map<string, PendingClarification>();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3: Confirmed selections cache (after user picks from clarify options)
+// Used by apply to skip re-linting and use user's choice directly
+// ═══════════════════════════════════════════════════════════════════════════
+interface ConfirmedSelection {
+  selectedRef: string;
+  userId: string;
+  timestamp: number;
+}
+
+// Key: `${previewSessionId}:${stepId}` -> ConfirmedSelection
+const confirmedSelections = new Map<string, ConfirmedSelection>();
+
+// Cleanup old clarifications and selections (older than 5 minutes)
+const CLARIFICATION_TTL_MS = 5 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of pendingClarifications) {
+    if (now - value.timestamp > CLARIFICATION_TTL_MS) {
+      pendingClarifications.delete(key);
+    }
+  }
+  // Also cleanup confirmed selections
+  for (const [key, value] of confirmedSelections) {
+    if (now - value.timestamp > CLARIFICATION_TTL_MS) {
+      confirmedSelections.delete(key);
+    }
+  }
+}, 60 * 1000); // Check every minute
 
 // ═══════════════════════════════════════════════════════════════════════════
 // V2: Rate limiting
@@ -33,6 +85,8 @@ const RATE_LIMITS = {
   lint: { max: 30, windowMs: 10000 },     // 30 lint requests per 10s
   apply: { max: 10, windowMs: 10000 },    // 10 apply requests per 10s
   subscribe: { max: 5, windowMs: 10000 }, // 5 subscribes per 10s
+  mouse: { max: 100, windowMs: 10000 },   // 100 mouse events per 10s
+  keyboard: { max: 50, windowMs: 10000 }, // 50 keyboard events per 10s
 };
 
 const rateLimitStore = new Map<string, Map<string, RateLimitEntry>>();
@@ -182,6 +236,71 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         previewSessionId,
         room,
       });
+
+      // V4: Emit initial preview:page with screenshot after subscribe
+      try {
+        const snapshot = await sessionService.getSnapshot(normalizedPreviewSessionId, ensuredUserId, {
+          force: true,
+          includeScreenshot: true,
+        });
+
+        if (snapshot) {
+          socket.emit('preview:page', {
+            previewSessionId: normalizedPreviewSessionId,
+            url: snapshot.url,
+            domNodes: snapshot.domNodes,
+            screenshot: snapshot.screenshot,
+            timestamp: new Date().toISOString(),
+          });
+
+          logger.debug('[WebSocket] Emitted initial preview:page with screenshot', {
+            socketId: socket.id,
+            previewSessionId,
+            hasScreenshot: !!snapshot.screenshot,
+            nodeCount: snapshot.domNodes.length,
+          });
+
+          // V5: Emit viewport metadata for coordinate mapping
+          const viewportMeta = sessionService.getViewportMetadata(normalizedPreviewSessionId, ensuredUserId);
+          if (viewportMeta) {
+            socket.emit('preview:viewport', {
+              previewSessionId: normalizedPreviewSessionId,
+              viewport: {
+                width: viewportMeta.width,
+                height: viewportMeta.height,
+              },
+              devicePixelRatio: viewportMeta.devicePixelRatio,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          // V4: Prefetch embeddings for faster first lint (async, non-blocking)
+          setImmediate(async () => {
+            try {
+              const { prefetchEmbeddings } = await import('@/services/testing/ui/preview/intent-step-lint.service');
+              await prefetchEmbeddings({
+                previewSessionId: normalizedPreviewSessionId,
+                domNodes: snapshot.domNodes,
+                pageUrl: snapshot.url,
+              });
+            } catch (prefetchError) {
+              // Don't fail - prefetch is optimization only
+              logger.debug('[WebSocket] Embeddings prefetch failed (non-critical)', {
+                socketId: socket.id,
+                previewSessionId,
+                error: prefetchError instanceof Error ? prefetchError.message : String(prefetchError),
+              });
+            }
+          });
+        }
+      } catch (snapshotError) {
+        logger.warn('[WebSocket] Failed to emit initial preview:page', {
+          socketId: socket.id,
+          previewSessionId,
+          error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError),
+        });
+        // Don't fail subscription - just log warning
+      }
     } catch (error) {
       logger.error('[WebSocket] Error in subscribe:preview', {
         socketId: socket.id,
@@ -223,7 +342,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
-  // Handle step lint request
+  // Handle step lint request (V3: with AI semantic matching)
   socket.on('preview:step:lint', async (data) => {
     try {
       const ensuredUserId = requireUser();
@@ -256,22 +375,75 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      logger.debug('[WebSocket] Step lint request', {
+      logger.debug('[WebSocket] Step lint request (AI)', {
         socketId: socket.id,
         previewSessionId,
         stepType: stepDraft.type,
-        description: stepDraft.description,
+        descriptionPreview: typeof stepDraft.description === 'string' ? stepDraft.description.slice(0, 80) : '',
       });
 
       // Import linting service dynamically to avoid circular deps
       const { IntentStepLintService } = await import('@/services/testing/ui/preview/intent-step-lint.service');
 
-      const result = await IntentStepLintService.lintStep({
+      // V3: Use AI-powered linting
+      const result = await IntentStepLintService.lintStepWithAI({
         previewSessionId,
         stepDraft,
         pageRef,
         userId: ensuredUserId,
       });
+
+      // V3: If needs clarification, emit separate clarify event
+      if (result.status === 'needs_clarification') {
+        // V3: Filter out candidates without valid ref (required for selection)
+        const validCandidates = result.candidates.filter(c => c.ref && c.ref.trim().length > 0);
+
+        if (validCandidates.length === 0) {
+          // No valid candidates to clarify - emit error
+          socket.emit('preview:step:lint:result', {
+            status: 'not_found',
+            message: 'No valid elements found for clarification',
+            confidence: 0,
+            candidates: [],
+            highlight: [],
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        // Store pending clarification for this step (only valid candidates)
+        const clarifyKey = `${previewSessionId}:${stepDraft.id}`;
+        pendingClarifications.set(clarifyKey, {
+          candidates: validCandidates,
+          stepDraft,
+          userId: ensuredUserId,
+          timestamp: Date.now(),
+        });
+
+        // Emit clarify event with candidates (max 3, all with valid refs)
+        socket.emit('preview:step:clarify', {
+          previewSessionId,
+          stepId: stepDraft.id,
+          candidates: validCandidates.slice(0, 3).map(c => ({
+            ref: c.ref!, // Safe - filtered above
+            label: c.label,
+            reason: c.reason,
+            boundingBox: c.boundingBox,
+          })),
+          interpretation: result.interpretation || '',
+          message: result.clarificationQuestion || 'Please select the correct element',
+          timestamp: new Date().toISOString(),
+        });
+
+        logger.info('[WebSocket] Emitted clarify event', {
+          socketId: socket.id,
+          previewSessionId,
+          stepId: stepDraft.id,
+          candidateCount: validCandidates.length,
+        });
+
+        return; // Don't emit lint:result for clarification
+      }
 
       socket.emit('preview:step:lint:result', {
         ...result,
@@ -285,6 +457,116 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       socket.emit('preview:step:lint:result', {
         status: 'error',
         message: error instanceof Error ? error.message : 'Linting failed',
+        confidence: 0,
+        candidates: [],
+        highlight: [],
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
+
+  // V3: Handle user selection from clarify options
+  socket.on('preview:step:clarify:select', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId, stepId, selectedRef } = data;
+
+      if (!previewSessionId || !stepId || !selectedRef) {
+        socket.emit('preview:step:lint:result', {
+          status: 'error',
+          message: 'Missing required fields for clarification selection',
+          confidence: 0,
+          candidates: [],
+          highlight: [],
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Get pending clarification
+      const clarifyKey = `${previewSessionId}:${stepId}`;
+      const pending = pendingClarifications.get(clarifyKey);
+
+      if (!pending) {
+        socket.emit('preview:step:lint:result', {
+          status: 'error',
+          message: 'Clarification session expired or not found',
+          confidence: 0,
+          candidates: [],
+          highlight: [],
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Validate user owns this clarification
+      if (pending.userId !== ensuredUserId) {
+        socket.emit('preview:step:lint:result', {
+          status: 'error',
+          message: 'Unauthorized clarification selection',
+          confidence: 0,
+          candidates: [],
+          highlight: [],
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Find selected candidate
+      const selectedCandidate = pending.candidates.find(c => c.ref === selectedRef);
+
+      if (!selectedCandidate) {
+        socket.emit('preview:step:lint:result', {
+          status: 'error',
+          message: 'Selected element not found in candidates',
+          confidence: 0,
+          candidates: [],
+          highlight: [],
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Clean up pending clarification
+      pendingClarifications.delete(clarifyKey);
+
+      // V3: Store confirmed selection for use in apply
+      confirmedSelections.set(clarifyKey, {
+        selectedRef,
+        userId: ensuredUserId,
+        timestamp: Date.now(),
+      });
+
+      logger.info('[WebSocket] Clarification selected and stored', {
+        socketId: socket.id,
+        previewSessionId,
+        stepId,
+        selectedRef,
+      });
+
+      // Return resolved result with user-confirmed candidate
+      socket.emit('preview:step:lint:result', {
+        status: 'resolved',
+        message: 'User confirmed element selection',
+        confidence: 1.0, // User confirmed = 100% confidence
+        candidates: [selectedCandidate],
+        highlight: [{
+          ref: selectedCandidate.ref,
+          boundingBox: selectedCandidate.boundingBox,
+          type: 'success',
+        }],
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:step:clarify:select', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      socket.emit('preview:step:lint:result', {
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Clarification selection failed',
         confidence: 0,
         candidates: [],
         highlight: [],
@@ -320,12 +602,48 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      logger.debug('[WebSocket] Step apply request', {
-        socketId: socket.id,
-        previewSessionId,
-        stepType: stepDraft.type,
-        description: stepDraft.description,
-      });
+      // V4: Normalize/sanitize options if present
+      if (stepDraft.options) {
+        const opts = stepDraft.options;
+        // Normalize timeout: must be number >= 0 and <= 60000 (max 1 min)
+        if (opts.timeout !== undefined) {
+          const t = Number(opts.timeout);
+          if (Number.isNaN(t) || t < 0) {
+            opts.timeout = undefined;
+          } else {
+            opts.timeout = Math.min(t, 60000);
+          }
+        }
+        // Normalize booleans
+        if (opts.replaceContent !== undefined) {
+          opts.replaceContent = Boolean(opts.replaceContent);
+        }
+        if (opts.pressEnter !== undefined) {
+          opts.pressEnter = Boolean(opts.pressEnter);
+        }
+      }
+
+      // V3: Check if user confirmed a selection for this step
+      const selectionKey = `${previewSessionId}:${stepDraft.id}`;
+      const confirmedSelection = confirmedSelections.get(selectionKey);
+      let selectedRef: string | undefined;
+
+      if (confirmedSelection && confirmedSelection.userId === ensuredUserId) {
+        selectedRef = confirmedSelection.selectedRef;
+        logger.debug('[WebSocket] Using confirmed selection for apply', {
+          socketId: socket.id,
+          previewSessionId,
+          stepId: stepDraft.id,
+          selectedRef,
+        });
+      } else {
+        logger.debug('[WebSocket] Step apply request (no confirmed selection)', {
+          socketId: socket.id,
+          previewSessionId,
+          stepType: stepDraft.type,
+          descriptionPreview: typeof stepDraft.description === 'string' ? stepDraft.description.slice(0, 80) : '',
+        });
+      }
 
       // Import apply service dynamically to avoid circular deps
       const { PreviewStepApplyService } = await import('@/services/testing/ui/preview/preview-step-apply.service');
@@ -335,33 +653,62 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         stepDraft,
         pageRef,
         userId: ensuredUserId,
+        selectedRef, // V3: Pass confirmed selection
       });
+
+      // V3: Clean up confirmed selection only after successful apply
+      if (result.success && confirmedSelection) {
+        confirmedSelections.delete(selectionKey);
+      }
 
       socket.emit('preview:step:apply:result', {
         ...result,
         timestamp: new Date().toISOString(),
       });
 
-      // If successful, emit updated page state to all subscribers
+      // If successful, emit updated page state with screenshot to all subscribers
       if (result.success) {
-        const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
-        const sessionService = getPreviewSessionService();
-        const snapshot = await sessionService.getSnapshot(previewSessionId, ensuredUserId, { force: true });
+        // Emit result immediately, then snapshot async
+        setImmediate(async () => {
+          try {
+            const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+            const sessionService = getPreviewSessionService();
+            const snapshot = await sessionService.getSnapshot(previewSessionId, ensuredUserId, {
+              force: true,
+              includeScreenshot: true,
+              onlyIfChanged: true, // Only emit if page actually changed
+            });
 
-        if (snapshot) {
-          const room = createRoomName('preview', previewSessionId);
-          const payload = {
-            previewSessionId,
-            url: snapshot.url,
-            domNodes: snapshot.domNodes,
-            timestamp: new Date().toISOString(),
-          };
+            if (snapshot && snapshot.changed !== false) {
+              const room = createRoomName('preview', previewSessionId);
+              const payload = {
+                previewSessionId,
+                url: snapshot.url,
+                domNodes: snapshot.domNodes,
+                screenshot: snapshot.screenshot,
+                timestamp: new Date().toISOString(),
+              };
 
-          // Emit to the caller immediately (even if not subscribed)
-          socket.emit('preview:page', payload);
-          // Emit to other subscribers
-          socket.to(room).emit('preview:page', payload);
-        }
+              // Emit to the caller immediately (even if not subscribed)
+              socket.emit('preview:page', payload);
+              // Emit to other subscribers
+              socket.to(room).emit('preview:page', payload);
+
+              logger.debug('[WebSocket] Emitted preview:page after apply', {
+                socketId: socket.id,
+                previewSessionId,
+                hasScreenshot: !!snapshot.screenshot,
+                changed: snapshot.changed,
+              });
+            }
+          } catch (snapshotError) {
+            logger.warn('[WebSocket] Failed to emit preview:page after apply', {
+              socketId: socket.id,
+              previewSessionId,
+              error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError),
+            });
+          }
+        });
       }
     } catch (error) {
       logger.error('[WebSocket] Error in preview:step:apply', {
@@ -372,6 +719,350 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         success: false,
         error: error instanceof Error ? error.message : 'Apply failed',
         timestamp: new Date().toISOString(),
+      });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V5: Interactive preview control handlers
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Handle mouse move (hover)
+  socket.on('preview:mouse:move', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'mouse')) {
+        emitInputError(socket, data.previewSessionId || '', 'move', 'Mouse rate limit exceeded');
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        emitInputError(socket, data.previewSessionId || '', 'move', 'Invalid previewSessionId');
+        return;
+      }
+
+      const { x, y } = data;
+      if (x === undefined || y === undefined) {
+        emitInputError(socket, previewSessionId, 'move', 'Missing x or y coordinates');
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.executeMouseAction({
+        sessionId: previewSessionId,
+        userId: ensuredUserId,
+        action: 'move',
+        x,
+        y,
+      });
+
+      if (result.success) {
+        emitInputSuccess(socket, previewSessionId, 'move');
+      } else {
+        emitInputError(socket, previewSessionId, 'move', result.error || 'Move failed');
+      }
+      // No snapshot for hover
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:mouse:move', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // Handle mouse click
+  socket.on('preview:mouse:click', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'mouse')) {
+        emitInputError(socket, data.previewSessionId || '', 'click', 'Mouse rate limit exceeded');
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        emitInputError(socket, data.previewSessionId || '', 'click', 'Invalid previewSessionId');
+        return;
+      }
+
+      const { x, y, button, clickCount } = data;
+      if (x === undefined || y === undefined) {
+        emitInputError(socket, previewSessionId, 'click', 'Missing x or y coordinates');
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.executeMouseAction({
+        sessionId: previewSessionId,
+        userId: ensuredUserId,
+        action: 'click',
+        x,
+        y,
+        button,
+        clickCount,
+      });
+
+      if (result.success) {
+        emitInputSuccess(socket, previewSessionId, 'click');
+        if (result.needsSnapshot) {
+          setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+        }
+      } else {
+        emitInputError(socket, previewSessionId, 'click', result.error || 'Click failed');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:mouse:click', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // Handle mouse down (drag start)
+  socket.on('preview:mouse:down', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'mouse')) {
+        emitInputError(socket, data.previewSessionId || '', 'down', 'Mouse rate limit exceeded');
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        emitInputError(socket, data.previewSessionId || '', 'down', 'Invalid previewSessionId');
+        return;
+      }
+
+      const { x, y, button } = data;
+      if (x === undefined || y === undefined) {
+        emitInputError(socket, previewSessionId, 'down', 'Missing x or y coordinates');
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.executeMouseAction({
+        sessionId: previewSessionId,
+        userId: ensuredUserId,
+        action: 'down',
+        x,
+        y,
+        button,
+      });
+
+      if (result.success) {
+        emitInputSuccess(socket, previewSessionId, 'down');
+      } else {
+        emitInputError(socket, previewSessionId, 'down', result.error || 'Mouse down failed');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:mouse:down', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // Handle mouse up (drag end)
+  socket.on('preview:mouse:up', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'mouse')) {
+        emitInputError(socket, data.previewSessionId || '', 'up', 'Mouse rate limit exceeded');
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        emitInputError(socket, data.previewSessionId || '', 'up', 'Invalid previewSessionId');
+        return;
+      }
+
+      const { x, y, button } = data;
+      if (x === undefined || y === undefined) {
+        emitInputError(socket, previewSessionId, 'up', 'Missing x or y coordinates');
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.executeMouseAction({
+        sessionId: previewSessionId,
+        userId: ensuredUserId,
+        action: 'up',
+        x,
+        y,
+        button,
+      });
+
+      if (result.success) {
+        emitInputSuccess(socket, previewSessionId, 'up');
+        if (result.needsSnapshot) {
+          setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+        }
+      } else {
+        emitInputError(socket, previewSessionId, 'up', result.error || 'Mouse up failed');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:mouse:up', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // Handle mouse wheel (scroll)
+  socket.on('preview:mouse:wheel', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'mouse')) {
+        emitInputError(socket, data.previewSessionId || '', 'wheel', 'Mouse rate limit exceeded');
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        emitInputError(socket, data.previewSessionId || '', 'wheel', 'Invalid previewSessionId');
+        return;
+      }
+
+      const { deltaX, deltaY } = data;
+      if (deltaX === undefined || deltaY === undefined) {
+        emitInputError(socket, previewSessionId, 'wheel', 'Missing deltaX or deltaY');
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.executeMouseWheel({
+        sessionId: previewSessionId,
+        userId: ensuredUserId,
+        deltaX,
+        deltaY,
+      });
+
+      if (result.success) {
+        emitInputSuccess(socket, previewSessionId, 'wheel');
+        // Scroll may reveal lazy-loaded content
+        setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+      } else {
+        emitInputError(socket, previewSessionId, 'wheel', result.error || 'Wheel failed');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:mouse:wheel', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // Handle keyboard type
+  socket.on('preview:keyboard:type', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'keyboard')) {
+        emitInputError(socket, data.previewSessionId || '', 'type', 'Keyboard rate limit exceeded');
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        emitInputError(socket, data.previewSessionId || '', 'type', 'Invalid previewSessionId');
+        return;
+      }
+
+      const { text } = data;
+      if (!text) {
+        emitInputError(socket, previewSessionId, 'type', 'Missing text');
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.executeKeyboardType({
+        sessionId: previewSessionId,
+        userId: ensuredUserId,
+        text,
+      });
+
+      if (result.success) {
+        emitInputSuccess(socket, previewSessionId, 'type');
+        setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+      } else {
+        emitInputError(socket, previewSessionId, 'type', result.error || 'Type failed');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:keyboard:type', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // Handle keyboard press
+  socket.on('preview:keyboard:press', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'keyboard')) {
+        emitInputError(socket, data.previewSessionId || '', 'press', 'Keyboard rate limit exceeded');
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        emitInputError(socket, data.previewSessionId || '', 'press', 'Invalid previewSessionId');
+        return;
+      }
+
+      const { key, modifiers } = data;
+      if (!key) {
+        emitInputError(socket, previewSessionId, 'press', 'Missing key');
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.executeKeyboardPress({
+        sessionId: previewSessionId,
+        userId: ensuredUserId,
+        key,
+        modifiers,
+      });
+
+      if (result.success) {
+        emitInputSuccess(socket, previewSessionId, 'press');
+        setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+      } else {
+        emitInputError(socket, previewSessionId, 'press', result.error || 'Press failed');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:keyboard:press', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
       });
     }
   });

@@ -1,18 +1,34 @@
 /**
- * Intent Step Lint Service V2
- * Rule-based linting for step editor with state-awareness and AI fallback
- * Resolves intent steps to candidate elements without full AI agent
+ * Intent Step Lint Service V4
+ * Embeddings-based linting for step editor (primary) with rule-based fallback
+ * Resolves intent steps to candidate elements using multilingual semantic matching
  */
 
+import {
+    EDITOR_RESOLVER_SYSTEM_PROMPT,
+    buildEditorResolverUserPrompt,
+    parseEditorResolverResponse,
+    type EditorResolverCandidate,
+    type ResolverResponse,
+} from '@/ai/prompts/editor-resolver-prompts';
 import { logger } from '@/utils/core/logger';
+import {
+    invalidateEmbeddingCache,
+    prefetchEmbeddings,
+    resolveWithEmbeddings,
+    sanitizeIntent,
+} from './embeddings-resolver.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type {
-  IntentStep,
-  InteractiveNode,
-  LintCandidate,
-  LintResult,
-  LintStatus,
+    IntentStep,
+    InteractiveNode,
+    LintCandidate,
+    LintResult,
+    LintStatus,
 } from './preview.types';
+
+// Re-export for external use
+export { invalidateEmbeddingCache, prefetchEmbeddings };
 
 // Scoring weights (V2: higher weights for labels, hierarchy bonus)
 const WEIGHTS = {
@@ -353,7 +369,7 @@ export class IntentStepLintService {
     logger.debug('[INTENT_LINT] Linting step', {
       previewSessionId,
       stepType: stepDraft.type,
-      description: stepDraft.description,
+      descriptionPreview: sanitizeIntent(stepDraft).slice(0, 80),
     });
 
     try {
@@ -504,6 +520,359 @@ export class IntentStepLintService {
   static getBestCandidate(result: LintResult): LintCandidate | null {
     if (result.candidates.length === 0) return null;
     return result.candidates[0];
+  }
+
+  /**
+   * V3: Semantic matching with LLM
+   * Uses AI to understand user intent and match against candidates
+   * Returns ranked candidates with reasoning and clarification needs
+   */
+  private static async semanticMatchWithLLM(params: {
+    userIntent: string;
+    actionType: string;
+    pageUrl: string;
+    candidates: LintCandidate[];
+    domNodes: InteractiveNode[];
+  }): Promise<{
+    response: ResolverResponse | null;
+    rankedCandidates: Array<LintCandidate & { llmReason: string; llmConfidence: number }>;
+    needsClarification: boolean;
+    clarificationQuestion?: string;
+    interpretation?: string;
+  }> {
+    // V3: Filter out candidates without valid ref before sending to LLM
+    const validCandidates = params.candidates.filter(c => c.ref && c.ref.trim().length > 0);
+
+    if (validCandidates.length === 0) {
+      logger.warn('[INTENT_LINT] No valid candidates with refs for LLM');
+      return {
+        response: null,
+        rankedCandidates: [],
+        needsClarification: false,
+      };
+    }
+
+    // Convert LintCandidate to EditorResolverCandidate with more attributes
+    const resolverCandidates: EditorResolverCandidate[] = validCandidates.map(c => {
+      // Find corresponding DOM node for more attributes
+      const node = params.domNodes.find(n => n.ref === c.ref);
+      return {
+        ref: c.ref!, // Safe after filter
+        label: c.label,
+        tag: node?.tag || 'unknown',
+        role: node?.role,
+        placeholder: node?.placeholder,
+        ariaLabel: node?.ariaLabel,
+        name: node?.name,
+        type: node?.type,
+      };
+    });
+
+    // Build prompt
+    const userPrompt = buildEditorResolverUserPrompt({
+      userIntent: params.userIntent,
+      actionType: params.actionType,
+      pageUrl: params.pageUrl,
+      candidates: resolverCandidates,
+    });
+
+    try {
+      // Call AI service
+      const { getChatCompletionWithMessages } = await import('@/services/ai/core/openai.service');
+      const aiResult = await getChatCompletionWithMessages(
+        [
+          { role: 'system', content: EDITOR_RESOLVER_SYSTEM_PROMPT },
+          { role: 'user', content: userPrompt },
+        ],
+        {
+          max_tokens: 400,
+          temperature: 0.1,
+          model: 'gpt-4o-mini',
+        }
+      );
+
+      // Parse response (use validCandidates refs)
+      const validRefs = validCandidates.map(c => c.ref!);
+      const parsed = parseEditorResolverResponse(aiResult.content, validRefs);
+
+      if (!parsed) {
+        logger.warn('[INTENT_LINT] Failed to parse LLM response', {
+          response: aiResult.content.slice(0, 200),
+        });
+        return {
+          response: null,
+          rankedCandidates: [],
+          needsClarification: false,
+        };
+      }
+
+      // Map ranked refs back to LintCandidate with LLM reasoning
+      const rankedCandidates = parsed.ranked
+        .map(r => {
+          const original = validCandidates.find(c => c.ref === r.ref);
+          if (!original) return null;
+          return {
+            ...original,
+            llmReason: r.reason,
+            llmConfidence: r.confidence,
+          };
+        })
+        .filter((c): c is LintCandidate & { llmReason: string; llmConfidence: number } => c !== null);
+
+      return {
+        response: parsed,
+        rankedCandidates,
+        needsClarification: parsed.needsClarification,
+        clarificationQuestion: parsed.clarificationQuestion,
+        interpretation: parsed.interpretation,
+      };
+    } catch (error) {
+      logger.error('[INTENT_LINT] LLM semantic matching failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        response: null,
+        rankedCandidates: [],
+        needsClarification: false,
+      };
+    }
+  }
+
+  /**
+   * V4: Lint step with embeddings-based semantic matching (PRIMARY)
+   *
+   * Pipeline:
+   * 1. Try embeddings-based resolver (multilingual, no hardcoded dictionaries)
+   * 2. If embeddings failed (degradedMode) → fall back to rule-based + LLM
+   * 3. If needs_clarification → generate clarification question with LLM
+   * 4. Return result with metrics
+   */
+  static async lintStepWithAI(params: {
+    previewSessionId: string;
+    stepDraft: IntentStep;
+    pageRef?: string;
+    userId: string;
+  }): Promise<LintResult> {
+    const { previewSessionId, stepDraft, userId } = params;
+
+    logger.debug('[INTENT_LINT_V4] Linting step with embeddings', {
+      previewSessionId,
+      stepType: stepDraft.type,
+      description: stepDraft.description.slice(0, 50),
+    });
+
+    // Non-targeting actions don't need element resolution
+    if (['navigate', 'wait'].includes(stepDraft.type)) {
+      return {
+        status: 'resolved',
+        message: `Action "${stepDraft.type}" does not require element targeting`,
+        confidence: 1,
+        candidates: [],
+        highlight: [],
+      };
+    }
+
+    // Get snapshot
+    const sessionService = getPreviewSessionService();
+    const snapshot = await sessionService.getSnapshot(previewSessionId, userId);
+
+    if (!snapshot) {
+      return {
+        status: 'error',
+        message: 'Preview session not found or expired',
+        confidence: 0,
+        candidates: [],
+        highlight: [],
+      };
+    }
+
+    // Step 1: Try embeddings-based resolver (PRIMARY)
+    const embeddingsResult = await resolveWithEmbeddings({
+      previewSessionId,
+      stepDraft,
+      domNodes: snapshot.domNodes,
+      pageUrl: snapshot.url,
+    });
+
+    // Step 2: If embeddings failed, fall back to rule-based + LLM
+    if (embeddingsResult.degradedMode) {
+      logger.warn('[INTENT_LINT_V4] Embeddings degraded, falling back to rule-based', {
+        previewSessionId,
+        degradedReason: embeddingsResult.degradedReason,
+      });
+
+      // Use old rule-based + LLM fallback
+      return this.lintStepWithRuleBasedFallback(params, snapshot);
+    }
+
+    // Step 3: If needs_clarification, generate clarification question with LLM
+    if (embeddingsResult.status === 'needs_clarification' && embeddingsResult.candidates.length > 0) {
+      // Generate clarification question using LLM (text only, not selection)
+      const clarifyResult = await this.generateClarificationQuestion({
+        userIntent: sanitizeIntent(stepDraft),
+        actionType: stepDraft.type,
+        pageUrl: snapshot.url,
+        candidates: embeddingsResult.candidates,
+        domNodes: snapshot.domNodes,
+      });
+
+      if (clarifyResult.question) {
+        return {
+          ...embeddingsResult,
+          message: clarifyResult.question,
+          clarificationQuestion: clarifyResult.question,
+          interpretation: clarifyResult.interpretation,
+        };
+      }
+    }
+
+    // Step 4: Return embeddings result
+    return embeddingsResult;
+  }
+
+  /**
+   * V4: Rule-based fallback (used when embeddings fail)
+   * IMPORTANT: LLM is allowed ONLY to generate clarification text (never selects refs).
+   */
+  private static async lintStepWithRuleBasedFallback(
+    params: {
+      previewSessionId: string;
+      stepDraft: IntentStep;
+      pageRef?: string;
+      userId: string;
+    },
+    snapshot: { url: string; domNodes: InteractiveNode[] }
+  ): Promise<LintResult> {
+    const { previewSessionId, stepDraft } = params;
+
+    // Rule-based scoring (degraded path)
+    const ruleResult = await this.lintStep(params);
+
+    // If high confidence resolved, return immediately
+    if (ruleResult.status === 'resolved' && ruleResult.confidence >= 0.7) {
+      return {
+        ...ruleResult,
+        degradedMode: true,
+        degradedReason: 'embeddings_unavailable',
+      };
+    }
+
+    // If there are no candidates, nothing to clarify
+    if (ruleResult.candidates.length === 0) {
+      return {
+        ...ruleResult,
+        degradedMode: true,
+        degradedReason: 'embeddings_unavailable',
+      };
+    }
+
+    // Convert ambiguous/low-confidence into needs_clarification for UI flow
+    const validCandidates = ruleResult.candidates
+      .filter((c) => c.ref && c.ref.trim().length > 0)
+      .slice(0, 3);
+
+    if (validCandidates.length === 0) {
+      return {
+        status: 'not_found',
+        message: 'No interactive elements found on page',
+        confidence: 0,
+        candidates: [],
+        highlight: [],
+        degradedMode: true,
+        degradedReason: 'embeddings_unavailable',
+      };
+    }
+
+    logger.info('[INTENT_LINT_V4] Degraded mode: asking clarification (rule-based candidates)', {
+      previewSessionId,
+      stepType: stepDraft.type,
+      candidateCount: validCandidates.length,
+    });
+
+    const clarifyResult = await this.generateClarificationQuestion({
+      userIntent: sanitizeIntent(stepDraft),
+      actionType: stepDraft.type,
+      pageUrl: snapshot.url,
+      candidates: validCandidates,
+      domNodes: snapshot.domNodes,
+    });
+
+    return {
+      status: 'needs_clarification',
+      message: clarifyResult.question || ruleResult.message || 'Please select the correct element',
+      confidence: 0,
+      candidates: validCandidates,
+      highlight: validCandidates.map((c) => ({
+        ref: c.ref,
+        boundingBox: c.boundingBox,
+        type: 'warning' as const,
+      })),
+      interpretation: clarifyResult.interpretation,
+      clarificationQuestion: clarifyResult.question,
+      needsAiFallback: false,
+      degradedMode: true,
+      degradedReason: 'embeddings_unavailable',
+    };
+  }
+
+  /**
+   * V4: Generate clarification question using LLM
+   * Only generates text, does NOT select elements (already ranked by embeddings)
+   */
+  private static async generateClarificationQuestion(params: {
+    userIntent: string;
+    actionType: string;
+    pageUrl: string;
+    candidates: LintCandidate[];
+    domNodes: InteractiveNode[];
+  }): Promise<{
+    question?: string;
+    interpretation?: string;
+  }> {
+    try {
+      const { getChatCompletionWithMessages } = await import('@/services/ai/core/openai.service');
+
+      // Build candidate descriptions
+      const candidateList = params.candidates.slice(0, 3).map((c, i) => {
+        const node = params.domNodes.find(n => n.ref === c.ref);
+        return `${i + 1}. "${c.label}" (${node?.tag || 'element'})`;
+      }).join('\n');
+
+      const prompt = `You are helping a user select the correct UI element for a test step.
+
+USER INTENT: "${params.userIntent}"
+ACTION: ${params.actionType}
+
+CANDIDATE ELEMENTS (already ranked by relevance):
+${candidateList}
+
+Generate a SHORT clarification question in the SAME LANGUAGE as the user's intent.
+The question should help the user choose between these specific elements.
+
+Reply with JSON only:
+{"question": "brief question in user's language", "interpretation": "what user wants to do"}`;
+
+      const result = await getChatCompletionWithMessages(
+        [{ role: 'user', content: prompt }],
+        {
+          max_tokens: 100,
+          temperature: 0.1,
+          model: 'gpt-4o-mini',
+          response_format: { type: 'json_object' },
+        }
+      );
+
+      const parsed = JSON.parse(result.content);
+      return {
+        question: parsed.question,
+        interpretation: parsed.interpretation,
+      };
+    } catch (error) {
+      logger.warn('[INTENT_LINT_V4] Clarification question generation failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {};
+    }
   }
 
   /**

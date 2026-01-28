@@ -41,9 +41,19 @@ export async function startPreview(req: Request, res: Response): Promise<void> {
       startUrl: safeStartUrl,
     });
 
+    // Get viewport metadata for coordinate mapping
+    const viewportMeta = sessionService.getViewportMetadata(result.previewSessionId, userId);
+
     res.json({
       success: true,
-      data: result,
+      data: {
+        ...result,
+        viewport: viewportMeta ? {
+          width: viewportMeta.width,
+          height: viewportMeta.height,
+        } : { width: 1280, height: 720 },
+        devicePixelRatio: viewportMeta?.devicePixelRatio || 1,
+      },
     });
   } catch (error) {
     logger.error('[PREVIEW_CONTROLLER] Failed to start preview', {

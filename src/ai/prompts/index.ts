@@ -35,6 +35,17 @@ export {
   buildActionGenerationPrompt, buildLogicAnalysisPrompt, buildNextStepPrompt, buildPageAnalysisPrompt, buildVisionPrompt
 } from './intelligent-testing-prompts';
 
+// Re-export from editor-resolver-prompts.ts
+export {
+  buildEditorResolverUserPrompt,
+  EDITOR_RESOLVER_SYSTEM_PROMPT,
+  parseEditorResolverResponse,
+  type EditorResolverCandidate,
+  type EditorResolverParams,
+  type ResolverRankedCandidate,
+  type ResolverResponse,
+} from './editor-resolver-prompts';
+
 // ═══════════════════════════════════════════════════════════════════════════
 // UTILITY FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -72,6 +83,7 @@ export {
 // EXPORT ALL PROMPT BUILDERS (for backward compatibility)
 // ═══════════════════════════════════════════════════════════════════════════
 
+import { buildEditorResolverUserPrompt, EDITOR_RESOLVER_SYSTEM_PROMPT } from './editor-resolver-prompts';
 import { buildActionGenerationPrompt, buildLogicAnalysisPrompt, buildNextStepPrompt, buildPageAnalysisPrompt, buildVisionPrompt } from './intelligent-testing-prompts';
 import { buildApprovalDetectionPrompt, buildChatSystemPrompt, buildIntentPrompt } from './intent-and-chat-prompts';
 import {
@@ -126,4 +138,8 @@ export const Prompts = {
 
   // 12. Utilities
   // buildContextString, // TODO: Temporarily disabled (KB disabled)
+
+  // 13. Editor resolver (step editor AI matching)
+  buildEditorResolverUserPrompt,
+  EDITOR_RESOLVER_SYSTEM_PROMPT,
 };

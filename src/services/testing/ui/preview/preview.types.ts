@@ -212,7 +212,7 @@ export interface IntentStep {
 /**
  * Lint status
  */
-export type LintStatus = 'resolved' | 'ambiguous' | 'not_found' | 'error';
+export type LintStatus = 'resolved' | 'ambiguous' | 'not_found' | 'needs_clarification' | 'error';
 
 /**
  * Candidate element from linting
@@ -254,6 +254,26 @@ export interface LintResult {
   aiResolvedRef?: string;
   /** V2: AI reasoning (if AI fallback was used) */
   aiReason?: string;
+  /** V3: AI interpretation of user intent */
+  interpretation?: string;
+  /** V3: Clarification question for user (in user's language) */
+  clarificationQuestion?: string;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V4: Embeddings-based resolver fields
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** True if embeddings failed and rule-based fallback was used */
+  degradedMode?: boolean;
+  /** Reason for degraded mode (e.g., "embeddings_timeout", "rate_limited") */
+  degradedReason?: string;
+  /** Top similarity score from embeddings ranking */
+  topSimilarity?: number;
+  /** Delta between top and second similarity */
+  similarityDelta?: number;
+  /** Whether embeddings cache was hit */
+  cacheHit?: boolean;
+  /** Embeddings latency in milliseconds */
+  embeddingsLatencyMs?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -305,6 +325,11 @@ export interface StartPreviewResponse {
   url: string;
   domNodes: InteractiveNode[];
   screenshot?: string;
+  viewport?: {
+    width: number;
+    height: number;
+  };
+  devicePixelRatio?: number;
 }
 
 /**

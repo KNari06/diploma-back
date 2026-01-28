@@ -7,12 +7,13 @@
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import type { Page } from 'playwright';
+import { sanitizeIntent } from './embeddings-resolver.service';
 import { IntentStepLintService } from './intent-step-lint.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type {
-  IntentStep,
-  InteractiveNode,
-  LintCandidate,
+    IntentStep,
+    InteractiveNode,
+    LintCandidate,
 } from './preview.types';
 
 // Max attempts to try different candidates
@@ -268,19 +269,22 @@ export class PreviewStepApplyService {
   /**
    * Apply a step in the preview session
    * Tries top candidates with limited retries
+   * V3: If selectedRef is provided (from user clarification), use it directly
    */
   static async applyStep(params: {
     previewSessionId: string;
     stepDraft: IntentStep;
     pageRef?: string;
     userId: string;
+    selectedRef?: string; // V3: User-confirmed element ref from clarification
   }): Promise<ApplyResult> {
-    const { previewSessionId, stepDraft, userId } = params;
+    const { previewSessionId, stepDraft, userId, selectedRef } = params;
 
     logger.info('[PREVIEW_APPLY] Applying step', {
       previewSessionId,
       stepType: stepDraft.type,
-      description: stepDraft.description,
+      descriptionPreview: sanitizeIntent(stepDraft).slice(0, 80),
+      selectedRef: selectedRef || 'none (will lint)',
     });
 
     try {
@@ -295,14 +299,7 @@ export class PreviewStepApplyService {
         };
       }
 
-      // Lint the step to get candidates
-      const lintResult = await IntentStepLintService.lintStep({
-        previewSessionId,
-        stepDraft,
-        userId,
-      });
-
-      // Handle non-targeting actions
+      // Handle non-targeting actions (navigate, wait)
       if (['navigate', 'wait'].includes(stepDraft.type)) {
         const result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
         return {
@@ -312,6 +309,87 @@ export class PreviewStepApplyService {
           urlChanged: result.urlChanged,
           url: page.url(),
           attempts: 1,
+        };
+      }
+
+      // V3: If user confirmed a selection, use it directly without re-linting
+      if (selectedRef) {
+        logger.info('[PREVIEW_APPLY] Using user-confirmed selectedRef', {
+          previewSessionId,
+          selectedRef,
+        });
+
+        const confirmedCandidate: LintCandidate = {
+          ref: selectedRef,
+          label: 'User confirmed',
+          reason: 'User selected from clarification options',
+          confidence: 1.0,
+        };
+
+        const result = await executeAction(page, stepDraft, confirmedCandidate);
+
+        if (result.success) {
+          // Wait for page to settle
+          await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
+
+          // Update step evidence
+          const updatedStep: IntentStep = {
+            ...stepDraft,
+            evidence: {
+              ...stepDraft.evidence,
+              lastSuccessRef: selectedRef,
+              confidence: 1.0,
+            },
+          };
+
+          return {
+            success: true,
+            appliedStep: updatedStep,
+            urlChanged: result.urlChanged,
+            url: page.url(),
+            highlight: [{
+              ref: selectedRef,
+              type: 'success',
+            }],
+            attempts: 1,
+          };
+        }
+
+        // If confirmed selection failed, return error (don't fallback to lint)
+        return {
+          success: false,
+          error: result.error || 'Failed to apply user-confirmed element',
+          highlight: [{
+            ref: selectedRef,
+            type: 'error',
+          }],
+          attempts: 1,
+        };
+      }
+
+      // Normal flow: Lint the step to get candidates
+      const lintResult = await IntentStepLintService.lintStepWithAI({
+        previewSessionId,
+        stepDraft,
+        pageRef: params.pageRef,
+        userId,
+      });
+
+      if (lintResult.status === 'needs_clarification') {
+        return {
+          success: false,
+          error: lintResult.message || 'Please clarify which element to use',
+          highlight: lintResult.highlight,
+          attempts: 0,
+        };
+      }
+
+      if (lintResult.status === 'error') {
+        return {
+          success: false,
+          error: lintResult.message || 'Linting failed',
+          highlight: [],
+          attempts: 0,
         };
       }
 

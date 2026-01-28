@@ -21,6 +21,16 @@ export interface ClientToServerEvents {
   // Preview step operations
   'preview:step:lint': (data: PreviewStepLintRequest) => void;
   'preview:step:apply': (data: PreviewStepApplyRequest) => void;
+  'preview:step:clarify:select': (data: PreviewClarifySelectRequest) => void;
+
+  // Preview interactive control (mouse/keyboard)
+  'preview:mouse:move': (data: PreviewMouseMoveRequest) => void;
+  'preview:mouse:click': (data: PreviewMouseClickRequest) => void;
+  'preview:mouse:down': (data: PreviewMouseButtonRequest) => void;
+  'preview:mouse:up': (data: PreviewMouseButtonRequest) => void;
+  'preview:mouse:wheel': (data: PreviewMouseWheelRequest) => void;
+  'preview:keyboard:type': (data: PreviewKeyboardTypeRequest) => void;
+  'preview:keyboard:press': (data: PreviewKeyboardPressRequest) => void;
 
   // Clarification
   'test:clarification:response': (data: { testId: string; questionId: string; answer: string }) => void;
@@ -84,6 +94,11 @@ export interface ServerToClientEvents {
   'preview:page': (data: PreviewPagePayload) => void;
   'preview:step:lint:result': (data: PreviewStepLintResultPayload) => void;
   'preview:step:apply:result': (data: PreviewStepApplyResultPayload) => void;
+  'preview:step:clarify': (data: PreviewClarifyPayload) => void;
+
+  // Preview interactive control responses
+  'preview:viewport': (data: PreviewViewportPayload) => void;
+  'preview:mouse:result': (data: PreviewMouseResultPayload) => void;
 
   // Heartbeat response
   pong: () => void;
@@ -632,6 +647,15 @@ export interface PreviewIntentStep {
     autocomplete?: string;
     type?: string;
   };
+  /** Step execution options */
+  options?: {
+    /** Timeout in ms (for wait action) */
+    timeout?: number;
+    /** If false, use page.type instead of page.fill (for fill action) */
+    replaceContent?: boolean;
+    /** Press Enter after fill (for fill action) */
+    pressEnter?: boolean;
+  };
 }
 
 /**
@@ -687,11 +711,15 @@ export interface PreviewPagePayload {
  * Step lint result payload
  */
 export interface PreviewStepLintResultPayload {
-  status: 'resolved' | 'ambiguous' | 'not_found' | 'error';
+  status: 'resolved' | 'ambiguous' | 'not_found' | 'needs_clarification' | 'error';
   message: string;
   confidence: number;
   candidates: PreviewLintCandidate[];
   highlight: PreviewHighlight[];
+  /** LLM interpretation of user intent (when AI resolver is used) */
+  interpretation?: string;
+  /** Clarification question from AI (in user's language) */
+  clarificationQuestion?: string;
   timestamp: string;
 }
 
@@ -706,6 +734,120 @@ export interface PreviewStepApplyResultPayload {
   url?: string;
   highlight?: PreviewHighlight[];
   attempts?: number;
+  timestamp: string;
+}
+
+/**
+ * Clarify payload (server -> client)
+ * Sent when AI resolver needs user to choose between similar elements
+ */
+export interface PreviewClarifyPayload {
+  previewSessionId: string;
+  stepId: string;
+  candidates: Array<{
+    ref: string;
+    label: string;
+    reason: string;
+    boundingBox?: PreviewBoundingBox;
+  }>;
+  /** AI interpretation of user intent */
+  interpretation: string;
+  /** Question to show user (in user's language) */
+  message: string;
+  timestamp: string;
+}
+
+/**
+ * Clarify select request (client -> server)
+ * User has selected one of the clarification options
+ */
+export interface PreviewClarifySelectRequest {
+  previewSessionId: string;
+  stepId: string;
+  selectedRef: string;
+}
+
+// ============================================================================
+// PREVIEW INTERACTIVE CONTROL PAYLOADS
+// ============================================================================
+
+/**
+ * Mouse move request (hover)
+ */
+export interface PreviewMouseMoveRequest {
+  previewSessionId: string;
+  x: number;
+  y: number;
+}
+
+/**
+ * Mouse click request
+ */
+export interface PreviewMouseClickRequest {
+  previewSessionId: string;
+  x: number;
+  y: number;
+  button?: 'left' | 'right' | 'middle';
+  clickCount?: number; // 1=single, 2=double
+}
+
+/**
+ * Mouse button request (down/up for drag)
+ */
+export interface PreviewMouseButtonRequest {
+  previewSessionId: string;
+  x: number;
+  y: number;
+  button?: 'left' | 'right' | 'middle';
+}
+
+/**
+ * Mouse wheel request (scroll)
+ */
+export interface PreviewMouseWheelRequest {
+  previewSessionId: string;
+  deltaX: number;
+  deltaY: number;
+}
+
+/**
+ * Keyboard type request (insert text)
+ */
+export interface PreviewKeyboardTypeRequest {
+  previewSessionId: string;
+  text: string;
+}
+
+/**
+ * Keyboard press request (key with modifiers)
+ */
+export interface PreviewKeyboardPressRequest {
+  previewSessionId: string;
+  key: string; // 'Enter', 'Escape', 'ArrowDown', etc.
+  modifiers?: ('Control' | 'Shift' | 'Alt' | 'Meta')[];
+}
+
+/**
+ * Viewport metadata payload (for coordinate mapping)
+ */
+export interface PreviewViewportPayload {
+  previewSessionId: string;
+  viewport: {
+    width: number;
+    height: number;
+  };
+  devicePixelRatio: number;
+  timestamp: string;
+}
+
+/**
+ * Mouse/keyboard action result (lightweight acknowledgment)
+ */
+export interface PreviewMouseResultPayload {
+  previewSessionId: string;
+  success: boolean;
+  action: 'move' | 'click' | 'down' | 'up' | 'wheel' | 'type' | 'press';
+  error?: string;
   timestamp: string;
 }
 
