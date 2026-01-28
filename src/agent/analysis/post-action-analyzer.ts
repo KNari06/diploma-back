@@ -15,7 +15,15 @@ import OpenAI from 'openai';
 import { Page } from 'playwright';
 import { DynamicAction } from '../types/intelligent-testing.types';
 
-const openai = new OpenAI();
+let openaiClient: OpenAI | null = null;
+
+function getOpenAIClient(): OpenAI {
+  // Lazy init: avoid crashing test imports when OPENAI_API_KEY is not set.
+  if (!openaiClient) {
+    openaiClient = new OpenAI();
+  }
+  return openaiClient;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -433,7 +441,7 @@ RULES:
 - CRITICAL: Do NOT suggest clicking on the same element that was just clicked (check action description and text)
 - If the executed action was a click and succeeded, do NOT suggest clicking the same button/element again`;
 
-      const response = await openai.chat.completions.create({
+      const response = await getOpenAIClient().chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
           { role: 'system', content: 'You are a QA automation expert. Respond with valid JSON only.' },
