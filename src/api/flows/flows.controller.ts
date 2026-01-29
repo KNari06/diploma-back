@@ -4,7 +4,11 @@
  */
 
 import { FlowService } from '@/services/testing/flows/flow.service';
+import { DefaultSuiteService } from '@/services/testing/regression/default-suite.service';
+import { ModuleService } from '@/services/testing/modules/module.service';
+import { supabaseAdmin } from '@/db/supabase';
 import { NotFoundError, ValidationError } from '@/types';
+import type { PlatformKey } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -20,20 +24,58 @@ function getUserId(req: AuthenticatedRequest): string {
 
 /**
  * Create a new test flow
+ * Accepts either suiteId (direct) or moduleId (resolves default suite)
+ * When moduleId is provided, also creates 1 initial empty test case
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { suiteId, name, description, flowType, tags, priority, preconditions, expectedResult } = req.body;
+    const { suiteId, moduleId, name, description, flowType, tags, priority, preconditions, expectedResult } = req.body;
 
-    if (!suiteId || !name) {
-      res.status(400).json({ success: false, error: 'suiteId and name are required' });
+    // Validate: either suiteId or moduleId required (but not both)
+    if (!suiteId && !moduleId) {
+      res.status(400).json({ success: false, error: 'Either suiteId or moduleId is required' });
+      return;
+    }
+
+    if (suiteId && moduleId) {
+      res.status(400).json({ success: false, error: 'Provide either suiteId or moduleId, not both' });
+      return;
+    }
+
+    if (!name) {
+      res.status(400).json({ success: false, error: 'name is required' });
       return;
     }
 
     const userId = getUserId(req);
 
+    // Resolve suiteId from moduleId if needed
+    let resolvedSuiteId = suiteId;
+    let platformKey: PlatformKey | undefined;
+    let projectId: string | undefined;
+
+    if (moduleId) {
+      // Get module info (includes project_id and platform_key)
+      const module = await ModuleService.getById(moduleId, userId);
+      if (!module) {
+        res.status(404).json({ success: false, error: 'Module not found' });
+        return;
+      }
+      
+      platformKey = module.platformKey;
+      projectId = module.projectId;
+
+      resolvedSuiteId = await DefaultSuiteService.ensureDefaultSuite(moduleId, userId);
+      logger.info('[FLOWS_API] Resolved default suite for module', {
+        moduleId,
+        suiteId: resolvedSuiteId,
+        platformKey,
+      });
+    }
+
+    // Create flow
     const flow = await FlowService.create({
-      suiteId,
+      suiteId: resolvedSuiteId,
       userId,
       name,
       description,
@@ -44,7 +86,63 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
       expectedResult,
     });
 
-    res.json({ success: true, data: flow, timestamp: new Date() });
+    // Create initial test case if moduleId was provided
+    let createdTestCaseId: string | undefined;
+    
+    if (moduleId && platformKey && projectId) {
+      if (platformKey === 'web_ui') {
+        // Create empty UI test case
+        const { data: testCase, error: testCaseError } = await supabaseAdmin
+          .from('saved_test_cases')
+          .insert({
+            project_id: projectId,
+            user_id: userId,
+            name: name, // Use flow name as default
+            kind: 'regression_member',
+            replay_strategy: 'commands',
+            flow_id: flow.id,
+            commands: [],
+            preconditions: preconditions || [],
+            setup_steps: [],
+            teardown_steps: [],
+            tags: tags || [],
+            priority: priority || null,
+            expected_result: expectedResult || null,
+            depends_on: [],
+          })
+          .select('id')
+          .single();
+
+        if (testCaseError) {
+          logger.error('[FLOWS_API] Failed to create initial test case', {
+            error: testCaseError,
+            flowId: flow.id,
+          });
+          // Don't fail the whole request, just log the error
+        } else {
+          createdTestCaseId = testCase.id;
+          logger.info('[FLOWS_API] Created initial test case', {
+            testCaseId: createdTestCaseId,
+            flowId: flow.id,
+          });
+        }
+      } else {
+        // For API platform, defer test case creation (requires endpoint_id)
+        logger.info('[FLOWS_API] Skipping initial test case creation for API platform', {
+          flowId: flow.id,
+          platformKey,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        flow,
+        createdTestCaseId: createdTestCaseId || null,
+      },
+      timestamp: new Date(),
+    });
   } catch (error) {
     logger.error('[FLOWS_API] Failed to create flow', { error });
     handleError(res, error, 'Failed to create flow');

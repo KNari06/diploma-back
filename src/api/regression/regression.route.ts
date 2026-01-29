@@ -1,21 +1,37 @@
 import { requireAuth } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import {
-    createSuite,
-    getRunStats,
-    listRuns,
-    listSavedTestCases,
-    listSuites,
-    runByPriority,
-    runByTag,
-    runFlow,
-    runModule,
-    runPlan,
-    runRegression,
-    saveTestCase,
+  createSuite,
+  getRunStats,
+  listRuns,
+  listSavedTestCases,
+  listSuites,
+  runByPriority,
+  runByTag,
+  runFlow,
+  runModule,
+  runPlan,
+  runRegression,
+  saveTestCase,
 } from './regression.controller';
 
 const router = Router();
+
+/**
+ * Regression API routes (replay-oriented).
+ *
+ * Key concepts (to avoid confusion with other "test" routes):
+ * - `tests` (execution): results of an actual run (produced by running UI/API tests)
+ * - `saved_test_cases` (definition): reusable UI test definitions used for replay/regression runs
+ * - `regression_suites` (collection): groups of saved test cases to run together
+ *
+ * This router mainly does 2 things:
+ * 1) Save: convert an already executed test (`tests`) into a reusable saved test case (`saved_test_cases`)
+ * 2) Run: execute saved definitions (saved test case / suite / module / flow / plan) and create new executions
+ *
+ * It does NOT provide "step editor" endpoints to manually author `saved_test_cases.commands`.
+ * Manual authoring is handled by the Preview/Intent Test Case endpoints (`/api/v1/preview/...`) in this codebase.
+ */
 
 /**
  * @swagger
@@ -59,6 +75,7 @@ const router = Router();
  *       422:
  *         description: Test is not replayable
  */
+// Save FROM execution: takes `sourceTestId` (completed test) -> creates `saved_test_cases` for replay.
 router.post('/save', requireAuth, saveTestCase);
 
 /**
@@ -116,7 +133,9 @@ router.post('/save', requireAuth, saveTestCase);
  *       200:
  *         description: List of suites
  */
+// List suites (collections of saved test cases) for a project.
 router.get('/suites', requireAuth, listSuites);
+// Create a suite (collection of saved test cases) for a project.
 router.post('/suites', requireAuth, createSuite);
 
 /**
@@ -158,6 +177,7 @@ router.post('/suites', requireAuth, createSuite);
  *       404:
  *         description: Resource not found
  */
+// Run/replay: execute a saved test case OR a suite (creates new execution run records).
 router.post('/run', requireAuth, runRegression);
 
 /**
@@ -179,6 +199,7 @@ router.post('/run', requireAuth, runRegression);
  *       200:
  *         description: List of saved test cases
  */
+// List saved test case definitions for a project (replay definitions, not execution history).
 router.get('/saved-test-cases', requireAuth, listSavedTestCases);
 
 /**
@@ -200,6 +221,7 @@ router.get('/saved-test-cases', requireAuth, listSavedTestCases);
  *       200:
  *         description: List of runs
  */
+// List regression run history/metadata for a project.
 router.get('/runs', requireAuth, listRuns);
 
 /**
@@ -228,6 +250,7 @@ router.get('/runs', requireAuth, listRuns);
  *       200:
  *         description: Plan run started
  */
+// Run a regression plan (a custom selection of tests).
 router.post('/run-plan', requireAuth, runPlan);
 
 /**
@@ -256,6 +279,7 @@ router.post('/run-plan', requireAuth, runPlan);
  *       200:
  *         description: Module run started
  */
+// Run all tests under a module (hierarchy shortcut).
 router.post('/run-module', requireAuth, runModule);
 
 /**
@@ -284,6 +308,7 @@ router.post('/run-module', requireAuth, runModule);
  *       200:
  *         description: Flow run started
  */
+// Run all tests under a flow (hierarchy shortcut).
 router.post('/run-flow', requireAuth, runFlow);
 
 /**
@@ -313,6 +338,7 @@ router.post('/run-flow', requireAuth, runFlow);
  *       200:
  *         description: Tag run started
  */
+// Run tests filtered by tag across a project.
 router.post('/run-by-tag', requireAuth, runByTag);
 
 /**
@@ -343,6 +369,7 @@ router.post('/run-by-tag', requireAuth, runByTag);
  *       200:
  *         description: Priority run started
  */
+// Run tests filtered by priority across a project.
 router.post('/run-by-priority', requireAuth, runByPriority);
 
 /**
@@ -364,6 +391,7 @@ router.post('/run-by-priority', requireAuth, runByPriority);
  *       200:
  *         description: Run stats
  */
+// Get aggregated execution stats for a specific runId (progress, pass/fail counts, etc.).
 router.get('/runs/:runId/stats', requireAuth, getRunStats);
 
 export default router;

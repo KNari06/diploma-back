@@ -35,7 +35,11 @@ const router = Router();
  *       200:
  *         description: List of flows
  *   post:
- *     summary: Create a new flow
+ *     summary: Create a new flow (with optional moduleId for auto-suite resolution)
+ *     description: |
+ *       Create a new test flow. You can either:
+ *       - Provide `suiteId` to create flow under existing suite
+ *       - Provide `moduleId` to auto-create/resolve Default suite and create 1 initial test case
  *     tags: [Flows]
  *     security:
  *       - bearerAuth: []
@@ -46,29 +50,69 @@ const router = Router();
  *           schema:
  *             type: object
  *             required:
- *               - suiteId
  *               - name
  *             properties:
  *               suiteId:
  *                 type: string
  *                 format: uuid
+ *                 description: Suite ID (either suiteId or moduleId required, not both)
+ *               moduleId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: Module ID - will auto-create Default suite and initial test case
  *               name:
  *                 type: string
+ *                 description: Flow name
  *               description:
  *                 type: string
+ *                 description: Optional flow description
  *               flowType:
  *                 type: string
  *                 enum: [ui, api, mixed]
+ *                 description: Flow type (defaults to ui)
  *               tags:
  *                 type: array
  *                 items:
  *                   type: string
+ *                 description: Flow tags
  *               priority:
  *                 type: string
  *                 enum: [critical, high, medium, low]
+ *                 description: Flow priority
+ *               preconditions:
+ *                 type: array
+ *                 description: Precondition steps
+ *               expectedResult:
+ *                 type: string
+ *                 description: Expected result description
  *     responses:
  *       200:
- *         description: Flow created
+ *         description: Flow created successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     flow:
+ *                       type: object
+ *                       description: Created flow object
+ *                     createdTestCaseId:
+ *                       type: string
+ *                       format: uuid
+ *                       nullable: true
+ *                       description: ID of initial test case (only when moduleId used, web_ui platform only)
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: Bad request (validation error)
+ *       404:
+ *         description: Module not found
  */
 router.get('/', requireAuth, listFlows);
 router.post('/', requireAuth, createFlow);
