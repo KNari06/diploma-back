@@ -2,7 +2,12 @@ import { Request, Response } from 'express';
 import { handlePlatformTest as handlePlatformTestOriginal } from '../ai_test/handler';
 import { handleApiTest as handleApiTestOriginal } from '../api_test/handler';
 import { handleGeneralChat as handleGeneralChatOriginal } from '../general/handler';
+import { handleAddToPlanIntent } from '../regression/add-to-plan.handler';
+import { handleCreatePlanIntent } from '../regression/create-plan.handler';
 import { handleCreateSuiteIntent } from '../regression/create-suite.handler';
+import { handleRunByTagIntent } from '../regression/run-by-tag.handler';
+import { handleRunModuleIntent } from '../regression/run-module.handler';
+import { handleRunPlanIntent } from '../regression/run-plan.handler';
 import { handleRunRegressionIntent } from '../regression/run-regression.handler';
 import { handleSaveTestIntent } from '../regression/save-test.handler';
 import { handleClarificationRequest as handleClarificationOriginal } from './clarification';
@@ -131,6 +136,13 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
   save_test: handleSaveTestIntent,
   create_suite: handleCreateSuiteIntent,
   run_regression: handleRunRegressionIntent,
+
+  // New hierarchy intents
+  run_plan: handleRunPlanIntent,
+  create_plan: handleCreatePlanIntent,
+  add_to_plan: handleAddToPlanIntent,
+  run_module: handleRunModuleIntent,
+  run_by_tag: handleRunByTagIntent,
 };
 
 /**
@@ -181,5 +193,10 @@ export function getIntentDescriptions(): Record<string, string> {
     save_test: 'User wants to save current/last test flow for replay',
     create_suite: 'User wants to create a regression suite from test cases',
     run_regression: 'User wants to run a saved test case or suite',
+    run_plan: 'User wants to run a regression plan (custom test set)',
+    create_plan: 'User wants to create a regression plan',
+    add_to_plan: 'User wants to add module/suite/flow to a regression plan',
+    run_module: 'User wants to run all tests in a module',
+    run_by_tag: 'User wants to run tests by tag (e.g., "run critical tests")',
   };
 }

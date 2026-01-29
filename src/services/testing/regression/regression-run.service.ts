@@ -1,6 +1,10 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { ApiConfigService } from '@/services/api/api-config.service';
 import { NotFoundError, ValidationError } from '@/types';
+import type { Priority, RunResult } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { ExecutionService } from '../executions/execution.service';
+import { RegressionPlanService } from '../plans/regression-plan.service';
 import { ManualTestService } from '../ui/manualTest.service';
 
 /**
@@ -566,5 +570,863 @@ export class RegressionRunService {
     if (project.user_id !== userId) {
       throw new ValidationError('Access denied to this project');
     }
+  }
+
+  // =========================================================================
+  // NEW HIERARCHY METHODS
+  // =========================================================================
+
+  /**
+   * Run a regression plan
+   * Expands plan to individual test cases and executes them
+   *
+   * @param params.planId - ID of regression plan to run
+   * @param params.userId - User ID for ownership verification
+   * @param params.trigger - Trigger type
+   * @param params.parameters - Runtime parameters
+   * @returns Run result with run ID and test case count
+   */
+  static async runPlan(params: {
+    planId: string;
+    userId: string;
+    trigger: 'manual' | 'chat' | 'scheduled';
+    parameters?: Record<string, any>;
+  }): Promise<RunResult> {
+    const { planId, userId, trigger, parameters = {} } = params;
+
+    try {
+      logger.info('[REGRESSION_RUN] Running plan', { planId, userId, trigger });
+
+      // 1. Verify plan access and expand to test cases
+      const plan = await RegressionPlanService.getById(planId, userId);
+      if (!plan) {
+        throw new NotFoundError('Regression plan', planId);
+      }
+
+      const expandedCases = await RegressionPlanService.expandPlan(planId);
+      if (expandedCases.length === 0) {
+        throw new ValidationError('Plan has no test cases');
+      }
+
+      // 2. Create regression run record with plan_id
+      const { data: run, error: runError } = await supabaseAdmin
+        .from('regression_runs')
+        .insert({
+          plan_id: planId,
+          project_id: plan.projectId,
+          user_id: userId,
+          trigger,
+          status: 'running',
+        })
+        .select('id')
+        .single();
+
+      if (runError || !run) {
+        throw new Error(`Failed to create plan run: ${runError?.message}`);
+      }
+
+      // 3. Create execution records for all test cases
+      const executions = await ExecutionService.createBatch(
+        run.id,
+        expandedCases.map((tc) => ({
+          testCaseId: tc.testCaseId,
+          testType: tc.testType,
+          moduleId: tc.moduleId,
+          suiteId: tc.suiteId,
+          flowId: tc.flowId,
+        }))
+      );
+
+      // 4. Start executing tests (async, don't wait)
+      this.executeTestCasesAsync(
+        run.id,
+        expandedCases,
+        userId,
+        trigger,
+        parameters
+      ).catch((error) => {
+        logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+      });
+
+      logger.info('[REGRESSION_RUN] Plan execution started', {
+        runId: run.id,
+        planId,
+        totalCases: expandedCases.length,
+      });
+
+      return {
+        runId: run.id,
+        executionIds: executions.map((e) => e.id),
+        totalTests: expandedCases.length,
+      };
+    } catch (error) {
+      logger.error('[REGRESSION_RUN] Failed to run plan', { error, planId });
+      throw error;
+    }
+  }
+
+  /**
+   * Run all tests in a module
+   *
+   * @param params.moduleId - ID of module to run
+   * @param params.userId - User ID for ownership verification
+   * @param params.trigger - Trigger type
+   * @param params.parameters - Runtime parameters
+   * @returns Run result
+   */
+  static async runModule(params: {
+    moduleId: string;
+    userId: string;
+    trigger: 'manual' | 'chat' | 'scheduled';
+    parameters?: Record<string, any>;
+  }): Promise<RunResult> {
+    const { moduleId, userId, trigger, parameters = {} } = params;
+
+    try {
+      logger.info('[REGRESSION_RUN] Running module', { moduleId, userId, trigger });
+
+      // 1. Get module and verify access
+      const { data: mod, error: modError } = await supabaseAdmin
+        .from('test_modules')
+        .select('*, projects!inner(user_id)')
+        .eq('id', moduleId)
+        .single();
+
+      if (modError || !mod) {
+        throw new NotFoundError('Module', moduleId);
+      }
+
+      if ((mod.projects as any)?.user_id !== userId) {
+        throw new ValidationError('Access denied to this module');
+      }
+
+      // 2. Get all suites in module
+      const { data: suites } = await supabaseAdmin
+        .from('regression_suites')
+        .select('id')
+        .eq('module_id', moduleId);
+
+      const suiteIds = (suites || []).map((s: any) => s.id);
+      if (suiteIds.length === 0) {
+        throw new ValidationError('Module has no suites');
+      }
+
+      // 3. Get all flows in suites
+      const { data: flows } = await supabaseAdmin
+        .from('test_flows')
+        .select('id')
+        .in('suite_id', suiteIds);
+
+      const flowIds = (flows || []).map((f: any) => f.id);
+
+      // 4. Get all test cases in flows
+      const testCases = await this.getTestCasesInFlows(flowIds);
+
+      if (testCases.length === 0) {
+        throw new ValidationError('Module has no test cases');
+      }
+
+      // 5. Create regression run record
+      const { data: run, error: runError } = await supabaseAdmin
+        .from('regression_runs')
+        .insert({
+          module_id: moduleId,
+          project_id: mod.project_id,
+          user_id: userId,
+          trigger,
+          status: 'running',
+        })
+        .select('id')
+        .single();
+
+      if (runError || !run) {
+        throw new Error(`Failed to create module run: ${runError?.message}`);
+      }
+
+      // 6. Create execution records
+      const executions = await ExecutionService.createBatch(run.id, testCases);
+
+      // 7. Start async execution
+      this.executeTestCasesAsync(
+        run.id,
+        testCases.map((tc) => ({
+          testCaseId: tc.testCaseId,
+          testType: tc.testType,
+          moduleId: tc.moduleId,
+          suiteId: tc.suiteId,
+          flowId: tc.flowId,
+        })),
+        userId,
+        trigger,
+        parameters
+      ).catch((error) => {
+        logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+      });
+
+      return {
+        runId: run.id,
+        executionIds: executions.map((e) => e.id),
+        totalTests: testCases.length,
+      };
+    } catch (error) {
+      logger.error('[REGRESSION_RUN] Failed to run module', { error, moduleId });
+      throw error;
+    }
+  }
+
+  /**
+   * Run all tests in a flow
+   *
+   * @param params.flowId - ID of flow to run
+   * @param params.userId - User ID for ownership verification
+   * @param params.trigger - Trigger type
+   * @param params.parameters - Runtime parameters
+   * @returns Run result
+   */
+  static async runFlow(params: {
+    flowId: string;
+    userId: string;
+    trigger: 'manual' | 'chat' | 'scheduled';
+    parameters?: Record<string, any>;
+  }): Promise<RunResult> {
+    const { flowId, userId, trigger, parameters = {} } = params;
+
+    try {
+      logger.info('[REGRESSION_RUN] Running flow', { flowId, userId, trigger });
+
+      // 1. Get flow and verify access
+      const { data: flow, error: flowError } = await supabaseAdmin
+        .from('test_flows')
+        .select('*, regression_suites!inner(project_id, module_id, projects!inner(user_id))')
+        .eq('id', flowId)
+        .single();
+
+      if (flowError || !flow) {
+        throw new NotFoundError('Flow', flowId);
+      }
+
+      const suite = flow.regression_suites as any;
+      if (suite?.projects?.user_id !== userId) {
+        throw new ValidationError('Access denied to this flow');
+      }
+
+      // 2. Get test cases in flow
+      const testCases = await this.getTestCasesInFlows([flowId]);
+
+      if (testCases.length === 0) {
+        throw new ValidationError('Flow has no test cases');
+      }
+
+      // 3. Create regression run record
+      const { data: run, error: runError } = await supabaseAdmin
+        .from('regression_runs')
+        .insert({
+          flow_id: flowId,
+          suite_id: flow.suite_id,
+          module_id: suite.module_id,
+          project_id: suite.project_id,
+          user_id: userId,
+          trigger,
+          status: 'running',
+        })
+        .select('id')
+        .single();
+
+      if (runError || !run) {
+        throw new Error(`Failed to create flow run: ${runError?.message}`);
+      }
+
+      // 4. Create execution records
+      const executions = await ExecutionService.createBatch(run.id, testCases);
+
+      // 5. Start async execution
+      this.executeTestCasesAsync(
+        run.id,
+        testCases.map((tc) => ({
+          testCaseId: tc.testCaseId,
+          testType: tc.testType,
+          moduleId: tc.moduleId,
+          suiteId: tc.suiteId,
+          flowId: tc.flowId,
+        })),
+        userId,
+        trigger,
+        parameters
+      ).catch((error) => {
+        logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+      });
+
+      return {
+        runId: run.id,
+        executionIds: executions.map((e) => e.id),
+        totalTests: testCases.length,
+      };
+    } catch (error) {
+      logger.error('[REGRESSION_RUN] Failed to run flow', { error, flowId });
+      throw error;
+    }
+  }
+
+  /**
+   * Run all tests with a specific tag
+   *
+   * @param params.projectId - Project ID
+   * @param params.tag - Tag to filter by
+   * @param params.userId - User ID for ownership verification
+   * @param params.trigger - Trigger type
+   * @returns Run result
+   */
+  static async runByTag(params: {
+    projectId: string;
+    tag: string;
+    userId: string;
+    trigger: 'manual' | 'chat' | 'scheduled';
+  }): Promise<RunResult> {
+    const { projectId, tag, userId, trigger } = params;
+
+    try {
+      logger.info('[REGRESSION_RUN] Running by tag', { projectId, tag, userId });
+
+      // Verify project access
+      await this.verifyProjectAccess(projectId, userId);
+
+      // Get UI test cases with tag
+      const { data: uiCases } = await supabaseAdmin
+        .from('saved_test_cases')
+        .select('id, flow_id')
+        .eq('project_id', projectId)
+        .contains('tags', [tag]);
+
+      // Get API test cases with tag (scoped to project via environments/endpoints)
+      const apiCases = await this.getApiTestConfigsByProjectAndTag(projectId, userId, tag);
+
+      const testCases = [
+        ...(uiCases || []).map((tc: any) => ({
+          testCaseId: tc.id,
+          testType: 'ui' as const,
+          flowId: tc.flow_id || undefined,
+        })),
+        ...(apiCases || []).map((tc: any) => ({
+          testCaseId: tc.id,
+          testType: 'api' as const,
+          flowId: tc.flow_id || undefined,
+        })),
+      ];
+
+      if (testCases.length === 0) {
+        throw new ValidationError(`No test cases found with tag: ${tag}`);
+      }
+
+      // Create regression run
+      const { data: run, error: runError } = await supabaseAdmin
+        .from('regression_runs')
+        .insert({
+          project_id: projectId,
+          user_id: userId,
+          trigger,
+          status: 'running',
+        })
+        .select('id')
+        .single();
+
+      if (runError || !run) {
+        throw new Error(`Failed to create tag run: ${runError?.message}`);
+      }
+
+      // Create execution records
+      const executions = await ExecutionService.createBatch(run.id, testCases);
+
+      // Start async execution
+      this.executeTestCasesAsync(
+        run.id,
+        testCases.map((tc) => ({
+          testCaseId: tc.testCaseId,
+          testType: tc.testType,
+          flowId: tc.flowId,
+        })),
+        userId,
+        trigger,
+        {}
+      ).catch((error) => {
+        logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+      });
+
+      return {
+        runId: run.id,
+        executionIds: executions.map((e) => e.id),
+        totalTests: testCases.length,
+      };
+    } catch (error) {
+      logger.error('[REGRESSION_RUN] Failed to run by tag', { error, projectId, tag });
+      throw error;
+    }
+  }
+
+  /**
+   * Run all tests with a specific priority
+   *
+   * @param params.projectId - Project ID
+   * @param params.priority - Priority to filter by
+   * @param params.userId - User ID for ownership verification
+   * @param params.trigger - Trigger type
+   * @returns Run result
+   */
+  static async runByPriority(params: {
+    projectId: string;
+    priority: Priority;
+    userId: string;
+    trigger: 'manual' | 'chat' | 'scheduled';
+  }): Promise<RunResult> {
+    const { projectId, priority, userId, trigger } = params;
+
+    try {
+      logger.info('[REGRESSION_RUN] Running by priority', { projectId, priority, userId });
+
+      // Verify project access
+      await this.verifyProjectAccess(projectId, userId);
+
+      // Get UI test cases with priority
+      const { data: uiCases } = await supabaseAdmin
+        .from('saved_test_cases')
+        .select('id, flow_id')
+        .eq('project_id', projectId)
+        .eq('priority', priority);
+
+      // Get API test cases with priority (scoped to project via environments/endpoints)
+      const apiCases = await this.getApiTestConfigsByProjectAndPriority(projectId, userId, priority);
+
+      const testCases = [
+        ...(uiCases || []).map((tc: any) => ({
+          testCaseId: tc.id,
+          testType: 'ui' as const,
+          flowId: tc.flow_id || undefined,
+        })),
+        ...(apiCases || []).map((tc: any) => ({
+          testCaseId: tc.id,
+          testType: 'api' as const,
+          flowId: tc.flow_id || undefined,
+        })),
+      ];
+
+      if (testCases.length === 0) {
+        throw new ValidationError(`No test cases found with priority: ${priority}`);
+      }
+
+      // Create regression run
+      const { data: run, error: runError } = await supabaseAdmin
+        .from('regression_runs')
+        .insert({
+          project_id: projectId,
+          user_id: userId,
+          trigger,
+          status: 'running',
+        })
+        .select('id')
+        .single();
+
+      if (runError || !run) {
+        throw new Error(`Failed to create priority run: ${runError?.message}`);
+      }
+
+      // Create execution records
+      const executions = await ExecutionService.createBatch(run.id, testCases);
+
+      // Start async execution
+      this.executeTestCasesAsync(
+        run.id,
+        testCases.map((tc) => ({
+          testCaseId: tc.testCaseId,
+          testType: tc.testType,
+          flowId: tc.flowId,
+        })),
+        userId,
+        trigger,
+        {}
+      ).catch((error) => {
+        logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+      });
+
+      return {
+        runId: run.id,
+        executionIds: executions.map((e) => e.id),
+        totalTests: testCases.length,
+      };
+    } catch (error) {
+      logger.error('[REGRESSION_RUN] Failed to run by priority', { error, projectId, priority });
+      throw error;
+    }
+  }
+
+  // =========================================================================
+  // HELPER METHODS FOR NEW HIERARCHY
+  // =========================================================================
+
+  /**
+   * Get all test cases in flows with hierarchy info
+   */
+  private static async getTestCasesInFlows(
+    flowIds: string[]
+  ): Promise<Array<{
+    testCaseId: string;
+    testType: 'ui' | 'api';
+    moduleId?: string;
+    suiteId?: string;
+    flowId?: string;
+  }>> {
+    if (flowIds.length === 0) {
+      return [];
+    }
+
+    // Map flow -> suite
+    const { data: flows, error: flowsError } = await supabaseAdmin
+      .from('test_flows')
+      .select('id, suite_id')
+      .in('id', flowIds);
+
+    if (flowsError) {
+      throw new Error(`Failed to load flows: ${flowsError.message}`);
+    }
+
+    const flowToSuite = new Map<string, string>();
+    const suiteIdSet = new Set<string>();
+    for (const f of flows || []) {
+      if (f?.id && f?.suite_id) {
+        flowToSuite.set(f.id, f.suite_id);
+        suiteIdSet.add(f.suite_id);
+      }
+    }
+
+    const suiteIds = Array.from(suiteIdSet);
+    if (suiteIds.length === 0) {
+      // Flows might have been deleted or malformed; still try to return cases without hierarchy
+      logger.warn('[REGRESSION_RUN] No suites found for flows', { flowIdsCount: flowIds.length });
+    }
+
+    // Map suite -> module
+    const suiteToModule = new Map<string, string | undefined>();
+    if (suiteIds.length > 0) {
+      const { data: suites, error: suitesError } = await supabaseAdmin
+        .from('regression_suites')
+        .select('id, module_id')
+        .in('id', suiteIds);
+
+      if (suitesError) {
+        throw new Error(`Failed to load suites: ${suitesError.message}`);
+      }
+
+      for (const s of suites || []) {
+        if (s?.id) {
+          suiteToModule.set(s.id, s.module_id || undefined);
+        }
+      }
+    }
+
+    const testCases: Array<{
+      testCaseId: string;
+      testType: 'ui' | 'api';
+      moduleId?: string;
+      suiteId?: string;
+      flowId?: string;
+    }> = [];
+
+    // UI test cases
+    const { data: uiCases, error: uiError } = await supabaseAdmin
+      .from('saved_test_cases')
+      .select('id, flow_id')
+      .in('flow_id', flowIds);
+
+    if (uiError) {
+      throw new Error(`Failed to load UI test cases: ${uiError.message}`);
+    }
+
+    for (const tc of uiCases || []) {
+      const flowId = tc.flow_id || undefined;
+      const suiteId = flowId ? flowToSuite.get(flowId) : undefined;
+      const moduleId = suiteId ? suiteToModule.get(suiteId) : undefined;
+      testCases.push({
+        testCaseId: tc.id,
+        testType: 'ui',
+        moduleId,
+        suiteId,
+        flowId,
+      });
+    }
+
+    // API test configs
+    const { data: apiCases, error: apiError } = await supabaseAdmin
+      .from('api_test_configs')
+      .select('id, flow_id')
+      .in('flow_id', flowIds);
+
+    if (apiError) {
+      throw new Error(`Failed to load API test cases: ${apiError.message}`);
+    }
+
+    for (const tc of apiCases || []) {
+      const flowId = tc.flow_id || undefined;
+      const suiteId = flowId ? flowToSuite.get(flowId) : undefined;
+      const moduleId = suiteId ? suiteToModule.get(suiteId) : undefined;
+      testCases.push({
+        testCaseId: tc.id,
+        testType: 'api',
+        moduleId,
+        suiteId,
+        flowId,
+      });
+    }
+
+    return testCases;
+  }
+
+  /**
+   * Execute test cases asynchronously
+   * Updates execution records as tests complete
+   */
+  private static async executeTestCasesAsync(
+    runId: string,
+    testCases: Array<{
+      testCaseId: string;
+      testType: 'ui' | 'api';
+      moduleId?: string;
+      suiteId?: string;
+      flowId?: string;
+    }>,
+    userId: string,
+    trigger: 'manual' | 'chat' | 'scheduled',
+    parameters: Record<string, any>
+  ): Promise<void> {
+    const startedAt = new Date().toISOString();
+
+    // Preload executions to avoid per-test lookups
+    const { data: executions, error: execError } = await supabaseAdmin
+      .from('test_executions')
+      .select('id, test_case_id, test_type')
+      .eq('run_id', runId);
+
+    if (execError) {
+      logger.error('[REGRESSION_RUN] Failed to preload executions', { error: execError, runId });
+      return;
+    }
+
+    const execByKey = new Map<string, string>();
+    for (const e of executions || []) {
+      execByKey.set(`${e.test_type}:${e.test_case_id}`, e.id);
+    }
+
+    const uiTestIds: string[] = [];
+    let apiPassed = 0;
+    let apiFailed = 0;
+
+    for (const testCase of testCases) {
+      const execId = execByKey.get(`${testCase.testType}:${testCase.testCaseId}`);
+
+      try {
+        if (execId) {
+          await ExecutionService.updateStatus({ id: execId, status: 'running' });
+        }
+
+        if (testCase.testType === 'ui') {
+          // Run UI test without creating nested regression_runs
+          const savedCase = await this.getSavedTestCase(testCase.testCaseId, userId);
+          const testRequest = await this.buildTestRequest(savedCase, userId, parameters);
+          const testResult = await ManualTestService.runTest(testRequest);
+
+          if (!testResult.success || !testResult.data?.id) {
+            throw new Error('Failed to start UI test execution');
+          }
+
+          const testId = testResult.data.id;
+          uiTestIds.push(testId);
+
+          if (execId) {
+            await ExecutionService.updateStatus({
+              id: execId,
+              status: 'running',
+              result: {
+                type: 'ui',
+                testId,
+                trigger,
+                startedAt,
+              },
+            });
+          }
+        } else {
+          // Run API test via existing configuration-based executor
+          const apiExecution = await ApiConfigService.executeWithConfig(userId, {
+            test_config_id: testCase.testCaseId,
+          } as any);
+
+          const passed = !!apiExecution?.success;
+          if (passed) apiPassed++;
+          else apiFailed++;
+
+          if (execId) {
+            await ExecutionService.updateStatus({
+              id: execId,
+              status: passed ? 'passed' : 'failed',
+              result: {
+                type: 'api',
+                apiExecutionId: apiExecution?.id,
+                statusCode: apiExecution?.status_code,
+                durationMs: apiExecution?.duration_ms,
+              },
+              errorMessage: passed ? undefined : apiExecution?.error_message || 'API test failed',
+            });
+          }
+        }
+      } catch (error) {
+        logger.error('[REGRESSION_RUN] Failed to execute test case', {
+          runId,
+          testCaseId: testCase.testCaseId,
+          testType: testCase.testType,
+          error,
+        });
+
+        if (execId) {
+          await ExecutionService.updateStatus({
+            id: execId,
+            status: 'failed',
+            errorMessage: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+
+    // Link UI test IDs to regression_runs so existing completion pipeline can update the run
+    if (uiTestIds.length > 0) {
+      const { error: updateError } = await supabaseAdmin
+        .from('regression_runs')
+        .update({
+          test_ids: uiTestIds,
+          summary: {
+            total: testCases.length,
+            ui_started: uiTestIds.length,
+            api_passed: apiPassed,
+            api_failed: apiFailed,
+            started_at: startedAt,
+          },
+        })
+        .eq('id', runId);
+
+      if (updateError) {
+        logger.warn('[REGRESSION_RUN] Failed to update run with UI test_ids', {
+          error: updateError,
+          runId,
+        });
+      }
+
+      // Do not finalize run here — it will be recomputed on UI test completion
+      return;
+    }
+
+    // If only API tests exist, finalize run immediately
+    const finalStatus = apiFailed > 0 ? 'failed' : 'completed';
+    await supabaseAdmin
+      .from('regression_runs')
+      .update({
+        status: finalStatus,
+        summary: {
+          total: testCases.length,
+          api_passed: apiPassed,
+          api_failed: apiFailed,
+          completed_at: new Date().toISOString(),
+        },
+        completed_at: new Date().toISOString(),
+      })
+      .eq('id', runId);
+  }
+
+  /**
+   * Get API test configs filtered by project and tag (via api_environments/api_endpoints).
+   */
+  private static async getApiTestConfigsByProjectAndTag(
+    projectId: string,
+    userId: string,
+    tag: string
+  ): Promise<Array<{ id: string; flow_id?: string }>> {
+    const { data: envs, error: envError } = await supabaseAdmin
+      .from('api_environments')
+      .select('id')
+      .eq('project_id', projectId)
+      .eq('user_id', userId);
+
+    if (envError) {
+      throw new Error(`Failed to load API environments: ${envError.message}`);
+    }
+
+    const envIds = (envs || []).map((e: any) => e.id);
+    if (envIds.length === 0) return [];
+
+    const { data: endpoints, error: epError } = await supabaseAdmin
+      .from('api_endpoints')
+      .select('id')
+      .in('environment_id', envIds);
+
+    if (epError) {
+      throw new Error(`Failed to load API endpoints: ${epError.message}`);
+    }
+
+    const endpointIds = (endpoints || []).map((e: any) => e.id);
+    if (endpointIds.length === 0) return [];
+
+    const { data: configs, error: cfgError } = await supabaseAdmin
+      .from('api_test_configs')
+      .select('id, flow_id')
+      .eq('user_id', userId)
+      .in('endpoint_id', endpointIds)
+      .contains('tags', [tag]);
+
+    if (cfgError) {
+      throw new Error(`Failed to load API test configs: ${cfgError.message}`);
+    }
+
+    return (configs || []).map((c: any) => ({ id: c.id, flow_id: c.flow_id || undefined }));
+  }
+
+  /**
+   * Get API test configs filtered by project and priority (via api_environments/api_endpoints).
+   */
+  private static async getApiTestConfigsByProjectAndPriority(
+    projectId: string,
+    userId: string,
+    priority: Priority
+  ): Promise<Array<{ id: string; flow_id?: string }>> {
+    const { data: envs, error: envError } = await supabaseAdmin
+      .from('api_environments')
+      .select('id')
+      .eq('project_id', projectId)
+      .eq('user_id', userId);
+
+    if (envError) {
+      throw new Error(`Failed to load API environments: ${envError.message}`);
+    }
+
+    const envIds = (envs || []).map((e: any) => e.id);
+    if (envIds.length === 0) return [];
+
+    const { data: endpoints, error: epError } = await supabaseAdmin
+      .from('api_endpoints')
+      .select('id')
+      .in('environment_id', envIds);
+
+    if (epError) {
+      throw new Error(`Failed to load API endpoints: ${epError.message}`);
+    }
+
+    const endpointIds = (endpoints || []).map((e: any) => e.id);
+    if (endpointIds.length === 0) return [];
+
+    const { data: configs, error: cfgError } = await supabaseAdmin
+      .from('api_test_configs')
+      .select('id, flow_id')
+      .eq('user_id', userId)
+      .in('endpoint_id', endpointIds)
+      .eq('priority', priority);
+
+    if (cfgError) {
+      throw new Error(`Failed to load API test configs: ${cfgError.message}`);
+    }
+
+    return (configs || []).map((c: any) => ({ id: c.id, flow_id: c.flow_id || undefined }));
   }
 }

@@ -1,12 +1,18 @@
-import { Router } from 'express';
 import { requireAuth } from '@/middleware/auth.middleware';
+import { Router } from 'express';
 import {
-  saveTestCase,
-  createSuite,
-  runRegression,
-  listSavedTestCases,
-  listSuites,
-  listRuns,
+    createSuite,
+    getRunStats,
+    listRuns,
+    listSavedTestCases,
+    listSuites,
+    runByPriority,
+    runByTag,
+    runFlow,
+    runModule,
+    runPlan,
+    runRegression,
+    saveTestCase,
 } from './regression.controller';
 
 const router = Router();
@@ -195,5 +201,169 @@ router.get('/saved-test-cases', requireAuth, listSavedTestCases);
  *         description: List of runs
  */
 router.get('/runs', requireAuth, listRuns);
+
+/**
+ * @swagger
+ * /api/v1/regression/run-plan:
+ *   post:
+ *     summary: Run a regression plan
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - planId
+ *             properties:
+ *               planId:
+ *                 type: string
+ *                 format: uuid
+ *               parameters:
+ *                 type: object
+ *     responses:
+ *       200:
+ *         description: Plan run started
+ */
+router.post('/run-plan', requireAuth, runPlan);
+
+/**
+ * @swagger
+ * /api/v1/regression/run-module:
+ *   post:
+ *     summary: Run all tests in a module
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - moduleId
+ *             properties:
+ *               moduleId:
+ *                 type: string
+ *                 format: uuid
+ *               parameters:
+ *                 type: object
+ *     responses:
+ *       200:
+ *         description: Module run started
+ */
+router.post('/run-module', requireAuth, runModule);
+
+/**
+ * @swagger
+ * /api/v1/regression/run-flow:
+ *   post:
+ *     summary: Run all tests in a flow
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - flowId
+ *             properties:
+ *               flowId:
+ *                 type: string
+ *                 format: uuid
+ *               parameters:
+ *                 type: object
+ *     responses:
+ *       200:
+ *         description: Flow run started
+ */
+router.post('/run-flow', requireAuth, runFlow);
+
+/**
+ * @swagger
+ * /api/v1/regression/run-by-tag:
+ *   post:
+ *     summary: Run tests by tag
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - projectId
+ *               - tag
+ *             properties:
+ *               projectId:
+ *                 type: string
+ *                 format: uuid
+ *               tag:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Tag run started
+ */
+router.post('/run-by-tag', requireAuth, runByTag);
+
+/**
+ * @swagger
+ * /api/v1/regression/run-by-priority:
+ *   post:
+ *     summary: Run tests by priority
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - projectId
+ *               - priority
+ *             properties:
+ *               projectId:
+ *                 type: string
+ *                 format: uuid
+ *               priority:
+ *                 type: string
+ *                 enum: [critical, high, medium, low]
+ *     responses:
+ *       200:
+ *         description: Priority run started
+ */
+router.post('/run-by-priority', requireAuth, runByPriority);
+
+/**
+ * @swagger
+ * /api/v1/regression/runs/{runId}/stats:
+ *   get:
+ *     summary: Get execution stats for a run
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: runId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Run stats
+ */
+router.get('/runs/:runId/stats', requireAuth, getRunStats);
 
 export default router;

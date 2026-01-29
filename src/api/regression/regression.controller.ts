@@ -1,6 +1,8 @@
+import { ExecutionService } from '@/services/testing/executions/execution.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
 import { NotFoundError, ValidationError } from '@/types';
+import type { Priority } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -339,6 +341,286 @@ export async function listRuns(req: AuthenticatedRequest, res: Response): Promis
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to list runs', { error });
     handleControllerError(res, error, 'Failed to list runs');
+  }
+}
+
+// =========================================================================
+// NEW HIERARCHY ENDPOINTS
+// =========================================================================
+
+/**
+ * Run a regression plan
+ *
+ * @route POST /api/v1/regression/run-plan
+ * @body {string} planId - ID of regression plan to run
+ * @body {object} [parameters] - Runtime parameters
+ * @returns {runId, executionIds, totalTests}
+ */
+export async function runPlan(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { planId, parameters } = req.body;
+
+    if (!planId) {
+      res.status(400).json({
+        success: false,
+        error: 'planId is required',
+      });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    logger.info('[REGRESSION_API] Running plan', { planId, userId });
+
+    const result = await RegressionRunService.runPlan({
+      planId,
+      userId,
+      trigger: 'manual',
+      parameters: parameters || {},
+    });
+
+    res.json({
+      success: true,
+      data: {
+        runId: result.runId,
+        executionIds: result.executionIds,
+        totalTests: result.totalTests,
+        message: `Plan run started with ${result.totalTests} tests`,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to run plan', { error });
+    handleControllerError(res, error, 'Failed to run plan');
+  }
+}
+
+/**
+ * Run all tests in a module
+ *
+ * @route POST /api/v1/regression/run-module
+ * @body {string} moduleId - ID of module to run
+ * @body {object} [parameters] - Runtime parameters
+ * @returns {runId, executionIds, totalTests}
+ */
+export async function runModule(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { moduleId, parameters } = req.body;
+
+    if (!moduleId) {
+      res.status(400).json({
+        success: false,
+        error: 'moduleId is required',
+      });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    logger.info('[REGRESSION_API] Running module', { moduleId, userId });
+
+    const result = await RegressionRunService.runModule({
+      moduleId,
+      userId,
+      trigger: 'manual',
+      parameters: parameters || {},
+    });
+
+    res.json({
+      success: true,
+      data: {
+        runId: result.runId,
+        executionIds: result.executionIds,
+        totalTests: result.totalTests,
+        message: `Module run started with ${result.totalTests} tests`,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to run module', { error });
+    handleControllerError(res, error, 'Failed to run module');
+  }
+}
+
+/**
+ * Run all tests in a flow
+ *
+ * @route POST /api/v1/regression/run-flow
+ * @body {string} flowId - ID of flow to run
+ * @body {object} [parameters] - Runtime parameters
+ * @returns {runId, executionIds, totalTests}
+ */
+export async function runFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { flowId, parameters } = req.body;
+
+    if (!flowId) {
+      res.status(400).json({
+        success: false,
+        error: 'flowId is required',
+      });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    logger.info('[REGRESSION_API] Running flow', { flowId, userId });
+
+    const result = await RegressionRunService.runFlow({
+      flowId,
+      userId,
+      trigger: 'manual',
+      parameters: parameters || {},
+    });
+
+    res.json({
+      success: true,
+      data: {
+        runId: result.runId,
+        executionIds: result.executionIds,
+        totalTests: result.totalTests,
+        message: `Flow run started with ${result.totalTests} tests`,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to run flow', { error });
+    handleControllerError(res, error, 'Failed to run flow');
+  }
+}
+
+/**
+ * Run tests by tag
+ *
+ * @route POST /api/v1/regression/run-by-tag
+ * @body {string} projectId - Project ID
+ * @body {string} tag - Tag to filter by
+ * @returns {runId, executionIds, totalTests}
+ */
+export async function runByTag(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { projectId, tag } = req.body;
+
+    if (!projectId || !tag) {
+      res.status(400).json({
+        success: false,
+        error: 'projectId and tag are required',
+      });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    logger.info('[REGRESSION_API] Running by tag', { projectId, tag, userId });
+
+    const result = await RegressionRunService.runByTag({
+      projectId,
+      tag,
+      userId,
+      trigger: 'manual',
+    });
+
+    res.json({
+      success: true,
+      data: {
+        runId: result.runId,
+        executionIds: result.executionIds,
+        totalTests: result.totalTests,
+        message: `Tag run started with ${result.totalTests} tests`,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to run by tag', { error });
+    handleControllerError(res, error, 'Failed to run by tag');
+  }
+}
+
+/**
+ * Run tests by priority
+ *
+ * @route POST /api/v1/regression/run-by-priority
+ * @body {string} projectId - Project ID
+ * @body {string} priority - Priority level (critical, high, medium, low)
+ * @returns {runId, executionIds, totalTests}
+ */
+export async function runByPriority(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { projectId, priority } = req.body;
+
+    if (!projectId || !priority) {
+      res.status(400).json({
+        success: false,
+        error: 'projectId and priority are required',
+      });
+      return;
+    }
+
+    const validPriorities = ['critical', 'high', 'medium', 'low'];
+    if (!validPriorities.includes(priority)) {
+      res.status(400).json({
+        success: false,
+        error: `priority must be one of: ${validPriorities.join(', ')}`,
+      });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    logger.info('[REGRESSION_API] Running by priority', { projectId, priority, userId });
+
+    const result = await RegressionRunService.runByPriority({
+      projectId,
+      priority: priority as Priority,
+      userId,
+      trigger: 'manual',
+    });
+
+    res.json({
+      success: true,
+      data: {
+        runId: result.runId,
+        executionIds: result.executionIds,
+        totalTests: result.totalTests,
+        message: `Priority run started with ${result.totalTests} tests`,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to run by priority', { error });
+    handleControllerError(res, error, 'Failed to run by priority');
+  }
+}
+
+/**
+ * Get execution stats for a run
+ *
+ * @route GET /api/v1/regression/runs/:runId/stats
+ * @param {string} runId - Run ID
+ * @returns ExecutionStats
+ */
+export async function getRunStats(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { runId } = req.params;
+
+    if (!runId) {
+      res.status(400).json({
+        success: false,
+        error: 'runId is required',
+      });
+      return;
+    }
+
+    const stats = await ExecutionService.getStats(runId);
+
+    res.json({
+      success: true,
+      data: stats,
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to get run stats', { error });
+    handleControllerError(res, error, 'Failed to get run stats');
   }
 }
 

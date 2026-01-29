@@ -3,6 +3,8 @@ import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import authRoutes from '@/api/auth/auth.route';
 import chatRoutes from '@/api/chat/chat.route';
 import feedbackRoutes from '@/api/chat/feedback.route';
+import fixturesRoutes from '@/api/fixtures/fixtures.route';
+import flowsRoutes from '@/api/flows/flows.route';
 import gitIntegrationRoutes from '@/api/gitIntegration/git-integration.route';
 import intelligentTestRoutes from '@/api/intelligentTest/intelligentTest.route';
 import jiraRoutes from '@/api/jira/jira.route';
@@ -10,14 +12,17 @@ import kbRoutes from '@/api/kb/kb.route';
 import rulesReloadRoutes from '@/api/kb/rules-reload.route';
 import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
+import modulesRoutes from '@/api/modules/modules.route';
 import notificationsRoutes from '@/api/notifications/notifications.routes';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import previewRoutes from '@/api/preview/preview.route';
 import projectRoutes from '@/api/project/project.routes';
+import regressionPlansRoutes from '@/api/regression-plans/plans.route';
 import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
-import supportRoutes from '@/api/support/support.routes';
+import schedulesRoutes from '@/api/schedules/schedules.route';
 import stripeRoutes from '@/api/stripe/stripe.routes';
+import supportRoutes from '@/api/support/support.routes';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
@@ -1225,6 +1230,11 @@ app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, reportsRoutes); // ✅ NEW: Test reports & Jira integration
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 app.use(`/api/${env.API_VERSION}/regression`, regressionRoutes); // ✅ NEW: Regression testing
+app.use(`/api/${env.API_VERSION}/modules`, modulesRoutes); // Test modules
+app.use(`/api/${env.API_VERSION}/flows`, flowsRoutes); // Test flows
+app.use(`/api/${env.API_VERSION}/schedules`, schedulesRoutes); // Test schedules
+app.use(`/api/${env.API_VERSION}/fixtures`, fixturesRoutes); // Test fixtures
+app.use(`/api/${env.API_VERSION}/regression-plans`, regressionPlansRoutes); // Regression plans
 app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes); // ✅ NEW: Git integrations (CRUD)
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
 app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
@@ -1387,6 +1397,7 @@ const startServer = async () => {
         logger.info(`🏷️ Queue prefix: ${env.QUEUE_PREFIX}`);
         logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
         logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
+
       });
 
       /**

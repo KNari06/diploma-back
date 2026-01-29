@@ -135,9 +135,73 @@ export class TestCompletionHandlerService {
       }
 
       // Update regression runs associated with this test
-      await this.updateRegressionRuns(testId, test.status);
+      // Also update unified test_executions records linked to this UI test
+      await this.updateTestExecutionsForCompletedUiTest(test);
+      await this.updateRegressionRuns(testId);
     } catch (error) {
       logger.error('[TEST_COMPLETION] Unexpected error', { error, testId });
+    }
+  }
+
+  /**
+   * Update unified test_executions rows that reference a completed UI test via result->>testId.
+   * This enables unified reporting for runs that mix UI and API tests.
+   */
+  private static async updateTestExecutionsForCompletedUiTest(test: {
+    id: string;
+    status: string;
+    created_at?: string;
+    completed_at?: string;
+  }): Promise<void> {
+    try {
+      const testId = test.id;
+
+      const mappedStatus =
+        test.status === 'completed'
+          ? 'passed'
+          : test.status === 'failed' || test.status === 'timeout'
+            ? 'failed'
+            : test.status === 'cancelled'
+              ? 'cancelled'
+              : test.status === 'running' || test.status === 'pending'
+                ? 'running'
+                : 'failed';
+
+      const durationMs =
+        test.created_at && test.completed_at
+          ? Math.max(0, new Date(test.completed_at).getTime() - new Date(test.created_at).getTime())
+          : undefined;
+
+      const { data, error } = await supabaseAdmin
+        .from('test_executions')
+        .update({
+          status: mappedStatus,
+          completed_at: test.completed_at || new Date().toISOString(),
+          duration_ms: durationMs,
+        })
+        .eq('result->>testId', testId)
+        .select('id');
+
+      if (error) {
+        logger.warn('[TEST_COMPLETION] Failed to update test_executions for UI test', {
+          error,
+          testId,
+        });
+        return;
+      }
+
+      if (data && data.length > 0) {
+        logger.info('[TEST_COMPLETION] Updated test_executions for UI test', {
+          testId,
+          updatedCount: data.length,
+          mappedStatus,
+        });
+      }
+    } catch (error) {
+      logger.warn('[TEST_COMPLETION] Error updating test_executions for UI test', {
+        error: error instanceof Error ? error.message : String(error),
+        testId: test?.id,
+      });
     }
   }
 
@@ -151,9 +215,7 @@ export class TestCompletionHandlerService {
    * @param testStatus - Status of completed test ('completed', 'failed', etc.)
    */
   private static async updateRegressionRuns(
-    testId: string,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    _testStatus: string
+    testId: string
   ): Promise<void> {
     try {
       // Find regression runs that reference this test
@@ -210,6 +272,71 @@ export class TestCompletionHandlerService {
    */
   private static async recomputeRunStatus(run: any): Promise<void> {
     try {
+      // Prefer unified executions if present (covers UI + API and avoids relying only on tests table)
+      const { data: unifiedExecutions, error: execError } = await supabaseAdmin
+        .from('test_executions')
+        .select('status')
+        .eq('run_id', run.id);
+
+      if (execError) {
+        logger.warn('[TEST_COMPLETION] Failed to load test_executions for run, falling back', {
+          error: execError,
+          runId: run.id,
+        });
+      } else if (unifiedExecutions && unifiedExecutions.length > 0) {
+        const statuses = unifiedExecutions.map((e: any) => e.status);
+
+        const hasRunning = statuses.some((s: string) => s === 'running' || s === 'pending');
+        if (hasRunning) {
+          logger.debug('[TEST_COMPLETION] Run still has running executions', {
+            runId: run.id,
+            runningCount: statuses.filter((s: string) => s === 'running' || s === 'pending').length,
+          });
+          return;
+        }
+
+        let finalStatus: 'completed' | 'failed' | 'cancelled' = 'completed';
+        if (statuses.some((s: string) => s === 'cancelled')) {
+          finalStatus = 'cancelled';
+        } else if (statuses.some((s: string) => s === 'failed')) {
+          finalStatus = 'failed';
+        }
+
+        const summary = {
+          total: statuses.length,
+          passed: statuses.filter((s: string) => s === 'passed').length,
+          failed: statuses.filter((s: string) => s === 'failed').length,
+          skipped: statuses.filter((s: string) => s === 'skipped').length,
+          cancelled: statuses.filter((s: string) => s === 'cancelled').length,
+          completed_at: new Date().toISOString(),
+        };
+
+        const { error: updateError } = await supabaseAdmin
+          .from('regression_runs')
+          .update({
+            status: finalStatus,
+            summary,
+            completed_at: new Date().toISOString(),
+          })
+          .eq('id', run.id);
+
+        if (updateError) {
+          logger.error('[TEST_COMPLETION] Failed to update regression run (unified)', {
+            error: updateError,
+            runId: run.id,
+            finalStatus,
+          });
+        } else {
+          logger.info('[TEST_COMPLETION] Regression run updated (unified)', {
+            runId: run.id,
+            status: finalStatus,
+            summary,
+          });
+        }
+
+        return;
+      }
+
       let underlyingTestIds: string[] = [];
 
       // Determine which test IDs to check

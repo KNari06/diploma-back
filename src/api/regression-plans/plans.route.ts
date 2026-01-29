@@ -1,0 +1,196 @@
+/**
+ * Regression Plans Routes
+ * CRUD routes for regression plans
+ */
+
+import { requireAuth } from '@/middleware/auth.middleware';
+import { Router } from 'express';
+import {
+    addItem,
+    createPlan,
+    deletePlan,
+    expandPlan,
+    getPlan,
+    listPlans,
+    removeItem,
+    updatePlan,
+} from './plans.controller';
+
+const router = Router();
+
+/**
+ * @swagger
+ * /api/v1/regression-plans:
+ *   get:
+ *     summary: List regression plans for a project
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: projectId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: List of plans
+ *   post:
+ *     summary: Create a new regression plan
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - projectId
+ *               - name
+ *             properties:
+ *               projectId:
+ *                 type: string
+ *                 format: uuid
+ *               name:
+ *                 type: string
+ *               description:
+ *                 type: string
+ *               isDefault:
+ *                 type: boolean
+ *               tags:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *     responses:
+ *       200:
+ *         description: Plan created
+ */
+router.get('/', requireAuth, listPlans);
+router.post('/', requireAuth, createPlan);
+
+/**
+ * @swagger
+ * /api/v1/regression-plans/{id}:
+ *   get:
+ *     summary: Get plan by ID with items
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Plan with items
+ *   patch:
+ *     summary: Update a plan
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Plan updated
+ *   delete:
+ *     summary: Delete a plan
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Plan deleted
+ */
+router.get('/:id', requireAuth, getPlan);
+router.patch('/:id', requireAuth, updatePlan);
+router.delete('/:id', requireAuth, deletePlan);
+
+/**
+ * @swagger
+ * /api/v1/regression-plans/{id}/items:
+ *   post:
+ *     summary: Add an item to a plan
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - itemType
+ *             properties:
+ *               itemType:
+ *                 type: string
+ *                 enum: [module, suite, flow, test_case]
+ *               moduleId:
+ *                 type: string
+ *                 format: uuid
+ *               suiteId:
+ *                 type: string
+ *                 format: uuid
+ *               flowId:
+ *                 type: string
+ *                 format: uuid
+ *               testCaseId:
+ *                 type: string
+ *                 format: uuid
+ *               testCaseType:
+ *                 type: string
+ *                 enum: [ui, api]
+ *     responses:
+ *       200:
+ *         description: Item added
+ */
+router.post('/:id/items', requireAuth, addItem);
+
+/**
+ * @swagger
+ * /api/v1/regression-plans/{id}/items/{itemId}:
+ *   delete:
+ *     summary: Remove an item from a plan
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Item removed
+ */
+router.delete('/:id/items/:itemId', requireAuth, removeItem);
+
+/**
+ * @swagger
+ * /api/v1/regression-plans/{id}/expand:
+ *   get:
+ *     summary: Expand plan to individual test cases
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Expanded test cases
+ */
+router.get('/:id/expand', requireAuth, expandPlan);
+
+export default router;

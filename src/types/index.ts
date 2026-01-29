@@ -521,6 +521,9 @@ export interface JiraProject {
 // Playwright test visualization types
 export * from './playwright.types';
 
+// Testing hierarchy types (Module, Flow, Schedule, Fixture, Plan, Execution)
+export * from './testing.types';
+
 // API Configuration types
 export interface ApiEnvironment {
   id: string;
