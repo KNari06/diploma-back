@@ -293,6 +293,133 @@ export class PreviewSessionService {
   }
 
   /**
+   * Reset session (clear context/cookies/storage) and return to startUrl
+   */
+  async resetSession(params: {
+    sessionId: string;
+    userId: string;
+  }): Promise<{
+    url: string;
+    domNodes: InteractiveNode[];
+    screenshot?: string;
+  } | null> {
+    const { sessionId, userId } = params;
+
+    // Acquire lock using the session owner to avoid race conditions
+    // (we must not swap context/page concurrently with other operations)
+    const sessionBeforeLock = this.getAuthorizedSession(sessionId, userId);
+    if (!sessionBeforeLock) return null;
+    const ownerUserId = sessionBeforeLock.userId;
+
+    const releaseLock = await this.acquireUserLock(ownerUserId);
+
+    // Local vars to prevent leaks on partial failure
+    let newContext: BrowserContext | undefined;
+    let newPage: Page | undefined;
+
+    try {
+      // Re-fetch session under lock to ensure it still exists and is owned
+      const session = this.getAuthorizedSession(sessionId, userId);
+      if (!session) return null;
+
+      logger.info('[PREVIEW_SESSION] Resetting session', { sessionId });
+
+      const browser = session.browser;
+      const startUrl = session.startUrl;
+
+      // IMPORTANT: Do reset atomically.
+      // 1) Create + load a fresh context/page successfully.
+      // 2) Swap session references.
+      // 3) Close old resources after swap.
+      newContext = await browser.newContext({
+        viewport: { width: 1280, height: 720 },
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      });
+
+      newPage = await newContext.newPage();
+
+      await newPage.goto(startUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000,
+      });
+
+      // Best-effort: some apps keep long-polling, so avoid long waits
+      await newPage.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+      // Save old resources (close after swap)
+      const oldContext = session.context;
+      const oldPage = session.page;
+
+      // Swap to new resources
+      session.context = newContext;
+      session.page = newPage;
+
+      // Reset internal timers/state to avoid throttling weirdness after reset
+      session.lastSnapshotEmit = 0;
+      session.lastScreenshotEmitAt = 0;
+      session.lastPageSignature = '';
+      session.lastInputAt = 0;
+
+      // Close old resources after swap (do not break reset if close fails)
+      await this.safeCloseBrowserResources(undefined, oldContext, oldPage);
+
+      return this.getSnapshot(sessionId, userId, {
+        force: true,
+        includeScreenshot: true,
+        onlyIfChanged: false,
+      });
+    } catch (error) {
+      logger.error('[PREVIEW_SESSION] Session reset failed', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      // Cleanup partially-created resources if we failed before swapping
+      await this.safeCloseBrowserResources(undefined, newContext, newPage).catch(() => {});
+      return null;
+    } finally {
+      releaseLock();
+    }
+  }
+
+  /**
+   * Refresh current page
+   */
+  async refreshPage(sessionId: string, userId: string): Promise<{
+    url: string;
+    domNodes: InteractiveNode[];
+    screenshot?: string;
+  } | null> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+
+    try {
+      logger.info('[PREVIEW_SESSION] Refreshing page', { sessionId, url: session.page.url() });
+
+      await session.page.reload({
+        waitUntil: 'domcontentloaded',
+        timeout: 30000,
+      });
+
+      // Optional: wait for network idle
+      await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+      return this.getSnapshot(sessionId, userId, {
+        force: true,
+        includeScreenshot: true,
+        onlyIfChanged: false
+      });
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] Page refresh failed', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
    * Stop a preview session
    */
   async stopSession(sessionId: string, userId?: string): Promise<void> {

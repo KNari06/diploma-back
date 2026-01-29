@@ -108,6 +108,7 @@ const RATE_LIMITS = {
   subscribe: { max: 5, windowMs: 10000 }, // 5 subscribes per 10s
   mouse: { max: 100, windowMs: 10000 },   // 100 mouse events per 10s
   keyboard: { max: 50, windowMs: 10000 }, // 50 keyboard events per 10s
+  pageAction: { max: 5, windowMs: 10000 }, // 5 refresh/reset per 10s
 };
 
 const rateLimitStore = new Map<string, Map<string, RateLimitEntry>>();
@@ -147,6 +148,25 @@ function cleanupRateLimits(socketId: string): void {
 }
 
 /**
+ * Emit action result for page actions (refresh/reset)
+ */
+function emitPageActionResult(
+  socket: TypedSocket,
+  previewSessionId: string,
+  action: 'refresh' | 'reset',
+  success: boolean,
+  error?: string
+): void {
+  socket.emit('preview:page:action:result', {
+    previewSessionId,
+    action,
+    success,
+    error,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+/**
  * Get preview subscriptions for a socket
  */
 const getPreviewSubs = (socketId: string): Set<string> => {
@@ -176,7 +196,7 @@ const startSnapshotStream = (context: StreamContext, nsp: any): void => {
     return;
   }
 
-  logger.info('[SNAPSHOT_STREAM] Starting stream', { previewSessionId, room });
+  // logger.info('[SNAPSHOT_STREAM] Starting stream', { previewSessionId, room });
 
   const interval = setInterval(async () => {
     try {
@@ -200,12 +220,12 @@ const startSnapshotStream = (context: StreamContext, nsp: any): void => {
         // Emit to entire room (including sender)
         nsp.to(room).emit('preview:page', payload);
 
-        logger.debug('[SNAPSHOT_STREAM] Emitted preview:page', {
-          previewSessionId,
-          room,
-          hasScreenshot: !!snapshot.screenshot,
-          nodeCount: snapshot.domNodes.length,
-        });
+        // logger.debug('[SNAPSHOT_STREAM] Emitted preview:page', {
+        //   previewSessionId,
+        //   room,
+        //   hasScreenshot: !!snapshot.screenshot,
+        //   nodeCount: snapshot.domNodes.length,
+        // });
       }
     } catch (error) {
       logger.error('[SNAPSHOT_STREAM] Failed to emit snapshot', {
@@ -1186,6 +1206,89 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
       });
+    }
+  });
+
+  // Handle page refresh
+  socket.on('preview:page:refresh', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'pageAction')) {
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        return;
+      }
+
+      logger.info('[WebSocket] Preview refresh requested', { previewSessionId, userId: ensuredUserId });
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      // Refresh page
+      const result = await sessionService.refreshPage(previewSessionId, ensuredUserId);
+
+      if (result) {
+        emitPageActionResult(socket, previewSessionId, 'refresh', true);
+        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+      } else {
+        emitPageActionResult(socket, previewSessionId, 'refresh', false, 'Refresh failed or session not found');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:page:refresh', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (data.previewSessionId) {
+        emitPageActionResult(socket, data.previewSessionId, 'refresh', false, 'Internal error');
+      }
+    }
+  });
+
+  // Handle page reset
+  socket.on('preview:page:reset', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'pageAction')) {
+        return;
+      }
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) {
+        return;
+      }
+
+      logger.info('[WebSocket] Preview reset requested', { previewSessionId, userId: ensuredUserId });
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      // Reset session (clears cookies/storage/context)
+      const result = await sessionService.resetSession({
+        sessionId: previewSessionId,
+        userId: ensuredUserId,
+      });
+
+      if (result) {
+        emitPageActionResult(socket, previewSessionId, 'reset', true);
+        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+      } else {
+        emitPageActionResult(socket, previewSessionId, 'reset', false, 'Reset failed or session not found');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:page:reset', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (data.previewSessionId) {
+        emitPageActionResult(socket, data.previewSessionId, 'reset', false, 'Internal error');
+      }
     }
   });
 

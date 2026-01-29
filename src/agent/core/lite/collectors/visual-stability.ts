@@ -5,8 +5,8 @@
  */
 
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
-import type { Page } from 'playwright';
 import { logger } from '@/utils/core/logger';
+import type { Page } from 'playwright';
 
 export class VisualStability {
   /**
@@ -44,18 +44,18 @@ export class VisualStability {
           const currCount = await this.getElementCount(page);
 
           if (currCount === prevCount) {
-            logger.debug('[VISUAL_STABILITY] Page stable', {
-              elementCount: currCount,
-              attempts: i + 1,
-            });
+            // logger.debug('[VISUAL_STABILITY] Page stable', {
+              // elementCount: currCount,
+            //   attempts: i + 1,
+            // });
             return 'stable'; // Stable - element count unchanged
           }
 
-          logger.debug('[VISUAL_STABILITY] Page still mutating', {
-            prevCount,
-            currCount,
-            attempt: i + 1,
-          });
+          // logger.debug('[VISUAL_STABILITY] Page still mutating', {
+          //   prevCount,
+          //   currCount,
+          //   attempt: i + 1,
+          // });
 
           prevCount = currCount;
         }

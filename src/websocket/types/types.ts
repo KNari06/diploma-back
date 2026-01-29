@@ -33,6 +33,10 @@ export interface ClientToServerEvents {
   'preview:keyboard:type': (data: PreviewKeyboardTypeRequest) => void;
   'preview:keyboard:press': (data: PreviewKeyboardPressRequest) => void;
 
+  // Preview page actions (refresh, reset)
+  'preview:page:refresh': (data: { previewSessionId: string }) => void;
+  'preview:page:reset': (data: { previewSessionId: string }) => void;
+
   // Clarification
   'test:clarification:response': (data: { testId: string; questionId: string; answer: string }) => void;
 
@@ -101,6 +105,7 @@ export interface ServerToClientEvents {
   'preview:viewport': (data: PreviewViewportPayload) => void;
   'preview:mouse:result': (data: PreviewMouseResultPayload) => void;
   'preview:mouse:probe:result': (data: PreviewMouseProbeResultPayload) => void;
+  'preview:page:action:result': (data: PreviewPageActionResultPayload) => void;
 
   // Heartbeat response
   pong: () => void;
@@ -878,6 +883,17 @@ export interface PreviewMouseProbeResultPayload {
     ariaLabel?: string;
     ref?: string;
   };
+  timestamp: string;
+}
+
+/**
+ * Preview page action result (refresh, reset)
+ */
+export interface PreviewPageActionResultPayload {
+  previewSessionId: string;
+  action: 'refresh' | 'reset';
+  success: boolean;
+  error?: string;
   timestamp: string;
 }
 

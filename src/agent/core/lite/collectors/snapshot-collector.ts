@@ -669,13 +669,13 @@ export class SnapshotCollector {
         };
       });
 
-      logger.debug('[SNAPSHOT_COLLECTOR] Collected snapshot', {
-        url: snapshot.url,
-        elementCount: snapshot.elements.length,
-        hasActiveModal: !!snapshot.activeModalRef,
-        isTransient: snapshot.transientState?.isTransient || false,
-        transientType: snapshot.transientState?.type,
-      });
+      // logger.debug('[SNAPSHOT_COLLECTOR] Collected snapshot', {
+      //   url: snapshot.url,
+      //   elementCount: snapshot.elements.length,
+      //   hasActiveModal: !!snapshot.activeModalRef,
+      //   isTransient: snapshot.transientState?.isTransient || false,
+      //   transientType: snapshot.transientState?.type,
+      // });
 
       return snapshot as LiteSnapshot;
     } catch (error) {
