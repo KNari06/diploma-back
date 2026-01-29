@@ -618,7 +618,7 @@ export class PricingPlansService {
               features: plan.features,
               limitations: plan.limitations,
               credit_options: creditOptions,
-              contact_required: false,
+              contact_required: plan.slug === 'ultra' ? true : false,
               contact_info: undefined,
             };
           })
