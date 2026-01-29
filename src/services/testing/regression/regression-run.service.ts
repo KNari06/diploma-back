@@ -667,6 +667,7 @@ export class RegressionRunService {
 
   /**
    * Run all tests in a module
+   * Platform determines whether this runs UI or API tests (enforced by DB triggers)
    *
    * @param params.moduleId - ID of module to run
    * @param params.userId - User ID for ownership verification
@@ -685,10 +686,10 @@ export class RegressionRunService {
     try {
       logger.info('[REGRESSION_RUN] Running module', { moduleId, userId, trigger });
 
-      // 1. Get module and verify access
+      // 1. Get module with platform info and verify access
       const { data: mod, error: modError } = await supabaseAdmin
         .from('test_modules')
-        .select('*, projects!inner(user_id)')
+        .select('*, projects!inner(user_id), test_platforms!inner(platform_key)')
         .eq('id', moduleId)
         .single();
 
@@ -699,6 +700,13 @@ export class RegressionRunService {
       if ((mod.projects as any)?.user_id !== userId) {
         throw new ValidationError('Access denied to this module');
       }
+
+      const platformKey = (mod.test_platforms as any)?.platform_key;
+      logger.info('[REGRESSION_RUN] Module platform resolved', {
+        moduleId,
+        moduleName: mod.name,
+        platformKey,
+      });
 
       // 2. Get all suites in module
       const { data: suites } = await supabaseAdmin

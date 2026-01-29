@@ -14,12 +14,14 @@ import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import modulesRoutes from '@/api/modules/modules.route';
 import notificationsRoutes from '@/api/notifications/notifications.routes';
+import platformsRoutes from '@/api/platforms/platforms.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import previewRoutes from '@/api/preview/preview.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionPlansRoutes from '@/api/regression-plans/plans.route';
 import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
+import savedTestCasesRoutes from '@/api/saved-test-cases/saved-test-cases.route';
 import schedulesRoutes from '@/api/schedules/schedules.route';
 import stripeRoutes from '@/api/stripe/stripe.routes';
 import supportRoutes from '@/api/support/support.routes';
@@ -1230,6 +1232,7 @@ app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, reportsRoutes); // ✅ NEW: Test reports & Jira integration
 app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
 app.use(`/api/${env.API_VERSION}/regression`, regressionRoutes); // ✅ NEW: Regression testing
+app.use(`/api/${env.API_VERSION}/platforms`, platformsRoutes); // Test platforms (web_ui/api)
 app.use(`/api/${env.API_VERSION}/modules`, modulesRoutes); // Test modules
 app.use(`/api/${env.API_VERSION}/flows`, flowsRoutes); // Test flows
 app.use(`/api/${env.API_VERSION}/schedules`, schedulesRoutes); // Test schedules
@@ -1244,6 +1247,7 @@ app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // ✅ NEW: User issu
 app.use(`/api/${env.API_VERSION}/billing`, stripeRoutes); // Stripe billing endpoints
 app.use(`/api/${env.API_VERSION}/stripe`, stripeRoutes); // Stripe webhook endpoint
 app.use(`/api/${env.API_VERSION}/preview`, previewRoutes); // ✅ NEW: Step editor preview
+app.use(`/api/${env.API_VERSION}/saved-test-cases`, savedTestCasesRoutes); // Saved test cases with AI dependency suggestions
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {

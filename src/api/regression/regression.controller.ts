@@ -1,4 +1,6 @@
+import { supabaseAdmin } from '@/db/supabase';
 import { ExecutionService } from '@/services/testing/executions/execution.service';
+import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/testing/flows/saved-case-dependency-suggester.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
 import { NotFoundError, ValidationError } from '@/types';
@@ -47,11 +49,12 @@ function getUserId(req: AuthenticatedRequest): string {
  * @body {string} name - Display name for saved test case
  * @body {string} [description] - Optional description
  * @body {string} [kind='standalone'] - 'standalone' or 'regression_member'
- * @returns {savedTestCaseId, projectId, replayStrategy, parametersCount}
+ * @body {string} [flowId] - Optional flow ID to assign the case to
+ * @returns {savedTestCaseId, projectId, replayStrategy, parametersCount, suggestedDependsOn}
  */
 export async function saveTestCase(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { sourceTestId, name, description, kind } = req.body;
+    const { sourceTestId, name, description, kind, flowId } = req.body;
 
     // Validate required inputs
     if (!sourceTestId || !name) {
@@ -64,7 +67,7 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
 
     const userId = getUserId(req);
 
-    logger.info('[REGRESSION_API] Saving test case', { sourceTestId, name, userId });
+    logger.info('[REGRESSION_API] Saving test case', { sourceTestId, name, userId, flowId });
 
     const result = await RegressionSaveService.saveTestCase({
       sourceTestId,
@@ -74,6 +77,51 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
       kind: kind || 'standalone',
     });
 
+    // If flowId provided, update the saved case and get suggestions
+    let suggestedDependsOn: DependencySuggestion[] = [];
+    if (flowId) {
+      // Verify flow exists, belongs to user, and is within the same project
+      const { data: flow, error: flowError } = await supabaseAdmin
+        .from('test_flows')
+        .select('id, regression_suites!inner(project_id, user_id)')
+        .eq('id', flowId)
+        .eq('user_id', userId)
+        .single();
+
+      if (flowError || !flow) {
+        res.status(404).json({ success: false, error: 'Flow not found or access denied' });
+        return;
+      }
+
+      const flowProjectId = (flow as any).regression_suites?.project_id;
+      if (!flowProjectId || flowProjectId !== result.projectId) {
+        res.status(422).json({
+          success: false,
+          error: 'Validation error',
+          message: 'Flow belongs to a different project',
+        });
+        return;
+      }
+
+      // Update flow_id (ensure update succeeded)
+      const { error: updateError } = await supabaseAdmin
+        .from('saved_test_cases')
+        .update({ flow_id: flowId })
+        .eq('id', result.savedTestCaseId)
+        .eq('user_id', userId);
+
+      if (updateError) {
+        throw new Error(`Failed to assign saved test case to flow: ${updateError.message}`);
+      }
+
+      // Get AI suggestions
+      suggestedDependsOn = await SavedCaseDependencySuggester.suggestForCase(
+        result.savedTestCaseId,
+        flowId,
+        userId
+      );
+    }
+
     res.json({
       success: true,
       data: {
@@ -81,17 +129,21 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
         projectId: result.projectId,
         replayStrategy: result.replayStrategy,
         parametersCount: result.parametersCount,
+        flowId: flowId || undefined,
+        suggestedDependsOn,
         message: 'Test case saved successfully',
         nextActions: [
           `Run test case: POST /api/v1/regression/run with savedTestCaseId="${result.savedTestCaseId}"`,
           `Add to suite: POST /api/v1/regression/suites with testCaseIds=["${result.savedTestCaseId}"]`,
-        ],
+          flowId ? `Confirm dependencies: PATCH /api/v1/saved-test-cases/${result.savedTestCaseId}/dependencies` : null,
+        ].filter(Boolean),
       },
       timestamp: new Date(),
     });
 
     logger.info('[REGRESSION_API] Test case saved successfully', {
       savedTestCaseId: result.savedTestCaseId,
+      suggestionsCount: suggestedDependsOn.length,
     });
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to save test case', { error });
@@ -247,7 +299,7 @@ export async function runRegression(req: AuthenticatedRequest, res: Response): P
  *
  * @route GET /api/v1/regression/saved-test-cases?projectId=<uuid>
  * @query {string} projectId - Project ID to list test cases for
- * @returns {array} List of saved test cases
+ * @returns {array} List of saved test cases with dependsOn
  */
 export async function listSavedTestCases(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
@@ -265,15 +317,46 @@ export async function listSavedTestCases(req: AuthenticatedRequest, res: Respons
 
     const cases = await RegressionRunService.listSavedTestCases(projectId, userId);
 
+    // Map to camelCase response format with dependsOn
+    const mappedCases = cases.map(mapSavedTestCaseToResponse);
+
     res.json({
       success: true,
-      data: cases,
+      data: mappedCases,
       timestamp: new Date(),
     });
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to list saved test cases', { error });
     handleControllerError(res, error, 'Failed to list saved test cases');
   }
+}
+
+/**
+ * Map saved test case database row to API response format
+ */
+function mapSavedTestCaseToResponse(row: any): any {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    userId: row.user_id,
+    sourceTestId: row.source_test_id,
+    sourceIntelligentSessionId: row.source_intelligent_session_id,
+    name: row.name,
+    description: row.description || undefined,
+    kind: row.kind,
+    replayStrategy: row.replay_strategy,
+    url: row.url,
+    flowId: row.flow_id || undefined,
+    tags: row.tags || [],
+    priority: row.priority || undefined,
+    preconditions: row.preconditions || [],
+    setupSteps: row.setup_steps || [],
+    teardownSteps: row.teardown_steps || [],
+    expectedResult: row.expected_result || undefined,
+    dependsOn: row.depends_on || [],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 /**

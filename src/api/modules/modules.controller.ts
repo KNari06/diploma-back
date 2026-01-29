@@ -4,7 +4,9 @@
  */
 
 import { ModuleService } from '@/services/testing/modules/module.service';
+import { PlatformService } from '@/services/testing/platforms/platform.service';
 import { NotFoundError, ValidationError } from '@/types';
+import type { PlatformKey } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -20,21 +22,36 @@ function getUserId(req: AuthenticatedRequest): string {
 
 /**
  * Create a new test module
+ * Requires platformId or platformKey to specify which platform the module belongs to
  */
 export async function createModule(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, name, description, tags, priority } = req.body;
+    const { projectId, platformId, platformKey, name, description, tags, priority } = req.body;
 
     if (!projectId || !name) {
       res.status(400).json({ success: false, error: 'projectId and name are required' });
       return;
     }
 
+    if (!platformId && !platformKey) {
+      res.status(400).json({ success: false, error: 'platformId or platformKey is required' });
+      return;
+    }
+
     const userId = getUserId(req);
+
+    // Resolve platformId from platformKey if needed
+    let resolvedPlatformId = platformId;
+    if (!resolvedPlatformId && platformKey) {
+      // Ensure platforms exist and get the one matching the key
+      const platforms = await PlatformService.ensurePlatformsExist(projectId, userId);
+      resolvedPlatformId = platformKey === 'web_ui' ? platforms.webUi.id : platforms.api.id;
+    }
 
     const module = await ModuleService.create({
       projectId,
       userId,
+      platformId: resolvedPlatformId,
       name,
       description,
       tags,
@@ -71,10 +88,11 @@ export async function getModule(req: AuthenticatedRequest, res: Response): Promi
 
 /**
  * List modules for a project
+ * Supports filtering by platformId or platformKey
  */
 export async function listModules(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId } = req.query;
+    const { projectId, platformId, platformKey } = req.query;
 
     if (!projectId || typeof projectId !== 'string') {
       res.status(400).json({ success: false, error: 'projectId is required' });
@@ -85,7 +103,12 @@ export async function listModules(req: AuthenticatedRequest, res: Response): Pro
     const limit = parseInt(req.query.limit as string) || 50;
     const offset = parseInt(req.query.offset as string) || 0;
 
-    const result = await ModuleService.listByProject(projectId, userId, { limit, offset });
+    const result = await ModuleService.listByProject(projectId, userId, {
+      limit,
+      offset,
+      platformId: typeof platformId === 'string' ? platformId : undefined,
+      platformKey: typeof platformKey === 'string' ? (platformKey as PlatformKey) : undefined,
+    });
 
     res.json({
       success: true,

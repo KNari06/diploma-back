@@ -6,6 +6,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import type {
     CreateTestModuleParams,
+    PlatformKey,
     TestModule,
     UpdateTestModuleParams,
 } from '@/types/testing.types';
@@ -14,19 +15,25 @@ import { logger } from '@/utils/core/logger';
 /**
  * Service for managing test modules
  * Modules represent functional areas of the product (Auth, Payments, Profile)
+ * Each module belongs to a platform (web_ui or api)
  */
 export class ModuleService {
   /**
    * Create a new test module
-   * @param params - Module creation parameters
+   * @param params - Module creation parameters (must include platformId)
    * @returns Created module
    */
   static async create(params: CreateTestModuleParams): Promise<TestModule> {
-    const { projectId, userId, name, description, tags, priority } = params;
+    const { projectId, userId, platformId, name, description, tags, priority } = params;
+
+    if (!platformId) {
+      throw new Error('platformId is required to create a module');
+    }
 
     logger.info('[MODULE_SERVICE] Creating module', {
       projectId,
       userId,
+      platformId,
       name,
     });
 
@@ -35,12 +42,13 @@ export class ModuleService {
       .insert({
         project_id: projectId,
         user_id: userId,
+        platform_id: platformId,
         name,
         description: description || null,
         tags: tags || [],
         priority: priority || null,
       })
-      .select('*')
+      .select('*, test_platforms!inner(platform_key)')
       .single();
 
     if (error) {
@@ -60,7 +68,7 @@ export class ModuleService {
   static async getById(id: string, userId: string): Promise<TestModule | null> {
     const { data, error } = await supabaseAdmin
       .from('test_modules')
-      .select('*')
+      .select('*, test_platforms!inner(platform_key)')
       .eq('id', id)
       .eq('user_id', userId)
       .single();
@@ -80,34 +88,51 @@ export class ModuleService {
    * List modules for a project
    * @param projectId - Project ID
    * @param userId - User ID for access control
-   * @param options - Pagination options
+   * @param options - Pagination and filter options
    * @returns List of modules with total count
    */
   static async listByProject(
     projectId: string,
     userId: string,
-    options: { limit?: number; offset?: number } = {}
+    options: { limit?: number; offset?: number; platformId?: string; platformKey?: PlatformKey } = {}
   ): Promise<{ items: TestModule[]; total: number }> {
-    const { limit = 50, offset = 0 } = options;
+    const { limit = 50, offset = 0, platformId, platformKey } = options;
 
-    // Get count
-    const { count, error: countError } = await supabaseAdmin
+    // Build base query for count
+    let countQuery = supabaseAdmin
       .from('test_modules')
       .select('id', { count: 'exact', head: true })
       .eq('project_id', projectId)
       .eq('user_id', userId);
+
+    // Apply platform filter
+    if (platformId) {
+      countQuery = countQuery.eq('platform_id', platformId);
+    }
+
+    const { count, error: countError } = await countQuery;
 
     if (countError) {
       logger.error('[MODULE_SERVICE] Failed to count modules', { error: countError });
       throw new Error(`Failed to list modules: ${countError.message}`);
     }
 
-    // Get items
-    const { data, error } = await supabaseAdmin
+    // Build query for items with platform join
+    let itemsQuery = supabaseAdmin
       .from('test_modules')
-      .select('*')
+      .select('*, test_platforms!inner(platform_key)')
       .eq('project_id', projectId)
-      .eq('user_id', userId)
+      .eq('user_id', userId);
+
+    // Apply platform filters
+    if (platformId) {
+      itemsQuery = itemsQuery.eq('platform_id', platformId);
+    }
+    if (platformKey) {
+      itemsQuery = itemsQuery.eq('test_platforms.platform_key', platformKey);
+    }
+
+    const { data, error } = await itemsQuery
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
@@ -150,7 +175,7 @@ export class ModuleService {
       .update(updates)
       .eq('id', id)
       .eq('user_id', userId)
-      .select('*')
+      .select('*, test_platforms!inner(platform_key)')
       .single();
 
     if (error) {
@@ -207,12 +232,15 @@ export class ModuleService {
 
   /**
    * Map database row to TestModule type
+   * Includes platformKey from joined test_platforms if available
    */
   private static mapToTestModule(row: any): TestModule {
     return {
       id: row.id,
       projectId: row.project_id,
       userId: row.user_id,
+      platformId: row.platform_id,
+      platformKey: row.test_platforms?.platform_key || undefined,
       name: row.name,
       description: row.description || undefined,
       tags: row.tags || [],

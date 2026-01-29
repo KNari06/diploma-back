@@ -53,17 +53,54 @@ export type FixtureScope = 'global' | 'project' | 'module' | 'suite' | 'flow';
  */
 export type PlanItemType = 'module' | 'suite' | 'flow' | 'test_case';
 
+/**
+ * Platform key types (top-level test category)
+ */
+export type PlatformKey = 'web_ui' | 'api';
+
+// ============================================================================
+// TEST PLATFORM
+// ============================================================================
+
+/**
+ * Test platform - top-level grouping (Web UI tests / API tests)
+ */
+export interface TestPlatform {
+  id: string;
+  projectId: string;
+  userId: string;
+  platformKey: PlatformKey;
+  name: string;
+  description?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Params for creating a test platform (typically auto-seeded)
+ */
+export interface CreateTestPlatformParams {
+  projectId: string;
+  userId: string;
+  platformKey: PlatformKey;
+  name: string;
+  description?: string;
+}
+
 // ============================================================================
 // TEST MODULE
 // ============================================================================
 
 /**
  * Test module - functional area of the product (Auth, Payments, Profile)
+ * Belongs to a platform (web_ui or api)
  */
 export interface TestModule {
   id: string;
   projectId: string;
   userId: string;
+  platformId: string;
+  platformKey?: PlatformKey;
   name: string;
   description?: string;
   tags: string[];
@@ -78,6 +115,7 @@ export interface TestModule {
 export interface CreateTestModuleParams {
   projectId: string;
   userId: string;
+  platformId: string;
   name: string;
   description?: string;
   tags?: string[];
@@ -250,6 +288,52 @@ export interface UpdateTestFixtureParams {
   scope?: FixtureScope;
   moduleId?: string;
   tags?: string[];
+}
+
+// ============================================================================
+// SAVED TEST CASE
+// ============================================================================
+
+/**
+ * Saved test case - reusable UI test for regression
+ */
+export interface SavedTestCase {
+  id: string;
+  projectId: string;
+  userId: string;
+  sourceTestId?: string;
+  sourceIntelligentSessionId?: string;
+  name: string;
+  description?: string;
+  kind: 'standalone' | 'regression_member';
+  replayStrategy: 'commands' | 'graph_extract';
+  url?: string;
+  flowId?: string;
+  tags: string[];
+  priority?: Priority;
+  preconditions: any[];
+  setupSteps: any[];
+  teardownSteps: any[];
+  expectedResult?: string;
+  dependsOn: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Dependency suggestion from AI
+ */
+export interface DependencySuggestion {
+  id: string;           // saved_test_cases.id of the suggested dependency
+  confidence: number;   // 0.0 - 1.0
+  reason: string;       // Human-readable explanation
+}
+
+/**
+ * Saved test case response with AI suggestions (for create/update)
+ */
+export interface SavedTestCaseWithSuggestions extends SavedTestCase {
+  suggestedDependsOn: DependencySuggestion[];
 }
 
 // ============================================================================

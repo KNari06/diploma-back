@@ -20,6 +20,7 @@ const router = Router();
  * /api/v1/modules:
  *   get:
  *     summary: List modules for a project
+ *     description: Returns modules optionally filtered by platform
  *     tags: [Modules]
  *     security:
  *       - bearerAuth: []
@@ -30,6 +31,18 @@ const router = Router();
  *         schema:
  *           type: string
  *           format: uuid
+ *       - in: query
+ *         name: platformId
+ *         description: Filter by platform UUID
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *       - in: query
+ *         name: platformKey
+ *         description: Filter by platform key
+ *         schema:
+ *           type: string
+ *           enum: [web_ui, api]
  *       - in: query
  *         name: limit
  *         schema:
@@ -45,6 +58,7 @@ const router = Router();
  *         description: List of modules
  *   post:
  *     summary: Create a new module
+ *     description: Creates a module under a platform. Requires platformId or platformKey.
  *     tags: [Modules]
  *     security:
  *       - bearerAuth: []
@@ -61,6 +75,14 @@ const router = Router();
  *               projectId:
  *                 type: string
  *                 format: uuid
+ *               platformId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: Platform UUID (required if platformKey not provided)
+ *               platformKey:
+ *                 type: string
+ *                 enum: [web_ui, api]
+ *                 description: Platform key (required if platformId not provided)
  *               name:
  *                 type: string
  *               description:
