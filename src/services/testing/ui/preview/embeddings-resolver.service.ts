@@ -451,20 +451,22 @@ async function generateEmbeddingsWithTimeout(texts: string[], timeoutMs: number)
 
 /**
  * Rank candidates by embedding similarity
- * Uses cache when available
+ * Uses cache when available (unless disableCaching is true)
  */
 async function rankCandidatesByEmbedding(params: {
   intentText: string;
   candidates: Array<{ node: InteractiveNode; candidateText: string }>;
   previewSessionId: string;
   pageSignature: string;
+  /** V5: When true, skip cache lookup and compute fresh embeddings */
+  disableCaching?: boolean;
 }): Promise<{
   ranked: RankedCandidate[];
   cacheHit: boolean;
   latencyMs: number;
 }> {
   const startTime = Date.now();
-  const { intentText, candidates, previewSessionId, pageSignature } = params;
+  const { intentText, candidates, previewSessionId, pageSignature, disableCaching = false } = params;
 
   if (candidates.length === 0) {
     return { ranked: [], cacheHit: false, latencyMs: 0 };
@@ -473,8 +475,14 @@ async function rankCandidatesByEmbedding(params: {
   // Generate intent embedding
   const intentEmbedding = await generateEmbeddingWithTimeout(intentText, EMBEDDING_TIMEOUT_MS);
 
-  // Check cache for candidate embeddings
-  const cached = getCachedEmbeddings(previewSessionId, pageSignature);
+  // Check cache for candidate embeddings (skip when disableCaching is true)
+  const cached = disableCaching ? null : getCachedEmbeddings(previewSessionId, pageSignature);
+
+  if (disableCaching) {
+    logger.debug('[EMBEDDINGS_RESOLVER] Cache bypass due to disableCaching flag', {
+      previewSessionId,
+    });
+  }
   let cacheHit = false;
   let candidateEmbeddings: number[][] = [];
   const textsToEmbed: string[] = [];
@@ -688,8 +696,10 @@ export async function resolveWithEmbeddings(params: {
   stepDraft: IntentStep;
   domNodes: InteractiveNode[];
   pageUrl: string;
+  /** V5: When true, bypass embeddings cache */
+  disableCaching?: boolean;
 }): Promise<LintResult> {
-  const { previewSessionId, stepDraft, domNodes, pageUrl } = params;
+  const { previewSessionId, stepDraft, domNodes, pageUrl, disableCaching = false } = params;
   const startTime = Date.now();
 
   logger.debug('[EMBEDDINGS_RESOLVER] Starting resolution', {
@@ -779,6 +789,7 @@ export async function resolveWithEmbeddings(params: {
         candidates: candidatesToEmbed,
         previewSessionId,
         pageSignature,
+        disableCaching, // V5: Bypass cache when true
       });
 
       ranked = rankResult.ranked;

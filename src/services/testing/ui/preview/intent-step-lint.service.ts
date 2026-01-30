@@ -687,12 +687,61 @@ export class IntentStepLintService {
       };
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // V5: Evidence shortcut - try lastSuccessRef first (when caching is enabled)
+    // ═══════════════════════════════════════════════════════════════════════════
+    const disableCaching = stepDraft.options?.disableCaching === true;
+
+    if (!disableCaching && stepDraft.evidence?.lastSuccessRef) {
+      const cachedRef = stepDraft.evidence.lastSuccessRef;
+      const cachedNode = snapshot.domNodes.find(n => n.ref === cachedRef);
+
+      // Minimal validation: exists, visible, not disabled
+      if (cachedNode && cachedNode.isVisible !== false && cachedNode.isDisabled !== true) {
+        logger.debug('[INTENT_LINT_V5] Evidence shortcut hit', {
+          previewSessionId,
+          cachedRef,
+          nodeTag: cachedNode.tag,
+        });
+
+        return {
+          status: 'resolved',
+          message: 'Element resolved from evidence cache',
+          confidence: 0.95,
+          candidates: [{
+            ref: cachedRef,
+            label: cachedNode.labelText || cachedNode.ariaLabel || cachedNode.text || cachedNode.placeholder || `<${cachedNode.tag}>`,
+            reason: 'Evidence shortcut (lastSuccessRef)',
+            confidence: 0.95,
+            boundingBox: cachedNode.boundingBox,
+            node: cachedNode, // Include full node for compiled plan generation
+          }],
+          highlight: [{
+            ref: cachedRef,
+            boundingBox: cachedNode.boundingBox,
+            type: 'success',
+          }],
+          cacheHit: true,
+        };
+      }
+
+      // Evidence ref not found or invalid - log and continue to full linting
+      logger.debug('[INTENT_LINT_V5] Evidence shortcut miss - node not found or invalid', {
+        previewSessionId,
+        cachedRef,
+        nodeFound: !!cachedNode,
+        nodeVisible: cachedNode?.isVisible,
+        nodeDisabled: cachedNode?.isDisabled,
+      });
+    }
+
     // Step 1: Try embeddings-based resolver (PRIMARY)
     const embeddingsResult = await resolveWithEmbeddings({
       previewSessionId,
       stepDraft,
       domNodes: snapshot.domNodes,
       pageUrl: snapshot.url,
+      disableCaching, // V5: Pass disableCaching to skip embeddings cache
     });
 
     // Step 2: If embeddings failed, fall back to rule-based + LLM
