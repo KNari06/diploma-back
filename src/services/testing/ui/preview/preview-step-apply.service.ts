@@ -6,7 +6,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
-import type { Page } from 'playwright';
+import type { FrameLocator, Locator, Page } from 'playwright';
 import { sanitizeIntent } from './embeddings-resolver.service';
 import { IntentStepLintService } from './intent-step-lint.service';
 import { LocatorPlanBuilder } from './locator-plan-builder.service';
@@ -50,7 +50,22 @@ interface ApplyResult {
 }
 
 /**
+ * Get locator context - either page or iframe
+ * Handles iframe configuration if specified in step options
+ */
+function getLocatorContext(page: Page, step: IntentStep): Page | FrameLocator {
+  if (step.options?.iframe?.selector) {
+    logger.debug('[PREVIEW_APPLY] Using iframe context', {
+      iframeSelector: step.options.iframe.selector,
+    });
+    return page.frameLocator(step.options.iframe.selector);
+  }
+  return page;
+}
+
+/**
  * V2: Verify that an action had the expected effect
+ * Respects iframe context if configured in step options
  */
 async function verifyActionEffect(
   page: Page,
@@ -60,36 +75,40 @@ async function verifyActionEffect(
   const selector = `[data-agent-ref="${ref}"]`;
 
   try {
+    // Use the same context (page or iframe) as action execution
+    const context = getLocatorContext(page, step);
+    const locator = context.locator(selector);
+
     switch (step.type) {
       case 'check': {
-        const checked = await page.locator(selector).isChecked();
+        const checked = await locator.isChecked();
         return checked === true;
       }
 
       case 'uncheck': {
-        const checked = await page.locator(selector).isChecked();
+        const checked = await locator.isChecked();
         return checked === false;
       }
 
       case 'toggle': {
         // For toggle, we just verify the element is still interactive
-        const isVisible = await page.locator(selector).isVisible();
+        const isVisible = await locator.isVisible();
         return isVisible;
       }
 
       case 'open': {
-        const expanded = await page.locator(selector).getAttribute('aria-expanded');
+        const expanded = await locator.getAttribute('aria-expanded');
         return expanded === 'true';
       }
 
       case 'close': {
-        const expanded = await page.locator(selector).getAttribute('aria-expanded');
+        const expanded = await locator.getAttribute('aria-expanded');
         return expanded !== 'true';
       }
 
       case 'fill': {
         // Verify the input has a value
-        const value = await page.locator(selector).inputValue().catch(() => '');
+        const value = await locator.inputValue().catch(() => '');
         return value.length > 0 || step.value === ''; // Empty fill is valid
       }
 
@@ -107,6 +126,33 @@ async function verifyActionEffect(
 }
 
 /**
+ * Build selector from step options and candidate
+ * Prioritizes manual CSS selector override if provided
+ */
+function buildSelector(step: IntentStep, candidate: LintCandidate): string | undefined {
+  // Manual CSS selector override takes priority
+  if (step.options?.cssSelector) {
+    return step.options.cssSelector;
+  }
+  // Fall back to candidate ref
+  return candidate.ref ? `[data-agent-ref="${candidate.ref}"]` : undefined;
+}
+
+/**
+ * Wait for element stability before action (unless disabled)
+ */
+async function ensureStability(
+  locator: Locator,
+  step: IntentStep,
+  timeout: number
+): Promise<void> {
+  if (step.options?.disableStabilityChecks) {
+    return;
+  }
+  await locator.waitFor({ state: 'visible', timeout });
+}
+
+/**
  * Execute an action on the page
  */
 async function executeAction(
@@ -117,59 +163,73 @@ async function executeAction(
   const urlBefore = page.url();
 
   try {
-    // Build selector from candidate
-    const selector = candidate.ref
-      ? `[data-agent-ref="${candidate.ref}"]`
-      : undefined;
+    // Build selector - prioritize manual CSS override
+    const selector = buildSelector(step, candidate);
 
     if (!selector && step.type !== 'navigate' && step.type !== 'wait') {
       return { success: false, error: 'No valid selector for element', urlChanged: false };
     }
 
+    // Get context (page or iframe)
+    const context = getLocatorContext(page, step);
+    const timeout = step.options?.timeout || ACTION_TIMEOUT;
+
+    // Get locator if we have a selector
+    const locator = selector ? (context as Page | FrameLocator).locator(selector) : undefined;
+
+    // Ensure element stability before action (unless disabled)
+    if (locator && step.type !== 'navigate' && step.type !== 'wait') {
+      await ensureStability(locator, step, timeout);
+    }
+
     switch (step.type) {
       case 'fill': {
-        if (!selector) throw new Error('No selector for fill action');
+        if (!locator) throw new Error('No selector for fill action');
         const value = step.value || '';
         if (step.options?.replaceContent === false) {
-          await page.click(selector, { timeout: ACTION_TIMEOUT });
-          await page.type(selector, value, { timeout: ACTION_TIMEOUT });
+          await locator.click({ timeout });
+          // Use keyPressDelay if specified
+          await locator.pressSequentially(value, {
+            timeout,
+            delay: step.options?.keyPressDelay,
+          });
         } else {
-          await page.fill(selector, value, { timeout: ACTION_TIMEOUT });
+          await locator.fill(value, { timeout });
         }
         if (step.options?.pressEnter) {
-          await page.press(selector, 'Enter', { timeout: ACTION_TIMEOUT });
+          await locator.press('Enter', { timeout });
         }
         break;
       }
 
       case 'click': {
-        if (!selector) throw new Error('No selector for click action');
-        await page.click(selector, { timeout: ACTION_TIMEOUT });
+        if (!locator) throw new Error('No selector for click action');
+        await locator.click({ timeout });
         break;
       }
 
       case 'select': {
-        if (!selector) throw new Error('No selector for select action');
-        await page.selectOption(selector, step.value || '', { timeout: ACTION_TIMEOUT });
+        if (!locator) throw new Error('No selector for select action');
+        await locator.selectOption(step.value || '', { timeout });
         break;
       }
 
       case 'hover': {
-        if (!selector) throw new Error('No selector for hover action');
-        await page.hover(selector, { timeout: ACTION_TIMEOUT });
+        if (!locator) throw new Error('No selector for hover action');
+        await locator.hover({ timeout });
         break;
       }
 
       case 'press': {
-        if (!selector) throw new Error('No selector for press action');
+        if (!locator) throw new Error('No selector for press action');
         const key = step.value || 'Enter';
-        await page.press(selector, key, { timeout: ACTION_TIMEOUT });
+        await locator.press(key, { timeout });
         break;
       }
 
       case 'scroll': {
-        if (selector) {
-          await page.locator(selector).scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT });
+        if (locator) {
+          await locator.scrollIntoViewIfNeeded({ timeout });
         } else {
           // Scroll down by 300px
           await page.evaluate(() => {
@@ -181,8 +241,8 @@ async function executeAction(
       }
 
       case 'wait': {
-        const timeout = step.options?.timeout || 1000;
-        await page.waitForTimeout(timeout);
+        const waitTimeout = step.options?.timeout || 1000;
+        await page.waitForTimeout(waitTimeout);
         break;
       }
 
@@ -194,9 +254,8 @@ async function executeAction(
       }
 
       case 'assert': {
-        if (!selector) throw new Error('No selector for assert action');
-        const element = page.locator(selector);
-        await element.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT });
+        if (!locator) throw new Error('No selector for assert action');
+        await locator.waitFor({ state: 'visible', timeout });
         break;
       }
 
@@ -204,41 +263,41 @@ async function executeAction(
       // V2: New state-aware action types
       // ═══════════════════════════════════════════════════════════════════════
       case 'check': {
-        if (!selector) throw new Error('No selector for check action');
-        await page.locator(selector).check({ timeout: ACTION_TIMEOUT });
+        if (!locator) throw new Error('No selector for check action');
+        await locator.check({ timeout });
         break;
       }
 
       case 'uncheck': {
-        if (!selector) throw new Error('No selector for uncheck action');
-        await page.locator(selector).uncheck({ timeout: ACTION_TIMEOUT });
+        if (!locator) throw new Error('No selector for uncheck action');
+        await locator.uncheck({ timeout });
         break;
       }
 
       case 'toggle': {
-        if (!selector) throw new Error('No selector for toggle action');
+        if (!locator) throw new Error('No selector for toggle action');
         // Toggle: click the element (works for checkboxes, switches, toggles)
-        await page.click(selector, { timeout: ACTION_TIMEOUT });
+        await locator.click({ timeout });
         break;
       }
 
       case 'open': {
-        if (!selector) throw new Error('No selector for open action');
+        if (!locator) throw new Error('No selector for open action');
         // Open: click to expand (dropdown, accordion, menu)
         // First check if already open
-        const isExpanded = await page.locator(selector).getAttribute('aria-expanded');
+        const isExpanded = await locator.getAttribute('aria-expanded');
         if (isExpanded !== 'true') {
-          await page.click(selector, { timeout: ACTION_TIMEOUT });
+          await locator.click({ timeout });
         }
         break;
       }
 
       case 'close': {
-        if (!selector) throw new Error('No selector for close action');
+        if (!locator) throw new Error('No selector for close action');
         // Close: click to collapse (dropdown, accordion, menu)
-        const isExpanded = await page.locator(selector).getAttribute('aria-expanded');
+        const isExpanded = await locator.getAttribute('aria-expanded');
         if (isExpanded === 'true') {
-          await page.click(selector, { timeout: ACTION_TIMEOUT });
+          await locator.click({ timeout });
         }
         break;
       }

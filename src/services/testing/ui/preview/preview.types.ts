@@ -226,11 +226,7 @@ export interface CompiledStepPlan {
   action: {
     type: IntentActionType;
     value?: string;
-    options?: {
-      timeout?: number;
-      replaceContent?: boolean;
-      pressEnter?: boolean;
-    };
+    options?: StepOptions;
   };
   /** Pre-conditions to check before action */
   preconditions?: ('visible' | 'enabled' | 'attached' | 'stable')[];
@@ -252,6 +248,38 @@ export interface CompiledStepPlan {
 }
 
 /**
+ * Iframe configuration for actions within iframes
+ */
+export interface IframeConfig {
+  /** CSS selector for the iframe element */
+  selector: string;
+  /** Timeout for waiting for iframe to be ready (ms) */
+  timeout?: number;
+}
+
+/**
+ * Step options - shared between IntentStep and CompiledStepPlan
+ */
+export interface StepOptions {
+  /** Action timeout in milliseconds */
+  timeout?: number;
+  /** If false, append text instead of replacing (for fill actions) */
+  replaceContent?: boolean;
+  /** Press Enter after filling */
+  pressEnter?: boolean;
+  /** Delay between keystrokes in milliseconds (for type actions) */
+  keyPressDelay?: number;
+  /** Manual CSS selector override - bypasses AI resolution */
+  cssSelector?: string;
+  /** Skip visibility/enabled checks before action */
+  disableStabilityChecks?: boolean;
+  /** Force fresh element lookup, skip evidence cache */
+  disableCaching?: boolean;
+  /** Iframe configuration for actions within iframes */
+  iframe?: IframeConfig;
+}
+
+/**
  * Intent step - user-authored test step with plain text description
  */
 export interface IntentStep {
@@ -264,11 +292,7 @@ export interface IntentStep {
   /** Value for fill actions */
   value?: string;
   /** Options for the action */
-  options?: {
-    timeout?: number;
-    replaceContent?: boolean;
-    pressEnter?: boolean;
-  };
+  options?: StepOptions;
   /** Hints for element resolution */
   bindingHints?: BindingHints;
   /** Cached evidence from last execution (optimization, not truth) */
