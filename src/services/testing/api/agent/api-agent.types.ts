@@ -9,11 +9,20 @@
 
 export type ApiAgentLevel = 'light' | 'medium' | 'hard';
 
+/**
+ * Execution profile determines safety constraints for the test run.
+ * - 'prod_readonly': strictly read-only, no mutations, minimal fuzzing impact (for production)
+ * - 'nonprod': allows mutations and aggressive testing (for staging/dev/local)
+ */
+export type ExecutionProfile = 'prod_readonly' | 'nonprod';
+
 export interface ApiAgentBudget {
   maxSteps: number;
   maxSeconds: number;
   maxAiTokens: number;
   maxEndpointsConsidered: number;
+  /** Hard cap on total HTTP requests for this run (across all steps) */
+  maxRequests: number;
 }
 
 export interface ApiAgentLevelPolicy {
@@ -64,6 +73,12 @@ export interface ApiAgentRequest {
   projectId?: string;
   /** User's original message/intent */
   userMessage?: string;
+  /**
+   * Execution profile override. If not provided, inferred from URL patterns.
+   * - 'prod_readonly': strictly read-only, minimal impact (for production)
+   * - 'nonprod': allows mutations and aggressive testing
+   */
+  executionProfile?: ExecutionProfile;
 }
 
 export type ApiAgentExpectationResponseType = 'list' | 'object' | 'primitive' | 'unknown';
@@ -107,6 +122,8 @@ export interface ApiAgentStepResult {
   findings: ApiAgentFinding[];
   /** AI tokens consumed in this step */
   aiTokensUsed: number;
+  /** Total HTTP requests executed for this step (multi-request steps use >1) */
+  requestsExecuted?: number;
   timestamp: string;
 }
 
@@ -120,7 +137,14 @@ export type ApiAgentStepType =
   | 'fuzzing'
   | 'auth_bypass'
   | 'race_probe'
-  | 'retry_on_error';
+  | 'retry_on_error'
+  // New read-only HARD step types for deeper coverage
+  | 'auth_matrix'           // Systematic auth header variations (missing/empty/malformed/bad bearer)
+  | 'idor_probe'            // Synthetic invalid IDs to detect IDOR vulnerabilities
+  | 'header_security_check' // Validate response security headers (CORS, caching, content-type)
+  | 'rate_limit_probe_safe' // Small burst to detect 429 and Retry-After behavior
+  | 'error_leak_check'      // Detect stack traces, SQL errors, debug info leaks
+  | 'content_negotiation';  // Accept header variants to detect unexpected responses
 
 export interface ApiAgentFinding {
   id: string;
@@ -151,7 +175,18 @@ export type ApiAgentFindingType =
   | 'auth_issue'
   | 'rate_limit_issue'
   | 'server_error'
-  | 'capability_discovered';
+  | 'capability_discovered'
+  // New finding types for expanded HARD coverage
+  | 'auth_matrix_issue'       // Auth header variation revealed weakness
+  | 'idor_vulnerability'      // Potential IDOR detected
+  | 'header_security_issue'   // Missing/misconfigured security headers
+  | 'error_leak'              // Stack trace, SQL error, or debug info leaked
+  | 'content_type_mismatch'   // Unexpected content type returned
+  | 'sql_injection_indicator' // Potential SQL injection signal
+  | 'xss_reflection'          // Potential XSS reflection detected
+  | 'command_injection_indicator' // Potential command injection signal
+  | 'ssrf_indicator'          // Potential SSRF signal
+  | 'path_traversal_indicator'; // Potential path traversal signal
 
 export interface ApiAgentRunState {
   runId: string;
@@ -182,6 +217,8 @@ export interface ApiAgentRunState {
     seconds: number;
     aiTokens: number;
     endpointsConsidered: number;
+    /** Total HTTP requests executed across all steps */
+    requests: number;
   };
   /** Stop reason if stopped early */
   stopReason?: ApiAgentStopReason;
@@ -193,6 +230,7 @@ export interface ApiAgentRunState {
 export type ApiAgentStopReason =
   | 'completed'
   | 'budget_steps'
+  | 'budget_requests'
   | 'budget_time'
   | 'budget_tokens'
   | 'novelty_threshold'
@@ -206,6 +244,12 @@ export interface ApiAgentSummary {
   testId: string;
   url: string;
   method: string;
+  /** Execution profile used for this run */
+  executionProfile?: ExecutionProfile;
+  /** User-facing mode label for UI */
+  modeLabel?: string;
+  /** Disclaimer to reduce legal ambiguity on production testing */
+  disclaimer?: string;
   /** Overall success (happy-path worked + no critical issues) */
   success: boolean;
   /** Total duration in ms */
@@ -296,4 +340,6 @@ export interface SafetyGateContext {
   stepType: ApiAgentStepType;
   policy: ApiAgentLevelPolicy;
   currentState: ApiAgentRunState;
+  /** Execution profile for safety decisions (prod_readonly blocks mutations entirely) */
+  executionProfile?: ExecutionProfile;
 }

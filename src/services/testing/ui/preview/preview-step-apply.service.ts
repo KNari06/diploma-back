@@ -9,6 +9,7 @@ import { sanitizeUrl } from '@/utils/validation/validation';
 import type { Page } from 'playwright';
 import { sanitizeIntent } from './embeddings-resolver.service';
 import { IntentStepLintService } from './intent-step-lint.service';
+import { LocatorPlanBuilder } from './locator-plan-builder.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type {
     IntentStep,
@@ -302,10 +303,28 @@ export class PreviewStepApplyService {
       // Handle non-targeting actions (navigate, wait)
       if (['navigate', 'wait'].includes(stepDraft.type)) {
         const result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
+        
+        // Generate compiled plan for non-targeting actions
+        let compiled;
+        try {
+          compiled = LocatorPlanBuilder.buildCompiledPlanForNonTargetingAction({
+            step: stepDraft,
+            pageUrl: page.url(),
+            pageTitle: await page.title().catch(() => undefined),
+          });
+        } catch (compileError) {
+          logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan for non-targeting action', {
+            error: compileError instanceof Error ? compileError.message : String(compileError),
+          });
+        }
+        
         return {
           success: result.success,
           error: result.error,
-          appliedStep: stepDraft,
+          appliedStep: {
+            ...stepDraft,
+            compiled,
+          },
           urlChanged: result.urlChanged,
           url: page.url(),
           attempts: 1,
@@ -332,6 +351,34 @@ export class PreviewStepApplyService {
           // Wait for page to settle
           await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
 
+          // Try to get the node from current session for compiled plan
+          const sessionService = getPreviewSessionService();
+          const isOwned = sessionService.isSessionOwned(previewSessionId, userId);
+          const session = isOwned ? sessionService.getSession(previewSessionId) : undefined;
+          const resolvedNode = session?.pageState?.domNodes?.find(n => n.ref === selectedRef);
+
+          // Generate compiled plan if node is available
+          let compiled;
+          if (resolvedNode) {
+            try {
+              compiled = LocatorPlanBuilder.buildCompiledPlan({
+                step: stepDraft,
+                resolvedNode,
+                pageUrl: page.url(),
+                pageTitle: await page.title().catch(() => undefined),
+              });
+            } catch (compileError) {
+              logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan for user-confirmed selection', {
+                error: compileError instanceof Error ? compileError.message : String(compileError),
+              });
+            }
+          } else if (!isOwned) {
+            logger.warn('[PREVIEW_APPLY] Skip compiled plan: session is not owned by user', {
+              previewSessionId,
+              userId,
+            });
+          }
+
           // Update step evidence
           const updatedStep: IntentStep = {
             ...stepDraft,
@@ -340,6 +387,7 @@ export class PreviewStepApplyService {
               lastSuccessRef: selectedRef,
               confidence: 1.0,
             },
+            compiled, // NEW: compiled execution plan
           };
 
           return {
@@ -440,6 +488,27 @@ export class PreviewStepApplyService {
             }
           }
 
+          // V3: Generate compiled plan from resolved node
+          let compiled;
+          if (candidate.node) {
+            try {
+              compiled = LocatorPlanBuilder.buildCompiledPlan({
+                step: stepDraft,
+                resolvedNode: candidate.node,
+                pageUrl: page.url(),
+                pageTitle: await page.title().catch(() => undefined),
+              });
+              logger.debug('[PREVIEW_APPLY] Compiled plan generated', {
+                stepId: stepDraft.id,
+                locatorCount: compiled.locatorPlan.length,
+              });
+            } catch (compileError) {
+              logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan', {
+                error: compileError instanceof Error ? compileError.message : String(compileError),
+              });
+            }
+          }
+
           // Update step evidence
           const updatedStep: IntentStep = {
             ...stepDraft,
@@ -448,6 +517,7 @@ export class PreviewStepApplyService {
               lastSuccessRef: candidate.ref,
               confidence: candidate.confidence,
             },
+            compiled, // NEW: compiled execution plan
           };
 
           return {

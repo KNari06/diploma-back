@@ -10,6 +10,7 @@ import type {
   ApiAgentStepType,
   SafetyGateContext,
   SafetyGateResult,
+  ExecutionProfile,
 } from './api-agent.types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -21,6 +22,7 @@ const LIGHT_BUDGET: ApiAgentBudget = {
   maxSeconds: 60,
   maxAiTokens: 15000,
   maxEndpointsConsidered: 1,
+  maxRequests: 20,
 };
 
 const MEDIUM_BUDGET: ApiAgentBudget = {
@@ -28,6 +30,7 @@ const MEDIUM_BUDGET: ApiAgentBudget = {
   maxSeconds: 180,
   maxAiTokens: 35000,
   maxEndpointsConsidered: 5,
+  maxRequests: 60,
 };
 
 const HARD_BUDGET: ApiAgentBudget = {
@@ -35,7 +38,11 @@ const HARD_BUDGET: ApiAgentBudget = {
   maxSeconds: 300,
   maxAiTokens: 50000,
   maxEndpointsConsidered: 5,
+  maxRequests: 120,
 };
+
+/** Hard cap for prod_readonly to prevent request sprawl */
+export const PROD_READONLY_MAX_REQUESTS = 30;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LEVEL POLICIES
@@ -159,6 +166,8 @@ const FUZZING_STEP_TYPES: ApiAgentStepType[] = [
 
 /**
  * Check if URL looks like production
+ * @param url - URL to analyze
+ * @returns true if URL appears to be a production environment
  */
 function looksLikeProduction(url: string): boolean {
   try {
@@ -186,19 +195,83 @@ function looksLikeProduction(url: string): boolean {
 }
 
 /**
- * Check safety gate for a planned step
- * Returns whether the step is allowed and why if not
+ * Infer execution profile from URL if not explicitly provided.
+ * Production-looking URLs get 'prod_readonly', others get 'nonprod'.
+ * @param url - Target URL to analyze
+ * @param explicitProfile - Optional explicit profile override
+ * @returns The effective execution profile
+ */
+export function inferExecutionProfile(
+  url: string,
+  explicitProfile?: ExecutionProfile
+): ExecutionProfile {
+  if (explicitProfile) {
+    return explicitProfile;
+  }
+  return looksLikeProduction(url) ? 'prod_readonly' : 'nonprod';
+}
+
+/**
+ * Check safety gate for a planned step.
+ * Enforces execution profile constraints (prod_readonly blocks all mutations).
+ * Returns whether the step is allowed and why if not.
+ * @param context - Safety gate context with URL, method, step type, policy, and profile
+ * @returns SafetyGateResult indicating if action is allowed
  */
 export function checkSafetyGate(context: SafetyGateContext): SafetyGateResult {
-  const { url, method, stepType, policy } = context;
+  const { url, method, stepType, policy, executionProfile } = context;
 
-  // Gate 1: SSRF protection (always enforced, inherited from executeApiTest)
+  // Determine effective profile (explicit or inferred)
+  const profile = inferExecutionProfile(url, executionProfile);
+
+  // Gate 0: SSRF protection (always enforced, inherited from executeApiTest)
   // This is handled at execution level, not here
 
-  // Gate 2: Mutation methods on production-looking hosts
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PROD_READONLY STRICT GATES (override all other logic)
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (profile === 'prod_readonly') {
+    // Block ALL mutation methods in prod_readonly (except method_contract probing)
+    if (MUTATION_METHODS.includes(method.toUpperCase())) {
+      // method_contract is allowed because it expects 405/4xx (read-only intent)
+      if (stepType !== 'method_contract') {
+        return {
+          allowed: false,
+          reason: `Mutation method ${method} blocked in prod_readonly profile`,
+          skippedAction: `${method} ${url} (prod_readonly)`,
+        };
+      }
+    }
+
+    // Block mutation step types entirely in prod_readonly
+    if (MUTATION_STEP_TYPES.includes(stepType)) {
+      return {
+        allowed: false,
+        reason: `Step type ${stepType} blocked in prod_readonly profile (requires mutations)`,
+        skippedAction: stepType,
+      };
+    }
+
+    // Block race_probe entirely in prod_readonly
+    if (stepType === 'race_probe') {
+      return {
+        allowed: false,
+        reason: 'Race probing blocked in prod_readonly profile',
+        skippedAction: 'race_probe',
+      };
+    }
+
+    // Fuzzing allowed in prod_readonly but with safe subset (enforced elsewhere via config)
+    // We allow the step type, the executor will use prod_readonly limits
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STANDARD POLICY GATES (nonprod or fallback)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Gate 1: Mutation methods based on policy
   if (MUTATION_METHODS.includes(method.toUpperCase())) {
     // Method contract probing is allowed at all levels (it is designed to expect 405/4xx).
-    // We still rely on other guards (SSRF protection in executeApiTest) and budgets.
     if (stepType === 'method_contract') {
       return { allowed: true };
     }
@@ -221,7 +294,7 @@ export function checkSafetyGate(context: SafetyGateContext): SafetyGateResult {
     }
   }
 
-  // Gate 3: Mutation step types
+  // Gate 2: Mutation step types
   if (MUTATION_STEP_TYPES.includes(stepType)) {
     if (!policy.allowMutations) {
       return {
@@ -232,7 +305,7 @@ export function checkSafetyGate(context: SafetyGateContext): SafetyGateResult {
     }
   }
 
-  // Gate 4: Fuzzing step types
+  // Gate 3: Fuzzing step types
   if (FUZZING_STEP_TYPES.includes(stepType)) {
     if (!policy.allowFuzzing) {
       return {
@@ -243,7 +316,7 @@ export function checkSafetyGate(context: SafetyGateContext): SafetyGateResult {
     }
   }
 
-  // Gate 5: Race probing
+  // Gate 4: Race probing
   if (stepType === 'race_probe') {
     if (!policy.allowRaceProbing) {
       return {
@@ -253,7 +326,7 @@ export function checkSafetyGate(context: SafetyGateContext): SafetyGateResult {
       };
     }
 
-    // Even in HARD, skip race probing on production
+    // Even in HARD nonprod, skip race probing on production-looking hosts
     if (looksLikeProduction(url)) {
       return {
         allowed: false,
@@ -268,7 +341,10 @@ export function checkSafetyGate(context: SafetyGateContext): SafetyGateResult {
 }
 
 /**
- * Get list of step types allowed for a level
+ * Get list of step types allowed for a level.
+ * HARD level includes expanded read-only security checks.
+ * @param level - API agent level (light/medium/hard)
+ * @returns Array of allowed step types for the level
  */
 export function getAllowedStepTypes(level: ApiAgentLevel): ApiAgentStepType[] {
   const base: ApiAgentStepType[] = [
@@ -293,12 +369,19 @@ export function getAllowedStepTypes(level: ApiAgentLevel): ApiAgentStepType[] {
     return medium;
   }
 
-  // HARD
+  // HARD: includes all medium steps + security-focused read-only checks
   return [
     ...medium,
     'fuzzing',
     'auth_bypass',
     'race_probe',
+    // New read-only HARD step types for deeper coverage
+    'auth_matrix',           // Systematic auth header variations
+    'idor_probe',            // Synthetic invalid IDs for IDOR detection
+    'header_security_check', // Validate security headers
+    'rate_limit_probe_safe', // Safe rate limit detection
+    'error_leak_check',      // Detect error/debug info leaks
+    'content_negotiation',   // Accept header variants
   ];
 }
 

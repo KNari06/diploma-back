@@ -165,6 +165,143 @@ export class ApiAgentPlannerService {
       }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HARD-ONLY: Suggest new read-only security checks
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (policy.level === 'hard' && happyPathDone) {
+      // Suggest auth_matrix if not done yet
+      if (allowedStepTypes.includes('auth_matrix')) {
+        const authMatrixDone = state.steps.some((s) => s.stepType === 'auth_matrix');
+        if (!authMatrixDone) {
+          return {
+            suggestedNextStep: {
+              stepType: 'auth_matrix',
+              description: 'Test authentication variations: missing, empty, malformed, invalid bearer token',
+              request: {
+                method: request.method,
+                url: request.url,
+                headers: {}, // Will be varied by executor
+              },
+              expectedOutcome: 'Expect 401/403 for invalid auth; detect any bypasses',
+              riskLevel: 'safe',
+            },
+            suggestedShouldStop: false,
+            suggestedReasoning: 'Testing auth matrix to verify authentication enforcement',
+          };
+        }
+      }
+
+      // Suggest header_security_check if not done yet
+      if (allowedStepTypes.includes('header_security_check')) {
+        const headerCheckDone = state.steps.some((s) => s.stepType === 'header_security_check');
+        if (!headerCheckDone) {
+          return {
+            suggestedNextStep: {
+              stepType: 'header_security_check',
+              description: 'Analyze response security headers (CORS, caching, content-type correctness)',
+              request: {
+                method: 'GET',
+                url: request.url,
+                headers: request.headers,
+              },
+              expectedOutcome: 'Validate security headers are properly configured',
+              riskLevel: 'safe',
+            },
+            suggestedShouldStop: false,
+            suggestedReasoning: 'Checking security headers for misconfigurations',
+          };
+        }
+      }
+
+      // Suggest error_leak_check if not done yet
+      if (allowedStepTypes.includes('error_leak_check')) {
+        const errorLeakDone = state.steps.some((s) => s.stepType === 'error_leak_check');
+        if (!errorLeakDone) {
+          return {
+            suggestedNextStep: {
+              stepType: 'error_leak_check',
+              description: 'Probe for error/debug info leaks (stack traces, SQL errors, framework info)',
+              request: {
+                method: request.method,
+                url: request.url,
+                headers: request.headers,
+              },
+              expectedOutcome: 'Verify no sensitive error information is exposed',
+              riskLevel: 'safe',
+            },
+            suggestedShouldStop: false,
+            suggestedReasoning: 'Checking for error information leakage',
+          };
+        }
+      }
+
+      // Suggest content_negotiation if not done yet
+      if (allowedStepTypes.includes('content_negotiation')) {
+        const contentNegDone = state.steps.some((s) => s.stepType === 'content_negotiation');
+        if (!contentNegDone) {
+          return {
+            suggestedNextStep: {
+              stepType: 'content_negotiation',
+              description: 'Test Accept header variants (text/html, application/xml, */*)',
+              request: {
+                method: 'GET',
+                url: request.url,
+                headers: { ...request.headers, 'Accept': 'text/html' },
+              },
+              expectedOutcome: 'Verify proper content-type handling and no unexpected responses',
+              riskLevel: 'safe',
+            },
+            suggestedShouldStop: false,
+            suggestedReasoning: 'Testing content negotiation for unexpected behavior',
+          };
+        }
+      }
+
+      // Suggest idor_probe if not done yet
+      if (allowedStepTypes.includes('idor_probe')) {
+        const idorDone = state.steps.some((s) => s.stepType === 'idor_probe');
+        if (!idorDone) {
+          return {
+            suggestedNextStep: {
+              stepType: 'idor_probe',
+              description: 'Probe with synthetic invalid/neighboring IDs to detect IDOR vulnerabilities',
+              request: {
+                method: 'GET',
+                url: request.url,
+                headers: request.headers,
+              },
+              expectedOutcome: 'Verify consistent 403/404 for unauthorized resource access',
+              riskLevel: 'safe',
+            },
+            suggestedShouldStop: false,
+            suggestedReasoning: 'Probing for IDOR vulnerabilities with synthetic IDs',
+          };
+        }
+      }
+
+      // Suggest rate_limit_probe_safe if not done yet
+      if (allowedStepTypes.includes('rate_limit_probe_safe')) {
+        const rateLimitDone = state.steps.some((s) => s.stepType === 'rate_limit_probe_safe');
+        if (!rateLimitDone) {
+          return {
+            suggestedNextStep: {
+              stepType: 'rate_limit_probe_safe',
+              description: 'Small burst (5-10 requests) to detect rate limiting and Retry-After behavior',
+              request: {
+                method: 'GET',
+                url: request.url,
+                headers: request.headers,
+              },
+              expectedOutcome: 'Detect 429 response and proper Retry-After header if rate limited',
+              riskLevel: 'low',
+            },
+            suggestedShouldStop: false,
+            suggestedReasoning: 'Safe rate limit detection probe',
+          };
+        }
+      }
+    }
+
     return { suggestedNextStep: null };
   }
 
@@ -353,22 +490,38 @@ Return JSON:
   }
 
   /**
-   * Get system prompt for planner
+   * Get system prompt for planner.
+   * Includes level-specific guidance and new HARD step types.
+   * @param level - Current test level
+   * @returns System prompt string
    */
   private static getSystemPrompt(level: string): string {
+    const hardStepGuide = level === 'hard' ? `
+
+HARD-specific step types (read-only, safe for production):
+- auth_matrix: Test auth variations (missing/empty/malformed/invalid bearer) - verify 401/403
+- idor_probe: Use synthetic invalid IDs to detect IDOR - verify 403/404 consistency
+- header_security_check: Analyze response headers (CORS, caching, content-type)
+- rate_limit_probe_safe: Small burst (5-10 req) to detect 429 and Retry-After
+- error_leak_check: Detect stack traces, SQL errors, debug info in responses
+- content_negotiation: Test Accept header variants for unexpected responses
+- fuzzing: Security payload probing (SQLi, XSS, path traversal - read-only safe payloads)
+` : '';
+
     return `You are an expert API testing agent planning the next test step.
 
 Level: ${level.toUpperCase()}
 - LIGHT: Focus on sanity checks, contract validation, basic schema
 - MEDIUM: Add business logic validation, negative cases, consistency checks
-- HARD: Add security testing, fuzzing, edge cases, deeper exploration
-
+- HARD: Maximum security coverage with read-only checks + safe fuzzing
+${hardStepGuide}
 Rules:
 1. Always return valid JSON
 2. Consider safety - skip high-risk steps on production-looking URLs
 3. Stop when novelty is low (nothing new to discover)
 4. Prioritize high-value tests over redundant ones
-5. For mutations, prefer test data that can be cleaned up`;
+5. For mutations, prefer test data that can be cleaned up
+6. For HARD: prefer read-only security checks that work on production`;
   }
 
   /**
@@ -407,6 +560,7 @@ Rules:
         stepType: parsed.nextStep.stepType,
         policy,
         currentState: state,
+        executionProfile: request.executionProfile,
       });
 
       if (!safetyCheck.allowed) {

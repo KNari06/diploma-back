@@ -14,6 +14,8 @@ import { ApiAgentPlannerService } from './api-agent-planner.service';
 import {
   getBaselineCredits,
   getPolicyWithOverrides,
+  inferExecutionProfile,
+  PROD_READONLY_MAX_REQUESTS,
   isValidLevel,
 } from './api-agent-policy';
 import {
@@ -45,6 +47,17 @@ import type {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class ApiAgentOrchestratorService {
+  private static getModeLabel(
+    level: ApiAgentRequest['level'],
+    executionProfile: 'prod_readonly' | 'nonprod'
+  ): string {
+    if (level !== 'hard') return level;
+    return executionProfile === 'prod_readonly' ? 'Hard (Prod-safe)' : 'Hard (Non-prod)';
+  }
+
+  private static getProdReadonlyDisclaimer(): string {
+    return 'No state mutation, no exploitation performed. Read-only probes only.';
+  }
   /**
    * Run the API agent with the given request
    * Main entry point for agent execution
@@ -65,8 +78,15 @@ export class ApiAgentOrchestratorService {
       };
     }
 
+    const executionProfile = inferExecutionProfile(request.url, request.executionProfile);
+
     // Get policy with optional overrides
     const policy = getPolicyWithOverrides(request.level, request.budgetOverrides);
+
+    // Enforce strict request budget for prod_readonly (hard cap)
+    if (executionProfile === 'prod_readonly') {
+      policy.budget.maxRequests = Math.min(policy.budget.maxRequests, PROD_READONLY_MAX_REQUESTS);
+    }
 
     // Initialize state
     const state = createInitialState(testId, request.level, runId);
@@ -82,10 +102,17 @@ export class ApiAgentOrchestratorService {
       url: request.url,
       method: request.method,
       budget: policy.budget,
+      executionProfile,
     });
 
     // Emit initial progress
-    this.emitProgress(request.chatSessionId, 'Starting API agent test...', 0);
+    const modeLabel = this.getModeLabel(request.level, executionProfile);
+    const disclaimer = executionProfile === 'prod_readonly' ? this.getProdReadonlyDisclaimer() : undefined;
+    this.emitProgress(
+      request.chatSessionId,
+      disclaimer ? `Starting ${modeLabel}. ${disclaimer}` : `Starting ${modeLabel}...`,
+      0
+    );
 
     try {
       // Interpretation stage: build expectation model once per run (JSON-first, 1 AI fallback)
@@ -175,6 +202,7 @@ export class ApiAgentOrchestratorService {
     startTime: number,
     traceService: ApiAgentTraceService
   ): Promise<void> {
+    const executionProfile = inferExecutionProfile(request.url, request.executionProfile);
     const maxIterations = policy.budget.maxSteps + 5; // Safety margin
     let iteration = 0;
 
@@ -282,20 +310,24 @@ export class ApiAgentOrchestratorService {
 
       // Execute with automatic retry on high-risk signals (HARD policy)
       // Requirement: if 5xx/high-risk → re-attack 3–5 times (bounded by policy.maxRetryOnHighRisk)
+      const retriesAllowed = executionProfile === 'prod_readonly' ? 0 : policy.maxRetryOnHighRisk;
+      const requestBudgetRemaining = Math.max(0, policy.budget.maxRequests - state.consumed.requests);
       const execResult =
-        policy.maxRetryOnHighRisk > 0
+        retriesAllowed > 0
           ? await ApiAgentStepExecutorService.executeStepWithRetry(
               decision.nextStep,
               state.consumed.steps,
-              policy.maxRetryOnHighRisk,
-              request.chatSessionId
+              retriesAllowed,
+              request.chatSessionId,
+              { executionProfile, requestBudgetRemaining }
             )
           : {
               results: [],
               finalResult: await ApiAgentStepExecutorService.executeStep(
                 decision.nextStep,
                 state.consumed.steps,
-                request.chatSessionId
+                request.chatSessionId,
+                { executionProfile, requestBudgetRemaining }
               ),
               retryCount: 0,
             };
@@ -323,6 +355,19 @@ export class ApiAgentOrchestratorService {
         if (extra.findings.length > 0) {
           stepResult.findings.push(...extra.findings);
         }
+      }
+
+      // prod_readonly: cap severities (no critical exploit wording)
+      if (executionProfile === 'prod_readonly') {
+        stepResult.findings = stepResult.findings.map((f) => {
+          if (f.severity !== 'critical') return f;
+          return {
+            ...f,
+            severity: 'high',
+            title: f.title.toLowerCase().includes('exploit') ? 'High-risk issue suspected' : f.title,
+            description: f.description.includes('suspected') ? f.description : `Suspected issue (prod-safe): ${f.description}`,
+          };
+        });
       }
 
       // Write step result to trace
@@ -404,7 +449,7 @@ export class ApiAgentOrchestratorService {
         aiTokensUsed: stepResult.aiTokensUsed,
         isRetry: execResult.retryCount > 0,
         retryAttempt: execResult.retryCount,
-        maxRetries: policy.maxRetryOnHighRisk,
+        maxRetries: retriesAllowed,
         request: correlationId
           ? {
               method: stepResult.request.method,
@@ -454,12 +499,19 @@ export class ApiAgentOrchestratorService {
           ? 'pass_with_risks'
           : 'pass';
 
+    const executionProfile = inferExecutionProfile(request.url, request.executionProfile);
+    const modeLabel = this.getModeLabel(state.level, executionProfile);
+    const disclaimer = executionProfile === 'prod_readonly' ? this.getProdReadonlyDisclaimer() : undefined;
+
     return {
       level: state.level,
       runId: state.runId,
       testId: state.testId,
       url: request.url,
       method: request.method,
+      executionProfile,
+      modeLabel,
+      disclaimer,
       success: hasSuccessfulHappyPath(state),
       durationMs: getDurationMs(state),
       stepsExecuted: state.consumed.steps,
@@ -483,21 +535,25 @@ export class ApiAgentOrchestratorService {
     request: ApiAgentRequest,
     error: string
   ): ApiAgentSummary {
+    const executionProfile = inferExecutionProfile(request.url, request.executionProfile);
     return {
       level: request.level,
       runId: randomUUID(),
       testId,
       url: request.url,
       method: request.method,
+      executionProfile,
+      modeLabel: this.getModeLabel(request.level, executionProfile),
+      disclaimer: executionProfile === 'prod_readonly' ? this.getProdReadonlyDisclaimer() : undefined,
       success: false,
       durationMs: 0,
       stepsExecuted: 0,
-      findingsCounts: { critical: 1, high: 0, medium: 0, low: 0, info: 0 },
+      findingsCounts: { critical: 0, high: 1, medium: 0, low: 0, info: 0 },
       topFindings: [
         {
           id: 'err_validation',
           type: 'server_error',
-          severity: 'critical',
+          severity: 'high',
           title: 'Validation Error',
           description: error,
         },

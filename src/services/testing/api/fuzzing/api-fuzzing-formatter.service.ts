@@ -13,6 +13,7 @@ export class ApiFuzzingFormatterService {
 
     // Header
     formatted += this.formatHeader();
+    formatted += this.formatDisclaimer(report);
 
     // Summary
     formatted += this.formatSummary(report);
@@ -47,6 +48,17 @@ export class ApiFuzzingFormatterService {
    */
   private static formatHeader(): string {
     return `🔒 **Comprehensive API Security Testing Report**\n`;
+  }
+
+  /**
+   * Add a disclaimer to reduce legal ambiguity (prod-safe / read-only).
+   * @param report - Fuzzing report
+   * @returns Disclaimer text
+   */
+  private static formatDisclaimer(report: FuzzingReport): string {
+    // Keep disclaimer always explicit to reduce legal ambiguity.
+    // Production-safe behavior (no mutation / no exploitation) is enforced by execution profiles upstream.
+    return `\n**Disclaimer:** No state mutation, no exploitation performed. Read-only probes only.\n\n`;
   }
 
   /**

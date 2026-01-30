@@ -465,6 +465,7 @@ export class IntentStepLintService {
         reason: c.reasons.slice(0, 3).join(', '),
         confidence: Math.min(c.score / maxPossibleScore, 1),
         boundingBox: c.node.boundingBox,
+        node: c.node, // Include full node for compiled plan generation
       }));
 
       let status: LintStatus;

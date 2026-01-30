@@ -1,6 +1,7 @@
 /**
  * API Agent Step Executor
- * Executes a single HTTP request step with timeout and error handling
+ * Executes a single HTTP request step with timeout and error handling.
+ * Includes schema inference and consistency checking for HARD level.
  */
 
 import { logger } from '@/utils/core/logger';
@@ -11,6 +12,7 @@ import type {
   ApiAgentStepResult,
   ApiAgentFinding,
 } from './api-agent.types';
+import { SchemaConsistencyService } from './schema-consistency.service';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -29,6 +31,21 @@ const CORRELATION_ID_HEADER = 'x-qai-correlation-id';
 export class ApiAgentStepExecutorService {
   private static isTimeoutError(error?: string): boolean {
     return (error || '').toLowerCase().includes('timeout');
+  }
+
+  /**
+   * Cap severity for prod_readonly runs to avoid "critical exploit" language.
+   * @param severity - Original severity
+   * @param executionProfile - Execution profile
+   * @returns Capped severity
+   */
+  private static capSeverityForProfile(
+    severity: ApiAgentFinding['severity'],
+    executionProfile: 'prod_readonly' | 'nonprod'
+  ): ApiAgentFinding['severity'] {
+    if (executionProfile !== 'prod_readonly') return severity;
+    if (severity === 'critical') return 'high';
+    return severity;
   }
 
   private static isNetworkUnreachableError(error?: string): boolean {
@@ -60,7 +77,12 @@ export class ApiAgentStepExecutorService {
   static async executeStep(
     step: ApiAgentPlannedStep,
     stepIndex: number,
-    chatSessionId?: string
+    chatSessionId?: string,
+    options?: {
+      executionProfile?: 'prod_readonly' | 'nonprod';
+      /** Remaining request budget for this run; multi-request steps must respect it */
+      requestBudgetRemaining?: number;
+    }
   ): Promise<ApiAgentStepResult> {
     const stepId = `step_${stepIndex}_${Date.now()}`;
     const timestamp = new Date().toISOString();
@@ -73,7 +95,24 @@ export class ApiAgentStepExecutorService {
     });
 
     try {
-      // Execute the HTTP request using existing executeApiTest
+      const profile = options?.executionProfile || 'nonprod';
+      const remainingBudget = options?.requestBudgetRemaining ?? Number.POSITIVE_INFINITY;
+
+      // Multi-request step handlers (respect request budget)
+      if (step.stepType === 'auth_matrix') {
+        return await this.executeAuthMatrixStep(step, stepId, timestamp, chatSessionId, profile, remainingBudget);
+      }
+      if (step.stepType === 'rate_limit_probe_safe') {
+        return await this.executeRateLimitProbeStep(step, stepId, timestamp, chatSessionId, profile, remainingBudget);
+      }
+      if (step.stepType === 'content_negotiation') {
+        return await this.executeContentNegotiationStep(step, stepId, timestamp, chatSessionId, profile, remainingBudget);
+      }
+      if (step.stepType === 'idor_probe') {
+        return await this.executeIdorProbeStep(step, stepId, timestamp, chatSessionId, profile, remainingBudget);
+      }
+
+      // Default: single request execution
       const result = await executeApiTest(
         {
           method: step.request.method,
@@ -86,7 +125,7 @@ export class ApiAgentStepExecutorService {
       );
 
       // Analyze findings from the response
-      const findings = this.analyzeResponseForFindings(step, result);
+      const findings = this.analyzeResponseForFindings(step, result, profile);
 
       const stepResult: ApiAgentStepResult = {
         stepId,
@@ -104,6 +143,7 @@ export class ApiAgentStepExecutorService {
         error: result.error,
         findings,
         aiTokensUsed: 0, // Will be updated by orchestrator after AI calls
+        requestsExecuted: 1,
         timestamp,
       };
 
@@ -139,6 +179,7 @@ export class ApiAgentStepExecutorService {
           },
         ],
         aiTokensUsed: 0,
+        requestsExecuted: 0,
         timestamp,
       };
     }
@@ -152,7 +193,11 @@ export class ApiAgentStepExecutorService {
     step: ApiAgentPlannedStep,
     stepIndex: number,
     maxRetries: number,
-    chatSessionId?: string
+    chatSessionId?: string,
+    options?: {
+      executionProfile?: 'prod_readonly' | 'nonprod';
+      requestBudgetRemaining?: number;
+    }
   ): Promise<{
     results: ApiAgentStepResult[];
     finalResult: ApiAgentStepResult;
@@ -176,7 +221,7 @@ export class ApiAgentStepExecutorService {
     });
 
     // First attempt (attempt=1)
-    const firstResult = await this.executeStep(withCorrelation(step, 1), stepIndex, chatSessionId);
+    const firstResult = await this.executeStep(withCorrelation(step, 1), stepIndex, chatSessionId, options);
     results.push(firstResult);
 
     // Check if we should retry (5xx or high-risk signal)
@@ -208,7 +253,8 @@ export class ApiAgentStepExecutorService {
           attemptNumber
         ),
         stepIndex,
-        chatSessionId
+        chatSessionId,
+        options
       );
       results.push(retryResult);
 
@@ -274,7 +320,8 @@ export class ApiAgentStepExecutorService {
    */
   private static analyzeResponseForFindings(
     step: ApiAgentPlannedStep,
-    result: any
+    result: any,
+    executionProfile: 'prod_readonly' | 'nonprod' = 'nonprod'
   ): ApiAgentFinding[] {
     const findings: ApiAgentFinding[] = [];
     const findingId = () => `finding_${Date.now()}_${Math.random().toString(36).substring(7)}`;
@@ -433,7 +480,587 @@ export class ApiAgentStepExecutorService {
       });
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // NEW HARD STEP TYPE FINDINGS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // Auth matrix findings - detect auth bypasses
+    if (step.stepType === 'auth_matrix') {
+      // If we get 2xx without proper auth, that's a bypass
+      if (result.status >= 200 && result.status < 300) {
+        findings.push({
+          id: findingId(),
+          type: 'auth_matrix_issue',
+          severity: this.capSeverityForProfile('critical', executionProfile),
+          title: executionProfile === 'prod_readonly'
+            ? 'Possible authentication bypass'
+            : 'Authentication bypass detected',
+          description: executionProfile === 'prod_readonly'
+            ? `Endpoint returned ${result.status} for an invalid/missing auth variation (suspected bypass)`
+            : `Endpoint returned ${result.status} without proper authentication headers`,
+          evidence: {
+            request: step.request,
+            response: { status: result.status, body: this.truncateBody(result.responseBody) },
+          },
+          recommendation: 'Implement proper authentication middleware to verify tokens/credentials',
+        });
+      }
+    }
+
+    // Header security check findings
+    if (step.stepType === 'header_security_check') {
+      const headers = result.responseHeaders || {};
+      const issues: string[] = [];
+
+      // Check for missing security headers
+      if (!headers['x-content-type-options']) {
+        issues.push('Missing X-Content-Type-Options header (should be "nosniff")');
+      }
+      if (!headers['x-frame-options'] && !headers['content-security-policy']) {
+        issues.push('Missing X-Frame-Options or CSP frame-ancestors (clickjacking risk)');
+      }
+      if (!headers['strict-transport-security'] && step.request.url.startsWith('https')) {
+        issues.push('Missing Strict-Transport-Security header (HSTS)');
+      }
+
+      // Check for CORS misconfiguration
+      if (headers['access-control-allow-origin'] === '*') {
+        issues.push('CORS allows all origins (*) - potential security risk');
+      }
+
+      // Check for sensitive caching
+      const cacheControl = headers['cache-control'] || '';
+      if (!cacheControl.includes('no-store') && !cacheControl.includes('private')) {
+        if (result.status === 200) {
+          issues.push('Response may be cached publicly (missing no-store/private)');
+        }
+      }
+
+      if (issues.length > 0) {
+        findings.push({
+          id: findingId(),
+          type: 'header_security_issue',
+          severity: issues.some(i => i.includes('CORS') || i.includes('clickjacking')) ? 'medium' : 'low',
+          title: 'Security header misconfiguration',
+          description: issues.join('; '),
+          evidence: { response: { headers } },
+          recommendation: 'Configure proper security headers according to OWASP guidelines',
+        });
+      }
+    }
+
+    // Error leak check findings
+    if (step.stepType === 'error_leak_check') {
+      const bodyStr = typeof result.responseBody === 'string'
+        ? result.responseBody
+        : JSON.stringify(result.responseBody || '');
+
+      const leakPatterns = [
+        { pattern: /stack\s*trace/i, type: 'Stack trace' },
+        { pattern: /at\s+\w+\s*\(.*:\d+:\d+\)/i, type: 'Stack trace' },
+        { pattern: /SQLException|ORA-\d+|mysql_|pg_|sqlite/i, type: 'SQL error' },
+        { pattern: /SQLSTATE\[/i, type: 'SQL error' },
+        { pattern: /syntax error.*near/i, type: 'SQL syntax error' },
+        { pattern: /DEBUG|debug\s*=\s*true/i, type: 'Debug mode' },
+        { pattern: /Laravel|Django|Express|Rails|Spring|ASP\.NET/i, type: 'Framework info' },
+        { pattern: /\/usr\/|\/var\/|C:\\|\/home\//i, type: 'Server path' },
+        { pattern: /password|api_key|secret|token.*=.*[a-zA-Z0-9]{8,}/i, type: 'Credentials leak' },
+      ];
+
+      for (const { pattern, type } of leakPatterns) {
+        if (pattern.test(bodyStr)) {
+          findings.push({
+            id: findingId(),
+            type: 'error_leak',
+            severity: type === 'Credentials leak' ? 'critical' : type === 'SQL error' ? 'high' : 'medium',
+            title: `${type} detected in response`,
+            description: `Response contains ${type.toLowerCase()} information that should not be exposed`,
+            evidence: { response: { body: this.truncateBody(result.responseBody, 200) } },
+            recommendation: 'Configure error handling to hide sensitive information in production',
+          });
+          break; // One finding per response is enough
+        }
+      }
+    }
+
+    // Content negotiation findings
+    if (step.stepType === 'content_negotiation') {
+      const contentType = (result.responseHeaders?.['content-type'] || '').toLowerCase();
+      const acceptHeader = (step.request.headers?.['Accept'] || '').toLowerCase();
+
+      // If we asked for HTML but got JSON API data, that's fine
+      // If we asked for HTML and got HTML with error/debug info, that's a problem
+      if (acceptHeader.includes('text/html') && contentType.includes('text/html')) {
+        // Check if HTML contains sensitive info
+        const bodyStr = typeof result.responseBody === 'string' ? result.responseBody : '';
+        if (/<pre>|<code>|stacktrace|debug/i.test(bodyStr)) {
+          findings.push({
+            id: findingId(),
+            type: 'content_type_mismatch',
+            severity: 'medium',
+            title: 'HTML error page with debug info',
+            description: 'Endpoint returned HTML page with potential debug/error information for HTML Accept header',
+            evidence: { response: { contentType, body: this.truncateBody(result.responseBody, 200) } },
+            recommendation: 'Ensure API endpoints return consistent JSON responses regardless of Accept header',
+          });
+        }
+      }
+    }
+
+    // IDOR probe findings
+    if (step.stepType === 'idor_probe') {
+      // If we get 2xx with actual data for an ID we shouldn't have access to
+      if (result.status >= 200 && result.status < 300 && result.responseBody) {
+        const bodyStr = JSON.stringify(result.responseBody);
+        // If body has actual data (not empty/null), potential IDOR
+        if (bodyStr.length > 10 && bodyStr !== '{}' && bodyStr !== '[]' && bodyStr !== 'null') {
+          findings.push({
+            id: findingId(),
+            type: 'idor_vulnerability',
+            severity: this.capSeverityForProfile('high', executionProfile),
+            title: 'Potential IDOR vulnerability',
+            description: 'Endpoint returned data for a resource ID that may not belong to the current user',
+            evidence: {
+              request: step.request,
+              response: { status: result.status, body: this.truncateBody(result.responseBody) },
+            },
+            recommendation: 'Implement proper authorization checks to verify resource ownership',
+          });
+        }
+      }
+    }
+
+    // Rate limit probe findings
+    if (step.stepType === 'rate_limit_probe_safe') {
+      if (result.status !== 429) {
+        // No rate limiting detected after burst
+        findings.push({
+          id: findingId(),
+          type: 'rate_limit_issue',
+          severity: this.capSeverityForProfile('medium', executionProfile),
+          title: 'No rate limiting detected',
+          description: 'Endpoint did not return 429 after multiple rapid requests',
+          evidence: { response: { status: result.status } },
+          recommendation: 'Implement rate limiting to prevent abuse and DDoS attacks',
+        });
+      } else {
+        // Rate limiting works - check for Retry-After header
+        const retryAfter = result.responseHeaders?.['retry-after'];
+        if (!retryAfter) {
+          findings.push({
+            id: findingId(),
+            type: 'rate_limit_issue',
+            severity: this.capSeverityForProfile('low', executionProfile),
+            title: 'Rate limit missing Retry-After header',
+            description: 'Endpoint returns 429 but does not include Retry-After header',
+            evidence: { response: { status: result.status, headers: result.responseHeaders } },
+            recommendation: 'Add Retry-After header to 429 responses for better client experience',
+          });
+        }
+      }
+    }
+
+    // Consistency check findings - use schema inference
+    if (step.stepType === 'consistency_check' || step.stepType === 'schema_validation') {
+      if (result.success && result.responseBody !== null) {
+        try {
+          // Infer schema from response
+          const schema = SchemaConsistencyService.inferSchema(result.responseBody);
+
+          // Store inferred schema in finding for future comparison
+          findings.push({
+            id: findingId(),
+            type: 'capability_discovered',
+            severity: 'info',
+            title: 'Response schema inferred',
+            description: `Response type: ${schema.type}${schema.fields ? `, fields: ${Object.keys(schema.fields).length}` : ''}${schema.arrayItemFields ? `, array item fields: ${Object.keys(schema.arrayItemFields).length}` : ''}`,
+            evidence: { diff: { inferredSchema: schema } },
+          });
+
+          // Check for pagination patterns in list responses
+          if (schema.type === 'object' && schema.fields) {
+            const paginationFields = ['page', 'limit', 'offset', 'total', 'totalCount', 'next', 'prev', 'hasMore'];
+            const foundPagination = Object.keys(schema.fields).filter(f =>
+              paginationFields.some(pf => f.toLowerCase().includes(pf.toLowerCase()))
+            );
+
+            if (foundPagination.length > 0) {
+              findings.push({
+                id: findingId(),
+                type: 'capability_discovered',
+                severity: 'info',
+                title: 'Pagination detected',
+                description: `Response contains pagination fields: ${foundPagination.join(', ')}`,
+                evidence: { diff: { paginationFields: foundPagination } },
+              });
+            }
+          }
+        } catch (schemaError) {
+          logger.debug('[API_AGENT_STEP] Schema inference failed', {
+            error: schemaError instanceof Error ? schemaError.message : String(schemaError),
+          });
+        }
+      }
+    }
+
     return findings;
+  }
+
+  /**
+   * Execute an auth matrix step (multiple requests with different auth headers).
+   * @param step - Planned step\n+   * @param stepId - Step ID\n+   * @param timestamp - Timestamp\n+   * @param chatSessionId - Optional chat session id\n+   * @param executionProfile - Execution profile\n+   * @param requestBudgetRemaining - Remaining request budget\n+   * @returns Step result\n+   */
+  private static async executeAuthMatrixStep(
+    step: ApiAgentPlannedStep,
+    stepId: string,
+    timestamp: string,
+    chatSessionId: string | undefined,
+    executionProfile: 'prod_readonly' | 'nonprod',
+    requestBudgetRemaining: number
+  ): Promise<ApiAgentStepResult> {
+    const variants = [
+      { name: 'No auth', headers: {} as Record<string, string> },
+      { name: 'Empty Authorization', headers: { Authorization: '' } },
+      { name: 'Malformed Bearer', headers: { Authorization: 'Bearer' } },
+      { name: 'Invalid Bearer', headers: { Authorization: 'Bearer invalid_token_12345' } },
+    ];
+
+    const maxRequests = Math.min(variants.length, Math.max(0, requestBudgetRemaining));
+    const toRun = variants.slice(0, maxRequests);
+
+    const findings: ApiAgentFinding[] = [];
+    let lastResult: any = null;
+    let executed = 0;
+
+    for (const v of toRun) {
+      executed++;
+      const mergedHeaders = { ...(step.request.headers || {}), ...v.headers };
+      const result = await executeApiTest(
+        {
+          method: step.request.method,
+          url: step.request.url,
+          headers: mergedHeaders,
+          body: step.request.body,
+          timeout: DEFAULT_STEP_TIMEOUT,
+        },
+        chatSessionId
+      );
+      lastResult = result;
+
+      const perRequestFindings = this.analyzeResponseForFindings(
+        { ...step, request: { ...step.request, headers: mergedHeaders } },
+        result,
+        executionProfile
+      );
+
+      // If any bypass signal appears, keep it
+      findings.push(
+        ...perRequestFindings.map((f) => ({
+          ...f,
+          description: `[${v.name}] ${f.description}`,
+        }))
+      );
+    }
+
+    // If we could not run due to budget, report
+    if (toRun.length === 0) {
+      findings.push({
+        id: `finding_${stepId}_budget`,
+        type: 'consistency_error',
+        severity: 'low',
+        title: 'Auth matrix skipped (budget)',
+        description: 'Auth matrix step skipped due to request budget limit',
+      });
+    }
+
+    return {
+      stepId,
+      stepType: step.stepType,
+      description: step.description,
+      request: step.request,
+      response: lastResult
+        ? {
+            status: lastResult.status,
+            statusText: lastResult.statusText || '',
+            headers: lastResult.responseHeaders || {},
+            body: lastResult.responseBody,
+            durationMs: lastResult.durationMs,
+          }
+        : null,
+      success: lastResult?.success === true,
+      error: lastResult?.error,
+      findings,
+      aiTokensUsed: 0,
+      requestsExecuted: executed,
+      timestamp,
+    };
+  }
+
+  /**
+   * Execute safe rate limit probing with a small burst of requests.
+   * @param step - Planned step\n+   * @param stepId - Step ID\n+   * @param timestamp - Timestamp\n+   * @param chatSessionId - Optional chat session id\n+   * @param executionProfile - Execution profile\n+   * @param requestBudgetRemaining - Remaining request budget\n+   * @returns Step result\n+   */
+  private static async executeRateLimitProbeStep(
+    step: ApiAgentPlannedStep,
+    stepId: string,
+    timestamp: string,
+    chatSessionId: string | undefined,
+    executionProfile: 'prod_readonly' | 'nonprod',
+    requestBudgetRemaining: number
+  ): Promise<ApiAgentStepResult> {
+    const targetCount = executionProfile === 'prod_readonly' ? 5 : 10;
+    const count = Math.min(targetCount, Math.max(0, requestBudgetRemaining));
+
+    const findings: ApiAgentFinding[] = [];
+    let lastResult: any = null;
+    let executed = 0;
+    let got429 = false;
+
+    for (let i = 0; i < count; i++) {
+      executed++;
+      const result = await executeApiTest(
+        {
+          method: step.request.method,
+          url: step.request.url,
+          headers: step.request.headers,
+          body: step.request.body,
+          timeout: DEFAULT_STEP_TIMEOUT,
+        },
+        chatSessionId
+      );
+      lastResult = result;
+      if (result.status === 429) {
+        got429 = true;
+        break; // Stop early once rate limited
+      }
+
+      // Add small delay to reduce load
+      await this.sleep(executionProfile === 'prod_readonly' ? 250 : 100);
+    }
+
+    // Analyze last response as representative (detect 429 and retry-after)
+    if (lastResult) {
+      findings.push(...this.analyzeResponseForFindings(step, lastResult, executionProfile));
+    }
+
+    // If no 429 seen, create explicit finding (prod_readonly -> medium at most)
+    if (!got429) {
+      findings.push({
+        id: `finding_${stepId}_no429`,
+        type: 'rate_limit_issue',
+        severity: this.capSeverityForProfile('medium', executionProfile),
+        title: 'No rate limiting detected (safe probe)',
+        description: `No 429 observed after ${executed} request(s). This is a suspected gap (not a confirmed exploit).`,
+        recommendation: 'Consider adding rate limiting on sensitive endpoints',
+      });
+    }
+
+    if (count === 0) {
+      findings.push({
+        id: `finding_${stepId}_budget`,
+        type: 'rate_limit_issue',
+        severity: 'low',
+        title: 'Rate limit probe skipped (budget)',
+        description: 'Rate limit probe skipped due to request budget limit',
+      });
+    }
+
+    return {
+      stepId,
+      stepType: step.stepType,
+      description: step.description,
+      request: step.request,
+      response: lastResult
+        ? {
+            status: lastResult.status,
+            statusText: lastResult.statusText || '',
+            headers: lastResult.responseHeaders || {},
+            body: lastResult.responseBody,
+            durationMs: lastResult.durationMs,
+          }
+        : null,
+      success: lastResult?.success === true,
+      error: lastResult?.error,
+      findings,
+      aiTokensUsed: 0,
+      requestsExecuted: executed,
+      timestamp,
+    };
+  }
+
+  /**
+   * Execute content negotiation checks (multiple Accept headers).
+   * @param step - Planned step\n+   * @param stepId - Step ID\n+   * @param timestamp - Timestamp\n+   * @param chatSessionId - Optional chat session id\n+   * @param executionProfile - Execution profile\n+   * @param requestBudgetRemaining - Remaining request budget\n+   * @returns Step result\n+   */
+  private static async executeContentNegotiationStep(
+    step: ApiAgentPlannedStep,
+    stepId: string,
+    timestamp: string,
+    chatSessionId: string | undefined,
+    executionProfile: 'prod_readonly' | 'nonprod',
+    requestBudgetRemaining: number
+  ): Promise<ApiAgentStepResult> {
+    const variants = [
+      { name: 'Accept: application/json', accept: 'application/json' },
+      { name: 'Accept: text/html', accept: 'text/html' },
+      { name: 'Accept: */*', accept: '*/*' },
+    ];
+
+    const count = Math.min(variants.length, Math.max(0, requestBudgetRemaining));
+    const toRun = variants.slice(0, count);
+
+    const findings: ApiAgentFinding[] = [];
+    let lastResult: any = null;
+    let executed = 0;
+
+    for (const v of toRun) {
+      executed++;
+      const headers = { ...(step.request.headers || {}), Accept: v.accept };
+      const result = await executeApiTest(
+        {
+          method: step.request.method,
+          url: step.request.url,
+          headers,
+          body: step.request.body,
+          timeout: DEFAULT_STEP_TIMEOUT,
+        },
+        chatSessionId
+      );
+      lastResult = result;
+      const per = this.analyzeResponseForFindings(
+        { ...step, request: { ...step.request, headers } },
+        result,
+        executionProfile
+      );
+      findings.push(
+        ...per.map((f) => ({
+          ...f,
+          description: `[${v.name}] ${f.description}`,
+        }))
+      );
+    }
+
+    if (toRun.length === 0) {
+      findings.push({
+        id: `finding_${stepId}_budget`,
+        type: 'content_type_mismatch',
+        severity: 'low',
+        title: 'Content negotiation skipped (budget)',
+        description: 'Content negotiation step skipped due to request budget limit',
+      });
+    }
+
+    return {
+      stepId,
+      stepType: step.stepType,
+      description: step.description,
+      request: step.request,
+      response: lastResult
+        ? {
+            status: lastResult.status,
+            statusText: lastResult.statusText || '',
+            headers: lastResult.responseHeaders || {},
+            body: lastResult.responseBody,
+            durationMs: lastResult.durationMs,
+          }
+        : null,
+      success: lastResult?.success === true,
+      error: lastResult?.error,
+      findings,
+      aiTokensUsed: 0,
+      requestsExecuted: executed,
+      timestamp,
+    };
+  }
+
+  /**
+   * Execute a safe IDOR probe with synthetic IDs (no enumeration/bruteforce).
+   * @param step - Planned step\n+   * @param stepId - Step ID\n+   * @param timestamp - Timestamp\n+   * @param chatSessionId - Optional chat session id\n+   * @param executionProfile - Execution profile\n+   * @param requestBudgetRemaining - Remaining request budget\n+   * @returns Step result\n+   */
+  private static async executeIdorProbeStep(
+    step: ApiAgentPlannedStep,
+    stepId: string,
+    timestamp: string,
+    chatSessionId: string | undefined,
+    executionProfile: 'prod_readonly' | 'nonprod',
+    requestBudgetRemaining: number
+  ): Promise<ApiAgentStepResult> {
+    const syntheticIds = [
+      '00000000-0000-0000-0000-000000000000',
+      '11111111-1111-1111-1111-111111111111',
+      '99999999-9999-9999-9999-999999999999',
+    ];
+
+    const count = Math.min(syntheticIds.length, Math.max(0, requestBudgetRemaining));
+    const ids = syntheticIds.slice(0, count);
+
+    const findings: ApiAgentFinding[] = [];
+    let lastResult: any = null;
+    let executed = 0;
+
+    for (const id of ids) {
+      executed++;
+      const url = this.injectPayloadInUrl(step.request.url, id, 'id');
+      const result = await executeApiTest(
+        {
+          method: step.request.method,
+          url,
+          headers: step.request.headers,
+          body: step.request.body,
+          timeout: DEFAULT_STEP_TIMEOUT,
+        },
+        chatSessionId
+      );
+      lastResult = result;
+      const per = this.analyzeResponseForFindings(
+        { ...step, request: { ...step.request, url } },
+        result,
+        executionProfile
+      );
+      findings.push(...per);
+    }
+
+    if (ids.length === 0) {
+      findings.push({
+        id: `finding_${stepId}_budget`,
+        type: 'idor_vulnerability',
+        severity: 'low',
+        title: 'IDOR probe skipped (budget)',
+        description: 'IDOR probe step skipped due to request budget limit',
+      });
+    }
+
+    return {
+      stepId,
+      stepType: step.stepType,
+      description: step.description,
+      request: step.request,
+      response: lastResult
+        ? {
+            status: lastResult.status,
+            statusText: lastResult.statusText || '',
+            headers: lastResult.responseHeaders || {},
+            body: lastResult.responseBody,
+            durationMs: lastResult.durationMs,
+          }
+        : null,
+      success: lastResult?.success === true,
+      error: lastResult?.error,
+      findings,
+      aiTokensUsed: 0,
+      requestsExecuted: executed,
+      timestamp,
+    };
+  }
+
+  /**
+   * Inject a payload into URL query parameters.\n+   * @param url - Original URL\n+   * @param payload - Payload to inject\n+   * @param keyHint - Preferred query param key\n+   * @returns Modified URL\n+   */
+  private static injectPayloadInUrl(url: string, payload: string, keyHint: string = 'q'): string {
+    try {
+      const urlObj = new URL(url);
+      const firstParam = urlObj.searchParams.keys().next();
+      const key = (!firstParam.done && firstParam.value) ? firstParam.value : keyHint;
+      urlObj.searchParams.set(key, payload);
+      return urlObj.toString();
+    } catch {
+      return `${url}${url.includes('?') ? '&' : '?'}${encodeURIComponent(keyHint)}=${encodeURIComponent(payload)}`;
+    }
   }
 
   /**

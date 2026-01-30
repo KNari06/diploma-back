@@ -43,6 +43,7 @@ export function createInitialState(
       seconds: 0,
       aiTokens: 0,
       endpointsConsidered: 0,
+      requests: 0,
     },
     expectationModel: undefined,
   };
@@ -63,6 +64,7 @@ export function addStepResult(
   state.currentStep = state.steps.length;
   state.consumed.steps++;
   state.consumed.aiTokens += step.aiTokensUsed;
+  state.consumed.requests += step.requestsExecuted ?? 1;
 
   // Add findings to aggregated list
   for (const finding of step.findings) {

@@ -1,6 +1,7 @@
 import { logger } from '@/utils/core/logger';
 import { IntelligentApiFuzzerService } from '@/services/testing/api/fuzzing/intelligent-api-fuzzer.service';
 import { ApiFuzzingExecutorService } from '@/services/testing/api/fuzzing/api-fuzzing-executor.service';
+import { inferExecutionProfile } from '@/services/testing/api/agent/api-agent-policy';
 import { CONSTANTS } from '../shared/constants';
 import { emitProcessingStep } from '../shared/utils';
 
@@ -30,16 +31,26 @@ export async function runApiFuzzing(
   let timeoutId: NodeJS.Timeout | null = null;
 
   try {
+    const executionProfile = inferExecutionProfile(url);
+
     logger.info('[API_FUZZING] Starting intelligent fuzzing', {
       method: apiDetails.method,
       url,
       timeout: CONSTANTS.FUZZING_TIMEOUT,
+      executionProfile,
     });
 
     // ═══════════════════════════════════════════════════════════════════════
     // PHASE 1: Initial Fuzzing (Broad Coverage)
     // ═══════════════════════════════════════════════════════════════════════
-    emitProcessingStep(chatSessionId, 'analyzing_results', '🔍 Generating initial security scenarios...', 70);
+    emitProcessingStep(
+      chatSessionId,
+      'analyzing_results',
+      executionProfile === 'prod_readonly'
+        ? '🔍 Generating production-safe security checks (read-only)...'
+        : '🔍 Generating initial security scenarios...',
+      70
+    );
 
     const initialScenarios = await IntelligentApiFuzzerService.generateFuzzingScenarios(
       {
@@ -49,7 +60,12 @@ export async function runApiFuzzing(
         headers: apiDetails.headers || {},
         expectedStatus: apiDetails.expectedStatus || 200,
       },
-      apiTestResult
+      apiTestResult,
+      {
+        executionProfile,
+        // prod_readonly: deterministic curated set only (no AI creative generation)
+        skipAiGeneration: executionProfile === 'prod_readonly',
+      }
     );
 
     if (!initialScenarios || initialScenarios.length === 0) {
@@ -88,7 +104,8 @@ export async function runApiFuzzing(
       initialScenarios,
       apiTestResult,
       abortController.signal,
-      onInitialProgress
+      onInitialProgress,
+      { executionProfile }
     );
 
     const initialReport = await Promise.race([initialFuzzingPromise, timeoutPromise]) as any;
@@ -104,14 +121,17 @@ export async function runApiFuzzing(
     // PHASE 2: Follow-On Fuzzing (Targeted Deep Dive)
     // ═══════════════════════════════════════════════════════════════════════
 
-    // Check if we found critical/high issues that warrant follow-on testing
-    const criticalIssues = initialReport.issues.filter(
-      (issue: any) => issue.severity === 'critical' || issue.severity === 'high'
-    );
+    // prod_readonly: no follow-on testing (avoid any exploitation language/behavior)
+    const allowFollowOn = executionProfile !== 'prod_readonly';
+    const criticalIssues = allowFollowOn
+      ? initialReport.issues.filter(
+          (issue: any) => issue.severity === 'critical' || issue.severity === 'high'
+        )
+      : [];
 
     let followOnReport: any = null;
 
-    if (criticalIssues.length > 0 && !abortController.signal.aborted) {
+    if (allowFollowOn && criticalIssues.length > 0 && !abortController.signal.aborted) {
       logger.info('[API_FUZZING] Critical issues found, generating follow-on scenarios', {
         criticalCount: criticalIssues.length,
       });
@@ -119,7 +139,7 @@ export async function runApiFuzzing(
       emitProcessingStep(
         chatSessionId,
         'analyzing_results',
-        `⚠️ ${criticalIssues.length} critical issue(s) found! Generating targeted exploits...`,
+        `⚠️ ${criticalIssues.length} high-risk issue(s) found! Generating deeper follow-on checks...`,
         85
       );
 
@@ -153,7 +173,7 @@ export async function runApiFuzzing(
             emitProcessingStep(
               chatSessionId,
               'analyzing_results',
-              `🔥 Deep exploit testing [Phase 2] (${completed}/${total})...`,
+              `🔥 Deep security checks [Phase 2] (${completed}/${total})...`,
               progressPercent
             );
           };
@@ -162,7 +182,8 @@ export async function runApiFuzzing(
             followOnScenarios,
             apiTestResult,
             abortController.signal,
-            onFollowOnProgress
+            onFollowOnProgress,
+            { executionProfile }
           );
 
           followOnReport = await Promise.race([followOnPromise, timeoutPromise]) as any;

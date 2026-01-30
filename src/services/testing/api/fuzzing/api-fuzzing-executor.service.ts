@@ -8,7 +8,9 @@ import {
   IssueSeverity,
 } from '@/types';
 import { executeApiTest } from '../apiTest.service';
-import { FUZZING_CONFIG } from './fuzzing-config';
+import { FUZZING_CONFIG, getProfileLimits } from './fuzzing-config';
+import { VulnerabilityDetectorService } from './vulnerability-detector.service';
+import type { ExecutionProfile } from '../agent/api-agent.types';
 import pLimit from 'p-limit';
 
 /**
@@ -26,20 +28,25 @@ export class ApiFuzzingExecutorService {
    * @param happyPathResult - Result from the original happy path test
    * @param abortSignal - Optional signal to abort execution
    * @param onProgress - Optional callback for progress updates
+   * @param options - Optional execution options (executionProfile)
    * @returns Comprehensive fuzzing report
    */
   static async executeFuzzingScenarios(
     scenarios: FuzzingScenario[],
     happyPathResult: ApiTestResponse,
     abortSignal?: AbortSignal,
-    onProgress?: (completed: number, total: number) => void
+    onProgress?: (completed: number, total: number) => void,
+    options?: { executionProfile?: ExecutionProfile }
   ): Promise<FuzzingReport> {
     const startTime = Date.now();
+    const executionProfile: ExecutionProfile = options?.executionProfile || 'nonprod';
+    const limits = getProfileLimits(executionProfile);
 
     logger.info('[FUZZING_EXECUTOR] Starting fuzzing execution', {
       scenarioCount: scenarios.length,
-      concurrencyLimit: FUZZING_CONFIG.MAX_CONCURRENT_REQUESTS,
+      concurrencyLimit: limits.MAX_CONCURRENT_REQUESTS,
       hasAbortSignal: !!abortSignal,
+      executionProfile,
     });
 
     // FIX #1 & #2: Check abort signal before starting
@@ -49,7 +56,7 @@ export class ApiFuzzingExecutorService {
 
     // Execute scenarios with concurrency limit + progress tracking
     let completed = 0;
-    const limit = pLimit(FUZZING_CONFIG.MAX_CONCURRENT_REQUESTS);
+    const limit = pLimit(limits.MAX_CONCURRENT_REQUESTS);
 
     const scenarioPromises = scenarios.map(scenario =>
       limit(async () => {
@@ -58,7 +65,12 @@ export class ApiFuzzingExecutorService {
           throw new Error('Fuzzing aborted');
         }
 
-        const result = await this.executeScenario(scenario, abortSignal);
+        // Add small delay between requests in prod_readonly to reduce load
+        if (limits.DELAY_BETWEEN_REQUESTS_MS > 0) {
+          await new Promise((resolve) => setTimeout(resolve, limits.DELAY_BETWEEN_REQUESTS_MS));
+        }
+
+        const result = await this.executeScenario(scenario, abortSignal, executionProfile);
 
         // FIX #5: Report progress
         completed++;
@@ -160,12 +172,16 @@ export class ApiFuzzingExecutorService {
   }
 
   /**
-   * Execute a single fuzzing scenario
-   * FIX #2: Added abort signal support
+   * Execute a single fuzzing scenario.
+   * Uses vulnerability detector to analyze response for security issues.
+   * @param scenario - Fuzzing scenario to execute
+   * @param abortSignal - Optional abort signal
+   * @returns Fuzzing scenario result with detected issues
    */
   private static async executeScenario(
     scenario: FuzzingScenario,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    executionProfile: ExecutionProfile = 'nonprod'
   ): Promise<FuzzingScenarioResult> {
     try {
       // FIX #2: Check if aborted before execution
@@ -189,12 +205,58 @@ export class ApiFuzzingExecutorService {
       const passed = this.evaluateScenario(scenario, result);
 
       // If failed, create security issue
-      const issue = passed ? undefined : this.createSecurityIssue(scenario, result);
+      let issue = passed ? undefined : this.createSecurityIssue(scenario, result);
+      if (issue) {
+        issue = this.capIssueForProfile(issue, executionProfile);
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // NEW: Run vulnerability detector on response for deeper analysis
+      // ═══════════════════════════════════════════════════════════════════════
+      const responseBody = typeof result.responseBody === 'string'
+        ? result.responseBody
+        : JSON.stringify(result.responseBody || '');
+
+      const requestPayload = scenario.request.body
+        ? (typeof scenario.request.body === 'string' ? scenario.request.body : JSON.stringify(scenario.request.body))
+        : new URL(scenario.request.url).search;
+
+      const vulnResults = VulnerabilityDetectorService.detectVulnerabilities({
+        requestPayload,
+        responseBody,
+        responseStatus: result.status,
+        responseHeaders: result.responseHeaders,
+        scenarioType: scenario.type,
+      });
+
+      // If vulnerability detected, create/upgrade security issue
+      if (vulnResults.length > 0) {
+        const primaryVuln = vulnResults[0]; // Use most severe
+        const vulnIssue = VulnerabilityDetectorService.toSecurityIssue(
+          primaryVuln,
+          scenario.id,
+          { method: scenario.request.method, url: scenario.request.url }
+        );
+
+        if (vulnIssue) {
+          const cappedVulnIssue = this.capIssueForProfile(vulnIssue, executionProfile);
+          // Use vulnerability-detected issue if more severe or no existing issue
+          if (!issue || this.severityRank(cappedVulnIssue.severity) < this.severityRank(issue.severity)) {
+            issue = cappedVulnIssue;
+          }
+
+          logger.info('[FUZZING_EXECUTOR] Vulnerability detected', {
+            scenarioId: scenario.id,
+            type: primaryVuln.vulnerabilityType,
+            severity: primaryVuln.severity,
+          });
+        }
+      }
 
       return {
         scenario,
         result,
-        passed,
+        passed: passed && vulnResults.length === 0, // Also fail if vuln detected
         issue,
       };
     } catch (error) {
@@ -217,6 +279,44 @@ export class ApiFuzzingExecutorService {
         passed: false,
       };
     }
+  }
+
+  /**
+   * Get numeric rank for severity comparison (lower = more severe)
+   * @param severity - Issue severity level
+   * @returns Numeric rank
+   */
+  private static severityRank(severity: IssueSeverity): number {
+    const ranks: Record<IssueSeverity, number> = {
+      critical: 0,
+      high: 1,
+      medium: 2,
+      low: 3,
+      info: 4,
+    };
+    return ranks[severity] ?? 5;
+  }
+
+  /**
+   * Cap issue severity and language for prod_readonly profile.
+   * @param issue - Security issue
+   * @param executionProfile - Execution profile
+   * @returns Possibly modified issue
+   */
+  private static capIssueForProfile(issue: SecurityIssue, executionProfile: ExecutionProfile): SecurityIssue {
+    if (executionProfile !== 'prod_readonly') return issue;
+
+    const cappedSeverity: IssueSeverity = issue.severity === 'critical' ? 'high' : issue.severity;
+    const title = issue.title.replace(/Vulnerability/gi, 'Suspected vulnerability');
+    const prefix = 'Prod-safe mode: suspected issue based on read-only probes. ';
+
+    return {
+      ...issue,
+      severity: cappedSeverity,
+      title,
+      description: issue.description?.startsWith(prefix) ? issue.description : `${prefix}${issue.description}`,
+      risk: 'Potential security risk (not confirmed exploitation).',
+    };
   }
 
   /**

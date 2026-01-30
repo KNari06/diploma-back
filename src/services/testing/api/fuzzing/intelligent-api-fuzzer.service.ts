@@ -2,30 +2,244 @@ import { logger } from '@/utils/core/logger';
 import { ApiTestRequest, ApiTestResponse, FuzzingScenario } from '@/types';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { buildApiFuzzingPrompt } from '@/ai/prompts';
-import { FUZZING_CONFIG } from './fuzzing-config';
+import {
+  FUZZING_CONFIG,
+  SQLI_PAYLOADS,
+  XSS_PAYLOADS,
+  COMMAND_INJECTION_PAYLOADS,
+  PATH_TRAVERSAL_PAYLOADS,
+  AUTH_BYPASS_HEADERS,
+  getProfileLimits,
+} from './fuzzing-config';
+import type { ExecutionProfile } from '../agent/api-agent.types';
 
 /**
  * Intelligent API Fuzzer Service
- * Generates negative test scenarios using GPT to find vulnerabilities
+ * Generates negative test scenarios using curated payloads + optional AI enhancement
  */
 export class IntelligentApiFuzzerService {
   /**
-   * Generate fuzzing scenarios for an API endpoint
+   * Generate fuzzing scenarios for an API endpoint.
+   * Uses curated payloads as baseline, then optionally adds AI-generated scenarios.
    * @param baseRequest - The original API request that passed
    * @param happyPathResult - Result from the successful test
+   * @param options - Optional configuration for fuzzing generation
    * @returns Array of fuzzing scenarios to execute
    */
   static async generateFuzzingScenarios(
     baseRequest: ApiTestRequest,
-    happyPathResult: ApiTestResponse
+    happyPathResult: ApiTestResponse,
+    options?: {
+      executionProfile?: ExecutionProfile;
+      skipAiGeneration?: boolean;
+    }
   ): Promise<FuzzingScenario[]> {
+    const profile = options?.executionProfile || 'nonprod';
+    const limits = getProfileLimits(profile);
+
     try {
       logger.info('[API_FUZZER] Generating fuzzing scenarios', {
         method: baseRequest.method,
         url: baseRequest.url,
         happyPathStatus: happyPathResult.status,
+        profile,
       });
 
+      // Step 1: Always generate curated baseline scenarios (deterministic)
+      const curatedScenarios = this.createCuratedSecurityScenarios(baseRequest, profile);
+
+      logger.info('[API_FUZZER] Generated curated baseline scenarios', {
+        count: curatedScenarios.length,
+      });
+
+      // Step 2: Optionally add AI-generated scenarios (for nonprod or if not skipped)
+      let aiScenarios: FuzzingScenario[] = [];
+
+      if (!options?.skipAiGeneration && profile !== 'prod_readonly') {
+        aiScenarios = await this.generateAiScenarios(baseRequest, happyPathResult);
+      }
+
+      // Combine and deduplicate
+      const allScenarios = [...curatedScenarios, ...aiScenarios];
+
+      // Apply profile limits
+      const limitedScenarios = allScenarios.slice(0, limits.MAX_TOTAL_REQUESTS);
+
+      logger.info('[API_FUZZER] Final fuzzing scenarios', {
+        curated: curatedScenarios.length,
+        ai: aiScenarios.length,
+        total: limitedScenarios.length,
+        profile,
+      });
+
+      return limitedScenarios;
+    } catch (error) {
+      logger.error('[API_FUZZER] Error generating fuzzing scenarios', { error });
+      // Fallback to basic curated scenarios only
+      return this.createCuratedSecurityScenarios(baseRequest, profile).slice(0, limits.MAX_TOTAL_REQUESTS);
+    }
+  }
+
+  /**
+   * Create curated security scenarios using predefined payload library.
+   * These are deterministic and safe for production testing.
+   * @param baseRequest - Base API request
+   * @param profile - Execution profile for limiting payloads
+   * @returns Array of curated fuzzing scenarios
+   */
+  private static createCuratedSecurityScenarios(
+    baseRequest: ApiTestRequest,
+    profile: ExecutionProfile
+  ): FuzzingScenario[] {
+    const scenarios: FuzzingScenario[] = [];
+
+    // Limit payloads based on profile
+    const maxPayloadsPerType = profile === 'prod_readonly' ? 3 : 5;
+
+    // 1. SQL Injection payloads (in URL params)
+    const sqliPayloads = SQLI_PAYLOADS.slice(0, maxPayloadsPerType);
+    sqliPayloads.forEach((payload, idx) => {
+      const url = this.injectPayloadInUrl(baseRequest.url, payload);
+      scenarios.push({
+        id: `curated_sqli_${idx + 1}`,
+        type: 'security',
+        description: `SQL Injection probe: ${payload.substring(0, 20)}...`,
+        request: {
+          method: baseRequest.method,
+          url,
+          headers: baseRequest.headers || {},
+        },
+        expectedStatus: 400,
+        expectedBehavior: 'Should sanitize SQL input and return 400 or safe response',
+        riskIfFails: 'SQL Injection vulnerability - database compromise risk',
+      });
+    });
+
+    // 2. XSS payloads
+    const xssPayloads = XSS_PAYLOADS.slice(0, maxPayloadsPerType);
+    xssPayloads.forEach((payload, idx) => {
+      const url = this.injectPayloadInUrl(baseRequest.url, payload);
+      scenarios.push({
+        id: `curated_xss_${idx + 1}`,
+        type: 'security',
+        description: `XSS probe: ${payload.substring(0, 20)}...`,
+        request: {
+          method: baseRequest.method,
+          url,
+          headers: baseRequest.headers || {},
+        },
+        expectedStatus: 400,
+        expectedBehavior: 'Should escape HTML/JS and return safe response',
+        riskIfFails: 'Cross-Site Scripting vulnerability',
+      });
+    });
+
+    // 3. Command injection payloads (only on nonprod)
+    if (profile !== 'prod_readonly') {
+      const cmdPayloads = COMMAND_INJECTION_PAYLOADS.slice(0, maxPayloadsPerType);
+      cmdPayloads.forEach((payload, idx) => {
+        const url = this.injectPayloadInUrl(baseRequest.url, payload);
+        scenarios.push({
+          id: `curated_cmdi_${idx + 1}`,
+          type: 'security',
+          description: `Command Injection probe: ${payload.substring(0, 15)}...`,
+          request: {
+            method: baseRequest.method,
+            url,
+            headers: baseRequest.headers || {},
+          },
+          expectedStatus: 400,
+          expectedBehavior: 'Should not execute shell commands',
+          riskIfFails: 'Remote Code Execution vulnerability',
+        });
+      });
+    }
+
+    // 4. Path traversal payloads
+    const pathPayloads = PATH_TRAVERSAL_PAYLOADS.slice(0, maxPayloadsPerType);
+    pathPayloads.forEach((payload, idx) => {
+      const url = this.injectPayloadInUrl(baseRequest.url, payload);
+      scenarios.push({
+        id: `curated_path_${idx + 1}`,
+        type: 'security',
+        description: `Path Traversal probe: ${payload.substring(0, 20)}...`,
+        request: {
+          method: baseRequest.method,
+          url,
+          headers: baseRequest.headers || {},
+        },
+        expectedStatus: 400,
+        expectedBehavior: 'Should block path traversal attempts',
+        riskIfFails: 'Local File Inclusion vulnerability',
+      });
+    });
+
+    // 5. Auth bypass variations
+    const authVariations = AUTH_BYPASS_HEADERS.slice(0, maxPayloadsPerType);
+    authVariations.forEach((variation, idx) => {
+      scenarios.push({
+        id: `curated_auth_${idx + 1}`,
+        type: 'authentication',
+        description: `Auth bypass: ${variation.name}`,
+        request: {
+          method: baseRequest.method,
+          url: baseRequest.url,
+          headers: variation.headers,
+        },
+        expectedStatus: 401,
+        expectedBehavior: 'Should return 401 Unauthorized',
+        riskIfFails: 'Authentication bypass vulnerability',
+      });
+    });
+
+    // 6. Standard negative tests (always include)
+    scenarios.push({
+      id: 'curated_method_wrong',
+      type: 'method_validation',
+      description: `Wrong HTTP method (${baseRequest.method === 'GET' ? 'POST' : 'GET'})`,
+      request: {
+        method: baseRequest.method === 'GET' ? 'POST' : 'GET',
+        url: baseRequest.url,
+        headers: baseRequest.headers || {},
+      },
+      expectedStatus: 405,
+      expectedBehavior: 'Should return 405 Method Not Allowed',
+      riskIfFails: 'HTTP method not properly validated',
+    });
+
+    // 7. Malformed JSON (for POST/PUT)
+    if (['POST', 'PUT', 'PATCH'].includes(baseRequest.method.toUpperCase())) {
+      scenarios.push({
+        id: 'curated_malformed_json',
+        type: 'payload_validation',
+        description: 'Malformed JSON body',
+        request: {
+          method: baseRequest.method,
+          url: baseRequest.url,
+          headers: { ...baseRequest.headers, 'Content-Type': 'application/json' },
+          body: '{invalid json,,,',
+        },
+        expectedStatus: 400,
+        expectedBehavior: 'Should return 400 Bad Request',
+        riskIfFails: 'API does not validate request format',
+      });
+    }
+
+    return scenarios;
+  }
+
+  /**
+   * Generate AI-powered scenarios for additional coverage.
+   * Only used in nonprod environments for creative test case generation.
+   * @param baseRequest - Base API request
+   * @param happyPathResult - Happy path test result
+   * @returns Array of AI-generated fuzzing scenarios
+   */
+  private static async generateAiScenarios(
+    baseRequest: ApiTestRequest,
+    happyPathResult: ApiTestResponse
+  ): Promise<FuzzingScenario[]> {
+    try {
       // Build prompt for GPT
       const prompt = buildApiFuzzingPrompt({
         method: baseRequest.method,
@@ -44,7 +258,7 @@ export class IntelligentApiFuzzerService {
         [
           {
             role: 'system',
-            content: 'You are a security testing expert. Generate comprehensive fuzzing scenarios in JSON format.',
+            content: 'You are a security testing expert. Generate creative fuzzing scenarios beyond standard payloads. Focus on business logic flaws, edge cases, and context-specific vulnerabilities. Return JSON format.',
           },
           {
             role: 'user',
@@ -52,7 +266,7 @@ export class IntelligentApiFuzzerService {
           },
         ],
         {
-          temperature: 0.7, // Bit higher for creativity
+          temperature: 0.7,
           response_format: { type: 'json_object' },
         }
       );
@@ -60,15 +274,15 @@ export class IntelligentApiFuzzerService {
       const parsed = JSON.parse(response.content);
 
       if (!parsed.scenarios || !Array.isArray(parsed.scenarios)) {
-        logger.warn('[API_FUZZER] Invalid response format from GPT', { parsed });
-        return this.createFallbackScenarios(baseRequest);
+        logger.warn('[API_FUZZER] Invalid AI response format', { parsed });
+        return [];
       }
 
-      // Normalize scenarios
+      // Normalize AI scenarios with prefix
       const scenarios: FuzzingScenario[] = parsed.scenarios.map((s: any, index: number) => ({
-        id: s.id || `scenario_${index + 1}`,
+        id: s.id || `ai_scenario_${index + 1}`,
         type: s.type || 'security',
-        description: s.description || 'Security test',
+        description: `[AI] ${s.description || 'Security test'}`,
         request: {
           method: s.request?.method || baseRequest.method,
           url: s.request?.url || baseRequest.url,
@@ -80,17 +294,51 @@ export class IntelligentApiFuzzerService {
         riskIfFails: s.riskIfFails || 'Security vulnerability',
       }));
 
-      logger.info('[API_FUZZER] Generated fuzzing scenarios', {
+      logger.info('[API_FUZZER] Generated AI scenarios', {
         count: scenarios.length,
-        types: this.countByType(scenarios),
       });
 
       return scenarios;
     } catch (error) {
-      logger.error('[API_FUZZER] Error generating fuzzing scenarios', { error });
-      // Fallback to basic scenarios
-      return this.createFallbackScenarios(baseRequest);
+      logger.warn('[API_FUZZER] AI scenario generation failed, using curated only', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
     }
+  }
+
+  /**
+   * Inject a payload into URL query parameters
+   * @param url - Original URL
+   * @param payload - Payload to inject
+   * @returns Modified URL with payload
+   */
+  private static injectPayloadInUrl(url: string, payload: string): string {
+    try {
+      const urlObj = new URL(url);
+      const firstParam = urlObj.searchParams.keys().next();
+
+      if (!firstParam.done && firstParam.value) {
+        urlObj.searchParams.set(firstParam.value, payload);
+      } else {
+        urlObj.searchParams.set('q', payload);
+      }
+
+      return urlObj.toString();
+    } catch {
+      return `${url}${url.includes('?') ? '&' : '?'}q=${encodeURIComponent(payload)}`;
+    }
+  }
+
+  /**
+   * Generate fuzzing scenarios for an API endpoint (legacy method, calls new implementation)
+   * @deprecated Use generateFuzzingScenarios with options instead
+   */
+  static async generateFuzzingScenariosLegacy(
+    baseRequest: ApiTestRequest,
+    happyPathResult: ApiTestResponse
+  ): Promise<FuzzingScenario[]> {
+    return this.generateFuzzingScenarios(baseRequest, happyPathResult, { executionProfile: 'nonprod' });
   }
 
   /**

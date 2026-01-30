@@ -181,6 +181,76 @@ export interface StepEvidence {
   evidenceNodeIds?: string[];
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPILED STEP PLAN (for reliable execution with fallback and heal)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Single locator strategy
+ * Represents one way to find an element (primary or fallback)
+ */
+export interface LocatorEntry {
+  /** Strategy type: role, label, testId, placeholder, css, ref */
+  strategy: 'role' | 'label' | 'testId' | 'placeholder' | 'css' | 'ref';
+  /** Playwright locator string or params */
+  value: string;
+  /** Optional role name for getByRole */
+  roleName?: string;
+  /** Confidence score when generated (0-1) */
+  confidence?: number;
+}
+
+/**
+ * Target element fingerprint for heal comparison
+ * Stores identifying characteristics to help AI find the element if it changed
+ */
+export interface TargetFingerprint {
+  tag?: string;
+  role?: string;
+  labelText?: string;
+  ariaLabel?: string;
+  testIdAttr?: string;
+  placeholder?: string;
+  boundingBox?: ElementBoundingBox;
+  containerTitles?: string[];
+}
+
+/**
+ * Compiled execution plan for a step
+ * Generated after successful apply, enables direct Playwright execution
+ */
+export interface CompiledStepPlan {
+  /** Ordered list of locators to try (primary first, then fallbacks) */
+  locatorPlan: LocatorEntry[];
+  /** Action to perform */
+  action: {
+    type: IntentActionType;
+    value?: string;
+    options?: {
+      timeout?: number;
+      replaceContent?: boolean;
+      pressEnter?: boolean;
+    };
+  };
+  /** Pre-conditions to check before action */
+  preconditions?: ('visible' | 'enabled' | 'attached' | 'stable')[];
+  /** Post-conditions / expected outcomes */
+  postconditions?: ('navigation' | 'domChange' | 'urlChange' | 'stateChange')[];
+  /** Context snapshot reference */
+  context: {
+    pageUrl: string;
+    pageTitle?: string;
+    /** Reference to dom_analysis snapshot (e.g., intelligent_page_visits.id) */
+    snapshotRef?: string;
+    /** Screenshot storage path (optional) */
+    screenshotRef?: string;
+    /** Timestamp when compiled */
+    compiledAt: string;
+  };
+  /** Target element fingerprint (for heal comparison) */
+  targetFingerprint?: TargetFingerprint;
+}
+
 /**
  * Intent step - user-authored test step with plain text description
  */
@@ -203,6 +273,8 @@ export interface IntentStep {
   bindingHints?: BindingHints;
   /** Cached evidence from last execution (optimization, not truth) */
   evidence?: StepEvidence;
+  /** Compiled execution plan (generated after successful apply) */
+  compiled?: CompiledStepPlan;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -228,6 +300,8 @@ export interface LintCandidate {
   confidence: number;
   /** Bounding box for highlighting */
   boundingBox?: ElementBoundingBox;
+  /** Full InteractiveNode data for compiled plan generation */
+  node?: InteractiveNode;
 }
 
 /**
@@ -341,6 +415,10 @@ export interface CreateIntentTestCaseRequest {
   description?: string;
   startUrl: string;
   steps: IntentStep[];
+  /** Optional link to test flow */
+  flowId?: string;
+  /** Optional link to saved test case (replay entity) */
+  savedTestCaseId?: string;
 }
 
 /**
@@ -354,6 +432,10 @@ export interface IntentTestCase {
   description?: string;
   startUrl: string;
   stepsJson: IntentStep[];
+  /** Optional link to test flow (enables "open flow → load draft steps") */
+  flowId?: string;
+  /** Optional link to saved test case (replay entity) */
+  savedTestCaseId?: string;
   createdAt: string;
   updatedAt: string;
 }

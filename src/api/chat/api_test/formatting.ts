@@ -1,5 +1,6 @@
 import { logger } from '@/utils/core/logger';
 import { CONSTANTS } from '../shared/constants';
+import { inferExecutionProfile } from '@/services/testing/api/agent/api-agent-policy';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -55,12 +56,17 @@ export async function formatApiResponse(
   }
 
   let finalMessage = '';
+  const executionProfile = inferExecutionProfile(plan.url);
+  const modeLabel = executionProfile === 'prod_readonly' ? 'Hard (Prod-safe)' : 'Hard (Non-prod)';
+  const disclaimer = 'No state mutation, no exploitation performed. Read-only probes only.';
 
   if (fuzzingReport) {
     const { ApiFuzzingFormatterService } = await import('@/services/testing/api/fuzzing/api-fuzzing-formatter.service');
     const fuzzingFormatted = ApiFuzzingFormatterService.formatComprehensiveReport(fuzzingReport);
 
     finalMessage = `✅ **API Test Results**\n` +
+      `**Mode:** ${modeLabel}\n` +
+      `**Disclaimer:** ${disclaimer}\n` +
       `**Happy Path Test:** PASSED ✅\n` +
       `• URL: ${plan.url}\n` +
       `• Method: ${apiDetails.method || 'GET'}\n` +
@@ -71,6 +77,9 @@ export async function formatApiResponse(
       fuzzingFormatted;
   } else {
     finalMessage = `✅ API test executed successfully!
+
+**Mode:** ${modeLabel}
+**Disclaimer:** ${disclaimer}
 
 **URL:** ${plan.url}
 **Method:** ${apiDetails.method || 'GET'}

@@ -841,6 +841,7 @@ export async function resolveWithEmbeddings(params: {
     reason: `Similarity: ${(r.similarity * 100).toFixed(0)}%`,
     confidence: r.similarity,
     boundingBox: r.node.boundingBox,
+    node: r.node, // Include full node for compiled plan generation
   }));
 
   // Build highlight

@@ -137,6 +137,11 @@ export class ApiAgentEvaluatorService {
       return { shouldStop: true, reason: 'budget_steps' };
     }
 
+    // Budget: total HTTP requests
+    if (state.consumed.requests >= policy.budget.maxRequests) {
+      return { shouldStop: true, reason: 'budget_requests' };
+    }
+
     // Budget: time
     if (elapsedMs >= policy.budget.maxSeconds * 1000) {
       return { shouldStop: true, reason: 'budget_time' };

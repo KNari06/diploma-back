@@ -21,14 +21,18 @@ export class IntentTestCaseService {
     description?: string;
     startUrl: string;
     steps: IntentStep[];
+    flowId?: string;
+    savedTestCaseId?: string;
   }): Promise<IntentTestCase> {
-    const { projectId, userId, name, description, startUrl, steps } = params;
+    const { projectId, userId, name, description, startUrl, steps, flowId, savedTestCaseId } = params;
 
     logger.info('[INTENT_TEST_CASE] Creating test case', {
       projectId,
       userId,
       name,
       stepsCount: steps.length,
+      flowId,
+      savedTestCaseId,
     });
 
     const { data, error } = await supabaseAdmin
@@ -40,6 +44,8 @@ export class IntentTestCaseService {
         description: description || null,
         start_url: startUrl,
         steps_json: steps,
+        flow_id: flowId || null,
+        saved_test_case_id: savedTestCaseId || null,
       })
       .select('*')
       .single();
@@ -80,17 +86,33 @@ export class IntentTestCaseService {
   static async listByProject(params: {
     projectId: string;
     userId: string;
+    flowId?: string;
     limit?: number;
     offset?: number;
   }): Promise<{ items: IntentTestCase[]; total: number }> {
-    const { projectId, userId, limit = 50, offset = 0 } = params;
+    const { projectId, userId, flowId, limit = 50, offset = 0 } = params;
 
-    // Get total count
-    const { count, error: countError } = await supabaseAdmin
+    // Build base query
+    let countQuery = supabaseAdmin
       .from('intent_test_cases')
       .select('id', { count: 'exact', head: true })
       .eq('project_id', projectId)
       .eq('user_id', userId);
+
+    let dataQuery = supabaseAdmin
+      .from('intent_test_cases')
+      .select('*')
+      .eq('project_id', projectId)
+      .eq('user_id', userId);
+
+    // Add optional flowId filter
+    if (flowId) {
+      countQuery = countQuery.eq('flow_id', flowId);
+      dataQuery = dataQuery.eq('flow_id', flowId);
+    }
+
+    // Get total count
+    const { count, error: countError } = await countQuery;
 
     if (countError) {
       logger.error('[INTENT_TEST_CASE] Failed to count', { error: countError });
@@ -98,11 +120,7 @@ export class IntentTestCaseService {
     }
 
     // Get items
-    const { data, error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('*')
-      .eq('project_id', projectId)
-      .eq('user_id', userId)
+    const { data, error } = await dataQuery
       .order('updated_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
@@ -127,14 +145,18 @@ export class IntentTestCaseService {
     description?: string;
     startUrl?: string;
     steps?: IntentStep[];
+    flowId?: string;
+    savedTestCaseId?: string;
   }): Promise<IntentTestCase> {
-    const { id, userId, name, description, startUrl, steps } = params;
+    const { id, userId, name, description, startUrl, steps, flowId, savedTestCaseId } = params;
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
     if (description !== undefined) updates.description = description;
     if (startUrl !== undefined) updates.start_url = startUrl;
     if (steps !== undefined) updates.steps_json = steps;
+    if (flowId !== undefined) updates.flow_id = flowId;
+    if (savedTestCaseId !== undefined) updates.saved_test_case_id = savedTestCaseId;
 
     if (Object.keys(updates).length === 0) {
       throw new Error('No fields to update');
@@ -193,6 +215,8 @@ export class IntentTestCaseService {
       description: row.description || undefined,
       startUrl: row.start_url,
       stepsJson: row.steps_json || [],
+      flowId: row.flow_id || undefined,
+      savedTestCaseId: row.saved_test_case_id || undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
