@@ -1,6 +1,8 @@
 import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { aiService } from '@/services/ai/analysis/test-results.service';
+import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
+import { JiraReportService } from '@/services/integrations/jira-report.service';
 import { handleAIError } from '@/utils/core/error-handler';
 import { logAIAnalysis, logger, logQueueEvent } from '@/utils/core/logger';
 import {
@@ -109,6 +111,9 @@ export class AIAnalysisJobHandler {
       // Send webhook notifications
       await this.sendWebhookNotifications(testId, aiSummary);
 
+      // Sync on bug creation: create Jira issue if project has syncOnCreate enabled
+      await this.handleSyncOnCreate(testId, testResult, aiSummary);
+
       logger.info(`[AI-ANALYSIS] Analysis completed successfully: ${testResultId}`);
       logAIAnalysis(testId, aiSummary);
 
@@ -205,9 +210,99 @@ export class AIAnalysisJobHandler {
       errors: dbResult.errors || [],
       performance: dbResult.performance,
       aiSummary: dbResult.ai_summary,
+      videoUrl: dbResult.video_url || dbResult.videoUrl,
+      traceUrl: dbResult.trace_url || dbResult.traceUrl,
       createdAt: new Date(dbResult.created_at),
       completedAt: dbResult.completed_at ? new Date(dbResult.completed_at) : undefined,
     };
+  }
+
+  /**
+   * Handle sync on bug creation: create Jira issue when project has syncOnCreate enabled
+   */
+  private static async handleSyncOnCreate(
+    testId: string,
+    dbResult: any,
+    aiSummary: any
+  ): Promise<void> {
+    try {
+      const bugs = aiSummary?.bugs || [];
+      if (bugs.length === 0) {
+        return;
+      }
+
+      const test = dbResult?.tests;
+      if (!test?.project_id || !test?.user_id) {
+        logger.debug('[AI-ANALYSIS] No project/user for syncOnCreate', { testId });
+        return;
+      }
+
+      const project = await dbAdminService.getProject(test.project_id) as any;
+      if (!project?.settings?.integrations?.jira) {
+        logger.debug('[AI-ANALYSIS] No Jira integration settings for project', {
+          projectId: test.project_id,
+        });
+        return;
+      }
+
+      const jiraSettings = project.settings.integrations.jira;
+      if (!jiraSettings.syncOnCreate || !jiraSettings.projectKey?.trim()) {
+        logger.debug('[AI-ANALYSIS] syncOnCreate disabled or projectKey missing', {
+          projectId: test.project_id,
+        });
+        return;
+      }
+
+      logger.info('[AI-ANALYSIS] Creating Jira issue (syncOnCreate)', {
+        testId,
+        projectId: test.project_id,
+        projectKey: jiraSettings.projectKey,
+        bugsCount: bugs.length,
+      });
+
+      const testResultData = this.convertToTestResult(dbResult);
+      const aiAnalysisForReport = {
+        bugs: (aiSummary.bugs || []).map((b: any) => ({
+          severity: b.severity || 'medium',
+          type: b.category || 'unknown',
+          message: b.description || b.title || b.message || 'No description',
+          selector: b.domSelector || b.selector,
+          recommendation: b.expectedResult || b.recommendation || 'No recommendation',
+        })),
+        recommendations: aiSummary.recommendations || [],
+        confidence: aiSummary.confidence ?? 0.8,
+      };
+
+      const { data: testPlan } = await dbAdminService.supabaseAdmin
+        .from('test_plans')
+        .select('*')
+        .eq('id', testId)
+        .maybeSingle();
+
+      const report = await TestReportGeneratorService.generateFinalReport({
+        testId,
+        testResult: testResultData,
+        testPlan: testPlan || undefined,
+        aiAnalysis: aiAnalysisForReport,
+      });
+
+      await JiraReportService.createJiraIssueFromReport({
+        userId: test.user_id,
+        projectKey: jiraSettings.projectKey.trim(),
+        testReport: report,
+        issueType: 'Bug',
+      });
+
+      logger.info('[AI-ANALYSIS] Jira issue created (syncOnCreate)', {
+        testId,
+        projectKey: jiraSettings.projectKey,
+      });
+    } catch (error) {
+      logger.error('[AI-ANALYSIS] syncOnCreate failed (non-fatal)', {
+        testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
