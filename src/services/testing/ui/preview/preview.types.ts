@@ -263,6 +263,13 @@ export interface IframeConfig {
 export interface StepOptions {
   /** Action timeout in milliseconds */
   timeout?: number;
+  /**
+   * Human-like execution mode for UI actions.
+   * When enabled, the backend tries to emulate real user behavior:
+   * - fill: gradual typing (per-character delays) instead of instant fill
+   * - click: hover + small pause before clicking; sometimes clicks at a random point inside the element
+   */
+  humanLike?: boolean;
   /** If false, append text instead of replacing (for fill actions) */
   replaceContent?: boolean;
   /** Press Enter after filling */

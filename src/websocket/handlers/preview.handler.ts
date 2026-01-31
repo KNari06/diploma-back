@@ -1,7 +1,11 @@
 /**
- * Preview Handler V3
+ * Preview Handler V7
  * Handles WebSocket events for step editor preview sessions
- * Features: ownership enforcement, rate limiting, AI semantic matching, clarification flow
+ * Features:
+ * - Ownership enforcement, rate limiting
+ * - AI semantic matching, clarification flow
+ * - Video stream (CDP screencast) instead of 500ms screenshot polling
+ * - DevTools tabs: Console, Network, HTML, Accessibility, Context
  */
 
 import { logger } from '@/utils/core/logger';
@@ -30,16 +34,13 @@ type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, So
 const previewSubscriptions = new Map<string, Set<string>>();
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Snapshot streaming registry (V6: continuous preview:page emission)
+// V7: Video + DevTools streaming registry
 // ═══════════════════════════════════════════════════════════════════════════
-
-// Active streaming intervals keyed by previewSessionId
-const activePreviewStreams = new Map<string, NodeJS.Timeout>();
 
 // Subscriber refcount per room (preview:<sessionId>)
 const previewRoomRefCount = new Map<string, number>();
 
-// Stream context to remember userId/room for snapshot emission
+// Stream context to remember userId/room for streams
 interface StreamContext {
   previewSessionId: string;
   userId: string;
@@ -47,7 +48,9 @@ interface StreamContext {
 }
 const previewStreamContext = new Map<string, StreamContext>();
 
-const SNAPSHOT_STREAM_INTERVAL_MS = 500;
+// DOM update interval for preview:page (check every 500ms, emit only on change)
+const DOM_UPDATE_INTERVAL_MS = 500;
+const activeDomUpdateIntervals = new Map<string, NodeJS.Timeout>();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // V3: Pending clarifications cache
@@ -107,7 +110,9 @@ const RATE_LIMITS = {
   apply: { max: 10, windowMs: 10000 },    // 10 apply requests per 10s
   subscribe: { max: 5, windowMs: 10000 }, // 5 subscribes per 10s
   mouse: { max: 100, windowMs: 10000 },   // 100 mouse events per 10s
-  keyboard: { max: 50, windowMs: 10000 }, // 50 keyboard events per 10s
+  // Typing can be bursty (frontend may send frequent keyboard:type updates),
+  // so keep this high enough to avoid UX throttling while still preventing abuse.
+  keyboard: { max: 300, windowMs: 10000 }, // 300 keyboard events per 10s
   pageAction: { max: 5, windowMs: 10000 }, // 5 refresh/reset per 10s
 };
 
@@ -185,72 +190,119 @@ const cleanupPreviewSubscriptions = (socketId: string): void => {
 };
 
 /**
- * Start snapshot streaming for a preview session
- * Emits preview:page every ~500ms to all subscribers in the room
+ * Start video stream + DevTools collectors for a preview session
+ * - Video: CDP screencast ~10 fps
+ * - DOM updates: preview:page only on change
+ * - DevTools: Console/Network push, HTML/Accessibility on-demand
  */
-const startSnapshotStream = (context: StreamContext, nsp: any): void => {
+const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<void> => {
   const { previewSessionId, userId, room } = context;
 
   // Don't start if already streaming
-  if (activePreviewStreams.has(previewSessionId)) {
+  if (activeDomUpdateIntervals.has(previewSessionId)) {
     return;
   }
 
-  // logger.info('[SNAPSHOT_STREAM] Starting stream', { previewSessionId, room });
-
-  const interval = setInterval(async () => {
-    try {
-      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
-      const sessionService = getPreviewSessionService();
-
-      const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
-        includeScreenshot: true,
-        onlyIfChanged: false, // Always emit, don't gate on change detection
-      });
-
-      if (snapshot) {
-        const payload: PreviewPagePayload = {
-          previewSessionId,
-          url: snapshot.url,
-          domNodes: snapshot.domNodes,
-          screenshot: snapshot.screenshot,
-          timestamp: new Date().toISOString(),
-        };
-
-        // Emit to entire room (including sender)
-        nsp.to(room).emit('preview:page', payload);
-
-        // logger.debug('[SNAPSHOT_STREAM] Emitted preview:page', {
-        //   previewSessionId,
-        //   room,
-        //   hasScreenshot: !!snapshot.screenshot,
-        //   nodeCount: snapshot.domNodes.length,
-        // });
-      }
-    } catch (error) {
-      logger.error('[SNAPSHOT_STREAM] Failed to emit snapshot', {
-        previewSessionId,
-        room,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }, SNAPSHOT_STREAM_INTERVAL_MS);
-
-  activePreviewStreams.set(previewSessionId, interval);
   previewStreamContext.set(previewSessionId, context);
+
+  try {
+    const { getPreviewSessionService, getPreviewVideoStreamRegistry, getPreviewDevToolsRegistry } =
+      await import('@/services/testing/ui/preview');
+    const sessionService = getPreviewSessionService();
+    const videoRegistry = getPreviewVideoStreamRegistry();
+    const devtoolsRegistry = getPreviewDevToolsRegistry();
+
+    // Get page from session
+    const page = sessionService.getPage(previewSessionId, userId);
+    if (!page) {
+      logger.warn('[PREVIEW_STREAM] No page found for session', { previewSessionId });
+      return;
+    }
+
+    // Start video stream (CDP screencast)
+    const videoStarted = await videoRegistry.startStream(previewSessionId, userId, room, page, nsp);
+    if (videoStarted) {
+      logger.info('[PREVIEW_STREAM] Video stream started', { previewSessionId, room });
+    }
+
+    // Start DevTools collectors (console/network push)
+    devtoolsRegistry.start(previewSessionId, room, page, nsp);
+
+    // Start DOM update interval (emit preview:page only on change)
+    const domInterval = setInterval(async () => {
+      try {
+        const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
+          onlyIfChanged: true, // Only return full data if changed
+        });
+
+        if (snapshot && snapshot.changed) {
+          const payload: PreviewPagePayload = {
+            previewSessionId,
+            url: snapshot.url,
+            domVersion: snapshot.domVersion,
+            pageSignature: snapshot.pageSignature,
+            domNodes: snapshot.domNodes, // Only included when changed
+            timestamp: new Date().toISOString(),
+          };
+
+          // Emit to entire room
+          nsp.to(room).emit('preview:page', payload);
+
+          // Update video stream with new DOM version
+          videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+
+          logger.debug('[PREVIEW_STREAM] Emitted preview:page (DOM changed)', {
+            previewSessionId,
+            domVersion: snapshot.domVersion,
+            nodeCount: snapshot.domNodes?.length || 0,
+          });
+        }
+      } catch (error) {
+        logger.error('[PREVIEW_STREAM] Failed to check DOM update', {
+          previewSessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }, DOM_UPDATE_INTERVAL_MS);
+
+    activeDomUpdateIntervals.set(previewSessionId, domInterval);
+
+    logger.info('[PREVIEW_STREAM] All streams started', { previewSessionId, room });
+  } catch (error) {
+    logger.error('[PREVIEW_STREAM] Failed to start streams', {
+      previewSessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 };
 
 /**
- * Stop snapshot streaming for a preview session
+ * Stop all preview streams for a session
  */
-const stopSnapshotStream = (previewSessionId: string): void => {
-  const interval = activePreviewStreams.get(previewSessionId);
-  if (interval) {
-    clearInterval(interval);
-    activePreviewStreams.delete(previewSessionId);
-    previewStreamContext.delete(previewSessionId);
-    logger.info('[SNAPSHOT_STREAM] Stopped stream', { previewSessionId });
+const stopPreviewStreams = async (previewSessionId: string): Promise<void> => {
+  // Stop DOM update interval
+  const domInterval = activeDomUpdateIntervals.get(previewSessionId);
+  if (domInterval) {
+    clearInterval(domInterval);
+    activeDomUpdateIntervals.delete(previewSessionId);
   }
+
+  // Stop video stream
+  try {
+    const { getPreviewVideoStreamRegistry, getPreviewDevToolsRegistry } =
+      await import('@/services/testing/ui/preview');
+
+    await getPreviewVideoStreamRegistry().stopStream(previewSessionId);
+    getPreviewDevToolsRegistry().stop(previewSessionId);
+  } catch (error) {
+    logger.warn('[PREVIEW_STREAM] Error stopping streams', {
+      previewSessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  previewStreamContext.delete(previewSessionId);
+  logger.info('[PREVIEW_STREAM] All streams stopped', { previewSessionId });
 };
 
 /**
@@ -340,20 +392,25 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       socket.join(room);
       subs.add(room);
 
-      // V6: Start snapshot streaming on first subscriber
+      // V7: Start video + devtools streaming on first subscriber
       const currentCount = previewRoomRefCount.get(room) || 0;
       previewRoomRefCount.set(room, currentCount + 1);
 
-      if (currentCount === 0 && !activePreviewStreams.has(normalizedPreviewSessionId)) {
-        // First subscriber - start streaming
-        startSnapshotStream(
+      if (currentCount === 0 && !activeDomUpdateIntervals.has(normalizedPreviewSessionId)) {
+        // First subscriber - start streaming (async, non-blocking)
+        startPreviewStreams(
           {
             previewSessionId: normalizedPreviewSessionId,
             userId: ensuredUserId,
             room,
           },
           socket.nsp
-        );
+        ).catch((err) => {
+          logger.error('[WebSocket] Failed to start preview streams', {
+            previewSessionId: normalizedPreviewSessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
       }
 
       logger.info('[WebSocket] Subscribed to preview', {
@@ -364,27 +421,28 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         subscriberCount: currentCount + 1,
       });
 
-      // V4: Emit initial preview:page with screenshot after subscribe
+      // V7: Emit initial preview:page with domNodes (video stream handles visuals)
       try {
         const snapshot = await sessionService.getSnapshot(normalizedPreviewSessionId, ensuredUserId, {
           force: true,
-          includeScreenshot: true,
+          includeDomNodes: true, // Always include domNodes on initial load
         });
 
         if (snapshot) {
           socket.emit('preview:page', {
             previewSessionId: normalizedPreviewSessionId,
             url: snapshot.url,
+            domVersion: snapshot.domVersion,
+            pageSignature: snapshot.pageSignature,
             domNodes: snapshot.domNodes,
-            screenshot: snapshot.screenshot,
             timestamp: new Date().toISOString(),
           });
 
-          logger.debug('[WebSocket] Emitted initial preview:page with screenshot', {
+          logger.debug('[WebSocket] Emitted initial preview:page', {
             socketId: socket.id,
             previewSessionId,
-            hasScreenshot: !!snapshot.screenshot,
-            nodeCount: snapshot.domNodes.length,
+            domVersion: snapshot.domVersion,
+            nodeCount: snapshot.domNodes?.length || 0,
           });
 
           // V5: Emit viewport metadata for coordinate mapping
@@ -402,23 +460,25 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           }
 
           // V4: Prefetch embeddings for faster first lint (async, non-blocking)
-          setImmediate(async () => {
-            try {
-              const { prefetchEmbeddings } = await import('@/services/testing/ui/preview/intent-step-lint.service');
-              await prefetchEmbeddings({
-                previewSessionId: normalizedPreviewSessionId,
-                domNodes: snapshot.domNodes,
-                pageUrl: snapshot.url,
-              });
-            } catch (prefetchError) {
-              // Don't fail - prefetch is optimization only
-              logger.debug('[WebSocket] Embeddings prefetch failed (non-critical)', {
-                socketId: socket.id,
-                previewSessionId,
-                error: prefetchError instanceof Error ? prefetchError.message : String(prefetchError),
-              });
-            }
-          });
+          if (snapshot.domNodes && snapshot.domNodes.length > 0) {
+            setImmediate(async () => {
+              try {
+                const { prefetchEmbeddings } = await import('@/services/testing/ui/preview/intent-step-lint.service');
+                await prefetchEmbeddings({
+                  previewSessionId: normalizedPreviewSessionId,
+                  domNodes: snapshot.domNodes!,
+                  pageUrl: snapshot.url,
+                });
+              } catch (prefetchError) {
+                // Don't fail - prefetch is optimization only
+                logger.debug('[WebSocket] Embeddings prefetch failed (non-critical)', {
+                  socketId: socket.id,
+                  previewSessionId,
+                  error: prefetchError instanceof Error ? prefetchError.message : String(prefetchError),
+                });
+              }
+            });
+          }
         }
       } catch (snapshotError) {
         logger.warn('[WebSocket] Failed to emit initial preview:page', {
@@ -457,14 +517,19 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const subs = getPreviewSubs(socket.id);
       subs.delete(room);
 
-      // V6: Stop snapshot streaming when last subscriber leaves
+      // V7: Stop all streaming when last subscriber leaves
       const currentCount = previewRoomRefCount.get(room) || 0;
       const newCount = Math.max(0, currentCount - 1);
       previewRoomRefCount.set(room, newCount);
 
       if (newCount === 0) {
-        // Last subscriber left - stop streaming
-        stopSnapshotStream(normalizedPreviewSessionId);
+        // Last subscriber left - stop all streams
+        stopPreviewStreams(normalizedPreviewSessionId).catch((err) => {
+          logger.warn('[WebSocket] Error stopping preview streams on unsubscribe', {
+            previewSessionId: normalizedPreviewSessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
         previewRoomRefCount.delete(room);
       }
 
@@ -482,7 +547,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
-  // Handle step lint request (V3: with AI semantic matching)
+  // Handle step lint request (V5: with HardAllowed/SoftAllowed sets + includeAlternatives)
   socket.on('preview:step:lint', async (data) => {
     try {
       const ensuredUserId = requireUser();
@@ -501,7 +566,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      const { previewSessionId, stepDraft, pageRef } = data;
+      const { previewSessionId, stepDraft, pageRef, includeAlternatives } = data;
 
       if (!previewSessionId || !stepDraft) {
         socket.emit('preview:step:lint:result', {
@@ -515,78 +580,96 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      logger.debug('[WebSocket] Step lint request (AI)', {
+      logger.debug('[WebSocket] Step lint request (V5)', {
         socketId: socket.id,
         previewSessionId,
         stepType: stepDraft.type,
         descriptionPreview: typeof stepDraft.description === 'string' ? stepDraft.description.slice(0, 80) : '',
+        includeAlternatives: !!includeAlternatives,
       });
 
       // Import linting service dynamically to avoid circular deps
       const { IntentStepLintService } = await import('@/services/testing/ui/preview/intent-step-lint.service');
 
-      // V3: Use AI-powered linting
+      // V5: Use AI-powered linting with includeAlternatives flag
       const result = await IntentStepLintService.lintStepWithAI({
         previewSessionId,
         stepDraft,
         pageRef,
         userId: ensuredUserId,
+        includeAlternatives: !!includeAlternatives,
       });
 
-      // V3: If needs clarification, emit separate clarify event
+      // V5: Handle needs_clarification status
       if (result.status === 'needs_clarification') {
-        // V3: Filter out candidates without valid ref (required for selection)
         const validCandidates = result.candidates.filter(c => c.ref && c.ref.trim().length > 0);
 
-        if (validCandidates.length === 0) {
-          // No valid candidates to clarify - emit error
-          socket.emit('preview:step:lint:result', {
-            status: 'not_found',
-            message: 'No valid elements found for clarification',
-            confidence: 0,
-            candidates: [],
-            highlight: [],
-            timestamp: new Date().toISOString(),
+        // Store pending clarification for this step (for use if user clicks "Show alternatives")
+        const clarifyKey = `${previewSessionId}:${stepDraft.id}`;
+        if (validCandidates.length > 0) {
+          pendingClarifications.set(clarifyKey, {
+            candidates: validCandidates,
+            stepDraft,
+            userId: ensuredUserId,
+            timestamp: Date.now(),
           });
-          return;
         }
 
-        // Store pending clarification for this step (only valid candidates)
-        const clarifyKey = `${previewSessionId}:${stepDraft.id}`;
-        pendingClarifications.set(clarifyKey, {
-          candidates: validCandidates,
-          stepDraft,
-          userId: ensuredUserId,
-          timestamp: Date.now(),
-        });
+        // V5: If includeAlternatives=true, emit clarify event with candidates
+        // Otherwise, just emit lint:result with LLM message (no candidates)
+        if (includeAlternatives && validCandidates.length > 0) {
+          // Emit clarify event with candidates (for "Show alternatives" flow)
+          socket.emit('preview:step:clarify', {
+            previewSessionId,
+            stepId: stepDraft.id,
+            candidates: validCandidates.slice(0, 5).map(c => ({
+              ref: c.ref!,
+              label: c.label,
+              reason: c.reason,
+              boundingBox: c.boundingBox,
+            })),
+            interpretation: result.interpretation || '',
+            message: result.clarificationQuestion || result.message,
+            timestamp: new Date().toISOString(),
+          });
 
-        // Emit clarify event with candidates (max 3, all with valid refs)
-        socket.emit('preview:step:clarify', {
-          previewSessionId,
-          stepId: stepDraft.id,
-          candidates: validCandidates.slice(0, 3).map(c => ({
-            ref: c.ref!, // Safe - filtered above
+          logger.info('[WebSocket] Emitted clarify event (alternatives requested)', {
+            socketId: socket.id,
+            previewSessionId,
+            stepId: stepDraft.id,
+            candidateCount: validCandidates.length,
+          });
+        }
+
+        // V5: Always emit lint:result for needs_clarification
+        // Frontend uses this to show LLM message and disable Apply
+        socket.emit('preview:step:lint:result', {
+          status: result.status,
+          message: result.message,
+          confidence: result.confidence,
+          // V5: Only include candidates if includeAlternatives=true
+          candidates: includeAlternatives ? validCandidates.slice(0, 5).map(c => ({
+            ref: c.ref,
             label: c.label,
             reason: c.reason,
+            confidence: c.confidence,
             boundingBox: c.boundingBox,
-          })),
-          interpretation: result.interpretation || '',
-          message: result.clarificationQuestion || 'Please select the correct element',
+          })) : [],
+          highlight: includeAlternatives ? result.highlight : [],
+          interpretation: result.interpretation,
+          clarificationQuestion: result.clarificationQuestion,
+          alternativesIncluded: !!includeAlternatives,
+          applyDisabled: true, // V5: Apply should be disabled for needs_clarification
           timestamp: new Date().toISOString(),
         });
 
-        logger.info('[WebSocket] Emitted clarify event', {
-          socketId: socket.id,
-          previewSessionId,
-          stepId: stepDraft.id,
-          candidateCount: validCandidates.length,
-        });
-
-        return; // Don't emit lint:result for clarification
+        return;
       }
 
+      // For resolved/not_found/error, emit result as usual
       socket.emit('preview:step:lint:result', {
         ...result,
+        applyDisabled: result.status !== 'resolved', // V5: Apply only enabled for resolved
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -600,6 +683,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         confidence: 0,
         candidates: [],
         highlight: [],
+        applyDisabled: true,
         timestamp: new Date().toISOString(),
       });
     }
@@ -806,26 +890,28 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         timestamp: new Date().toISOString(),
       });
 
-      // If successful, emit updated page state with screenshot to all subscribers
+      // If successful, emit updated page state to all subscribers
       if (result.success) {
         // Emit result immediately, then snapshot async
         setImmediate(async () => {
           try {
-            const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+            const { getPreviewSessionService, getPreviewVideoStreamRegistry } =
+              await import('@/services/testing/ui/preview');
             const sessionService = getPreviewSessionService();
             const snapshot = await sessionService.getSnapshot(previewSessionId, ensuredUserId, {
               force: true,
-              includeScreenshot: true,
-              onlyIfChanged: true, // Only emit if page actually changed
+              includeDomNodes: true, // Always include after action
+              onlyIfChanged: true,
             });
 
-            if (snapshot && snapshot.changed !== false) {
+            if (snapshot && snapshot.changed) {
               const room = createRoomName('preview', previewSessionId);
-              const payload = {
+              const payload: PreviewPagePayload = {
                 previewSessionId,
                 url: snapshot.url,
+                domVersion: snapshot.domVersion,
+                pageSignature: snapshot.pageSignature,
                 domNodes: snapshot.domNodes,
-                screenshot: snapshot.screenshot,
                 timestamp: new Date().toISOString(),
               };
 
@@ -834,10 +920,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               // Emit to other subscribers
               socket.to(room).emit('preview:page', payload);
 
+              // Update video stream with new DOM version
+              getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
+
               logger.debug('[WebSocket] Emitted preview:page after apply', {
                 socketId: socket.id,
                 previewSessionId,
-                hasScreenshot: !!snapshot.screenshot,
+                domVersion: snapshot.domVersion,
                 changed: snapshot.changed,
               });
             }
@@ -1292,6 +1381,171 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V7: DevTools handlers (on-demand requests)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Handle network detail request (on-demand body fetch)
+  socket.on('preview:network:detail:request', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId, id } = data;
+      if (!previewSessionId || !id) return;
+
+      const { getPreviewSessionService, getPreviewDevToolsRegistry } =
+        await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      const devtoolsRegistry = getPreviewDevToolsRegistry();
+
+      // Check session ownership
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        return;
+      }
+
+      const collector = devtoolsRegistry.get(previewSessionId);
+      if (!collector) {
+        logger.debug('[WebSocket] DevTools collector not found', { previewSessionId });
+        return;
+      }
+
+      const detail = collector.getNetworkDetail(id);
+      if (detail) {
+        socket.emit('preview:network:detail', detail);
+      }
+    } catch (error) {
+      logger.debug('[WebSocket] Error in preview:network:detail:request', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // Handle HTML request (on-demand, heavy content)
+  socket.on('preview:html:request', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId, domVersion } = data;
+      if (!previewSessionId) return;
+
+      const { getPreviewSessionService, getPreviewDevToolsRegistry } =
+        await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      const devtoolsRegistry = getPreviewDevToolsRegistry();
+
+      // Check session ownership
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        return;
+      }
+
+      const currentDomVersion = sessionService.getDomVersion(previewSessionId, ensuredUserId);
+
+      // If client has same or newer version, skip
+      if (domVersion !== undefined && currentDomVersion !== null && domVersion >= currentDomVersion) {
+        return;
+      }
+
+      const collector = devtoolsRegistry.get(previewSessionId);
+      if (!collector) return;
+
+      const htmlPayload = await collector.fetchHtml(currentDomVersion || 1);
+      if (htmlPayload) {
+        socket.emit('preview:html:update', htmlPayload);
+      }
+    } catch (error) {
+      logger.debug('[WebSocket] Error in preview:html:request', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // Handle Accessibility request (on-demand, heavy content)
+  socket.on('preview:accessibility:request', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId, domVersion } = data;
+      if (!previewSessionId) return;
+
+      const { getPreviewSessionService, getPreviewDevToolsRegistry } =
+        await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      const devtoolsRegistry = getPreviewDevToolsRegistry();
+
+      // Check session ownership
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        return;
+      }
+
+      const currentDomVersion = sessionService.getDomVersion(previewSessionId, ensuredUserId);
+
+      // If client has same or newer version, skip
+      if (domVersion !== undefined && currentDomVersion !== null && domVersion >= currentDomVersion) {
+        return;
+      }
+
+      const collector = devtoolsRegistry.get(previewSessionId);
+      if (!collector) return;
+
+      const accessibilityPayload = await collector.fetchAccessibility(currentDomVersion || 1);
+      if (accessibilityPayload) {
+        socket.emit('preview:accessibility:update', accessibilityPayload);
+      }
+    } catch (error) {
+      logger.debug('[WebSocket] Error in preview:accessibility:request', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // Handle Context set (step editor env/variables)
+  socket.on('preview:context:set', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId, data: contextData } = data;
+      if (!previewSessionId || !contextData) return;
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      // Check session ownership
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        return;
+      }
+
+      const result = sessionService.setContextData(previewSessionId, ensuredUserId, contextData);
+      if (result) {
+        const room = createRoomName('preview', previewSessionId);
+
+        // Emit to all subscribers including sender
+        socket.nsp.to(room).emit('preview:context:update', {
+          previewSessionId,
+          version: result.version,
+          data: result.data,
+          timestamp: new Date().toISOString(),
+        });
+
+        logger.debug('[WebSocket] Context updated', {
+          previewSessionId,
+          version: result.version,
+        });
+      }
+    } catch (error) {
+      logger.debug('[WebSocket] Error in preview:context:set', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // Handle mouse probe (debug: element under point)
   socket.on('preview:mouse:probe', async (data) => {
     try {
@@ -1340,7 +1594,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
   // Cleanup on disconnect
   socket.on('disconnect', () => {
-    // V6: Cleanup snapshot streams for all rooms the socket was subscribed to
+    // V7: Cleanup all streams for all rooms the socket was subscribed to
     const subs = previewSubscriptions.get(socket.id);
     if (subs) {
       for (const room of subs) {
@@ -1351,10 +1605,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         if (newCount === 0) {
           // Extract previewSessionId from room name (format: "preview:<sessionId>")
           const previewSessionId = room.replace('preview:', '');
-          stopSnapshotStream(previewSessionId);
+          stopPreviewStreams(previewSessionId).catch(() => {});
           previewRoomRefCount.delete(room);
 
-          logger.debug('[WebSocket] Stopped stream on disconnect', {
+          logger.debug('[WebSocket] Stopped streams on disconnect', {
             socketId: socket.id,
             room,
             previewSessionId,

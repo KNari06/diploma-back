@@ -26,6 +26,40 @@ const POST_ACTION_SETTLE_TIMEOUT = 5000; // 5 seconds
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'fill', 'click']);
 
 /**
+ * Generate a random integer in range [min, max] (inclusive).
+ */
+function randomIntInclusive(min: number, max: number): number {
+  const lo = Math.ceil(min);
+  const hi = Math.floor(max);
+  if (hi <= lo) return lo;
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+/**
+ * Best-effort: sleep for ms using Playwright timers.
+ * (We use this for "human-like" micro-pauses only.)
+ */
+async function sleepMs(page: Page, ms: number): Promise<void> {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  await page.waitForTimeout(ms);
+}
+
+/**
+ * With probability `chance` (0..1), wait a random duration within [minMs, maxMs].
+ */
+async function maybeRandomPause(
+  page: Page,
+  chance: number,
+  minMs: number,
+  maxMs: number
+): Promise<void> {
+  if (!Number.isFinite(chance) || chance <= 0) return;
+  if (Math.random() > Math.min(1, chance)) return;
+  const ms = randomIntInclusive(minMs, maxMs);
+  await sleepMs(page, ms);
+}
+
+/**
  * Result of step application (V2: enhanced)
  */
 interface ApplyResult {
@@ -185,15 +219,39 @@ async function executeAction(
     switch (step.type) {
       case 'fill': {
         if (!locator) throw new Error('No selector for fill action');
-        const value = step.value || '';
-        if (step.options?.replaceContent === false) {
+        const value = (step.value || '').trim();
+        const humanLike = step.options?.humanLike === true;
+
+        // Human-like typing: gradual per-character input (instead of instant fill).
+        // - If replaceContent is false: append by typing
+        // - Else: clear first (fast), then type gradually
+        if (humanLike) {
+          // Focus the input first (real user behavior)
           await locator.click({ timeout });
-          // Use keyPressDelay if specified
-          await locator.pressSequentially(value, {
-            timeout,
-            delay: step.options?.keyPressDelay,
-          });
+
+          // If we want to "replace", clear existing content before typing.
+          // We clear quickly, then type gradually for the human-like effect.
+          if (step.options?.replaceContent !== false) {
+            await locator.fill('', { timeout });
+          }
+
+          // Delay between keystrokes:
+          // - If explicitly set, respect it
+          // - Else choose a realistic random delay in [50..150] ms
+          const delay = Number.isFinite(step.options?.keyPressDelay)
+            ? Math.max(0, step.options!.keyPressDelay!)
+            : randomIntInclusive(50, 150);
+
+          await locator.pressSequentially(value, { timeout, delay });
+
+          // Sometimes pause after typing (e.g., user thinking / UI debounce)
+          await maybeRandomPause(page, 0.35, 80, 220);
+        } else if (step.options?.replaceContent === false) {
+          // Legacy behavior: append typing (uses keyPressDelay if provided)
+          await locator.click({ timeout });
+          await locator.pressSequentially(value, { timeout, delay: step.options?.keyPressDelay });
         } else {
+          // Default: fast fill
           await locator.fill(value, { timeout });
         }
         if (step.options?.pressEnter) {
@@ -204,6 +262,27 @@ async function executeAction(
 
       case 'click': {
         if (!locator) throw new Error('No selector for click action');
+        const humanLike = step.options?.humanLike === true;
+
+        if (humanLike) {
+          // Human-like click: hover -> small pause -> click
+          await locator.hover({ timeout });
+          await sleepMs(page, randomIntInclusive(40, 160));
+
+          // Sometimes click at a random point inside the element (reduces "robotic" center-click pattern)
+          const usePosition = Math.random() < 0.3;
+          if (usePosition) {
+            const box = await locator.boundingBox().catch(() => null);
+            if (box && box.width > 6 && box.height > 6) {
+              // Position is relative to the element's top-left in Playwright
+              const x = randomIntInclusive(3, Math.floor(box.width) - 3);
+              const y = randomIntInclusive(3, Math.floor(box.height) - 3);
+              await locator.click({ timeout, position: { x, y } });
+              break;
+            }
+          }
+        }
+
         await locator.click({ timeout });
         break;
       }

@@ -37,6 +37,12 @@ export interface ClientToServerEvents {
   'preview:page:refresh': (data: { previewSessionId: string }) => void;
   'preview:page:reset': (data: { previewSessionId: string }) => void;
 
+  // Preview DevTools (on-demand requests)
+  'preview:network:detail:request': (data: PreviewNetworkDetailRequest) => void;
+  'preview:html:request': (data: PreviewHtmlRequest) => void;
+  'preview:accessibility:request': (data: PreviewAccessibilityRequest) => void;
+  'preview:context:set': (data: PreviewContextSetRequest) => void;
+
   // Clarification
   'test:clarification:response': (data: { testId: string; questionId: string; answer: string }) => void;
 
@@ -97,9 +103,18 @@ export interface ServerToClientEvents {
 
   // Preview events
   'preview:page': (data: PreviewPagePayload) => void;
+  'preview:video:frame': (data: PreviewVideoFramePayload) => void;
   'preview:step:lint:result': (data: PreviewStepLintResultPayload) => void;
   'preview:step:apply:result': (data: PreviewStepApplyResultPayload) => void;
   'preview:step:clarify': (data: PreviewClarifyPayload) => void;
+
+  // Preview DevTools events (server -> client)
+  'preview:console:update': (data: PreviewConsoleUpdatePayload) => void;
+  'preview:network:update': (data: PreviewNetworkUpdatePayload) => void;
+  'preview:network:detail': (data: PreviewNetworkDetailPayload) => void;
+  'preview:html:update': (data: PreviewHtmlUpdatePayload) => void;
+  'preview:accessibility:update': (data: PreviewAccessibilityUpdatePayload) => void;
+  'preview:context:update': (data: PreviewContextUpdatePayload) => void;
 
   // Preview interactive control responses
   'preview:viewport': (data: PreviewViewportPayload) => void;
@@ -658,10 +673,19 @@ export interface PreviewIntentStep {
   options?: {
     /** Timeout in ms (for wait action) */
     timeout?: number;
+    /**
+     * Human-like execution mode for UI actions.
+     * When enabled, the backend tries to emulate real user behavior:
+     * - fill: gradual typing (per-character delays) instead of instant fill
+     * - click: hover + small pause before clicking; sometimes clicks at a random point inside the element
+     */
+    humanLike?: boolean;
     /** If false, use page.type instead of page.fill (for fill action) */
     replaceContent?: boolean;
     /** Press Enter after fill (for fill action) */
     pressEnter?: boolean;
+    /** Delay between keystrokes in ms (for human-like typing) */
+    keyPressDelay?: number;
   };
 }
 
@@ -672,6 +696,11 @@ export interface PreviewStepLintRequest {
   previewSessionId: string;
   stepDraft: PreviewIntentStep;
   pageRef?: string; // Optional page reference (for cached context)
+  /** 
+   * V3: When true, include full candidate list in response (for "Show alternatives" button).
+   * By default (false), needs_clarification only returns LLM message without candidate list.
+   */
+  includeAlternatives?: boolean;
 }
 
 /**
@@ -704,13 +733,30 @@ export interface PreviewHighlight {
 }
 
 /**
- * Page snapshot payload
+ * Page snapshot payload (DOM state for resolving/highlighting, no screenshot)
+ * Video frames are sent separately via preview:video:frame
  */
 export interface PreviewPagePayload {
   previewSessionId: string;
   url: string;
-  domNodes: PreviewInteractiveNode[];
-  screenshot?: string;
+  domVersion: number;        // Monotonically increasing int, incremented on DOM changes
+  pageSignature: string;     // Hash of URL + interactive element refs
+  domNodes?: PreviewInteractiveNode[]; // Only sent when domVersion changes
+  timestamp: string;
+}
+
+/**
+ * Video frame payload for preview stream (CDP screencast)
+ * ~10 fps, 1280x720, JPEG quality 60
+ */
+export interface PreviewVideoFramePayload {
+  previewSessionId: string;
+  seq: number;               // Monotonic frame number
+  format: 'jpeg';
+  data: string;              // base64 without prefix
+  width: number;             // 1280
+  height: number;            // 720
+  domVersion: number;        // Which DOM version this frame relates to
   timestamp: string;
 }
 
@@ -727,6 +773,15 @@ export interface PreviewStepLintResultPayload {
   interpretation?: string;
   /** Clarification question from AI (in user's language) */
   clarificationQuestion?: string;
+  /** 
+   * V3: True if this is a response to "Show alternatives" request.
+   * When true, candidates list is populated even for needs_clarification.
+   */
+  alternativesIncluded?: boolean;
+  /**
+   * V3: True if Apply should be disabled (status is needs_clarification without user selection)
+   */
+  applyDisabled?: boolean;
   timestamp: string;
 }
 
@@ -894,6 +949,146 @@ export interface PreviewPageActionResultPayload {
   action: 'refresh' | 'reset';
   success: boolean;
   error?: string;
+  timestamp: string;
+}
+
+// ============================================================================
+// PREVIEW DEVTOOLS PAYLOADS
+// ============================================================================
+
+/**
+ * Console log entry for DevTools Console tab
+ */
+export interface PreviewConsoleEntry {
+  level: 'log' | 'info' | 'warn' | 'error' | 'debug';
+  text: string;
+  location?: string;   // e.g., "app.js:42"
+  timestamp: string;
+}
+
+/**
+ * Console update payload (push, incremental)
+ */
+export interface PreviewConsoleUpdatePayload {
+  previewSessionId: string;
+  seq: number;
+  entries: PreviewConsoleEntry[];
+  domVersion?: number;
+}
+
+/**
+ * Network request/response item for DevTools Network tab
+ */
+export interface PreviewNetworkItem {
+  id: string;                          // Unique request ID
+  phase: 'request' | 'response' | 'error';
+  url: string;
+  method: string;
+  status?: number;
+  statusText?: string;
+  resourceType?: string;               // 'xhr', 'fetch', 'document', etc.
+  startTs: string;
+  endTs?: string;
+  durationMs?: number;
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+  size?: number;                        // Response body size in bytes
+  error?: string;
+}
+
+/**
+ * Network update payload (push, incremental metadata)
+ */
+export interface PreviewNetworkUpdatePayload {
+  previewSessionId: string;
+  seq: number;
+  items: PreviewNetworkItem[];
+}
+
+/**
+ * Network detail request (client -> server, on-demand)
+ */
+export interface PreviewNetworkDetailRequest {
+  previewSessionId: string;
+  id: string;                           // Request ID to get details for
+}
+
+/**
+ * Network detail payload (on-demand response with bodies)
+ */
+export interface PreviewNetworkDetailPayload {
+  previewSessionId: string;
+  id: string;
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+  requestBody?: string;
+  responseBody?: string;
+  truncated?: boolean;                  // True if body was truncated
+}
+
+/**
+ * HTML request (client -> server, on-demand)
+ */
+export interface PreviewHtmlRequest {
+  previewSessionId: string;
+  domVersion?: number;                  // Optional: only fetch if newer
+}
+
+/**
+ * HTML update payload (on-demand response)
+ */
+export interface PreviewHtmlUpdatePayload {
+  previewSessionId: string;
+  domVersion: number;
+  html: string;
+  truncated?: boolean;
+}
+
+/**
+ * Accessibility request (client -> server, on-demand)
+ */
+export interface PreviewAccessibilityRequest {
+  previewSessionId: string;
+  domVersion?: number;
+}
+
+/**
+ * Accessibility tree node (simplified)
+ */
+export interface PreviewAccessibilityNode {
+  role: string;
+  name?: string;
+  value?: string;
+  description?: string;
+  children?: PreviewAccessibilityNode[];
+}
+
+/**
+ * Accessibility update payload (on-demand response)
+ */
+export interface PreviewAccessibilityUpdatePayload {
+  previewSessionId: string;
+  domVersion: number;
+  tree: PreviewAccessibilityNode[];
+  truncated?: boolean;
+}
+
+/**
+ * Context set request (client -> server)
+ * Used to update step editor env/variables
+ */
+export interface PreviewContextSetRequest {
+  previewSessionId: string;
+  data: Record<string, any>;
+}
+
+/**
+ * Context update payload (server -> client)
+ */
+export interface PreviewContextUpdatePayload {
+  previewSessionId: string;
+  version: number;
+  data: Record<string, any>;
   timestamp: string;
 }
 
