@@ -279,9 +279,36 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
       id: event.id,
     });
 
-    logger.debug('[STRIPE_WEBHOOK] Unhandled event type', { type: event.type });
-    // Handle different event types      
-    await handleSubscriptionEvent(event);
+    const handledEventTypes = new Set([
+      'customer.subscription.created',
+      'customer.subscription.updated',
+      'customer.subscription.deleted',
+      'invoice.payment_succeeded',
+      'invoice.payment_failed',
+    ]);
+
+    if (!handledEventTypes.has(event.type)) {
+      logger.info('[STRIPE_WEBHOOK] Event type ignored', { type: event.type });
+      res.json({ received: true });
+      return;
+    }
+
+    switch (event.type) {
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted':
+        await handleSubscriptionEvent(event);
+        break;
+      case 'invoice.payment_succeeded':
+        await handleInvoicePaymentSucceeded(event);
+        break;
+      case 'invoice.payment_failed':
+        await handleInvoicePaymentFailed(event);
+        break;
+      default:
+        logger.info('[STRIPE_WEBHOOK] Event type ignored', { type: event.type });
+        break;
+    }
 
     res.json({ received: true });
   } catch (error) {
@@ -298,7 +325,18 @@ export const handleWebhook = async (req: Request, res: Response): Promise<void> 
  */
 async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
   const subscription = event.data.object as Stripe.Subscription;
-  const customerId = subscription.customer as string;
+  const customerId =
+    typeof subscription.customer === 'string'
+      ? subscription.customer
+      : subscription.customer?.id;
+
+  if (!customerId) {
+    logger.warn('[STRIPE_WEBHOOK] Subscription missing customer', {
+      subscriptionId: subscription.id,
+      eventType: event.type,
+    });
+    return;
+  }
 
   logger.info('[STRIPE_WEBHOOK] Processing subscription event', {
     type: event.type,
@@ -319,12 +357,8 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     logger.warn('[STRIPE_WEBHOOK] User not found for customer', { customerId });
     return;
   }
-  logger.info('[STRIPE_WEBHOOK] Subscription:', { subscription });
-  // @ts-ignore
-  logger.info('[STRIPE_WEBHOOK] Subscription:', subscription.lines.data[0].pricing.price_details.price);
-  // Get price ID from subscription
-  // @ts-ignore
-  const priceId = subscription.lines.data[0].pricing.price_details.price;
+
+  const priceId = subscription.items?.data?.[0]?.price?.id;
   if (!priceId) {
     logger.error('[STRIPE_WEBHOOK] No price ID in subscription', {
       subscriptionId: subscription.id,
@@ -332,108 +366,271 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     return;
   }
 
-  // Get plan by stripe_price_id
+  // Get plan by stripe_price_id (plan may be missing)
   const { data: plan } = await supabaseAdmin
     .from('plans')
     .select('*')
     .eq('stripe_price_id', priceId)
     .maybeSingle();
 
-  logger.info('[STRIPE_WEBHOOK] Plan:', { plan });
   if (!plan) {
-    logger.error('[STRIPE_WEBHOOK] Plan not found for price', { priceId });
-    return;
+    logger.warn('[STRIPE_WEBHOOK] Plan not found for price', { priceId });
+  } else {
+    logger.info('[STRIPE_WEBHOOK] Plan:', { plan });
   }
 
-  // Determine if user is pro
-  logger.info('[STRIPE_WEBHOOK] Subscription status:', subscription.status);
-  // const isPro =
-  //   subscription.status === 'active' ||
-  //   (subscription.cancel_at_period_end &&
-  //     subscription.current_period_end > Math.floor(Date.now() / 1000));
-
-  const creditsPerPeriod = plan.credits_per_period || 0;
-  // @ts-ignore
-  const isNowActive = subscription.status === 'active' || subscription.status === 'paid';
-
-  // Get existing subscription to check previous status
-  const { data: existingSubscription } = await supabaseAdmin
-    .from('subscriptions')
-    .select('status')
-    .eq('stripe_subscription_id', subscription.id)
-    .maybeSingle();
-
-  const wasActive = existingSubscription?.status === 'active';
-  const statusChangedToActive = !wasActive && isNowActive;
+  const isActive = subscription.status === 'active' || subscription.status === 'trialing';
+  const creditsPerPeriod = plan?.credits_per_period || 0;
+  const currentPeriodEnd = subscription.current_period_end
+    ? new Date(subscription.current_period_end * 1000).toISOString()
+    : null;
+  const subscriptionPlanLabel = plan?.name || plan?.code || 'pro';
+  const latestInvoiceId =
+    typeof subscription.latest_invoice === 'string'
+      ? subscription.latest_invoice
+      : subscription.latest_invoice?.id || null;
 
   // Upsert subscription record
-  const subscriptionData = {
+  const subscriptionData: Record<string, any> = {
     user_id: user.id,
     customer_id: customerId,
     stripe_subscription_id: subscription.id,
     status: subscription.status,
-    plan_code: plan.code,
     stripe_price_id: priceId,
     credits_per_period: creditsPerPeriod,
-    // current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
-    cancel_at_period_end: false,
+    current_period_end: currentPeriodEnd,
+    cancel_at_period_end: subscription.cancel_at_period_end ?? false,
     updated_at: new Date().toISOString(),
   };
+
+  if (plan?.code) {
+    subscriptionData.plan_code = plan.code;
+  }
 
   await supabaseAdmin.from('subscriptions').upsert(subscriptionData, {
     onConflict: 'stripe_subscription_id',
   });
 
   // Update user plan
+  const userUpdateData: Record<string, any> = {
+    plan: isActive ? 'pro' : 'free',
+    plan_status: isActive ? 'paid' : null,
+    current_period_end: currentPeriodEnd,
+    cancel_at_period_end: subscription.cancel_at_period_end ?? false,
+    stripe_price_id: priceId,
+    subscription: isActive
+      ? {
+          plan: subscriptionPlanLabel,
+          status: 'active',
+          credits_included: creditsPerPeriod,
+        }
+      : {
+          plan: 'free',
+          status: 'inactive',
+          credits_included: 0,
+        },
+    last_credits_invoice_id: latestInvoiceId,
+    updated_at: new Date().toISOString(),
+  };
+
+  if (isActive && plan?.id) {
+    userUpdateData.plan_id = plan.id;
+  } else if (!isActive) {
+    userUpdateData.plan_id = null;
+  }
+
   await supabaseAdmin
     .from('users')
-    .update({
-      plan: 'pro',
-      plan_status: subscription.status,
-      // current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
-      cancel_at_period_end: false,
-      stripe_price_id: priceId,
-      updated_at: new Date().toISOString(),
-    })
+    .update(userUpdateData)
     .eq('id', user.id);
 
-  // Add credits when subscription becomes active (after successful payment)
-  // This happens when:
-  // 1. Subscription is created and immediately active
-  // 2. Subscription status changes from non-active to active (payment succeeded)
-  if (statusChangedToActive && creditsPerPeriod > 0) {
-    logger.info('[STRIPE_WEBHOOK] Adding credits to user_credits', { userId: user.id, credits: creditsPerPeriod, subscriptionId: subscription.id, eventType: event.type });
+  const planCode = plan?.code || 'unknown';
+
+  logger.info('[STRIPE_WEBHOOK] Subscription updated', {
+    userId: user.id,
+    planCode,
+    status: subscription.status,
+    eventType: event.type,
+  });
+}
+
+async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void> {
+  const invoice = event.data.object as Stripe.Invoice;
+  const customerId =
+    typeof invoice.customer === 'string'
+      ? invoice.customer
+      : invoice.customer?.id;
+
+  if (!customerId) {
+    logger.warn('[STRIPE_WEBHOOK] Invoice missing customer', {
+      invoiceId: invoice.id,
+      eventType: event.type,
+    });
+    return;
+  }
+
+  const { data: user } = await supabaseAdmin
+    .from('users')
+    .select('id, last_credits_invoice_id')
+    .eq('stripe_customer_id', customerId)
+    .maybeSingle();
+
+  if (!user) {
+    logger.warn('[STRIPE_WEBHOOK] User not found for customer', { customerId });
+    return;
+  }
+
+  if (user.last_credits_invoice_id === invoice.id) {
+    logger.info('[STRIPE_WEBHOOK] Invoice already processed', {
+      userId: user.id,
+      invoiceId: invoice.id,
+    });
+    return;
+  }
+
+  let priceId = invoice.lines?.data?.[0]?.price?.id;
+  const subscriptionId =
+    typeof invoice.subscription === 'string'
+      ? invoice.subscription
+      : invoice.subscription?.id;
+
+  if (!priceId && subscriptionId) {
+    if (!stripe) {
+      logger.error('[STRIPE_WEBHOOK] Stripe not configured');
+      return;
+    }
+
+    try {
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
+        expand: ['items.data.price'],
+      });
+      priceId = subscription.items?.data?.[0]?.price?.id;
+    } catch (error) {
+      logger.error('[STRIPE_WEBHOOK] Failed to fetch subscription for price', {
+        subscriptionId,
+        error,
+      });
+    }
+  }
+  const { data: plan } = priceId
+    ? await supabaseAdmin
+        .from('plans')
+        .select('*')
+        .eq('stripe_price_id', priceId)
+        .maybeSingle()
+    : { data: null };
+
+  const creditsPerPeriod = plan?.credits_per_period || 0;
+  const planCode = plan?.code || 'unknown';
+  const subscriptionPlanLabel = plan?.name || plan?.code || 'pro';
+
+  if (creditsPerPeriod > 0) {
+    logger.info('[STRIPE_WEBHOOK] Adding credits on invoice payment', {
+      userId: user.id,
+      credits: creditsPerPeriod,
+      invoiceId: invoice.id,
+    });
+
     const result = await UserCreditsService.addCredits(
       user.id,
       creditsPerPeriod,
       'purchase',
-      `Subscription payment - ${plan.code} plan`,
-      { subscription_id: subscription.id, event_type: event.type }
+      `Subscription payment - ${planCode} plan`,
+      { invoice_id: invoice.id, event_type: event.type }
     );
 
     if (result.success) {
-      logger.info('[STRIPE_WEBHOOK] Credits added to user_credits after successful payment', {
+      logger.info('[STRIPE_WEBHOOK] Credits added after invoice payment', {
         userId: user.id,
         credits: creditsPerPeriod,
         newBalance: result.newBalance,
-        subscriptionId: subscription.id,
-        eventType: event.type,
+        invoiceId: invoice.id,
       });
     } else {
       logger.error('[STRIPE_WEBHOOK] Failed to add credits', {
         userId: user.id,
         credits: creditsPerPeriod,
-        subscriptionId: subscription.id,
+        invoiceId: invoice.id,
       });
     }
   }
 
-  logger.info('[STRIPE_WEBHOOK] Subscription updated', {
-    userId: user.id,
-    planCode: plan.code,
-    status: subscription.status,
-    eventType: event.type,
-  });
+  const userUpdateData: Record<string, any> = {
+    last_credits_invoice_id: invoice.id,
+    updated_at: new Date().toISOString(),
+    subscription: {
+      plan: subscriptionPlanLabel,
+      status: 'active',
+      credits_included: creditsPerPeriod,
+    },
+  };
+
+  if (plan?.id) {
+    userUpdateData.plan_id = plan.id;
+    userUpdateData.plan = 'pro';
+    userUpdateData.plan_status = 'paid';
+  }
+
+  if (priceId) {
+    userUpdateData.stripe_price_id = priceId;
+  }
+
+  await supabaseAdmin.from('users').update(userUpdateData).eq('id', user.id);
+}
+
+async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
+  const invoice = event.data.object as Stripe.Invoice;
+  const customerId =
+    typeof invoice.customer === 'string'
+      ? invoice.customer
+      : invoice.customer?.id;
+
+  if (!customerId) {
+    logger.warn('[STRIPE_WEBHOOK] Invoice missing customer', {
+      invoiceId: invoice.id,
+      eventType: event.type,
+    });
+    return;
+  }
+
+  const { data: user } = await supabaseAdmin
+    .from('users')
+    .select('id')
+    .eq('stripe_customer_id', customerId)
+    .maybeSingle();
+
+  if (!user) {
+    logger.warn('[STRIPE_WEBHOOK] User not found for customer', { customerId });
+    return;
+  }
+
+  await supabaseAdmin
+    .from('users')
+    .update({
+      plan_status: null,
+      subscription: {
+        plan: 'free',
+        status: 'inactive',
+        credits_included: 0,
+      },
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', user.id);
+
+  const subscriptionId =
+    typeof invoice.subscription === 'string'
+      ? invoice.subscription
+      : invoice.subscription?.id;
+
+  if (subscriptionId) {
+    await supabaseAdmin
+      .from('subscriptions')
+      .update({
+        status: 'past_due',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('stripe_subscription_id', subscriptionId);
+  }
 }
 
 /**
@@ -443,7 +640,6 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
 export const getBillingStatus = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user?.id;
-
     if (!userId) {
       res.status(401).json({
         success: false,
@@ -458,7 +654,13 @@ export const getBillingStatus = async (req: Request, res: Response): Promise<voi
     // Get user with subscription info
     const { data: user } = await supabaseAdmin
       .from('users')
-      .select('plan, plan_status, current_period_end, cancel_at_period_end, stripe_price_id')
+      .select(`
+        plan,
+        plan_status,
+        stripe_price_id,
+        current_period_end,
+        cancel_at_period_end
+      `)
       .eq('id', userId)
       .maybeSingle();
 
@@ -470,14 +672,26 @@ export const getBillingStatus = async (req: Request, res: Response): Promise<voi
       return;
     }
 
+    const { data: plan } = user.stripe_price_id
+      ? await supabaseAdmin
+          .from('plans')
+          .select('credits_per_period')
+          .eq('stripe_price_id', user.stripe_price_id)
+          .maybeSingle()
+      : { data: null };
+
     // Get credits balance
     const userCredits = await UserCreditsService.getOrCreateUserCredits(userId);
+
+    const creditsPerPeriod = plan?.credits_per_period ?? 0;
 
     res.json({
       success: true,
       plan: user.plan || 'free',
-      plan_status: user.plan_status || 'inactive',
+      plan_status: user.plan_status || null,
+      stripe_price_id: user.stripe_price_id || null,
       credits_balance: userCredits.credits_balance,
+      credits_per_period: creditsPerPeriod,
       current_period_end: user.current_period_end,
       cancel_at_period_end: user.cancel_at_period_end || false,
       timestamp: new Date().toISOString(),
