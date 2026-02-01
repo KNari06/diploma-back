@@ -167,6 +167,27 @@ export interface BindingHints {
 }
 
 /**
+ * Confidence tier for resolution/execution quality
+ */
+export type ConfidenceTier = 'high' | 'medium' | 'low';
+
+/**
+ * Resolution metadata from linting/execution
+ */
+export interface ResolutionMeta {
+  /** Count of elements in allowed set */
+  allowedCount: number;
+  /** Rule IDs that were applied */
+  usedRules?: string[];
+  /** Whether embeddings were used for ranking */
+  usedEmbeddings: boolean;
+  /** Confidence tier based on resolution quality */
+  confidenceTier: ConfidenceTier;
+  /** Top similarity score (if embeddings used) */
+  topSimilarity?: number;
+}
+
+/**
  * Evidence cache from last successful execution
  * Used as optimization hint, not as truth
  */
@@ -179,6 +200,8 @@ export interface StepEvidence {
   confidence?: number;
   /** Node IDs from graph that evidence this step */
   evidenceNodeIds?: string[];
+  /** Resolution metadata from last successful lint/apply */
+  resolutionMeta?: ResolutionMeta;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -216,6 +239,16 @@ export interface TargetFingerprint {
 }
 
 /**
+ * Versioning metadata for compiled plans
+ */
+export interface CompiledPlanMeta {
+  /** Version of the compiled plan format */
+  compiledVersion: string;
+  /** Version of the resolver that created this plan */
+  resolverVersion: string;
+}
+
+/**
  * Compiled execution plan for a step
  * Generated after successful apply, enables direct Playwright execution
  */
@@ -242,7 +275,11 @@ export interface CompiledStepPlan {
     screenshotRef?: string;
     /** Timestamp when compiled */
     compiledAt: string;
+    /** Page signature hash for staleness detection */
+    pageSignature?: string;
   };
+  /** Versioning metadata */
+  meta?: CompiledPlanMeta;
   /** Target element fingerprint (for heal comparison) */
   targetFingerprint?: TargetFingerprint;
 }
@@ -355,6 +392,8 @@ export interface LintResult {
   }>;
   /** V2: True if AI fallback is recommended (ambiguous/low confidence) */
   needsAiFallback?: boolean;
+  /** V2: Reason for AI fallback (semantic_zero, ambiguous, low_confidence) */
+  aiFallbackReason?: 'semantic_zero' | 'ambiguous' | 'low_confidence';
   /** V2: AI resolved ref (if AI fallback was used) */
   aiResolvedRef?: string;
   /** V2: AI reasoning (if AI fallback was used) */
@@ -379,6 +418,86 @@ export interface LintResult {
   cacheHit?: boolean;
   /** Embeddings latency in milliseconds */
   embeddingsLatencyMs?: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RUNTIME EXECUTION TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Runtime execution status for a step
+ */
+export type RuntimeStatus = 'executed' | 'healed' | 'failed';
+
+/**
+ * Source of the element resolution at runtime
+ */
+export type RuntimeSource = 'compiled' | 'resolver' | 'self_heal';
+
+/**
+ * Reason for step failure
+ */
+export type FailedReason = 
+  | 'element_not_found' 
+  | 'assertion_failed' 
+  | 'heal_blocked' 
+  | 'timeout' 
+  | 'unknown';
+
+/**
+ * Runtime metadata for step execution
+ * Used for reporting and debugging
+ */
+export interface StepRuntimeMeta {
+  /** Final status of the step execution */
+  runtimeStatus: RuntimeStatus;
+  /** Source of the element resolution */
+  source: RuntimeSource;
+  /** Confidence tier of the resolution */
+  confidenceTier: ConfidenceTier;
+  /** Reason for failure (if runtimeStatus === 'failed') */
+  failedReason?: FailedReason;
+  /** True if step should be reviewed for flakiness */
+  needsReview?: boolean;
+  /** True if step is flagged as flaky */
+  flaky?: boolean;
+  /** Execution time in milliseconds */
+  executionMs?: number;
+  /** Which locator strategy worked (if any) */
+  usedLocatorStrategy?: string;
+  /** Whether compiled plan was expired */
+  compiledExpired?: boolean;
+  /** Whether page signature matched */
+  pageSignatureMatched?: boolean;
+  /** Self-healing confidence (if healed) */
+  healConfidence?: number;
+}
+
+/**
+ * TTL values for compiled plan expiration (in milliseconds)
+ * Fill actions have shorter TTL since form fields change more often
+ */
+export const COMPILED_TTL_MS: Record<string, number> = {
+  fill: 7 * 24 * 60 * 60 * 1000,      // 7 days
+  click: 14 * 24 * 60 * 60 * 1000,    // 14 days
+  select: 7 * 24 * 60 * 60 * 1000,    // 7 days
+  check: 14 * 24 * 60 * 60 * 1000,    // 14 days
+  uncheck: 14 * 24 * 60 * 60 * 1000,  // 14 days
+  hover: 14 * 24 * 60 * 60 * 1000,    // 14 days
+  default: 14 * 24 * 60 * 60 * 1000,  // 14 days
+};
+
+/**
+ * Check if a compiled plan is expired based on action type
+ */
+export function isCompiledPlanExpired(
+  compiledAt: string,
+  actionType: string
+): boolean {
+  const ttl = COMPILED_TTL_MS[actionType] || COMPILED_TTL_MS.default;
+  const compiledTime = new Date(compiledAt).getTime();
+  const now = Date.now();
+  return now > compiledTime + ttl;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -438,22 +557,41 @@ export interface StartPreviewResponse {
 }
 
 /**
+ * Intent test case status for lifecycle management
+ */
+export type IntentTestCaseStatus = 'draft' | 'published' | 'archived';
+
+/**
+ * Intent test case kind (classification)
+ */
+export type IntentTestCaseKind = 'standalone' | 'regression_member';
+
+/**
+ * Replay strategy for test execution
+ */
+export type ReplayStrategy = 'commands' | 'graph_extract';
+
+/**
  * Request to create intent test case
  */
 export interface CreateIntentTestCaseRequest {
   projectId: string;
   name: string;
   description?: string;
-  startUrl: string;
+  startUrl?: string;
   steps: IntentStep[];
   /** Optional link to test flow */
   flowId?: string;
-  /** Optional link to saved test case (replay entity) */
-  savedTestCaseId?: string;
+  /** Lifecycle status (defaults to 'draft') */
+  status?: IntentTestCaseStatus;
+  /** Classification */
+  kind?: IntentTestCaseKind;
 }
 
 /**
- * Intent test case (DB entity)
+ * Intent test case (DB entity) - unified table for UI test cases
+ * This is now the single source of truth for UI test cases,
+ * supporting both draft/preview authoring and published regression tests.
  */
 export interface IntentTestCase {
   id: string;
@@ -461,12 +599,40 @@ export interface IntentTestCase {
   userId: string;
   name: string;
   description?: string;
-  startUrl: string;
+  
+  // URL fields
+  startUrl?: string;
+  url?: string;
+  
+  // Steps for authoring
   stepsJson: IntentStep[];
-  /** Optional link to test flow (enables "open flow → load draft steps") */
+  
+  // Lifecycle
+  status: IntentTestCaseStatus;
+  kind: IntentTestCaseKind;
+  
+  // Replay data (populated when saved from completed test or published)
+  replayStrategy?: ReplayStrategy;
+  commands?: any[];
+  graphRef?: any;
+  parametersSchema?: Record<string, any>;
+  
+  // Organization
   flowId?: string;
-  /** Optional link to saved test case (replay entity) */
-  savedTestCaseId?: string;
+  dependsOn?: string[];
+  
+  // Metadata
+  tags?: string[];
+  priority?: 'critical' | 'high' | 'medium' | 'low';
+  preconditions?: string[];
+  setupSteps?: any[];
+  teardownSteps?: any[];
+  expectedResult?: string;
+  
+  // Provenance (when saved from a completed test)
+  sourceTestId?: string;
+  sourceIntelligentSessionId?: string;
+  
   createdAt: string;
   updatedAt: string;
 }

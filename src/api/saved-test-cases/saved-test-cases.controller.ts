@@ -1,6 +1,10 @@
 /**
- * Saved Test Cases Controller
- * API endpoints for CRUD operations on saved_test_cases with AI dependency suggestions.
+ * Saved Test Cases Controller (Compatibility Layer)
+ * API endpoints for CRUD operations on intent_test_cases (unified table).
+ * This controller maintains the /api/v1/saved-test-cases routes for backward
+ * compatibility while the frontend migrates to the new intent_test_cases API.
+ *
+ * NOTE: All operations now target intent_test_cases instead of saved_test_cases.
  */
 
 import { supabaseAdmin } from '@/db/supabase';
@@ -75,7 +79,7 @@ export async function getSavedTestCase(req: AuthenticatedRequest, res: Response)
     const userId = getUserId(req);
 
     const { data, error } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('*')
       .eq('id', id)
       .eq('user_id', userId)
@@ -126,7 +130,7 @@ export async function listSavedTestCases(req: AuthenticatedRequest, res: Respons
     const safeLimit = Math.min(Math.max(Math.trunc(parsedLimit), 1), 500);
 
     let query = supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('*')
       .eq('project_id', projectId)
       .eq('user_id', userId)
@@ -181,7 +185,7 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
     // If flowId is being changed, validate flow ownership + project match
     if (flowId !== undefined && flowId !== null) {
       const { data: existing, error: existingError } = await supabaseAdmin
-        .from('saved_test_cases')
+        .from('intent_test_cases')
         .select('id, project_id')
         .eq('id', id)
         .eq('user_id', userId)
@@ -236,7 +240,7 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
 
     // Update in DB
     const { data, error } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .update(updates)
       .eq('id', id)
       .eq('user_id', userId)
@@ -301,7 +305,7 @@ export async function assignToFlow(req: AuthenticatedRequest, res: Response): Pr
 
     // Get saved case for project scoping
     const { data: savedCase, error: savedCaseError } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('id, project_id')
       .eq('id', id)
       .eq('user_id', userId)
@@ -337,7 +341,7 @@ export async function assignToFlow(req: AuthenticatedRequest, res: Response): Pr
 
     // Update saved test case
     const { data, error } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .update({ flow_id: flowId })
       .eq('id', id)
       .eq('user_id', userId)
@@ -380,12 +384,12 @@ export async function assignToFlow(req: AuthenticatedRequest, res: Response): Pr
 }
 
 /**
- * Confirm and save dependencies (depends_on) for a saved test case.
+ * Confirm and save dependencies (depends_on) for a test case.
  * Validates: existence, ownership, same flow, no cycles.
  *
  * @route PATCH /api/v1/saved-test-cases/:id/dependencies
- * @body dependsOn - Array of saved_test_cases IDs
- * @returns Updated saved test case
+ * @body dependsOn - Array of intent_test_cases IDs
+ * @returns Updated test case
  */
 export async function updateDependencies(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
@@ -401,7 +405,7 @@ export async function updateDependencies(req: AuthenticatedRequest, res: Respons
 
     // Get target case
     const { data: targetCase, error: targetError } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('id, project_id, flow_id, user_id')
       .eq('id', id)
       .eq('user_id', userId)
@@ -415,7 +419,7 @@ export async function updateDependencies(req: AuthenticatedRequest, res: Respons
     // If empty array, just clear dependencies
     if (dependsOn.length === 0) {
       const { data, error } = await supabaseAdmin
-        .from('saved_test_cases')
+        .from('intent_test_cases')
         .update({ depends_on: [] })
         .eq('id', id)
         .eq('user_id', userId)
@@ -466,7 +470,7 @@ export async function updateDependencies(req: AuthenticatedRequest, res: Respons
 
     // Save dependencies
     const { data, error } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .update({ depends_on: dependsOn })
       .eq('id', id)
       .eq('user_id', userId)
@@ -507,7 +511,7 @@ export async function getDependencySuggestions(req: AuthenticatedRequest, res: R
 
     // Get case
     const { data: testCase, error } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('id, name, description, url, flow_id')
       .eq('id', id)
       .eq('user_id', userId)
@@ -569,7 +573,7 @@ async function validateDependencies(
 
   // Fetch all referenced cases
   const { data: cases, error } = await supabaseAdmin
-    .from('saved_test_cases')
+    .from('intent_test_cases')
     .select('id, project_id, flow_id, user_id')
     .in('id', dependsOn);
 
@@ -624,7 +628,7 @@ async function detectCycle(
   // Adding edge: targetId -> depId introduces a cycle if depId can already reach targetId.
 
   let query = supabaseAdmin
-    .from('saved_test_cases')
+    .from('intent_test_cases')
     .select('id, depends_on')
     .eq('user_id', userId)
     .eq('project_id', projectId);

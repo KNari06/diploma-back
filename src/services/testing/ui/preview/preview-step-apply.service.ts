@@ -12,13 +12,37 @@ import { IntentStepLintService } from './intent-step-lint.service';
 import { LocatorPlanBuilder } from './locator-plan-builder.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type {
+    BindingHints,
+    ConfidenceTier,
     IntentStep,
     InteractiveNode,
     LintCandidate,
+    ResolutionMeta,
 } from './preview.types';
 
 // Max attempts to try different candidates
 const MAX_ATTEMPTS = 3;
+
+/**
+ * V2: Build bindingHints from resolved InteractiveNode
+ * Auto-populates hints for better runtime resolution
+ */
+function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
+  const hints: BindingHints = {};
+
+  if (node.role) hints.role = node.role;
+  if (node.labelText) hints.label = node.labelText;
+  if (node.placeholder) hints.placeholder = node.placeholder;
+  if (node.autocomplete) hints.autocomplete = node.autocomplete;
+  if (node.inputType || node.type) hints.type = node.inputType || node.type;
+  
+  // Add nearby text from container titles
+  if (node.containerTitles && node.containerTitles.length > 0) {
+    hints.nearText = node.containerTitles[0];
+  }
+
+  return hints;
+}
 const ACTION_TIMEOUT = 10000; // 10 seconds
 const POST_ACTION_SETTLE_TIMEOUT = 5000; // 5 seconds
 
@@ -517,13 +541,28 @@ export class PreviewStepApplyService {
             });
           }
 
-          // Update step evidence
+          // Build resolution meta for user-confirmed selection
+          const resolutionMeta: ResolutionMeta = {
+            allowedCount: 1,
+            usedRules: ['user_confirmed'],
+            usedEmbeddings: false,
+            confidenceTier: 'high' as ConfidenceTier,
+          };
+
+          // V2: Auto-populate bindingHints from resolved node
+          const enrichedBindingHints = resolvedNode 
+            ? { ...stepDraft.bindingHints, ...buildBindingHintsFromNode(resolvedNode) }
+            : stepDraft.bindingHints;
+
+          // Update step evidence with resolutionMeta and enriched bindingHints
           const updatedStep: IntentStep = {
             ...stepDraft,
+            bindingHints: enrichedBindingHints,
             evidence: {
               ...stepDraft.evidence,
               lastSuccessRef: selectedRef,
               confidence: 1.0,
+              resolutionMeta,
             },
             compiled, // NEW: compiled execution plan
           };
@@ -627,18 +666,26 @@ export class PreviewStepApplyService {
           }
 
           // V3: Generate compiled plan from resolved node
+          // Include pageSignature from session for staleness detection
           let compiled;
+          let pageSignature: string | undefined;
           if (candidate.node) {
             try {
+              // Get pageSignature from session if available
+              const session = sessionService.getSession(previewSessionId);
+              pageSignature = session?.lastPageSignature;
+
               compiled = LocatorPlanBuilder.buildCompiledPlan({
                 step: stepDraft,
                 resolvedNode: candidate.node,
                 pageUrl: page.url(),
                 pageTitle: await page.title().catch(() => undefined),
+                pageSignature,
               });
               logger.debug('[PREVIEW_APPLY] Compiled plan generated', {
                 stepId: stepDraft.id,
                 locatorCount: compiled.locatorPlan.length,
+                hasPageSignature: !!pageSignature,
               });
             } catch (compileError) {
               logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan', {
@@ -647,13 +694,34 @@ export class PreviewStepApplyService {
             }
           }
 
-          // Update step evidence
+          // Build resolution meta from lint result
+          // Determine confidence tier based on candidate confidence
+          const confidenceTier: ConfidenceTier = 
+            candidate.confidence >= 0.85 ? 'high' :
+            candidate.confidence >= 0.6 ? 'medium' : 'low';
+
+          const resolutionMeta: ResolutionMeta = {
+            allowedCount: lintResult.candidates.length,
+            usedRules: [], // TODO: Populate from embeddings resolver if available
+            usedEmbeddings: !lintResult.degradedMode,
+            confidenceTier,
+            topSimilarity: lintResult.topSimilarity,
+          };
+
+          // V2: Auto-populate bindingHints from resolved node
+          const enrichedBindingHints = candidate.node 
+            ? { ...stepDraft.bindingHints, ...buildBindingHintsFromNode(candidate.node) }
+            : stepDraft.bindingHints;
+
+          // Update step evidence with resolutionMeta and enriched bindingHints
           const updatedStep: IntentStep = {
             ...stepDraft,
+            bindingHints: enrichedBindingHints,
             evidence: {
               ...stepDraft.evidence,
               lastSuccessRef: candidate.ref,
               confidence: candidate.confidence,
+              resolutionMeta,
             },
             compiled, // NEW: compiled execution plan
           };

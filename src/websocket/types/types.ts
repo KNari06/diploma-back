@@ -199,6 +199,36 @@ export interface TestStepCompletedPayload {
   stepDescription: string;
   success: boolean;
   timestamp: string;
+  /**
+   * V2: Runtime metadata for intent-based test steps
+   * Provides detailed information about element resolution and execution
+   */
+  runtimeMeta?: {
+    /** Step ID from IntentStep */
+    stepId?: string;
+    /** Final status: executed, healed, or failed */
+    runtimeStatus?: 'executed' | 'healed' | 'failed';
+    /** Source of element resolution */
+    source?: 'compiled' | 'resolver' | 'self_heal';
+    /** Confidence tier of the resolution */
+    confidenceTier?: 'high' | 'medium' | 'low';
+    /** Reason for failure (if status is failed) */
+    failedReason?: 'element_not_found' | 'assertion_failed' | 'heal_blocked' | 'timeout' | 'unknown';
+    /** Execution time in milliseconds */
+    executionMs?: number;
+    /** Which locator strategy was used */
+    usedLocatorStrategy?: string;
+    /** Whether compiled plan was expired */
+    compiledExpired?: boolean;
+    /** Whether page signature matched */
+    pageSignatureMatched?: boolean;
+    /** Self-healing confidence (if healed) */
+    healConfidence?: number;
+    /** True if step is flagged as needing review */
+    needsReview?: boolean;
+    /** True if step is flagged as flaky */
+    flaky?: boolean;
+  };
 }
 
 // ✅ NEW: Graph visualization update payload

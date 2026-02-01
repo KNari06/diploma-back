@@ -52,7 +52,7 @@ export async function buildRegressionContext(params: {
 
     // Get recent test IDs from chat session
     const recentTestIds = chatSessionId
-      ? await getRecentTestIds(chatSessionId, userId)
+      ? await getRecentTestIds(chatSessionId)
       : [];
 
     return {
@@ -153,12 +153,13 @@ async function getLastTestFromSession(
 }
 
 /**
- * Get count of saved test cases for a project
- * Used to provide context about available saved tests
+ * Get count of intent test cases for a project
+ * Now counts from intent_test_cases (unified table).
+ * Used to provide context about available tests.
  *
- * @param projectId - Project ID to count saved cases for
+ * @param projectId - Project ID to count intent cases for
  * @param userId - User ID for filtering
- * @returns Number of saved test cases (0 on error)
+ * @returns Number of intent test cases (0 on error)
  */
 async function getSavedCasesCount(
   projectId: string,
@@ -166,7 +167,7 @@ async function getSavedCasesCount(
 ): Promise<number> {
   try {
     const { count, error } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('id', { count: 'exact', head: true })
       .eq('project_id', projectId)
       .eq('user_id', userId);
@@ -174,7 +175,7 @@ async function getSavedCasesCount(
     if (error) throw error;
     return count || 0;
   } catch (error) {
-    logger.warn('[REGRESSION_CONTEXT] Error getting saved cases count', { error });
+    logger.warn('[REGRESSION_CONTEXT] Error getting intent test cases count', { error });
     return 0;
   }
 }
@@ -213,9 +214,7 @@ async function getSuitesCount(projectId: string, userId: string): Promise<number
  * @returns Array of up to 5 most recent test IDs
  */
 async function getRecentTestIds(
-  chatSessionId: string,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _userId: string
+  chatSessionId: string
 ): Promise<string[]> {
   try {
     // Note: chat_messages table uses 'session_id' not 'chat_session_id'

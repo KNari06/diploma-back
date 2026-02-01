@@ -1,0 +1,310 @@
+/**
+ * Intent Step to PlaywrightCommand Converter
+ * 
+ * DESIGN PHILOSOPHY (per plan): This converter is strictly "dumb" -
+ * it does NOT resolve elements or look them up. It only transfers:
+ * - intent (type/description/value/options)
+ * - compiled/evidence/bindingHints into metadata
+ * 
+ * Element resolution happens at runtime in CommandExecutor via:
+ * 1. compiled.locatorPlan (if present and valid)
+ * 2. Fallback to smart-locator + self-healing
+ */
+
+import { PlaywrightCommand } from '@/types';
+import { logger } from '@/utils/core/logger';
+import type { IntentStep, IntentActionType, CompiledStepPlan, StepEvidence, BindingHints } from './preview.types';
+
+/**
+ * Extended PlaywrightCommand with intent metadata for runtime resolution
+ * This metadata enables the executor to use compiled plans and self-healing
+ */
+export interface IntentPlaywrightCommand extends PlaywrightCommand {
+  /**
+   * Intent metadata for runtime resolution and reporting
+   */
+  intentMeta?: {
+    /** Original IntentStep ID */
+    stepId: string;
+    /** Original intent description */
+    intentDescription: string;
+    /** Compiled execution plan (if available) */
+    compiled?: CompiledStepPlan;
+    /** Evidence from previous executions */
+    evidence?: StepEvidence;
+    /** Binding hints for resolution */
+    bindingHints?: BindingHints;
+    /** Step index in the test case */
+    stepIndex: number;
+    /** V2: Parent IntentTestCase ID for heal persistence */
+    intentTestCaseId?: string;
+  };
+}
+
+/**
+ * Map IntentActionType to PlaywrightCommand action
+ * Some actions map directly, others need translation
+ */
+function mapActionType(intentAction: IntentActionType): string {
+  switch (intentAction) {
+    case 'fill':
+      return 'fill';
+    case 'click':
+      return 'click';
+    case 'wait':
+      return 'wait';
+    case 'assert':
+      return 'assertVisible'; // Default assert type; refined in command
+    case 'navigate':
+      return 'goto';
+    case 'select':
+      return 'select';
+    case 'hover':
+      return 'hover';
+    case 'scroll':
+      return 'scroll';
+    case 'press':
+      return 'press';
+    // V2: State-aware actions
+    case 'check':
+      return 'check';
+    case 'uncheck':
+      return 'uncheck';
+    case 'toggle':
+      return 'click'; // Toggle is click on checkable element
+    case 'open':
+      return 'click'; // Open is click on expandable element
+    case 'close':
+      return 'click'; // Close is click on closable element
+    default:
+      return 'click'; // Fallback
+  }
+}
+
+/**
+ * Build selector from compiled locatorPlan (primary locator only)
+ * Returns undefined if no compiled plan or no locators
+ * 
+ * The CommandExecutor will try all locators in the plan at runtime.
+ * Here we just provide the primary one for backward compatibility.
+ */
+function buildPrimarySelector(compiled?: CompiledStepPlan): string | undefined {
+  if (!compiled?.locatorPlan || compiled.locatorPlan.length === 0) {
+    return undefined;
+  }
+
+  const primary = compiled.locatorPlan[0];
+  
+  switch (primary.strategy) {
+    case 'ref':
+    case 'css':
+      return primary.value;
+    case 'role':
+      // Format: role=button[name="Submit"]
+      if (primary.roleName && primary.value) {
+        return `role=${primary.roleName}[name="${primary.value}"]`;
+      }
+      return undefined;
+    case 'label':
+      // Format: getByLabel locator syntax
+      return `text="${primary.value}"`;
+    case 'testId':
+      return `[data-testid="${primary.value}"]`;
+    case 'placeholder':
+      return `[placeholder="${primary.value}"]`;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Convert a single IntentStep to IntentPlaywrightCommand
+ * 
+ * This is a "dumb" converter - it does NOT:
+ * - Resolve elements
+ * - Make API calls
+ * - Validate selectors
+ * 
+ * Resolution happens at runtime in CommandExecutor.
+ */
+export function convertIntentStepToCommand(
+  step: IntentStep,
+  stepIndex: number,
+  testCaseStartUrl?: string
+): IntentPlaywrightCommand {
+  const action = mapActionType(step.type);
+  
+  // Build primary selector from compiled plan if available
+  // If not available, CommandExecutor will use intent-based resolution
+  const primarySelector = buildPrimarySelector(step.compiled);
+  
+  // Build command
+  const command: IntentPlaywrightCommand = {
+    action,
+    description: step.description,
+    timeout: step.options?.timeout || 30000,
+    continueOnError: false,
+    
+    // Intent metadata for runtime resolution
+    intentMeta: {
+      stepId: step.id,
+      intentDescription: step.description,
+      compiled: step.compiled,
+      evidence: step.evidence,
+      bindingHints: step.bindingHints,
+      stepIndex,
+    },
+  };
+
+  // Add selector if compiled plan available
+  if (primarySelector) {
+    command.selector = primarySelector;
+  }
+
+  // Handle specific action types
+  switch (step.type) {
+    case 'fill':
+      command.value = step.value || '';
+      break;
+      
+    case 'navigate':
+      // For navigate, use the value as URL, or fallback to test case startUrl
+      command.url = step.value || testCaseStartUrl;
+      command.waitFor = 'domcontentloaded';
+      break;
+      
+    case 'press':
+      // For press, value is the key to press (e.g., "Enter", "Tab")
+      command.value = step.value || 'Enter';
+      break;
+      
+    case 'select':
+      // For select, value is the option to select
+      command.value = step.value || '';
+      break;
+      
+    case 'wait': {
+      // For wait, value might be time in ms
+      // ESLint: wrap in block to avoid no-case-declarations
+      const waitTimeMsRaw = step.value ?? '1000';
+      const waitTimeMs = typeof waitTimeMsRaw === 'number' ? waitTimeMsRaw : Number(waitTimeMsRaw);
+      const normalizedWaitMs = Number.isFinite(waitTimeMs) ? Math.max(0, Math.floor(waitTimeMs)) : 1000;
+      command.timeout = normalizedWaitMs;
+      break;
+    }
+      
+    case 'assert':
+      // For assert, set up assertion config
+      command.assertion = {
+        type: 'visible',
+        expected: step.value || true,
+      };
+      break;
+      
+    case 'scroll':
+      // Scroll doesn't need value, but may have selector
+      break;
+      
+    default:
+      // For click, hover, check, uncheck, toggle, open, close
+      // Just need the selector which is handled above
+      break;
+  }
+
+  logger.debug('[INTENT_STEP_CONVERTER] Converted step', {
+    stepId: step.id,
+    stepType: step.type,
+    action: command.action,
+    hasCompiledPlan: !!step.compiled,
+    hasSelector: !!command.selector,
+    stepIndex,
+  });
+
+  return command;
+}
+
+/**
+ * Convert array of IntentSteps to IntentPlaywrightCommands
+ * 
+ * @param steps Array of IntentSteps from the test case
+ * @param startUrl Starting URL for navigate actions
+ * @param intentTestCaseId Optional parent test case ID for heal persistence
+ * @returns Array of IntentPlaywrightCommands ready for execution
+ */
+export function convertIntentStepsToCommands(
+  steps: IntentStep[],
+  startUrl: string,
+  intentTestCaseId?: string
+): IntentPlaywrightCommand[] {
+  logger.info('[INTENT_STEP_CONVERTER] Converting intent steps', {
+    stepsCount: steps.length,
+    startUrl,
+    intentTestCaseId,
+  });
+
+  // Add initial goto command for startUrl
+  const commands: IntentPlaywrightCommand[] = [
+    {
+      action: 'goto',
+      url: startUrl,
+      waitFor: 'domcontentloaded',
+      timeout: 30000,
+      description: `Navigate to ${startUrl}`,
+    },
+  ];
+
+  // Convert each step
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const command = convertIntentStepToCommand(step, i, startUrl);
+    
+    // V2: Add intentTestCaseId for heal persistence
+    if (intentTestCaseId && command.intentMeta) {
+      command.intentMeta.intentTestCaseId = intentTestCaseId;
+    }
+    
+    commands.push(command);
+  }
+
+  logger.info('[INTENT_STEP_CONVERTER] Conversion complete', {
+    inputSteps: steps.length,
+    outputCommands: commands.length,
+    stepsWithCompiledPlan: steps.filter(s => !!s.compiled).length,
+  });
+
+  return commands;
+}
+
+/**
+ * Service class for Intent Step conversion
+ */
+export class IntentStepConverterService {
+  /**
+   * Convert intent steps to Playwright commands
+   * 
+   * This is the main entry point for the converter.
+   * The conversion is "dumb" - no resolution, no API calls.
+   * 
+   * @param steps Array of IntentSteps
+   * @param startUrl Starting URL
+   * @param intentTestCaseId Optional parent test case ID for heal persistence
+   */
+  static convertToCommands(
+    steps: IntentStep[],
+    startUrl: string,
+    intentTestCaseId?: string
+  ): IntentPlaywrightCommand[] {
+    return convertIntentStepsToCommands(steps, startUrl, intentTestCaseId);
+  }
+
+  /**
+   * Convert a single step (for preview/testing)
+   */
+  static convertSingleStep(
+    step: IntentStep,
+    stepIndex: number,
+    startUrl?: string
+  ): IntentPlaywrightCommand {
+    return convertIntentStepToCommand(step, stepIndex, startUrl);
+  }
+}

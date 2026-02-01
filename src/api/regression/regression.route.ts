@@ -22,14 +22,14 @@ const router = Router();
  *
  * Key concepts (to avoid confusion with other "test" routes):
  * - `tests` (execution): results of an actual run (produced by running UI/API tests)
- * - `saved_test_cases` (definition): reusable UI test definitions used for replay/regression runs
- * - `regression_suites` (collection): groups of saved test cases to run together
+ * - `intent_test_cases` (definition): unified UI test definitions used for authoring and replay/regression
+ * - `regression_suites` (collection): groups of test cases to run together
  *
  * This router mainly does 2 things:
- * 1) Save: convert an already executed test (`tests`) into a reusable saved test case (`saved_test_cases`)
- * 2) Run: execute saved definitions (saved test case / suite / module / flow / plan) and create new executions
+ * 1) Save: convert an already executed test (`tests`) into a reusable test case (`intent_test_cases` with status=published)
+ * 2) Run: execute saved definitions (test case / suite / module / flow / plan) and create new executions
  *
- * It does NOT provide "step editor" endpoints to manually author `saved_test_cases.commands`.
+ * It does NOT provide "step editor" endpoints to manually author `intent_test_cases.commands`.
  * Manual authoring is handled by the Preview/Intent Test Case endpoints (`/api/v1/preview/...`) in this codebase.
  */
 
@@ -75,7 +75,7 @@ const router = Router();
  *       422:
  *         description: Test is not replayable
  */
-// Save FROM execution: takes `sourceTestId` (completed test) -> creates `saved_test_cases` for replay.
+// Save FROM execution: takes `sourceTestId` (completed test) -> creates intent_test_cases (status=published) for replay.
 router.post('/save', requireAuth, saveTestCase);
 
 /**

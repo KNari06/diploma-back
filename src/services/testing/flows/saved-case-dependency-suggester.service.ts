@@ -1,7 +1,10 @@
 /**
- * Saved Case Dependency Suggester Service
- * Generates AI-powered dependency suggestions for saved_test_cases within a flow.
+ * Intent Case Dependency Suggester Service
+ * Generates AI-powered dependency suggestions for intent_test_cases within a flow.
  * Uses context-first approach: URL continuity, heuristics, and semantic similarity.
+ *
+ * NOTE: Service class name kept as SavedCaseDependencySuggester for API compatibility.
+ * Now operates on intent_test_cases (unified table) instead of saved_test_cases.
  */
 
 import { supabaseAdmin } from '@/db/supabase';
@@ -16,19 +19,20 @@ import { logger } from '@/utils/core/logger';
  * A single dependency suggestion with confidence and reasoning
  */
 export interface DependencySuggestion {
-  id: string;           // saved_test_cases.id of the suggested dependency
+  id: string;           // intent_test_cases.id of the suggested dependency
   confidence: number;   // 0.0 - 1.0
   reason: string;       // Human-readable explanation
 }
 
 /**
- * Minimal saved case data needed for suggestion calculations
+ * Minimal intent case data needed for suggestion calculations
  */
-interface SavedCaseData {
+interface IntentCaseData {
   id: string;
   name: string;
   description?: string;
   url?: string;
+  start_url?: string;
   flow_id?: string;
   depends_on?: string[];
 }
@@ -60,7 +64,8 @@ const DEPENDENT_KEYWORDS = ['dashboard', 'profile', 'settings', 'account', 'home
 // ============================================================================
 
 /**
- * Service for generating dependency suggestions for saved test cases.
+ * Service for generating dependency suggestions for intent test cases.
+ * Now operates on intent_test_cases (unified table).
  * Analyzes test cases within the same flow and suggests dependencies based on:
  * 1. URL continuity (strongest signal)
  * 2. Keyword heuristics (login -> dashboard patterns)
@@ -68,10 +73,10 @@ const DEPENDENT_KEYWORDS = ['dashboard', 'profile', 'settings', 'account', 'home
  */
 export class SavedCaseDependencySuggester {
   /**
-   * Generate dependency suggestions for a saved test case.
+   * Generate dependency suggestions for an intent test case.
    * Only considers candidates within the same flow_id.
    *
-   * @param caseId - ID of the saved test case (or null for draft)
+   * @param caseId - ID of the intent test case (or null for draft)
    * @param flowId - Flow ID to scope candidates
    * @param userId - User ID for access control
    * @param draftCase - Optional draft case data (when creating new case)
@@ -92,7 +97,7 @@ export class SavedCaseDependencySuggester {
       });
 
       // 1. Get target case data
-      let targetCase: SavedCaseData;
+      let targetCase: IntentCaseData;
       if (draftCase) {
         targetCase = {
           id: caseId || 'draft',
@@ -102,7 +107,7 @@ export class SavedCaseDependencySuggester {
           flow_id: flowId,
         };
       } else if (caseId) {
-        const fetched = await this.getSavedCase(caseId, userId);
+        const fetched = await this.getIntentCase(caseId, userId);
         if (!fetched) {
           logger.warn('[DEPENDENCY_SUGGESTER] Target case not found', { caseId });
           return [];
@@ -194,38 +199,45 @@ export class SavedCaseDependencySuggester {
   // ==========================================================================
 
   /**
-   * Get a saved test case by ID
+   * Get an intent test case by ID
+   * Now fetches from intent_test_cases (unified table).
    */
-  private static async getSavedCase(
+  private static async getIntentCase(
     caseId: string,
     userId: string
-  ): Promise<SavedCaseData | null> {
+  ): Promise<IntentCaseData | null> {
     const { data, error } = await supabaseAdmin
-      .from('saved_test_cases')
-      .select('id, name, description, url, flow_id, depends_on')
+      .from('intent_test_cases')
+      .select('id, name, description, url, start_url, flow_id, depends_on')
       .eq('id', caseId)
       .eq('user_id', userId)
       .single();
 
     if (error) {
       if (error.code === 'PGRST116') return null;
-      throw new Error(`Failed to get saved case: ${error.message}`);
+      throw new Error(`Failed to get intent case: ${error.message}`);
     }
 
-    return data as SavedCaseData;
+    // Normalize url: use url field, fallback to start_url
+    const result = data as any;
+    return {
+      ...result,
+      url: result.url || result.start_url,
+    } as IntentCaseData;
   }
 
   /**
    * Get all candidate cases in the same flow (excluding target)
+   * Now fetches from intent_test_cases (unified table).
    */
   private static async getCandidatesInFlow(
     flowId: string,
     userId: string,
     excludeCaseId?: string | null
-  ): Promise<SavedCaseData[]> {
+  ): Promise<IntentCaseData[]> {
     let query = supabaseAdmin
-      .from('saved_test_cases')
-      .select('id, name, description, url, flow_id, depends_on')
+      .from('intent_test_cases')
+      .select('id, name, description, url, start_url, flow_id, depends_on')
       .eq('flow_id', flowId)
       .eq('user_id', userId);
 
@@ -239,7 +251,11 @@ export class SavedCaseDependencySuggester {
       throw new Error(`Failed to get candidates: ${error.message}`);
     }
 
-    return (data || []) as SavedCaseData[];
+    // Normalize url for each candidate
+    return (data || []).map((row: any) => ({
+      ...row,
+      url: row.url || row.start_url,
+    })) as IntentCaseData[];
   }
 
   // ==========================================================================
@@ -253,8 +269,8 @@ export class SavedCaseDependencySuggester {
    * @returns Score (0.0 - 0.9) and reason
    */
   private static checkUrlContinuity(
-    candidate: SavedCaseData,
-    target: SavedCaseData
+    candidate: IntentCaseData,
+    target: IntentCaseData
   ): { score: number; reason: string } {
     if (!candidate.url || !target.url) {
       return { score: 0, reason: '' };
@@ -307,8 +323,8 @@ export class SavedCaseDependencySuggester {
    * @returns Score (0.0 - 0.8) and reason
    */
   private static checkKeywordHeuristics(
-    candidate: SavedCaseData,
-    target: SavedCaseData
+    candidate: IntentCaseData,
+    target: IntentCaseData
   ): { score: number; reason: string } {
     const candidateText = `${candidate.name} ${candidate.description || ''} ${candidate.url || ''}`.toLowerCase();
     const targetText = `${target.name} ${target.description || ''} ${target.url || ''}`.toLowerCase();
@@ -342,8 +358,8 @@ export class SavedCaseDependencySuggester {
    * @returns Score (0.0 - 0.9) and reason
    */
   private static async checkSemanticSimilarity(
-    candidate: SavedCaseData,
-    target: SavedCaseData
+    candidate: IntentCaseData,
+    target: IntentCaseData
   ): Promise<{ score: number; reason: string }> {
     const candidateText = `${candidate.name} ${candidate.description || ''}`.trim();
     const targetText = `${target.name} ${target.description || ''}`.trim();

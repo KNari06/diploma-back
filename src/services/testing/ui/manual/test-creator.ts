@@ -39,6 +39,8 @@ export async function createTest(testRequest: TestRunRequest): Promise<Test> {
     options: {
       ...(testRequest.options || {}),
       mode: testRequest.mode || 'lite',
+      // V2: Store metadata for linking intentTestCaseId
+      metadata: testRequest.metadata || undefined,
     },
     // Intelligent testing fields
     intelligent_mode: testRequest.intelligentMode || false,

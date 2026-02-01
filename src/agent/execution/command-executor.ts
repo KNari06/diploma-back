@@ -1,17 +1,22 @@
 /* eslint-disable no-case-declarations */
-import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
 import { AIExtractService } from '@/services/ai-extract';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service';
+import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
+import type { IntentPlaywrightCommand } from '@/services/testing/ui/preview/intent-step-converter.service';
+import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import type { CompiledStepPlan, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Locator, Page } from 'playwright';
 import { shouldPressEnterAfterFill } from '../utils/ai/enter-detection-ai';
 import { getLocator, getSmartLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLocator } from '../utils/selectors/selector-utils';
 import { SelectorStabilityScore, SmartWaitService } from '../utils/selectors/smart-wait.service';
+import { buildRuntimeMeta, executeCompiledLocatorPlan } from './compiled-locator-executor';
 
 /**
  * Execute Playwright commands on a page
  * ✅ NEW: With AI self-healing support
+ * ✅ V2: With compiled locator plan support for IntentStep execution
  */
 export class CommandExecutor {
   private page: Page;
@@ -23,6 +28,9 @@ export class CommandExecutor {
   private costManager?: AICostManager;
   private externalAbortHandler?: () => void; // ✅ FIX 1: Store handler for cleanup
   private selfHealingConfidenceThreshold: number = 0.85; // ✅ FIX 7: Configurable threshold
+  private maxHealAttempts: number = 1; // ✅ V2: Limit self-heal attempts to expose flakiness
+  /** Runtime metadata for each step (keyed by stepId) */
+  private stepRuntimeMeta: Map<string, StepRuntimeMeta> = new Map();
 
   constructor(
     page: Page,
@@ -95,16 +103,29 @@ export class CommandExecutor {
 
   /**
    * Execute a single command
+   *
+   * For IntentPlaywrightCommand (has intentMeta), uses:
+   * 1. compiled.locatorPlan first (with pageSignature check + TTL expiry)
+   * 2. Fallback to smart-locator
+   * 3. Self-healing (with maxHealAttempts=1)
+   *
+   * Records StepRuntimeMeta for reporting.
    */
   async executeCommand(command: PlaywrightCommand): Promise<{
     success: boolean;
     error?: string;
     screenshot?: string;
     extractedValue?: any;
+    /** Runtime metadata for intent-based commands */
+    runtimeMeta?: StepRuntimeMeta;
   }> {
     this.checkAborted();
 
     const { action, value, url, timeout, continueOnError, description } = command;
+
+    // ✅ V2: Check if this is an intent command (has intentMeta)
+    const intentCommand = command as IntentPlaywrightCommand;
+    const isIntentCommand = !!(intentCommand.intentMeta);
 
     // ✅ FIX 2: Normalize selector ONCE at the beginning
     const selector = this.prepareSelector(command.selector);
@@ -129,6 +150,9 @@ export class CommandExecutor {
         expected: command.assertion.expected,
         operator: command.assertion.operator,
       } : undefined,
+      isIntentCommand,
+      intentStepId: intentCommand.intentMeta?.stepId,
+      hasCompiledPlan: !!intentCommand.intentMeta?.compiled,
     });
 
     try {
@@ -142,6 +166,34 @@ export class CommandExecutor {
           break;
 
         case 'click':
+          // ✅ FIX 3: Helper for click with optional navigation wait
+          const performClick = async (locator: Locator) => {
+            await this.forceScrollIntoView(locator);
+            if (awaitNavigation) {
+              // Wait for navigation if expected
+              await Promise.all([
+                this.page.waitForNavigation({ timeout: timeout || 30000 }).catch(() => {
+                  logger.debug('[COMMAND_EXECUTOR] Navigation timeout after click, continuing');
+                }),
+                locator.click({ timeout: timeout || 30000 }),
+              ]);
+            } else {
+              await locator.click({ timeout: timeout || 30000 });
+            }
+          };
+
+          // ✅ V2: Use intent-based locator resolution for IntentPlaywrightCommand
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentLocator } = await this.getLocatorForIntentCommand(
+              intentCommand,
+              'click',
+              timeout || 30000
+            );
+            await performClick(intentLocator);
+            break;
+          }
+
+          // Standard flow for non-intent commands
           if (!selector) throw new Error('Selector is required for click action');
 
           // ✅ NEW: Use smart locator to select the right element based on action context
@@ -161,22 +213,6 @@ export class CommandExecutor {
               selectedIndex: smartResult.selectedIndex,
             });
           }
-
-          // ✅ FIX 3: Helper for click with optional navigation wait
-          const performClick = async (locator: Locator) => {
-            await this.forceScrollIntoView(locator);
-            if (awaitNavigation) {
-              // Wait for navigation if expected
-              await Promise.all([
-                this.page.waitForNavigation({ timeout: timeout || 30000 }).catch(() => {
-                  logger.debug('[COMMAND_EXECUTOR] Navigation timeout after click, continuing');
-                }),
-                locator.click({ timeout: timeout || 30000 }),
-              ]);
-            } else {
-              await locator.click({ timeout: timeout || 30000 });
-            }
-          };
 
           // Wait for element to be visible first
           try {
@@ -206,8 +242,27 @@ export class CommandExecutor {
           break;
 
         case 'fill':
-          if (!selector) throw new Error('Selector is required for fill action');
           if (value === undefined) throw new Error('Value is required for fill action');
+
+          // ✅ V2: Use intent-based locator resolution for IntentPlaywrightCommand
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentFillLocator } = await this.getLocatorForIntentCommand(
+              intentCommand,
+              'fill',
+              timeout || 30000
+            );
+            await intentFillLocator.fill(String(value), { timeout: timeout || 30000 });
+
+            // AI-powered Enter key detection
+            const shouldPressIntent = await shouldPressEnterAfterFill(intentFillLocator, this.page, description);
+            if (shouldPressIntent) {
+              await intentFillLocator.press('Enter', { timeout: timeout || 5000 });
+            }
+            break;
+          }
+
+          // Standard flow for non-intent commands
+          if (!selector) throw new Error('Selector is required for fill action');
 
           // ✅ NEW: Use smart locator to select the right input element
           const fillSmartResult = await getSmartLocator(
@@ -720,10 +775,16 @@ export class CommandExecutor {
         return {
           success: true,
           screenshot: `data:image/png;base64,${screenshot.toString('base64')}`,
+          runtimeMeta: isIntentCommand ? this.stepRuntimeMeta.get(intentCommand.intentMeta?.stepId || '') : undefined,
         };
       }
 
-      return { success: true };
+      // ✅ V2: Include runtime metadata for intent-based commands
+      const runtimeMeta = isIntentCommand
+        ? this.stepRuntimeMeta.get(intentCommand.intentMeta?.stepId || '')
+        : undefined;
+
+      return { success: true, runtimeMeta };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       // ✅ FIX: Enhanced error logging with full context
@@ -740,11 +801,15 @@ export class CommandExecutor {
           name: error.name,
           stack: error.stack,
         } : String(error),
+        intentStepId: isIntentCommand ? intentCommand.intentMeta?.stepId : undefined,
       });
 
       if (continueOnError) {
         logger.warn(`Continuing despite error due to continueOnError flag`);
-        return { success: false, error: errorMessage };
+        const runtimeMeta = isIntentCommand
+          ? this.stepRuntimeMeta.get(intentCommand.intentMeta?.stepId || '')
+          : undefined;
+        return { success: false, error: errorMessage, runtimeMeta };
       }
 
       throw error;
@@ -957,6 +1022,361 @@ export class CommandExecutor {
    */
   getExtractedData(): Map<string, any> {
     return this.extractedData;
+  }
+
+  /**
+   * Get runtime metadata for all executed steps
+   * Useful for reporting and debugging intent-based test execution
+   */
+  getStepRuntimeMeta(): Map<string, StepRuntimeMeta> {
+    return this.stepRuntimeMeta;
+  }
+
+  /**
+   * Get runtime metadata for a specific step
+   */
+  getStepRuntimeMetaById(stepId: string): StepRuntimeMeta | undefined {
+    return this.stepRuntimeMeta.get(stepId);
+  }
+
+  /**
+   * V2: Persist healed compiled plan to DB after high-confidence heal
+   * This updates the IntentTestCase so future runs use the new selector
+   *
+   * NOTE: Only updates locatorPlan and context, preserves existing action
+   */
+  private async persistHealedCompiled(params: {
+    intentTestCaseId?: string;
+    stepId: string;
+    newSelector: string;
+    healConfidence: number;
+    pageUrl: string;
+    existingCompiled?: CompiledStepPlan;
+  }): Promise<void> {
+    const { intentTestCaseId, stepId, newSelector, healConfidence, pageUrl, existingCompiled } = params;
+
+    if (!intentTestCaseId) {
+      logger.debug('[COMMAND_EXECUTOR] No intentTestCaseId, skipping heal persistence');
+      return;
+    }
+
+    // Build new locator plan from healed selector
+    // Add healed selector as primary, keep old selectors as fallback
+    const healedEntry: LocatorEntry = {
+      strategy: 'css',
+      value: newSelector,
+      confidence: healConfidence,
+    };
+
+    // Merge with existing locator plan (healed first, then old ones as fallback)
+    const existingLocators = existingCompiled?.locatorPlan || [];
+    const newLocatorPlan: LocatorEntry[] = [
+      healedEntry,
+      ...existingLocators.filter(e => e.value !== newSelector), // Avoid duplicates
+    ];
+
+    // Preserve existing action, update locators and context
+    const newCompiled: CompiledStepPlan = {
+      locatorPlan: newLocatorPlan,
+      action: existingCompiled?.action || { type: 'click' },
+      targetFingerprint: existingCompiled?.targetFingerprint, // Preserve fingerprint
+      context: {
+        ...existingCompiled?.context,
+        pageUrl,
+        compiledAt: new Date().toISOString(),
+        pageSignature: undefined, // Clear signature - will be regenerated on next lint
+      },
+      meta: {
+        compiledVersion: existingCompiled?.meta?.compiledVersion || '1.0.0',
+        resolverVersion: '3.0.0-healed',
+      },
+    };
+
+    const newEvidence = {
+      lastSuccessSelector: newSelector,
+      confidence: healConfidence,
+    };
+
+    await IntentTestCaseService.updateStepAfterHeal({
+      intentTestCaseId,
+      stepId,
+      compiled: newCompiled,
+      evidence: newEvidence,
+    });
+
+    logger.info('[COMMAND_EXECUTOR] Persisted healed compiled to DB', {
+      intentTestCaseId,
+      stepId,
+      healConfidence,
+      locatorCount: newLocatorPlan.length,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // COMPILED LOCATOR PLAN EXECUTION (for IntentStep-based commands)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** V2: Retry configuration for element resolution */
+  private static readonly RETRY_CONFIG = {
+    maxRetries: 2,
+    retryDelayMs: 500,
+    retryBackoffMultiplier: 1.5,
+  };
+
+  /**
+   * Get locator for an intent-based command with retry logic
+   *
+   * Priority order:
+   * 1. compiled.locatorPlan (if present, not expired, signature matches)
+   * 2. Smart locator from selector (if provided)
+   * 3. Self-healing (if enabled and maxHealAttempts not exceeded)
+   *
+   * V2: Includes retry logic (2-3 attempts with backoff delay)
+   *
+   * Records runtime metadata for reporting.
+   */
+  private async getLocatorForIntentCommand(
+    command: IntentPlaywrightCommand,
+    actionType: string,
+    timeout: number
+  ): Promise<{
+    locator: Locator;
+    runtimeMeta: StepRuntimeMeta;
+  }> {
+    const { maxRetries, retryDelayMs, retryBackoffMultiplier } = CommandExecutor.RETRY_CONFIG;
+    let lastError: Error | undefined;
+
+    // Retry loop
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) {
+        // Wait before retry with exponential backoff
+        const delay = retryDelayMs * Math.pow(retryBackoffMultiplier, attempt - 1);
+        logger.info('[COMMAND_EXECUTOR] Retrying element resolution', {
+          attempt: attempt + 1,
+          maxRetries: maxRetries + 1,
+          delayMs: Math.round(delay),
+        });
+        await this.page.waitForTimeout(delay);
+      }
+
+      try {
+        return await this.tryGetLocatorForIntentCommand(command, actionType, timeout);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        logger.warn('[COMMAND_EXECUTOR] Element resolution attempt failed', {
+          attempt: attempt + 1,
+          error: lastError.message,
+        });
+      }
+    }
+
+    // All retries failed
+    throw lastError || new Error('Element not found after retries');
+  }
+
+  /**
+   * Single attempt to get locator for intent command (called by retry wrapper)
+   */
+  private async tryGetLocatorForIntentCommand(
+    command: IntentPlaywrightCommand,
+    actionType: string,
+    timeout: number
+  ): Promise<{
+    locator: Locator;
+    runtimeMeta: StepRuntimeMeta;
+  }> {
+    const startTime = Date.now();
+    const intentMeta = command.intentMeta;
+    const stepId = intentMeta?.stepId || 'unknown';
+
+    // Track healing attempts for this step
+    let healAttempts = 0;
+
+    // 1. Try compiled locator plan first (if available)
+    if (intentMeta?.compiled) {
+      const compiledResult = await executeCompiledLocatorPlan(
+        this.page,
+        intentMeta.compiled,
+        actionType,
+        timeout
+      );
+
+      if (compiledResult.success && compiledResult.locator) {
+        const runtimeMeta = buildRuntimeMeta(compiledResult, Date.now() - startTime);
+        this.stepRuntimeMeta.set(stepId, runtimeMeta);
+
+        logger.info('[COMMAND_EXECUTOR] Using compiled locator', {
+          stepId,
+          strategy: compiledResult.usedStrategy,
+          confidence: compiledResult.confidence,
+        });
+
+        return { locator: compiledResult.locator, runtimeMeta };
+      }
+
+      // Log why compiled failed
+      logger.info('[COMMAND_EXECUTOR] Compiled locator failed, falling back', {
+        stepId,
+        skipReason: compiledResult.skipReason,
+        expired: compiledResult.expired,
+        signatureMatched: compiledResult.signatureMatched,
+      });
+    }
+
+    // 2. Try smart locator from selector
+    if (command.selector) {
+      try {
+        const smartResult = await getSmartLocator(
+          this.page,
+          command.selector,
+          actionType as any,
+          command.description
+        );
+
+        if (smartResult.locator) {
+          await smartResult.locator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
+
+          const runtimeMeta: StepRuntimeMeta = {
+            runtimeStatus: 'executed',
+            source: 'resolver',
+            confidenceTier: 'medium',
+            executionMs: Date.now() - startTime,
+            usedLocatorStrategy: 'smart',
+          };
+          this.stepRuntimeMeta.set(stepId, runtimeMeta);
+
+          logger.info('[COMMAND_EXECUTOR] Using smart locator', {
+            stepId,
+            wasSmartSelected: smartResult.wasSmartSelected,
+            totalMatches: smartResult.totalMatches,
+          });
+
+          return { locator: smartResult.locator, runtimeMeta };
+        }
+      } catch (smartError) {
+        logger.warn('[COMMAND_EXECUTOR] Smart locator failed', {
+          stepId,
+          error: smartError instanceof Error ? smartError.message : String(smartError),
+        });
+      }
+    }
+
+    // 3. Try self-healing (if enabled and not exceeded max attempts)
+    if (this.selfHealingEnabled && healAttempts < this.maxHealAttempts) {
+      healAttempts++;
+
+      try {
+        const healingResult = await SelfHealingService.healSelector({
+          oldSelector: command.selector || '',
+          intent: intentMeta?.intentDescription || command.description || '',
+          page: this.page,
+          errorMessage: 'Element not found via compiled or smart locator',
+          metadata: {
+            url: this.metadata.url || this.page.url(),
+            projectId: this.metadata.projectId,
+            userId: this.metadata.userId,
+          },
+          mode: 'fast',
+        });
+
+        if (healingResult.success && healingResult.newSelector) {
+          const healConfidence = healingResult.diff?.confidence ?? 0;
+
+          // GUARD RAILS: Check confidence threshold before auto-applying healed selector
+          // This prevents "quietly wrong heal" - a key safety feature
+          if (healConfidence >= this.selfHealingConfidenceThreshold) {
+            const locator = getLocator(this.page, healingResult.newSelector);
+            await locator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
+
+            // Determine if this healed step needs review
+            // Even successful heals with medium confidence should be flagged
+            const needsReview = healConfidence < 0.9;
+            const flaky = healConfidence < 0.9;
+
+            const runtimeMeta: StepRuntimeMeta = {
+              runtimeStatus: 'healed',
+              source: 'self_heal',
+              confidenceTier: healConfidence >= 0.9 ? 'high' : 'medium',
+              executionMs: Date.now() - startTime,
+              usedLocatorStrategy: 'healed',
+              healConfidence,
+              // GUARD RAILS: Flag for review even when heal succeeds
+              needsReview,
+              flaky,
+            };
+            this.stepRuntimeMeta.set(stepId, runtimeMeta);
+
+            logger.info('[COMMAND_EXECUTOR] Self-healing succeeded', {
+              stepId,
+              newSelector: healingResult.newSelector,
+              confidence: healConfidence,
+              needsReview,
+              flaky,
+            });
+
+            // V2: Update compiled in DB if high-confidence heal (≥0.9)
+            // This persists the healed selector for future runs
+            if (healConfidence >= 0.9 && intentMeta?.stepId && intentMeta?.intentTestCaseId) {
+              this.persistHealedCompiled({
+                intentTestCaseId: intentMeta.intentTestCaseId,
+                stepId: intentMeta.stepId,
+                newSelector: healingResult.newSelector,
+                healConfidence,
+                pageUrl: this.page.url(),
+                existingCompiled: intentMeta.compiled, // Pass existing for merging
+              }).catch(err => {
+                // Don't fail the action if persistence fails
+                logger.warn('[COMMAND_EXECUTOR] Failed to persist healed compiled', {
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              });
+            }
+
+            return { locator, runtimeMeta };
+          } else {
+            // GUARD RAILS: Low confidence - block auto-healing entirely
+            // Don't auto-update compiled/evidence when semantic match is low
+            logger.warn('[COMMAND_EXECUTOR] Self-healing BLOCKED due to low confidence (guard rails)', {
+              stepId,
+              confidence: healConfidence,
+              threshold: this.selfHealingConfidenceThreshold,
+              reason: 'heal_blocked',
+            });
+
+            // Record that healing was attempted but blocked
+            const blockedMeta: StepRuntimeMeta = {
+              runtimeStatus: 'failed',
+              source: 'self_heal',
+              confidenceTier: 'low',
+              executionMs: Date.now() - startTime,
+              failedReason: 'heal_blocked',
+              healConfidence,
+              needsReview: true,
+              flaky: true,
+            };
+            this.stepRuntimeMeta.set(stepId, blockedMeta);
+          }
+        }
+      } catch (healError) {
+        logger.warn('[COMMAND_EXECUTOR] Self-healing failed', {
+          stepId,
+          error: healError instanceof Error ? healError.message : String(healError),
+        });
+      }
+    }
+
+    // 4. All attempts failed
+    const runtimeMeta: StepRuntimeMeta = {
+      runtimeStatus: 'failed',
+      source: intentMeta?.compiled ? 'compiled' : 'resolver',
+      confidenceTier: 'low',
+      executionMs: Date.now() - startTime,
+      failedReason: 'element_not_found',
+      needsReview: true,
+    };
+    this.stepRuntimeMeta.set(stepId, runtimeMeta);
+
+    throw new Error(`Element not found for step: ${intentMeta?.intentDescription || command.description || 'unknown'}`);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

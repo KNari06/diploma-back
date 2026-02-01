@@ -766,6 +766,43 @@ export class IntentStepLintService {
       return this.lintStepWithRuleBasedFallback(params, { url: snapshot.url, domNodes });
     }
 
+    // Step 2.5: V2 - Handle semantic-zero with explicit AI fallback
+    // When we found elements but none semantically match the description
+    if (embeddingsResult.needsAiFallback && (embeddingsResult as any).aiFallbackReason === 'semantic_zero') {
+      logger.info('[INTENT_LINT_V5] Semantic-zero detected, triggering AI fallback', {
+        previewSessionId,
+        topSimilarity: embeddingsResult.topSimilarity,
+      });
+
+      // Generate a helpful clarification message using AI
+      const clarifyResult = await this.generateClarificationQuestion({
+        userIntent: sanitizeIntent(stepDraft),
+        actionType: stepDraft.type,
+        pageUrl: snapshot.url,
+        candidates: embeddingsResult.candidates.slice(0, 5), // Use top candidates for context
+        domNodes,
+        isSemanticZero: true, // V2: Flag for semantic-zero specific messaging
+      });
+
+      // Build descriptive message
+      let message = clarifyResult.question || 
+        `I found some elements but none seem to match "${stepDraft.description}". Could you describe the element more specifically?`;
+      
+      if (clarifyResult.examples && clarifyResult.examples.length > 0) {
+        message += `\n\nTry being more specific, like:\n${clarifyResult.examples.map(e => `• "${e}"`).join('\n')}`;
+      }
+
+      return {
+        ...embeddingsResult,
+        status: 'needs_clarification', // Change to needs_clarification for UI handling
+        message,
+        clarificationQuestion: clarifyResult.question,
+        interpretation: clarifyResult.interpretation,
+        needsAiFallback: true,
+        aiFallbackReason: 'semantic_zero',
+      };
+    }
+
     // Step 3: If needs_clarification, generate LLM clarification message
     if (embeddingsResult.status === 'needs_clarification') {
       // For clarification, we always need candidates for LLM context (even if not returned to frontend)
@@ -905,12 +942,18 @@ export class IntentStepLintService {
    * 
    * Does NOT select elements - just helps user refine their description.
    */
+  /**
+   * V5: Generate LLM clarification question for ambiguous or semantic-zero cases
+   * V2 update: Added isSemanticZero flag for different messaging approach
+   */
   private static async generateClarificationQuestion(params: {
     userIntent: string;
     actionType: string;
     pageUrl: string;
     candidates: LintCandidate[];
     domNodes: InteractiveNode[];
+    /** V2: Flag indicating semantic-zero scenario (no good matches found) */
+    isSemanticZero?: boolean;
   }): Promise<{
     question?: string;
     interpretation?: string;
@@ -931,8 +974,13 @@ export class IntentStepLintService {
         return `${i + 1}. <${node?.tag || 'element'}> ${details.join(', ')}`;
       }).join('\n');
 
+      // V2: Different prompt for semantic-zero vs multiple matches
+      const scenarioContext = params.isSemanticZero
+        ? `The user wrote "${params.userIntent}" for a ${params.actionType} action, but NONE of the elements on the page seem to match this description. The elements below are the closest we found, but similarity is very low.`
+        : `The user wrote "${params.userIntent}" for a ${params.actionType} action, but it matches multiple elements.`;
+
       const prompt = `You are helping a user write a clearer element description for UI testing.
-The user wrote "${params.userIntent}" for a ${params.actionType} action, but it matches multiple elements.
+${scenarioContext}
 
 MATCHING ELEMENTS:
 ${candidateList}

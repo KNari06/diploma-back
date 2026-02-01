@@ -87,21 +87,27 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     });
 
     // Create initial test case if moduleId was provided
+    // UI test cases are now created in intent_test_cases (unified table)
     let createdTestCaseId: string | undefined;
     
     if (moduleId && platformKey && projectId) {
       if (platformKey === 'web_ui') {
-        // Create empty UI test case
+        // Create empty UI test case in intent_test_cases (unified table)
         const { data: testCase, error: testCaseError } = await supabaseAdmin
-          .from('saved_test_cases')
+          .from('intent_test_cases')
           .insert({
             project_id: projectId,
             user_id: userId,
             name: name, // Use flow name as default
-            kind: 'regression_member',
-            replay_strategy: 'commands',
             flow_id: flow.id,
+            // Lifecycle/classification
+            status: 'draft',
+            kind: 'regression_member',
+            // Replay fields (empty for new flow)
+            replay_strategy: 'commands',
             commands: [],
+            steps_json: [],
+            // Metadata fields
             preconditions: preconditions || [],
             setup_steps: [],
             teardown_steps: [],
@@ -121,7 +127,7 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
           // Don't fail the whole request, just log the error
         } else {
           createdTestCaseId = testCase.id;
-          logger.info('[FLOWS_API] Created initial test case', {
+          logger.info('[FLOWS_API] Created initial intent test case', {
             testCaseId: createdTestCaseId,
             flowId: flow.id,
           });

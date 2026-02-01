@@ -243,6 +243,7 @@ export class FlowService {
 
   /**
    * Get all test case IDs in a flow
+   * UI test cases are now sourced from intent_test_cases (unified table).
    * @param flowId - Flow ID
    * @param userId - User ID for access control
    * @returns Object with UI and API test case IDs
@@ -251,9 +252,9 @@ export class FlowService {
     flowId: string,
     userId: string
   ): Promise<{ ui: string[]; api: string[] }> {
-    // Get UI test cases
+    // Get UI test cases from intent_test_cases (unified table)
     const { data: uiCases, error: uiError } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('id')
       .eq('flow_id', flowId)
       .eq('user_id', userId);
@@ -263,7 +264,7 @@ export class FlowService {
       throw new Error(`Failed to get test cases: ${uiError.message}`);
     }
 
-    // Get API test cases
+    // Get API test cases (unchanged)
     const { data: apiCases, error: apiError } = await supabaseAdmin
       .from('api_test_configs')
       .select('id')

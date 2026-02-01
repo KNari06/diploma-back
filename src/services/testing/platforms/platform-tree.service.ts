@@ -62,6 +62,7 @@ interface TestCaseSummary {
   testType: 'ui' | 'api';
   name: string;
   priority?: string;
+  status?: 'draft' | 'published' | 'archived';
   createdAt: string;
 }
 
@@ -348,6 +349,8 @@ export class PlatformTreeService {
 
   /**
    * Flow mode: return flow with paginated test cases (merged from UI + API)
+   * UI test cases are now sourced from intent_test_cases (unified table).
+   * API test cases continue to come from api_test_configs.
    * @param flowId - Flow ID
    * @param userId - User ID for access control
    * @param options - Pagination options for test cases
@@ -371,9 +374,9 @@ export class PlatformTreeService {
       throw new Error('Flow not found or access denied');
     }
 
-    // Get UI test cases count
+    // Get UI test cases count from intent_test_cases (unified table)
     const { count: uiCount, error: uiCountError } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('id', { count: 'exact', head: true })
       .eq('flow_id', flowId)
       .eq('user_id', userId);
@@ -383,7 +386,7 @@ export class PlatformTreeService {
       throw new Error(`Failed to count UI test cases: ${uiCountError.message}`);
     }
 
-    // Get API test cases count
+    // Get API test cases count (unchanged)
     const { count: apiCount, error: apiCountError } = await supabaseAdmin
       .from('api_test_configs')
       .select('id', { count: 'exact', head: true })
@@ -398,10 +401,11 @@ export class PlatformTreeService {
     const totalTestCases = (uiCount || 0) + (apiCount || 0);
 
     // Get all test cases from both sources (for proper merge/pagination)
+    // UI cases now come from intent_test_cases with status field
     const [uiResult, apiResult] = await Promise.all([
       supabaseAdmin
-        .from('saved_test_cases')
-        .select('id, name, priority, created_at')
+        .from('intent_test_cases')
+        .select('id, name, priority, status, created_at')
         .eq('flow_id', flowId)
         .eq('user_id', userId)
         .order('created_at', { ascending: false }),
@@ -420,13 +424,14 @@ export class PlatformTreeService {
       throw new Error(`Failed to get API test cases: ${apiResult.error.message}`);
     }
 
-    // Merge and tag with testType
+    // Merge and tag with testType; UI cases include status
     const merged: TestCaseSummary[] = [
       ...(uiResult.data || []).map((tc: any) => ({
         id: tc.id,
         testType: 'ui' as const,
         name: tc.name,
         priority: tc.priority || undefined,
+        status: tc.status as 'draft' | 'published' | 'archived',
         createdAt: tc.created_at,
       })),
       ...(apiResult.data || []).map((tc: any) => ({
@@ -434,6 +439,7 @@ export class PlatformTreeService {
         testType: 'api' as const,
         name: tc.name,
         priority: tc.priority || undefined,
+        // API test cases don't have status concept yet
         createdAt: tc.created_at,
       })),
     ];

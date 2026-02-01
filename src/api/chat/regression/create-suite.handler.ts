@@ -103,14 +103,15 @@ export async function handleCreateSuiteIntent(
     }
 
     // Use supabaseAdmin to bypass RLS - handler already verified user auth
+    // Now fetches from intent_test_cases (unified table)
     const { data: testCases, error: testCasesError } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('id, project_id')
       .in('id', uniqueTestCaseIds)
       .eq('user_id', userId);
 
     if (testCasesError || !testCases || testCases.length !== uniqueTestCaseIds.length) {
-      throw new ValidationError('One or more test cases are invalid or do not belong to the user');
+      throw new ValidationError('One or more intent test cases are invalid or do not belong to the user');
     }
 
     const projectIds = Array.from(new Set(testCases.map(tc => tc.project_id)));
