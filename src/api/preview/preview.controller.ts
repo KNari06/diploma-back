@@ -302,7 +302,7 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     }
 
     const { id } = req.params;
-    const { name, description, startUrl, steps, flowId } = req.body;
+    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority } = req.body;
 
     // Get existing test case to get projectId for validation
     const existingTestCase = await IntentTestCaseService.getById(id, userId);
@@ -326,14 +326,46 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       }
     }
 
+    /**
+     * Normalize optional URL fields for update.
+     * - undefined => do not update field
+     * - null/"" => clear field (set NULL in DB)
+     * - string => sanitize + store
+     */
+    const normalizeOptionalUrl = (value: unknown): string | null | undefined => {
+      if (value === undefined) return undefined;
+      if (value === null) return null;
+      if (typeof value !== 'string') {
+        throw new Error('Invalid URL type (expected string|null|undefined)');
+      }
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      return sanitizeUrl(trimmed);
+    };
+
+    // Validate status/kind if provided (simple guardrails)
+    if (status !== undefined && !['draft', 'published', 'archived'].includes(String(status))) {
+      res.status(400).json({ error: 'Invalid status (expected draft|published|archived)' });
+      return;
+    }
+    if (kind !== undefined && !['standalone', 'regression_member'].includes(String(kind))) {
+      res.status(400).json({ error: 'Invalid kind (expected standalone|regression_member)' });
+      return;
+    }
+
     const testCase = await IntentTestCaseService.update({
       id,
       userId,
       name,
       description,
-      startUrl: startUrl !== undefined ? sanitizeUrl(String(startUrl)) : undefined,
+      startUrl: normalizeOptionalUrl(startUrl),
+      url: normalizeOptionalUrl(url),
       steps,
       flowId,
+      status: status !== undefined ? (String(status) as any) : undefined,
+      kind: kind !== undefined ? (String(kind) as any) : undefined,
+      tags: Array.isArray(tags) ? tags : undefined,
+      priority: priority !== undefined ? (String(priority) as any) : undefined,
     });
 
     res.json({

@@ -149,8 +149,8 @@ export class IntentTestCaseService {
     userId: string;
     name?: string;
     description?: string;
-    startUrl?: string;
-    url?: string;
+    startUrl?: string | null;
+    url?: string | null;
     steps?: IntentStep[];
     flowId?: string;
     status?: 'draft' | 'published' | 'archived';
