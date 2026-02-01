@@ -335,13 +335,25 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     const normalizeOptionalUrl = (value: unknown): string | null | undefined => {
       if (value === undefined) return undefined;
       if (value === null) return null;
-      if (typeof value !== 'string') {
-        throw new Error('Invalid URL type (expected string|null|undefined)');
-      }
+      if (typeof value !== 'string') return undefined;
       const trimmed = value.trim();
       if (!trimmed) return null;
       return sanitizeUrl(trimmed);
     };
+
+    // Validate URL types early (avoid accidental 500s on weird payloads)
+    if (
+      startUrl !== undefined &&
+      startUrl !== null &&
+      typeof startUrl !== 'string'
+    ) {
+      res.status(400).json({ error: 'Invalid startUrl type (expected string|null|undefined)' });
+      return;
+    }
+    if (url !== undefined && url !== null && typeof url !== 'string') {
+      res.status(400).json({ error: 'Invalid url type (expected string|null|undefined)' });
+      return;
+    }
 
     // Validate status/kind if provided (simple guardrails)
     if (status !== undefined && !['draft', 'published', 'archived'].includes(String(status))) {
@@ -352,6 +364,27 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       res.status(400).json({ error: 'Invalid kind (expected standalone|regression_member)' });
       return;
     }
+    if (
+      priority !== undefined &&
+      priority !== null &&
+      !['critical', 'high', 'medium', 'low'].includes(String(priority))
+    ) {
+      res.status(400).json({ error: 'Invalid priority (expected critical|high|medium|low)' });
+      return;
+    }
+
+    // Normalize steps to avoid DB NOT NULL violation (steps_json is NOT NULL)
+    let normalizedSteps: any = undefined;
+    if (steps !== undefined) {
+      if (steps === null) {
+        normalizedSteps = [];
+      } else if (Array.isArray(steps)) {
+        normalizedSteps = steps;
+      } else {
+        res.status(400).json({ error: 'Invalid steps (expected array|null|undefined)' });
+        return;
+      }
+    }
 
     const testCase = await IntentTestCaseService.update({
       id,
@@ -360,12 +393,12 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       description,
       startUrl: normalizeOptionalUrl(startUrl),
       url: normalizeOptionalUrl(url),
-      steps,
+      steps: normalizedSteps,
       flowId,
       status: status !== undefined ? (String(status) as any) : undefined,
       kind: kind !== undefined ? (String(kind) as any) : undefined,
       tags: Array.isArray(tags) ? tags : undefined,
-      priority: priority !== undefined ? (String(priority) as any) : undefined,
+      priority: priority !== undefined && priority !== null ? (String(priority) as any) : undefined,
     });
 
     res.json({
