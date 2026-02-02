@@ -444,6 +444,45 @@ export async function getBoardConfiguration(
 }
 
 /**
+ * Get all workflow status names for a project (GET /rest/api/3/project/{projectIdOrKey}/statuses).
+ * Returns unique status names in order - used as column list when board config is unavailable.
+ */
+export async function getProjectStatuses(
+  accessToken: string,
+  cloudId: string,
+  projectKeyOrId: string
+): Promise<string[]> {
+  const url = `${JIRA_API_URL}/ex/jira/${cloudId}/rest/api/3/project/${encodeURIComponent(projectKeyOrId)}/statuses`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    logger.warn('Failed to get project statuses', { status: response.status, error: errorText });
+    return [];
+  }
+
+  const data = (await response.json()) as Array<{ statuses?: Array<{ id: string; name: string }> }>;
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const item of data || []) {
+    for (const s of item.statuses || []) {
+      const name = s?.name?.trim();
+      if (name && !seen.has(name)) {
+        seen.add(name);
+        ordered.push(name);
+      }
+    }
+  }
+  return ordered;
+}
+
+/**
  * Get all Jira statuses (GET /rest/api/3/status) for id → name mapping
  */
 export async function getJiraStatuses(

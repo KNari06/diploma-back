@@ -12,6 +12,7 @@ import {
   getJiraBoards,
   getBoardConfiguration,
   getJiraStatuses,
+  getProjectStatuses,
   getBoardIssues,
   searchJiraIssues,
   createJiraIssue,
@@ -473,25 +474,39 @@ export const getIssues = async (req: Request, res: Response): Promise<void> => {
       }
     }
 
-    // Build columns: board config + any status from issues not in config (auto-add missing columns)
+    // Build columns: include ALL columns (including empty) for frontend to display
     const issueStatusNames = [...new Set(issues.map((i) => i.status?.name).filter(Boolean))] as string[];
     let columns: { name: string; statusNames: string[] }[] = [];
 
     const effectiveBoardId = boardId ?? (spaceKey ? (await getJiraBoards(accessToken, cloudIdToUse, spaceKey))[0]?.id : undefined);
+    const projectKeyForStatuses = projectKey || spaceKey || issues[0]?.project?.key;
+
     if (effectiveBoardId) {
-      const [config, statusMap] = await Promise.all([
-        getBoardConfiguration(accessToken, cloudIdToUse, effectiveBoardId),
-        getJiraStatuses(accessToken, cloudIdToUse),
-      ]);
-      columns = (config.columns || []).map((col) => {
-        const statusNames = (col.statuses || [])
-          .map((s) => statusMap[s.id] ?? s.id)
-          .filter(Boolean);
-        return {
-          name: col.name ?? '',
-          statusNames: statusNames.length > 0 ? statusNames : [col.name ?? ''],
-        };
-      });
+      try {
+        const [config, statusMap] = await Promise.all([
+          getBoardConfiguration(accessToken, cloudIdToUse, effectiveBoardId),
+          getJiraStatuses(accessToken, cloudIdToUse),
+        ]);
+        columns = (config.columns || []).map((col) => {
+          const statusNames = (col.statuses || [])
+            .map((s) => statusMap[s.id] ?? s.id)
+            .filter(Boolean);
+          return {
+            name: col.name ?? '',
+            statusNames: statusNames.length > 0 ? statusNames : [col.name ?? ''],
+          };
+        });
+      } catch {
+        // Board config requires admin scope; fallback to project statuses
+      }
+    }
+
+    // If no columns from board config (401/empty), use project statuses so empty columns appear
+    if (columns.length === 0 && projectKeyForStatuses) {
+      const projectStatusNames = await getProjectStatuses(accessToken, cloudIdToUse, projectKeyForStatuses);
+      for (const name of projectStatusNames) {
+        columns.push({ name, statusNames: [name] });
+      }
     }
 
     const statusNamesInColumns = new Set(columns.flatMap((c) => c.statusNames));
