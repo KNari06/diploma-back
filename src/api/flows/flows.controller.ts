@@ -3,13 +3,14 @@
  * API endpoints for test flows CRUD
  */
 
-import { FlowService } from '@/services/testing/flows/flow.service';
-import { DefaultSuiteService } from '@/services/testing/regression/default-suite.service';
-import { ModuleService } from '@/services/testing/modules/module.service';
 import { supabaseAdmin } from '@/db/supabase';
+import { FlowService } from '@/services/testing/flows/flow.service';
+import { ModuleService } from '@/services/testing/modules/module.service';
+import { DefaultSuiteService } from '@/services/testing/regression/default-suite.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type { PlatformKey } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { sanitizeUrl } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
 
 interface AuthenticatedRequest extends Request {
@@ -29,7 +30,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { suiteId, moduleId, name, description, flowType, tags, priority, preconditions, expectedResult } = req.body;
+    const { suiteId, moduleId, name, description, flowType, tags, priority, preconditions, expectedResult, baseUrl } = req.body;
 
     // Validate: either suiteId or moduleId required (but not both)
     if (!suiteId && !moduleId) {
@@ -61,7 +62,7 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
         res.status(404).json({ success: false, error: 'Module not found' });
         return;
       }
-      
+
       platformKey = module.platformKey;
       projectId = module.projectId;
 
@@ -89,9 +90,22 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     // Create initial test case if moduleId was provided
     // UI test cases are now created in intent_test_cases (unified table)
     let createdTestCaseId: string | undefined;
-    
+
     if (moduleId && platformKey && projectId) {
       if (platformKey === 'web_ui') {
+        // Sanitize baseUrl if provided
+        let sanitizedBaseUrl: string | null = null;
+        if (baseUrl && typeof baseUrl === 'string' && baseUrl.trim()) {
+          try {
+            sanitizedBaseUrl = sanitizeUrl(baseUrl);
+          } catch (error) {
+            logger.warn('[FLOWS_API] Invalid baseUrl provided, skipping URL fields', {
+              baseUrl,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+
         // Create empty UI test case in intent_test_cases (unified table)
         const { data: testCase, error: testCaseError } = await supabaseAdmin
           .from('intent_test_cases')
@@ -100,6 +114,9 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
             user_id: userId,
             name: name, // Use flow name as default
             flow_id: flow.id,
+            // URL fields (from baseUrl if provided)
+            start_url: sanitizedBaseUrl,
+            url: sanitizedBaseUrl,
             // Lifecycle/classification
             status: 'draft',
             kind: 'regression_member',
@@ -130,6 +147,7 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
           logger.info('[FLOWS_API] Created initial intent test case', {
             testCaseId: createdTestCaseId,
             flowId: flow.id,
+            hasBaseUrl: !!sanitizedBaseUrl,
           });
         }
       } else {
