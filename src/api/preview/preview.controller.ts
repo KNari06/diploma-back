@@ -162,6 +162,17 @@ export async function createIntentTestCase(req: Request, res: Response): Promise
 
     const { projectId, name, description, startUrl, steps, flowId } = req.body;
 
+    logger.info('[PREVIEW_CONTROLLER] Creating intent test case', {
+      userId,
+      projectId,
+      hasName: name !== undefined,
+      hasDescription: description !== undefined,
+      hasStartUrl: startUrl !== undefined,
+      hasSteps: steps !== undefined,
+      stepsCount: Array.isArray(steps) ? steps.length : undefined,
+      flowId: flowId || null,
+    });
+
     if (!projectId || !name) {
       res.status(400).json({ error: 'Missing required fields: projectId, name' });
       return;
@@ -192,6 +203,10 @@ export async function createIntentTestCase(req: Request, res: Response): Promise
     res.status(201).json({
       success: true,
       data: testCase,
+      // Compatibility fields for clients that expect id at top-level
+      // (some frontends unwrap Axios response differently)
+      id: testCase.id,
+      intentTestCaseId: testCase.id,
     });
   } catch (error) {
     logger.error('[PREVIEW_CONTROLLER] Failed to create intent test case', {
@@ -304,6 +319,23 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     const { id } = req.params;
     const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority } = req.body;
 
+    logger.info('[PREVIEW_CONTROLLER] Updating intent test case', {
+      intentTestCaseId: id,
+      userId,
+      fieldsProvided: {
+        name: name !== undefined,
+        description: description !== undefined,
+        startUrl: startUrl !== undefined,
+        url: url !== undefined,
+        steps: steps !== undefined,
+        flowId: flowId !== undefined,
+        status: status !== undefined,
+        kind: kind !== undefined,
+        tags: tags !== undefined,
+        priority: priority !== undefined,
+      },
+    });
+
     // Get existing test case to get projectId for validation
     const existingTestCase = await IntentTestCaseService.getById(id, userId);
     if (!existingTestCase) {
@@ -401,9 +433,19 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       priority: priority !== undefined && priority !== null ? (String(priority) as any) : undefined,
     });
 
+    logger.info('[PREVIEW_CONTROLLER] Successfully updated intent test case', {
+      intentTestCaseId: id,
+      updatedFields: Object.keys({
+        name, description, startUrl, url, steps, flowId, status, kind, tags, priority
+      }).filter(k => (req.body as any)[k] !== undefined),
+    });
+
     res.json({
       success: true,
       data: testCase,
+      // Compatibility fields for clients that expect id at top-level
+      id: testCase.id,
+      intentTestCaseId: testCase.id,
     });
   } catch (error) {
     logger.error('[PREVIEW_CONTROLLER] Failed to update intent test case', {
