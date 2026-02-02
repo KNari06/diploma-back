@@ -135,39 +135,69 @@ export class PreviewSessionService {
   /**
    * Helper to safely close browser resources
    * Guarantees cleanup even if errors occur
+   * Includes 10s timeout per resource to prevent infinite hangs
    */
   private async safeCloseBrowserResources(
     browser?: Browser,
     context?: BrowserContext,
     page?: Page
   ): Promise<void> {
+    const CLOSE_TIMEOUT_MS = 10000; // 10 seconds per resource
+    const getBrowserPid = (b?: Browser): number | undefined => {
+      try {
+        const proc = (b as any)?.process?.();
+        return proc?.pid;
+      } catch {
+        return undefined;
+      }
+    };
+
+    /**
+     * Helper: wrap close operation with timeout
+     */
+    const closeWithTimeout = async (
+      closePromise: Promise<void>,
+      resourceName: string,
+      resourceId?: number
+    ): Promise<void> => {
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`${resourceName} close timeout (${CLOSE_TIMEOUT_MS}ms)`)), CLOSE_TIMEOUT_MS)
+      );
+
+      try {
+        await Promise.race([closePromise, timeoutPromise]);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const isTimeout = errorMessage.includes('timeout');
+
+        if (isTimeout) {
+          logger.warn(`[PREVIEW_SESSION] ${resourceName} close timeout, may need force kill`, {
+            timeout: CLOSE_TIMEOUT_MS,
+            pid: resourceId,
+          });
+        } else if (!isBenignAlreadyClosedError(error)) {
+          logger.warn(`[PREVIEW_SESSION] Error closing ${resourceName}`, {
+            error: formatPlaywrightCloseError(error),
+          });
+        }
+
+        // Don't throw - we want to try closing other resources
+      }
+    };
+
     const closePromises: Promise<void>[] = [];
 
     if (page) {
-      closePromises.push(page.close().catch((error) => {
-        const level = isBenignAlreadyClosedError(error) ? 'debug' : 'warn';
-        logger[level]('[PREVIEW_SESSION] Error closing page', {
-          error: formatPlaywrightCloseError(error),
-        });
-      }));
+      closePromises.push(closeWithTimeout(page.close(), 'page'));
     }
 
     if (context) {
-      closePromises.push(context.close().catch((error) => {
-        const level = isBenignAlreadyClosedError(error) ? 'debug' : 'warn';
-        logger[level]('[PREVIEW_SESSION] Error closing context', {
-          error: formatPlaywrightCloseError(error),
-        });
-      }));
+      closePromises.push(closeWithTimeout(context.close(), 'context'));
     }
 
     if (browser) {
-      closePromises.push(browser.close().catch((error) => {
-        const level = isBenignAlreadyClosedError(error) ? 'debug' : 'warn';
-        logger[level]('[PREVIEW_SESSION] Error closing browser', {
-          error: formatPlaywrightCloseError(error),
-        });
-      }));
+      const browserPid = getBrowserPid(browser);
+      closePromises.push(closeWithTimeout(browser.close(), 'browser', browserPid));
     }
 
     await Promise.all(closePromises);
@@ -203,7 +233,7 @@ export class PreviewSessionService {
       const existingSessionId = this.userToSession.get(userId);
       if (existingSessionId) {
         try {
-          await this.stopSession(existingSessionId);
+          await this.stopSessionInternal(existingSessionId);
         } catch (stopError) {
           // Log but don't fail - we still want to create new session
           logger.warn('[PREVIEW_SESSION] Error stopping existing session, continuing', {
@@ -484,6 +514,52 @@ export class PreviewSessionService {
     } finally {
       releaseLock();
     }
+  }
+
+  /**
+   * Stop a preview session (internal, without lock)
+   * IMPORTANT: Only call this when lock is already acquired (e.g., inside startSession)
+   * For external calls, use stopSession() which acquires lock
+   */
+  private async stopSessionInternal(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return; // Idempotent: already deleted
+    }
+
+    logger.info('[PREVIEW_SESSION] Stopping session (internal)', { sessionId, userId: session.userId });
+
+    try {
+      // Safe cleanup of browser resources
+      await this.safeCloseBrowserResources(session.browser, session.context, session.page);
+
+      // Fallback force-kill if browser process still alive
+      const browserProcess = (session.browser as any)?.process?.();
+      if (browserProcess && browserProcess.pid) {
+        try {
+          // Check if process is still alive
+          process.kill(browserProcess.pid, 0); // Signal 0 checks existence without killing
+          logger.warn('[PREVIEW_SESSION] Browser process still alive after close, force killing', {
+            sessionId,
+            pid: browserProcess.pid,
+          });
+          process.kill(browserProcess.pid, 'SIGKILL');
+        } catch (error) {
+          // Process already dead or not accessible - this is fine
+        }
+      }
+    } catch (error) {
+      logger.error('[PREVIEW_SESSION] Error during stopSessionInternal', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // Remove from maps atomically (even if cleanup failed)
+    this.sessions.delete(sessionId);
+    this.userToSession.delete(session.userId);
+
+    logger.info('[PREVIEW_SESSION] Session stopped (internal)', { sessionId });
   }
 
   /**
