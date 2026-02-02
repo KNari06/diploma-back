@@ -40,6 +40,10 @@ const router = Router();
  *       Create a new test flow. You can either:
  *       - Provide `suiteId` to create flow under existing suite
  *       - Provide `moduleId` to auto-create/resolve Default suite and create 1 initial test case
+ *
+ *       When `moduleId` is provided with `baseUrl`, the baseUrl is stored as `startUrl`
+ *       and `url` in the auto-created intent test case, enabling the editor to reopen
+ *       the test case even when it has no steps yet.
  *     tags: [Flows]
  *     security:
  *       - bearerAuth: []
@@ -70,6 +74,13 @@ const router = Router();
  *                 type: string
  *                 enum: [ui, api, mixed]
  *                 description: Flow type (defaults to ui)
+ *               baseUrl:
+ *                 type: string
+ *                 format: uri
+ *                 description: |
+ *                   Optional base URL for the test case (when moduleId is provided for web_ui platform).
+ *                   Will be stored as startUrl and url in the auto-created intent test case.
+ *                   Example: https://example.com/login
  *               tags:
  *                 type: array
  *                 items:

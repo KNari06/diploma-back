@@ -12,18 +12,76 @@ import { IntentStepLintService } from './intent-step-lint.service';
 import { LocatorPlanBuilder } from './locator-plan-builder.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type {
+    BindingHints,
+    ConfidenceTier,
     IntentStep,
     InteractiveNode,
     LintCandidate,
+    ResolutionMeta,
 } from './preview.types';
 
 // Max attempts to try different candidates
 const MAX_ATTEMPTS = 3;
+
+/**
+ * V2: Build bindingHints from resolved InteractiveNode
+ * Auto-populates hints for better runtime resolution
+ */
+function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
+  const hints: BindingHints = {};
+
+  if (node.role) hints.role = node.role;
+  if (node.labelText) hints.label = node.labelText;
+  if (node.placeholder) hints.placeholder = node.placeholder;
+  if (node.autocomplete) hints.autocomplete = node.autocomplete;
+  if (node.inputType || node.type) hints.type = node.inputType || node.type;
+  
+  // Add nearby text from container titles
+  if (node.containerTitles && node.containerTitles.length > 0) {
+    hints.nearText = node.containerTitles[0];
+  }
+
+  return hints;
+}
 const ACTION_TIMEOUT = 10000; // 10 seconds
 const POST_ACTION_SETTLE_TIMEOUT = 5000; // 5 seconds
 
 // V2: Action types that support state verification
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'fill', 'click']);
+
+/**
+ * Generate a random integer in range [min, max] (inclusive).
+ */
+function randomIntInclusive(min: number, max: number): number {
+  const lo = Math.ceil(min);
+  const hi = Math.floor(max);
+  if (hi <= lo) return lo;
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+/**
+ * Best-effort: sleep for ms using Playwright timers.
+ * (We use this for "human-like" micro-pauses only.)
+ */
+async function sleepMs(page: Page, ms: number): Promise<void> {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  await page.waitForTimeout(ms);
+}
+
+/**
+ * With probability `chance` (0..1), wait a random duration within [minMs, maxMs].
+ */
+async function maybeRandomPause(
+  page: Page,
+  chance: number,
+  minMs: number,
+  maxMs: number
+): Promise<void> {
+  if (!Number.isFinite(chance) || chance <= 0) return;
+  if (Math.random() > Math.min(1, chance)) return;
+  const ms = randomIntInclusive(minMs, maxMs);
+  await sleepMs(page, ms);
+}
 
 /**
  * Result of step application (V2: enhanced)
@@ -185,15 +243,39 @@ async function executeAction(
     switch (step.type) {
       case 'fill': {
         if (!locator) throw new Error('No selector for fill action');
-        const value = step.value || '';
-        if (step.options?.replaceContent === false) {
+        const value = (step.value || '').trim();
+        const humanLike = step.options?.humanLike === true;
+
+        // Human-like typing: gradual per-character input (instead of instant fill).
+        // - If replaceContent is false: append by typing
+        // - Else: clear first (fast), then type gradually
+        if (humanLike) {
+          // Focus the input first (real user behavior)
           await locator.click({ timeout });
-          // Use keyPressDelay if specified
-          await locator.pressSequentially(value, {
-            timeout,
-            delay: step.options?.keyPressDelay,
-          });
+
+          // If we want to "replace", clear existing content before typing.
+          // We clear quickly, then type gradually for the human-like effect.
+          if (step.options?.replaceContent !== false) {
+            await locator.fill('', { timeout });
+          }
+
+          // Delay between keystrokes:
+          // - If explicitly set, respect it
+          // - Else choose a realistic random delay in [50..150] ms
+          const delay = Number.isFinite(step.options?.keyPressDelay)
+            ? Math.max(0, step.options!.keyPressDelay!)
+            : randomIntInclusive(50, 150);
+
+          await locator.pressSequentially(value, { timeout, delay });
+
+          // Sometimes pause after typing (e.g., user thinking / UI debounce)
+          await maybeRandomPause(page, 0.35, 80, 220);
+        } else if (step.options?.replaceContent === false) {
+          // Legacy behavior: append typing (uses keyPressDelay if provided)
+          await locator.click({ timeout });
+          await locator.pressSequentially(value, { timeout, delay: step.options?.keyPressDelay });
         } else {
+          // Default: fast fill
           await locator.fill(value, { timeout });
         }
         if (step.options?.pressEnter) {
@@ -204,6 +286,27 @@ async function executeAction(
 
       case 'click': {
         if (!locator) throw new Error('No selector for click action');
+        const humanLike = step.options?.humanLike === true;
+
+        if (humanLike) {
+          // Human-like click: hover -> small pause -> click
+          await locator.hover({ timeout });
+          await sleepMs(page, randomIntInclusive(40, 160));
+
+          // Sometimes click at a random point inside the element (reduces "robotic" center-click pattern)
+          const usePosition = Math.random() < 0.3;
+          if (usePosition) {
+            const box = await locator.boundingBox().catch(() => null);
+            if (box && box.width > 6 && box.height > 6) {
+              // Position is relative to the element's top-left in Playwright
+              const x = randomIntInclusive(3, Math.floor(box.width) - 3);
+              const y = randomIntInclusive(3, Math.floor(box.height) - 3);
+              await locator.click({ timeout, position: { x, y } });
+              break;
+            }
+          }
+        }
+
         await locator.click({ timeout });
         break;
       }
@@ -438,13 +541,28 @@ export class PreviewStepApplyService {
             });
           }
 
-          // Update step evidence
+          // Build resolution meta for user-confirmed selection
+          const resolutionMeta: ResolutionMeta = {
+            allowedCount: 1,
+            usedRules: ['user_confirmed'],
+            usedEmbeddings: false,
+            confidenceTier: 'high' as ConfidenceTier,
+          };
+
+          // V2: Auto-populate bindingHints from resolved node
+          const enrichedBindingHints = resolvedNode 
+            ? { ...stepDraft.bindingHints, ...buildBindingHintsFromNode(resolvedNode) }
+            : stepDraft.bindingHints;
+
+          // Update step evidence with resolutionMeta and enriched bindingHints
           const updatedStep: IntentStep = {
             ...stepDraft,
+            bindingHints: enrichedBindingHints,
             evidence: {
               ...stepDraft.evidence,
               lastSuccessRef: selectedRef,
               confidence: 1.0,
+              resolutionMeta,
             },
             compiled, // NEW: compiled execution plan
           };
@@ -548,18 +666,26 @@ export class PreviewStepApplyService {
           }
 
           // V3: Generate compiled plan from resolved node
+          // Include pageSignature from session for staleness detection
           let compiled;
+          let pageSignature: string | undefined;
           if (candidate.node) {
             try {
+              // Get pageSignature from session if available
+              const session = sessionService.getSession(previewSessionId);
+              pageSignature = session?.lastPageSignature;
+
               compiled = LocatorPlanBuilder.buildCompiledPlan({
                 step: stepDraft,
                 resolvedNode: candidate.node,
                 pageUrl: page.url(),
                 pageTitle: await page.title().catch(() => undefined),
+                pageSignature,
               });
               logger.debug('[PREVIEW_APPLY] Compiled plan generated', {
                 stepId: stepDraft.id,
                 locatorCount: compiled.locatorPlan.length,
+                hasPageSignature: !!pageSignature,
               });
             } catch (compileError) {
               logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan', {
@@ -568,13 +694,34 @@ export class PreviewStepApplyService {
             }
           }
 
-          // Update step evidence
+          // Build resolution meta from lint result
+          // Determine confidence tier based on candidate confidence
+          const confidenceTier: ConfidenceTier = 
+            candidate.confidence >= 0.85 ? 'high' :
+            candidate.confidence >= 0.6 ? 'medium' : 'low';
+
+          const resolutionMeta: ResolutionMeta = {
+            allowedCount: lintResult.candidates.length,
+            usedRules: [], // TODO: Populate from embeddings resolver if available
+            usedEmbeddings: !lintResult.degradedMode,
+            confidenceTier,
+            topSimilarity: lintResult.topSimilarity,
+          };
+
+          // V2: Auto-populate bindingHints from resolved node
+          const enrichedBindingHints = candidate.node 
+            ? { ...stepDraft.bindingHints, ...buildBindingHintsFromNode(candidate.node) }
+            : stepDraft.bindingHints;
+
+          // Update step evidence with resolutionMeta and enriched bindingHints
           const updatedStep: IntentStep = {
             ...stepDraft,
+            bindingHints: enrichedBindingHints,
             evidence: {
               ...stepDraft.evidence,
               lastSuccessRef: candidate.ref,
               confidence: candidate.confidence,
+              resolutionMeta,
             },
             compiled, // NEW: compiled execution plan
           };

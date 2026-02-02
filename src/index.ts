@@ -134,7 +134,8 @@ const getCorsOrigins = (): boolean | string[] => {
 app.use(cors({
   origin: getCorsOrigins(),
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  // Include HEAD for common browser/proxy behavior. Keep TRACE/CONNECT disabled for security.
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID'],
 }));
 
@@ -165,7 +166,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     res.status = function (code: number) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
       return originalStatus.call(this, code);
     };
@@ -174,7 +175,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     res.json = function (body: any) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
       return originalJson.call(this, body);
     };
@@ -183,7 +184,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     res.send = function (body?: any) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
       return originalSend.call(this, body);
     };
@@ -1134,7 +1135,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
   if (origin && isOriginAllowed(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
   }
 
@@ -1297,7 +1298,7 @@ const startServer = async () => {
       if (origin && isOriginAllowed(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
       }
       res.status(503).json({

@@ -483,9 +483,9 @@ export class RegressionPlanService {
       moduleId = suite?.module_id;
     }
 
-    // Get UI test cases
+    // Get UI test cases from intent_test_cases (unified table)
     const { data: uiCases } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('id, name')
       .eq('flow_id', flowId);
 
@@ -527,7 +527,8 @@ export class RegressionPlanService {
     testCaseId: string,
     testType: 'ui' | 'api'
   ): Promise<ExpandedTestCase | null> {
-    const table = testType === 'ui' ? 'saved_test_cases' : 'api_test_configs';
+    // UI test cases now in intent_test_cases (unified table)
+    const table = testType === 'ui' ? 'intent_test_cases' : 'api_test_configs';
 
     const { data } = await supabaseAdmin
       .from(table)

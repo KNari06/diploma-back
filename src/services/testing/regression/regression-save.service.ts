@@ -8,7 +8,7 @@ import { logger } from '@/utils/core/logger';
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * Extracts replay data from completed tests and creates:
- * - Saved test cases (individual tests for replay)
+ * - Intent test cases (unified table for UI test cases)
  * - Regression suites (collections of related test cases)
  *
  * Key Features:
@@ -16,6 +16,9 @@ import { logger } from '@/utils/core/logger';
  * - Support for commands-based and graph-based replay strategies
  * - URL persistence for reliable replay
  * - Access control verification
+ *
+ * NOTE: UI test cases are now stored in intent_test_cases (unified table)
+ * with status='published' when saved from a completed test.
  */
 
 // Limits to prevent resource abuse
@@ -86,9 +89,10 @@ export class RegressionSaveService {
         );
       }
 
-      // 6. Create saved test case
+      // 6. Create intent test case (unified table) with status='published'
+      // Saving from a completed test means it's ready for regression runs.
       const { data: savedCase, error } = await supabaseAdmin
-        .from('saved_test_cases')
+        .from('intent_test_cases')
         .insert({
           project_id: test.project_id,
           user_id: userId,
@@ -96,12 +100,19 @@ export class RegressionSaveService {
           source_intelligent_session_id: session?.id || null,
           name,
           description: description || null,
+          // Lifecycle: saved from test = published
+          status: 'published',
           kind,
+          // Replay data
           replay_strategy: replayData.strategy,
           commands: replayData.commands || null,
           graph_ref: replayData.graphRef || null,
           parameters_schema: replayData.parametersSchema || null,
-          url: test.url || null, // Persist URL for replay safety
+          // URL fields
+          url: test.url || null,
+          start_url: test.url || null,
+          // Empty steps_json (commands are the source of truth for replay)
+          steps_json: [],
         })
         .select('id')
         .single();
@@ -110,14 +121,15 @@ export class RegressionSaveService {
         throw new Error(`Failed to save test case: ${error?.message}`);
       }
 
-      logger.info('[REGRESSION_SAVE] Test case saved successfully', {
-        savedTestCaseId: savedCase.id,
+      logger.info('[REGRESSION_SAVE] Intent test case saved successfully', {
+        intentTestCaseId: savedCase.id,
         projectId: test.project_id,
         strategy: replayData.strategy,
+        status: 'published',
       });
 
       return {
-        savedTestCaseId: savedCase.id,
+        savedTestCaseId: savedCase.id, // Keep same return field name for API compatibility
         projectId: test.project_id,
         replayStrategy: replayData.strategy,
         parametersCount: Object.keys(replayData.parametersSchema || {}).length,
@@ -130,12 +142,13 @@ export class RegressionSaveService {
 
   /**
    * Create a regression suite with multiple test cases
+   * Test case IDs now refer to intent_test_cases (unified table).
    *
    * @param params.projectId - Project ID for the suite
    * @param params.userId - User ID for ownership verification
    * @param params.name - Display name for the suite
    * @param params.description - Optional description
-   * @param params.testCaseIds - Array of saved test case IDs to include (must be pre-saved)
+   * @param params.testCaseIds - Array of intent_test_cases IDs to include
    * @returns Suite metadata
    * @throws {NotFoundError} If project not found
    * @throws {ValidationError} If access denied or validation fails
@@ -145,7 +158,7 @@ export class RegressionSaveService {
     userId: string;
     name: string;
     description?: string;
-    testCaseIds: string[]; // Already saved test case IDs
+    testCaseIds: string[]; // intent_test_cases IDs
   }): Promise<{ suiteId: string }> {
     const { projectId, userId, name, description, testCaseIds } = params;
 
@@ -183,10 +196,10 @@ export class RegressionSaveService {
         throw new Error(`Failed to create suite: ${suiteError?.message}`);
       }
 
-      // Add test cases to suite
+      // Add test cases to suite (now uses intent_test_case_id)
       const items = testCaseIds.map((caseId, index) => ({
         suite_id: suite.id,
-        saved_test_case_id: caseId,
+        intent_test_case_id: caseId,
         order_index: index + 1,
       }));
 

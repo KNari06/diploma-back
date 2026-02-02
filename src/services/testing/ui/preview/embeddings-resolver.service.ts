@@ -1,7 +1,15 @@
 /**
- * Embeddings Resolver Service V2
+ * Embeddings Resolver Service V3
  * Language-agnostic element resolution using multilingual embeddings
- * Primary resolver for step editor with 4-branch decision policy
+ * 
+ * Architecture (V3):
+ * 1. Build HardAllowed/SoftAllowed sets via deterministic rules
+ * 2. Apply contextual deterministic rules (label/aria/autocomplete)
+ * 3. Embeddings only SORT allowed candidates (never decide status)
+ * 4. Status decision based on allowed count:
+ *    - 0 allowed → AI fallback
+ *    - 1 allowed → resolved
+ *    - >1 allowed → needs_clarification (unless rule short-circuit)
  */
 
 import { generateEmbedding, generateEmbeddings } from '@/services/ai/core/embedding.service';
@@ -41,32 +49,12 @@ const CIRCUIT_BREAKER_COOLDOWN_MS = 30000;
 /** Cache TTL (milliseconds) - same as session TTL */
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
-/**
- * Per-action thresholds for decision policy
- * T_resolve: minimum similarity to consider resolved
- * T_min: minimum similarity to consider valid candidate
- * T_delta: minimum gap between top and second to be confident
- */
-const ACTION_THRESHOLDS: Record<string, { resolve: number; min: number; delta: number }> = {
-  fill: { resolve: 0.40, min: 0.25, delta: 0.08 },
-  click: { resolve: 0.35, min: 0.20, delta: 0.06 },
-  select: { resolve: 0.40, min: 0.25, delta: 0.08 },
-  check: { resolve: 0.45, min: 0.30, delta: 0.10 },
-  uncheck: { resolve: 0.45, min: 0.30, delta: 0.10 },
-  toggle: { resolve: 0.40, min: 0.25, delta: 0.08 },
-  open: { resolve: 0.40, min: 0.25, delta: 0.08 },
-  close: { resolve: 0.40, min: 0.25, delta: 0.08 },
-  hover: { resolve: 0.35, min: 0.20, delta: 0.06 },
-  scroll: { resolve: 0.35, min: 0.20, delta: 0.06 },
-  press: { resolve: 0.35, min: 0.20, delta: 0.06 },
-  assert: { resolve: 0.35, min: 0.20, delta: 0.06 },
-  // Default for unknown actions
-  default: { resolve: 0.35, min: 0.20, delta: 0.06 },
-};
+/** Minimum semantic similarity to consider a match valid (for semantic-zero check) */
+const SEMANTIC_MIN_THRESHOLD = 0.25;
 
 /**
- * Action type to expected element tags mapping
- * Used for structural post-filter
+ * Action type to expected element tags mapping (HardAllowed filter)
+ * Elements not in this list are excluded for the action
  */
 const ACTION_TO_TAGS: Record<string, string[]> = {
   fill: ['input', 'textarea'],
@@ -92,6 +80,450 @@ const STATE_AWARE_ACTIONS: Record<string, { requiredState: string; field: keyof 
   open: { requiredState: 'closed', field: 'ariaExpanded' },
   close: { requiredState: 'open', field: 'ariaExpanded' },
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3: RULE TRACE TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Rule trace entry for debugging and logging
+ * Records which rules were applied and their effects
+ */
+export interface RuleTraceEntry {
+  ruleId: string;
+  version: string;
+  action: 'exclude' | 'boost' | 'penalize' | 'shortcircuit';
+  evidence: string;
+  affectedRefs: string[];
+}
+
+/**
+ * Allowed set classification result
+ */
+export interface AllowedSetResult {
+  /** Elements that pass all hard rules */
+  hardAllowed: InteractiveNode[];
+  /** Elements that pass hard rules but have soft penalties */
+  softAllowed: InteractiveNode[];
+  /** Rule trace for debugging */
+  ruleTrace: RuleTraceEntry[];
+  /** If true, a single element matched exactly (short-circuit to resolved) */
+  shortCircuitRef?: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3: DETERMINISTIC CONTEXT RULES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Password-related keywords for intent detection
+ */
+const PASSWORD_KEYWORDS = ['password', 'пароль', 'şifre', 'mot de passe', 'contraseña', 'passwort'];
+
+/**
+ * Username-related keywords for intent detection
+ */
+const USERNAME_KEYWORDS = ['username', 'логин', 'пользователь', 'user', 'login', 'email', 'почта', 'e-mail'];
+
+/**
+ * Check if intent text contains password-related keywords
+ */
+function isPasswordIntent(intentText: string): boolean {
+  const lower = intentText.toLowerCase();
+  return PASSWORD_KEYWORDS.some(kw => lower.includes(kw));
+}
+
+/**
+ * Check if node is a password field
+ */
+function isPasswordField(node: InteractiveNode): boolean {
+  if (node.type === 'password' || node.inputType === 'password') return true;
+  if (node.autocomplete?.includes('password')) return true;
+  const labelLower = (node.labelText || node.ariaLabel || node.placeholder || '').toLowerCase();
+  return PASSWORD_KEYWORDS.some(kw => labelLower.includes(kw));
+}
+
+/**
+ * Check if node is a username/email field
+ */
+function isUsernameField(node: InteractiveNode): boolean {
+  if (node.type === 'email' || node.inputType === 'email') return true;
+  if (node.autocomplete === 'username' || node.autocomplete === 'email') return true;
+  const labelLower = (node.labelText || node.ariaLabel || node.placeholder || '').toLowerCase();
+  return USERNAME_KEYWORDS.some(kw => labelLower.includes(kw));
+}
+
+/**
+ * Fill action should only target editable text-like inputs.
+ * Excludes input types that are not textual (checkbox, radio, submit, etc.).
+ */
+function isFillCompatibleTextField(node: InteractiveNode): boolean {
+  if (node.tag === 'textarea') return true;
+
+  if (node.tag === 'input') {
+    const t = (node.type || node.inputType || 'text').toLowerCase();
+    const disallowed = new Set([
+      'button',
+      'submit',
+      'reset',
+      'image',
+      'checkbox',
+      'radio',
+      'file',
+      'range',
+      'color',
+      'date',
+      'datetime-local',
+      'month',
+      'week',
+      'time',
+      'hidden',
+    ]);
+    return !disallowed.has(t);
+  }
+
+  // Non-standard textbox components (best-effort support).
+  // Note: we don't have a dedicated `contenteditable` flag in InteractiveNode.
+  if (node.tag === 'div' && node.role === 'textbox') return true;
+
+  return false;
+}
+
+/**
+ * Extract a “searchable” text blob for deterministic lexical checks.
+ */
+function getNodeSearchText(node: InteractiveNode): string {
+  return [
+    node.labelText,
+    node.ariaLabel,
+    node.placeholder,
+    node.text,
+    node.name,
+    node.autocomplete,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+/**
+ * Check if node label/aria/placeholder contains exact quoted text from intent
+ * Supports: 'exact text' or "exact text" patterns
+ */
+function matchesExactQuotedText(node: InteractiveNode, intentText: string): boolean {
+  // Extract quoted strings from intent
+  const singleQuoteMatch = intentText.match(/'([^']+)'/);
+  const doubleQuoteMatch = intentText.match(/"([^"]+)"/);
+  const quotedText = singleQuoteMatch?.[1] || doubleQuoteMatch?.[1];
+  
+  if (!quotedText) return false;
+  
+  const quotedLower = quotedText.toLowerCase();
+  const nodeTexts = [
+    node.labelText,
+    node.ariaLabel,
+    node.placeholder,
+    node.text,
+    node.name,
+  ].filter(Boolean).map(t => t!.toLowerCase());
+  
+  return nodeTexts.some(t => t === quotedLower || t.includes(quotedLower));
+}
+
+/**
+ * Extract meaningful keywords from intent text
+ * Filters out common stop words and action words
+ */
+function extractIntentKeywords(intentText: string): string[] {
+  const stopWords = new Set([
+    'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'with', 'and', 'or',
+    'enter', 'fill', 'type', 'click', 'press', 'select', 'input', 'field',
+    'button', 'link', 'into', 'please', 'should', 'want', 'need', 'put',
+    'this', 'value', 'box', 'form', 'element',
+  ]);
+  
+  return intentText
+    .toLowerCase()
+    .replace(/[^a-zа-яё0-9\s]/gi, ' ')
+    .split(/\s+/)
+    .filter(word => word.length > 2 && !stopWords.has(word));
+}
+
+/**
+ * Build HardAllowed and SoftAllowed sets based on deterministic rules
+ * V3: Core function for element filtering before embeddings
+ */
+export function buildAllowedSets(
+  nodes: InteractiveNode[],
+  actionType: IntentActionType,
+  intentText: string
+): AllowedSetResult {
+  const hardAllowed: InteractiveNode[] = [];
+  const softAllowed: InteractiveNode[] = [];
+  const ruleTrace: RuleTraceEntry[] = [];
+  let shortCircuitRef: string | undefined;
+  
+  const intentIsPassword = isPasswordIntent(intentText);
+  const intentKeywords = extractIntentKeywords(intentText);
+  
+  // Track exact quote match candidates for potential short-circuit
+  const exactMatchRefs: string[] = [];
+  
+  for (const node of nodes) {
+    // Skip nodes without valid ref
+    if (!node.ref || node.ref.trim().length === 0) {
+      continue;
+    }
+    
+    let excluded = false;
+    let isSoft = false;
+    const nodeRules: RuleTraceEntry[] = [];
+    const isNonStandardTextbox = actionType === 'fill' && node.tag === 'div' && node.role === 'textbox';
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // HARD RULES: Exclude elements that are fundamentally incompatible
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    // Rule 1: Visibility check
+    if (node.isVisible === false) {
+      excluded = true;
+      nodeRules.push({
+        ruleId: 'visibility.hidden',
+        version: 'v1',
+        action: 'exclude',
+        evidence: 'isVisible=false',
+        affectedRefs: [node.ref],
+      });
+    }
+    
+    // Rule 2: Disabled check
+    if (!excluded && node.isDisabled) {
+      excluded = true;
+      nodeRules.push({
+        ruleId: 'state.disabled',
+        version: 'v1',
+        action: 'exclude',
+        evidence: 'isDisabled=true',
+        affectedRefs: [node.ref],
+      });
+    }
+    
+    // Rule 3: Readonly for writable actions
+    if (!excluded && WRITABLE_ACTIONS.has(actionType) && node.readOnly) {
+      excluded = true;
+      nodeRules.push({
+        ruleId: 'state.readonly',
+        version: 'v1',
+        action: 'exclude',
+        evidence: `readOnly=true for action=${actionType}`,
+        affectedRefs: [node.ref],
+      });
+    }
+
+    // Rule 3b: Fill must target text-like editable fields only
+    if (!excluded && actionType === 'fill' && !isFillCompatibleTextField(node)) {
+      excluded = true;
+      nodeRules.push({
+        ruleId: 'fill.incompatible_field_type',
+        version: 'v1',
+        action: 'exclude',
+        evidence: `tag=${node.tag}, type=${node.type || node.inputType || 'unknown'}`,
+        affectedRefs: [node.ref],
+      });
+    }
+    
+    // Rule 4: State-aware action checks
+    if (!excluded) {
+      const stateCheck = STATE_AWARE_ACTIONS[actionType];
+      if (stateCheck) {
+        const currentState = node[stateCheck.field];
+        if (currentState !== undefined) {
+          const isCorrectState =
+            (stateCheck.requiredState === 'unchecked' && currentState === false) ||
+            (stateCheck.requiredState === 'checked' && currentState === true) ||
+            (stateCheck.requiredState === 'closed' && currentState === false) ||
+            (stateCheck.requiredState === 'open' && currentState === true);
+          
+          if (!isCorrectState) {
+            excluded = true;
+            nodeRules.push({
+              ruleId: 'state.mismatch',
+              version: 'v1',
+              action: 'exclude',
+              evidence: `${stateCheck.field}=${currentState}, required=${stateCheck.requiredState}`,
+              affectedRefs: [node.ref],
+            });
+          }
+        }
+      }
+    }
+    
+    // Rule 5: Tag compatibility for action
+    if (!excluded) {
+      const allowedTags = ACTION_TO_TAGS[actionType];
+      if (allowedTags && allowedTags.length > 0) {
+        // Exception: allow non-standard textbox components for fill as SoftAllowed.
+        if (!allowedTags.includes(node.tag.toLowerCase()) && !isNonStandardTextbox) {
+          excluded = true;
+          nodeRules.push({
+            ruleId: 'tag.incompatible',
+            version: 'v1',
+            action: 'exclude',
+            evidence: `tag=${node.tag} not in [${allowedTags.join(',')}] for action=${actionType}`,
+            affectedRefs: [node.ref],
+          });
+        } else if (isNonStandardTextbox) {
+          isSoft = true;
+          nodeRules.push({
+            ruleId: 'structure.nonstandard_textbox',
+            version: 'v1',
+            action: 'penalize',
+            evidence: 'div with role=textbox allowed as soft candidate',
+            affectedRefs: [node.ref],
+          });
+        }
+      }
+    }
+    
+    // Rule 6: Password isolation (if intent is NOT password, exclude password fields)
+    if (!excluded && actionType === 'fill' && !intentIsPassword && isPasswordField(node)) {
+      excluded = true;
+      nodeRules.push({
+        ruleId: 'context.password_isolation',
+        version: 'v1',
+        action: 'exclude',
+        evidence: 'Intent does not mention password, node is password field',
+        affectedRefs: [node.ref],
+      });
+    }
+    
+    // Rule 7: Username isolation (if intent is password, exclude username fields)
+    if (!excluded && actionType === 'fill' && intentIsPassword && isUsernameField(node) && !isPasswordField(node)) {
+      excluded = true;
+      nodeRules.push({
+        ruleId: 'context.username_isolation',
+        version: 'v1',
+        action: 'exclude',
+        evidence: 'Intent mentions password, node is username/email field',
+        affectedRefs: [node.ref],
+      });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // SOFT RULES: Penalize but don't exclude
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    if (!excluded) {
+      // Soft Rule 1: Covered by overlay
+      if (node.isTopMostAtCenter === false) {
+        isSoft = true;
+        nodeRules.push({
+          ruleId: 'visibility.covered',
+          version: 'v1',
+          action: 'penalize',
+          evidence: 'isTopMostAtCenter=false',
+          affectedRefs: [node.ref],
+        });
+      }
+      
+      // Soft Rule 2: Dynamic ID (less reliable)
+      if (node.isDynamicId) {
+        isSoft = true;
+        nodeRules.push({
+          ruleId: 'stability.dynamic_id',
+          version: 'v1',
+          action: 'penalize',
+          evidence: 'isDynamicId=true',
+          affectedRefs: [node.ref],
+        });
+      }
+      
+      // Soft Rule 3: Non-standard role (e.g., div with role=textbox)
+      // Handled earlier (Rule 5 exception) to avoid being excluded by tag checks.
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // SHORT-CIRCUIT: Check for exact quoted text match
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    if (!excluded && matchesExactQuotedText(node, intentText)) {
+      exactMatchRefs.push(node.ref);
+      nodeRules.push({
+        ruleId: 'match.exact_quote',
+        version: 'v1',
+        action: 'shortcircuit',
+        evidence: 'Node matches quoted text in intent',
+        affectedRefs: [node.ref],
+      });
+    }
+    
+    // Add to appropriate set
+    if (!excluded) {
+      if (isSoft) {
+        softAllowed.push(node);
+      } else {
+        hardAllowed.push(node);
+      }
+    }
+    
+    // Add all rules for this node to trace
+    ruleTrace.push(...nodeRules);
+  }
+  
+  // If exactly one element matches quoted text, short-circuit to resolved
+  if (exactMatchRefs.length === 1) {
+    shortCircuitRef = exactMatchRefs[0];
+    ruleTrace.push({
+      ruleId: 'decision.shortcircuit',
+      version: 'v1',
+      action: 'shortcircuit',
+      evidence: `Single exact quote match: ${shortCircuitRef}`,
+      affectedRefs: [shortCircuitRef],
+    });
+  }
+
+  // Deterministic lexical short-circuit (label/aria/placeholder/name/autocomplete)
+  // If exactly one allowed element has strong lexical overlap with intent keywords,
+  // we can safely auto-resolve without using embeddings.
+  if (!shortCircuitRef && intentKeywords.length > 0) {
+    const allowedAll = [...hardAllowed, ...softAllowed];
+    const matchedRefs: string[] = [];
+
+    for (const node of allowedAll) {
+      if (!node.ref) continue;
+      const txt = getNodeSearchText(node);
+      const matchCount = intentKeywords.filter((kw) => txt.includes(kw)).length;
+      const ratio = matchCount / intentKeywords.length;
+
+      // “Strong enough” means at least one meaningful hit and decent ratio.
+      if (matchCount >= 1 && (ratio >= 0.6 || matchCount >= 2)) {
+        matchedRefs.push(node.ref);
+      }
+    }
+
+    if (matchedRefs.length === 1) {
+      shortCircuitRef = matchedRefs[0];
+      ruleTrace.push({
+        ruleId: 'decision.lexical_shortcircuit',
+        version: 'v1',
+        action: 'shortcircuit',
+        evidence: `Single strong lexical match for keywords=[${intentKeywords.join(', ')}]`,
+        affectedRefs: [shortCircuitRef],
+      });
+    }
+  }
+  
+  // Log rule trace summary
+  logger.debug('[EMBEDDINGS_RESOLVER] Built allowed sets', {
+    hardAllowedCount: hardAllowed.length,
+    softAllowedCount: softAllowed.length,
+    rulesApplied: ruleTrace.length,
+    shortCircuitRef,
+    intentKeywordCount: intentKeywords.length,
+  });
+  
+  return { hardAllowed, softAllowed, ruleTrace, shortCircuitRef };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // EMBEDDING CACHE
@@ -295,11 +727,13 @@ export function buildCandidateText(node: InteractiveNode): string {
  * @returns Sanitized intent text (max 500 chars)
  */
 export function sanitizeIntent(step: IntentStep): string {
-  let intent = step.description || '';
+  const description = (step.description || '').trim();
+  const value = (step.value || '').trim();
+  let intent = description;
 
   // Redact value if accidentally included in description
-  if (step.value && step.value.length > 0) {
-    intent = intent.replace(new RegExp(escapeRegex(step.value), 'gi'), '[VALUE]');
+  if (value.length > 0) {
+    intent = intent.replace(new RegExp(escapeRegex(value), 'gi'), '[VALUE]');
   }
 
   return intent.trim().slice(0, MAX_INTENT_TEXT_LENGTH);
@@ -313,7 +747,7 @@ function escapeRegex(str: string): string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// STRUCTURAL FILTERS
+// STRUCTURAL FILTERS (Legacy - kept for backward compatibility)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
@@ -328,6 +762,7 @@ interface FilterResult {
 /**
  * Apply structural filters to a candidate node
  * Language-agnostic checks for visibility, state, action compatibility
+ * NOTE: V3 uses buildAllowedSets() instead for more comprehensive filtering
  * @param node - Interactive node
  * @param actionType - Action being performed
  * @returns Filter result with reasons
@@ -378,18 +813,6 @@ export function applyStructuralFilters(
   }
 
   return { passed: true, hardReject: false };
-}
-
-/**
- * Check if candidate tag is compatible with action type
- * Used as structural post-filter
- */
-function isTagCompatibleWithAction(tag: string, actionType: IntentActionType): boolean {
-  const allowedTags = ACTION_TO_TAGS[actionType];
-  if (!allowedTags || allowedTags.length === 0) {
-    return true; // No restriction
-  }
-  return allowedTags.includes(tag.toLowerCase());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -484,7 +907,7 @@ async function rankCandidatesByEmbedding(params: {
     });
   }
   let cacheHit = false;
-  let candidateEmbeddings: number[][] = [];
+  const candidateEmbeddings: number[][] = new Array(candidates.length);
   const textsToEmbed: string[] = [];
   const indexMapping: number[] = []; // Maps textsToEmbed index to candidate index
 
@@ -552,11 +975,11 @@ async function rankCandidatesByEmbedding(params: {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DECISION POLICY
+// V3: DECISION POLICY (Count-based)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Decision result from 4-branch policy
+ * Decision result from count-based policy
  */
 interface DecisionResult {
   status: LintStatus;
@@ -565,21 +988,58 @@ interface DecisionResult {
   topSimilarity: number;
   similarityDelta: number;
   selectedCandidates: RankedCandidate[];
+  /** True if AI fallback is needed (0 allowed or semantic-zero) */
+  needsAiFallback?: boolean;
+  /** Reason for AI fallback */
+  aiFallbackReason?: string;
+  /** Rule trace from allowed set building */
+  ruleTrace?: RuleTraceEntry[];
 }
 
 /**
- * Apply 4-branch decision policy
- * @param ranked - Ranked candidates by similarity
- * @param actionType - Action type for threshold lookup
+ * V3: Apply count-based decision policy
+ * Decision is based on the NUMBER of allowed elements, not similarity scores:
+ * - 0 allowed → AI fallback (not_found with needsAiFallback=true)
+ * - 1 allowed → resolved
+ * - >1 allowed → needs_clarification (embeddings only sort, never decide)
+ * 
+ * Special case: semantic-zero
+ * If allowed > 0 but all have very low semantic match, trigger AI fallback
+ * 
+ * @param ranked - Candidates ranked by embedding similarity (already filtered to allowed set)
+ * @param allowedCount - Total count of allowed elements (hard + soft)
+ * @param shortCircuitRef - If set, single exact match was found (auto-resolve)
+ * @param ruleTrace - Rule trace for debugging
  * @returns Decision result
  */
 function applyDecisionPolicy(
   ranked: RankedCandidate[],
-  actionType: IntentActionType
+  allowedCount: number,
+  shortCircuitRef?: string,
+  ruleTrace?: RuleTraceEntry[]
 ): DecisionResult {
-  const thresholds = ACTION_THRESHOLDS[actionType] || ACTION_THRESHOLDS.default;
+  const topSim = ranked.length > 0 ? ranked[0].similarity : 0;
+  const secondSim = ranked.length > 1 ? ranked[1].similarity : 0;
+  const delta = topSim - secondSim;
+  
+  // Case 0: Short-circuit - exact quoted text match
+  if (shortCircuitRef && ranked.length > 0) {
+    const shortCircuitCandidate = ranked.find(r => r.node.ref === shortCircuitRef);
+    if (shortCircuitCandidate) {
+      return {
+        status: 'resolved',
+        message: 'Element found by exact match',
+        confidence: 1.0,
+        topSimilarity: shortCircuitCandidate.similarity,
+        similarityDelta: delta,
+        selectedCandidates: [shortCircuitCandidate],
+        ruleTrace,
+      };
+    }
+  }
 
-  if (ranked.length === 0) {
+  // Case 1: No allowed elements → AI fallback
+  if (allowedCount === 0) {
     return {
       status: 'not_found',
       message: 'No matching elements found on page',
@@ -587,91 +1047,53 @@ function applyDecisionPolicy(
       topSimilarity: 0,
       similarityDelta: 0,
       selectedCandidates: [],
+      needsAiFallback: true,
+      aiFallbackReason: 'zero_allowed',
+      ruleTrace,
     };
   }
 
-  const topSim = ranked[0].similarity;
-  const secondSim = ranked.length > 1 ? ranked[1].similarity : 0;
-  const delta = topSim - secondSim;
+  // Case 2: Exactly one allowed element → resolved
+  if (allowedCount === 1 && ranked.length > 0) {
+    return {
+      status: 'resolved',
+      message: 'Element found',
+      confidence: Math.max(topSim, 0.8), // High confidence when single match
+      topSimilarity: topSim,
+      similarityDelta: delta,
+      selectedCandidates: [ranked[0]],
+      ruleTrace,
+    };
+  }
 
-  // Calculate average similarity for relative threshold
-  const avgSim = ranked.reduce((sum, r) => sum + r.similarity, 0) / ranked.length;
-
-  // Branch 1: not_found - all similarities too low
-  if (topSim < thresholds.min) {
+  // Case 3: Multiple allowed elements
+  // Check for semantic-zero: allowed > 0 but all have very low semantic match
+  if (topSim < SEMANTIC_MIN_THRESHOLD) {
     return {
       status: 'not_found',
-      message: 'No elements match the description with sufficient confidence',
+      message: 'Found elements but none semantically match your description',
       confidence: topSim,
       topSimilarity: topSim,
       similarityDelta: delta,
-      selectedCandidates: [],
+      selectedCandidates: ranked.slice(0, 3),
+      needsAiFallback: true,
+      aiFallbackReason: 'semantic_zero',
+      ruleTrace,
     };
   }
 
-  // Branch 1b: not_found - relative threshold (top not significantly better than average)
-  if (topSim < 1.5 * avgSim && ranked.length > 3) {
-    return {
-      status: 'not_found',
-      message: 'Multiple elements match equally, but none stands out',
-      confidence: topSim,
-      topSimilarity: topSim,
-      similarityDelta: delta,
-      selectedCandidates: [],
-    };
-  }
-
-  // Check container diversity for top-3
+  // Case 4: Multiple allowed with good semantic match → needs_clarification
+  // Embeddings sorted them, but we don't auto-select
   const top3 = ranked.slice(0, 3);
-  const uniqueContainers = new Set(top3.map(r => r.node.containerRef || 'none'));
-  const containerDiverse = uniqueContainers.size >= 3;
-
-  // Branch 2: needs_clarification - ambiguous (multiple close candidates or container diversity)
-  if ((delta < thresholds.delta && ranked.length > 1) || containerDiverse) {
-    return {
-      status: 'needs_clarification',
-      message: containerDiverse
-        ? 'Found similar elements in different sections. Please specify which one.'
-        : 'Found multiple matching elements. Please clarify which one you mean.',
-      confidence: topSim,
-      topSimilarity: topSim,
-      similarityDelta: delta,
-      selectedCandidates: top3,
-    };
-  }
-
-  // Branch 3: resolved - single confident winner
-  if (topSim >= thresholds.resolve && delta >= thresholds.delta) {
-    return {
-      status: 'resolved',
-      message: 'Element found with high confidence',
-      confidence: topSim,
-      topSimilarity: topSim,
-      similarityDelta: delta,
-      selectedCandidates: [ranked[0]],
-    };
-  }
-
-  // Branch 3b: resolved with moderate confidence
-  if (topSim >= thresholds.min && delta >= thresholds.delta) {
-    return {
-      status: 'resolved',
-      message: 'Element found with moderate confidence',
-      confidence: topSim,
-      topSimilarity: topSim,
-      similarityDelta: delta,
-      selectedCandidates: [ranked[0]],
-    };
-  }
-
-  // Default: needs_clarification
+  
   return {
     status: 'needs_clarification',
-    message: 'Please select the correct element',
+    message: 'Found multiple matching elements',
     confidence: topSim,
     topSimilarity: topSim,
     similarityDelta: delta,
     selectedCandidates: top3,
+    ruleTrace,
   };
 }
 
@@ -680,26 +1102,37 @@ function applyDecisionPolicy(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Resolve step using embeddings-based matching
- * Primary resolver for multilingual step targeting
- *
+ * V3: Resolve step using embeddings-based matching with deterministic rules
+ * 
  * Pipeline:
- * 1. Snapshot + structural filters
- * 2. CandidateText builder
- * 3. Embeddings ranking (cached)
- * 4. Decision policy (4 branches)
+ * 1. Build HardAllowed/SoftAllowed sets via deterministic rules
+ * 2. Check for short-circuit (exact quoted match)
+ * 3. If allowed > 0, rank by embeddings
+ * 4. Apply count-based decision policy:
+ *    - 0 allowed → AI fallback
+ *    - 1 allowed → resolved
+ *    - >1 allowed → needs_clarification
  *
- * @returns LintResult with embeddings-specific metrics
+ * @returns LintResult with embeddings-specific metrics and rule trace
  */
 export async function resolveWithEmbeddings(params: {
   previewSessionId: string;
   stepDraft: IntentStep;
   domNodes: InteractiveNode[];
   pageUrl: string;
-  /** V5: When true, bypass embeddings cache */
+  /** When true, bypass embeddings cache */
   disableCaching?: boolean;
+  /** When true, include candidates in result (for Show Alternatives) */
+  includeAlternatives?: boolean;
 }): Promise<LintResult> {
-  const { previewSessionId, stepDraft, domNodes, pageUrl, disableCaching = false } = params;
+  const { 
+    previewSessionId, 
+    stepDraft, 
+    domNodes, 
+    pageUrl, 
+    disableCaching = false,
+    includeAlternatives = false,
+  } = params;
   const startTime = Date.now();
 
   logger.debug('[EMBEDDINGS_RESOLVER] Starting resolution', {
@@ -727,49 +1160,139 @@ export async function resolveWithEmbeddings(params: {
       confidence: 0,
       candidates: [],
       highlight: [],
+      needsAiFallback: true,
     };
   }
 
-  // Step 1: Apply structural filters
-  const filteredCandidates: Array<{ node: InteractiveNode; candidateText: string }> = [];
+  // Step 1: Prepare intent text
+  const intentText = sanitizeIntent(stepDraft);
 
-  for (const node of domNodes) {
-    // Must have valid ref
-    if (!node.ref || node.ref.trim().length === 0) {
-      continue;
+  // Step 2: Build HardAllowed/SoftAllowed sets via deterministic rules
+  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, intentText);
+  const { hardAllowed, softAllowed, ruleTrace, shortCircuitRef } = allowedResult;
+  
+  // Combine allowed sets (hardAllowed first, then softAllowed)
+  const allAllowed = [...hardAllowed, ...softAllowed];
+  const allowedCount = allAllowed.length;
+
+  logger.debug('[EMBEDDINGS_RESOLVER] Allowed sets built', {
+    previewSessionId,
+    hardAllowedCount: hardAllowed.length,
+    softAllowedCount: softAllowed.length,
+    totalAllowed: allowedCount,
+    shortCircuitRef,
+  });
+
+  // Step 3: Handle short-circuit case (exact quoted match)
+  if (shortCircuitRef) {
+    const shortCircuitNode = allAllowed.find(n => n.ref === shortCircuitRef);
+    if (shortCircuitNode) {
+      const lintCandidate: LintCandidate = {
+        ref: shortCircuitNode.ref,
+        label: shortCircuitNode.labelText || shortCircuitNode.ariaLabel || shortCircuitNode.text || shortCircuitNode.placeholder || `<${shortCircuitNode.tag}>`,
+        reason: 'Exact match',
+        confidence: 1.0,
+        boundingBox: shortCircuitNode.boundingBox,
+        node: shortCircuitNode,
+      };
+
+      logger.info('[EMBEDDINGS_RESOLVER] Short-circuit resolved', {
+        event: 'lint_decision',
+        previewSessionId,
+        stepType: stepDraft.type,
+        status: 'resolved',
+        shortCircuitRef,
+        totalLatencyMs: Date.now() - startTime,
+      });
+
+      return {
+        status: 'resolved',
+        message: 'Element found by exact match',
+        confidence: 1.0,
+        candidates: [lintCandidate],
+        highlight: [{
+          ref: shortCircuitNode.ref,
+          boundingBox: shortCircuitNode.boundingBox,
+          type: 'success',
+        }],
+        cacheHit: false,
+        embeddingsLatencyMs: 0,
+        degradedMode: false,
+      };
     }
-
-    // Apply structural filters
-    const filterResult = applyStructuralFilters(node, stepDraft.type);
-    if (filterResult.hardReject) {
-      continue;
-    }
-
-    // Build candidate text
-    const candidateText = buildCandidateText(node);
-    filteredCandidates.push({ node, candidateText });
   }
 
-  if (filteredCandidates.length === 0) {
+  // Step 4: Handle case of 0 allowed elements → AI fallback
+  if (allowedCount === 0) {
+    logger.info('[EMBEDDINGS_RESOLVER] Zero allowed elements', {
+      event: 'lint_decision',
+      previewSessionId,
+      stepType: stepDraft.type,
+      status: 'not_found',
+      rulesApplied: ruleTrace.length,
+      totalLatencyMs: Date.now() - startTime,
+    });
+
     return {
       status: 'not_found',
-      message: 'All matching elements are disabled, readonly, or in wrong state',
+      message: 'No elements match your description on this page',
       confidence: 0,
       candidates: [],
       highlight: [],
+      needsAiFallback: true,
+      degradedMode: false,
     };
   }
 
-  // Limit candidates to prevent excessive API calls
-  const candidatesToEmbed = filteredCandidates.slice(0, MAX_CANDIDATES_TO_EMBED);
+  // Step 5: Handle case of exactly 1 allowed element → auto-resolve
+  if (allowedCount === 1) {
+    const singleNode = allAllowed[0];
+    const lintCandidate: LintCandidate = {
+      ref: singleNode.ref,
+      label: singleNode.labelText || singleNode.ariaLabel || singleNode.text || singleNode.placeholder || `<${singleNode.tag}>`,
+      reason: 'Single match',
+      confidence: 0.9,
+      boundingBox: singleNode.boundingBox,
+      node: singleNode,
+    };
 
-  // Step 2: Prepare intent text
-  const intentText = sanitizeIntent(stepDraft);
+    logger.info('[EMBEDDINGS_RESOLVER] Single allowed element', {
+      event: 'lint_decision',
+      previewSessionId,
+      stepType: stepDraft.type,
+      status: 'resolved',
+      ref: singleNode.ref,
+      totalLatencyMs: Date.now() - startTime,
+    });
+
+    return {
+      status: 'resolved',
+      message: 'Element found',
+      confidence: 0.9,
+      candidates: [lintCandidate],
+      highlight: [{
+        ref: singleNode.ref,
+        boundingBox: singleNode.boundingBox,
+        type: 'success',
+      }],
+      cacheHit: false,
+      embeddingsLatencyMs: 0,
+      degradedMode: false,
+    };
+  }
+
+  // Step 6: Multiple allowed elements → use embeddings to rank, then decide
+  // Build candidate texts for embedding
+  const candidatesToEmbed: Array<{ node: InteractiveNode; candidateText: string }> = [];
+  for (const node of allAllowed.slice(0, MAX_CANDIDATES_TO_EMBED)) {
+    const candidateText = buildCandidateText(node);
+    candidatesToEmbed.push({ node, candidateText });
+  }
 
   // Compute page signature for cache
   const pageSignature = computePageSignature(pageUrl, domNodes);
 
-  // Step 3: Rank by embeddings
+  // Rank by embeddings
   let ranked: RankedCandidate[];
   let cacheHit = false;
   let embeddingsLatencyMs = 0;
@@ -781,7 +1304,12 @@ export async function resolveWithEmbeddings(params: {
     degradedMode = true;
     degradedReason = 'circuit_breaker_open';
     logger.warn('[EMBEDDINGS_RESOLVER] Circuit breaker is open, skipping embeddings');
-    ranked = [];
+    // Fallback: use candidates in original order
+    ranked = candidatesToEmbed.map(c => ({
+      node: c.node,
+      candidateText: c.candidateText,
+      similarity: 0.5, // Default similarity when embeddings unavailable
+    }));
   } else {
     try {
       const rankResult = await rankCandidatesByEmbedding({
@@ -789,7 +1317,7 @@ export async function resolveWithEmbeddings(params: {
         candidates: candidatesToEmbed,
         previewSessionId,
         pageSignature,
-        disableCaching, // V5: Bypass cache when true
+        disableCaching,
       });
 
       ranked = rankResult.ranked;
@@ -816,51 +1344,45 @@ export async function resolveWithEmbeddings(params: {
         degradedReason,
       });
 
-      ranked = [];
+      // Fallback: use candidates in original order
+      ranked = candidatesToEmbed.map(c => ({
+        node: c.node,
+        candidateText: c.candidateText,
+        similarity: 0.5,
+      }));
     }
   }
 
-  // If embeddings failed, return degraded result
-  if (degradedMode || ranked.length === 0) {
-    return {
-      status: 'not_found',
-      message: 'Element resolution failed. Please try again or add more specific hints.',
-      confidence: 0,
-      candidates: [],
-      highlight: [],
-      degradedMode: true,
-      degradedReason,
-      needsAiFallback: true,
-    };
-  }
+  // Step 7: Apply count-based decision policy
+  const decision = applyDecisionPolicy(ranked, allowedCount, undefined, ruleTrace);
 
-  // Step 4: Apply structural post-filter (tag compatibility)
-  const tagFilteredRanked = ranked.filter(r =>
-    isTagCompatibleWithAction(r.node.tag, stepDraft.type)
-  );
+  // Step 8: Build lint candidates
+  // V3: For needs_clarification, only include candidates if includeAlternatives=true
+  const shouldIncludeCandidates = 
+    decision.status === 'resolved' || 
+    decision.status === 'not_found' ||
+    includeAlternatives;
 
-  // If all filtered out, use original ranked but with lower confidence
-  const finalRanked = tagFilteredRanked.length > 0 ? tagFilteredRanked : ranked;
-
-  // Step 5: Apply decision policy
-  const decision = applyDecisionPolicy(finalRanked, stepDraft.type);
-
-  // Build lint candidates
-  const lintCandidates: LintCandidate[] = decision.selectedCandidates.map(r => ({
-    ref: r.node.ref,
-    label: r.node.labelText || r.node.ariaLabel || r.node.text || r.node.placeholder || `<${r.node.tag}>`,
-    reason: `Similarity: ${(r.similarity * 100).toFixed(0)}%`,
-    confidence: r.similarity,
-    boundingBox: r.node.boundingBox,
-    node: r.node, // Include full node for compiled plan generation
-  }));
+  const lintCandidates: LintCandidate[] = shouldIncludeCandidates
+    ? decision.selectedCandidates.map(r => ({
+        ref: r.node.ref,
+        label: r.node.labelText || r.node.ariaLabel || r.node.text || r.node.placeholder || `<${r.node.tag}>`,
+        reason: `Match: ${(r.similarity * 100).toFixed(0)}%`,
+        confidence: r.similarity,
+        boundingBox: r.node.boundingBox,
+        node: r.node,
+      }))
+    : [];
 
   // Build highlight
-  const highlight = decision.selectedCandidates.map((r, idx) => ({
-    ref: r.node.ref,
-    boundingBox: r.node.boundingBox,
-    type: (decision.status === 'resolved' && idx === 0 ? 'success' : 'warning') as 'success' | 'warning' | 'error',
-  }));
+  // V3: For needs_clarification without includeAlternatives, don't highlight
+  const highlight = shouldIncludeCandidates
+    ? decision.selectedCandidates.map((r, idx) => ({
+        ref: r.node.ref,
+        boundingBox: r.node.boundingBox,
+        type: (decision.status === 'resolved' && idx === 0 ? 'success' : 'warning') as 'success' | 'warning' | 'error',
+      }))
+    : [];
 
   const totalLatencyMs = Date.now() - startTime;
 
@@ -872,11 +1394,13 @@ export async function resolveWithEmbeddings(params: {
     topSim: decision.topSimilarity.toFixed(3),
     delta: decision.similarityDelta.toFixed(3),
     status: decision.status,
+    allowedCount,
     cacheHit,
     embeddingsLatencyMs,
     totalLatencyMs,
-    candidateCount: finalRanked.length,
+    candidateCount: ranked.length,
     degradedMode,
+    includeAlternatives,
   });
 
   return {
@@ -889,7 +1413,9 @@ export async function resolveWithEmbeddings(params: {
     similarityDelta: decision.similarityDelta,
     cacheHit,
     embeddingsLatencyMs,
-    degradedMode: false,
+    degradedMode,
+    degradedReason,
+    needsAiFallback: decision.needsAiFallback,
   };
 }
 

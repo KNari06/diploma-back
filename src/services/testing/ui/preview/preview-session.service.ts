@@ -25,8 +25,14 @@ const SCREENSHOT_CONFIG = {
   throttleMs: 500,       // Min time between screenshot emissions per session
 };
 
-// Input throttle (anti-flood for mouse/keyboard events)
-const INPUT_THROTTLE_MS = 50; // Min 50ms between input events (20 events/sec max)
+// Input throttling (anti-flood)
+// IMPORTANT:
+// - Mouse/wheel events are high-volume and expensive (affect page + snapshots)
+// - Keyboard typing should feel responsive, so it gets a much smaller throttle window
+const MOUSE_INPUT_THROTTLE_MS = 50; // ~20 mouse events/sec max
+const WHEEL_INPUT_THROTTLE_MS = 50; // ~20 wheel events/sec max
+const KEYBOARD_TYPE_THROTTLE_MS = 10; // ~100 type events/sec max (frontend may still debounce)
+const KEYBOARD_PRESS_THROTTLE_MS = 20; // ~50 press events/sec max
 
 /**
  * Sanitize Playwright close errors.
@@ -47,7 +53,10 @@ function formatPlaywrightCloseError(error: unknown): string {
  */
 function isBenignAlreadyClosedError(error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error);
-  return /Target page, context or browser has been closed/i.test(msg);
+  return (
+    /Target page, context or browser has been closed/i.test(msg) ||
+    /Target\.disposeBrowserContext.+Failed to find context/i.test(msg)
+  );
 }
 
 /**
@@ -60,7 +69,13 @@ interface InternalSession extends PreviewSession {
   lastSnapshotEmit: number;
   lastScreenshotEmitAt: number;  // Last screenshot emission timestamp
   lastPageSignature: string;      // Hash for diff detection (url+domMetrics)
-  lastInputAt: number;            // Input throttling timestamp
+  lastMouseInputAt: number;       // Mouse input throttling timestamp
+  lastWheelInputAt: number;       // Wheel input throttling timestamp
+  lastKeyboardTypeAt: number;     // Keyboard type throttling timestamp
+  lastKeyboardPressAt: number;    // Keyboard press throttling timestamp
+  domVersion: number;             // Monotonically increasing DOM version
+  contextVersion: number;         // Version for context updates
+  contextData: Record<string, any>; // Context data (env + test variables)
 }
 
 /**
@@ -120,39 +135,69 @@ export class PreviewSessionService {
   /**
    * Helper to safely close browser resources
    * Guarantees cleanup even if errors occur
+   * Includes 10s timeout per resource to prevent infinite hangs
    */
   private async safeCloseBrowserResources(
     browser?: Browser,
     context?: BrowserContext,
     page?: Page
   ): Promise<void> {
+    const CLOSE_TIMEOUT_MS = 10000; // 10 seconds per resource
+    const getBrowserPid = (b?: Browser): number | undefined => {
+      try {
+        const proc = (b as any)?.process?.();
+        return proc?.pid;
+      } catch {
+        return undefined;
+      }
+    };
+
+    /**
+     * Helper: wrap close operation with timeout
+     */
+    const closeWithTimeout = async (
+      closePromise: Promise<void>,
+      resourceName: string,
+      resourceId?: number
+    ): Promise<void> => {
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`${resourceName} close timeout (${CLOSE_TIMEOUT_MS}ms)`)), CLOSE_TIMEOUT_MS)
+      );
+
+      try {
+        await Promise.race([closePromise, timeoutPromise]);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const isTimeout = errorMessage.includes('timeout');
+
+        if (isTimeout) {
+          logger.warn(`[PREVIEW_SESSION] ${resourceName} close timeout, may need force kill`, {
+            timeout: CLOSE_TIMEOUT_MS,
+            pid: resourceId,
+          });
+        } else if (!isBenignAlreadyClosedError(error)) {
+          logger.warn(`[PREVIEW_SESSION] Error closing ${resourceName}`, {
+            error: formatPlaywrightCloseError(error),
+          });
+        }
+
+        // Don't throw - we want to try closing other resources
+      }
+    };
+
     const closePromises: Promise<void>[] = [];
 
     if (page) {
-      closePromises.push(page.close().catch((error) => {
-        const level = isBenignAlreadyClosedError(error) ? 'debug' : 'warn';
-        logger[level]('[PREVIEW_SESSION] Error closing page', {
-          error: formatPlaywrightCloseError(error),
-        });
-      }));
+      closePromises.push(closeWithTimeout(page.close(), 'page'));
     }
 
     if (context) {
-      closePromises.push(context.close().catch((error) => {
-        const level = isBenignAlreadyClosedError(error) ? 'debug' : 'warn';
-        logger[level]('[PREVIEW_SESSION] Error closing context', {
-          error: formatPlaywrightCloseError(error),
-        });
-      }));
+      closePromises.push(closeWithTimeout(context.close(), 'context'));
     }
 
     if (browser) {
-      closePromises.push(browser.close().catch((error) => {
-        const level = isBenignAlreadyClosedError(error) ? 'debug' : 'warn';
-        logger[level]('[PREVIEW_SESSION] Error closing browser', {
-          error: formatPlaywrightCloseError(error),
-        });
-      }));
+      const browserPid = getBrowserPid(browser);
+      closePromises.push(closeWithTimeout(browser.close(), 'browser', browserPid));
     }
 
     await Promise.all(closePromises);
@@ -188,7 +233,7 @@ export class PreviewSessionService {
       const existingSessionId = this.userToSession.get(userId);
       if (existingSessionId) {
         try {
-          await this.stopSession(existingSessionId);
+          await this.stopSessionInternal(existingSessionId);
         } catch (stopError) {
           // Log but don't fail - we still want to create new session
           logger.warn('[PREVIEW_SESSION] Error stopping existing session, continuing', {
@@ -238,6 +283,10 @@ export class PreviewSessionService {
         // Generate session ID
         const sessionId = `preview_${randomUUID()}`;
 
+        // Compute initial page signature
+        const initialUrl = page.url();
+        const initialSignature = this.computePageSignature(initialUrl, domAnalysis.interactiveNodes);
+
         // Create session
         const session: InternalSession = {
           id: sessionId,
@@ -245,7 +294,7 @@ export class PreviewSessionService {
           projectId,
           startUrl: safeStartUrl,
           pageState: {
-            url: page.url(),
+            url: initialUrl,
             domNodes: domAnalysis.interactiveNodes,
           },
           createdAt: Date.now(),
@@ -255,8 +304,14 @@ export class PreviewSessionService {
           page,
           lastSnapshotEmit: 0,
           lastScreenshotEmitAt: 0,
-          lastPageSignature: '',
-          lastInputAt: 0,
+          lastPageSignature: initialSignature,
+          lastMouseInputAt: 0,
+          lastWheelInputAt: 0,
+          lastKeyboardTypeAt: 0,
+          lastKeyboardPressAt: 0,
+          domVersion: 1,           // Start at version 1
+          contextVersion: 0,
+          contextData: {},
         };
 
         // Store session
@@ -300,8 +355,11 @@ export class PreviewSessionService {
     userId: string;
   }): Promise<{
     url: string;
-    domNodes: InteractiveNode[];
+    domNodes?: InteractiveNode[];
+    domVersion: number;
+    pageSignature: string;
     screenshot?: string;
+    changed: boolean;
   } | null> {
     const { sessionId, userId } = params;
 
@@ -359,14 +417,18 @@ export class PreviewSessionService {
       session.lastSnapshotEmit = 0;
       session.lastScreenshotEmitAt = 0;
       session.lastPageSignature = '';
-      session.lastInputAt = 0;
+      session.lastMouseInputAt = 0;
+      session.lastWheelInputAt = 0;
+      session.lastKeyboardTypeAt = 0;
+      session.lastKeyboardPressAt = 0;
+      session.domVersion = 1; // Reset to version 1 on session reset
 
       // Close old resources after swap (do not break reset if close fails)
       await this.safeCloseBrowserResources(undefined, oldContext, oldPage);
 
       return this.getSnapshot(sessionId, userId, {
         force: true,
-        includeScreenshot: true,
+        includeDomNodes: true,
         onlyIfChanged: false,
       });
     } catch (error) {
@@ -388,8 +450,11 @@ export class PreviewSessionService {
    */
   async refreshPage(sessionId: string, userId: string): Promise<{
     url: string;
-    domNodes: InteractiveNode[];
+    domNodes?: InteractiveNode[];
+    domVersion: number;
+    pageSignature: string;
     screenshot?: string;
+    changed: boolean;
   } | null> {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
@@ -407,7 +472,7 @@ export class PreviewSessionService {
 
       return this.getSnapshot(sessionId, userId, {
         force: true,
-        includeScreenshot: true,
+        includeDomNodes: true,
         onlyIfChanged: false
       });
     } catch (error) {
@@ -449,6 +514,52 @@ export class PreviewSessionService {
     } finally {
       releaseLock();
     }
+  }
+
+  /**
+   * Stop a preview session (internal, without lock)
+   * IMPORTANT: Only call this when lock is already acquired (e.g., inside startSession)
+   * For external calls, use stopSession() which acquires lock
+   */
+  private async stopSessionInternal(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return; // Idempotent: already deleted
+    }
+
+    logger.info('[PREVIEW_SESSION] Stopping session (internal)', { sessionId, userId: session.userId });
+
+    try {
+      // Safe cleanup of browser resources
+      await this.safeCloseBrowserResources(session.browser, session.context, session.page);
+
+      // Fallback force-kill if browser process still alive
+      const browserProcess = (session.browser as any)?.process?.();
+      if (browserProcess && browserProcess.pid) {
+        try {
+          // Check if process is still alive
+          process.kill(browserProcess.pid, 0); // Signal 0 checks existence without killing
+          logger.warn('[PREVIEW_SESSION] Browser process still alive after close, force killing', {
+            sessionId,
+            pid: browserProcess.pid,
+          });
+          process.kill(browserProcess.pid, 'SIGKILL');
+        } catch (error) {
+          // Process already dead or not accessible - this is fine
+        }
+      }
+    } catch (error) {
+      logger.error('[PREVIEW_SESSION] Error during stopSessionInternal', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // Remove from maps atomically (even if cleanup failed)
+    this.sessions.delete(sessionId);
+    this.userToSession.delete(session.userId);
+
+    logger.info('[PREVIEW_SESSION] Session stopped (internal)', { sessionId });
   }
 
   /**
@@ -554,11 +665,11 @@ export class PreviewSessionService {
     const now = Date.now();
 
     // Throttle input events (anti-DoS)
-    if (now - session.lastInputAt < INPUT_THROTTLE_MS) {
+    if (now - session.lastMouseInputAt < MOUSE_INPUT_THROTTLE_MS) {
       return { success: false, error: 'Input throttled', needsSnapshot: false };
     }
 
-    session.lastInputAt = now;
+    session.lastMouseInputAt = now;
     session.lastSeenAt = now;
 
     try {
@@ -633,11 +744,11 @@ export class PreviewSessionService {
 
     const now = Date.now();
 
-    if (now - session.lastInputAt < INPUT_THROTTLE_MS) {
+    if (now - session.lastWheelInputAt < WHEEL_INPUT_THROTTLE_MS) {
       return { success: false, error: 'Input throttled' };
     }
 
-    session.lastInputAt = now;
+    session.lastWheelInputAt = now;
     session.lastSeenAt = now;
 
     try {
@@ -686,11 +797,11 @@ export class PreviewSessionService {
     }
 
     const now = Date.now();
-    if (now - session.lastInputAt < INPUT_THROTTLE_MS) {
+    if (now - session.lastKeyboardTypeAt < KEYBOARD_TYPE_THROTTLE_MS) {
       return { success: false, error: 'Input throttled' };
     }
 
-    session.lastInputAt = now;
+    session.lastKeyboardTypeAt = now;
     session.lastSeenAt = now;
 
     try {
@@ -726,11 +837,11 @@ export class PreviewSessionService {
     }
 
     const now = Date.now();
-    if (now - session.lastInputAt < INPUT_THROTTLE_MS) {
+    if (now - session.lastKeyboardPressAt < KEYBOARD_PRESS_THROTTLE_MS) {
       return { success: false, error: 'Input throttled' };
     }
 
-    session.lastInputAt = now;
+    session.lastKeyboardPressAt = now;
     session.lastSeenAt = now;
 
     const safeModifiers = Array.isArray(modifiers) ? modifiers : [];
@@ -891,32 +1002,46 @@ export class PreviewSessionService {
   }
 
   /**
-   * Get current page snapshot
+   * Get current page snapshot with DOM versioning
    * @param options.force - Skip throttling
-   * @param options.includeScreenshot - Include JPEG screenshot (default: true)
-   * @param options.onlyIfChanged - Only return if page signature changed (for apply)
+   * @param options.includeScreenshot - Include JPEG screenshot (default: false for new video-based flow)
+   * @param options.onlyIfChanged - Only return full response if page signature changed
+   * @param options.includeDomNodes - Force include domNodes even if not changed (default: auto)
    */
   async getSnapshot(
     sessionId: string,
     userId?: string,
-    options?: { force?: boolean; includeScreenshot?: boolean; onlyIfChanged?: boolean }
+    options?: {
+      force?: boolean;
+      includeScreenshot?: boolean;
+      onlyIfChanged?: boolean;
+      includeDomNodes?: boolean;
+    }
   ): Promise<{
     url: string;
-    domNodes: InteractiveNode[];
-    screenshot?: string;
-    changed?: boolean;
+    domNodes?: InteractiveNode[];  // Only included when DOM changed or forced
+    domVersion: number;
+    pageSignature: string;
+    screenshot?: string;           // Deprecated: use video:frame instead
+    changed: boolean;
   } | null> {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
 
     const now = Date.now();
-    const includeScreenshot = options?.includeScreenshot !== false;
+    const includeScreenshot = options?.includeScreenshot === true; // Default false now
 
     // Throttle snapshot collection (unless forced)
     if (!options?.force && now - session.lastSnapshotEmit < SNAPSHOT_THROTTLE_MS) {
+      // IMPORTANT:
+      // Linting needs domNodes, but collecting a fresh snapshot is expensive.
+      // When throttled, return the last known domNodes from session.pageState if explicitly requested.
+      const shouldIncludeDomNodes = options?.includeDomNodes === true;
       return {
         url: session.pageState.url,
-        domNodes: session.pageState.domNodes,
+        domNodes: shouldIncludeDomNodes ? session.pageState.domNodes : undefined,
+        domVersion: session.domVersion,
+        pageSignature: session.lastPageSignature,
         changed: false,
       };
     }
@@ -935,18 +1060,24 @@ export class PreviewSessionService {
       // Compute signature for diff detection
       const newSignature = this.computePageSignature(currentUrl, domAnalysis.interactiveNodes);
       const changed = newSignature !== session.lastPageSignature;
-      session.lastPageSignature = newSignature;
 
-      // If onlyIfChanged and no change, skip
+      // Increment domVersion only if signature changed
+      if (changed) {
+        session.domVersion++;
+        session.lastPageSignature = newSignature;
+      }
+
+      // If onlyIfChanged and no change, return minimal response
       if (options?.onlyIfChanged && !changed) {
         return {
           url: session.pageState.url,
-          domNodes: session.pageState.domNodes,
+          domVersion: session.domVersion,
+          pageSignature: session.lastPageSignature,
           changed: false,
         };
       }
 
-      // Capture screenshot if requested and throttle allows
+      // Capture screenshot if explicitly requested (deprecated for preview)
       let screenshot: string | undefined;
       if (includeScreenshot) {
         const canEmitScreenshot = now - session.lastScreenshotEmitAt >= SCREENSHOT_CONFIG.throttleMs;
@@ -959,9 +1090,14 @@ export class PreviewSessionService {
         }
       }
 
+      // Include domNodes only if changed or explicitly requested
+      const shouldIncludeDomNodes = options?.includeDomNodes ?? changed;
+
       return {
         url: session.pageState.url,
-        domNodes: session.pageState.domNodes,
+        domNodes: shouldIncludeDomNodes ? session.pageState.domNodes : undefined,
+        domVersion: session.domVersion,
+        pageSignature: session.lastPageSignature,
         screenshot,
         changed,
       };
@@ -972,6 +1108,42 @@ export class PreviewSessionService {
       });
       return null;
     }
+  }
+
+  /**
+   * Get current DOM version for a session
+   */
+  getDomVersion(sessionId: string, userId?: string): number | null {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.domVersion ?? null;
+  }
+
+  /**
+   * Get context data for a session
+   */
+  getContextData(sessionId: string, userId?: string): { version: number; data: Record<string, any> } | null {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+    return {
+      version: session.contextVersion,
+      data: session.contextData,
+    };
+  }
+
+  /**
+   * Set context data for a session
+   */
+  setContextData(sessionId: string, userId: string, data: Record<string, any>): { version: number; data: Record<string, any> } | null {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+
+    session.contextVersion++;
+    session.contextData = { ...data };
+
+    return {
+      version: session.contextVersion,
+      data: session.contextData,
+    };
   }
 
   /**
@@ -987,7 +1159,10 @@ export class PreviewSessionService {
    */
   async navigate(sessionId: string, url: string, userId?: string): Promise<{
     url: string;
-    domNodes: InteractiveNode[];
+    domNodes?: InteractiveNode[];
+    domVersion: number;
+    pageSignature: string;
+    changed: boolean;
   } | null> {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
@@ -1001,7 +1176,7 @@ export class PreviewSessionService {
 
       await session.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => { });
 
-      return this.getSnapshot(sessionId, userId, { force: true });
+      return this.getSnapshot(sessionId, userId, { force: true, includeDomNodes: true });
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Navigation failed', {
         sessionId,

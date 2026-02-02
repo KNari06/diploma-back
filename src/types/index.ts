@@ -33,6 +33,17 @@ export interface TestRunRequest {
   intent?: string; // Original user intent for context
   mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
   chatSessionId?: string; // Chat session ID for WebSocket routing isolation
+  /** V2: Additional metadata for linking and reporting */
+  metadata?: {
+    /** Intent test case ID if run from intent test case */
+    intentTestCaseId?: string;
+    /** Intent test case name */
+    intentTestCaseName?: string;
+    /** Source of the test run */
+    source?: 'intent_test_case' | 'chat' | 'api' | 'manual';
+    /** Any additional custom data */
+    [key: string]: any;
+  };
 }
 
 export interface TestOptions {

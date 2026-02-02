@@ -47,8 +47,8 @@ const messages = chatHistory.map((msg) => ({
 
 ```bash
 # 1. Найди ВСЕ файлы которые импортируют этот модуль
-grep -r "import.*from.*@/" src/
-grep -r "require.*@/" src/
+rg "import.*from.*@/" src/
+rg "require.*@/" src/
 
 # 2. Проверь каждый файл что импорт правильный
 # 3. Обнови импорты ВЕЗДЕ где нужно
@@ -97,10 +97,10 @@ const test = await supabase
 
 ```bash
 # В коде посмотри на CREATE TABLE statement
-grep -r "create table.*tests" supabase-schema.sql
+rg "create table.*tests" supabase-schema.sql
 
 # Или в коде найди примеры использования
-grep -r "\.select.*tests" src/
+rg "\.select.*tests" src/
 ```
 
 ## Проверка на дубликаты
@@ -108,13 +108,8 @@ grep -r "\.select.*tests" src/
 ### Перед созданием нового файла
 
 ```bash
-# Проверь есть ли уже похожий файл
-find src/ -name "*service*"
-find src/ -name "*auth*"
-find src/ -name "*test*"
-
-# Поищи по содержимому
-grep -r "function_you_want_to_add" src/
+# Поищи по содержимому (предпочитай точный запрос)
+rg "function_you_want_to_add" src/
 ```
 
 ### Признаки дубликатов:
@@ -135,7 +130,7 @@ npm run type-check
 npm run lint
 
 # Или автоматически все измененные
-git diff --name-only | grep '\.ts$' | xargs -I {} sh -c 'npx tsc --noEmit {} && echo "✅ {}"'
+git diff --name-only | rg "\.ts$" | xargs -I {} sh -c 'npx tsc --noEmit {} && echo "✅ {}"'
 ```
 
 ## Логические проверки
@@ -164,16 +159,10 @@ const testId = result.test.id; // может быть undefined!
 ### При добавлении новых зависимостей
 
 ```typescript
-// ✅ Хорошо - проверяешь что модуль установлен
-try {
-  const module = require("new-module");
-} catch (err) {
-  logger.error("Module not installed:", err);
-}
-
-// ⚠️ Не забудь добавить в package.json
-// npm install new-module --save
-// npm install @types/new-module --save-dev (если нужны типы)
+// ✅ Minimum: add dependency + types (if needed), then run checks
+// npm install new-module
+// npm install -D @types/new-module (if needed)
+// npm run type-check && npm run lint
 ```
 
 ## Performance проверки
@@ -217,31 +206,4 @@ if (!process.env.OPENAI_API_KEY) {
 
 ## Документация
 
-### ❌ НЕ создавай .md файлы каждый раз
-
-```bash
-# ❌ ПЛОХО - создаешь документацию без запроса
-touch docs/new-feature.md
-touch README-feature.md
-touch CHANGELOG.md
-
-# ✅ ХОРОШО - спрашиваешь у пользователя
-# "Нужно ли создать документацию для этой функции?"
-# Создавай документы только если пользователь явно просит
-```
-
-### Правила создания документации:
-
-1. **НИКОГДА не создавай .md файлы проактивно**
-2. **ВСЕГДА спрашивай** у пользователя перед созданием документации
-3. **Если разрешение получено** - создавай в правильной папке:
-   - `/docs/api/` - для API документации
-   - `/docs/development/` - для разработки
-   - `/docs/architecture/` - для архитектуры
-4. **ОБНОВЛЯЙ** `/docs/README.md` при добавлении новых документов
-
-### Исключения (когда можно создавать):
-
-- Пользователь **явно просит**: "создай документацию", "напиши README"
-- Пользователь **указывает название файла**: "создай docs/api-guide.md"
-- **Критические изменения** требуют обновления существующих документов
+- Правила про `.md` и папки docs: см. `.cursor/rules/docs.mdc` (не дублируем здесь).

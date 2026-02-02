@@ -9,3 +9,17 @@ export { PreviewSessionService, getPreviewSessionService } from './preview-sessi
 export { IntentTestCaseService } from './intent-test-case.service';
 export { IntentStepLintService } from './intent-step-lint.service';
 export { PreviewStepApplyService } from './preview-step-apply.service';
+export {
+  PreviewVideoStreamService,
+  PreviewVideoStreamRegistry,
+  getPreviewVideoStreamRegistry,
+} from './preview-video-stream.service';
+export {
+  PreviewConsoleCollector,
+  PreviewNetworkCollector,
+  PreviewDevToolsCollector,
+  PreviewDevToolsRegistry,
+  getPreviewDevToolsRegistry,
+  fetchHtml,
+  fetchAccessibility,
+} from './preview-devtools-collector.service';

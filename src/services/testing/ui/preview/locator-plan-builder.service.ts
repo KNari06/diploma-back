@@ -186,12 +186,20 @@ function determinePostconditions(actionType: string, node?: InteractiveNode): ('
   }
 }
 
+/** Current version of the compiled plan format */
+const COMPILED_VERSION = '1.0.0';
+
+/** Current version of the resolver */
+const RESOLVER_VERSION = '3.0.0';
+
 /**
  * Locator Plan Builder Service
  */
 export class LocatorPlanBuilder {
   /**
    * Build compiled execution plan from resolved node and step
+   * 
+   * @param params.pageSignature Optional page signature for staleness detection
    */
   static buildCompiledPlan(params: {
     step: IntentStep;
@@ -200,8 +208,9 @@ export class LocatorPlanBuilder {
     pageTitle?: string;
     snapshotRef?: string;
     screenshotRef?: string;
+    pageSignature?: string;
   }): CompiledStepPlan {
-    const { step, resolvedNode, pageUrl, pageTitle, snapshotRef, screenshotRef } = params;
+    const { step, resolvedNode, pageUrl, pageTitle, snapshotRef, screenshotRef, pageSignature } = params;
 
     logger.debug('[LOCATOR_PLAN_BUILDER] Building compiled plan', {
       stepId: step.id,
@@ -209,6 +218,7 @@ export class LocatorPlanBuilder {
       nodeTag: resolvedNode.tag,
       nodeRole: resolvedNode.role,
       nodeRef: resolvedNode.ref,
+      hasPageSignature: !!pageSignature,
     });
 
     // Build locator chain (primary + fallbacks)
@@ -236,6 +246,11 @@ export class LocatorPlanBuilder {
         snapshotRef,
         screenshotRef,
         compiledAt: new Date().toISOString(),
+        pageSignature,
+      },
+      meta: {
+        compiledVersion: COMPILED_VERSION,
+        resolverVersion: RESOLVER_VERSION,
       },
       targetFingerprint,
     };
@@ -245,6 +260,8 @@ export class LocatorPlanBuilder {
       locatorCount: locatorPlan.length,
       primaryStrategy: locatorPlan[0]?.strategy,
       primaryConfidence: locatorPlan[0]?.confidence,
+      compiledVersion: COMPILED_VERSION,
+      resolverVersion: RESOLVER_VERSION,
     });
 
     return compiled;

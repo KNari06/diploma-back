@@ -5,7 +5,9 @@
 
 import { supabaseAdmin } from '@/db/supabase';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import { IntentStepConverterService } from '@/services/testing/ui/preview/intent-step-converter.service';
 import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-session.service';
+import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
@@ -54,46 +56,8 @@ async function validateFlowLink(params: {
   return { valid: true };
 }
 
-/**
- * Validate saved test case ownership and linkage
- * Returns: { valid: boolean; error?: string }
- */
-async function validateSavedTestCaseLink(params: {
-  savedTestCaseId: string;
-  userId: string;
-  projectId: string;
-  flowId?: string;
-}): Promise<{ valid: boolean; error?: string }> {
-  const { savedTestCaseId, userId, projectId, flowId } = params;
-
-  // Get saved test case
-  const { data: savedTestCase, error } = await supabaseAdmin
-    .from('saved_test_cases')
-    .select('id, user_id, project_id, flow_id')
-    .eq('id', savedTestCaseId)
-    .single();
-
-  if (error || !savedTestCase) {
-    return { valid: false, error: 'Saved test case not found' };
-  }
-
-  // Check ownership
-  if (savedTestCase.user_id !== userId) {
-    return { valid: false, error: 'Saved test case does not belong to user' };
-  }
-
-  // Check project match
-  if (savedTestCase.project_id !== projectId) {
-    return { valid: false, error: 'Saved test case does not belong to the specified project' };
-  }
-
-  // If flowId is provided, check it matches
-  if (flowId && savedTestCase.flow_id !== flowId) {
-    return { valid: false, error: 'Saved test case is not linked to the specified flow' };
-  }
-
-  return { valid: true };
-}
+// NOTE: validateSavedTestCaseLink removed - intent_test_cases is now the unified table
+// and doesn't reference saved_test_cases anymore.
 
 /**
  * Start a preview session
@@ -196,10 +160,21 @@ export async function createIntentTestCase(req: Request, res: Response): Promise
       return;
     }
 
-    const { projectId, name, description, startUrl, steps, flowId, savedTestCaseId } = req.body;
+    const { projectId, name, description, startUrl, steps, flowId } = req.body;
 
-    if (!projectId || !name || !startUrl) {
-      res.status(400).json({ error: 'Missing required fields: projectId, name, startUrl' });
+    logger.info('[PREVIEW_CONTROLLER] Creating intent test case', {
+      userId,
+      projectId,
+      hasName: name !== undefined,
+      hasDescription: description !== undefined,
+      hasStartUrl: startUrl !== undefined,
+      hasSteps: steps !== undefined,
+      stepsCount: Array.isArray(steps) ? steps.length : undefined,
+      flowId: flowId || null,
+    });
+
+    if (!projectId || !name) {
+      res.status(400).json({ error: 'Missing required fields: projectId, name' });
       return;
     }
 
@@ -212,21 +187,8 @@ export async function createIntentTestCase(req: Request, res: Response): Promise
       }
     }
 
-    // Validate savedTestCaseId if provided
-    if (savedTestCaseId) {
-      const savedTestCaseValidation = await validateSavedTestCaseLink({
-        savedTestCaseId,
-        userId,
-        projectId,
-        flowId,
-      });
-      if (!savedTestCaseValidation.valid) {
-        res.status(400).json({ error: savedTestCaseValidation.error });
-        return;
-      }
-    }
-
-    const safeStartUrl = sanitizeUrl(String(startUrl));
+    // startUrl is optional now (flow-created cases may not have URL initially)
+    const safeStartUrl = startUrl ? sanitizeUrl(String(startUrl)) : undefined;
 
     const testCase = await IntentTestCaseService.create({
       projectId,
@@ -236,12 +198,15 @@ export async function createIntentTestCase(req: Request, res: Response): Promise
       startUrl: safeStartUrl,
       steps: steps || [],
       flowId,
-      savedTestCaseId,
     });
 
     res.status(201).json({
       success: true,
       data: testCase,
+      // Compatibility fields for clients that expect id at top-level
+      // (some frontends unwrap Axios response differently)
+      id: testCase.id,
+      intentTestCaseId: testCase.id,
     });
   } catch (error) {
     logger.error('[PREVIEW_CONTROLLER] Failed to create intent test case', {
@@ -352,7 +317,24 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     }
 
     const { id } = req.params;
-    const { name, description, startUrl, steps, flowId, savedTestCaseId } = req.body;
+    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority } = req.body;
+
+    logger.info('[PREVIEW_CONTROLLER] Updating intent test case', {
+      intentTestCaseId: id,
+      userId,
+      fieldsProvided: {
+        name: name !== undefined,
+        description: description !== undefined,
+        startUrl: startUrl !== undefined,
+        url: url !== undefined,
+        steps: steps !== undefined,
+        flowId: flowId !== undefined,
+        status: status !== undefined,
+        kind: kind !== undefined,
+        tags: tags !== undefined,
+        priority: priority !== undefined,
+      },
+    });
 
     // Get existing test case to get projectId for validation
     const existingTestCase = await IntentTestCaseService.getById(id, userId);
@@ -376,19 +358,63 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       }
     }
 
-    // Validate savedTestCaseId if provided
-    if (savedTestCaseId !== undefined) {
-      if (savedTestCaseId) {
-        const savedTestCaseValidation = await validateSavedTestCaseLink({
-          savedTestCaseId,
-          userId,
-          projectId: existingTestCase.projectId,
-          flowId: flowId !== undefined ? flowId : existingTestCase.flowId,
-        });
-        if (!savedTestCaseValidation.valid) {
-          res.status(400).json({ error: savedTestCaseValidation.error });
-          return;
-        }
+    /**
+     * Normalize optional URL fields for update.
+     * - undefined => do not update field
+     * - null/"" => clear field (set NULL in DB)
+     * - string => sanitize + store
+     */
+    const normalizeOptionalUrl = (value: unknown): string | null | undefined => {
+      if (value === undefined) return undefined;
+      if (value === null) return null;
+      if (typeof value !== 'string') return undefined;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      return sanitizeUrl(trimmed);
+    };
+
+    // Validate URL types early (avoid accidental 500s on weird payloads)
+    if (
+      startUrl !== undefined &&
+      startUrl !== null &&
+      typeof startUrl !== 'string'
+    ) {
+      res.status(400).json({ error: 'Invalid startUrl type (expected string|null|undefined)' });
+      return;
+    }
+    if (url !== undefined && url !== null && typeof url !== 'string') {
+      res.status(400).json({ error: 'Invalid url type (expected string|null|undefined)' });
+      return;
+    }
+
+    // Validate status/kind if provided (simple guardrails)
+    if (status !== undefined && !['draft', 'published', 'archived'].includes(String(status))) {
+      res.status(400).json({ error: 'Invalid status (expected draft|published|archived)' });
+      return;
+    }
+    if (kind !== undefined && !['standalone', 'regression_member'].includes(String(kind))) {
+      res.status(400).json({ error: 'Invalid kind (expected standalone|regression_member)' });
+      return;
+    }
+    if (
+      priority !== undefined &&
+      priority !== null &&
+      !['critical', 'high', 'medium', 'low'].includes(String(priority))
+    ) {
+      res.status(400).json({ error: 'Invalid priority (expected critical|high|medium|low)' });
+      return;
+    }
+
+    // Normalize steps to avoid DB NOT NULL violation (steps_json is NOT NULL)
+    let normalizedSteps: any = undefined;
+    if (steps !== undefined) {
+      if (steps === null) {
+        normalizedSteps = [];
+      } else if (Array.isArray(steps)) {
+        normalizedSteps = steps;
+      } else {
+        res.status(400).json({ error: 'Invalid steps (expected array|null|undefined)' });
+        return;
       }
     }
 
@@ -397,15 +423,29 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       userId,
       name,
       description,
-      startUrl: startUrl !== undefined ? sanitizeUrl(String(startUrl)) : undefined,
-      steps,
+      startUrl: normalizeOptionalUrl(startUrl),
+      url: normalizeOptionalUrl(url),
+      steps: normalizedSteps,
       flowId,
-      savedTestCaseId,
+      status: status !== undefined ? (String(status) as any) : undefined,
+      kind: kind !== undefined ? (String(kind) as any) : undefined,
+      tags: Array.isArray(tags) ? tags : undefined,
+      priority: priority !== undefined && priority !== null ? (String(priority) as any) : undefined,
+    });
+
+    logger.info('[PREVIEW_CONTROLLER] Successfully updated intent test case', {
+      intentTestCaseId: id,
+      updatedFields: Object.keys({
+        name, description, startUrl, url, steps, flowId, status, kind, tags, priority
+      }).filter(k => (req.body as any)[k] !== undefined),
     });
 
     res.json({
       success: true,
       data: testCase,
+      // Compatibility fields for clients that expect id at top-level
+      id: testCase.id,
+      intentTestCaseId: testCase.id,
     });
   } catch (error) {
     logger.error('[PREVIEW_CONTROLLER] Failed to update intent test case', {
@@ -441,5 +481,335 @@ export async function deleteIntentTestCase(req: Request, res: Response): Promise
     res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to delete test case',
     });
+  }
+}
+
+// ============================================================================
+// INTENT TEST CASE RUN ENDPOINT
+// ============================================================================
+
+/**
+ * Run an intent test case
+ * POST /api/v1/preview/intent-test-cases/:id/run
+ * 
+ * Flow:
+ * 1. Load IntentTestCase from DB (steps_json)
+ * 2. Convert IntentSteps to PlaywrightCommands (dumb converter)
+ * 3. Call ManualTestService.runTest() with commands
+ * 
+ * The CommandExecutor handles:
+ * - compiled.locatorPlan execution (if present and valid)
+ * - Fallback to smart-locator + self-healing
+ */
+export async function runIntentTestCase(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = (req as any).user?.id;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const { id } = req.params;
+    const { browsers = ['chromium'], projectId: overrideProjectId } = req.body;
+
+    logger.info('[PREVIEW_CONTROLLER] Running intent test case', {
+      intentTestCaseId: id,
+      userId,
+      browsers,
+    });
+
+    // 1. Load the intent test case
+    const testCase = await IntentTestCaseService.getById(id, userId);
+    if (!testCase) {
+      res.status(404).json({ error: 'Intent test case not found' });
+      return;
+    }
+
+    // 2. Validate project if override provided
+    const projectId = overrideProjectId || testCase.projectId;
+    if (overrideProjectId && overrideProjectId !== testCase.projectId) {
+      // Verify user has access to the override project
+      const { data: project, error: projectError } = await supabaseAdmin
+        .from('projects')
+        .select('id')
+        .eq('id', overrideProjectId)
+        .eq('user_id', userId)
+        .single();
+
+      if (projectError || !project) {
+        res.status(403).json({ error: 'Access denied to specified project' });
+        return;
+      }
+    }
+
+    // 3. Check if there are steps to run
+    if (!testCase.stepsJson || testCase.stepsJson.length === 0) {
+      res.status(400).json({ error: 'No steps to run in this test case' });
+      return;
+    }
+
+    // 3.5. Check if there's a valid URL (prefer url, fallback to startUrl)
+    const targetUrl = testCase.url || testCase.startUrl;
+    if (!targetUrl) {
+      res.status(400).json({ error: 'No URL specified for this test case' });
+      return;
+    }
+
+    // 4. Convert IntentSteps to PlaywrightCommands (dumb converter - no resolution)
+    // Pass intentTestCaseId for heal persistence
+    const commands = IntentStepConverterService.convertToCommands(
+      testCase.stepsJson,
+      targetUrl,
+      id // intentTestCaseId for heal persistence
+    );
+
+    logger.info('[PREVIEW_CONTROLLER] Converted intent steps to commands', {
+      intentTestCaseId: id,
+      stepsCount: testCase.stepsJson.length,
+      commandsCount: commands.length,
+      stepsWithCompiled: testCase.stepsJson.filter(s => !!s.compiled).length,
+    });
+
+    // 5. Build test request for ManualTestService
+    // NOTE: Credits check/deduction should be handled by CreditCostTrackerService
+    // before calling this endpoint (similar to other test run flows)
+    const testRequest = {
+      url: targetUrl,
+      projectId,
+      userId,
+      browsers,
+      // Pass commands for execution
+      commands,
+      // Additional metadata
+      testGoal: testCase.description || `Run intent test: ${testCase.name}`,
+      intelligentMode: false, // Intent tests use pre-defined steps, not AI exploration
+      options: {
+        mode: 'lite' as const,
+      },
+      // Link back to intent test case for reporting
+      metadata: {
+        intentTestCaseId: id,
+        intentTestCaseName: testCase.name,
+        source: 'intent_test_case',
+      },
+    };
+
+    // 6. Run the test via ManualTestService
+    const result = await ManualTestService.runTest(testRequest as any);
+
+    if (!result.success) {
+      logger.error('[PREVIEW_CONTROLLER] Failed to run intent test case', {
+        intentTestCaseId: id,
+        error: result.message,
+      });
+      res.status(500).json({ error: result.message || 'Failed to run test' });
+      return;
+    }
+
+    logger.info('[PREVIEW_CONTROLLER] Intent test case run started', {
+      intentTestCaseId: id,
+      testId: result.data?.id,
+      browsers,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        testId: result.data?.id,
+        intentTestCaseId: id,
+        browsers,
+        stepsCount: testCase.stepsJson.length,
+        commandsCount: commands.length,
+      },
+      message: result.message === 'ACTIVE_TEST_REUSED' 
+        ? 'Existing active test reused' 
+        : 'Test run started',
+    });
+  } catch (error) {
+    logger.error('[PREVIEW_CONTROLLER] Failed to run intent test case', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    const message = error instanceof Error ? error.message : 'Failed to run test case';
+    const statusCode = (error as any)?.name === 'ValidationError' ? 400 : 500;
+    res.status(statusCode).json({ error: message });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2: BATCH RUN - Multiple test cases in parallel
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Run multiple intent test cases in parallel
+ * 
+ * POST /api/v1/preview/intent-test-cases/batch-run
+ * 
+ * Body:
+ * {
+ *   testCaseIds: string[],   // Array of intent test case IDs to run
+ *   browsers?: string[],     // Optional browser override
+ *   concurrency?: number     // Max parallel runs (default: 3)
+ * }
+ */
+export async function batchRunIntentTestCases(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = (req as any).user?.id;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const { 
+      testCaseIds, 
+      browsers = ['chromium'], 
+      concurrency = 3 
+    } = req.body;
+
+    // Validate input
+    if (!Array.isArray(testCaseIds) || testCaseIds.length === 0) {
+      res.status(400).json({ error: 'testCaseIds must be a non-empty array' });
+      return;
+    }
+
+    if (testCaseIds.length > 20) {
+      res.status(400).json({ error: 'Maximum 20 test cases per batch' });
+      return;
+    }
+
+    logger.info('[PREVIEW_CONTROLLER] Starting batch run', {
+      userId,
+      testCaseCount: testCaseIds.length,
+      browsers,
+      concurrency: Math.min(concurrency, 5),
+    });
+
+    // Load all test cases in parallel
+    const testCasePromises = testCaseIds.map(id => IntentTestCaseService.getById(id, userId));
+    const testCases = await Promise.all(testCasePromises);
+
+    // Filter out not-found cases
+    const validTestCases = testCases.filter(tc => tc !== null);
+    const notFoundIds = testCaseIds.filter((_, i) => testCases[i] === null);
+
+    if (validTestCases.length === 0) {
+      res.status(404).json({ error: 'No valid test cases found' });
+      return;
+    }
+
+    // Run tests with controlled concurrency
+    const maxConcurrency = Math.min(concurrency, 5);
+    const results: Array<{
+      intentTestCaseId: string;
+      testId?: string;
+      success: boolean;
+      error?: string;
+    }> = [];
+
+    // Process in batches for concurrency control
+    for (let i = 0; i < validTestCases.length; i += maxConcurrency) {
+      const batch = validTestCases.slice(i, i + maxConcurrency);
+      
+      const batchResults = await Promise.allSettled(
+        batch.map(async (testCase) => {
+          try {
+            // Get target URL (prefer url, fallback to startUrl)
+            const targetUrl = testCase!.url || testCase!.startUrl;
+            if (!targetUrl) {
+              throw new Error(`No URL specified for test case ${testCase!.id}`);
+            }
+
+            // Convert steps to commands
+            const commands = IntentStepConverterService.convertToCommands(
+              testCase!.stepsJson,
+              targetUrl,
+              testCase!.id
+            );
+
+            // Build test request
+            const testRequest = {
+              url: targetUrl,
+              projectId: testCase!.projectId,
+              userId,
+              browsers,
+              commands,
+              testGoal: testCase!.description || `Run intent test: ${testCase!.name}`,
+              intelligentMode: false,
+              options: { mode: 'lite' as const },
+              metadata: {
+                intentTestCaseId: testCase!.id,
+                intentTestCaseName: testCase!.name,
+                source: 'intent_test_case',
+                batchRun: true,
+              },
+            };
+
+            // Run test
+            const result = await ManualTestService.runTest(testRequest as any);
+
+            return {
+              intentTestCaseId: testCase!.id,
+              testId: result.data?.id,
+              success: result.success,
+              error: result.success ? undefined : result.message,
+            };
+          } catch (error) {
+            return {
+              intentTestCaseId: testCase!.id,
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        })
+      );
+
+      // Collect results
+      for (const result of batchResults) {
+        if (result.status === 'fulfilled') {
+          results.push(result.value);
+        } else {
+          // This shouldn't happen with our try/catch, but just in case
+          results.push({
+            intentTestCaseId: 'unknown',
+            success: false,
+            error: result.reason?.message || 'Unknown error',
+          });
+        }
+      }
+    }
+
+    // Summary
+    const successCount = results.filter(r => r.success).length;
+    const failureCount = results.filter(r => !r.success).length;
+
+    logger.info('[PREVIEW_CONTROLLER] Batch run completed', {
+      userId,
+      totalRequested: testCaseIds.length,
+      successCount,
+      failureCount,
+      notFoundCount: notFoundIds.length,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        results,
+        summary: {
+          total: testCaseIds.length,
+          started: successCount,
+          failed: failureCount,
+          notFound: notFoundIds.length,
+          notFoundIds,
+        },
+      },
+      message: `Batch run started: ${successCount} tests running, ${failureCount} failed`,
+    });
+  } catch (error) {
+    logger.error('[PREVIEW_CONTROLLER] Batch run failed', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    const message = error instanceof Error ? error.message : 'Batch run failed';
+    res.status(500).json({ error: message });
   }
 }

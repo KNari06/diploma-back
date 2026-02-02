@@ -1,6 +1,7 @@
 /**
- * Saved Test Cases Routes
- * API routes for saved_test_cases CRUD with AI dependency suggestions.
+ * Saved Test Cases Routes (Compatibility Layer)
+ * API routes for intent_test_cases CRUD with AI dependency suggestions.
+ * These routes maintain backward compatibility at /api/v1/saved-test-cases.
  */
 
 import { requireAuth } from '@/middleware/auth.middleware';
@@ -183,7 +184,7 @@ router.put('/:id/flow', requireAuth, assignToFlow);
  *                 items:
  *                   type: string
  *                   format: uuid
- *                 description: Array of saved_test_cases IDs this case depends on
+ *                 description: Array of intent_test_cases IDs this case depends on
  *     responses:
  *       200:
  *         description: Dependencies saved successfully

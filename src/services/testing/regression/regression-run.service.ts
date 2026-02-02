@@ -34,14 +34,15 @@ const MAX_LIST_LIMIT = 500;
  */
 export class RegressionRunService {
   /**
-   * Run a saved test case
+   * Run an intent test case (unified table for UI test cases)
+   * Method name kept as runSavedTestCase for API compatibility.
    *
-   * @param params.savedTestCaseId - ID of saved test case to run
+   * @param params.savedTestCaseId - ID of intent_test_cases to run
    * @param params.userId - User ID for ownership verification
    * @param params.trigger - Trigger type ('manual' via API or 'chat' via AI command)
    * @param params.parameters - Runtime parameters for parameterized values
    * @returns Regression run ID and underlying test ID
-   * @throws {NotFoundError} If saved test case not found
+   * @throws {NotFoundError} If intent test case not found
    * @throws {ValidationError} If validation fails or access denied
    */
   static async runSavedTestCase(params: {
@@ -53,24 +54,24 @@ export class RegressionRunService {
     runId: string;
     testId: string;
   }> {
-    const { savedTestCaseId, userId, trigger, parameters = {} } = params;
+    const { savedTestCaseId: intentTestCaseId, userId, trigger, parameters = {} } = params;
 
     try {
-      logger.info('[REGRESSION_RUN] Running saved test case', {
-        savedTestCaseId,
+      logger.info('[REGRESSION_RUN] Running intent test case', {
+        intentTestCaseId,
         userId,
         trigger,
       });
 
-      // 1. Get saved test case
-      const savedCase = await this.getSavedTestCase(savedTestCaseId, userId);
+      // 1. Get intent test case
+      const intentCase = await this.getSavedTestCase(intentTestCaseId, userId);
 
-      // 2. Create regression run record
+      // 2. Create regression run record (now uses intent_test_case_id)
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
         .insert({
-          saved_test_case_id: savedTestCaseId,
-          project_id: savedCase.project_id,
+          intent_test_case_id: intentTestCaseId,
+          project_id: intentCase.project_id,
           user_id: userId,
           trigger,
           status: 'running',
@@ -82,8 +83,8 @@ export class RegressionRunService {
         throw new Error(`Failed to create regression run: ${runError?.message}`);
       }
 
-      // 3. Build test request from saved case
-      const testRequest = await this.buildTestRequest(savedCase, userId, parameters);
+      // 3. Build test request from intent case
+      const testRequest = await this.buildTestRequest(intentCase, userId, parameters);
 
       // 4. Execute test using existing test service
       const testResult = await ManualTestService.runTest(testRequest);
@@ -111,7 +112,7 @@ export class RegressionRunService {
       logger.info('[REGRESSION_RUN] Test execution started', {
         runId: run.id,
         testId,
-        savedTestCaseId,
+        intentTestCaseId,
       });
 
       return {
@@ -119,9 +120,9 @@ export class RegressionRunService {
         testId,
       };
     } catch (error) {
-      logger.error('[REGRESSION_RUN] Failed to run saved test case', {
+      logger.error('[REGRESSION_RUN] Failed to run intent test case', {
         error,
-        savedTestCaseId,
+        intentTestCaseId,
       });
       throw error;
     }
@@ -263,36 +264,38 @@ export class RegressionRunService {
   }
 
   /**
-   * Get saved test case and verify access
+   * Get intent test case and verify access
+   * Now fetches from intent_test_cases (unified table).
    *
-   * @throws {NotFoundError} If saved test case not found
+   * @throws {NotFoundError} If intent test case not found
    * @throws {ValidationError} If access denied
    */
   private static async getSavedTestCase(
-    savedTestCaseId: string,
+    intentTestCaseId: string,
     userId: string
   ): Promise<any> {
-    const { data: savedCase, error } = await supabaseAdmin
-      .from('saved_test_cases')
+    const { data: intentCase, error } = await supabaseAdmin
+      .from('intent_test_cases')
       .select('*, projects!inner(user_id)')
-      .eq('id', savedTestCaseId)
+      .eq('id', intentTestCaseId)
       .single();
 
-    if (error || !savedCase) {
-      throw new NotFoundError('Saved test case', savedTestCaseId);
+    if (error || !intentCase) {
+      throw new NotFoundError('Intent test case', intentTestCaseId);
     }
 
-    // ✅ FIX: Handle projects as object (when using single())
-    const projectUserId = (savedCase.projects as any)?.user_id;
+    // Verify user has access via project ownership
+    const projectUserId = (intentCase.projects as any)?.user_id;
     if (!projectUserId || projectUserId !== userId) {
-      throw new ValidationError('Access denied to this saved test case');
+      throw new ValidationError('Access denied to this intent test case');
     }
 
-    return savedCase;
+    return intentCase;
   }
 
   /**
    * Get suite with all test cases
+   * Now fetches test cases from intent_test_cases (unified table).
    *
    * @throws {NotFoundError} If suite not found
    * @throws {ValidationError} If access denied
@@ -312,16 +315,16 @@ export class RegressionRunService {
       throw new NotFoundError('Suite', suiteId);
     }
 
-    // ✅ FIX: Handle projects as object (when using single())
+    // Verify user has access via project ownership
     const projectUserId = (suite.projects as any)?.user_id;
     if (!projectUserId || projectUserId !== userId) {
       throw new ValidationError('Access denied to this suite');
     }
 
-    // Get test cases
+    // Get test cases from intent_test_cases via suite items
     const { data: items, error: itemsError } = await supabaseAdmin
       .from('regression_suite_items')
-      .select('*, saved_test_cases(*)')
+      .select('*, intent_test_cases(*)')
       .eq('suite_id', suiteId)
       .order('order_index', { ascending: true });
 
@@ -329,19 +332,20 @@ export class RegressionRunService {
       throw new Error(`Failed to get suite items: ${itemsError.message}`);
     }
 
-    const testCases = (items || []).map((item: any) => item.saved_test_cases);
+    const testCases = (items || []).map((item: any) => item.intent_test_cases);
 
     return { suite, testCases };
   }
 
   /**
-   * Build test request from saved case
-   * Constructs a test execution request with parameterized values
+   * Build test request from intent test case
+   * Constructs a test execution request with parameterized values.
+   * Uses url field with fallback to start_url for compatibility.
    *
-   * @throws {ValidationError} If saved case has no replayable data or URL
+   * @throws {ValidationError} If intent case has no replayable data or URL
    */
   private static async buildTestRequest(
-    savedCase: any,
+    intentCase: any,
     userId: string,
     parameters: Record<string, any>
   ): Promise<any> {
@@ -349,35 +353,36 @@ export class RegressionRunService {
     const { data: sourceTest } = await supabaseAdmin
       .from('tests')
       .select('browsers, options')
-      .eq('id', savedCase.source_test_id)
+      .eq('id', intentCase.source_test_id)
       .maybeSingle();
 
     let commands: any[] = [];
 
     // Extract commands based on strategy
-    if (savedCase.replay_strategy === 'commands' && savedCase.commands) {
-      commands = this.applyParameters(savedCase.commands, parameters);
-    } else if (savedCase.replay_strategy === 'graph_extract' && savedCase.graph_ref?.steps) {
-      commands = this.applyParameters(savedCase.graph_ref.steps, parameters);
+    if (intentCase.replay_strategy === 'commands' && intentCase.commands) {
+      commands = this.applyParameters(intentCase.commands, parameters);
+    } else if (intentCase.replay_strategy === 'graph_extract' && intentCase.graph_ref?.steps) {
+      commands = this.applyParameters(intentCase.graph_ref.steps, parameters);
     } else {
-      throw new ValidationError('Saved test case has no replayable data');
+      throw new ValidationError('Intent test case has no replayable data');
     }
 
-    // Validate URL exists (no unsafe fallback)
-    if (!savedCase.url) {
+    // Validate URL exists (with fallback to start_url)
+    const targetUrl = intentCase.url || intentCase.start_url;
+    if (!targetUrl) {
       throw new ValidationError(
-        'Saved test case has no URL. Please re-save the test case with a valid URL.'
+        'Intent test case has no URL. Please update the test case with a valid URL.'
       );
     }
 
     // Build request
     return {
-      url: savedCase.url, // Use persisted URL from saved_test_cases
-      projectId: savedCase.project_id,
+      url: targetUrl, // Use url with fallback to start_url
+      projectId: intentCase.project_id,
       userId,
       browsers: sourceTest?.browsers || ['chrome'],
-      intelligentMode: true, // Use intelligent mode for saved cases
-      testGoal: savedCase.description || savedCase.name,
+      intelligentMode: true, // Use intelligent mode for regression cases
+      testGoal: intentCase.description || intentCase.name,
       commands, // Pre-generated commands
       options: sourceTest?.options || {},
     };
@@ -467,15 +472,16 @@ export class RegressionRunService {
     // Apply limit bounds
     const safeLimit = Math.min(Math.max(limit, 1), MAX_LIST_LIMIT);
 
+    // Now fetches from intent_test_cases (unified table)
     const { data: cases, error } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('*')
       .eq('project_id', projectId)
       .order('created_at', { ascending: false })
       .limit(safeLimit);
 
     if (error) {
-      throw new Error(`Failed to list saved test cases: ${error.message}`);
+      throw new Error(`Failed to list intent test cases: ${error.message}`);
     }
 
     return cases || [];
@@ -898,9 +904,9 @@ export class RegressionRunService {
       // Verify project access
       await this.verifyProjectAccess(projectId, userId);
 
-      // Get UI test cases with tag
+      // Get UI test cases with tag from intent_test_cases (unified table)
       const { data: uiCases } = await supabaseAdmin
-        .from('saved_test_cases')
+        .from('intent_test_cases')
         .select('id, flow_id')
         .eq('project_id', projectId)
         .contains('tags', [tag]);
@@ -993,9 +999,9 @@ export class RegressionRunService {
       // Verify project access
       await this.verifyProjectAccess(projectId, userId);
 
-      // Get UI test cases with priority
+      // Get UI test cases with priority from intent_test_cases (unified table)
       const { data: uiCases } = await supabaseAdmin
-        .from('saved_test_cases')
+        .from('intent_test_cases')
         .select('id, flow_id')
         .eq('project_id', projectId)
         .eq('priority', priority);
@@ -1137,9 +1143,9 @@ export class RegressionRunService {
       flowId?: string;
     }> = [];
 
-    // UI test cases
+    // UI test cases from intent_test_cases (unified table)
     const { data: uiCases, error: uiError } = await supabaseAdmin
-      .from('saved_test_cases')
+      .from('intent_test_cases')
       .select('id, flow_id')
       .in('flow_id', flowIds);
 

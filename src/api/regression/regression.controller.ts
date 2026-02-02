@@ -103,15 +103,15 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
         return;
       }
 
-      // Update flow_id (ensure update succeeded)
+      // Update flow_id in intent_test_cases (unified table)
       const { error: updateError } = await supabaseAdmin
-        .from('saved_test_cases')
+        .from('intent_test_cases')
         .update({ flow_id: flowId })
         .eq('id', result.savedTestCaseId)
         .eq('user_id', userId);
 
       if (updateError) {
-        throw new Error(`Failed to assign saved test case to flow: ${updateError.message}`);
+        throw new Error(`Failed to assign intent test case to flow: ${updateError.message}`);
       }
 
       // Get AI suggestions

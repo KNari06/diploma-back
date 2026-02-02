@@ -85,23 +85,25 @@ export async function emitSnapshotIfChanged(
   const forceEmit = options?.forceEmit ?? false;
 
   try {
-    const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+    const { getPreviewSessionService, getPreviewVideoStreamRegistry } =
+      await import('@/services/testing/ui/preview');
     const sessionService = getPreviewSessionService();
 
     const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
       force: true,
-      includeScreenshot: true,
+      includeDomNodes: forceEmit, // Include domNodes when forced
       onlyIfChanged: !forceEmit, // Skip change-gate when forceEmit=true
     });
 
     // Emit when forceEmit or when change was detected
-    if (snapshot && (forceEmit || snapshot.changed !== false)) {
+    if (snapshot && (forceEmit || snapshot.changed)) {
       const room = createRoomName('preview', previewSessionId);
       const payload = {
         previewSessionId,
         url: snapshot.url,
+        domVersion: snapshot.domVersion,
+        pageSignature: snapshot.pageSignature,
         domNodes: snapshot.domNodes,
-        screenshot: snapshot.screenshot,
         timestamp: new Date().toISOString(),
       };
 
@@ -110,10 +112,13 @@ export async function emitSnapshotIfChanged(
       // Emit to other subscribers
       socket.to(room).emit('preview:page', payload);
 
+      // Update video stream with new DOM version
+      getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
+
       logger.debug('[WebSocket] Emitted preview:page after input', {
         socketId: socket.id,
         previewSessionId,
-        hasScreenshot: !!snapshot.screenshot,
+        domVersion: snapshot.domVersion,
         forceEmit,
       });
     }

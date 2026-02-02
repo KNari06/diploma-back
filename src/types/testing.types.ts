@@ -291,50 +291,92 @@ export interface UpdateTestFixtureParams {
 }
 
 // ============================================================================
-// SAVED TEST CASE
+// INTENT TEST CASE (UNIFIED UI TEST CASE)
 // ============================================================================
 
 /**
- * Saved test case - reusable UI test for regression
+ * Intent test case status for lifecycle management
  */
-export interface SavedTestCase {
+export type IntentTestCaseStatus = 'draft' | 'published' | 'archived';
+
+/**
+ * Intent test case - unified UI test for authoring and regression
+ * This is the single source of truth for UI test cases.
+ * 
+ * @deprecated SavedTestCase - use IntentTestCase instead
+ */
+export interface IntentTestCase {
   id: string;
   projectId: string;
   userId: string;
-  sourceTestId?: string;
-  sourceIntelligentSessionId?: string;
+  
+  // Basic info
   name: string;
   description?: string;
-  kind: 'standalone' | 'regression_member';
-  replayStrategy: 'commands' | 'graph_extract';
+  
+  // URL fields
+  startUrl?: string;
   url?: string;
+  
+  // Lifecycle
+  status: IntentTestCaseStatus;
+  kind: 'standalone' | 'regression_member';
+  
+  // Replay data
+  replayStrategy?: 'commands' | 'graph_extract';
+  commands?: any[];
+  graphRef?: any;
+  parametersSchema?: Record<string, any>;
+  
+  // Steps for authoring
+  stepsJson?: any[];
+  
+  // Organization
   flowId?: string;
-  tags: string[];
+  dependsOn?: string[];
+  
+  // Metadata
+  tags?: string[];
   priority?: Priority;
-  preconditions: any[];
-  setupSteps: any[];
-  teardownSteps: any[];
+  preconditions?: any[];
+  setupSteps?: any[];
+  teardownSteps?: any[];
   expectedResult?: string;
-  dependsOn: string[];
+  
+  // Provenance
+  sourceTestId?: string;
+  sourceIntelligentSessionId?: string;
+  
   createdAt: string;
   updatedAt: string;
 }
 
 /**
+ * @deprecated Use IntentTestCase instead
+ * Kept for API compatibility during migration
+ */
+export type SavedTestCase = IntentTestCase;
+
+/**
  * Dependency suggestion from AI
  */
 export interface DependencySuggestion {
-  id: string;           // saved_test_cases.id of the suggested dependency
+  id: string;           // intent_test_cases.id of the suggested dependency
   confidence: number;   // 0.0 - 1.0
   reason: string;       // Human-readable explanation
 }
 
 /**
- * Saved test case response with AI suggestions (for create/update)
+ * Intent test case response with AI suggestions (for create/update)
  */
-export interface SavedTestCaseWithSuggestions extends SavedTestCase {
+export interface IntentTestCaseWithSuggestions extends IntentTestCase {
   suggestedDependsOn: DependencySuggestion[];
 }
+
+/**
+ * @deprecated Use IntentTestCaseWithSuggestions instead
+ */
+export type SavedTestCaseWithSuggestions = IntentTestCaseWithSuggestions;
 
 // ============================================================================
 // REGRESSION PLAN

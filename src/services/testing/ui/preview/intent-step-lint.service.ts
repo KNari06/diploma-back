@@ -375,7 +375,9 @@ export class IntentStepLintService {
     try {
       // Get DOM nodes from preview session
       const sessionService = getPreviewSessionService();
-      const snapshot = await sessionService.getSnapshot(previewSessionId, userId);
+      const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
+        includeDomNodes: true, // Always need domNodes for linting
+      });
 
       if (!snapshot) {
         return {
@@ -387,7 +389,7 @@ export class IntentStepLintService {
         };
       }
 
-      const domNodes = snapshot.domNodes;
+      const domNodes = snapshot.domNodes ?? [];
 
       // Non-targeting actions (navigate, wait, assert without target)
       if (['navigate', 'wait'].includes(stepDraft.type)) {
@@ -640,26 +642,30 @@ export class IntentStepLintService {
   }
 
   /**
-   * V4: Lint step with embeddings-based semantic matching (PRIMARY)
+   * V5: Lint step with embeddings-based semantic matching (PRIMARY)
    *
-   * Pipeline:
-   * 1. Try embeddings-based resolver (multilingual, no hardcoded dictionaries)
-   * 2. If embeddings failed (degradedMode) → fall back to rule-based + LLM
-   * 3. If needs_clarification → generate clarification question with LLM
-   * 4. Return result with metrics
+   * Architecture (V3/V5):
+   * 1. Evidence shortcut (if enabled)
+   * 2. Embeddings-based resolver with HardAllowed/SoftAllowed sets
+   * 3. Count-based decision: 0→AI, 1→resolved, >1→needs_clarification
+   * 4. For needs_clarification: generate LLM message (no candidates by default)
+   * 5. Candidates only returned when includeAlternatives=true
    */
   static async lintStepWithAI(params: {
     previewSessionId: string;
     stepDraft: IntentStep;
     pageRef?: string;
     userId: string;
+    /** V5: When true, include full candidate list (for "Show alternatives") */
+    includeAlternatives?: boolean;
   }): Promise<LintResult> {
-    const { previewSessionId, stepDraft, userId } = params;
+    const { previewSessionId, stepDraft, userId, includeAlternatives = false } = params;
 
-    logger.debug('[INTENT_LINT_V4] Linting step with embeddings', {
+    logger.debug('[INTENT_LINT_V5] Linting step with embeddings', {
       previewSessionId,
       stepType: stepDraft.type,
       description: stepDraft.description.slice(0, 50),
+      includeAlternatives,
     });
 
     // Non-targeting actions don't need element resolution
@@ -675,7 +681,9 @@ export class IntentStepLintService {
 
     // Get snapshot
     const sessionService = getPreviewSessionService();
-    const snapshot = await sessionService.getSnapshot(previewSessionId, userId);
+    const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
+      includeDomNodes: true, // Always need domNodes for linting
+    });
 
     if (!snapshot) {
       return {
@@ -687,6 +695,8 @@ export class IntentStepLintService {
       };
     }
 
+    const domNodes = snapshot.domNodes ?? [];
+
     // ═══════════════════════════════════════════════════════════════════════════
     // V5: Evidence shortcut - try lastSuccessRef first (when caching is enabled)
     // ═══════════════════════════════════════════════════════════════════════════
@@ -694,7 +704,7 @@ export class IntentStepLintService {
 
     if (!disableCaching && stepDraft.evidence?.lastSuccessRef) {
       const cachedRef = stepDraft.evidence.lastSuccessRef;
-      const cachedNode = snapshot.domNodes.find(n => n.ref === cachedRef);
+      const cachedNode = domNodes.find(n => n.ref === cachedRef);
 
       // Minimal validation: exists, visible, not disabled
       if (cachedNode && cachedNode.isVisible !== false && cachedNode.isDisabled !== true) {
@@ -714,7 +724,7 @@ export class IntentStepLintService {
             reason: 'Evidence shortcut (lastSuccessRef)',
             confidence: 0.95,
             boundingBox: cachedNode.boundingBox,
-            node: cachedNode, // Include full node for compiled plan generation
+            node: cachedNode,
           }],
           highlight: [{
             ref: cachedRef,
@@ -735,48 +745,107 @@ export class IntentStepLintService {
       });
     }
 
-    // Step 1: Try embeddings-based resolver (PRIMARY)
+    // Step 1: Try embeddings-based resolver (PRIMARY) with includeAlternatives flag
     const embeddingsResult = await resolveWithEmbeddings({
       previewSessionId,
       stepDraft,
-      domNodes: snapshot.domNodes,
+      domNodes,
       pageUrl: snapshot.url,
-      disableCaching, // V5: Pass disableCaching to skip embeddings cache
+      disableCaching,
+      includeAlternatives, // V5: Pass flag to control candidate inclusion
     });
 
     // Step 2: If embeddings failed, fall back to rule-based + LLM
     if (embeddingsResult.degradedMode) {
-      logger.warn('[INTENT_LINT_V4] Embeddings degraded, falling back to rule-based', {
+      logger.warn('[INTENT_LINT_V5] Embeddings degraded, falling back to rule-based', {
         previewSessionId,
         degradedReason: embeddingsResult.degradedReason,
       });
 
       // Use old rule-based + LLM fallback
-      return this.lintStepWithRuleBasedFallback(params, snapshot);
+      return this.lintStepWithRuleBasedFallback(params, { url: snapshot.url, domNodes });
     }
 
-    // Step 3: If needs_clarification, generate clarification question with LLM
-    if (embeddingsResult.status === 'needs_clarification' && embeddingsResult.candidates.length > 0) {
-      // Generate clarification question using LLM (text only, not selection)
+    // Step 2.5: V2 - Handle semantic-zero with explicit AI fallback
+    // When we found elements but none semantically match the description
+    if (embeddingsResult.needsAiFallback && (embeddingsResult as any).aiFallbackReason === 'semantic_zero') {
+      logger.info('[INTENT_LINT_V5] Semantic-zero detected, triggering AI fallback', {
+        previewSessionId,
+        topSimilarity: embeddingsResult.topSimilarity,
+      });
+
+      // Generate a helpful clarification message using AI
       const clarifyResult = await this.generateClarificationQuestion({
         userIntent: sanitizeIntent(stepDraft),
         actionType: stepDraft.type,
         pageUrl: snapshot.url,
-        candidates: embeddingsResult.candidates,
-        domNodes: snapshot.domNodes,
+        candidates: embeddingsResult.candidates.slice(0, 5), // Use top candidates for context
+        domNodes,
+        isSemanticZero: true, // V2: Flag for semantic-zero specific messaging
       });
 
-      if (clarifyResult.question) {
-        return {
-          ...embeddingsResult,
-          message: clarifyResult.question,
-          clarificationQuestion: clarifyResult.question,
-          interpretation: clarifyResult.interpretation,
-        };
+      // Build descriptive message
+      let message = clarifyResult.question || 
+        `I found some elements but none seem to match "${stepDraft.description}". Could you describe the element more specifically?`;
+      
+      if (clarifyResult.examples && clarifyResult.examples.length > 0) {
+        message += `\n\nTry being more specific, like:\n${clarifyResult.examples.map(e => `• "${e}"`).join('\n')}`;
       }
+
+      return {
+        ...embeddingsResult,
+        status: 'needs_clarification', // Change to needs_clarification for UI handling
+        message,
+        clarificationQuestion: clarifyResult.question,
+        interpretation: clarifyResult.interpretation,
+        needsAiFallback: true,
+        aiFallbackReason: 'semantic_zero',
+      };
     }
 
-    // Step 4: Return embeddings result
+    // Step 3: If needs_clarification, generate LLM clarification message
+    if (embeddingsResult.status === 'needs_clarification') {
+      // For clarification, we always need candidates for LLM context (even if not returned to frontend)
+      // Temporarily fetch candidates for LLM if not already included
+      let candidatesForLLM = embeddingsResult.candidates;
+      if (candidatesForLLM.length === 0) {
+        // Re-resolve with includeAlternatives=true just for LLM context
+        const withCandidates = await resolveWithEmbeddings({
+          previewSessionId,
+          stepDraft,
+          domNodes,
+          pageUrl: snapshot.url,
+          disableCaching: true, // Don't cache this auxiliary call
+          includeAlternatives: true,
+        });
+        candidatesForLLM = withCandidates.candidates;
+      }
+
+      // Generate clarification message using LLM
+      const clarifyResult = await this.generateClarificationQuestion({
+        userIntent: sanitizeIntent(stepDraft),
+        actionType: stepDraft.type,
+        pageUrl: snapshot.url,
+        candidates: candidatesForLLM,
+        domNodes,
+      });
+
+      // Build the message with examples if available
+      let message = clarifyResult.question || embeddingsResult.message;
+      if (clarifyResult.examples && clarifyResult.examples.length > 0) {
+        message += `\n\nExamples:\n${clarifyResult.examples.map(e => `• "${e}"`).join('\n')}`;
+      }
+
+      return {
+        ...embeddingsResult,
+        message,
+        clarificationQuestion: clarifyResult.question,
+        interpretation: clarifyResult.interpretation,
+        // V5: candidates and highlight already controlled by includeAlternatives in embeddingsResult
+      };
+    }
+
+    // Step 4: Return embeddings result as-is
     return embeddingsResult;
   }
 
@@ -866,8 +935,16 @@ export class IntentStepLintService {
   }
 
   /**
-   * V4: Generate clarification question using LLM
-   * Only generates text, does NOT select elements (already ranked by embeddings)
+   * V5: Generate clarification message with examples using LLM
+   * 
+   * Generates helpful text that teaches user how to write better descriptions.
+   * Uses Momentic-style hints: role/label/quotes/inside/above/below/closest/nth
+   * 
+   * Does NOT select elements - just helps user refine their description.
+   */
+  /**
+   * V5: Generate LLM clarification question for ambiguous or semantic-zero cases
+   * V2 update: Added isSemanticZero flag for different messaging approach
    */
   private static async generateClarificationQuestion(params: {
     userIntent: string;
@@ -875,38 +952,61 @@ export class IntentStepLintService {
     pageUrl: string;
     candidates: LintCandidate[];
     domNodes: InteractiveNode[];
+    /** V2: Flag indicating semantic-zero scenario (no good matches found) */
+    isSemanticZero?: boolean;
   }): Promise<{
     question?: string;
     interpretation?: string;
+    examples?: string[];
   }> {
     try {
       const { getChatCompletionWithMessages } = await import('@/services/ai/core/openai.service');
 
-      // Build candidate descriptions
+      // Build candidate descriptions for context
       const candidateList = params.candidates.slice(0, 3).map((c, i) => {
         const node = params.domNodes.find(n => n.ref === c.ref);
-        return `${i + 1}. "${c.label}" (${node?.tag || 'element'})`;
+        const details: string[] = [];
+        if (node?.labelText) details.push(`label="${node.labelText}"`);
+        if (node?.ariaLabel) details.push(`aria="${node.ariaLabel}"`);
+        if (node?.placeholder) details.push(`placeholder="${node.placeholder}"`);
+        if (node?.autocomplete) details.push(`autocomplete="${node.autocomplete}"`);
+        if (node?.containerTitles?.length) details.push(`in section "${node.containerTitles[0]}"`);
+        return `${i + 1}. <${node?.tag || 'element'}> ${details.join(', ')}`;
       }).join('\n');
 
-      const prompt = `You are helping a user select the correct UI element for a test step.
+      // V2: Different prompt for semantic-zero vs multiple matches
+      const scenarioContext = params.isSemanticZero
+        ? `The user wrote "${params.userIntent}" for a ${params.actionType} action, but NONE of the elements on the page seem to match this description. The elements below are the closest we found, but similarity is very low.`
+        : `The user wrote "${params.userIntent}" for a ${params.actionType} action, but it matches multiple elements.`;
 
-USER INTENT: "${params.userIntent}"
-ACTION: ${params.actionType}
+      const prompt = `You are helping a user write a clearer element description for UI testing.
+${scenarioContext}
 
-CANDIDATE ELEMENTS (already ranked by relevance):
+MATCHING ELEMENTS:
 ${candidateList}
 
-Generate a SHORT clarification question in the SAME LANGUAGE as the user's intent.
-The question should help the user choose between these specific elements.
+Generate a helpful message and 2-3 example descriptions that would uniquely identify ONE element.
 
-Reply with JSON only:
-{"question": "brief question in user's language", "interpretation": "what user wants to do"}`;
+Use these patterns in examples:
+- Exact text in quotes: 'Submit' button, 'Email' input
+- Role mentions: the password input, the login button
+- Position hints: above the "Sign Up" link, inside the "Login" form
+- Label references: the 'Username' field, input with placeholder 'Enter email'
+
+Respond in the SAME LANGUAGE as the user's original intent.
+
+Reply with JSON:
+{
+  "message": "Brief helpful message explaining the issue (1 sentence)",
+  "examples": ["example 1", "example 2"],
+  "interpretation": "What the user wants to do"
+}`;
 
       const result = await getChatCompletionWithMessages(
         [{ role: 'user', content: prompt }],
         {
-          max_tokens: 100,
-          temperature: 0.1,
+          max_tokens: 200,
+          temperature: 0.2,
           model: 'gpt-4o-mini',
           response_format: { type: 'json_object' },
         }
@@ -914,14 +1014,19 @@ Reply with JSON only:
 
       const parsed = JSON.parse(result.content);
       return {
-        question: parsed.question,
+        question: parsed.message,
         interpretation: parsed.interpretation,
+        examples: parsed.examples,
       };
     } catch (error) {
-      logger.warn('[INTENT_LINT_V4] Clarification question generation failed', {
+      logger.warn('[INTENT_LINT_V5] Clarification message generation failed', {
         error: error instanceof Error ? error.message : String(error),
       });
-      return {};
+      // Fallback to a generic message
+      return {
+        question: 'Multiple elements match your description. Try using exact text in quotes or specify the element\'s position.',
+        examples: ["the 'Submit' button", "password input below the username field"],
+      };
     }
   }
 
