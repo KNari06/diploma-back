@@ -414,6 +414,67 @@ interface JiraStatus {
 }
 
 /**
+ * Get board details including location.projectKey (GET /rest/agile/1.0/board/{boardId})
+ */
+export async function getBoardDetails(
+  accessToken: string,
+  cloudId: string,
+  boardId: number | string
+): Promise<{ projectKey?: string }> {
+  const url = `${JIRA_API_URL}/ex/jira/${cloudId}/rest/agile/1.0/board/${encodeURIComponent(String(boardId))}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    logger.error('Failed to get board details', { status: response.status, error: errorText });
+    throw new Error(`Failed to get board details: ${response.status} ${errorText}`);
+  }
+
+  const data = (await response.json()) as { location?: { projectKey?: string } };
+  return { projectKey: data.location?.projectKey };
+}
+
+/**
+ * Get all statuses for a project (GET /rest/api/3/project/{projectKey}/statuses)
+ * Used as fallback when board configuration is unavailable (scope) to show empty columns
+ */
+export async function getProjectStatuses(
+  accessToken: string,
+  cloudId: string,
+  projectKey: string
+): Promise<string[]> {
+  const url = `${JIRA_API_URL}/ex/jira/${cloudId}/rest/api/3/project/${encodeURIComponent(projectKey)}/statuses`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    logger.error('Failed to get project statuses', { status: response.status, error: errorText });
+    throw new Error(`Failed to get project statuses: ${response.status} ${errorText}`);
+  }
+
+  const data = (await response.json()) as Array<{ statuses?: Array<{ name?: string }> }>;
+  const names = new Set<string>();
+  for (const it of data || []) {
+    for (const s of it.statuses || []) {
+      if (s?.name) names.add(s.name);
+    }
+  }
+  return Array.from(names);
+}
+
+/**
  * Get board configuration (Agile API: GET /rest/agile/1.0/board/{boardId}/configuration)
  */
 export async function getBoardConfiguration(

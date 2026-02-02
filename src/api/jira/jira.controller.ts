@@ -11,6 +11,8 @@ import {
   getJiraProjects,
   getJiraBoards,
   getBoardConfiguration,
+  getBoardDetails,
+  getProjectStatuses,
   getJiraStatuses,
   getBoardIssues,
   searchJiraIssues,
@@ -473,25 +475,38 @@ export const getIssues = async (req: Request, res: Response): Promise<void> => {
       }
     }
 
-    // Build columns: board config + any status from issues not in config (auto-add missing columns)
+    // Build columns: board config (or project statuses fallback) so empty columns show with 0 tasks
     const issueStatusNames = [...new Set(issues.map((i) => i.status?.name).filter(Boolean))] as string[];
     let columns: { name: string; statusNames: string[] }[] = [];
 
     const effectiveBoardId = boardId ?? (spaceKey ? (await getJiraBoards(accessToken, cloudIdToUse, spaceKey))[0]?.id : undefined);
+
     if (effectiveBoardId) {
-      const [config, statusMap] = await Promise.all([
-        getBoardConfiguration(accessToken, cloudIdToUse, effectiveBoardId),
-        getJiraStatuses(accessToken, cloudIdToUse),
-      ]);
-      columns = (config.columns || []).map((col) => {
-        const statusNames = (col.statuses || [])
-          .map((s) => statusMap[s.id] ?? s.id)
-          .filter(Boolean);
-        return {
-          name: col.name ?? '',
-          statusNames: statusNames.length > 0 ? statusNames : [col.name ?? ''],
-        };
-      });
+      try {
+        const [config, statusMap] = await Promise.all([
+          getBoardConfiguration(accessToken, cloudIdToUse, effectiveBoardId),
+          getJiraStatuses(accessToken, cloudIdToUse),
+        ]);
+        columns = (config.columns || []).map((col) => {
+          const statusNames = (col.statuses || [])
+            .map((s) => statusMap[s.id] ?? s.id)
+            .filter(Boolean);
+          return {
+            name: col.name ?? '',
+            statusNames: statusNames.length > 0 ? statusNames : [col.name ?? ''],
+          };
+        });
+      } catch (configErr) {
+        // Board config may require read:board-scope.admin - use project statuses as fallback
+        const projectKey =
+          spaceKey ||
+          (await getBoardDetails(accessToken, cloudIdToUse, effectiveBoardId).then((b) => b.projectKey)) ||
+          issues[0]?.project?.key;
+        if (projectKey) {
+          const statusNames = await getProjectStatuses(accessToken, cloudIdToUse, projectKey);
+          columns = statusNames.map((name) => ({ name, statusNames: [name] }));
+        }
+      }
     }
 
     const statusNamesInColumns = new Set(columns.flatMap((c) => c.statusNames));
