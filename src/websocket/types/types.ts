@@ -726,7 +726,7 @@ export interface PreviewStepLintRequest {
   previewSessionId: string;
   stepDraft: PreviewIntentStep;
   pageRef?: string; // Optional page reference (for cached context)
-  /** 
+  /**
    * V3: When true, include full candidate list in response (for "Show alternatives" button).
    * By default (false), needs_clarification only returns LLM message without candidate list.
    */
@@ -740,6 +740,8 @@ export interface PreviewStepApplyRequest {
   previewSessionId: string;
   stepDraft: PreviewIntentStep;
   pageRef?: string;
+  /** Optional: If provided, auto-persist appliedStep to this test case after successful apply */
+  intentTestCaseId?: string;
 }
 
 /**
@@ -803,7 +805,7 @@ export interface PreviewStepLintResultPayload {
   interpretation?: string;
   /** Clarification question from AI (in user's language) */
   clarificationQuestion?: string;
-  /** 
+  /**
    * V3: True if this is a response to "Show alternatives" request.
    * When true, candidates list is populated even for needs_clarification.
    */

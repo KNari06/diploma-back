@@ -1,9 +1,9 @@
 /**
  * Compiled Locator Executor
- * 
+ *
  * Executes locators from CompiledStepPlan with fallback chain.
  * Performs pageSignature check before attempting compiled locators.
- * 
+ *
  * Flow:
  * 1. Check pageSignature (if present) - mismatch = skip compiled entirely
  * 2. Check soft-expire based on actionType TTL
@@ -11,16 +11,16 @@
  * 4. Return success with used locator, or failure for fallback
  */
 
-import { logger } from '@/utils/core/logger';
-import { Locator, Page } from 'playwright';
 import type {
-  CompiledStepPlan,
-  ConfidenceTier,
-  LocatorEntry,
-  RuntimeSource,
-  StepRuntimeMeta,
+    CompiledStepPlan,
+    ConfidenceTier,
+    LocatorEntry,
+    RuntimeSource,
+    StepRuntimeMeta,
 } from '@/services/testing/ui/preview/preview.types';
 import { isCompiledPlanExpired } from '@/services/testing/ui/preview/preview.types';
+import { logger } from '@/utils/core/logger';
+import { Locator, Page } from 'playwright';
 
 /**
  * Result from compiled locator execution attempt
@@ -35,7 +35,7 @@ export interface CompiledExecutionResult {
   /** Confidence from the locator entry */
   confidence?: number;
   /** Reason for skipping/failure */
-  skipReason?: 'signature_mismatch' | 'expired' | 'no_plan' | 'locator_failed';
+  skipReason?: 'signature_mismatch' | 'expired' | 'no_plan' | 'locator_failed' | 'ambiguous';
   /** Whether compiled plan was expired */
   expired?: boolean;
   /** Whether page signature matched */
@@ -54,7 +54,7 @@ async function getCurrentPageSignature(page: Page): Promise<string> {
       // @ts-expect-error - runs in browser context
       const inputs = document.querySelectorAll('input, select, textarea, button, [role="button"]');
       const elements: string[] = [];
-      
+
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       inputs.forEach((el: any) => {
         const tag = el.tagName?.toLowerCase() || '';
@@ -64,11 +64,11 @@ async function getCurrentPageSignature(page: Page): Promise<string> {
         const role = el.getAttribute?.('role') || '';
         elements.push(`${tag}:${type}:${name}:${id}:${role}`);
       });
-      
+
       // Simple hash from sorted element signatures
       return elements.sort().join('|').slice(0, 500);
     });
-    
+
     return signature;
   } catch {
     return '';
@@ -89,12 +89,12 @@ async function checkPageSignature(
   }
 
   const currentSignature = await getCurrentPageSignature(page);
-  
+
   // Signatures don't need to be exact - just similar enough
   // Use simple overlap check (60% match is enough)
   const compiledParts = new Set(compiledSignature.split('|'));
   const currentParts = currentSignature.split('|');
-  
+
   if (compiledParts.size === 0 || currentParts.length === 0) {
     return { matched: true, currentSignature };
   }
@@ -126,7 +126,12 @@ async function tryLocatorEntry(
   page: Page,
   entry: LocatorEntry,
   timeout: number
-): Promise<{ success: boolean; locator?: Locator; error?: string }> {
+): Promise<{
+  success: boolean;
+  locator?: Locator;
+  error?: string;
+  failureKind?: 'ambiguous' | 'not_found' | 'error';
+}> {
   try {
     let locator: Locator;
 
@@ -168,32 +173,33 @@ async function tryLocatorEntry(
 
     // Wait for element to be visible (quick check)
     await locator.waitFor({ state: 'visible', timeout: Math.min(timeout, 5000) });
-    
+
     // Verify exactly one match (avoid ambiguity)
     const count = await locator.count();
     if (count === 0) {
-      return { success: false, error: 'No elements found' };
+      return { success: false, error: 'No elements found', failureKind: 'not_found' };
     }
     if (count > 1) {
-      // Multiple matches - use first but log warning
-      logger.warn('[COMPILED_EXECUTOR] Multiple elements matched, using first', {
+      // Multiple matches - treat as ambiguity for CI/background runs
+      // This forces fallback to resolver/self-heal instead of blindly clicking first
+      logger.warn('[COMPILED_EXECUTOR] Multiple elements matched - treating as ambiguous', {
         strategy: entry.strategy,
         value: entry.value,
         count,
       });
-      locator = locator.first();
+      return { success: false, error: `Ambiguous: ${count} elements matched`, failureKind: 'ambiguous' };
     }
 
     return { success: true, locator };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    return { success: false, error: errorMessage };
+    return { success: false, error: errorMessage, failureKind: 'error' };
   }
 }
 
 /**
  * Execute compiled locator plan
- * 
+ *
  * @param page Playwright Page
  * @param compiled CompiledStepPlan from IntentStep
  * @param actionType Action type for TTL calculation
@@ -248,6 +254,7 @@ export async function executeCompiledLocatorPlan(
   }
 
   // 4. Try each locator in order
+  let sawAmbiguous = false;
   for (const entry of compiled.locatorPlan) {
     logger.debug('[COMPILED_EXECUTOR] Trying locator', {
       strategy: entry.strategy,
@@ -256,13 +263,13 @@ export async function executeCompiledLocatorPlan(
     });
 
     const result = await tryLocatorEntry(page, entry, timeout);
-    
+
     if (result.success && result.locator) {
       logger.info('[COMPILED_EXECUTOR] Locator succeeded', {
         strategy: entry.strategy,
         confidence: entry.confidence,
       });
-      
+
       return {
         success: true,
         locator: result.locator,
@@ -272,6 +279,10 @@ export async function executeCompiledLocatorPlan(
         signatureMatched: true,
         source: 'compiled',
       };
+    }
+
+    if (result.failureKind === 'ambiguous') {
+      sawAmbiguous = true;
     }
 
     logger.debug('[COMPILED_EXECUTOR] Locator failed, trying next', {
@@ -284,7 +295,7 @@ export async function executeCompiledLocatorPlan(
   logger.warn('[COMPILED_EXECUTOR] All locators in plan failed');
   return {
     success: false,
-    skipReason: 'locator_failed',
+    skipReason: sawAmbiguous ? 'ambiguous' : 'locator_failed',
     expired: false,
     signatureMatched: true,
     source: 'resolver',
@@ -303,10 +314,10 @@ export function buildRuntimeMeta(
   let runtimeStatus: 'executed' | 'healed' | 'failed' = 'failed';
   let source = result.source;
   let confidenceTier: ConfidenceTier = 'low';
-  
+
   if (result.success) {
     runtimeStatus = 'executed';
-    confidenceTier = (result.confidence ?? 0) >= 0.8 ? 'high' : 
+    confidenceTier = (result.confidence ?? 0) >= 0.8 ? 'high' :
                      (result.confidence ?? 0) >= 0.6 ? 'medium' : 'low';
   } else if (healResult?.success) {
     runtimeStatus = 'healed';
@@ -324,16 +335,28 @@ export function buildRuntimeMeta(
     pageSignatureMatched: result.signatureMatched,
   };
 
-  // Add failure reason if failed
+  // Add failure reason and explanation if failed
   if (runtimeStatus === 'failed') {
     switch (result.skipReason) {
       case 'signature_mismatch':
+        meta.failedReason = 'element_not_found';
+        meta.failureExplanation = 'Page structure changed significantly since step was created. Element locators no longer match current page.';
+        break;
       case 'expired':
+        meta.failedReason = 'element_not_found';
+        meta.failureExplanation = 'Compiled locator plan expired (too old). Re-linting recommended.';
+        break;
       case 'locator_failed':
         meta.failedReason = 'element_not_found';
+        meta.failureExplanation = 'All compiled locators failed to find element. Element may have been removed or changed.';
+        break;
+      case 'ambiguous':
+        meta.failedReason = 'element_not_found';
+        meta.failureExplanation = 'Multiple elements matched the locator. Cannot determine which element to interact with without user clarification.';
         break;
       default:
         meta.failedReason = 'unknown';
+        meta.failureExplanation = 'Unknown failure reason.';
     }
   }
 
@@ -342,6 +365,7 @@ export function buildRuntimeMeta(
     meta.needsReview = true;
     meta.flaky = true;
     meta.healConfidence = healResult?.confidence;
+    meta.failureExplanation = `Self-healing succeeded but with low confidence (${Math.round((healResult?.confidence ?? 0) * 100)}%). Manual review recommended.`;
   }
 
   return meta;

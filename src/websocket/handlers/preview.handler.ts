@@ -12,20 +12,20 @@ import { logger } from '@/utils/core/logger';
 import { Socket } from 'socket.io';
 import { getUserId } from '../middleware/middleware';
 import {
-  ClientToServerEvents,
-  createRoomName,
-  PreviewIntentStep,
-  PreviewLintCandidate,
-  PreviewPagePayload,
-  ServerToClientEvents,
-  SocketData,
+    ClientToServerEvents,
+    createRoomName,
+    PreviewIntentStep,
+    PreviewLintCandidate,
+    PreviewPagePayload,
+    ServerToClientEvents,
+    SocketData,
 } from '../types/types';
 import {
-  emitInputError,
-  emitInputSuccess,
-  emitSnapshotAlways,
-  emitSnapshotIfChanged,
-  validateInputRequest,
+    emitInputError,
+    emitInputSuccess,
+    emitSnapshotAlways,
+    emitSnapshotIfChanged,
+    validateInputRequest,
 } from './preview-input-helpers';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
@@ -815,7 +815,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      const { previewSessionId, stepDraft, pageRef } = data;
+      const { previewSessionId, stepDraft, pageRef, intentTestCaseId } = data;
 
       if (!previewSessionId || !stepDraft) {
         socket.emit('preview:step:apply:result', {
@@ -866,6 +866,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           previewSessionId,
           stepType: stepDraft.type,
           descriptionPreview: typeof stepDraft.description === 'string' ? stepDraft.description.slice(0, 80) : '',
+          intentTestCaseId,
         });
       }
 
@@ -889,6 +890,40 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         ...result,
         timestamp: new Date().toISOString(),
       });
+
+      // V6: Optional auto-persist to DB if intentTestCaseId provided and apply succeeded
+      if (result.success && intentTestCaseId && result.appliedStep) {
+        // Don't wait for DB update - fire and forget (don't block response)
+        setImmediate(async () => {
+          try {
+            const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+            const updated = await IntentTestCaseService.updateStepFromPreviewApply({
+              intentTestCaseId,
+              appliedStep: result.appliedStep!,
+            });
+
+            if (updated) {
+              logger.info('[WebSocket] Auto-persisted appliedStep to DB', {
+                socketId: socket.id,
+                intentTestCaseId,
+                stepId: result.appliedStep!.id,
+              });
+            } else {
+              logger.warn('[WebSocket] Failed to auto-persist appliedStep to DB', {
+                socketId: socket.id,
+                intentTestCaseId,
+                stepId: result.appliedStep!.id,
+              });
+            }
+          } catch (persistError) {
+            logger.error('[WebSocket] Error auto-persisting appliedStep to DB', {
+              socketId: socket.id,
+              intentTestCaseId,
+              error: persistError instanceof Error ? persistError.message : String(persistError),
+            });
+          }
+        });
+      }
 
       // If successful, emit updated page state to all subscribers
       if (result.success) {

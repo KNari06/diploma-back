@@ -228,28 +228,28 @@ export class IntentTestCaseService {
       userId: row.user_id,
       name: row.name,
       description: row.description || undefined,
-      
+
       // URL fields
       startUrl: row.start_url || undefined,
       url: row.url || undefined,
-      
+
       // Steps
       stepsJson: row.steps_json || [],
-      
+
       // Lifecycle
       status: row.status || 'draft',
       kind: row.kind || 'standalone',
-      
+
       // Replay data
       replayStrategy: row.replay_strategy || undefined,
       commands: row.commands || undefined,
       graphRef: row.graph_ref || undefined,
       parametersSchema: row.parameters_schema || undefined,
-      
+
       // Organization
       flowId: row.flow_id || undefined,
       dependsOn: row.depends_on || undefined,
-      
+
       // Metadata
       tags: row.tags || undefined,
       priority: row.priority || undefined,
@@ -257,11 +257,11 @@ export class IntentTestCaseService {
       setupSteps: row.setup_steps || undefined,
       teardownSteps: row.teardown_steps || undefined,
       expectedResult: row.expected_result || undefined,
-      
+
       // Provenance
       sourceTestId: row.source_test_id || undefined,
       sourceIntelligentSessionId: row.source_intelligent_session_id || undefined,
-      
+
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -274,7 +274,7 @@ export class IntentTestCaseService {
   /**
    * Update a single step's compiled plan after successful high-confidence heal
    * Called from runtime when heal succeeds with confidence ≥ 0.9
-   * 
+   *
    * @param intentTestCaseId The test case ID
    * @param stepId The step ID within the test case
    * @param compiled New compiled plan from healed selector
@@ -375,6 +375,92 @@ export class IntentTestCaseService {
       logger.error('[INTENT_TEST_CASE] Exception updating step after heal', {
         intentTestCaseId,
         stepId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Update a single step after successful preview apply
+   * Replaces the step with appliedStep (which has compiled/evidence/bindingHints)
+   *
+   * @param intentTestCaseId The test case ID
+   * @param appliedStep The full IntentStep from preview:step:apply:result
+   */
+  static async updateStepFromPreviewApply(params: {
+    intentTestCaseId: string;
+    appliedStep: IntentStep;
+  }): Promise<boolean> {
+    const { intentTestCaseId, appliedStep } = params;
+
+    logger.info('[INTENT_TEST_CASE] Updating step from preview apply', {
+      intentTestCaseId,
+      stepId: appliedStep.id,
+      hasCompiled: !!appliedStep.compiled,
+      hasEvidence: !!appliedStep.evidence,
+      hasBindingHints: !!appliedStep.bindingHints,
+    });
+
+    try {
+      // Get current test case (without userId check - this is internal call from preview)
+      const { data: row, error: fetchError } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('steps_json')
+        .eq('id', intentTestCaseId)
+        .single();
+
+      if (fetchError || !row) {
+        logger.warn('[INTENT_TEST_CASE] Test case not found for preview apply update', {
+          intentTestCaseId,
+          error: fetchError?.message,
+        });
+        return false;
+      }
+
+      const steps: IntentStep[] = row.steps_json || [];
+      const stepIndex = steps.findIndex(s => s.id === appliedStep.id);
+
+      if (stepIndex === -1) {
+        logger.warn('[INTENT_TEST_CASE] Step not found for preview apply update', {
+          intentTestCaseId,
+          stepId: appliedStep.id,
+        });
+        return false;
+      }
+
+      // Replace the step entirely with appliedStep
+      steps[stepIndex] = appliedStep;
+
+      // Save back to DB
+      const { error: updateError } = await supabaseAdmin
+        .from('intent_test_cases')
+        .update({
+          steps_json: steps,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', intentTestCaseId);
+
+      if (updateError) {
+        logger.error('[INTENT_TEST_CASE] Failed to update step from preview apply', {
+          intentTestCaseId,
+          stepId: appliedStep.id,
+          error: updateError.message,
+        });
+        return false;
+      }
+
+      logger.info('[INTENT_TEST_CASE] Step updated from preview apply', {
+        intentTestCaseId,
+        stepId: appliedStep.id,
+        locatorCount: appliedStep.compiled?.locatorPlan?.length,
+      });
+
+      return true;
+    } catch (error) {
+      logger.error('[INTENT_TEST_CASE] Exception updating step from preview apply', {
+        intentTestCaseId,
+        stepId: appliedStep.id,
         error: error instanceof Error ? error.message : String(error),
       });
       return false;

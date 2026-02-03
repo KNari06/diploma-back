@@ -437,11 +437,11 @@ export type RuntimeSource = 'compiled' | 'resolver' | 'self_heal';
 /**
  * Reason for step failure
  */
-export type FailedReason = 
-  | 'element_not_found' 
-  | 'assertion_failed' 
-  | 'heal_blocked' 
-  | 'timeout' 
+export type FailedReason =
+  | 'element_not_found'
+  | 'assertion_failed'
+  | 'heal_blocked'
+  | 'timeout'
   | 'unknown';
 
 /**
@@ -457,6 +457,8 @@ export interface StepRuntimeMeta {
   confidenceTier: ConfidenceTier;
   /** Reason for failure (if runtimeStatus === 'failed') */
   failedReason?: FailedReason;
+  /** Human-readable explanation for failure (for CI reports) */
+  failureExplanation?: string;
   /** True if step should be reviewed for flakiness */
   needsReview?: boolean;
   /** True if step is flagged as flaky */
@@ -599,28 +601,28 @@ export interface IntentTestCase {
   userId: string;
   name: string;
   description?: string;
-  
+
   // URL fields
   startUrl?: string;
   url?: string;
-  
+
   // Steps for authoring
   stepsJson: IntentStep[];
-  
+
   // Lifecycle
   status: IntentTestCaseStatus;
   kind: IntentTestCaseKind;
-  
+
   // Replay data (populated when saved from completed test or published)
   replayStrategy?: ReplayStrategy;
   commands?: any[];
   graphRef?: any;
   parametersSchema?: Record<string, any>;
-  
+
   // Organization
   flowId?: string;
   dependsOn?: string[];
-  
+
   // Metadata
   tags?: string[];
   priority?: 'critical' | 'high' | 'medium' | 'low';
@@ -628,11 +630,11 @@ export interface IntentTestCase {
   setupSteps?: any[];
   teardownSteps?: any[];
   expectedResult?: string;
-  
+
   // Provenance (when saved from a completed test)
   sourceTestId?: string;
   sourceIntelligentSessionId?: string;
-  
+
   createdAt: string;
   updatedAt: string;
 }

@@ -1350,6 +1350,7 @@ export class CommandExecutor {
               confidenceTier: 'low',
               executionMs: Date.now() - startTime,
               failedReason: 'heal_blocked',
+              failureExplanation: `Self-healing was blocked due to low confidence (${Math.round(healConfidence * 100)}% < ${Math.round(this.selfHealingConfidenceThreshold * 100)}%). Cannot auto-apply potentially incorrect selector.`,
               healConfidence,
               needsReview: true,
               flaky: true,
@@ -1372,6 +1373,7 @@ export class CommandExecutor {
       confidenceTier: 'low',
       executionMs: Date.now() - startTime,
       failedReason: 'element_not_found',
+      failureExplanation: `Element not found after trying all resolution methods (compiled → smart locator → self-healing). ${intentMeta?.intentDescription || command.description || 'Element'} may not exist on current page or selector may be invalid.`,
       needsReview: true,
     };
     this.stepRuntimeMeta.set(stepId, runtimeMeta);

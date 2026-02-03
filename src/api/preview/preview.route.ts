@@ -25,9 +25,413 @@ const router = Router();
 
 /**
  * @swagger
+ * components:
+ *   schemas:
+ *     PreviewSimpleError:
+ *       type: object
+ *       properties:
+ *         error:
+ *           type: string
+ *       required: [error]
+ *
+ *     PreviewIntentStep:
+ *       type: object
+ *       description: |
+ *         Draft step structure used by Step Editor (shape is flexible; backend supports extra fields).
+ *         This schema documents the common subset used by preview lint/apply.
+ *       properties:
+ *         id:
+ *           type: string
+ *         action:
+ *           type: string
+ *           description: e.g. click, fill, goto, wait, assert
+ *         description:
+ *           type: string
+ *         url:
+ *           type: string
+ *         value:
+ *           description: Optional value for fill/assert/etc
+ *         ref:
+ *           type: string
+ *           description: Optional element ref (e.g., "e123")
+ *         selector:
+ *           type: string
+ *         options:
+ *           type: object
+ *           additionalProperties: true
+ *       additionalProperties: true
+ *
+ *     PreviewBoundingBox:
+ *       type: object
+ *       properties:
+ *         x: { type: number }
+ *         y: { type: number }
+ *         width: { type: number }
+ *         height: { type: number }
+ *
+ *     PreviewLintCandidate:
+ *       type: object
+ *       properties:
+ *         ref: { type: string, nullable: true }
+ *         label: { type: string }
+ *         reason: { type: string }
+ *         confidence: { type: number }
+ *         boundingBox:
+ *           $ref: '#/components/schemas/PreviewBoundingBox'
+ *
+ *     PreviewHighlight:
+ *       type: object
+ *       properties:
+ *         ref: { type: string, nullable: true }
+ *         boundingBox:
+ *           $ref: '#/components/schemas/PreviewBoundingBox'
+ *         type:
+ *           type: string
+ *           enum: [success, warning, error]
+ *
+ *     PreviewStepLintRequest:
+ *       type: object
+ *       required: [previewSessionId, stepDraft]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         stepDraft:
+ *           $ref: '#/components/schemas/PreviewIntentStep'
+ *         pageRef:
+ *           type: string
+ *           description: Optional page reference (client cache hint)
+ *         includeAlternatives:
+ *           type: boolean
+ *           description: When true, include full candidates list even for needs_clarification
+ *
+ *     PreviewStepApplyRequest:
+ *       type: object
+ *       required: [previewSessionId, stepDraft]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         stepDraft:
+ *           $ref: '#/components/schemas/PreviewIntentStep'
+ *         pageRef: { type: string }
+ *         intentTestCaseId:
+ *           type: string
+ *           description: Optional. If provided, auto-persist appliedStep to this test case after successful apply.
+ *
+ *     PreviewClarifySelectRequest:
+ *       type: object
+ *       required: [previewSessionId, stepId, selectedRef]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         stepId: { type: string }
+ *         selectedRef: { type: string }
+ *
+ *     PreviewStepLintResultPayload:
+ *       type: object
+ *       required: [status, message, confidence, candidates, highlight, timestamp]
+ *       properties:
+ *         status:
+ *           type: string
+ *           enum: [resolved, ambiguous, not_found, needs_clarification, error]
+ *         message: { type: string }
+ *         confidence: { type: number }
+ *         candidates:
+ *           type: array
+ *           items:
+ *             $ref: '#/components/schemas/PreviewLintCandidate'
+ *         highlight:
+ *           type: array
+ *           items:
+ *             $ref: '#/components/schemas/PreviewHighlight'
+ *         interpretation: { type: string }
+ *         clarificationQuestion: { type: string }
+ *         alternativesIncluded: { type: boolean }
+ *         applyDisabled: { type: boolean }
+ *         timestamp: { type: string, format: date-time }
+ *
+ *     PreviewStepApplyResultPayload:
+ *       type: object
+ *       required: [success, timestamp]
+ *       properties:
+ *         success: { type: boolean }
+ *         error: { type: string }
+ *         appliedStep:
+ *           $ref: '#/components/schemas/PreviewIntentStep'
+ *         urlChanged: { type: boolean }
+ *         url: { type: string }
+ *         highlight:
+ *           type: array
+ *           items:
+ *             $ref: '#/components/schemas/PreviewHighlight'
+ *         attempts: { type: integer }
+ *         timestamp: { type: string, format: date-time }
+ *
+ *     PreviewClarifyPayload:
+ *       type: object
+ *       required: [previewSessionId, stepId, candidates, interpretation, message, timestamp]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         stepId: { type: string }
+ *         candidates:
+ *           type: array
+ *           items:
+ *             type: object
+ *             required: [ref, label, reason]
+ *             properties:
+ *               ref: { type: string }
+ *               label: { type: string }
+ *               reason: { type: string }
+ *               boundingBox:
+ *                 $ref: '#/components/schemas/PreviewBoundingBox'
+ *         interpretation: { type: string }
+ *         message: { type: string }
+ *         timestamp: { type: string, format: date-time }
+ *
+ *     PreviewMouseMoveRequest:
+ *       type: object
+ *       required: [previewSessionId, x, y]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         x: { type: number }
+ *         y: { type: number }
+ *
+ *     PreviewMouseClickRequest:
+ *       type: object
+ *       required: [previewSessionId, x, y]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         x: { type: number }
+ *         y: { type: number }
+ *         button:
+ *           type: string
+ *           enum: [left, right, middle]
+ *         clickCount:
+ *           type: integer
+ *           description: 1=single, 2=double
+ *
+ *     PreviewMouseButtonRequest:
+ *       type: object
+ *       required: [previewSessionId, x, y]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         x: { type: number }
+ *         y: { type: number }
+ *         button:
+ *           type: string
+ *           enum: [left, right, middle]
+ *
+ *     PreviewMouseWheelRequest:
+ *       type: object
+ *       required: [previewSessionId, deltaX, deltaY]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         deltaX: { type: number }
+ *         deltaY: { type: number }
+ *
+ *     PreviewKeyboardTypeRequest:
+ *       type: object
+ *       required: [previewSessionId, text]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         text: { type: string }
+ *
+ *     PreviewKeyboardPressRequest:
+ *       type: object
+ *       required: [previewSessionId, key]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         key: { type: string }
+ *         modifiers:
+ *           type: array
+ *           items:
+ *             type: string
+ *             enum: [Control, Shift, Alt, Meta]
+ *
+ *     PreviewViewportPayload:
+ *       type: object
+ *       required: [previewSessionId, viewport, devicePixelRatio, timestamp]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         viewport:
+ *           $ref: '#/components/schemas/PreviewViewport'
+ *         devicePixelRatio: { type: number }
+ *         timestamp: { type: string, format: date-time }
+ *
+ *     PreviewMouseResultPayload:
+ *       type: object
+ *       required: [previewSessionId, success, action, timestamp]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         success: { type: boolean }
+ *         action:
+ *           type: string
+ *           enum: [move, click, down, up, wheel, type, press]
+ *         error: { type: string }
+ *         timestamp: { type: string, format: date-time }
+ *
+ *     PreviewMouseProbeRequest:
+ *       type: object
+ *       required: [previewSessionId, x, y]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         x: { type: number }
+ *         y: { type: number }
+ *
+ *     PreviewMouseProbeResultPayload:
+ *       type: object
+ *       required: [previewSessionId, x, y, timestamp]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         x: { type: number }
+ *         y: { type: number }
+ *         element:
+ *           type: object
+ *           additionalProperties: true
+ *         timestamp: { type: string, format: date-time }
+ *
+ *     PreviewPageActionResultPayload:
+ *       type: object
+ *       required: [previewSessionId, action, success, timestamp]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         action:
+ *           type: string
+ *           enum: [refresh, reset]
+ *         success: { type: boolean }
+ *         error: { type: string }
+ *         timestamp: { type: string, format: date-time }
+ *
+ *     PreviewNetworkDetailRequest:
+ *       type: object
+ *       required: [previewSessionId, id]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         id: { type: string }
+ *
+ *     PreviewHtmlRequest:
+ *       type: object
+ *       required: [previewSessionId]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         domVersion: { type: integer }
+ *
+ *     PreviewAccessibilityRequest:
+ *       type: object
+ *       required: [previewSessionId]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         domVersion: { type: integer }
+ *
+ *     PreviewContextSetRequest:
+ *       type: object
+ *       required: [previewSessionId, data]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         data:
+ *           type: object
+ *           additionalProperties: true
+ *
+ *     PreviewContextUpdatePayload:
+ *       type: object
+ *       required: [previewSessionId, version, data, timestamp]
+ *       properties:
+ *         previewSessionId: { type: string }
+ *         version: { type: integer }
+ *         data:
+ *           type: object
+ *           additionalProperties: true
+ *         timestamp: { type: string, format: date-time }
+ *
+ *     PreviewStartRequest:
+ *       type: object
+ *       required: [projectId, startUrl]
+ *       properties:
+ *         projectId:
+ *           type: string
+ *           format: uuid
+ *           description: Project ID (owner scope)
+ *         startUrl:
+ *           type: string
+ *           format: uri
+ *           description: URL to open in headless browser for Step Editor preview
+ *     PreviewViewport:
+ *       type: object
+ *       properties:
+ *         width:
+ *           type: integer
+ *           example: 1280
+ *         height:
+ *           type: integer
+ *           example: 720
+ *     PreviewStartResponse:
+ *       type: object
+ *       properties:
+ *         success:
+ *           type: boolean
+ *           example: true
+ *         data:
+ *           type: object
+ *           properties:
+ *             previewSessionId:
+ *               type: string
+ *               description: Unique preview session id (used for WebSocket subscription)
+ *               example: preview_35f2ea87-935d-4cb1-b6f4-7e059246c619
+ *             url:
+ *               type: string
+ *               format: uri
+ *               description: Final URL after redirects (page.url())
+ *             domNodes:
+ *               type: array
+ *               description: Interactive nodes extracted from initial snapshot (used by Step Editor lint/highlight)
+ *               items:
+ *                 type: object
+ *                 additionalProperties: true
+ *             viewport:
+ *               $ref: '#/components/schemas/PreviewViewport'
+ *             devicePixelRatio:
+ *               type: number
+ *               example: 1
+ *
  * /api/v1/preview/start:
  *   post:
  *     summary: Start a preview session
+ *     description: |
+ *       Starts a server-side Step Editor Preview session:
+ *       - Launches headless Chromium (Playwright)
+ *       - Navigates to `startUrl`
+ *       - Collects initial DOM snapshot and extracts interactive nodes
+ *       - Returns `previewSessionId` that the frontend uses to subscribe via WebSocket
+ *
+ *       WebSocket flow after successful start:
+ *
+ *       Client → Server events (what frontend sends):
+ *       - `subscribe:preview` — subscribe to room `preview:<previewSessionId>` `{ previewSessionId }`
+ *       - `unsubscribe:preview` — unsubscribe `{ previewSessionId }`
+ *       - `preview:step:lint` — lint/resolve draft step `{ previewSessionId, stepDraft, pageRef?, includeAlternatives? }`
+ *       - `preview:step:clarify:select` — user selects candidate `{ previewSessionId, stepId, selectedRef }`
+ *       - `preview:step:apply` — execute step in preview browser `{ previewSessionId, stepDraft, pageRef? }`
+ *       - `preview:mouse:move` — hover by coords `{ previewSessionId, x, y }`
+ *       - `preview:mouse:click` — click by coords `{ previewSessionId, x, y, button?, clickCount? }`
+ *       - `preview:mouse:down` / `preview:mouse:up` — drag support `{ previewSessionId, x, y, button? }`
+ *       - `preview:mouse:wheel` — scroll `{ previewSessionId, deltaX, deltaY }`
+ *       - `preview:keyboard:type` — type text `{ previewSessionId, text }`
+ *       - `preview:keyboard:press` — key press `{ previewSessionId, key, modifiers? }`
+ *       - `preview:page:refresh` — reload page `{ previewSessionId }`
+ *       - `preview:page:reset` — reset context/page and return to startUrl `{ previewSessionId }`
+ *       - `preview:network:detail:request` — request network item detail `{ previewSessionId, id }`
+ *       - `preview:html:request` — request HTML `{ previewSessionId, domVersion? }`
+ *       - `preview:accessibility:request` — request accessibility tree `{ previewSessionId, domVersion? }`
+ *       - `preview:context:set` — update editor context vars `{ previewSessionId, data }`
+ *       - `preview:mouse:probe` — debug: element under point `{ previewSessionId, x, y }`
+ *
+ *       Server → Client events (what backend emits):
+ *       - `preview:page` — DOM state updates `{ previewSessionId, url, domVersion, pageSignature, domNodes?, timestamp }`
+ *       - `preview:video:frame` — JPEG frames (base64) `{ previewSessionId, seq, format, data, width, height, domVersion, timestamp }`
+ *       - `preview:viewport` — viewport metadata `{ previewSessionId, viewport, devicePixelRatio, timestamp }`
+ *       - `preview:mouse:result` — lightweight ACK for input `{ previewSessionId, success, action, error?, timestamp }`
+ *       - `preview:mouse:probe:result` — debug probe result `{ previewSessionId, x, y, element?, timestamp }`
+ *       - `preview:page:action:result` — refresh/reset result `{ previewSessionId, action, success, error?, timestamp }`
+ *       - `preview:step:lint:result` — lint outcome (candidates/highlights) `{ status, message, confidence, candidates, highlight, ... }`
+ *       - `preview:step:clarify` — ask user to pick element `{ previewSessionId, stepId, candidates, interpretation, message, timestamp }`
+ *       - `preview:step:apply:result` — step execution result `{ success, error?, appliedStep?, urlChanged?, url?, highlight?, attempts?, timestamp }`
+ *       - DevTools: `preview:console:update`, `preview:network:update`, `preview:network:detail`, `preview:html:update`, `preview:accessibility:update`, `preview:context:update`
  *     tags: [Preview]
  *     security:
  *       - bearerAuth: []
@@ -36,18 +440,32 @@ const router = Router();
  *       content:
  *         application/json:
  *           schema:
- *             type: object
- *             required:
- *               - projectId
- *               - startUrl
- *             properties:
- *               projectId:
- *                 type: string
- *               startUrl:
- *                 type: string
+ *             $ref: '#/components/schemas/PreviewStartRequest'
  *     responses:
  *       200:
  *         description: Preview session started
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/PreviewStartResponse'
+ *       400:
+ *         description: Invalid input (missing projectId/startUrl)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/PreviewSimpleError'
+ *       401:
+ *         description: Unauthorized
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/PreviewSimpleError'
+ *       500:
+ *         description: Failed to start preview (browser launch/goto/snapshot failed)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/PreviewSimpleError'
  */
 router.post('/start', requireAuth, startPreview);
 
@@ -56,6 +474,13 @@ router.post('/start', requireAuth, startPreview);
  * /api/v1/preview/stop:
  *   post:
  *     summary: Stop a preview session
+ *     description: |
+ *       Stops a Step Editor Preview session and closes server-side browser resources.
+ *       After stop:
+ *       - `previewSessionId` becomes invalid (WS subscribe will be rejected)
+ *       - Frontend should unsubscribe from `preview:<previewSessionId>` (best effort)
+ *
+ *       Note: Preview sessions also have TTL auto-cleanup on the backend.
  *     tags: [Preview]
  *     security:
  *       - bearerAuth: []
@@ -73,6 +498,30 @@ router.post('/start', requireAuth, startPreview);
  *     responses:
  *       200:
  *         description: Preview session stopped
+ *       400:
+ *         description: Missing previewSessionId
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/PreviewSimpleError'
+ *       401:
+ *         description: Unauthorized
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/PreviewSimpleError'
+ *       403:
+ *         description: Forbidden (session not owned by user)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/PreviewSimpleError'
+ *       500:
+ *         description: Failed to stop preview (cleanup error)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/PreviewSimpleError'
  */
 router.post('/stop', requireAuth, stopPreview);
 

@@ -140,6 +140,14 @@ const options: swaggerJsdoc.Options = {
         description: 'Health check endpoints',
       },
       {
+        name: 'Preview',
+        description: 'Step Editor Preview: старт/стоп preview-сессии (server-side headless browser) + дальнейший WebSocket control flow',
+      },
+      {
+        name: 'Intent Test Cases',
+        description: 'Intent test cases (Step Editor): CRUD + запуск (run/batch-run) (требует auth)',
+      },
+      {
         name: 'Manual Tests',
         description: 'Ручное тестирование веб-приложений через Playwright (требует auth)',
       },
