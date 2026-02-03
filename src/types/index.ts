@@ -1000,6 +1000,35 @@ export interface JiraAttachment {
   mimeType: string;
 }
 
+/** Board item for GET /api/v1/jira/boards response */
+export interface JiraBoard {
+  id: number | string;
+  name: string;
+  type: string;
+}
+
+/** Issue item for GET /api/v1/jira/issues response */
+export interface JiraIssueListItem {
+  id: string;
+  key: string;
+  summary: string;
+  description: string | null;
+  status: { id: string; name: string; statusCategory?: Record<string, unknown> };
+  priority: { id: string; name: string } | null;
+  issuetype: { id: string; name: string };
+  reporter: { accountId: string; displayName: string; emailAddress?: string } | null;
+  assignee: { accountId: string; displayName: string; emailAddress?: string } | null;
+  created: string;
+  updated: string;
+  labels: string[];
+  project: { id: string; key: string; name: string };
+}
+
+export interface JiraSearchResult {
+  issues: JiraIssueListItem[];
+  total: number;
+}
+
 // Message Feedback types
 export type FeedbackType = 'like' | 'dislike';
 
