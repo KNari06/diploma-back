@@ -4,6 +4,7 @@ import { Router } from 'express';
 import {
   createCheckoutSession,
   createPortalSession,
+  getBillingTransactions,
   getBillingStatus,
   handleWebhook,
 } from './stripe.controller';
@@ -122,6 +123,25 @@ router.post('/portal', requireAuth, asyncHandler(createPortalSession));
  *         description: Server error
  */
 router.get('/status', requireAuth, asyncHandler(getBillingStatus));
+
+/**
+ * @swagger
+ * /api/billing/transactions:
+ *   get:
+ *     summary: Get billing transactions
+ *     description: Get current user's Stripe transactions
+ *     tags: [Billing]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Transactions retrieved successfully
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+router.get('/transactions', requireAuth, asyncHandler(getBillingTransactions));
 
 /**
  * @swagger

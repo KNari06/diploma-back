@@ -456,6 +456,7 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
 
 async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void> {
   const invoice = event.data.object as Stripe.Invoice;
+  logger.info('[STRIPE_WEBHOOK] Invoice payment succeeded', { invoice });
   const customerId =
     typeof invoice.customer === 'string'
       ? invoice.customer
@@ -471,12 +472,35 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
 
   const { data: user } = await supabaseAdmin
     .from('users')
-    .select('id, last_credits_invoice_id')
+    .select('id, last_credits_invoice_id, stripe_price_id')
     .eq('stripe_customer_id', customerId)
     .maybeSingle();
 
   if (!user) {
     logger.warn('[STRIPE_WEBHOOK] User not found for customer', { customerId });
+    return;
+  }
+
+  const { data: existingTransaction, error: existingTransactionError } = await supabaseAdmin
+    .from('stripe_transactions')
+    .select('id')
+    .or(`stripe_invoice_id.eq.${invoice.id},stripe_event_id.eq.${event.id}`)
+    .maybeSingle();
+
+  if (existingTransactionError) {
+    logger.error('[STRIPE_WEBHOOK] Failed to check transaction duplicate', {
+      invoiceId: invoice.id,
+      eventId: event.id,
+      error: existingTransactionError.message,
+    });
+  }
+
+  if (existingTransaction) {
+    logger.info('[STRIPE_WEBHOOK] Duplicate transaction ignored', {
+      invoiceId: invoice.id,
+      eventId: event.id,
+      userId: user.id,
+    });
     return;
   }
 
@@ -488,11 +512,19 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     return;
   }
 
-  let priceId = invoice.lines?.data?.[0]?.price?.id;
+  let priceId =
+    invoice.lines?.data?.[0]?.price?.id ||
+    // @ts-ignore
+    invoice.lines?.data?.[0]?.pricing?.price_details?.price?.id ||
+    null;
+
   const subscriptionId =
     typeof invoice.subscription === 'string'
       ? invoice.subscription
-      : invoice.subscription?.id;
+      : invoice.subscription?.id ||
+        // @ts-ignore
+        invoice.parent?.subscription_details?.subscription ||
+        null;
 
   if (!priceId && subscriptionId) {
     if (!stripe) {
@@ -512,6 +544,10 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
       });
     }
   }
+  if (!priceId && user.stripe_price_id) {
+    priceId = user.stripe_price_id;
+  }
+
   const { data: plan } = priceId
     ? await supabaseAdmin
         .from('plans')
@@ -520,9 +556,53 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
         .maybeSingle()
     : { data: null };
 
+  if (!plan && priceId) {
+    logger.warn('[STRIPE_WEBHOOK] Plan not found for price', { priceId });
+  }
+
   const creditsPerPeriod = plan?.credits_per_period || 0;
   const planCode = plan?.code || 'unknown';
   const subscriptionPlanLabel = plan?.name || plan?.code || 'pro';
+
+  const transactionData: Record<string, any> = {
+    user_id: user.id,
+    stripe_customer_id: customerId,
+    stripe_invoice_id: invoice.id,
+    stripe_event_id: event.id,
+    stripe_subscription_id: subscriptionId || null,
+    stripe_payment_intent_id:
+      typeof invoice.payment_intent === 'string'
+        ? invoice.payment_intent
+        : invoice.payment_intent?.id || null,
+    stripe_charge_id:
+      typeof invoice.charge === 'string' ? invoice.charge : invoice.charge?.id || null,
+    stripe_price_id: priceId || null,
+    amount: invoice.amount_paid ?? 0,
+    currency: invoice.currency || 'usd',
+    status: 'succeeded',
+    created_at: invoice.created
+      ? new Date(invoice.created * 1000).toISOString()
+      : new Date().toISOString(),
+  };
+
+  const { error: transactionError } = await supabaseAdmin
+    .from('stripe_transactions')
+    .upsert(transactionData, { onConflict: 'stripe_invoice_id' });
+
+  if (transactionError) {
+    logger.error('[STRIPE_WEBHOOK] Failed to save transaction', {
+      invoiceId: invoice.id,
+      userId: user.id,
+      error: transactionError.message,
+    });
+  } else {
+    logger.info('[STRIPE_WEBHOOK] Transaction saved', {
+      invoiceId: invoice.id,
+      userId: user.id,
+      amount: transactionData.amount,
+      currency: transactionData.currency,
+    });
+  }
 
   if (creditsPerPeriod > 0) {
     logger.info('[STRIPE_WEBHOOK] Adding credits on invoice payment', {
@@ -685,9 +765,11 @@ export const getBillingStatus = async (req: Request, res: Response): Promise<voi
 
     const creditsPerPeriod = plan?.credits_per_period ?? 0;
 
+    const resolvedPlan = plan ? 'pro' : user.plan || 'free';
+
     res.json({
       success: true,
-      plan: user.plan || 'free',
+      plan: resolvedPlan,
       plan_status: user.plan_status || null,
       stripe_price_id: user.stripe_price_id || null,
       credits_balance: userCredits.credits_balance,
@@ -701,6 +783,62 @@ export const getBillingStatus = async (req: Request, res: Response): Promise<voi
     res.status(500).json({
       success: false,
       error: 'Failed to get billing status',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+};
+
+/**
+ * GET /api/billing/transactions
+ * Get user's Stripe transactions
+ */
+export const getBillingTransactions = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authorization required',
+      });
+      return;
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('stripe_transactions')
+      .select('created_at, stripe_invoice_id, amount, currency')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.error('[BILLING_TRANSACTIONS] Error fetching transactions', {
+        error: error.message,
+        userId,
+      });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch transactions',
+      });
+      return;
+    }
+
+    const transactions = (data || []).map((item) => ({
+      date: item.created_at,
+      invoice: item.stripe_invoice_id,
+      amount: item.currency === 'usd' ? (item.amount || 0) / 100 : (item.amount || 0) / 100,
+      status: 'paid'
+    }));
+
+    res.json({
+      success: true,
+      transactions,
+    });
+  } catch (error) {
+    logger.error('[BILLING_TRANSACTIONS] Error fetching transactions', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch transactions',
       message: error instanceof Error ? error.message : 'Unknown error',
     });
   }
