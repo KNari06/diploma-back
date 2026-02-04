@@ -1627,6 +1627,129 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V8: Preview Run Handlers ("Run from start" feature)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Handle preview:run:start - Start "Run from start" execution
+   * Executes all saved steps sequentially in existing preview session
+   */
+  socket.on('preview:run:start', async (data) => {
+    try {
+      const userId = getUserId(socket);
+      const { previewSessionId, intentTestCaseId } = data;
+
+      // Validate input
+      if (!previewSessionId || !intentTestCaseId) {
+        socket.emit('error', {
+          code: 'INVALID_INPUT',
+          message: 'previewSessionId and intentTestCaseId are required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      // Check ownership
+      if (!sessionService.isSessionOwned(previewSessionId, userId)) {
+        socket.emit('error', {
+          code: 'UNAUTHORIZED',
+          message: 'Session not owned by user',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Import PreviewRunService
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+
+      // Check if already running
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        socket.emit('error', {
+          code: 'RUN_IN_PROGRESS',
+          message: 'Run already in progress',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      logger.info('[WebSocket] Starting preview run', {
+        previewSessionId,
+        intentTestCaseId,
+        userId,
+        socketId: socket.id,
+      });
+
+      // Start run (async, emits progress via WebSocket)
+      PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId).catch((error) => {
+        logger.error('[WebSocket] Preview run failed', {
+          previewSessionId,
+          intentTestCaseId,
+          userId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        socket.emit('error', {
+          code: 'RUN_FAILED',
+          message: error instanceof Error ? error.message : 'Run failed',
+          timestamp: new Date().toISOString(),
+        });
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:run:start', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      socket.emit('error', {
+        code: 'INTERNAL_ERROR',
+        message: error instanceof Error ? error.message : 'Internal error',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
+
+  /**
+   * Handle preview:run:cancel - Cancel active preview run
+   * Sets cancellation flag, main loop handles skipping remaining steps
+   */
+  socket.on('preview:run:cancel', async (data) => {
+    try {
+      const userId = getUserId(socket);
+      const { previewSessionId } = data;
+
+      if (!previewSessionId) {
+        socket.emit('error', {
+          code: 'INVALID_INPUT',
+          message: 'previewSessionId is required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+
+      logger.info('[WebSocket] Cancelling preview run', {
+        previewSessionId,
+        userId,
+        socketId: socket.id,
+      });
+
+      PreviewRunService.cancelRun(previewSessionId, userId);
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:run:cancel', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      socket.emit('error', {
+        code: 'INTERNAL_ERROR',
+        message: error instanceof Error ? error.message : 'Cancel failed',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
+
   // Cleanup on disconnect
   socket.on('disconnect', () => {
     // V7: Cleanup all streams for all rooms the socket was subscribed to

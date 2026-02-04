@@ -143,6 +143,172 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     await navigateToUrl(page, testData, requestTracker);
     await checkTestCancelled(testData.testId);
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // V8: Background Replay Mode (for "Run from start" in CI/CD)
+    // If intelligentMode is false AND commands are present, execute them step-by-step
+    // This ensures preview-saved steps are executed deterministically without AI agents
+    // NO Lite/Pro engine fallback - pure command replay
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (!testData.intelligentMode && testData.commands && testData.commands.length > 0) {
+      logger.info('[PLAYWRIGHT] Entering Background Replay Mode', {
+        testId: testData.testId,
+        commandsCount: testData.commands.length,
+        intelligentMode: false,
+      });
+
+      // Import CommandExecutor
+      const { CommandExecutor } = await import('@/agent/execution/command-executor');
+
+      // Create executor with self-healing enabled (for AI fallback without clarification)
+      const executor = new CommandExecutor(page, {
+        selfHealingEnabled: true,
+        metadata: {
+          url: testData.url,
+          projectId: testData.projectId,
+          userId: testData.userId,
+        },
+      });
+
+      // Execute commands step-by-step
+      let currentStepIndex = 0;
+      const totalSteps = testData.commands.length;
+      let allSuccess = true;
+      let finalError: string | undefined;
+
+      try {
+        for (const command of testData.commands) {
+          currentStepIndex++;
+          const action = (command as any).action ?? (command as any).type ?? 'action';
+          const intentMeta = (command as any).intentMeta as undefined | { elementDescription?: string };
+
+          // Check cancellation
+          await checkTestCancelled(testData.testId);
+
+          // Emit test:progress
+          webSocketService.emitTestProgress(testData.testId, {
+            testId: testData.testId,
+            browser: testData.browser,
+            progress: Math.round((currentStepIndex / totalSteps) * 80) + 10, // 10-90%
+            phase: 'execution',
+            currentStep: `Step ${currentStepIndex}/${totalSteps}: ${action}`,
+            icon: getActionIcon(action, 'execution'),
+            status: 'running',
+            timestamp: new Date().toISOString(),
+            userId: testData.userId,
+            sessionId: testData.chatSessionId,
+          });
+
+          logger.info('[PLAYWRIGHT] Replay mode executing step', {
+            testId: testData.testId,
+            stepIndex: currentStepIndex,
+            commandType: action,
+            description: intentMeta?.elementDescription,
+          });
+
+          try {
+            // Execute command via CommandExecutor
+            // This supports compiled plans, self-healing, AI fallback (no clarification in background)
+            const stepResult = await executor.executeCommand(command);
+
+            logger.info('[PLAYWRIGHT] Replay mode step passed', {
+              testId: testData.testId,
+              stepIndex: currentStepIndex,
+            });
+
+            // Emit test:step:completed with success
+            webSocketService.emitTestStepCompleted(testData.testId, {
+              testId: testData.testId,
+              browser: testData.browser,
+              step: currentStepIndex,
+              stepDescription: intentMeta?.elementDescription || action,
+              success: true,
+              timestamp: new Date().toISOString(),
+              runtimeMeta: stepResult.runtimeMeta,
+            });
+          } catch (stepError) {
+            allSuccess = false;
+            finalError = stepError instanceof Error ? stepError.message : 'Unexpected error';
+
+            logger.error('[PLAYWRIGHT] Replay mode step failed', {
+              testId: testData.testId,
+              stepIndex: currentStepIndex,
+              command: action,
+              error: finalError,
+            });
+
+            // Emit test:step:completed with failure
+            webSocketService.emitTestStepCompleted(testData.testId, {
+              testId: testData.testId,
+              browser: testData.browser,
+              step: currentStepIndex,
+              stepDescription: intentMeta?.elementDescription || action,
+              success: false,
+              timestamp: new Date().toISOString(),
+              runtimeMeta: {
+                stepId: (command as any).intentMeta?.stepId,
+                runtimeStatus: 'failed',
+                failedReason: 'unknown',
+              },
+            });
+
+            // Stop on first failure
+            break;
+          }
+        }
+      } finally {
+        // Cleanup executor
+        executor.dispose();
+      }
+
+      // Collect artifacts and return
+      const finalScreenshot = await page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => null);
+      const logs: string[] = [];
+      const networkLogs: any[] = [];
+      const errors: any[] = [];
+
+      // Cleanup
+      // Stop video streaming (best-effort) before closing context/page
+      if (videoStreamService?.isActive()) {
+        try {
+          await videoStreamService.stop(allSuccess ? 'completed' : 'error');
+        } catch (videoError) {
+          logger.debug('[PLAYWRIGHT] Failed to stop video streaming in replay mode', {
+            testId: testData.testId,
+            error: videoError instanceof Error ? videoError.message : String(videoError),
+          });
+        } finally {
+          VideoStreamRegistry.unregister(runKey);
+        }
+      }
+
+      // Collect artifacts (video/trace) and cleanup browser resources
+      const artifacts = await collectArtifactsAndCleanup(testData, context, page, tracePath);
+
+      logger.info('[PLAYWRIGHT] Background Replay Mode completed', {
+        testId: testData.testId,
+        success: allSuccess,
+        totalSteps,
+        executedSteps: currentStepIndex,
+      });
+
+      // Mark as completed and unregister from run registry
+      TestRunRegistry.setCompleted(runKey);
+      TestRunRegistry.unregister(runKey);
+
+      return {
+        success: allSuccess,
+        status: allSuccess ? 'completed' : 'failed',
+        screenshot: finalScreenshot ? `data:image/jpeg;base64,${finalScreenshot.toString('base64')}` : undefined,
+        logs,
+        networkLogs,
+        errors,
+        error: allSuccess ? undefined : finalError,
+        videoPath: artifacts.videoPath,
+        tracePath: artifacts.tracePath,
+      };
+    }
+
+    // Continue with existing Lite/Pro mode selection...
     // Determine which mode to use (Lite vs Pro)
     const modeSelection = ModeRouter.selectMode({
       goal,

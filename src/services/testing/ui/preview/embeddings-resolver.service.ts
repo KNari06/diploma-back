@@ -52,6 +52,9 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 /** Minimum semantic similarity to consider a match valid (for semantic-zero check) */
 const SEMANTIC_MIN_THRESHOLD = 0.25;
 
+/** Threshold for considering candidates ambiguous (require spatial tie-breaking) */
+const AMBIGUOUS_SIMILARITY_DELTA = 0.05;
+
 /**
  * Action type to expected element tags mapping (HardAllowed filter)
  * Elements not in this list are excluded for the action
@@ -975,6 +978,58 @@ async function rankCandidatesByEmbedding(params: {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SPATIAL TIE-BREAK ORDERING
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Apply spatial tie-break ordering for candidates with very close semantic similarity.
+ * This must NOT change status decisions or similarity values; it only stabilizes ordering.
+ *
+ * Tie-break priority:
+ * 1) Prefer `isTopMostAtCenter === true` (when available)
+ * 2) Prefer smaller `boundingBox.y` (top-to-bottom reading order)
+ * 3) Prefer smaller `boundingBox.x` (left-to-right)
+ * 4) As last resort, keep original order
+ *
+ * @param ranked - Candidates already ranked by semantic similarity
+ * @returns Same candidates with tie-broken ordering (similarity unchanged)
+ */
+export function applySpatialTieBreakOrdering(ranked: RankedCandidate[]): {
+  ordered: RankedCandidate[];
+  applied: boolean;
+} {
+  const hasAnySpatialSignal = ranked.some(
+    (c) => c.node.boundingBox || c.node.isTopMostAtCenter !== undefined
+  );
+  if (!hasAnySpatialSignal) return { ordered: ranked, applied: false };
+
+  const withIndex = ranked.map((c, idx) => ({ c, idx }));
+  withIndex.sort((a, b) => {
+    const simDiff = b.c.similarity - a.c.similarity;
+    if (Math.abs(simDiff) >= AMBIGUOUS_SIMILARITY_DELTA) return simDiff;
+
+    const aTop = a.c.node.isTopMostAtCenter === true ? 1 : 0;
+    const bTop = b.c.node.isTopMostAtCenter === true ? 1 : 0;
+    if (aTop !== bTop) return bTop - aTop;
+
+    const aBox = a.c.node.boundingBox;
+    const bBox = b.c.node.boundingBox;
+    if (aBox && bBox) {
+      if (aBox.y !== bBox.y) return aBox.y - bBox.y;
+      if (aBox.x !== bBox.x) return aBox.x - bBox.x;
+    } else if (aBox && !bBox) {
+      return -1;
+    } else if (!aBox && bBox) {
+      return 1;
+    }
+
+    return a.idx - b.idx;
+  });
+
+  return { ordered: withIndex.map((x) => x.c), applied: true };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // V3: DECISION POLICY (Count-based)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1083,8 +1138,23 @@ function applyDecisionPolicy(
   }
 
   // Case 4: Multiple allowed with good semantic match → needs_clarification
-  // Embeddings sorted them, but we don't auto-select
-  const top3 = ranked.slice(0, 3);
+  // Embeddings sorted them, but we don't auto-select.
+  // Apply spatial tie-break ordering for very close candidates (delta < threshold).
+  let rankedForSelection = ranked;
+  if (allowedCount > 1 && topSim >= SEMANTIC_MIN_THRESHOLD && delta < AMBIGUOUS_SIMILARITY_DELTA) {
+    const { ordered, applied } = applySpatialTieBreakOrdering(ranked);
+    if (applied) {
+      rankedForSelection = ordered;
+      logger.debug('[EMBEDDINGS_RESOLVER] Spatial tie-break applied', {
+        event: 'spatial_tiebreak',
+        delta: delta.toFixed(3),
+        candidatesWithBbox: ordered.filter(c => c.node.boundingBox).length,
+        topMostCount: ordered.filter(c => c.node.isTopMostAtCenter === true).length,
+      });
+    }
+  }
+
+  const top3 = rankedForSelection.slice(0, 3);
   
   return {
     status: 'needs_clarification',

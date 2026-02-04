@@ -5,6 +5,7 @@
 
 import {
     applyStructuralFilters,
+    applySpatialTieBreakOrdering,
     buildCandidateText,
     sanitizeIntent,
 } from '../embeddings-resolver.service';
@@ -484,6 +485,201 @@ describe('EmbeddingsResolverService', () => {
 
       const text = buildCandidateText(node);
       expect(text).toContain('🔒 Login');
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Spatial Tie-Break Ordering
+  // ═══════════════════════════════════════════════════════════════════════════
+  describe('Spatial Tie-Break Ordering', () => {
+    describe('applySpatialTieBreakOrdering', () => {
+      it('should prefer isTopMostAtCenter=true when similarity is tied', () => {
+        const ranked = [
+          {
+            node: {
+              tag: 'button',
+              text: 'A',
+              isTopMostAtCenter: false,
+              boundingBox: { x: 100, y: 200, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'A',
+            similarity: 0.65,
+          },
+          {
+            node: {
+              tag: 'button',
+              text: 'B',
+              isTopMostAtCenter: true,
+              boundingBox: { x: 100, y: 700, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'B',
+            similarity: 0.65,
+          },
+        ];
+
+        const { ordered, applied } = applySpatialTieBreakOrdering(ranked);
+
+        expect(applied).toBe(true);
+        expect(ordered[0].node.text).toBe('B');
+      });
+
+      it('should prioritize top-to-bottom when similarity is tied', () => {
+        const ranked = [
+          {
+            node: {
+              tag: 'button',
+              text: 'Bottom',
+              boundingBox: { x: 100, y: 700, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'Bottom',
+            similarity: 0.65,
+          },
+          {
+            node: {
+              tag: 'button',
+              text: 'Top',
+              boundingBox: { x: 100, y: 200, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'Top',
+            similarity: 0.65,
+          },
+        ];
+
+        const { ordered } = applySpatialTieBreakOrdering(ranked);
+
+        expect(ordered[0].node.text).toBe('Top');
+      });
+
+      it('should prioritize left-to-right when Y is the same', () => {
+        const ranked = [
+          {
+            node: {
+              tag: 'button',
+              text: 'Right',
+              boundingBox: { x: 500, y: 200, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'Right',
+            similarity: 0.65,
+          },
+          {
+            node: {
+              tag: 'button',
+              text: 'Left',
+              boundingBox: { x: 100, y: 200, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'Left',
+            similarity: 0.65,
+          },
+        ];
+
+        const { ordered } = applySpatialTieBreakOrdering(ranked);
+
+        expect(ordered[0].node.text).toBe('Left');
+      });
+
+      it('should handle candidates without boundingBox gracefully', () => {
+        const ranked = [
+          {
+            node: { tag: 'button', text: 'A' } as InteractiveNode,
+            candidateText: 'A',
+            similarity: 0.65,
+          },
+          {
+            node: {
+              tag: 'button',
+              text: 'B',
+              boundingBox: { x: 100, y: 500, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'B',
+            similarity: 0.65,
+          },
+        ];
+
+        const { ordered, applied } = applySpatialTieBreakOrdering(ranked);
+
+        expect(applied).toBe(true);
+        expect(ordered).toHaveLength(2);
+        // B should come first because it has boundingBox
+        expect(ordered[0].node.text).toBe('B');
+      });
+
+      it('should not apply spatial when all candidates lack boundingBox and isTopMostAtCenter', () => {
+        const ranked = [
+          {
+            node: { tag: 'button', text: 'A' } as InteractiveNode,
+            candidateText: 'A',
+            similarity: 0.65,
+          },
+          {
+            node: { tag: 'button', text: 'B' } as InteractiveNode,
+            candidateText: 'B',
+            similarity: 0.64,
+          },
+        ];
+
+        const { ordered, applied } = applySpatialTieBreakOrdering(ranked);
+
+        expect(applied).toBe(false);
+        expect(ordered).toEqual(ranked);
+      });
+
+      it('should not reorder when similarity difference is above threshold', () => {
+        const ranked = [
+          {
+            node: {
+              tag: 'button',
+              text: 'High',
+              boundingBox: { x: 100, y: 700, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'High',
+            similarity: 0.75,
+          },
+          {
+            node: {
+              tag: 'button',
+              text: 'Low',
+              boundingBox: { x: 100, y: 200, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'Low',
+            similarity: 0.60, // delta = 0.15 > threshold (0.05)
+          },
+        ];
+
+        const { ordered, applied } = applySpatialTieBreakOrdering(ranked);
+
+        expect(applied).toBe(true);
+        // High should remain first because similarity gap is > threshold
+        expect(ordered[0].node.text).toBe('High');
+      });
+
+      it('should maintain stable order when all criteria are equal', () => {
+        const ranked = [
+          {
+            node: {
+              tag: 'button',
+              text: 'First',
+              boundingBox: { x: 100, y: 200, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'First',
+            similarity: 0.65,
+          },
+          {
+            node: {
+              tag: 'button',
+              text: 'Second',
+              boundingBox: { x: 100, y: 200, width: 50, height: 30 },
+            } as InteractiveNode,
+            candidateText: 'Second',
+            similarity: 0.65,
+          },
+        ];
+
+        const { ordered } = applySpatialTieBreakOrdering(ranked);
+
+        // Should maintain original order (First before Second)
+        expect(ordered[0].node.text).toBe('First');
+        expect(ordered[1].node.text).toBe('Second');
+      });
     });
   });
 });

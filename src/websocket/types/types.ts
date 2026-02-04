@@ -23,6 +23,10 @@ export interface ClientToServerEvents {
   'preview:step:apply': (data: PreviewStepApplyRequest) => void;
   'preview:step:clarify:select': (data: PreviewClarifySelectRequest) => void;
 
+  // Preview run operations (V8: Run from start)
+  'preview:run:start': (data: PreviewRunStartRequest) => void;
+  'preview:run:cancel': (data: PreviewRunCancelRequest) => void;
+
   // Preview interactive control (mouse/keyboard)
   'preview:mouse:move': (data: PreviewMouseMoveRequest) => void;
   'preview:mouse:click': (data: PreviewMouseClickRequest) => void;
@@ -107,6 +111,11 @@ export interface ServerToClientEvents {
   'preview:step:lint:result': (data: PreviewStepLintResultPayload) => void;
   'preview:step:apply:result': (data: PreviewStepApplyResultPayload) => void;
   'preview:step:clarify': (data: PreviewClarifyPayload) => void;
+
+  // Preview run events (V8: Run from start)
+  'preview:run:started': (data: PreviewRunStartedPayload) => void;
+  'preview:run:step': (data: PreviewRunStepPayload) => void;
+  'preview:run:completed': (data: PreviewRunCompletedPayload) => void;
 
   // Preview DevTools events (server -> client)
   'preview:console:update': (data: PreviewConsoleUpdatePayload) => void;
@@ -762,6 +771,21 @@ export interface PreviewStepApplyRequest {
 }
 
 /**
+ * V8: Request to start "Run from start" in preview
+ */
+export interface PreviewRunStartRequest {
+  previewSessionId: string;
+  intentTestCaseId: string; // Load saved steps from DB
+}
+
+/**
+ * V8: Request to cancel running preview run
+ */
+export interface PreviewRunCancelRequest {
+  previewSessionId: string;
+}
+
+/**
  * Candidate element from linting
  */
 export interface PreviewLintCandidate {
@@ -876,6 +900,48 @@ export interface PreviewClarifySelectRequest {
   previewSessionId: string;
   stepId: string;
   selectedRef: string;
+}
+
+/**
+ * V8: Preview run started payload (server -> client)
+ * Emitted when "Run from start" begins
+ */
+export interface PreviewRunStartedPayload {
+  previewSessionId: string;
+  totalSteps: number;
+  timestamp: string;
+}
+
+/**
+ * V8: Preview run step progress payload (server -> client)
+ * Emitted for each step as it transitions through states
+ */
+export interface PreviewRunStepPayload {
+  previewSessionId: string;
+  stepIndex: number;
+  stepId: string;
+  status: 'pending' | 'running' | 'pass' | 'fail' | 'skipped';
+  action?: string; // e.g., "click", "type", "assert", "ai_check"
+  description?: string;
+  error?: string;
+  failedReason?: string;
+  timestamp: string;
+}
+
+/**
+ * V8: Preview run completed payload (server -> client)
+ * Emitted when "Run from start" finishes (success, failure, or cancelled)
+ */
+export interface PreviewRunCompletedPayload {
+  previewSessionId: string;
+  success: boolean;
+  totalSteps: number;
+  passedSteps: number;
+  failedSteps: number;
+  skippedSteps: number;
+  cancelled?: boolean;
+  duration: number; // ms
+  timestamp: string;
 }
 
 // ============================================================================

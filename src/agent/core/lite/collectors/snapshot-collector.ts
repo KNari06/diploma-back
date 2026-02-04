@@ -589,13 +589,34 @@ export class SnapshotCollector {
             // ═══════════════════════════════════════════════════════════════
             const { chain: parentRefChain, containerRef, containerTitles } = getParentRefChain(el);
 
+            /**
+             * Best-effort: get human-readable visible text for an element.
+             * We prefer `innerText` because it tends to preserve visual spacing/newlines
+             * between inline children better than `textContent` (which can concatenate).
+             * Fallback to `textContent` for non-HTMLElement nodes or when `innerText` is empty.
+             */
+            const getReadableElementText = (node: Element): string => {
+              try {
+                const asHtmlEl = node as unknown as HTMLElement;
+                const raw = (typeof asHtmlEl.innerText === 'string' && asHtmlEl.innerText.trim().length > 0)
+                  ? asHtmlEl.innerText
+                  : (node.textContent || '');
+
+                // Normalize whitespace for UI labels: collapse to single spaces and trim.
+                // This avoids "glued" strings like "Опытныйрепетитор" when there are many inline spans.
+                return raw.replace(/\s+/g, ' ').trim();
+              } catch {
+                return (node.textContent || '').replace(/\s+/g, ' ').trim();
+              }
+            };
+
             elements.push({
               ref,
               role: el.getAttribute('role') || el.tagName.toLowerCase(),
               name: ariaLabel ||
                 el.getAttribute('title') ||
                 el.getAttribute('placeholder') ||
-                el.textContent?.trim().slice(0, 50) || '',
+                getReadableElementText(el).slice(0, 50) || '',
               tag: el.tagName.toLowerCase(),
               type: isInput ? input.type : undefined,
               // SECURITY: Never include raw input values in snapshots.
