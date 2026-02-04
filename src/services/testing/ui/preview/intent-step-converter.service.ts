@@ -1,11 +1,11 @@
 /**
  * Intent Step to PlaywrightCommand Converter
- * 
+ *
  * DESIGN PHILOSOPHY (per plan): This converter is strictly "dumb" -
  * it does NOT resolve elements or look them up. It only transfers:
  * - intent (type/description/value/options)
  * - compiled/evidence/bindingHints into metadata
- * 
+ *
  * Element resolution happens at runtime in CommandExecutor via:
  * 1. compiled.locatorPlan (if present and valid)
  * 2. Fallback to smart-locator + self-healing
@@ -13,7 +13,7 @@
 
 import { PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
-import type { IntentStep, IntentActionType, CompiledStepPlan, StepEvidence, BindingHints } from './preview.types';
+import type { BindingHints, CompiledStepPlan, IntentActionType, IntentStep, StepEvidence } from './preview.types';
 
 /**
  * Extended PlaywrightCommand with intent metadata for runtime resolution
@@ -38,6 +38,12 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     stepIndex: number;
     /** V2: Parent IntentTestCase ID for heal persistence */
     intentTestCaseId?: string;
+    /** V3: Assertion text for ai_check */
+    assertionText?: string;
+    /** V3: AI context mode for ai_check */
+    aiContextMode?: 'html' | 'screenshot' | 'html+screenshot' | 'html+a11y+screenshot';
+    /** Iframe selector for actions within iframes */
+    iframeSelector?: string;
   };
 }
 
@@ -76,6 +82,9 @@ function mapActionType(intentAction: IntentActionType): string {
       return 'click'; // Open is click on expandable element
     case 'close':
       return 'click'; // Close is click on closable element
+    // V3: AI check
+    case 'ai_check':
+      return 'aiCheck'; // New runtime action for AI-based assertions
     default:
       return 'click'; // Fallback
   }
@@ -84,7 +93,7 @@ function mapActionType(intentAction: IntentActionType): string {
 /**
  * Build selector from compiled locatorPlan (primary locator only)
  * Returns undefined if no compiled plan or no locators
- * 
+ *
  * The CommandExecutor will try all locators in the plan at runtime.
  * Here we just provide the primary one for backward compatibility.
  */
@@ -94,7 +103,7 @@ function buildPrimarySelector(compiled?: CompiledStepPlan): string | undefined {
   }
 
   const primary = compiled.locatorPlan[0];
-  
+
   switch (primary.strategy) {
     case 'ref':
     case 'css':
@@ -119,12 +128,12 @@ function buildPrimarySelector(compiled?: CompiledStepPlan): string | undefined {
 
 /**
  * Convert a single IntentStep to IntentPlaywrightCommand
- * 
+ *
  * This is a "dumb" converter - it does NOT:
  * - Resolve elements
  * - Make API calls
  * - Validate selectors
- * 
+ *
  * Resolution happens at runtime in CommandExecutor.
  */
 export function convertIntentStepToCommand(
@@ -133,18 +142,18 @@ export function convertIntentStepToCommand(
   testCaseStartUrl?: string
 ): IntentPlaywrightCommand {
   const action = mapActionType(step.type);
-  
+
   // Build primary selector from compiled plan if available
   // If not available, CommandExecutor will use intent-based resolution
   const primarySelector = buildPrimarySelector(step.compiled);
-  
+
   // Build command
   const command: IntentPlaywrightCommand = {
     action,
     description: step.description,
     timeout: step.options?.timeout || 30000,
     continueOnError: false,
-    
+
     // Intent metadata for runtime resolution
     intentMeta: {
       stepId: step.id,
@@ -153,6 +162,15 @@ export function convertIntentStepToCommand(
       evidence: step.evidence,
       bindingHints: step.bindingHints,
       stepIndex,
+      // V3: AI check metadata
+      ...(step.type === 'ai_check' && {
+        assertionText: step.assertionText,
+        aiContextMode: step.options?.aiContextMode || 'html+a11y+screenshot',
+      }),
+      // Iframe metadata (if step is within an iframe)
+      ...(step.options?.iframe?.selector && {
+        iframeSelector: step.options.iframe.selector,
+      }),
     },
   };
 
@@ -166,23 +184,23 @@ export function convertIntentStepToCommand(
     case 'fill':
       command.value = step.value || '';
       break;
-      
+
     case 'navigate':
       // For navigate, use the value as URL, or fallback to test case startUrl
       command.url = step.value || testCaseStartUrl;
       command.waitFor = 'domcontentloaded';
       break;
-      
+
     case 'press':
       // For press, value is the key to press (e.g., "Enter", "Tab")
       command.value = step.value || 'Enter';
       break;
-      
+
     case 'select':
       // For select, value is the option to select
       command.value = step.value || '';
       break;
-      
+
     case 'wait': {
       // For wait, value might be time in ms
       // ESLint: wrap in block to avoid no-case-declarations
@@ -192,7 +210,7 @@ export function convertIntentStepToCommand(
       command.timeout = normalizedWaitMs;
       break;
     }
-      
+
     case 'assert':
       // For assert, set up assertion config
       command.assertion = {
@@ -200,11 +218,16 @@ export function convertIntentStepToCommand(
         expected: step.value || true,
       };
       break;
-      
+
+    case 'ai_check':
+      // For ai_check, no additional command fields needed
+      // All data is in intentMeta (assertionText, aiContextMode)
+      break;
+
     case 'scroll':
       // Scroll doesn't need value, but may have selector
       break;
-      
+
     default:
       // For click, hover, check, uncheck, toggle, open, close
       // Just need the selector which is handled above
@@ -225,7 +248,7 @@ export function convertIntentStepToCommand(
 
 /**
  * Convert array of IntentSteps to IntentPlaywrightCommands
- * 
+ *
  * @param steps Array of IntentSteps from the test case
  * @param startUrl Starting URL for navigate actions
  * @param intentTestCaseId Optional parent test case ID for heal persistence
@@ -257,12 +280,12 @@ export function convertIntentStepsToCommands(
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const command = convertIntentStepToCommand(step, i, startUrl);
-    
+
     // V2: Add intentTestCaseId for heal persistence
     if (intentTestCaseId && command.intentMeta) {
       command.intentMeta.intentTestCaseId = intentTestCaseId;
     }
-    
+
     commands.push(command);
   }
 
@@ -281,10 +304,10 @@ export function convertIntentStepsToCommands(
 export class IntentStepConverterService {
   /**
    * Convert intent steps to Playwright commands
-   * 
+   *
    * This is the main entry point for the converter.
    * The conversion is "dumb" - no resolution, no API calls.
-   * 
+   *
    * @param steps Array of IntentSteps
    * @param startUrl Starting URL
    * @param intentTestCaseId Optional parent test case ID for heal persistence

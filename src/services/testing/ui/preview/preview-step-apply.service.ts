@@ -35,7 +35,7 @@ function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
   if (node.placeholder) hints.placeholder = node.placeholder;
   if (node.autocomplete) hints.autocomplete = node.autocomplete;
   if (node.inputType || node.type) hints.type = node.inputType || node.type;
-  
+
   // Add nearby text from container titles
   if (node.containerTitles && node.containerTitles.length > 0) {
     hints.nearText = node.containerTitles[0];
@@ -465,7 +465,7 @@ export class PreviewStepApplyService {
       // Handle non-targeting actions (navigate, wait)
       if (['navigate', 'wait'].includes(stepDraft.type)) {
         const result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
-        
+
         // Generate compiled plan for non-targeting actions
         let compiled;
         try {
@@ -479,7 +479,7 @@ export class PreviewStepApplyService {
             error: compileError instanceof Error ? compileError.message : String(compileError),
           });
         }
-        
+
         return {
           success: result.success,
           error: result.error,
@@ -491,6 +491,120 @@ export class PreviewStepApplyService {
           url: page.url(),
           attempts: 1,
         };
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V3: Handle ai_check assertions
+      // ═══════════════════════════════════════════════════════════════════════
+      if (stepDraft.type === 'ai_check') {
+        logger.info('[PREVIEW_APPLY] Handling ai_check assertion', {
+          previewSessionId,
+          assertion: stepDraft.assertionText,
+          contextMode: stepDraft.options?.aiContextMode || 'html+a11y+screenshot',
+        });
+
+        // Validate assertionText
+        if (!stepDraft.assertionText || stepDraft.assertionText.trim().length === 0) {
+          return {
+            success: false,
+            error: 'assertionText is required for ai_check',
+            attempts: 0,
+          };
+        }
+
+        try {
+          // Import devtools collector and AI check service
+          const { fetchHtml, fetchAccessibility } = await import('./preview-devtools-collector.service');
+          const { evaluateAiCheck } = await import('./ai-check.service');
+
+          // Determine context mode (default: html+a11y+screenshot)
+          const contextMode = stepDraft.options?.aiContextMode || 'html+a11y+screenshot';
+
+          // Gather context based on mode
+          let html: string | undefined;
+          let a11yTree: any[] | undefined;
+          let screenshotBase64: string | undefined;
+
+          const sessionService = getPreviewSessionService();
+
+          if (contextMode.includes('html')) {
+            const htmlPayload = await fetchHtml(page, previewSessionId, 0);
+            html = htmlPayload.html;
+          }
+
+          if (contextMode.includes('a11y')) {
+            const a11yPayload = await fetchAccessibility(page, previewSessionId, 0);
+            a11yTree = a11yPayload.tree;
+          }
+
+          if (contextMode.includes('screenshot')) {
+            const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
+              force: true,
+              includeScreenshot: true,
+              includeDomNodes: false,
+            });
+            screenshotBase64 = snapshot?.screenshot;
+            if (!screenshotBase64) {
+              logger.warn('[PREVIEW_APPLY] ai_check screenshot not available from snapshot', {
+                previewSessionId,
+              });
+            }
+          }
+
+          // Evaluate AI check
+          const aiCheckResult = await evaluateAiCheck({
+            assertionText: stepDraft.assertionText,
+            url: page.url(),
+            html,
+            a11yTree,
+            screenshotBase64,
+          });
+
+          logger.info('[PREVIEW_APPLY] ai_check evaluation completed', {
+            previewSessionId,
+            pass: aiCheckResult.pass,
+            confidence: aiCheckResult.confidence,
+            explanation: aiCheckResult.explanation,
+          });
+
+          // Build appliedStep with evidence
+          const updatedStep: IntentStep = {
+            ...stepDraft,
+            evidence: {
+              ...stepDraft.evidence,
+              confidence: aiCheckResult.confidence,
+              resolutionMeta: {
+                allowedCount: 1,
+                usedRules: ['ai_check'],
+                usedEmbeddings: false,
+                confidenceTier: (aiCheckResult.confidence || 0) >= 0.85 ? 'high' :
+                                (aiCheckResult.confidence || 0) >= 0.6 ? 'medium' : 'low',
+              },
+            },
+            // No compiled plan for ai_check (it's evaluated by LLM, not by locators)
+          };
+
+          return {
+            success: aiCheckResult.pass,
+            error: aiCheckResult.pass ? undefined : aiCheckResult.explanation,
+            appliedStep: updatedStep,
+            urlChanged: false,
+            url: page.url(),
+            highlight: [], // No element highlight for ai_check
+            attempts: 1,
+          };
+        } catch (error) {
+          logger.error('[PREVIEW_APPLY] ai_check evaluation failed', {
+            previewSessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+
+          return {
+            success: false,
+            error: `AI check failed: ${error instanceof Error ? error.message : String(error)}`,
+            attempts: 0,
+          };
+        }
       }
 
       // V3: If user confirmed a selection, use it directly without re-linting
@@ -550,7 +664,7 @@ export class PreviewStepApplyService {
           };
 
           // V2: Auto-populate bindingHints from resolved node
-          const enrichedBindingHints = resolvedNode 
+          const enrichedBindingHints = resolvedNode
             ? { ...stepDraft.bindingHints, ...buildBindingHintsFromNode(resolvedNode) }
             : stepDraft.bindingHints;
 
@@ -696,7 +810,7 @@ export class PreviewStepApplyService {
 
           // Build resolution meta from lint result
           // Determine confidence tier based on candidate confidence
-          const confidenceTier: ConfidenceTier = 
+          const confidenceTier: ConfidenceTier =
             candidate.confidence >= 0.85 ? 'high' :
             candidate.confidence >= 0.6 ? 'medium' : 'low';
 
@@ -709,7 +823,7 @@ export class PreviewStepApplyService {
           };
 
           // V2: Auto-populate bindingHints from resolved node
-          const enrichedBindingHints = candidate.node 
+          const enrichedBindingHints = candidate.node
             ? { ...stepDraft.bindingHints, ...buildBindingHintsFromNode(candidate.node) }
             : stepDraft.bindingHints;
 

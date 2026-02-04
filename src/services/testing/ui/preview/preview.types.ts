@@ -124,7 +124,7 @@ export interface DomAnalysisData {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Action type for intent steps (V2: added state-aware actions)
+ * Action type for intent steps (V2: added state-aware actions, V3: added ai_check)
  */
 export type IntentActionType =
   | 'fill'
@@ -141,7 +141,9 @@ export type IntentActionType =
   | 'uncheck'
   | 'toggle'
   | 'open'
-  | 'close';
+  | 'close'
+  // V3: AI-powered assertion
+  | 'ai_check';
 
 /**
  * Binding hints for element resolution
@@ -321,6 +323,15 @@ export interface StepOptions {
   disableCaching?: boolean;
   /** Iframe configuration for actions within iframes */
   iframe?: IframeConfig;
+  /**
+   * AI context mode for ai_check assertions (V3)
+   * Specifies what context to provide to the LLM for evaluation
+   * - 'html': HTML content only
+   * - 'screenshot': Screenshot only
+   * - 'html+screenshot': HTML + screenshot
+   * - 'html+a11y+screenshot': HTML + accessibility tree + screenshot (default, most comprehensive)
+   */
+  aiContextMode?: 'html' | 'screenshot' | 'html+screenshot' | 'html+a11y+screenshot';
 }
 
 /**
@@ -335,6 +346,13 @@ export interface IntentStep {
   description: string;
   /** Value for fill actions */
   value?: string;
+  /**
+   * Assertion text for ai_check actions (V3)
+   * Natural language assertion to be evaluated by LLM
+   * Example: "There is a black nav bar with five links"
+   * Required when type === 'ai_check'
+   */
+  assertionText?: string;
   /** Options for the action */
   options?: StepOptions;
   /** Hints for element resolution */

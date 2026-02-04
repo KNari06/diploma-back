@@ -1,0 +1,309 @@
+/**
+ * AI Check Service
+ * Evaluates natural language assertions using LLM with HTML, accessibility tree, and screenshot context
+ * Inspired by Momentic's AI check feature
+ */
+
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { logger } from '@/utils/core/logger';
+import { PreviewAccessibilityNode } from '@/websocket/types/types';
+import { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Input for AI check evaluation
+ */
+export interface AiCheckInput {
+  /** Natural language assertion to evaluate (required) */
+  assertionText: string;
+  /** Current page URL */
+  url: string;
+  /** HTML content (optional, max 100KB) */
+  html?: string;
+  /** Accessibility tree (optional) */
+  a11yTree?: PreviewAccessibilityNode[];
+  /** Screenshot base64 (JPEG, optional) */
+  screenshotBase64?: string;
+}
+
+/**
+ * Result from AI check evaluation
+ */
+export interface AiCheckResult {
+  /** Whether the assertion passes */
+  pass: boolean;
+  /** Short explanation (for CI/report) */
+  explanation: string;
+  /** Confidence score (0-1, optional) */
+  confidence?: number;
+  /** Which artifacts were used for evaluation */
+  artifactsUsed: {
+    html: boolean;
+    a11y: boolean;
+    screenshot: boolean;
+  };
+}
+
+/**
+ * Structured JSON response from LLM
+ */
+interface AiCheckLLMResponse {
+  pass: boolean;
+  explanation: string;
+  confidence?: number;
+  reasoning?: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Max HTML content length (100KB) */
+const MAX_HTML_LENGTH = 100 * 1024;
+
+/** Max accessibility tree depth */
+const MAX_A11Y_DEPTH = 10;
+
+/** Max accessibility tree nodes */
+const MAX_A11Y_NODES = 500;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROMPT BUILDERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Build system prompt for AI check evaluation (Momentic-inspired)
+ * Enforces: no vacuous truth, strict counts, visual criteria from screenshot
+ */
+function buildSystemPrompt(): string {
+  return `You are an expert QA engineer evaluating natural language assertions about web pages.
+
+Your job is to determine if a user's assertion is TRUE or FALSE based on the provided context (HTML, accessibility tree, and/or screenshot).
+
+# CRITICAL RULES (Momentic-style enforcement):
+
+1. **No Vacuous Truth**: If an assertion mentions a specific element (e.g., "Submit button is not blue"), the element MUST exist. If it doesn't exist, the assertion FAILS.
+   - Example: "Submit button is not blue" with no submit button present → FAIL (not pass by absence)
+
+2. **Strict Counts**: When an assertion specifies a count (e.g., "page shows 3 results"), the count must be EXACT. Off-by-one or approximate counts are FAIL.
+   - Example: "page shows 3 results" with 4 results present → FAIL
+
+3. **Visual Criteria from Screenshot**: Any assertion about color, style, position, or visual appearance MUST be evaluated using the screenshot (if provided). HTML/a11y alone are insufficient for visual checks.
+   - Example: "Buy button is blue" → evaluate from screenshot, not HTML
+
+4. **Be Precise**: If the assertion is ambiguous or context is insufficient, set pass:false and explain why.
+
+5. **Short Explanations**: Keep explanations concise (1-2 sentences) for CI/report readability.
+
+# OUTPUT FORMAT:
+Return a JSON object with these fields:
+- pass: boolean (true if assertion holds, false otherwise)
+- explanation: string (short, 1-2 sentences)
+- confidence: number (0-1, optional, your confidence in the evaluation)
+- reasoning: string (optional, detailed reasoning for debugging)
+
+# EXAMPLES:
+
+Assertion: "There is a black nav bar with five links"
+Context: HTML shows <nav> with 5 <a> tags, screenshot shows black background
+→ { "pass": true, "explanation": "Nav bar exists with 5 links and black background.", "confidence": 0.95 }
+
+Assertion: "Submit button is not blue"
+Context: No submit button found in HTML/a11y
+→ { "pass": false, "explanation": "Submit button does not exist, so assertion is vacuously false.", "confidence": 0.9 }
+
+Assertion: "Page shows 3 results"
+Context: HTML shows 4 result items
+→ { "pass": false, "explanation": "Page shows 4 results, not 3.", "confidence": 1.0 }
+
+Assertion: "Logo is in the top-left corner"
+Context: Screenshot shows logo in top-right corner
+→ { "pass": false, "explanation": "Logo is in top-right corner, not top-left.", "confidence": 0.85 }
+
+Now evaluate the user's assertion based on the provided context.`;
+}
+
+/**
+ * Build user prompt with assertion and context
+ */
+function buildUserPrompt(input: AiCheckInput, truncatedFlags: { html: boolean; a11y: boolean }): string {
+  let prompt = `# ASSERTION TO EVALUATE:\n"${input.assertionText}"\n\n`;
+  prompt += `# CURRENT PAGE:\nURL: ${input.url}\n\n`;
+
+  if (input.html) {
+    prompt += `# HTML CONTENT:\n${input.html}\n`;
+    if (truncatedFlags.html) {
+      prompt += `(Note: HTML was truncated to fit within limits)\n`;
+    }
+    prompt += `\n`;
+  }
+
+  if (input.a11yTree && input.a11yTree.length > 0) {
+    const a11yText = serializeA11yTree(input.a11yTree);
+    prompt += `# ACCESSIBILITY TREE:\n${a11yText}\n`;
+    if (truncatedFlags.a11y) {
+      prompt += `(Note: Accessibility tree was truncated to fit within limits)\n`;
+    }
+    prompt += `\n`;
+  }
+
+  prompt += `Now evaluate the assertion and return JSON.`;
+
+  return prompt;
+}
+
+/**
+ * Serialize accessibility tree to text (for LLM context)
+ */
+function serializeA11yTree(nodes: PreviewAccessibilityNode[], depth: number = 0, maxDepth: number = MAX_A11Y_DEPTH, nodeCount: { count: number } = { count: 0 }): string {
+  if (depth > maxDepth || nodeCount.count > MAX_A11Y_NODES) {
+    return '';
+  }
+
+  let result = '';
+  for (const node of nodes) {
+    if (nodeCount.count > MAX_A11Y_NODES) break;
+    nodeCount.count++;
+
+    const indent = '  '.repeat(depth);
+    let line = `${indent}- ${node.role}`;
+    if (node.name) line += `: ${node.name}`;
+    if (node.value) line += ` (value: ${node.value})`;
+    if (node.description) line += ` [${node.description}]`;
+    result += line + '\n';
+
+    if (node.children && node.children.length > 0) {
+      result += serializeA11yTree(node.children, depth + 1, maxDepth, nodeCount);
+    }
+  }
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN EVALUATION FUNCTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Evaluate an AI check assertion
+ * Uses OpenAI GPT-4o (vision) when screenshot is provided, otherwise GPT-4o-mini
+ */
+export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResult> {
+  const startTime = Date.now();
+
+  logger.info('[AI_CHECK] Starting evaluation', {
+    assertion: input.assertionText,
+    url: input.url,
+    hasHtml: !!input.html,
+    hasA11y: !!input.a11yTree,
+    hasScreenshot: !!input.screenshotBase64,
+  });
+
+  try {
+    // Validate input
+    if (!input.assertionText || input.assertionText.trim().length === 0) {
+      throw new Error('assertionText is required and cannot be empty');
+    }
+
+    // Determine which artifacts are being used
+    const artifactsUsed = {
+      html: !!input.html,
+      a11y: !!input.a11yTree && input.a11yTree.length > 0,
+      screenshot: !!input.screenshotBase64,
+    };
+
+    // Truncate HTML if too large
+    const truncatedFlags = { html: false, a11y: false };
+    let html = input.html;
+    if (html && html.length > MAX_HTML_LENGTH) {
+      html = html.substring(0, MAX_HTML_LENGTH);
+      truncatedFlags.html = true;
+      logger.warn('[AI_CHECK] HTML truncated', {
+        originalLength: input.html?.length ?? 0,
+        truncatedLength: html.length,
+      });
+    }
+
+    // Build messages
+    const messages: ChatCompletionMessageParam[] = [
+      { role: 'system', content: buildSystemPrompt() },
+    ];
+
+    // Build user message with text and optional screenshot
+    if (input.screenshotBase64) {
+      // Multimodal: text + image
+      messages.push({
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: buildUserPrompt({ ...input, html }, truncatedFlags),
+          },
+          {
+            type: 'image_url',
+            image_url: {
+              url: `data:image/jpeg;base64,${input.screenshotBase64}`,
+              detail: 'high', // High detail for better visual analysis
+            },
+          },
+        ],
+      });
+    } else {
+      // Text-only
+      messages.push({
+        role: 'user',
+        content: buildUserPrompt({ ...input, html }, truncatedFlags),
+      });
+    }
+
+    // Choose model based on whether we have a screenshot
+    const model = input.screenshotBase64 ? 'gpt-4o' : 'gpt-4o-mini';
+
+    // Call OpenAI
+    logger.debug('[AI_CHECK] Calling OpenAI', { model, messageCount: messages.length });
+    const response = await getChatCompletionWithMessages(messages, {
+      model,
+      temperature: 0.2, // Lower temperature for more consistent evaluation
+      max_tokens: 500, // Keep explanations concise
+      response_format: { type: 'json_object' },
+    });
+
+    // Parse response
+    const parsed: AiCheckLLMResponse = JSON.parse(response.content);
+
+    logger.info('[AI_CHECK] Evaluation completed', {
+      assertion: input.assertionText,
+      pass: parsed.pass,
+      confidence: parsed.confidence,
+      tokensUsed: response.usage.totalTokens,
+      durationMs: Date.now() - startTime,
+    });
+
+    return {
+      pass: parsed.pass,
+      explanation: parsed.explanation || 'No explanation provided',
+      confidence: parsed.confidence,
+      artifactsUsed,
+    };
+  } catch (error) {
+    logger.error('[AI_CHECK] Evaluation failed', {
+      assertion: input.assertionText,
+      error: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startTime,
+    });
+
+    // Return failure result on error
+    return {
+      pass: false,
+      explanation: `AI check evaluation failed: ${error instanceof Error ? error.message : String(error)}`,
+      confidence: 0,
+      artifactsUsed: {
+        html: !!input.html,
+        a11y: !!input.a11yTree,
+        screenshot: !!input.screenshotBase64,
+      },
+    };
+  }
+}

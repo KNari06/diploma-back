@@ -37,27 +37,53 @@ const router = Router();
  *     PreviewIntentStep:
  *       type: object
  *       description: |
- *         Draft step structure used by Step Editor (shape is flexible; backend supports extra fields).
- *         This schema documents the common subset used by preview lint/apply.
+ *         Draft step structure used by Step Editor (V3: added ai_check support).
+ *         Shape is flexible; backend supports extra fields. This schema documents the common subset.
  *       properties:
  *         id:
  *           type: string
- *         action:
+ *         type:
  *           type: string
- *           description: e.g. click, fill, goto, wait, assert
+ *           description: Action type (fill, click, wait, assert, navigate, select, hover, scroll, press, check, uncheck, toggle, open, close, ai_check)
+ *           enum: [fill, click, wait, assert, navigate, select, hover, scroll, press, check, uncheck, toggle, open, close, ai_check]
  *         description:
  *           type: string
- *         url:
- *           type: string
  *         value:
+ *           type: string
  *           description: Optional value for fill/assert/etc
- *         ref:
+ *         assertionText:
  *           type: string
- *           description: Optional element ref (e.g., "e123")
- *         selector:
- *           type: string
+ *           description: |
+ *             (V3) Natural language assertion for ai_check type.
+ *             Example: "There is a black nav bar with five links"
+ *             Required when type === 'ai_check'
+ *         bindingHints:
+ *           type: object
+ *           properties:
+ *             role: { type: string }
+ *             label: { type: string }
+ *             placeholder: { type: string }
+ *             nearText: { type: string }
+ *             autocomplete: { type: string }
+ *             type: { type: string }
  *         options:
  *           type: object
+ *           properties:
+ *             timeout: { type: number, description: 'Timeout in milliseconds' }
+ *             humanLike: { type: boolean, description: 'Human-like execution mode (gradual typing, hover before click)' }
+ *             replaceContent: { type: boolean, description: 'Replace content instead of appending (fill action)' }
+ *             pressEnter: { type: boolean, description: 'Press Enter after fill' }
+ *             keyPressDelay: { type: number, description: 'Delay between keystrokes in ms' }
+ *             aiContextMode:
+ *               type: string
+ *               enum: [html, screenshot, 'html+screenshot', 'html+a11y+screenshot']
+ *               description: |
+ *                 (V3) AI context mode for ai_check assertions.
+ *                 Specifies what context to provide to the LLM:
+ *                 - 'html': HTML content only
+ *                 - 'screenshot': Screenshot only
+ *                 - 'html+screenshot': HTML + screenshot
+ *                 - 'html+a11y+screenshot': HTML + accessibility tree + screenshot (default, most comprehensive)
  *           additionalProperties: true
  *       additionalProperties: true
  *

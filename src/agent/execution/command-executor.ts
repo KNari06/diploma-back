@@ -7,7 +7,7 @@ import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test
 import type { CompiledStepPlan, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
-import { Locator, Page } from 'playwright';
+import { Frame, Locator, Page } from 'playwright';
 import { shouldPressEnterAfterFill } from '../utils/ai/enter-detection-ai';
 import { getLocator, getSmartLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLocator } from '../utils/selectors/selector-utils';
 import { SelectorStabilityScore, SmartWaitService } from '../utils/selectors/smart-wait.service';
@@ -102,6 +102,43 @@ export class CommandExecutor {
   }
 
   /**
+   * ✅ Get context-aware locator (page or iframe)
+   * If iframe selector is provided, creates a frameLocator chain
+   * @param selector The element selector
+   * @param iframeSelector Optional iframe selector for actions within iframes
+   * @returns Locator for the element (either in page or iframe context)
+   */
+  private getContextLocator(selector: string, iframeSelector?: string): Locator {
+    if (iframeSelector) {
+      // Element is within an iframe - use frameLocator
+      logger.debug('[COMMAND_EXECUTOR] Using frameLocator for iframe context', {
+        iframeSelector: iframeSelector.substring(0, 50),
+        selector: selector.substring(0, 50),
+      });
+      return this.page.frameLocator(iframeSelector).locator(selector);
+    } else {
+      // Element is in main page context
+      return getLocator(this.page, selector);
+    }
+  }
+
+  /**
+   * ✅ Resolve iframe Frame from iframe element selector.
+   * Uses ElementHandle.contentFrame() to get the underlying Playwright Frame.
+   * @param iframeSelector CSS selector for the iframe element
+   * @param timeout Maximum time to wait for iframe to be attached/ready
+   */
+  private async getFrameFromIframeSelector(iframeSelector: string, timeout: number = 10000): Promise<Frame> {
+    // Wait for the iframe element to exist in DOM
+    const iframeHandle = await this.page.waitForSelector(iframeSelector, { timeout });
+    const frame = await iframeHandle.contentFrame();
+    if (!frame) {
+      throw new Error(`Iframe content frame not available for selector: ${iframeSelector}`);
+    }
+    return frame;
+  }
+
+  /**
    * Execute a single command
    *
    * For IntentPlaywrightCommand (has intentMeta), uses:
@@ -169,6 +206,10 @@ export class CommandExecutor {
           // ✅ FIX 3: Helper for click with optional navigation wait
           const performClick = async (locator: Locator) => {
             await this.forceScrollIntoView(locator);
+            // ✅ Overlay guard: Ensure element is topmost before clicking
+            await this.ensureTopMostAtCenter(locator, 2000);
+            // ✅ Wait for enabled: Ensure element is not disabled
+            await this.waitForEnabled(locator, 5000);
             if (awaitNavigation) {
               // Wait for navigation if expected
               await Promise.all([
@@ -398,6 +439,10 @@ export class CommandExecutor {
 
           try {
             await selectSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            // ✅ Wait for enabled: Ensure select is not disabled
+            await this.waitForEnabled(selectSmartResult.locator, 5000);
+            // ✅ Wait for options: Ensure select has options available
+            await this.waitForSelectOptions(selectSmartResult.locator, 5000, 3);
             await selectSmartResult.locator.selectOption(selectValue, { timeout: timeout || 30000 });
           } catch (selectError) {
             // Smart locator failed, try self-healing
@@ -409,6 +454,10 @@ export class CommandExecutor {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
+                // ✅ Wait for enabled in self-healing path too
+                await this.waitForEnabled(locator, 5000);
+                // ✅ Wait for options in self-healing path too
+                await this.waitForSelectOptions(locator, 5000, 3);
                 await locator.selectOption(selectValue, { timeout: timeout || 30000 });
               },
               {
@@ -443,6 +492,8 @@ export class CommandExecutor {
 
           try {
             await checkSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            // ✅ Wait for enabled: Ensure checkbox is not disabled
+            await this.waitForEnabled(checkSmartResult.locator, 5000);
             await checkSmartResult.locator.check({ timeout: timeout || 30000 });
           } catch (checkError) {
             logger.warn('[COMMAND_EXECUTOR] Smart locator check failed, trying self-healing', {
@@ -453,6 +504,8 @@ export class CommandExecutor {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
+                // ✅ Wait for enabled in self-healing path too
+                await this.waitForEnabled(locator, 5000);
                 await locator.check({ timeout: timeout || 30000 });
               },
               {
@@ -486,6 +539,8 @@ export class CommandExecutor {
 
           try {
             await uncheckSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            // ✅ Wait for enabled: Ensure checkbox is not disabled
+            await this.waitForEnabled(uncheckSmartResult.locator, 5000);
             await uncheckSmartResult.locator.uncheck({ timeout: timeout || 30000 });
           } catch (uncheckError) {
             logger.warn('[COMMAND_EXECUTOR] Smart locator uncheck failed, trying self-healing', {
@@ -496,6 +551,8 @@ export class CommandExecutor {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
+                // ✅ Wait for enabled in self-healing path too
+                await this.waitForEnabled(locator, 5000);
                 await locator.uncheck({ timeout: timeout || 30000 });
               },
               {
@@ -611,8 +668,14 @@ export class CommandExecutor {
           if (!value) throw new Error('Key is required for press action');
           if (selector) {
             const pressLocator = this.getLocatorInternal(selector);
+            // ✅ Ensure focus: Verify element is focused before pressing key
+            await this.ensureFocused(pressLocator, 2000);
             await pressLocator.press(String(value), { timeout: timeout || 30000 });
           } else {
+            // No selector - use page.keyboard.press (risky, log warning)
+            logger.warn('[COMMAND_EXECUTOR] Using page.keyboard.press without selector - risky behavior', {
+              key: String(value),
+            });
             await this.page.keyboard.press(String(value));
           }
           break;
@@ -764,6 +827,115 @@ export class CommandExecutor {
           });
           await this.page.evaluate(script);
           break;
+
+        // ═══════════════════════════════════════════════════════════════
+        // V3: AI CHECK (LLM-based assertion)
+        // ═══════════════════════════════════════════════════════════════
+        case 'aiCheck': {
+          logger.info('[COMMAND_EXECUTOR] Executing aiCheck assertion', {
+            stepId: isIntentCommand ? intentCommand.intentMeta?.stepId : undefined,
+            assertionText: isIntentCommand ? intentCommand.intentMeta?.assertionText : undefined,
+          });
+
+          if (!isIntentCommand || !intentCommand.intentMeta?.assertionText) {
+            throw new Error('aiCheck requires intentMeta.assertionText');
+          }
+
+          try {
+            // Import services
+            const { evaluateAiCheck } = await import('@/services/testing/ui/preview/ai-check.service');
+
+            // Determine context mode (default: html+a11y+screenshot)
+            const contextMode = intentCommand.intentMeta.aiContextMode || 'html+a11y+screenshot';
+
+            // Gather context based on mode
+            let html: string | undefined;
+            let a11yTree: any[] | undefined;
+            let screenshotBase64: string | undefined;
+
+            if (contextMode.includes('html')) {
+              html = await this.page.content();
+              // Truncate if too large (100KB)
+              if (html.length > 100 * 1024) {
+                html = html.substring(0, 100 * 1024);
+              }
+            }
+
+            if (contextMode.includes('a11y')) {
+              // Fetch accessibility tree via CDP
+              const cdpSession = await this.page.context().newCDPSession(this.page);
+              try {
+                const { nodes } = await cdpSession.send('Accessibility.getFullAXTree');
+                // Convert CDP nodes to our format (simplified)
+                a11yTree = this.convertCdpA11yTree(nodes);
+              } catch (a11yError) {
+                logger.warn('[COMMAND_EXECUTOR] Failed to fetch accessibility tree', {
+                  error: a11yError instanceof Error ? a11yError.message : String(a11yError),
+                });
+              } finally {
+                await cdpSession.detach();
+              }
+            }
+
+            if (contextMode.includes('screenshot')) {
+              const screenshot = await this.page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
+              screenshotBase64 = screenshot.toString('base64');
+            }
+
+            // Evaluate AI check
+            const aiCheckResult = await evaluateAiCheck({
+              assertionText: intentCommand.intentMeta.assertionText,
+              url: this.page.url(),
+              html,
+              a11yTree,
+              screenshotBase64,
+            });
+
+            logger.info('[COMMAND_EXECUTOR] aiCheck evaluation completed', {
+              stepId: intentCommand.intentMeta.stepId,
+              pass: aiCheckResult.pass,
+              confidence: aiCheckResult.confidence,
+            });
+
+            // If check fails, throw error with explanation
+            if (!aiCheckResult.pass) {
+              // Record failure in runtime meta
+              if (isIntentCommand && intentCommand.intentMeta?.stepId) {
+                this.stepRuntimeMeta.set(intentCommand.intentMeta.stepId, {
+                  runtimeStatus: 'failed',
+                  source: 'resolver',
+                  confidenceTier: 'high',
+                  failedReason: 'assertion_failed',
+                  failureExplanation: aiCheckResult.explanation,
+                });
+              }
+              throw new Error(aiCheckResult.explanation);
+            }
+
+            // Success - record in runtime meta
+            if (isIntentCommand && intentCommand.intentMeta?.stepId) {
+              this.stepRuntimeMeta.set(intentCommand.intentMeta.stepId, {
+                runtimeStatus: 'executed',
+                source: 'resolver',
+                confidenceTier: aiCheckResult.confidence && aiCheckResult.confidence >= 0.85 ? 'high' :
+                                aiCheckResult.confidence && aiCheckResult.confidence >= 0.6 ? 'medium' : 'low',
+              });
+            }
+          } catch (error) {
+            // Record failure in runtime meta
+            if (isIntentCommand && intentCommand.intentMeta?.stepId) {
+              this.stepRuntimeMeta.set(intentCommand.intentMeta.stepId, {
+                runtimeStatus: 'failed',
+                source: 'resolver',
+                confidenceTier: 'low',
+                failedReason: 'assertion_failed',
+                failureExplanation: error instanceof Error ? error.message : String(error),
+              });
+            }
+            throw error;
+          }
+          break;
+        }
 
         default:
           throw new Error(`Unknown action: ${action}`);
@@ -1018,6 +1190,61 @@ export class CommandExecutor {
   }
 
   /**
+   * V3: Convert CDP accessibility tree to our PreviewAccessibilityNode format
+   * Simplified converter for ai_check runtime execution
+   */
+  private convertCdpA11yTree(nodes: any[]): any[] {
+    if (!nodes || nodes.length === 0) return [];
+
+    const result: any[] = [];
+    const maxNodes = 500;
+    let nodeCount = 0;
+
+    const convertNode = (node: any): any | null => {
+      if (nodeCount >= maxNodes) return null;
+      if (!node.role || node.role.value === 'none' || node.role.value === 'ignored') return null;
+
+      nodeCount++;
+
+      const converted: any = {
+        role: node.role?.value || 'unknown',
+      };
+
+      if (node.name?.value) converted.name = node.name.value;
+      if (node.value?.value) converted.value = node.value.value;
+      if (node.description?.value) converted.description = node.description.value;
+
+      if (node.childIds && node.childIds.length > 0) {
+        const children: any[] = [];
+        for (const childId of node.childIds) {
+          const childNode = nodes.find((n: any) => n.nodeId === childId);
+          if (childNode) {
+            const convertedChild = convertNode(childNode);
+            if (convertedChild) children.push(convertedChild);
+          }
+        }
+        if (children.length > 0) converted.children = children;
+      }
+
+      return converted;
+    };
+
+    // Find root nodes (nodes without parents)
+    const rootNodes = nodes.filter((node: any) => {
+      const hasParent = nodes.some((n: any) => n.childIds?.includes(node.nodeId));
+      return !hasParent;
+    });
+
+    for (const rootNode of rootNodes) {
+      const converted = convertNode(rootNode);
+      if (converted) result.push(converted);
+      if (nodeCount >= maxNodes) break;
+    }
+
+    return result;
+  }
+
+  /**
    * Get extracted data
    */
   getExtractedData(): Map<string, any> {
@@ -1188,14 +1415,18 @@ export class CommandExecutor {
     const startTime = Date.now();
     const intentMeta = command.intentMeta;
     const stepId = intentMeta?.stepId || 'unknown';
+    const iframeSelector = intentMeta?.iframeSelector;
 
     // Track healing attempts for this step
     let healAttempts = 0;
 
     // 1. Try compiled locator plan first (if available)
     if (intentMeta?.compiled) {
+      const compiledContext = iframeSelector
+        ? await this.getFrameFromIframeSelector(iframeSelector, Math.min(timeout, 10000))
+        : this.page;
       const compiledResult = await executeCompiledLocatorPlan(
-        this.page,
+        compiledContext,
         intentMeta.compiled,
         actionType,
         timeout
@@ -1209,6 +1440,7 @@ export class CommandExecutor {
           stepId,
           strategy: compiledResult.usedStrategy,
           confidence: compiledResult.confidence,
+          iframe: !!iframeSelector,
         });
 
         return { locator: compiledResult.locator, runtimeMeta };
@@ -1234,7 +1466,12 @@ export class CommandExecutor {
         );
 
         if (smartResult.locator) {
-          await smartResult.locator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
+          // Apply iframe context if needed
+          const finalLocator = iframeSelector
+            ? this.page.frameLocator(iframeSelector).locator(command.selector)
+            : smartResult.locator;
+
+          await finalLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
 
           const runtimeMeta: StepRuntimeMeta = {
             runtimeStatus: 'executed',
@@ -1249,9 +1486,10 @@ export class CommandExecutor {
             stepId,
             wasSmartSelected: smartResult.wasSmartSelected,
             totalMatches: smartResult.totalMatches,
+            iframe: !!iframeSelector,
           });
 
-          return { locator: smartResult.locator, runtimeMeta };
+          return { locator: finalLocator, runtimeMeta };
         }
       } catch (smartError) {
         logger.warn('[COMMAND_EXECUTOR] Smart locator failed', {
@@ -1285,7 +1523,11 @@ export class CommandExecutor {
           // GUARD RAILS: Check confidence threshold before auto-applying healed selector
           // This prevents "quietly wrong heal" - a key safety feature
           if (healConfidence >= this.selfHealingConfidenceThreshold) {
-            const locator = getLocator(this.page, healingResult.newSelector);
+            // Apply iframe context if needed
+            const locator = iframeSelector
+              ? this.page.frameLocator(iframeSelector).locator(healingResult.newSelector)
+              : getLocator(this.page, healingResult.newSelector);
+
             await locator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
 
             // Determine if this healed step needs review
@@ -1613,6 +1855,29 @@ export class CommandExecutor {
     }
 
     const locator = validation.locator; // ✅ FIX 1: Use validated locator to avoid race conditions
+
+    // ✅ Post-heal ambiguity check: Ensure healed selector matches exactly 1 element
+    const elementCount = await locator.count();
+    if (elementCount !== 1) {
+      const errorMsg = elementCount === 0
+        ? `Healed selector matches 0 elements (element disappeared)`
+        : `Healed selector is ambiguous: matches ${elementCount} elements (expected exactly 1)`;
+
+      logger.error('[COMMAND_EXECUTOR] Post-heal ambiguity check failed', {
+        selector: selector.substring(0, 100),
+        elementCount,
+        actionType,
+      });
+
+      // Record this as a failure requiring review
+      throw new Error(errorMsg);
+    }
+
+    logger.debug('[COMMAND_EXECUTOR] Post-heal count check passed', {
+      selector: selector.substring(0, 100),
+      elementCount,
+    });
+
     const defaultTimeout = timeout || 30000;
 
     // Wait for element to be visible first (except for assertions and waits)
@@ -1634,6 +1899,10 @@ export class CommandExecutor {
       case 'click':
         // ✅ FIX: Force scroll into view before clicking (handles viewport issues)
         await this.forceScrollIntoView(locator);
+        // ✅ Overlay guard: Ensure element is topmost before clicking
+        await this.ensureTopMostAtCenter(locator, 2000);
+        // ✅ Wait for enabled: Ensure element is not disabled
+        await this.waitForEnabled(locator, 5000);
         await locator.click({ timeout: defaultTimeout });
         break;
 
@@ -1654,14 +1923,22 @@ export class CommandExecutor {
       case 'select':
       case 'selectOption':
         if (value === undefined) throw new Error('Value is required for select action');
+        // ✅ Wait for enabled: Ensure select is not disabled
+        await this.waitForEnabled(locator, 5000);
+        // ✅ Wait for options: Ensure select has options available
+        await this.waitForSelectOptions(locator, 5000, 3);
         await locator.selectOption(String(value), { timeout: defaultTimeout });
         break;
 
       case 'check':
+        // ✅ Wait for enabled: Ensure checkbox is not disabled
+        await this.waitForEnabled(locator, 5000);
         await locator.check({ timeout: defaultTimeout });
         break;
 
       case 'uncheck':
+        // ✅ Wait for enabled: Ensure checkbox is not disabled
+        await this.waitForEnabled(locator, 5000);
         await locator.uncheck({ timeout: defaultTimeout });
         break;
 
@@ -1679,6 +1956,8 @@ export class CommandExecutor {
 
       case 'press':
         if (value === undefined) throw new Error('Key is required for press action');
+        // ✅ Ensure focus: Verify element is focused before pressing key
+        await this.ensureFocused(locator, 2000);
         await locator.press(String(value), { timeout: defaultTimeout });
         break;
 
@@ -1896,5 +2175,238 @@ export class CommandExecutor {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  /**
+   * ✅ Overlay/interception guard: Ensure element is topmost at its center point
+   * Prevents clicks on elements that are covered by overlays, modals, sticky headers, etc.
+   * @param locator The locator to check
+   * @param timeout Maximum time to wait for element to become topmost (default: 2000ms)
+   * @throws Error if element is not topmost after timeout
+   */
+  private async ensureTopMostAtCenter(locator: Locator, timeout: number = 2000): Promise<void> {
+    const startTime = Date.now();
+    const pollInterval = 250;
+
+    while (Date.now() - startTime < timeout) {
+      try {
+        // Get the target element's bounding box
+        const box = await locator.boundingBox();
+        if (!box) {
+          throw new Error('Element has no bounding box (not visible or not in DOM)');
+        }
+
+        // Calculate center point
+        const centerX = box.x + box.width / 2;
+        const centerY = box.y + box.height / 2;
+
+        // Check if the element at center point is the target or its descendant
+        const isTopMost = await this.page.evaluate(
+          ({ x, y, targetElement }) => {
+            // @ts-ignore - browser context
+            const elementAtPoint = document.elementFromPoint(x, y);
+            if (!elementAtPoint) return false;
+
+            // Check if elementAtPoint is the target or a descendant of target
+            return targetElement === elementAtPoint || targetElement.contains(elementAtPoint);
+          },
+          { x: centerX, y: centerY, targetElement: await locator.elementHandle() }
+        );
+
+        if (isTopMost) {
+          logger.debug('[COMMAND_EXECUTOR] Element is topmost at center point');
+          return; // Success
+        }
+
+        // Element is not topmost, wait and retry
+        logger.debug('[COMMAND_EXECUTOR] Element not topmost, waiting...', {
+          elapsed: Date.now() - startTime,
+        });
+        await this.page.waitForTimeout(pollInterval);
+      } catch (error) {
+        // If we can't get bounding box or evaluate, element might be gone
+        logger.debug('[COMMAND_EXECUTOR] Error checking topmost status', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await this.page.waitForTimeout(pollInterval);
+      }
+    }
+
+    // Timeout reached - element is still not topmost
+    throw new Error(
+      `Element is not clickable: it is covered by another element (overlay, modal, sticky header, etc.). ` +
+      `Waited ${timeout}ms but the element at the click point is still not the target element.`
+    );
+  }
+
+  /**
+   * ✅ Wait for element to be enabled (not disabled)
+   * Checks both the 'disabled' property and 'aria-disabled' attribute (for custom components)
+   * @param locator The locator to check
+   * @param timeout Maximum time to wait for element to become enabled (default: 5000ms)
+   * @throws Error if element is still disabled after timeout
+   */
+  private async waitForEnabled(locator: Locator, timeout: number = 5000): Promise<void> {
+    const startTime = Date.now();
+    const pollInterval = 250;
+
+    while (Date.now() - startTime < timeout) {
+      try {
+        // Check if element is enabled (both native and ARIA disabled)
+        const isEnabled = await locator.evaluate((el) => {
+          // Check native disabled property (for native form elements)
+          if ('disabled' in el && (el as any).disabled === true) {
+            return false;
+          }
+
+          // Check aria-disabled attribute (for custom components)
+          const ariaDisabled = el.getAttribute('aria-disabled');
+          if (ariaDisabled === 'true') {
+            return false;
+          }
+
+          // Element is enabled
+          return true;
+        });
+
+        if (isEnabled) {
+          logger.debug('[COMMAND_EXECUTOR] Element is enabled');
+          return; // Success
+        }
+
+        // Element is still disabled, wait and retry
+        logger.debug('[COMMAND_EXECUTOR] Element disabled, waiting...', {
+          elapsed: Date.now() - startTime,
+        });
+        await this.page.waitForTimeout(pollInterval);
+      } catch (error) {
+        // If we can't evaluate, element might be gone
+        logger.debug('[COMMAND_EXECUTOR] Error checking enabled status', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await this.page.waitForTimeout(pollInterval);
+      }
+    }
+
+    // Timeout reached - element is still disabled
+    throw new Error(
+      `Element is disabled and cannot be interacted with. ` +
+      `Waited ${timeout}ms but the element remained disabled.`
+    );
+  }
+
+  /**
+   * ✅ Wait for select element to have options available
+   * Checks that the select element has at least one option element
+   * @param locator The select locator to check
+   * @param timeout Maximum time to wait for options to appear (default: 5000ms)
+   * @param maxRetries Maximum number of retries (default: 3)
+   * @throws Error if options don't appear after timeout and retries
+   */
+  private async waitForSelectOptions(locator: Locator, timeout: number = 5000, maxRetries: number = 3): Promise<void> {
+    let attempt = 0;
+    const backoffMs = 500; // Short backoff between retries
+
+    while (attempt < maxRetries) {
+      try {
+        const startTime = Date.now();
+        const pollInterval = 250;
+
+        while (Date.now() - startTime < timeout) {
+          // Check if select has at least one option
+          const optionsCount = await locator.locator('option').count();
+
+          if (optionsCount > 0) {
+            logger.debug('[COMMAND_EXECUTOR] Select has options available', { optionsCount });
+            return; // Success
+          }
+
+          // No options yet, wait and retry
+          logger.debug('[COMMAND_EXECUTOR] Waiting for select options...', {
+            elapsed: Date.now() - startTime,
+            attempt: attempt + 1,
+          });
+          await this.page.waitForTimeout(pollInterval);
+        }
+
+        // Timeout reached for this attempt - retry with backoff
+        logger.debug('[COMMAND_EXECUTOR] No options found, retrying with backoff', {
+          attempt: attempt + 1,
+          maxRetries,
+        });
+        await this.page.waitForTimeout(backoffMs);
+        attempt++;
+      } catch (error) {
+        logger.debug('[COMMAND_EXECUTOR] Error checking select options', {
+          error: error instanceof Error ? error.message : String(error),
+          attempt: attempt + 1,
+        });
+        await this.page.waitForTimeout(backoffMs);
+        attempt++;
+      }
+    }
+
+    // All retries exhausted - select has no options
+    throw new Error(
+      `Select element has no options available. ` +
+      `Waited ${timeout}ms with ${maxRetries} retries but no <option> elements appeared.`
+    );
+  }
+
+  /**
+   * ✅ Ensure element has focus before pressing keys
+   * Verifies that document.activeElement is the target element
+   * @param locator The locator to focus
+   * @param timeout Maximum time to wait for focus (default: 2000ms)
+   * @throws Error if element cannot be focused after timeout
+   */
+  private async ensureFocused(locator: Locator, timeout: number = 2000): Promise<void> {
+    const startTime = Date.now();
+    const pollInterval = 250;
+    let lastError: string | undefined;
+
+    while (Date.now() - startTime < timeout) {
+      try {
+        // Focus the element
+        await locator.focus({ timeout: 1000 });
+
+        // Wait a bit for focus to take effect
+        await this.page.waitForTimeout(100);
+
+        // Verify that the element is now the active element
+        const isFocused = await this.page.evaluate(
+          (targetElement) => {
+            // @ts-ignore - browser context
+            return document.activeElement === targetElement;
+          },
+          await locator.elementHandle()
+        );
+
+        if (isFocused) {
+          logger.debug('[COMMAND_EXECUTOR] Element has focus');
+          return; // Success
+        }
+
+        lastError = 'Element is not document.activeElement after focus() call';
+        logger.debug('[COMMAND_EXECUTOR] Element not focused, retrying...', {
+          elapsed: Date.now() - startTime,
+        });
+        await this.page.waitForTimeout(pollInterval);
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        logger.debug('[COMMAND_EXECUTOR] Error focusing element', {
+          error: lastError,
+          elapsed: Date.now() - startTime,
+        });
+        await this.page.waitForTimeout(pollInterval);
+      }
+    }
+
+    // Timeout reached - element cannot be focused
+    throw new Error(
+      `Element cannot be focused for press action. ` +
+      `Waited ${timeout}ms but the element is not document.activeElement. ` +
+      `Last error: ${lastError || 'unknown'}`
+    );
   }
 }

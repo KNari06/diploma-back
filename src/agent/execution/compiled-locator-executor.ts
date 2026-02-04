@@ -12,15 +12,21 @@
  */
 
 import type {
-    CompiledStepPlan,
-    ConfidenceTier,
-    LocatorEntry,
-    RuntimeSource,
-    StepRuntimeMeta,
+  CompiledStepPlan,
+  ConfidenceTier,
+  LocatorEntry,
+  RuntimeSource,
+  StepRuntimeMeta,
 } from '@/services/testing/ui/preview/preview.types';
 import { isCompiledPlanExpired } from '@/services/testing/ui/preview/preview.types';
 import { logger } from '@/utils/core/logger';
-import { Locator, Page } from 'playwright';
+import { Frame, Locator, Page } from 'playwright';
+
+/**
+ * Playwright "page-like" context that supports locator + evaluate APIs.
+ * We use this to run compiled locator plans either on the main Page or inside an iframe Frame.
+ */
+type PageLike = Page | Frame;
 
 /**
  * Result from compiled locator execution attempt
@@ -48,7 +54,7 @@ export interface CompiledExecutionResult {
  * Get page signature from current page
  * Uses a simple hash of form/input structure for quick comparison
  */
-async function getCurrentPageSignature(page: Page): Promise<string> {
+async function getCurrentPageSignature(page: PageLike): Promise<string> {
   try {
     const signature = await page.evaluate(() => {
       // @ts-expect-error - runs in browser context
@@ -80,7 +86,7 @@ async function getCurrentPageSignature(page: Page): Promise<string> {
  * Returns true if no signature is stored (backward compatibility)
  */
 async function checkPageSignature(
-  page: Page,
+  page: PageLike,
   compiledSignature?: string
 ): Promise<{ matched: boolean; currentSignature: string }> {
   if (!compiledSignature) {
@@ -123,7 +129,7 @@ async function checkPageSignature(
  * Try a single locator entry
  */
 async function tryLocatorEntry(
-  page: Page,
+  page: PageLike,
   entry: LocatorEntry,
   timeout: number
 ): Promise<{
@@ -207,7 +213,7 @@ async function tryLocatorEntry(
  * @returns Result with success status and locator if found
  */
 export async function executeCompiledLocatorPlan(
-  page: Page,
+  page: PageLike,
   compiled: CompiledStepPlan | undefined,
   actionType: string,
   timeout: number = 30000

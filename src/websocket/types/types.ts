@@ -684,13 +684,20 @@ export interface PreviewInteractiveNode {
 }
 
 /**
- * Intent step draft for linting
+ * Intent step draft for linting (V3: added ai_check support)
  */
 export interface PreviewIntentStep {
   id: string;
-  type: 'fill' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close';
+  type: 'fill' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check';
   description: string;
   value?: string;
+  /**
+   * Assertion text for ai_check actions (V3)
+   * Natural language assertion to be evaluated by LLM
+   * Example: "There is a black nav bar with five links"
+   * Required when type === 'ai_check'
+   */
+  assertionText?: string;
   bindingHints?: {
     role?: string;
     label?: string;
@@ -716,6 +723,15 @@ export interface PreviewIntentStep {
     pressEnter?: boolean;
     /** Delay between keystrokes in ms (for human-like typing) */
     keyPressDelay?: number;
+    /**
+     * AI context mode for ai_check assertions (V3)
+     * Specifies what context to provide to the LLM for evaluation
+     * - 'html': HTML content only
+     * - 'screenshot': Screenshot only
+     * - 'html+screenshot': HTML + screenshot
+     * - 'html+a11y+screenshot': HTML + accessibility tree + screenshot (default, most comprehensive)
+     */
+    aiContextMode?: 'html' | 'screenshot' | 'html+screenshot' | 'html+a11y+screenshot';
   };
 }
 
