@@ -565,7 +565,47 @@ export class PreviewStepApplyService {
             pass: aiCheckResult.pass,
             confidence: aiCheckResult.confidence,
             explanation: aiCheckResult.explanation,
+            highlightRefsCount: aiCheckResult.highlightRefs?.length || 0,
           });
+
+          /**
+           * V4: Best-effort highlight mapping for ai_check.
+           *
+           * We can only reliably highlight DOM elements when the model returns `data-agent-ref` values
+           * (highlightRefs). Those refs are mapped to `InteractiveNode.boundingBox` when available.
+           *
+           * Limitations:
+           * - If HTML lacks `data-agent-ref` attributes, `highlightRefs` will likely be empty.
+           * - If domNodes are not available (ownership / snapshot missing), highlights may miss boundingBox.
+           */
+          let highlight: ApplyResult['highlight'] = [];
+          if (aiCheckResult.highlightRefs && aiCheckResult.highlightRefs.length > 0) {
+            const isOwned = sessionService.isSessionOwned(previewSessionId, userId);
+            if (!isOwned) {
+              logger.warn('[PREVIEW_APPLY] Skip ai_check highlight mapping: session is not owned by user', {
+                previewSessionId,
+                userId,
+              });
+            } else {
+              // Force-including domNodes is cheap when throttled (reuses session.pageState.domNodes).
+              // When not throttled, it collects a fresh snapshot and updates session.pageState.
+              const snapshotWithDom = await sessionService.getSnapshot(previewSessionId, userId, {
+                force: true,
+                includeDomNodes: true,
+                includeScreenshot: false,
+              });
+              const domNodes = snapshotWithDom?.domNodes ?? sessionService.getSession(previewSessionId)?.pageState?.domNodes ?? [];
+
+              highlight = aiCheckResult.highlightRefs.map((ref) => {
+                const node = domNodes.find((n) => n.ref === ref);
+                return {
+                  ref,
+                  boundingBox: node?.boundingBox,
+                  type: aiCheckResult.pass ? 'success' : 'error',
+                };
+              });
+            }
+          }
 
           // Build appliedStep with evidence
           const updatedStep: IntentStep = {
@@ -590,7 +630,7 @@ export class PreviewStepApplyService {
             appliedStep: updatedStep,
             urlChanged: false,
             url: page.url(),
-            highlight: [], // No element highlight for ai_check
+            highlight,
             attempts: 1,
           };
         } catch (error) {

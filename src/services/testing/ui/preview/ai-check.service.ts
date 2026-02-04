@@ -45,6 +45,8 @@ export interface AiCheckResult {
     a11y: boolean;
     screenshot: boolean;
   };
+  /** Optional: data-agent-ref values that support the explanation (for UI highlight) */
+  highlightRefs?: string[];
 }
 
 /**
@@ -55,6 +57,8 @@ interface AiCheckLLMResponse {
   explanation: string;
   confidence?: number;
   reasoning?: string;
+  /** Optional: data-agent-ref values that support the explanation */
+  highlightRefs?: string[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -77,6 +81,7 @@ const MAX_A11Y_NODES = 500;
 /**
  * Build system prompt for AI check evaluation (Momentic-inspired)
  * Enforces: no vacuous truth, strict counts, visual criteria from screenshot
+ * V2: Optionally returns highlightRefs for UI highlighting
  */
 function buildSystemPrompt(): string {
   return `You are an expert QA engineer evaluating natural language assertions about web pages.
@@ -104,24 +109,29 @@ Return a JSON object with these fields:
 - explanation: string (short, 1-2 sentences)
 - confidence: number (0-1, optional, your confidence in the evaluation)
 - reasoning: string (optional, detailed reasoning for debugging)
+- highlightRefs: array of strings (optional, best-effort)
+  - If HTML contains data-agent-ref attributes on elements relevant to the assertion, include them here
+  - Example: For "Submit button is blue", if you find <button data-agent-ref="btn_submit">, return ["btn_submit"]
+  - If you cannot confidently identify refs or HTML lacks data-agent-ref, return [] or omit
+  - Limit to 5 refs max (most relevant)
 
 # EXAMPLES:
 
 Assertion: "There is a black nav bar with five links"
-Context: HTML shows <nav> with 5 <a> tags, screenshot shows black background
-→ { "pass": true, "explanation": "Nav bar exists with 5 links and black background.", "confidence": 0.95 }
+Context: HTML shows <nav data-agent-ref="nav_main"> with 5 <a> tags, screenshot shows black background
+→ { "pass": true, "explanation": "Nav bar exists with 5 links and black background.", "confidence": 0.95, "highlightRefs": ["nav_main"] }
 
 Assertion: "Submit button is not blue"
 Context: No submit button found in HTML/a11y
-→ { "pass": false, "explanation": "Submit button does not exist, so assertion is vacuously false.", "confidence": 0.9 }
+→ { "pass": false, "explanation": "Submit button does not exist, so assertion is vacuously false.", "confidence": 0.9, "highlightRefs": [] }
 
 Assertion: "Page shows 3 results"
-Context: HTML shows 4 result items
-→ { "pass": false, "explanation": "Page shows 4 results, not 3.", "confidence": 1.0 }
+Context: HTML shows 4 result items with refs: result_1, result_2, result_3, result_4
+→ { "pass": false, "explanation": "Page shows 4 results, not 3.", "confidence": 1.0, "highlightRefs": ["result_1", "result_2", "result_3", "result_4"] }
 
 Assertion: "Logo is in the top-left corner"
-Context: Screenshot shows logo in top-right corner
-→ { "pass": false, "explanation": "Logo is in top-right corner, not top-left.", "confidence": 0.85 }
+Context: Screenshot shows logo in top-right corner, HTML has <img data-agent-ref="logo_img">
+→ { "pass": false, "explanation": "Logo is in top-right corner, not top-left.", "confidence": 0.85, "highlightRefs": ["logo_img"] }
 
 Now evaluate the user's assertion based on the provided context.`;
 }
@@ -286,6 +296,7 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
       explanation: parsed.explanation || 'No explanation provided',
       confidence: parsed.confidence,
       artifactsUsed,
+      highlightRefs: parsed.highlightRefs || [],
     };
   } catch (error) {
     logger.error('[AI_CHECK] Evaluation failed', {
@@ -304,6 +315,7 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
         a11y: !!input.a11yTree,
         screenshot: !!input.screenshotBase64,
       },
+      highlightRefs: [],
     };
   }
 }

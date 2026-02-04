@@ -41,7 +41,7 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     /** V3: Assertion text for ai_check */
     assertionText?: string;
     /** V3: AI context mode for ai_check */
-    aiContextMode?: 'html' | 'screenshot' | 'html+screenshot' | 'html+a11y+screenshot';
+    aiContextMode?: 'html' | 'screenshot' | 'html+a11y' | 'html+screenshot' | 'html+a11y+screenshot';
     /** Iframe selector for actions within iframes */
     iframeSelector?: string;
   };

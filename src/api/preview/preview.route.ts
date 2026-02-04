@@ -76,12 +76,13 @@ const router = Router();
  *             keyPressDelay: { type: number, description: 'Delay between keystrokes in ms' }
  *             aiContextMode:
  *               type: string
- *               enum: [html, screenshot, 'html+screenshot', 'html+a11y+screenshot']
+ *               enum: [html, screenshot, 'html+a11y', 'html+screenshot', 'html+a11y+screenshot']
  *               description: |
  *                 (V3) AI context mode for ai_check assertions.
  *                 Specifies what context to provide to the LLM:
  *                 - 'html': HTML content only
  *                 - 'screenshot': Screenshot only
+ *                 - 'html+a11y': HTML + accessibility tree (no screenshot)
  *                 - 'html+screenshot': HTML + screenshot
  *                 - 'html+a11y+screenshot': HTML + accessibility tree + screenshot (default, most comprehensive)
  *           additionalProperties: true

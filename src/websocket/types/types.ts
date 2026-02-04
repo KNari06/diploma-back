@@ -728,10 +728,11 @@ export interface PreviewIntentStep {
      * Specifies what context to provide to the LLM for evaluation
      * - 'html': HTML content only
      * - 'screenshot': Screenshot only
+     * - 'html+a11y': HTML + accessibility tree (no screenshot)
      * - 'html+screenshot': HTML + screenshot
      * - 'html+a11y+screenshot': HTML + accessibility tree + screenshot (default, most comprehensive)
      */
-    aiContextMode?: 'html' | 'screenshot' | 'html+screenshot' | 'html+a11y+screenshot';
+    aiContextMode?: 'html' | 'screenshot' | 'html+a11y' | 'html+screenshot' | 'html+a11y+screenshot';
   };
 }
 
