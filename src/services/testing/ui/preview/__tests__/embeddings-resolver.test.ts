@@ -203,19 +203,19 @@ describe('EmbeddingsResolverService', () => {
     it('should return description as-is when no value', () => {
       const step: IntentStep = {
         id: 'step1',
-        type: 'fill',
-        description: 'fill username field',
+        type: 'type',
+        description: 'type username field',
       };
 
       const result = sanitizeIntent(step);
-      expect(result).toBe('fill username field');
+      expect(result).toBe('type username field');
     });
 
     it('should redact value from description', () => {
       const step: IntentStep = {
         id: 'step1',
-        type: 'fill',
-        description: 'fill username with secretpassword123',
+        type: 'type',
+        description: 'type username with secretpassword123',
         value: 'secretpassword123',
       };
 
@@ -227,7 +227,7 @@ describe('EmbeddingsResolverService', () => {
     it('should handle case-insensitive value redaction', () => {
       const step: IntentStep = {
         id: 'step1',
-        type: 'fill',
+        type: 'type',
         description: 'enter MyEmail@Test.com in email field',
         value: 'myemail@test.com',
       };
@@ -240,7 +240,7 @@ describe('EmbeddingsResolverService', () => {
       const longDescription = 'a'.repeat(600);
       const step: IntentStep = {
         id: 'step1',
-        type: 'fill',
+        type: 'type',
         description: longDescription,
       };
 
@@ -251,18 +251,18 @@ describe('EmbeddingsResolverService', () => {
     it('should trim whitespace', () => {
       const step: IntentStep = {
         id: 'step1',
-        type: 'fill',
-        description: '  fill username field  ',
+        type: 'type',
+        description: '  type username field  ',
       };
 
       const result = sanitizeIntent(step);
-      expect(result).toBe('fill username field');
+      expect(result).toBe('type username field');
     });
 
     it('should handle empty description', () => {
       const step: IntentStep = {
         id: 'step1',
-        type: 'fill',
+        type: 'type',
         description: '',
       };
 
@@ -274,7 +274,7 @@ describe('EmbeddingsResolverService', () => {
     it('should preserve Russian intent', () => {
       const step: IntentStep = {
         id: 'step1',
-        type: 'fill',
+        type: 'type',
         description: 'введите логин пользователя',
       };
 
@@ -285,7 +285,7 @@ describe('EmbeddingsResolverService', () => {
     it('should preserve Kazakh intent', () => {
       const step: IntentStep = {
         id: 'step1',
-        type: 'fill',
+        type: 'type',
         description: 'құпия сөзді енгізіңіз',
       };
 
@@ -305,7 +305,7 @@ describe('EmbeddingsResolverService', () => {
         isDisabled: false,
       };
 
-      const result = applyStructuralFilters(node, 'fill');
+      const result = applyStructuralFilters(node, 'type');
       expect(result.passed).toBe(true);
       expect(result.hardReject).toBe(false);
     });
@@ -316,7 +316,7 @@ describe('EmbeddingsResolverService', () => {
         isVisible: false,
       };
 
-      const result = applyStructuralFilters(node, 'fill');
+      const result = applyStructuralFilters(node, 'type');
       expect(result.passed).toBe(false);
       expect(result.hardReject).toBe(true);
       expect(result.reason).toBe('Not visible');
@@ -329,20 +329,20 @@ describe('EmbeddingsResolverService', () => {
         isDisabled: true,
       };
 
-      const result = applyStructuralFilters(node, 'fill');
+      const result = applyStructuralFilters(node, 'type');
       expect(result.passed).toBe(false);
       expect(result.hardReject).toBe(true);
       expect(result.reason).toBe('Disabled');
     });
 
-    it('should hard reject readonly fields for fill actions', () => {
+    it('should hard reject readonly fields for type actions', () => {
       const node: InteractiveNode = {
         tag: 'input',
         isVisible: true,
         readOnly: true,
       };
 
-      const result = applyStructuralFilters(node, 'fill');
+      const result = applyStructuralFilters(node, 'type');
       expect(result.passed).toBe(false);
       expect(result.hardReject).toBe(true);
       expect(result.reason).toBe('Readonly field');

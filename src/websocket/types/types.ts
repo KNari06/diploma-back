@@ -688,7 +688,7 @@ export interface PreviewInteractiveNode {
  */
 export interface PreviewIntentStep {
   id: string;
-  type: 'fill' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check';
+  type: 'type' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check';
   description: string;
   value?: string;
   /**

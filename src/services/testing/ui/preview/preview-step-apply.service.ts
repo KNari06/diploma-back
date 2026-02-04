@@ -47,7 +47,7 @@ const ACTION_TIMEOUT = 10000; // 10 seconds
 const POST_ACTION_SETTLE_TIMEOUT = 5000; // 5 seconds
 
 // V2: Action types that support state verification
-const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'fill', 'click']);
+const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click']);
 
 /**
  * Generate a random integer in range [min, max] (inclusive).
@@ -164,10 +164,10 @@ async function verifyActionEffect(
         return expanded !== 'true';
       }
 
-      case 'fill': {
+      case 'type': {
         // Verify the input has a value
         const value = await locator.inputValue().catch(() => '');
-        return value.length > 0 || step.value === ''; // Empty fill is valid
+        return value.length > 0 || step.value === ''; // Empty type is valid
       }
 
       case 'click': {
@@ -241,8 +241,8 @@ async function executeAction(
     }
 
     switch (step.type) {
-      case 'fill': {
-        if (!locator) throw new Error('No selector for fill action');
+      case 'type': {
+        if (!locator) throw new Error('No selector for type action');
         const value = (step.value || '').trim();
         const humanLike = step.options?.humanLike === true;
 

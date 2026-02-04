@@ -57,7 +57,7 @@ const SEMANTIC_MIN_THRESHOLD = 0.25;
  * Elements not in this list are excluded for the action
  */
 const ACTION_TO_TAGS: Record<string, string[]> = {
-  fill: ['input', 'textarea'],
+  type: ['input', 'textarea'],
   click: ['button', 'a', 'input', 'div', 'span', 'label'],
   select: ['select'],
   check: ['input'],
@@ -237,7 +237,7 @@ function matchesExactQuotedText(node: InteractiveNode, intentText: string): bool
 function extractIntentKeywords(intentText: string): string[] {
   const stopWords = new Set([
     'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'with', 'and', 'or',
-    'enter', 'fill', 'type', 'click', 'press', 'select', 'input', 'field',
+    'enter', 'type', 'click', 'press', 'select', 'input', 'field',
     'button', 'link', 'into', 'please', 'should', 'want', 'need', 'put',
     'this', 'value', 'box', 'form', 'element',
   ]);
@@ -278,7 +278,7 @@ export function buildAllowedSets(
     let excluded = false;
     let isSoft = false;
     const nodeRules: RuleTraceEntry[] = [];
-    const isNonStandardTextbox = actionType === 'fill' && node.tag === 'div' && node.role === 'textbox';
+    const isNonStandardTextbox = actionType === 'type' && node.tag === 'div' && node.role === 'textbox';
     
     // ═══════════════════════════════════════════════════════════════════════
     // HARD RULES: Exclude elements that are fundamentally incompatible
@@ -320,11 +320,11 @@ export function buildAllowedSets(
       });
     }
 
-    // Rule 3b: Fill must target text-like editable fields only
-    if (!excluded && actionType === 'fill' && !isFillCompatibleTextField(node)) {
+    // Rule 3b: Type must target text-like editable fields only
+    if (!excluded && actionType === 'type' && !isFillCompatibleTextField(node)) {
       excluded = true;
       nodeRules.push({
-        ruleId: 'fill.incompatible_field_type',
+        ruleId: 'type.incompatible_field_type',
         version: 'v1',
         action: 'exclude',
         evidence: `tag=${node.tag}, type=${node.type || node.inputType || 'unknown'}`,
@@ -362,7 +362,7 @@ export function buildAllowedSets(
     if (!excluded) {
       const allowedTags = ACTION_TO_TAGS[actionType];
       if (allowedTags && allowedTags.length > 0) {
-        // Exception: allow non-standard textbox components for fill as SoftAllowed.
+        // Exception: allow non-standard textbox components for type as SoftAllowed.
         if (!allowedTags.includes(node.tag.toLowerCase()) && !isNonStandardTextbox) {
           excluded = true;
           nodeRules.push({
@@ -386,7 +386,7 @@ export function buildAllowedSets(
     }
     
     // Rule 6: Password isolation (if intent is NOT password, exclude password fields)
-    if (!excluded && actionType === 'fill' && !intentIsPassword && isPasswordField(node)) {
+    if (!excluded && actionType === 'type' && !intentIsPassword && isPasswordField(node)) {
       excluded = true;
       nodeRules.push({
         ruleId: 'context.password_isolation',
@@ -398,7 +398,7 @@ export function buildAllowedSets(
     }
     
     // Rule 7: Username isolation (if intent is password, exclude username fields)
-    if (!excluded && actionType === 'fill' && intentIsPassword && isUsernameField(node) && !isPasswordField(node)) {
+    if (!excluded && actionType === 'type' && intentIsPassword && isUsernameField(node) && !isPasswordField(node)) {
       excluded = true;
       nodeRules.push({
         ruleId: 'context.username_isolation',

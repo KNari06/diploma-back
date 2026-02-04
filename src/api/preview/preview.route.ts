@@ -44,13 +44,13 @@ const router = Router();
  *           type: string
  *         type:
  *           type: string
- *           description: Action type (fill, click, wait, assert, navigate, select, hover, scroll, press, check, uncheck, toggle, open, close, ai_check)
- *           enum: [fill, click, wait, assert, navigate, select, hover, scroll, press, check, uncheck, toggle, open, close, ai_check]
+ *           description: Action type (type, click, wait, assert, navigate, select, hover, scroll, press, check, uncheck, toggle, open, close, ai_check)
+ *           enum: [type, click, wait, assert, navigate, select, hover, scroll, press, check, uncheck, toggle, open, close, ai_check]
  *         description:
  *           type: string
  *         value:
  *           type: string
- *           description: Optional value for fill/assert/etc
+ *           description: Optional value for type/assert/etc
  *         assertionText:
  *           type: string
  *           description: |
@@ -71,8 +71,8 @@ const router = Router();
  *           properties:
  *             timeout: { type: number, description: 'Timeout in milliseconds' }
  *             humanLike: { type: boolean, description: 'Human-like execution mode (gradual typing, hover before click)' }
- *             replaceContent: { type: boolean, description: 'Replace content instead of appending (fill action)' }
- *             pressEnter: { type: boolean, description: 'Press Enter after fill' }
+ *             replaceContent: { type: boolean, description: 'Replace content instead of appending (type action)' }
+ *             pressEnter: { type: boolean, description: 'Press Enter after type' }
  *             keyPressDelay: { type: number, description: 'Delay between keystrokes in ms' }
  *             aiContextMode:
  *               type: string

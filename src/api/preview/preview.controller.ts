@@ -411,7 +411,13 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       if (steps === null) {
         normalizedSteps = [];
       } else if (Array.isArray(steps)) {
-        normalizedSteps = steps;
+        // Migrate legacy 'fill' to 'type' (defense-in-depth)
+        normalizedSteps = steps.map((step: any) => {
+          if (step?.type === 'fill') {
+            return { ...step, type: 'type' };
+          }
+          return step;
+        });
       } else {
         res.status(400).json({ error: 'Invalid steps (expected array|null|undefined)' });
         return;

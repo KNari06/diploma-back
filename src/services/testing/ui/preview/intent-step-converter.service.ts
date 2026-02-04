@@ -53,8 +53,8 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
  */
 function mapActionType(intentAction: IntentActionType): string {
   switch (intentAction) {
-    case 'fill':
-      return 'fill';
+    case 'type':
+      return 'type';
     case 'click':
       return 'click';
     case 'wait':
@@ -181,7 +181,7 @@ export function convertIntentStepToCommand(
 
   // Handle specific action types
   switch (step.type) {
-    case 'fill':
+    case 'type':
       command.value = step.value || '';
       break;
 

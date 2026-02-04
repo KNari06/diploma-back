@@ -124,10 +124,10 @@ export interface DomAnalysisData {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Action type for intent steps (V2: added state-aware actions, V3: added ai_check)
+ * Action type for intent steps (V2: added state-aware actions, V3: added ai_check, V4: replaced fill with type)
  */
 export type IntentActionType =
-  | 'fill'
+  | 'type'
   | 'click'
   | 'wait'
   | 'assert'
@@ -305,11 +305,11 @@ export interface StepOptions {
   /**
    * Human-like execution mode for UI actions.
    * When enabled, the backend tries to emulate real user behavior:
-   * - fill: gradual typing (per-character delays) instead of instant fill
+   * - type: gradual typing (per-character delays) instead of instant fill
    * - click: hover + small pause before clicking; sometimes clicks at a random point inside the element
    */
   humanLike?: boolean;
-  /** If false, append text instead of replacing (for fill actions) */
+  /** If false, append text instead of replacing (for type actions) */
   replaceContent?: boolean;
   /** Press Enter after filling */
   pressEnter?: boolean;
@@ -344,7 +344,7 @@ export interface IntentStep {
   type: IntentActionType;
   /** Plain text description (user's intent) */
   description: string;
-  /** Value for fill actions */
+  /** Value for type actions */
   value?: string;
   /**
    * Assertion text for ai_check actions (V3)
@@ -495,10 +495,10 @@ export interface StepRuntimeMeta {
 
 /**
  * TTL values for compiled plan expiration (in milliseconds)
- * Fill actions have shorter TTL since form fields change more often
+ * Type actions have shorter TTL since form fields change more often
  */
 export const COMPILED_TTL_MS: Record<string, number> = {
-  fill: 7 * 24 * 60 * 60 * 1000,      // 7 days
+  type: 7 * 24 * 60 * 60 * 1000,      // 7 days
   click: 14 * 24 * 60 * 60 * 1000,    // 14 days
   select: 7 * 24 * 60 * 60 * 1000,    // 7 days
   check: 14 * 24 * 60 * 60 * 1000,    // 14 days

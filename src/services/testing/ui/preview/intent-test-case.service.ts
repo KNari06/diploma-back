@@ -47,7 +47,7 @@ export class IntentTestCaseService {
         name,
         description: description || null,
         start_url: startUrl || null,
-        steps_json: steps,
+        steps_json: this.normalizeSteps(steps),
         flow_id: flowId || null,
         status,
         kind,
@@ -165,7 +165,7 @@ export class IntentTestCaseService {
     if (description !== undefined) updates.description = description;
     if (startUrl !== undefined) updates.start_url = startUrl;
     if (url !== undefined) updates.url = url;
-    if (steps !== undefined) updates.steps_json = steps;
+    if (steps !== undefined) updates.steps_json = this.normalizeSteps(steps);
     if (flowId !== undefined) updates.flow_id = flowId;
     if (status !== undefined) updates.status = status;
     if (kind !== undefined) updates.kind = kind;
@@ -218,10 +218,28 @@ export class IntentTestCaseService {
   }
 
   /**
+   * Normalize legacy steps: replace 'fill' with 'type' (server-side migration)
+   */
+  private static normalizeSteps(steps: IntentStep[]): IntentStep[] {
+    return steps.map(step => {
+      if ((step.type as any) === 'fill') {
+        return {
+          ...step,
+          type: 'type' as any,
+        };
+      }
+      return step;
+    });
+  }
+
+  /**
    * Map database row to IntentTestCase type
    * Supports all unified fields including status, kind, replay data, etc.
    */
   private static mapToIntentTestCase(row: any): IntentTestCase {
+    // Normalize steps on read (migrate-on-read strategy)
+    const stepsJson = this.normalizeSteps(row.steps_json || []);
+
     return {
       id: row.id,
       projectId: row.project_id,
@@ -234,7 +252,7 @@ export class IntentTestCaseService {
       url: row.url || undefined,
 
       // Steps
-      stepsJson: row.steps_json || [],
+      stepsJson,
 
       // Lifecycle
       status: row.status || 'draft',

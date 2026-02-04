@@ -141,7 +141,7 @@ function buildTargetFingerprint(node: InteractiveNode): TargetFingerprint {
 function determinePreconditions(actionType: string): ('visible' | 'enabled' | 'attached' | 'stable')[] {
   switch (actionType) {
     case 'click':
-    case 'fill':
+    case 'type':
     case 'select':
     case 'check':
     case 'uncheck':
@@ -170,7 +170,7 @@ function determinePostconditions(actionType: string, node?: InteractiveNode): ('
         return ['navigation'];
       }
       return ['domChange'];
-    case 'fill':
+    case 'type':
     case 'select':
     case 'check':
     case 'uncheck':

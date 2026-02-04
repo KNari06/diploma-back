@@ -282,103 +282,35 @@ export class CommandExecutor {
           }
           break;
 
-        case 'fill':
-          if (value === undefined) throw new Error('Value is required for fill action');
+        case 'type':
+          if (value === undefined) throw new Error('Value is required for type action');
 
           // ✅ V2: Use intent-based locator resolution for IntentPlaywrightCommand
           if (isIntentCommand && intentCommand.intentMeta) {
-            const { locator: intentFillLocator } = await this.getLocatorForIntentCommand(
+            const { locator: intentTypeLocator } = await this.getLocatorForIntentCommand(
               intentCommand,
-              'fill',
+              'type',
               timeout || 30000
             );
-            await intentFillLocator.fill(String(value), { timeout: timeout || 30000 });
+            await intentTypeLocator.fill(String(value), { timeout: timeout || 30000 });
 
             // AI-powered Enter key detection
-            const shouldPressIntent = await shouldPressEnterAfterFill(intentFillLocator, this.page, description);
+            const shouldPressIntent = await shouldPressEnterAfterFill(intentTypeLocator, this.page, description);
             if (shouldPressIntent) {
-              await intentFillLocator.press('Enter', { timeout: timeout || 5000 });
+              await intentTypeLocator.press('Enter', { timeout: timeout || 5000 });
             }
             break;
           }
 
           // Standard flow for non-intent commands
-          if (!selector) throw new Error('Selector is required for fill action');
+          if (!selector) throw new Error('Selector is required for type action');
 
           // ✅ NEW: Use smart locator to select the right input element
-          const fillSmartResult = await getSmartLocator(
-            this.page,
-            selector,
-            'fill',
-            description // Intent for AI context
-          );
-
-          if (fillSmartResult.wasSmartSelected) {
-            logger.info('[COMMAND_EXECUTOR] Smart element selection used for fill', {
-              selector: selector.substring(0, 50),
-              totalMatches: fillSmartResult.totalMatches,
-              selectedIndex: fillSmartResult.selectedIndex,
-            });
-          }
-
-          try {
-            await fillSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            await fillSmartResult.locator.fill(String(value), { timeout: timeout || 30000 });
-
-            // ✅ AI-powered Enter key detection
-            const shouldPress = await shouldPressEnterAfterFill(
-              fillSmartResult.locator,
-              this.page,
-              description
-            );
-
-            if (shouldPress) {
-              logger.info('[COMMAND_EXECUTOR] AI decided to press Enter after fill', {
-                selector: selector.substring(0, 50),
-              });
-              await fillSmartResult.locator.press('Enter', { timeout: timeout || 5000 });
-            }
-          } catch (fillError) {
-            // Smart locator failed, try self-healing
-            logger.warn('[COMMAND_EXECUTOR] Smart locator fill failed, trying self-healing', {
-              selector: selector.substring(0, 50),
-              error: fillError instanceof Error ? fillError.message : String(fillError),
-            });
-
-            await this.executeWithSelfHealing(
-              async () => {
-                const locator = getLocator(this.page, selector);
-                await locator.fill(String(value), { timeout: timeout || 30000 });
-
-                // ✅ AI-powered Enter key detection (self-healing path)
-                const shouldPress = await shouldPressEnterAfterFill(locator, this.page, description);
-                if (shouldPress) {
-                  logger.info('[COMMAND_EXECUTOR] AI decided to press Enter after fill (self-healing)');
-                  await locator.press('Enter', { timeout: timeout || 5000 });
-                }
-              },
-              {
-                selector,
-                intent: description || `fill with ${value}`,
-                action: 'fill',
-                timeout,
-                value,
-              }
-            );
-          }
-          // Note: Post-action analysis handled by PostActionAnalyzer
-          break;
-
-        case 'type':
-          if (!selector) throw new Error('Selector is required for type action');
-          if (value === undefined) throw new Error('Value is required for type action');
-
-          // ✅ NEW: Use smart locator for type action
           const typeSmartResult = await getSmartLocator(
             this.page,
             selector,
-            'fill', // Type is similar to fill - targets input elements
-            description
+            'type',
+            description // Intent for AI context
           );
 
           if (typeSmartResult.wasSmartSelected) {
@@ -391,8 +323,23 @@ export class CommandExecutor {
 
           try {
             await typeSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            await typeSmartResult.locator.type(String(value), { timeout: timeout || 30000 });
+            await typeSmartResult.locator.fill(String(value), { timeout: timeout || 30000 });
+
+            // ✅ AI-powered Enter key detection
+            const shouldPress = await shouldPressEnterAfterFill(
+              typeSmartResult.locator,
+              this.page,
+              description
+            );
+
+            if (shouldPress) {
+              logger.info('[COMMAND_EXECUTOR] AI decided to press Enter after type', {
+                selector: selector.substring(0, 50),
+              });
+              await typeSmartResult.locator.press('Enter', { timeout: timeout || 5000 });
+            }
           } catch (typeError) {
+            // Smart locator failed, try self-healing
             logger.warn('[COMMAND_EXECUTOR] Smart locator type failed, trying self-healing', {
               selector: selector.substring(0, 50),
               error: typeError instanceof Error ? typeError.message : String(typeError),
@@ -401,17 +348,25 @@ export class CommandExecutor {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                await locator.type(String(value), { timeout: timeout || 30000 });
+                await locator.fill(String(value), { timeout: timeout || 30000 });
+
+                // ✅ AI-powered Enter key detection (self-healing path)
+                const shouldPress = await shouldPressEnterAfterFill(locator, this.page, description);
+                if (shouldPress) {
+                  logger.info('[COMMAND_EXECUTOR] AI decided to press Enter after type (self-healing)');
+                  await locator.press('Enter', { timeout: timeout || 5000 });
+                }
               },
               {
                 selector,
-                intent: description || `type ${value}`,
+                intent: description || `type with ${value}`,
                 action: 'type',
                 timeout,
                 value,
               }
             );
           }
+          // Note: Post-action analysis handled by PostActionAnalyzer
           break;
 
         case 'select':
@@ -1910,14 +1865,9 @@ export class CommandExecutor {
         await locator.dblclick({ timeout: defaultTimeout });
         break;
 
-      case 'fill':
-        if (value === undefined) throw new Error('Value is required for fill action');
-        await locator.fill(String(value), { timeout: defaultTimeout });
-        break;
-
       case 'type':
         if (value === undefined) throw new Error('Value is required for type action');
-        await locator.type(String(value), { timeout: defaultTimeout });
+        await locator.fill(String(value), { timeout: defaultTimeout });
         break;
 
       case 'select':
