@@ -473,6 +473,12 @@ export interface LintResult {
   cacheHit?: boolean;
   /** Embeddings latency in milliseconds */
   embeddingsLatencyMs?: number;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V5: LLM disambiguation fields
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** True if LLM disambiguation was used to select the element */
+  llmDisambiguationUsed?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

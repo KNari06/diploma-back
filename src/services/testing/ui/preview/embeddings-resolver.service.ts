@@ -15,6 +15,11 @@
 import { generateEmbedding, generateEmbeddings } from '@/services/ai/core/embedding.service';
 import { logger } from '@/utils/core/logger';
 import { cosineSimilarity } from '@/utils/text-processing/vector';
+import {
+    disambiguateWithLLM,
+    nodeToDisambiguationCandidate,
+    type DisambiguationResult,
+} from './llm-disambiguation.service';
 import type {
     IntentActionType,
     IntentStep,
@@ -1194,6 +1199,8 @@ export async function resolveWithEmbeddings(params: {
   disableCaching?: boolean;
   /** When true, include candidates in result (for Show Alternatives) */
   includeAlternatives?: boolean;
+  /** When true, use LLM to disambiguate between multiple candidates (default: true for aggressive mode) */
+  enableLLMDisambiguation?: boolean;
 }): Promise<LintResult> {
   const { 
     previewSessionId, 
@@ -1202,6 +1209,7 @@ export async function resolveWithEmbeddings(params: {
     pageUrl, 
     disableCaching = false,
     includeAlternatives = false,
+    enableLLMDisambiguation = true, // Aggressive mode: ON by default
   } = params;
   const startTime = Date.now();
 
@@ -1424,7 +1432,63 @@ export async function resolveWithEmbeddings(params: {
   }
 
   // Step 7: Apply count-based decision policy
-  const decision = applyDecisionPolicy(ranked, allowedCount, undefined, ruleTrace);
+  let decision = applyDecisionPolicy(ranked, allowedCount, undefined, ruleTrace);
+
+  // Step 7.5: LLM disambiguation for needs_clarification cases
+  // V4: If multiple candidates with good similarity, try LLM to auto-select
+  let llmDisambiguationResult: DisambiguationResult | undefined;
+  if (
+    enableLLMDisambiguation &&
+    decision.status === 'needs_clarification' &&
+    !degradedMode && // Don't call LLM if embeddings already failed
+    ranked.length >= 2
+  ) {
+    const topK = ranked.slice(0, 5); // Use top 5 candidates for LLM
+    const disambiguationCandidates = topK.map(r => nodeToDisambiguationCandidate(r.node));
+
+    llmDisambiguationResult = await disambiguateWithLLM({
+      userIntent: intentText,
+      actionType: stepDraft.type,
+      pageUrl,
+      candidates: disambiguationCandidates,
+      totalAllowedCount: allowedCount,
+      pageSignature,
+    });
+
+    // If LLM successfully selected a ref with high confidence, override decision
+    if (llmDisambiguationResult.selectedRef && !llmDisambiguationResult.skipped) {
+      const selectedCandidate = ranked.find(r => r.node.ref === llmDisambiguationResult!.selectedRef);
+      if (selectedCandidate) {
+        decision = {
+          status: 'resolved',
+          message: 'Element found by AI disambiguation',
+          confidence: llmDisambiguationResult.confidence,
+          topSimilarity: decision.topSimilarity,
+          similarityDelta: decision.similarityDelta,
+          selectedCandidates: [selectedCandidate],
+          ruleTrace,
+        };
+
+        logger.info('[EMBEDDINGS_RESOLVER] LLM disambiguation resolved', {
+          event: 'llm_disambiguation_resolved',
+          previewSessionId,
+          selectedRef: llmDisambiguationResult.selectedRef,
+          confidence: llmDisambiguationResult.confidence,
+          llmLatencyMs: llmDisambiguationResult.latencyMs,
+          reason: llmDisambiguationResult.reason.slice(0, 100),
+        });
+      }
+    } else if (!llmDisambiguationResult.skipped) {
+      // LLM was called but couldn't decide (low confidence or null ref)
+      logger.info('[EMBEDDINGS_RESOLVER] LLM disambiguation inconclusive', {
+        event: 'llm_disambiguation_inconclusive',
+        previewSessionId,
+        confidence: llmDisambiguationResult.confidence,
+        llmLatencyMs: llmDisambiguationResult.latencyMs,
+        reason: llmDisambiguationResult.reason.slice(0, 100),
+      });
+    }
+  }
 
   // Step 8: Build lint candidates
   // V3: For needs_clarification, only include candidates if includeAlternatives=true
@@ -1471,6 +1535,12 @@ export async function resolveWithEmbeddings(params: {
     candidateCount: ranked.length,
     degradedMode,
     includeAlternatives,
+    // LLM disambiguation metrics
+    llmDisambiguationEnabled: enableLLMDisambiguation,
+    llmDisambiguationRan: !!llmDisambiguationResult && !llmDisambiguationResult.skipped,
+    llmDisambiguationResolved: llmDisambiguationResult?.selectedRef !== null && llmDisambiguationResult?.selectedRef !== undefined,
+    llmDisambiguationLatencyMs: llmDisambiguationResult?.latencyMs,
+    llmDisambiguationCacheHit: llmDisambiguationResult?.cacheHit,
   });
 
   return {
@@ -1486,6 +1556,8 @@ export async function resolveWithEmbeddings(params: {
     degradedMode,
     degradedReason,
     needsAiFallback: decision.needsAiFallback,
+    // LLM disambiguation info (if used)
+    llmDisambiguationUsed: llmDisambiguationResult?.selectedRef !== null && llmDisambiguationResult?.selectedRef !== undefined,
   };
 }
 
