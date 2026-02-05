@@ -707,9 +707,10 @@ export class PreviewStepApplyService {
         }
 
         try {
-          // Import devtools collector and AI check service
-          const { fetchHtml, fetchAccessibility } = await import('./preview-devtools-collector.service');
+          // Import devtools collector, AI check service, and HTML context service
+          const { fetchAccessibility } = await import('./preview-devtools-collector.service');
           const { evaluateAiCheck } = await import('./ai-check.service');
+          const { buildSemanticHtmlFromPage } = await import('./html-context.service');
 
           // Determine context mode (default: html+a11y+screenshot)
           const contextMode = stepDraft.options?.aiContextMode || 'html+a11y+screenshot';
@@ -721,9 +722,42 @@ export class PreviewStepApplyService {
 
           const sessionService = getPreviewSessionService();
 
+          // Feature flag: use semantic HTML builder (default: ON)
+          const useSemanticHtml = process.env.AI_CHECK_SEMANTIC_HTML !== '0';
+
           if (contextMode.includes('html')) {
-            const htmlPayload = await fetchHtml(page, previewSessionId, 0);
-            html = htmlPayload.html;
+            if (useSemanticHtml) {
+              try {
+                // Use semantic HTML builder with token budgeting
+                const semanticResult = await buildSemanticHtmlFromPage(page, {
+                  assertionText: stepDraft.assertionText,
+                  tokenBudget: 8000,
+                  expandForNegative: true,
+                });
+                html = semanticResult.html;
+                
+                logger.debug('[PREVIEW_APPLY] Using semantic HTML for ai_check', {
+                  previewSessionId,
+                  originalLength: semanticResult.originalLength,
+                  semanticLength: semanticResult.semanticLength,
+                  tokens: semanticResult.tokens,
+                  reduction: `${Math.round((1 - semanticResult.semanticLength / semanticResult.originalLength) * 100)}%`,
+                });
+              } catch (semanticError) {
+                // Fallback to raw HTML if semantic builder fails
+                logger.warn('[PREVIEW_APPLY] Semantic HTML builder failed, falling back to raw HTML', {
+                  previewSessionId,
+                  error: semanticError instanceof Error ? semanticError.message : String(semanticError),
+                });
+                const rawHtml = await page.content();
+                html = rawHtml.substring(0, 100 * 1024); // Fallback: 100KB truncation
+              }
+            } else {
+              // Legacy path: use raw HTML
+              const { fetchHtml } = await import('./preview-devtools-collector.service');
+              const htmlPayload = await fetchHtml(page, previewSessionId, 0);
+              html = htmlPayload.html;
+            }
           }
 
           if (contextMode.includes('a11y')) {

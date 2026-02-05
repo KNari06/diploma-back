@@ -809,6 +809,7 @@ export class CommandExecutor {
           try {
             // Import services
             const { evaluateAiCheck } = await import('@/services/testing/ui/preview/ai-check.service');
+            const { buildSemanticHtmlFromPage } = await import('@/services/testing/ui/preview/html-context.service');
 
             // Determine context mode (default: html+a11y+screenshot)
             const contextMode = intentCommand.intentMeta.aiContextMode || 'html+a11y+screenshot';
@@ -818,11 +819,46 @@ export class CommandExecutor {
             let a11yTree: any[] | undefined;
             let screenshotBase64: string | undefined;
 
+            // Feature flag: use semantic HTML builder (default: ON)
+            const useSemanticHtml = process.env.AI_CHECK_SEMANTIC_HTML !== '0';
+
             if (contextMode.includes('html')) {
-              html = await this.page.content();
-              // Truncate if too large (100KB)
-              if (html.length > 100 * 1024) {
-                html = html.substring(0, 100 * 1024);
+              if (useSemanticHtml) {
+                try {
+                  // Use semantic HTML builder with token budgeting
+                  const semanticResult = await buildSemanticHtmlFromPage(this.page, {
+                    assertionText: intentCommand.intentMeta.assertionText,
+                    tokenBudget: 8000,
+                    expandForNegative: true,
+                  });
+                  html = semanticResult.html;
+                  
+                  logger.debug('[COMMAND_EXECUTOR] Using semantic HTML for aiCheck', {
+                    stepId: intentCommand.intentMeta.stepId,
+                    originalLength: semanticResult.originalLength,
+                    semanticLength: semanticResult.semanticLength,
+                    tokens: semanticResult.tokens,
+                    reduction: `${Math.round((1 - semanticResult.semanticLength / semanticResult.originalLength) * 100)}%`,
+                  });
+                } catch (semanticError) {
+                  // Fallback to raw HTML if semantic builder fails
+                  logger.warn('[COMMAND_EXECUTOR] Semantic HTML builder failed, falling back to raw HTML', {
+                    stepId: intentCommand.intentMeta.stepId,
+                    error: semanticError instanceof Error ? semanticError.message : String(semanticError),
+                  });
+                  html = await this.page.content();
+                  // Truncate if too large (100KB)
+                  if (html.length > 100 * 1024) {
+                    html = html.substring(0, 100 * 1024);
+                  }
+                }
+              } else {
+                // Legacy path: use raw HTML with truncation
+                html = await this.page.content();
+                // Truncate if too large (100KB)
+                if (html.length > 100 * 1024) {
+                  html = html.substring(0, 100 * 1024);
+                }
               }
             }
 
