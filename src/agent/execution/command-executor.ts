@@ -688,6 +688,14 @@ export class CommandExecutor {
           await this.page.waitForLoadState('networkidle', { timeout: timeout || 30000 });
           break;
 
+        // V5: SPA-safe URL waiting (Momentic-like matchers)
+        case 'waitForUrl': {
+          const matcher = command.urlMatcher;
+          const waitForUrlTimeout = matcher?.timeoutMs ?? timeout ?? 15000;
+          await this.executeWaitForUrl(matcher, waitForUrlTimeout);
+          break;
+        }
+
         case 'scroll':
           if (selector) {
             const scrollLocator = this.getLocatorInternal(selector);
@@ -2026,6 +2034,7 @@ export class CommandExecutor {
       case 'reload':
       case 'waitForNavigation':
       case 'waitForLoadState':
+      case 'waitForUrl': // V5: SPA-safe URL waiting (no selector needed)
         logger.warn('[COMMAND_EXECUTOR] Navigation action in self-healing - no selector needed', {
           actionType,
         });
@@ -2038,6 +2047,129 @@ export class CommandExecutor {
         // ✅ IMPROVED: Don't fallback to click - throw error for unknown actions
         throw new Error(`Unknown action type for self-healing: ${actionType}. Cannot apply healed selector.`);
     }
+  }
+
+  /**
+   * V5: Execute wait_for_url using SPA-safe approach (page.waitForFunction)
+   * Works for both full navigations AND SPA client-side routing (React Router, Next.js, etc.)
+   *
+   * Matcher precedence:
+   * 1. changedFrom: wait until URL != changedFrom value (used by auto-insert)
+   * 2. regex: match URL against regex pattern
+   * 3. glob: match URL against glob pattern (converted to regex)
+   * 4. substring: URL contains substring
+   * 5. domain: URL domain equals value (strict host match)
+   *
+   * @param matcher URL matcher configuration
+   * @param timeoutMs Timeout in milliseconds
+   */
+  private async executeWaitForUrl(
+    matcher: import('@/types').PlaywrightUrlMatcher | undefined,
+    timeoutMs: number
+  ): Promise<void> {
+    if (!matcher) {
+      // No matcher specified - just return (no-op)
+      return;
+    }
+
+    const negate = matcher.negate ?? false;
+    const caseSensitive = matcher.caseSensitive ?? false;
+
+    logger.debug('[COMMAND_EXECUTOR] Executing waitForUrl', {
+      matcher: Object.keys(matcher).filter(k => (matcher as any)[k] !== undefined),
+      timeoutMs,
+    });
+
+    // Priority: changedFrom > regex > glob > substring > domain
+
+    if (matcher.changedFrom) {
+      // Wait until URL changes from the specified value
+      const prevUrl = matcher.changedFrom;
+      await this.page.waitForFunction(
+        (prev: string) => String((globalThis as any).location?.href ?? '') !== prev,
+        prevUrl,
+        { timeout: timeoutMs }
+      );
+      logger.debug('[COMMAND_EXECUTOR] URL changed from previous value', {
+        prevUrl,
+        newUrl: this.page.url(),
+      });
+      return;
+    }
+
+    if (matcher.regex) {
+      const pattern = matcher.regex;
+      const flags = caseSensitive ? '' : 'i';
+      await this.page.waitForFunction(
+        ({ pattern, flags, negate }: { pattern: string; flags: string; negate: boolean }) => {
+          const re = new RegExp(pattern, flags);
+          const href = String((globalThis as any).location?.href ?? '');
+          const matches = re.test(href);
+          return negate ? !matches : matches;
+        },
+        { pattern, flags, negate: negate },
+        { timeout: timeoutMs }
+      );
+      return;
+    }
+
+    if (matcher.glob) {
+      // Convert glob to regex (simple conversion)
+      const globToRegex = (glob: string): string => {
+        return glob
+          .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape special chars
+          .replace(/\*\*/g, '.*') // ** → .*
+          .replace(/\*/g, '[^/]*') // * → [^/]*
+          .replace(/\?/g, '.'); // ? → .
+      };
+      const pattern = globToRegex(matcher.glob);
+      const flags = caseSensitive ? '' : 'i';
+      await this.page.waitForFunction(
+        ({ pattern, flags, negate }: { pattern: string; flags: string; negate: boolean }) => {
+          const re = new RegExp(pattern, flags);
+          const href = String((globalThis as any).location?.href ?? '');
+          const matches = re.test(href);
+          return negate ? !matches : matches;
+        },
+        { pattern, flags, negate: negate },
+        { timeout: timeoutMs }
+      );
+      return;
+    }
+
+    if (matcher.substring) {
+      const sub = matcher.substring;
+      await this.page.waitForFunction(
+        ({ sub, caseSensitive, negate }: { sub: string; caseSensitive: boolean; negate: boolean }) => {
+          const hrefRaw = String((globalThis as any).location?.href ?? '');
+          const url = caseSensitive ? hrefRaw : hrefRaw.toLowerCase();
+          const search = caseSensitive ? sub : sub.toLowerCase();
+          const matches = url.includes(search);
+          return negate ? !matches : matches;
+        },
+        { sub, caseSensitive, negate: negate },
+        { timeout: timeoutMs }
+      );
+      return;
+    }
+
+    if (matcher.domain) {
+      const domain = matcher.domain;
+      await this.page.waitForFunction(
+        ({ domain, caseSensitive, negate }: { domain: string; caseSensitive: boolean; negate: boolean }) => {
+          const hostRaw = String((globalThis as any).location?.hostname ?? '');
+          const host = caseSensitive ? hostRaw : hostRaw.toLowerCase();
+          const target = caseSensitive ? domain : domain.toLowerCase();
+          const matches = host === target;
+          return negate ? !matches : matches;
+        },
+        { domain, caseSensitive, negate: negate },
+        { timeout: timeoutMs }
+      );
+      return;
+    }
+
+    // No specific matcher - return
   }
 
   /**

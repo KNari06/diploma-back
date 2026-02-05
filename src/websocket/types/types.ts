@@ -697,7 +697,7 @@ export interface PreviewInteractiveNode {
  */
 export interface PreviewIntentStep {
   id: string;
-  type: 'type' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check';
+  type: 'type' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check' | 'wait_for_url';
   description: string;
   value?: string;
   /**
@@ -717,21 +717,37 @@ export interface PreviewIntentStep {
   };
   /** Step execution options */
   options?: {
-    /** Timeout in ms (for wait action) */
+    /** Timeout in ms (for wait / wait_for_url actions) */
     timeout?: number;
     /**
      * Human-like execution mode for UI actions.
      * When enabled, the backend tries to emulate real user behavior:
-     * - fill: gradual typing (per-character delays) instead of instant fill
+     * - type: gradual typing (per-character delays) instead of instant fill
      * - click: hover + small pause before clicking; sometimes clicks at a random point inside the element
      */
     humanLike?: boolean;
-    /** If false, use page.type instead of page.fill (for fill action) */
+    /** If false, append instead of replacing (for type action) */
     replaceContent?: boolean;
-    /** Press Enter after fill (for fill action) */
+    /** Press Enter after typing */
     pressEnter?: boolean;
     /** Delay between keystrokes in ms (for human-like typing) */
     keyPressDelay?: number;
+    /**
+     * URL matcher for wait_for_url step (V5)
+     * Supports Momentic-like matchers + internal changedFrom (used by backend auto-insert)
+     */
+    urlMatcher?: {
+      substring?: string;
+      glob?: string;
+      regex?: string;
+      domain?: string;
+      /** Internal: wait until URL changes from this value (auto-insert) */
+      changedFrom?: string;
+      caseSensitive?: boolean;
+      negate?: boolean;
+      /** Timeout in ms (default on backend: 15000) */
+      timeoutMs?: number;
+    };
     /**
      * AI context mode for ai_check assertions (V3)
      * Specifies what context to provide to the LLM for evaluation

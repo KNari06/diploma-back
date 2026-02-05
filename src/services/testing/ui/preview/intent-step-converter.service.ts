@@ -85,6 +85,9 @@ function mapActionType(intentAction: IntentActionType): string {
     // V3: AI check
     case 'ai_check':
       return 'aiCheck'; // New runtime action for AI-based assertions
+    // V5: URL wait
+    case 'wait_for_url':
+      return 'waitForUrl'; // SPA-safe URL waiting
     default:
       return 'click'; // Fallback
   }
@@ -222,6 +225,22 @@ export function convertIntentStepToCommand(
     case 'ai_check':
       // For ai_check, no additional command fields needed
       // All data is in intentMeta (assertionText, aiContextMode)
+      break;
+
+    case 'wait_for_url':
+      // V5: For wait_for_url, pass urlMatcher to command
+      if (step.options?.urlMatcher) {
+        command.urlMatcher = {
+          substring: step.options.urlMatcher.substring,
+          glob: step.options.urlMatcher.glob,
+          regex: step.options.urlMatcher.regex,
+          domain: step.options.urlMatcher.domain,
+          changedFrom: step.options.urlMatcher.changedFrom,
+          caseSensitive: step.options.urlMatcher.caseSensitive,
+          negate: step.options.urlMatcher.negate,
+          timeoutMs: step.options.urlMatcher.timeoutMs ?? 15000,
+        };
+      }
       break;
 
     case 'scroll':

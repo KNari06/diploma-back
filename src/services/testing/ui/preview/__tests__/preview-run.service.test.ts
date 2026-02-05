@@ -63,7 +63,10 @@ describe('PreviewRunService', () => {
   ];
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    // Reset mocks (incl. mockImplementationOnce queues) to avoid cross-test leakage
+    jest.resetAllMocks();
+    // Ensure no cross-test leakage from module-scoped activeRuns map
+    PreviewRunService.__dangerousClearRunsForTests();
 
     // Setup default mocks
     (getPreviewSessionService as jest.Mock).mockReturnValue(mockSessionService);
@@ -74,7 +77,7 @@ describe('PreviewRunService', () => {
 
     (IntentTestCaseService.getById as jest.Mock).mockResolvedValue({
       id: mockIntentTestCaseId,
-      steps_json: mockSteps,
+      stepsJson: mockSteps,
     });
 
     (PreviewStepApplyService.applyStep as jest.Mock).mockResolvedValue({
@@ -181,22 +184,39 @@ describe('PreviewRunService', () => {
     });
 
     it('should handle cancellation and skip remaining steps', async () => {
-      // Setup: Cancel after first step
-      let stepCount = 0;
-      (PreviewStepApplyService.applyStep as jest.Mock).mockImplementation(async () => {
-        stepCount++;
-        if (stepCount === 1) {
-          // Cancel after first step completes
-          PreviewRunService.cancelRun(mockPreviewSessionId, mockUserId);
-        }
-        return { success: true, appliedStep: mockSteps[stepCount - 1] };
-      });
+      // Setup: cancel while first step is "in flight"
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let resolveFirst: any = null;
+      (PreviewStepApplyService.applyStep as jest.Mock)
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveFirst = resolve;
+            })
+        )
+        .mockResolvedValue({ success: true, appliedStep: mockSteps[1] });
 
-      await PreviewRunService.runSavedSteps(
+      const runPromise = PreviewRunService.runSavedSteps(
         mockPreviewSessionId,
         mockIntentTestCaseId,
         mockUserId
       );
+
+      // Ensure first step started (avoid flakiness; don't assert before cleanup)
+      for (let i = 0; i < 10; i++) {
+        if ((PreviewStepApplyService.applyStep as jest.Mock).mock.calls.length >= 1) break;
+        await new Promise<void>((r) => setImmediate(r));
+      }
+
+      // Cancel before first step resolves
+      PreviewRunService.cancelRun(mockPreviewSessionId, mockUserId);
+
+      // Resolve first step
+      if (typeof resolveFirst === 'function') {
+        resolveFirst({ success: true, appliedStep: mockSteps[0] });
+      }
+
+      await runPromise;
 
       // Only first step should be executed
       expect(PreviewStepApplyService.applyStep).toHaveBeenCalledTimes(1);
@@ -239,7 +259,7 @@ describe('PreviewRunService', () => {
     it('should throw error if no steps to run', async () => {
       (IntentTestCaseService.getById as jest.Mock).mockResolvedValue({
         id: mockIntentTestCaseId,
-        steps_json: [],
+        stepsJson: [],
       });
 
       await expect(

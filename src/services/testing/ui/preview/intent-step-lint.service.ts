@@ -391,8 +391,8 @@ export class IntentStepLintService {
 
       const domNodes = snapshot.domNodes ?? [];
 
-      // Non-targeting actions (navigate, wait, assert without target)
-      if (['navigate', 'wait'].includes(stepDraft.type)) {
+      // Non-targeting actions (navigate, wait, wait_for_url)
+      if (['navigate', 'wait', 'wait_for_url'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -641,11 +641,27 @@ export class IntentStepLintService {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EVIDENCE SHORTCUT VALIDATION (delegates to exported function)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Check if a cached node is compatible with the step action type.
+   * Wrapper that delegates to the exported `isEvidenceShortcutNodeCompatible` function.
+   */
+  private static isEvidenceShortcutNodeCompatible(
+    step: IntentStep,
+    node: InteractiveNode,
+    pageUrl: string
+  ): { ok: boolean; reason?: string } {
+    return isEvidenceShortcutNodeCompatible(step, node, pageUrl);
+  }
+
   /**
    * V5: Lint step with embeddings-based semantic matching (PRIMARY)
    *
    * Architecture (V3/V5):
-   * 1. Evidence shortcut (if enabled)
+   * 1. Evidence shortcut (if enabled) with action-type validation
    * 2. Embeddings-based resolver with HardAllowed/SoftAllowed sets
    * 3. Count-based decision: 0→AI, 1→resolved, >1→needs_clarification
    * 4. For needs_clarification: generate LLM message (no candidates by default)
@@ -669,7 +685,7 @@ export class IntentStepLintService {
     });
 
     // Non-targeting actions don't need element resolution
-    if (['navigate', 'wait'].includes(stepDraft.type)) {
+    if (['navigate', 'wait', 'wait_for_url'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -706,43 +722,56 @@ export class IntentStepLintService {
       const cachedRef = stepDraft.evidence.lastSuccessRef;
       const cachedNode = domNodes.find(n => n.ref === cachedRef);
 
-      // Minimal validation: exists, visible, not disabled
-      if (cachedNode && cachedNode.isVisible !== false && cachedNode.isDisabled !== true) {
-        logger.debug('[INTENT_LINT_V5] Evidence shortcut hit', {
+      if (cachedNode) {
+        // V6: Validate cached node is compatible with action type (not just visible/enabled)
+        const compat = this.isEvidenceShortcutNodeCompatible(stepDraft, cachedNode, snapshot.url);
+
+        if (compat.ok) {
+          logger.debug('[INTENT_LINT_V5] Evidence shortcut hit', {
+            previewSessionId,
+            cachedRef,
+            nodeTag: cachedNode.tag,
+            nodeRole: cachedNode.role,
+          });
+
+          return {
+            status: 'resolved',
+            message: 'Element resolved from evidence cache',
+            confidence: 0.95,
+            candidates: [{
+              ref: cachedRef,
+              label: cachedNode.labelText || cachedNode.ariaLabel || cachedNode.text || cachedNode.placeholder || `<${cachedNode.tag}>`,
+              reason: 'Evidence shortcut (lastSuccessRef)',
+              confidence: 0.95,
+              boundingBox: cachedNode.boundingBox,
+              node: cachedNode,
+            }],
+            highlight: [{
+              ref: cachedRef,
+              boundingBox: cachedNode.boundingBox,
+              type: 'success',
+            }],
+            cacheHit: true,
+          };
+        }
+
+        // Evidence ref found but incompatible with action type - bypass cache
+        logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - node incompatible with action', {
           previewSessionId,
           cachedRef,
+          actionType: stepDraft.type,
           nodeTag: cachedNode.tag,
+          nodeRole: cachedNode.role,
+          nodeType: cachedNode.type || cachedNode.inputType,
+          reason: compat.reason,
         });
-
-        return {
-          status: 'resolved',
-          message: 'Element resolved from evidence cache',
-          confidence: 0.95,
-          candidates: [{
-            ref: cachedRef,
-            label: cachedNode.labelText || cachedNode.ariaLabel || cachedNode.text || cachedNode.placeholder || `<${cachedNode.tag}>`,
-            reason: 'Evidence shortcut (lastSuccessRef)',
-            confidence: 0.95,
-            boundingBox: cachedNode.boundingBox,
-            node: cachedNode,
-          }],
-          highlight: [{
-            ref: cachedRef,
-            boundingBox: cachedNode.boundingBox,
-            type: 'success',
-          }],
-          cacheHit: true,
-        };
+      } else {
+        // Evidence ref not found in current DOM
+        logger.debug('[INTENT_LINT_V5] Evidence shortcut miss - node not found', {
+          previewSessionId,
+          cachedRef,
+        });
       }
-
-      // Evidence ref not found or invalid - log and continue to full linting
-      logger.debug('[INTENT_LINT_V5] Evidence shortcut miss - node not found or invalid', {
-        previewSessionId,
-        cachedRef,
-        nodeFound: !!cachedNode,
-        nodeVisible: cachedNode?.isVisible,
-        nodeDisabled: cachedNode?.isDisabled,
-      });
     }
 
     // Step 1: Try embeddings-based resolver (PRIMARY) with includeAlternatives flag
@@ -1136,6 +1165,169 @@ Reply with JSON:
 
       // Return rule-based result on AI failure
       return ruleResult;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPORTED EVIDENCE SHORTCUT VALIDATION (for testing)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if a cached node is compatible with the step action type.
+ * Used by evidence shortcut to avoid resolving wrong element types
+ * (e.g., preventing `type` action from targeting an `<a>` link).
+ *
+ * Exported for unit testing. Internal logic used by IntentStepLintService.
+ *
+ * Validation rules are conservative (fail-closed):
+ * - Common: visible, not disabled, interactive for targeting actions
+ * - Per action: tag/role/type/readOnly checks
+ * - Optional URL guard via bindingHints.urlPattern
+ *
+ * @param step - The intent step being executed
+ * @param node - The cached InteractiveNode from domNodes
+ * @param pageUrl - Current page URL for urlPattern matching
+ * @returns Object with `ok` boolean and optional `reason` for rejection
+ */
+export function isEvidenceShortcutNodeCompatible(
+  step: IntentStep,
+  node: InteractiveNode,
+  pageUrl: string
+): { ok: boolean; reason?: string } {
+  // Evidence shortcut is only meaningful for actions that target a specific element.
+  // For non-targeting actions, accept by default.
+  if (step.type === 'navigate' || step.type === 'wait' || step.type === 'wait_for_url' || step.type === 'ai_check') {
+    return { ok: true };
+  }
+
+  // Common checks: must be visible and not disabled
+  if (node.isVisible === false) {
+    return { ok: false, reason: 'node_not_visible' };
+  }
+  if (node.isDisabled === true) {
+    return { ok: false, reason: 'node_disabled' };
+  }
+
+  // For most targeting actions we require an interactive element (fail-closed).
+  // NOTE: `assert` is allowed on non-interactive elements (it only waits for visibility).
+  if (step.type !== 'assert' && node.isInteractive === false) {
+    return { ok: false, reason: 'node_not_interactive' };
+  }
+
+  // Optional URL guard: if step has urlPattern, verify it matches current page
+  if (step.bindingHints?.urlPattern) {
+    try {
+      const pattern = new RegExp(step.bindingHints.urlPattern, 'i');
+      if (!pattern.test(pageUrl)) {
+        return { ok: false, reason: 'url_pattern_mismatch' };
+      }
+    } catch {
+      // Invalid regex - skip check rather than fail
+    }
+  }
+
+  const tag = node.tag?.toLowerCase();
+  const role = node.role?.toLowerCase();
+  const inputType = (node.inputType || node.type)?.toLowerCase();
+
+  // Per-action-type validation
+  switch (step.type) {
+    case 'type': {
+      // NOTE: In preview we execute `locator.fill(...)` (or click+pressSequentially for humanLike).
+      // Playwright `fill` supports input/textarea/contenteditable. We don't track contenteditable in snapshots,
+      // so we keep this conservative: accept only input/textarea.
+      const isInputLike = tag === 'input' || tag === 'textarea';
+
+      if (!isInputLike) {
+        return { ok: false, reason: `type_action_requires_input_or_textarea (got ${tag}/${role})` };
+      }
+
+      // Reject input types that are not fill-eligible
+      if (tag === 'input') {
+        const disallowed: Record<string, true> = {
+          checkbox: true,
+          radio: true,
+          button: true,
+          submit: true,
+          reset: true,
+          image: true,
+          file: true,
+          range: true,
+          color: true,
+        };
+        if (inputType && disallowed[inputType]) {
+          return { ok: false, reason: `type_action_disallowed_input_type (${inputType})` };
+        }
+      }
+
+      // Reject readOnly inputs
+      if (node.readOnly === true) {
+        return { ok: false, reason: 'input_is_readonly' };
+      }
+
+      return { ok: true };
+    }
+
+    case 'select': {
+      // Preview executor uses `locator.selectOption(...)` which only works for native <select>.
+      if (tag !== 'select') {
+        return { ok: false, reason: `select_action_requires_native_select (got ${tag}/${role})` };
+      }
+
+      return { ok: true };
+    }
+
+    case 'check':
+    case 'uncheck': {
+      // Preview executor uses `locator.check/uncheck(...)` which requires <input type=checkbox|radio>.
+      const isNativeCheckable = tag === 'input' && (inputType === 'checkbox' || inputType === 'radio');
+      if (!isNativeCheckable) {
+        return { ok: false, reason: `check_action_requires_input_checkbox_or_radio (got ${tag}/${role}/${inputType})` };
+      }
+
+      return { ok: true };
+    }
+
+    case 'open':
+    case 'close': {
+      // Prefer elements that can expand: ariaExpanded-capable, button, summary, details
+      const isExpandable =
+        node.ariaExpanded !== undefined ||
+        role === 'button' ||
+        role === 'menuitem' ||
+        tag === 'button' ||
+        tag === 'summary' ||
+        tag === 'details';
+
+      if (!isExpandable) {
+        return { ok: false, reason: `open_close_action_requires_expandable_element (got ${tag}/${role})` };
+      }
+
+      return { ok: true };
+    }
+
+    case 'click':
+    case 'hover':
+    case 'toggle':
+    case 'press': {
+      // These are permissive (interactive check already applied above)
+      return { ok: true };
+    }
+
+    case 'assert': {
+      // Preview executor only waits for visibility.
+      return { ok: true };
+    }
+
+    case 'scroll': {
+      // Scroll can target any scrollable container - be permissive
+      return { ok: true };
+    }
+
+    default: {
+      // Unknown action type - be conservative (interactive check already applied above)
+      return { ok: true };
     }
   }
 }

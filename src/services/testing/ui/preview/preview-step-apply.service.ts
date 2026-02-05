@@ -18,6 +18,7 @@ import type {
     InteractiveNode,
     LintCandidate,
     ResolutionMeta,
+    UrlMatcher,
 } from './preview.types';
 
 // Max attempts to try different candidates
@@ -81,6 +82,138 @@ async function maybeRandomPause(
   if (Math.random() > Math.min(1, chance)) return;
   const ms = randomIntInclusive(minMs, maxMs);
   await sleepMs(page, ms);
+}
+
+/**
+ * V5: Execute wait_for_url using SPA-safe approach (page.waitForFunction)
+ * Works for both full navigations AND SPA client-side routing (React Router, Next.js, etc.)
+ *
+ * Matcher precedence:
+ * 1. changedFrom: wait until URL != changedFrom value (used by auto-insert)
+ * 2. regex: match URL against regex pattern
+ * 3. glob: match URL against glob pattern (converted to regex)
+ * 4. substring: URL contains substring
+ * 5. domain: URL domain equals value (strict host match)
+ *
+ * @param page Playwright Page
+ * @param matcher UrlMatcher configuration
+ * @param timeoutMs Timeout in milliseconds
+ */
+async function executeWaitForUrl(
+  page: Page,
+  matcher: UrlMatcher | undefined,
+  timeoutMs: number
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    if (!matcher) {
+      // No matcher specified - just return success (no-op)
+      return { success: true };
+    }
+
+    const negate = matcher.negate ?? false;
+    const caseSensitive = matcher.caseSensitive ?? false;
+
+    // Build predicate based on matcher type
+    // Priority: changedFrom > regex > glob > substring > domain
+
+    if (matcher.changedFrom) {
+      // Wait until URL changes from the specified value
+      const prevUrl = matcher.changedFrom;
+      await page.waitForFunction(
+        (prev: string) => String((globalThis as any).location?.href ?? '') !== prev,
+        prevUrl,
+        { timeout: timeoutMs }
+      );
+      logger.debug('[WAIT_FOR_URL] URL changed from previous value', {
+        prevUrl,
+        newUrl: page.url(),
+      });
+      return { success: true };
+    }
+
+    if (matcher.regex) {
+      const pattern = matcher.regex;
+      const flags = caseSensitive ? '' : 'i';
+      await page.waitForFunction(
+        ({ pattern, flags, negate }: { pattern: string; flags: string; negate: boolean }) => {
+          const re = new RegExp(pattern, flags);
+          const href = String((globalThis as any).location?.href ?? '');
+          const matches = re.test(href);
+          return negate ? !matches : matches;
+        },
+        { pattern, flags, negate: negate },
+        { timeout: timeoutMs }
+      );
+      return { success: true };
+    }
+
+    if (matcher.glob) {
+      // Convert glob to regex (simple conversion)
+      const globToRegex = (glob: string): string => {
+        return glob
+          .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape special chars
+          .replace(/\*\*/g, '.*') // ** → .*
+          .replace(/\*/g, '[^/]*') // * → [^/]*
+          .replace(/\?/g, '.'); // ? → .
+      };
+      const pattern = globToRegex(matcher.glob);
+      const flags = caseSensitive ? '' : 'i';
+      await page.waitForFunction(
+        ({ pattern, flags, negate }: { pattern: string; flags: string; negate: boolean }) => {
+          const re = new RegExp(pattern, flags);
+          const href = String((globalThis as any).location?.href ?? '');
+          const matches = re.test(href);
+          return negate ? !matches : matches;
+        },
+        { pattern, flags, negate: negate },
+        { timeout: timeoutMs }
+      );
+      return { success: true };
+    }
+
+    if (matcher.substring) {
+      const sub = matcher.substring;
+      await page.waitForFunction(
+        ({ sub, caseSensitive, negate }: { sub: string; caseSensitive: boolean; negate: boolean }) => {
+          const hrefRaw = String((globalThis as any).location?.href ?? '');
+          const url = caseSensitive ? hrefRaw : hrefRaw.toLowerCase();
+          const search = caseSensitive ? sub : sub.toLowerCase();
+          const matches = url.includes(search);
+          return negate ? !matches : matches;
+        },
+        { sub, caseSensitive, negate: negate },
+        { timeout: timeoutMs }
+      );
+      return { success: true };
+    }
+
+    if (matcher.domain) {
+      const domain = matcher.domain;
+      await page.waitForFunction(
+        ({ domain, caseSensitive, negate }: { domain: string; caseSensitive: boolean; negate: boolean }) => {
+          const hostRaw = String((globalThis as any).location?.hostname ?? '');
+          const host = caseSensitive ? hostRaw : hostRaw.toLowerCase();
+          const target = caseSensitive ? domain : domain.toLowerCase();
+          const matches = host === target;
+          return negate ? !matches : matches;
+        },
+        { domain, caseSensitive, negate: negate },
+        { timeout: timeoutMs }
+      );
+      return { success: true };
+    }
+
+    // No specific matcher - return success
+    return { success: true };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.warn('[WAIT_FOR_URL] Timeout or error waiting for URL', {
+      matcher,
+      timeoutMs,
+      error: msg,
+    });
+    return { success: false, error: `wait_for_url timed out or failed: ${msg}` };
+  }
 }
 
 /**
@@ -491,6 +624,59 @@ export class PreviewStepApplyService {
           url: page.url(),
           attempts: 1,
         };
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V5: Handle wait_for_url (SPA-safe URL waiting)
+      // ═══════════════════════════════════════════════════════════════════════
+      if (stepDraft.type === 'wait_for_url') {
+        const urlBefore = page.url();
+        const matcher = stepDraft.options?.urlMatcher;
+        const timeoutMs = matcher?.timeoutMs ?? 15000;
+
+        logger.info('[PREVIEW_APPLY] Handling wait_for_url', {
+          previewSessionId,
+          matcher: matcher ? Object.keys(matcher).filter(k => (matcher as any)[k] !== undefined) : [],
+          timeoutMs,
+        });
+
+        try {
+          const result = await executeWaitForUrl(page, matcher, timeoutMs);
+
+          // Generate compiled plan for wait_for_url
+          let compiled;
+          try {
+            compiled = LocatorPlanBuilder.buildCompiledPlanForNonTargetingAction({
+              step: stepDraft,
+              pageUrl: page.url(),
+              pageTitle: await page.title().catch(() => undefined),
+            });
+          } catch (compileError) {
+            logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan for wait_for_url', {
+              error: compileError instanceof Error ? compileError.message : String(compileError),
+            });
+          }
+
+          return {
+            success: result.success,
+            error: result.error,
+            appliedStep: {
+              ...stepDraft,
+              compiled,
+            },
+            urlChanged: urlBefore !== page.url(),
+            url: page.url(),
+            attempts: 1,
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : 'wait_for_url failed',
+            urlChanged: urlBefore !== page.url(),
+            url: page.url(),
+            attempts: 1,
+          };
+        }
       }
 
       // ═══════════════════════════════════════════════════════════════════════

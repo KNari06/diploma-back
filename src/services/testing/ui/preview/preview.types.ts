@@ -124,7 +124,7 @@ export interface DomAnalysisData {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Action type for intent steps (V2: added state-aware actions, V3: added ai_check, V4: replaced fill with type)
+ * Action type for intent steps (V2: added state-aware actions, V3: added ai_check, V4: replaced fill with type, V5: added wait_for_url)
  */
 export type IntentActionType =
   | 'type'
@@ -143,7 +143,9 @@ export type IntentActionType =
   | 'open'
   | 'close'
   // V3: AI-powered assertion
-  | 'ai_check';
+  | 'ai_check'
+  // V5: URL wait (Momentic-like matchers + auto-insert support)
+  | 'wait_for_url';
 
 /**
  * Binding hints for element resolution
@@ -297,6 +299,29 @@ export interface IframeConfig {
 }
 
 /**
+ * URL matcher configuration for wait_for_url step (V5)
+ * Supports Momentic-like matchers + internal auto-insert matcher
+ */
+export interface UrlMatcher {
+  /** Match if URL contains this substring */
+  substring?: string;
+  /** Match using glob pattern (e.g., 'checkout' or 'products/*') */
+  glob?: string;
+  /** Match using regex pattern */
+  regex?: string;
+  /** Match if URL domain equals this value (strict host match) */
+  domain?: string;
+  /** Internal: wait until URL changes from this value (used by auto-insert) */
+  changedFrom?: string;
+  /** Case-sensitive matching (default: false) */
+  caseSensitive?: boolean;
+  /** Negate the match (wait until URL does NOT match) */
+  negate?: boolean;
+  /** Timeout in milliseconds (default: 15000) */
+  timeoutMs?: number;
+}
+
+/**
  * Step options - shared between IntentStep and CompiledStepPlan
  */
 export interface StepOptions {
@@ -333,6 +358,11 @@ export interface StepOptions {
    * - 'html+a11y+screenshot': HTML + accessibility tree + screenshot (default, most comprehensive)
    */
   aiContextMode?: 'html' | 'screenshot' | 'html+a11y' | 'html+screenshot' | 'html+a11y+screenshot';
+  /**
+   * URL matcher configuration for wait_for_url step (V5)
+   * Supports Momentic-like matchers (substring/glob/regex/domain) + internal changedFrom for auto-insert
+   */
+  urlMatcher?: UrlMatcher;
 }
 
 /**

@@ -39,9 +39,19 @@ export class VisualStability {
       const stabilityPromise = (async () => {
         let prevCount = await this.getElementCount(page);
 
+        // V5: If getElementCount returns null, page is likely navigating - exit early
+        if (prevCount === null) {
+          return 'navigating';
+        }
+
         for (let i = 0; i < maxAttempts; i++) {
           await page.waitForTimeout(interval);
           const currCount = await this.getElementCount(page);
+
+          // V5: If currCount is null, page navigation detected during check
+          if (currCount === null) {
+            return 'navigating';
+          }
 
           if (currCount === prevCount) {
             // logger.debug('[VISUAL_STABILITY] Page stable', {
@@ -87,16 +97,31 @@ export class VisualStability {
   /**
    * Get current element count on page
    * Used as a simple proxy for DOM stability
+   * 
+   * V5: Handle "Execution context was destroyed" gracefully during navigation
+   * This error is expected when page navigates and is not a real failure.
    */
-  private static async getElementCount(page: Page): Promise<number> {
+  private static async getElementCount(page: Page): Promise<number | null> {
     try {
       return await page.evaluate(() => {
         // @ts-expect-error - DOM types available in browser context
         return document.querySelectorAll('*').length;
       });
     } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+
+      // V5: Expected during navigation - downgrade to debug
+      if (errorMsg.includes('Execution context was destroyed') ||
+          errorMsg.includes('Target closed') ||
+          errorMsg.includes('Navigation interrupted')) {
+        logger.debug('[VISUAL_STABILITY] Page navigation detected during stability check', {
+          error: errorMsg,
+        });
+        return null; // Return null to signal "cannot measure, likely navigating"
+      }
+
       logger.error('[VISUAL_STABILITY] Failed to get element count', {
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMsg,
       });
       return 0;
     }

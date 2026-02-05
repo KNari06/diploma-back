@@ -644,6 +644,13 @@ router.get('/intent-test-cases/:id', requireAuth, getIntentTestCase);
  * /api/v1/preview/intent-test-cases/{id}:
  *   patch:
  *     summary: Update an intent test case
+ *     description: |
+ *       Update an intent test case. The backend may auto-insert `wait_for_url` steps
+ *       between steps where navigation was detected (based on compiled.context.pageUrl diff).
+ *       
+ *       **IMPORTANT for Frontend**: After successful PATCH, frontend MUST replace local
+ *       `editorSteps` with `response.data.stepsJson` to include any auto-inserted
+ *       `wait_for_url` steps. Otherwise, the user will see a stale step list.
  *     tags: [Intent Test Cases]
  *     security:
  *       - bearerAuth: []
@@ -667,9 +674,10 @@ router.get('/intent-test-cases/:id', requireAuth, getIntentTestCase);
  *                 type: string
  *               steps:
  *                 type: array
+ *                 description: Array of IntentStep objects. May be modified by backend (auto-inserted wait_for_url steps).
  *     responses:
  *       200:
- *         description: Test case updated
+ *         description: Test case updated. Response includes data.stepsJson with potentially auto-inserted wait_for_url steps.
  */
 router.patch('/intent-test-cases/:id', requireAuth, updateIntentTestCase);
 

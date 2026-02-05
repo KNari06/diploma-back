@@ -6,6 +6,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { IntentStepConverterService } from '@/services/testing/ui/preview/intent-step-converter.service';
+import { injectAutoWaitForUrlSteps } from '@/services/testing/ui/preview/auto-wait-for-url.utils';
 import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-session.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { logger } from '@/utils/core/logger';
@@ -418,6 +419,10 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
           }
           return step;
         });
+
+        // V5: Auto-inject wait_for_url steps where navigation occurred
+        // This ensures stability during background runs without requiring user to add waits manually
+        normalizedSteps = injectAutoWaitForUrlSteps(normalizedSteps);
       } else {
         res.status(400).json({ error: 'Invalid steps (expected array|null|undefined)' });
         return;
@@ -446,6 +451,9 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       }).filter(k => (req.body as any)[k] !== undefined),
     });
 
+    // IMPORTANT for Frontend: response.data.stepsJson may contain auto-inserted
+    // wait_for_url steps. Frontend MUST replace local editorSteps with this value
+    // to show the user the complete step list including auto-waits.
     res.json({
       success: true,
       data: testCase,

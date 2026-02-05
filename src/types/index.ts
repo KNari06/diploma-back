@@ -861,6 +861,7 @@ export type PlaywrightActionType =
   | 'waitForTimeout'    // Wait for specific timeout (alias for wait)
   | 'waitForLoadState'  // Wait for page load state
   | 'waitForNavigation' // Wait for page navigation
+  | 'waitForUrl'        // Wait for URL to match (V5: SPA-safe, supports Momentic-like matchers)
   | 'scroll'            // Scroll page/element
   | 'scrollIntoView'    // Scroll element into view
   // File operations
@@ -882,6 +883,29 @@ export type PlaywrightActionType =
   | 'script'            // Execute custom script (alias for evaluate)
   // Fallback for custom/unknown actions
   | string;
+
+/**
+ * URL matcher configuration for waitForUrl action (V5)
+ * Same shape as UrlMatcher in preview.types.ts for consistency
+ */
+export interface PlaywrightUrlMatcher {
+  /** Match if URL contains this substring */
+  substring?: string;
+  /** Match using glob pattern (e.g., 'checkout' or 'products/*') */
+  glob?: string;
+  /** Match using regex pattern */
+  regex?: string;
+  /** Match if URL domain equals this value (strict host match) */
+  domain?: string;
+  /** Internal: wait until URL changes from this value (used by auto-insert) */
+  changedFrom?: string;
+  /** Case-sensitive matching (default: false) */
+  caseSensitive?: boolean;
+  /** Negate the match (wait until URL does NOT match) */
+  negate?: boolean;
+  /** Timeout in milliseconds (default: 15000) */
+  timeoutMs?: number;
+}
 
 export interface PlaywrightCommand {
   action: PlaywrightActionType;
@@ -908,6 +932,8 @@ export interface PlaywrightCommand {
     mode?: 'html' | 'text' | 'auto'; // Extraction mode for AI
     instructions?: string;  // Additional instructions for AI
   };
+  /** URL matcher for waitForUrl action (V5: SPA-safe URL waiting) */
+  urlMatcher?: PlaywrightUrlMatcher;
 }
 
 export interface PlaywrightTestPlan {

@@ -54,24 +54,7 @@ export class PreviewRunService {
       throw new Error('Session not owned by user');
     }
 
-    // 3. Load saved steps from DB
-    const testCase = await IntentTestCaseService.getById(intentTestCaseId, userId);
-    if (!testCase || !testCase.stepsJson) {
-      throw new Error('Test case not found or has no saved steps');
-    }
-
-    const savedSteps: IntentStep[] = testCase.stepsJson;
-    if (savedSteps.length === 0) {
-      throw new Error('No steps to run');
-    }
-
-    // 4. Get session page
-    const session = sessionService.getSession(previewSessionId);
-    if (!session?.page) {
-      throw new Error('Session has no active page');
-    }
-
-    // 5. Initialize run state
+    // 3. Initialize run state early (before awaits) to make cancellation/concurrency deterministic
     const runState: RunState = {
       running: true,
       cancelled: false,
@@ -80,19 +63,8 @@ export class PreviewRunService {
     };
     activeRuns.set(previewSessionId, runState);
 
-    logger.info('[PreviewRun] Starting run', {
-      previewSessionId,
-      intentTestCaseId,
-      userId,
-      totalSteps: savedSteps.length,
-    });
-
-    // 6. Emit started event
-    webSocketService.emitToUser(userId, 'preview:run:started', {
-      previewSessionId,
-      totalSteps: savedSteps.length,
-      timestamp: new Date().toISOString(),
-    });
+    let savedSteps: IntentStep[] | null = null;
+    let startedEmitted = false;
 
     // 7. Execute steps sequentially
     let passedSteps = 0;
@@ -100,10 +72,47 @@ export class PreviewRunService {
     let skippedSteps = 0;
 
     try {
+      // 4. Load saved steps from DB
+      const testCase = await IntentTestCaseService.getById(intentTestCaseId, userId);
+      if (!testCase || !testCase.stepsJson) {
+        throw new Error('Test case not found or has no saved steps');
+      }
+
+      savedSteps = testCase.stepsJson;
+      if (savedSteps.length === 0) {
+        throw new Error('No steps to run');
+      }
+
+      // 5. Get session page
+      const session = sessionService.getSession(previewSessionId);
+      if (!session?.page) {
+        throw new Error('Session has no active page');
+      }
+
+      logger.info('[PreviewRun] Starting run', {
+        previewSessionId,
+        intentTestCaseId,
+        userId,
+        totalSteps: savedSteps.length,
+      });
+
+      // 6. Emit started event
+      webSocketService.emitToUser(userId, 'preview:run:started', {
+        previewSessionId,
+        totalSteps: savedSteps.length,
+        timestamp: new Date().toISOString(),
+      });
+      startedEmitted = true;
+
+      // Allow other events (cancel/isRunning) to observe activeRuns state.
+      // This is effectively a no-op in real runs (applyStep is async anyway),
+      // but makes cancellation and concurrency behavior deterministic.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
       for (let i = 0; i < savedSteps.length; i++) {
         // Check cancellation
         const currentRunState = activeRuns.get(previewSessionId);
-        if (!currentRunState || currentRunState.cancelled) {
+        if (!currentRunState || runState.cancelled || currentRunState.cancelled) {
           logger.info('[PreviewRun] Run cancelled, skipping remaining steps', {
             previewSessionId,
             currentStep: i,
@@ -149,11 +158,48 @@ export class PreviewRunService {
           timestamp: new Date().toISOString(),
         });
 
+        // Give a chance for a cancellation request to land before executing the step.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const stateBeforeExecute = activeRuns.get(previewSessionId);
+        if (!stateBeforeExecute || runState.cancelled || stateBeforeExecute.cancelled) {
+          logger.info('[PreviewRun] Cancel detected before step execute, skipping remaining steps', {
+            previewSessionId,
+            currentStep: i,
+            remainingSteps: savedSteps.length - i,
+          });
+
+          // Mark this step and remaining as skipped
+          for (let j = i; j < savedSteps.length; j++) {
+            const remaining = savedSteps[j];
+            webSocketService.emitToUser(userId, 'preview:run:step', {
+              previewSessionId,
+              stepIndex: j,
+              stepId: remaining.id,
+              status: 'skipped',
+              action: remaining.type,
+              description: remaining.description,
+              timestamp: new Date().toISOString(),
+            });
+            skippedSteps++;
+          }
+          break;
+        }
+
         try {
           // Execute step via PreviewStepApplyService
+          // V2: Disable evidence caching for batch replay to avoid stale refs after navigations
+          const stepWithCacheDisabled: IntentStep = {
+            ...step,
+            options: {
+              ...step.options,
+              disableCaching: true, // Prevents evidence shortcut from using stale lastSuccessRef
+            },
+          };
+
           const result = await PreviewStepApplyService.applyStep({
             previewSessionId,
-            stepDraft: step,
+            stepDraft: stepWithCacheDisabled,
             userId,
           });
 
@@ -196,6 +242,32 @@ export class PreviewRunService {
                 });
                 // Don't fail the run, continue
               }
+            }
+
+            // If cancellation was requested during/after this step, stop before next step.
+            const cancelledAfterStep =
+              runState.cancelled || activeRuns.get(previewSessionId)?.cancelled === true;
+            if (cancelledAfterStep) {
+              logger.info('[PreviewRun] Cancellation detected after step completion, skipping remaining steps', {
+                previewSessionId,
+                completedStep: i,
+                remainingSteps: savedSteps.length - i - 1,
+              });
+
+              for (let j = i + 1; j < savedSteps.length; j++) {
+                const remainingStep = savedSteps[j];
+                webSocketService.emitToUser(userId, 'preview:run:step', {
+                  previewSessionId,
+                  stepIndex: j,
+                  stepId: remainingStep.id,
+                  status: 'skipped',
+                  action: remainingStep.type,
+                  description: remainingStep.description,
+                  timestamp: new Date().toISOString(),
+                });
+                skippedSteps++;
+              }
+              break;
             }
           } else {
             logger.warn('[PreviewRun] Step failed', {
@@ -279,32 +351,34 @@ export class PreviewRunService {
         }
       }
     } finally {
-      // 8. Emit completed event
-      const duration = Date.now() - runState.startTime;
-      const cancelled = activeRuns.get(previewSessionId)?.cancelled || false;
+      // 8. Emit completed event (only if we emitted started)
+      if (startedEmitted && savedSteps) {
+        const duration = Date.now() - runState.startTime;
+        const cancelled = activeRuns.get(previewSessionId)?.cancelled || false;
 
-      logger.info('[PreviewRun] Run completed', {
-        previewSessionId,
-        intentTestCaseId,
-        success: failedSteps === 0 && !cancelled,
-        passedSteps,
-        failedSteps,
-        skippedSteps,
-        cancelled,
-        duration,
-      });
+        logger.info('[PreviewRun] Run completed', {
+          previewSessionId,
+          intentTestCaseId,
+          success: failedSteps === 0 && !cancelled,
+          passedSteps,
+          failedSteps,
+          skippedSteps,
+          cancelled,
+          duration,
+        });
 
-      webSocketService.emitToUser(userId, 'preview:run:completed', {
-        previewSessionId,
-        success: failedSteps === 0 && !cancelled,
-        totalSteps: savedSteps.length,
-        passedSteps,
-        failedSteps,
-        skippedSteps,
-        cancelled,
-        duration,
-        timestamp: new Date().toISOString(),
-      });
+        webSocketService.emitToUser(userId, 'preview:run:completed', {
+          previewSessionId,
+          success: failedSteps === 0 && !cancelled,
+          totalSteps: savedSteps.length,
+          passedSteps,
+          failedSteps,
+          skippedSteps,
+          cancelled,
+          duration,
+          timestamp: new Date().toISOString(),
+        });
+      }
 
       // 9. Cleanup run state
       activeRuns.delete(previewSessionId);
@@ -344,5 +418,14 @@ export class PreviewRunService {
   static isRunning(previewSessionId: string): boolean {
     const runState = activeRuns.get(previewSessionId);
     return !!(runState?.running && !runState.cancelled);
+  }
+
+  /**
+   * TEST-ONLY: Clear all active run states.
+   * This prevents cross-test leakage since activeRuns is module-scoped state.
+   * Do NOT call this in production code.
+   */
+  static __dangerousClearRunsForTests(): void {
+    activeRuns.clear();
   }
 }
