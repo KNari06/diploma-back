@@ -1,10 +1,10 @@
 /**
- * Auto Wait For URL Utils (V5)
- * Smart auto-insertion of wait_for_url steps between navigating actions
+ * Auto Wait For Utils (V5)
+ * Smart auto-insertion of wait_for steps between navigating actions
  * 
  * This module provides utilities for:
  * 1. Detecting implicit navigation between steps (via compiled.context.pageUrl diff)
- * 2. Injecting wait_for_url steps to ensure stability during background runs
+ * 2. Injecting wait_for steps to ensure stability during background runs
  * 3. URL normalization for comparison
  */
 
@@ -30,33 +30,33 @@ export function normalizeUrlForComparison(url: string): string {
 }
 
 /**
- * Action types that should NOT trigger auto-insert of wait_for_url after them.
+ * Action types that should NOT trigger auto-insert of wait_for after them.
  * These are either:
- * - Already waiting actions (wait, wait_for_url)
+ * - Already waiting actions (wait, wait_for)
  * - Actions that already handle navigation (navigate uses networkidle)
  * - Non-targeting actions (ai_check doesn't interact with page)
  */
 const SKIP_INJECT_AFTER_TYPES: Set<IntentActionType> = new Set([
   'navigate',
   'wait',
-  'wait_for_url',
+  'wait_for',
   'ai_check',
 ]);
 
 /**
- * Check if a wait_for_url step should be injected between two adjacent steps.
+ * Check if a wait_for step should be injected between two adjacent steps.
  * 
  * Injection criteria:
  * 1. Both steps have compiled.context.pageUrl
  * 2. Normalized URLs differ (navigation occurred)
  * 3. Previous step is a targeting action (not in SKIP_INJECT_AFTER_TYPES)
- * 4. Next step is NOT already a wait_for_url (avoid duplicates)
+ * 4. Next step is NOT already a wait_for (avoid duplicates)
  * 
  * @param prevStep - Previous step in sequence
  * @param nextStep - Next step in sequence
- * @returns true if wait_for_url should be injected between them
+ * @returns true if wait_for should be injected between them
  */
-function shouldInjectWaitForUrl(prevStep: IntentStep, nextStep: IntentStep): boolean {
+function shouldInjectWaitFor(prevStep: IntentStep, nextStep: IntentStep): boolean {
   // Get URLs from compiled context
   const prevUrl = prevStep.compiled?.context?.pageUrl;
   const nextUrl = nextStep.compiled?.context?.pageUrl;
@@ -76,8 +76,8 @@ function shouldInjectWaitForUrl(prevStep: IntentStep, nextStep: IntentStep): boo
     return false;
   }
 
-  // Skip if next step is already wait_for_url (avoid duplicates)
-  if (nextStep.type === 'wait_for_url') {
+  // Skip if next step is already wait_for (avoid duplicates)
+  if (nextStep.type === 'wait_for') {
     return false;
   }
 
@@ -85,16 +85,16 @@ function shouldInjectWaitForUrl(prevStep: IntentStep, nextStep: IntentStep): boo
 }
 
 /**
- * Create a new wait_for_url step for auto-insertion.
+ * Create a new wait_for step for auto-insertion.
  * Uses changedFrom matcher to wait for any URL change from the previous URL.
  * 
  * @param prevUrl - Previous page URL (wait until URL != this)
- * @returns New IntentStep for wait_for_url
+ * @returns New IntentStep for wait_for
  */
-function createAutoWaitForUrlStep(prevUrl: string): IntentStep {
+function createAutoWaitForStep(prevUrl: string): IntentStep {
   return {
     id: uuid(),
-    type: 'wait_for_url',
+    type: 'wait_for',
     description: 'Auto: wait for URL change',
     options: {
       urlMatcher: {
@@ -106,7 +106,7 @@ function createAutoWaitForUrlStep(prevUrl: string): IntentStep {
 }
 
 /**
- * Auto-inject wait_for_url steps between steps where navigation occurred.
+ * Auto-inject wait_for steps between steps where navigation occurred.
  * 
  * Detection: adjacent steps have different compiled.context.pageUrl.
  * Injection is conservative: only after targeting actions, not after navigate/wait/ai_check.
@@ -114,9 +114,9 @@ function createAutoWaitForUrlStep(prevUrl: string): IntentStep {
  * This function is PURE - it returns a new array without modifying the input.
  * 
  * @param steps - Array of IntentSteps from the test case
- * @returns New array with auto-inserted wait_for_url steps
+ * @returns New array with auto-inserted wait_for steps
  */
-export function injectAutoWaitForUrlSteps(steps: IntentStep[]): IntentStep[] {
+export function injectAutoWaitForSteps(steps: IntentStep[]): IntentStep[] {
   if (!steps || steps.length < 2) {
     return steps;
   }
@@ -132,13 +132,13 @@ export function injectAutoWaitForUrlSteps(steps: IntentStep[]): IntentStep[] {
     if (i < steps.length - 1) {
       const nextStep = steps[i + 1];
 
-      if (shouldInjectWaitForUrl(currentStep, nextStep)) {
+      if (shouldInjectWaitFor(currentStep, nextStep)) {
         const prevUrl = currentStep.compiled?.context?.pageUrl!;
-        const autoStep = createAutoWaitForUrlStep(prevUrl);
+        const autoStep = createAutoWaitForStep(prevUrl);
         result.push(autoStep);
         injectedCount++;
 
-        logger.debug('[AUTO_WAIT_FOR_URL] Injected wait_for_url step', {
+        logger.debug('[AUTO_WAIT_FOR] Injected wait_for step', {
           afterStepId: currentStep.id,
           afterStepType: currentStep.type,
           prevUrl: normalizeUrlForComparison(prevUrl),
@@ -150,7 +150,7 @@ export function injectAutoWaitForUrlSteps(steps: IntentStep[]): IntentStep[] {
   }
 
   if (injectedCount > 0) {
-    logger.info('[AUTO_WAIT_FOR_URL] Auto-inserted wait_for_url steps', {
+    logger.info('[AUTO_WAIT_FOR] Auto-inserted wait_for steps', {
       originalCount: steps.length,
       resultCount: result.length,
       injectedCount,

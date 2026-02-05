@@ -391,8 +391,8 @@ export class IntentStepLintService {
 
       const domNodes = snapshot.domNodes ?? [];
 
-      // Non-targeting actions (navigate, wait, wait_for_url)
-      if (['navigate', 'wait', 'wait_for_url'].includes(stepDraft.type)) {
+      // Non-targeting actions (navigate, wait, wait_for)
+      if (['navigate', 'wait', 'wait_for'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -685,7 +685,7 @@ export class IntentStepLintService {
     });
 
     // Non-targeting actions don't need element resolution
-    if (['navigate', 'wait', 'wait_for_url'].includes(stepDraft.type)) {
+    if (['navigate', 'wait', 'wait_for'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -1197,7 +1197,7 @@ export function isEvidenceShortcutNodeCompatible(
 ): { ok: boolean; reason?: string } {
   // Evidence shortcut is only meaningful for actions that target a specific element.
   // For non-targeting actions, accept by default.
-  if (step.type === 'navigate' || step.type === 'wait' || step.type === 'wait_for_url' || step.type === 'ai_check') {
+  if (step.type === 'navigate' || step.type === 'wait' || step.type === 'wait_for' || step.type === 'ai_check') {
     return { ok: true };
   }
 

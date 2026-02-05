@@ -4,7 +4,8 @@ import { SelfHealingService } from '@/services/ai-selector/self-healing.service'
 import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
 import type { IntentPlaywrightCommand } from '@/services/testing/ui/preview/intent-step-converter.service';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
-import type { CompiledStepPlan, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
+import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
+import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Frame, Locator, Page } from 'playwright';
@@ -689,10 +690,11 @@ export class CommandExecutor {
           break;
 
         // V5: SPA-safe URL waiting (Momentic-like matchers)
-        case 'waitForUrl': {
+        case 'waitFor': {
           const matcher = command.urlMatcher;
-          const waitForUrlTimeout = matcher?.timeoutMs ?? timeout ?? 15000;
-          await this.executeWaitForUrl(matcher, waitForUrlTimeout);
+          // V5.1: timeout is now primary (from command.timeout), urlMatcher.timeoutMs is fallback
+          const waitForTimeout = timeout ?? matcher?.timeoutMs ?? 15000;
+          await this.executeWaitFor(matcher, waitForTimeout);
           break;
         }
 
@@ -953,6 +955,7 @@ export class CommandExecutor {
 
   /**
    * Execute multiple commands in sequence
+   * V6: Includes lookahead wait between commands for inter-step stability
    */
   async executeCommands(commands: PlaywrightCommand[]): Promise<{
     success: boolean;
@@ -971,6 +974,79 @@ export class CommandExecutor {
 
         if (!result.success && !command.continueOnError) {
           throw new Error(result.error || 'Command failed');
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Lookahead wait: check next command's element readiness before executing
+        // Uses fast Playwright checks only (no AI/embeddings)
+        // ─────────────────────────────────────────────────────────────────────
+        if (result.success && index < commands.length - 1) {
+          const nextCommand = commands[index + 1];
+          const intentCommand = command as IntentPlaywrightCommand;
+          const nextIntentCommand = nextCommand as IntentPlaywrightCommand;
+
+          // Only apply lookahead if both commands are intent-based (have intentMeta)
+          if (intentCommand.intentMeta && nextIntentCommand.intentMeta) {
+            const prevActionType = intentCommand.intentMeta.actionType as any;
+
+            // Skip lookahead if previous action already handled waiting
+            if (!shouldSkipLookaheadAfter(prevActionType)) {
+              // Build IntentStep-like object for lookahead
+              const nextStepForLookahead: IntentStep = {
+                id: nextIntentCommand.intentMeta.stepId || `cmd-${index + 1}`,
+                type: nextIntentCommand.intentMeta.actionType as any,
+                description: nextIntentCommand.description || '',
+                compiled: nextIntentCommand.intentMeta.compiled,
+                evidence: nextIntentCommand.intentMeta.evidence,
+                options: {
+                  disableLookaheadWait: nextIntentCommand.intentMeta.disableLookaheadWait,
+                },
+              };
+
+              try {
+                const lookahead: LookaheadResult = await waitForStepReadiness(
+                  this.page,
+                  nextStepForLookahead,
+                  {
+                    maxWaitMs: 10000,
+                    settleMs: 3000,
+                    autoWaitThresholdMs: 2000,
+                  }
+                );
+
+                // Update runtime meta if significant wait occurred
+                if (lookahead.autoWaitApplied && nextIntentCommand.intentMeta.stepId) {
+                  const existingMeta = this.stepRuntimeMeta.get(nextIntentCommand.intentMeta.stepId);
+                  this.stepRuntimeMeta.set(nextIntentCommand.intentMeta.stepId, {
+                    ...existingMeta,
+                    runtimeStatus: existingMeta?.runtimeStatus || 'executed',
+                    source: existingMeta?.source || 'resolver',
+                    confidenceTier: existingMeta?.confidenceTier || 'medium',
+                    // V6: Add lookahead wait info
+                    autoWaitApplied: true,
+                    autoWaitMs: lookahead.waited,
+                  } as StepRuntimeMeta & { autoWaitApplied?: boolean; autoWaitMs?: number });
+
+                  logger.info('[COMMAND_EXECUTOR] Lookahead auto-wait applied', {
+                    currentIndex: index,
+                    nextStepId: nextIntentCommand.intentMeta.stepId,
+                    waitedMs: lookahead.waited,
+                  });
+                } else if (lookahead.skipReason) {
+                  logger.debug('[COMMAND_EXECUTOR] Lookahead skipped', {
+                    nextStepId: nextIntentCommand.intentMeta.stepId,
+                    reason: lookahead.skipReason,
+                  });
+                }
+              } catch (lookaheadError) {
+                // Lookahead failure is non-fatal, log and continue
+                logger.warn('[COMMAND_EXECUTOR] Lookahead wait failed, continuing', {
+                  nextIndex: index + 1,
+                  error: lookaheadError instanceof Error ? lookaheadError.message : String(lookaheadError),
+                });
+              }
+            }
+          }
         }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -2034,7 +2110,7 @@ export class CommandExecutor {
       case 'reload':
       case 'waitForNavigation':
       case 'waitForLoadState':
-      case 'waitForUrl': // V5: SPA-safe URL waiting (no selector needed)
+      case 'waitFor': // V5: SPA-safe URL waiting (no selector needed)
         logger.warn('[COMMAND_EXECUTOR] Navigation action in self-healing - no selector needed', {
           actionType,
         });
@@ -2050,7 +2126,7 @@ export class CommandExecutor {
   }
 
   /**
-   * V5: Execute wait_for_url using SPA-safe approach (page.waitForFunction)
+   * V5: Execute wait_for using SPA-safe approach (page.waitForFunction)
    * Works for both full navigations AND SPA client-side routing (React Router, Next.js, etc.)
    *
    * Matcher precedence:
@@ -2063,19 +2139,21 @@ export class CommandExecutor {
    * @param matcher URL matcher configuration
    * @param timeoutMs Timeout in milliseconds
    */
-  private async executeWaitForUrl(
+  private async executeWaitFor(
     matcher: import('@/types').PlaywrightUrlMatcher | undefined,
     timeoutMs: number
   ): Promise<void> {
     if (!matcher) {
-      // No matcher specified - just return (no-op)
+      // No matcher specified - simple wait for duration (like 'wait' action)
+      logger.debug('[COMMAND_EXECUTOR] No URL matcher specified, waiting for duration', { timeoutMs });
+      await this.page.waitForTimeout(timeoutMs);
       return;
     }
 
     const negate = matcher.negate ?? false;
     const caseSensitive = matcher.caseSensitive ?? false;
 
-    logger.debug('[COMMAND_EXECUTOR] Executing waitForUrl', {
+    logger.debug('[COMMAND_EXECUTOR] Executing waitFor', {
       matcher: Object.keys(matcher).filter(k => (matcher as any)[k] !== undefined),
       timeoutMs,
     });

@@ -697,7 +697,7 @@ export interface PreviewInteractiveNode {
  */
 export interface PreviewIntentStep {
   id: string;
-  type: 'type' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check' | 'wait_for_url';
+  type: 'type' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check' | 'wait_for';
   description: string;
   value?: string;
   /**
@@ -717,7 +717,7 @@ export interface PreviewIntentStep {
   };
   /** Step execution options */
   options?: {
-    /** Timeout in ms (for wait / wait_for_url actions) */
+    /** Timeout in ms (for wait / wait_for actions) */
     timeout?: number;
     /**
      * Human-like execution mode for UI actions.
@@ -733,7 +733,7 @@ export interface PreviewIntentStep {
     /** Delay between keystrokes in ms (for human-like typing) */
     keyPressDelay?: number;
     /**
-     * URL matcher for wait_for_url step (V5)
+     * URL matcher for wait_for step (V5)
      * Supports Momentic-like matchers + internal changedFrom (used by backend auto-insert)
      */
     urlMatcher?: {
@@ -758,6 +758,12 @@ export interface PreviewIntentStep {
      * - 'html+a11y+screenshot': HTML + accessibility tree + screenshot (default, most comprehensive)
      */
     aiContextMode?: 'html' | 'screenshot' | 'html+a11y' | 'html+screenshot' | 'html+a11y+screenshot';
+    /**
+     * Advanced: Disable lookahead wait before this step (V6)
+     * Use when intentionally running on not-yet-ready element (rare).
+     * Default: false (lookahead wait is enabled)
+     */
+    disableLookaheadWait?: boolean;
   };
 }
 

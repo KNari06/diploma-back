@@ -124,7 +124,7 @@ export interface DomAnalysisData {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Action type for intent steps (V2: added state-aware actions, V3: added ai_check, V4: replaced fill with type, V5: added wait_for_url)
+ * Action type for intent steps (V2: added state-aware actions, V3: added ai_check, V4: replaced fill with type, V5: added wait_for)
  */
 export type IntentActionType =
   | 'type'
@@ -145,7 +145,7 @@ export type IntentActionType =
   // V3: AI-powered assertion
   | 'ai_check'
   // V5: URL wait (Momentic-like matchers + auto-insert support)
-  | 'wait_for_url';
+  | 'wait_for';
 
 /**
  * Binding hints for element resolution
@@ -299,7 +299,7 @@ export interface IframeConfig {
 }
 
 /**
- * URL matcher configuration for wait_for_url step (V5)
+ * URL matcher configuration for wait_for step (V5)
  * Supports Momentic-like matchers + internal auto-insert matcher
  */
 export interface UrlMatcher {
@@ -359,10 +359,16 @@ export interface StepOptions {
    */
   aiContextMode?: 'html' | 'screenshot' | 'html+a11y' | 'html+screenshot' | 'html+a11y+screenshot';
   /**
-   * URL matcher configuration for wait_for_url step (V5)
+   * URL matcher configuration for wait_for step (V5)
    * Supports Momentic-like matchers (substring/glob/regex/domain) + internal changedFrom for auto-insert
    */
   urlMatcher?: UrlMatcher;
+  /**
+   * Advanced: Disable lookahead wait before this step.
+   * Use when intentionally running on not-yet-ready element (rare).
+   * Default: false (lookahead wait is enabled)
+   */
+  disableLookaheadWait?: boolean;
 }
 
 /**
@@ -522,6 +528,15 @@ export interface StepRuntimeMeta {
   pageSignatureMatched?: boolean;
   /** Self-healing confidence (if healed) */
   healConfidence?: number;
+  /**
+   * V6: True if lookahead auto-wait was applied (waited > threshold)
+   * Indicates significant inter-step wait due to element not being ready
+   */
+  autoWaitApplied?: boolean;
+  /**
+   * V6: Milliseconds waited during lookahead (if autoWaitApplied is true)
+   */
+  autoWaitMs?: number;
 }
 
 /**

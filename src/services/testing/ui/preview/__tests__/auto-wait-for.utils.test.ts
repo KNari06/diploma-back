@@ -1,9 +1,9 @@
 /**
- * Unit tests for auto-wait-for-url.utils
- * Tests URL normalization and auto-injection of wait_for_url steps
+ * Unit tests for auto-wait-for.utils
+ * Tests URL normalization and auto-injection of wait_for steps
  */
 
-import { normalizeUrlForComparison, injectAutoWaitForUrlSteps } from '../auto-wait-for-url.utils';
+import { normalizeUrlForComparison, injectAutoWaitForSteps } from '../auto-wait-for.utils';
 import type { IntentStep } from '../preview.types';
 
 describe('normalizeUrlForComparison', () => {
@@ -32,7 +32,7 @@ describe('normalizeUrlForComparison', () => {
   });
 });
 
-describe('injectAutoWaitForUrlSteps', () => {
+describe('injectAutoWaitForSteps', () => {
   // Helper to create step with compiled pageUrl
   const createStep = (
     id: string,
@@ -52,17 +52,17 @@ describe('injectAutoWaitForUrlSteps', () => {
   });
 
   describe('basic injection', () => {
-    it('should inject wait_for_url when URLs differ', () => {
+    it('should inject wait_for when URLs differ', () => {
       const steps: IntentStep[] = [
         createStep('1', 'click', 'https://example.com/page1'),
         createStep('2', 'type', 'https://example.com/page2'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(3);
       expect(result[0].id).toBe('1');
-      expect(result[1].type).toBe('wait_for_url');
+      expect(result[1].type).toBe('wait_for');
       expect(result[1].options?.urlMatcher?.changedFrom).toBe('https://example.com/page1');
       expect(result[2].id).toBe('2');
     });
@@ -73,10 +73,10 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('2', 'type', 'https://example.com/page'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(2);
-      expect(result.every(s => s.type !== 'wait_for_url')).toBe(true);
+      expect(result.every(s => s.type !== 'wait_for')).toBe(true);
     });
 
     it('should NOT inject when URLs differ only by query/hash', () => {
@@ -85,7 +85,7 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('2', 'type', 'https://example.com/page?b=2#section'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(2);
     });
@@ -98,7 +98,7 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('2', 'type', 'https://example.com/page2'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(2);
     });
@@ -109,18 +109,18 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('2', 'type', 'https://example.com/page2'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(2);
     });
 
-    it('should NOT inject after wait_for_url step', () => {
+    it('should NOT inject after wait_for step', () => {
       const steps: IntentStep[] = [
-        createStep('1', 'wait_for_url', 'https://example.com/page1'),
+        createStep('1', 'wait_for', 'https://example.com/page1'),
         createStep('2', 'type', 'https://example.com/page2'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(2);
     });
@@ -131,23 +131,23 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('2', 'type', 'https://example.com/page2'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(2);
     });
 
-    it('should NOT inject if next step is already wait_for_url', () => {
+    it('should NOT inject if next step is already wait_for', () => {
       const steps: IntentStep[] = [
         createStep('1', 'click', 'https://example.com/page1'),
-        createStep('2', 'wait_for_url', 'https://example.com/page2'),
+        createStep('2', 'wait_for', 'https://example.com/page2'),
         createStep('3', 'type', 'https://example.com/page2'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(3);
-      // Only the existing wait_for_url, no new ones
-      expect(result.filter(s => s.type === 'wait_for_url')).toHaveLength(1);
+      // Only the existing wait_for, no new ones
+      expect(result.filter(s => s.type === 'wait_for')).toHaveLength(1);
     });
   });
 
@@ -158,7 +158,7 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('2', 'type', 'https://example.com/page2'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(2);
     });
@@ -169,7 +169,7 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('2', 'type'), // No pageUrl
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(2);
     });
@@ -177,17 +177,17 @@ describe('injectAutoWaitForUrlSteps', () => {
 
   describe('edge cases', () => {
     it('should return empty array for empty input', () => {
-      expect(injectAutoWaitForUrlSteps([])).toEqual([]);
+      expect(injectAutoWaitForSteps([])).toEqual([]);
     });
 
     it('should return same array for single step', () => {
       const steps: IntentStep[] = [createStep('1', 'click', 'https://example.com')];
-      expect(injectAutoWaitForUrlSteps(steps)).toEqual(steps);
+      expect(injectAutoWaitForSteps(steps)).toEqual(steps);
     });
 
     it('should handle null/undefined gracefully', () => {
-      expect(injectAutoWaitForUrlSteps(null as any)).toEqual(null);
-      expect(injectAutoWaitForUrlSteps(undefined as any)).toEqual(undefined);
+      expect(injectAutoWaitForSteps(null as any)).toEqual(null);
+      expect(injectAutoWaitForSteps(undefined as any)).toEqual(undefined);
     });
 
     it('should generate unique IDs for injected steps', () => {
@@ -198,8 +198,8 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('4', 'type', 'https://example.com/page3'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
-      const injectedSteps = result.filter(s => s.type === 'wait_for_url');
+      const result = injectAutoWaitForSteps(steps);
+      const injectedSteps = result.filter(s => s.type === 'wait_for');
 
       expect(injectedSteps).toHaveLength(2);
       expect(injectedSteps[0].id).not.toBe(injectedSteps[1].id);
@@ -210,7 +210,7 @@ describe('injectAutoWaitForUrlSteps', () => {
   });
 
   describe('multiple navigations', () => {
-    it('should inject multiple wait_for_url steps for multiple navigations', () => {
+    it('should inject multiple wait_for steps for multiple navigations', () => {
       const steps: IntentStep[] = [
         createStep('1', 'click', 'https://example.com/page1'),
         createStep('2', 'type', 'https://example.com/page2'),
@@ -218,12 +218,12 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('4', 'type', 'https://example.com/page3'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
 
       expect(result).toHaveLength(6); // 4 original + 2 injected
-      expect(result[1].type).toBe('wait_for_url');
+      expect(result[1].type).toBe('wait_for');
       expect(result[1].options?.urlMatcher?.changedFrom).toBe('https://example.com/page1');
-      expect(result[4].type).toBe('wait_for_url');
+      expect(result[4].type).toBe('wait_for');
       expect(result[4].options?.urlMatcher?.changedFrom).toBe('https://example.com/page2');
     });
   });
@@ -235,10 +235,10 @@ describe('injectAutoWaitForUrlSteps', () => {
         createStep('2', 'type', 'https://example.com/page2'),
       ];
 
-      const result = injectAutoWaitForUrlSteps(steps);
+      const result = injectAutoWaitForSteps(steps);
       const injected = result[1];
 
-      expect(injected.type).toBe('wait_for_url');
+      expect(injected.type).toBe('wait_for');
       expect(injected.description).toBe('Auto: wait for URL change');
       expect(injected.options?.urlMatcher?.changedFrom).toBe('https://example.com/page1');
       expect(injected.options?.urlMatcher?.timeoutMs).toBe(15000);

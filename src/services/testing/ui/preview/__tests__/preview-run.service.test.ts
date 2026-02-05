@@ -72,11 +72,16 @@ describe('PreviewRunService', () => {
     (getPreviewSessionService as jest.Mock).mockReturnValue(mockSessionService);
     mockSessionService.isSessionOwned.mockReturnValue(true);
     mockSessionService.getSession.mockReturnValue({
-      page: { url: () => 'https://example.com' },
+      page: {
+        url: () => 'https://example.com',
+        goto: jest.fn().mockResolvedValue(undefined),
+        waitForLoadState: jest.fn().mockResolvedValue(undefined),
+      },
     });
 
     (IntentTestCaseService.getById as jest.Mock).mockResolvedValue({
       id: mockIntentTestCaseId,
+      startUrl: 'https://example.com/start',
       stepsJson: mockSteps,
     });
 

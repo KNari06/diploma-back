@@ -861,7 +861,7 @@ export type PlaywrightActionType =
   | 'waitForTimeout'    // Wait for specific timeout (alias for wait)
   | 'waitForLoadState'  // Wait for page load state
   | 'waitForNavigation' // Wait for page navigation
-  | 'waitForUrl'        // Wait for URL to match (V5: SPA-safe, supports Momentic-like matchers)
+  | 'waitFor'        // Wait for URL to match (V5: SPA-safe, supports Momentic-like matchers)
   | 'scroll'            // Scroll page/element
   | 'scrollIntoView'    // Scroll element into view
   // File operations
@@ -885,7 +885,7 @@ export type PlaywrightActionType =
   | string;
 
 /**
- * URL matcher configuration for waitForUrl action (V5)
+ * URL matcher configuration for waitFor action (V5)
  * Same shape as UrlMatcher in preview.types.ts for consistency
  */
 export interface PlaywrightUrlMatcher {
@@ -932,7 +932,7 @@ export interface PlaywrightCommand {
     mode?: 'html' | 'text' | 'auto'; // Extraction mode for AI
     instructions?: string;  // Additional instructions for AI
   };
-  /** URL matcher for waitForUrl action (V5: SPA-safe URL waiting) */
+  /** URL matcher for waitFor action (V5: SPA-safe URL waiting) */
   urlMatcher?: PlaywrightUrlMatcher;
 }
 

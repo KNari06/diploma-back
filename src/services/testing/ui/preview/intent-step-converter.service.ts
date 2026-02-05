@@ -44,6 +44,10 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     aiContextMode?: 'html' | 'screenshot' | 'html+a11y' | 'html+screenshot' | 'html+a11y+screenshot';
     /** Iframe selector for actions within iframes */
     iframeSelector?: string;
+    /** V6: Original action type for lookahead checks */
+    actionType?: IntentActionType;
+    /** V6: Disable lookahead wait before this step */
+    disableLookaheadWait?: boolean;
   };
 }
 
@@ -86,8 +90,8 @@ function mapActionType(intentAction: IntentActionType): string {
     case 'ai_check':
       return 'aiCheck'; // New runtime action for AI-based assertions
     // V5: URL wait
-    case 'wait_for_url':
-      return 'waitForUrl'; // SPA-safe URL waiting
+    case 'wait_for':
+      return 'waitFor'; // SPA-safe URL waiting
     default:
       return 'click'; // Fallback
   }
@@ -165,6 +169,10 @@ export function convertIntentStepToCommand(
       evidence: step.evidence,
       bindingHints: step.bindingHints,
       stepIndex,
+      // V6: Action type for lookahead checks
+      actionType: step.type,
+      // V6: Lookahead wait disable flag
+      disableLookaheadWait: step.options?.disableLookaheadWait,
       // V3: AI check metadata
       ...(step.type === 'ai_check' && {
         assertionText: step.assertionText,
@@ -227,8 +235,8 @@ export function convertIntentStepToCommand(
       // All data is in intentMeta (assertionText, aiContextMode)
       break;
 
-    case 'wait_for_url':
-      // V5: For wait_for_url, pass urlMatcher to command
+    case 'wait_for':
+      // V5: For wait_for, pass urlMatcher to command
       if (step.options?.urlMatcher) {
         command.urlMatcher = {
           substring: step.options.urlMatcher.substring,

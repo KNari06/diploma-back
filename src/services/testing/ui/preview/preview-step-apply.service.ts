@@ -85,7 +85,7 @@ async function maybeRandomPause(
 }
 
 /**
- * V5: Execute wait_for_url using SPA-safe approach (page.waitForFunction)
+ * V5: Execute wait_for using SPA-safe approach (page.waitForFunction)
  * Works for both full navigations AND SPA client-side routing (React Router, Next.js, etc.)
  *
  * Matcher precedence:
@@ -99,14 +99,16 @@ async function maybeRandomPause(
  * @param matcher UrlMatcher configuration
  * @param timeoutMs Timeout in milliseconds
  */
-async function executeWaitForUrl(
+async function executeWaitFor(
   page: Page,
   matcher: UrlMatcher | undefined,
   timeoutMs: number
 ): Promise<{ success: boolean; error?: string }> {
   try {
     if (!matcher) {
-      // No matcher specified - just return success (no-op)
+      // No matcher specified - simple wait for duration (like 'wait' action)
+      logger.debug('[WAIT_FOR] No URL matcher specified, waiting for duration', { timeoutMs });
+      await page.waitForTimeout(timeoutMs);
       return { success: true };
     }
 
@@ -212,7 +214,7 @@ async function executeWaitForUrl(
       timeoutMs,
       error: msg,
     });
-    return { success: false, error: `wait_for_url timed out or failed: ${msg}` };
+    return { success: false, error: `wait_for timed out or failed: ${msg}` };
   }
 }
 
@@ -597,14 +599,19 @@ export class PreviewStepApplyService {
 
       // Handle non-targeting actions (navigate, wait)
       if (['navigate', 'wait'].includes(stepDraft.type)) {
+        // V5: Capture URL BEFORE action for accurate compiled context
+        // This is important for auto-wait-for-url injection which compares adjacent pageUrls
+        const urlBeforeAction = page.url();
+        
         const result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
 
         // Generate compiled plan for non-targeting actions
+        // Use urlBeforeAction to record the context where action was initiated
         let compiled;
         try {
           compiled = LocatorPlanBuilder.buildCompiledPlanForNonTargetingAction({
             step: stepDraft,
-            pageUrl: page.url(),
+            pageUrl: urlBeforeAction,
             pageTitle: await page.title().catch(() => undefined),
           });
         } catch (compileError) {
@@ -621,29 +628,30 @@ export class PreviewStepApplyService {
             compiled,
           },
           urlChanged: result.urlChanged,
-          url: page.url(),
+          url: page.url(), // Current URL after action (may have changed)
           attempts: 1,
         };
       }
 
       // ═══════════════════════════════════════════════════════════════════════
-      // V5: Handle wait_for_url (SPA-safe URL waiting)
+      // V5: Handle wait_for (SPA-safe URL waiting)
       // ═══════════════════════════════════════════════════════════════════════
-      if (stepDraft.type === 'wait_for_url') {
+      if (stepDraft.type === 'wait_for') {
         const urlBefore = page.url();
         const matcher = stepDraft.options?.urlMatcher;
-        const timeoutMs = matcher?.timeoutMs ?? 15000;
+        // V5.1: timeout is now primary (required from frontend), urlMatcher.timeoutMs is fallback
+        const timeoutMs = stepDraft.options?.timeout ?? matcher?.timeoutMs ?? 15000;
 
-        logger.info('[PREVIEW_APPLY] Handling wait_for_url', {
+        logger.info('[PREVIEW_APPLY] Handling wait_for', {
           previewSessionId,
           matcher: matcher ? Object.keys(matcher).filter(k => (matcher as any)[k] !== undefined) : [],
           timeoutMs,
         });
 
         try {
-          const result = await executeWaitForUrl(page, matcher, timeoutMs);
+          const result = await executeWaitFor(page, matcher, timeoutMs);
 
-          // Generate compiled plan for wait_for_url
+          // Generate compiled plan for wait_for
           let compiled;
           try {
             compiled = LocatorPlanBuilder.buildCompiledPlanForNonTargetingAction({
@@ -652,7 +660,7 @@ export class PreviewStepApplyService {
               pageTitle: await page.title().catch(() => undefined),
             });
           } catch (compileError) {
-            logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan for wait_for_url', {
+            logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan for wait_for', {
               error: compileError instanceof Error ? compileError.message : String(compileError),
             });
           }
@@ -671,7 +679,7 @@ export class PreviewStepApplyService {
         } catch (error) {
           return {
             success: false,
-            error: error instanceof Error ? error.message : 'wait_for_url failed',
+            error: error instanceof Error ? error.message : 'wait_for failed',
             urlChanged: urlBefore !== page.url(),
             url: page.url(),
             attempts: 1,
@@ -847,6 +855,9 @@ export class PreviewStepApplyService {
           confidence: 1.0,
         };
 
+        // V5: Capture URL BEFORE action for accurate compiled context
+        const urlBeforeAction = page.url();
+        
         const result = await executeAction(page, stepDraft, confirmedCandidate);
 
         if (result.success) {
@@ -860,13 +871,14 @@ export class PreviewStepApplyService {
           const resolvedNode = session?.pageState?.domNodes?.find(n => n.ref === selectedRef);
 
           // Generate compiled plan if node is available
+          // Use urlBeforeAction to record the context where element was found
           let compiled;
           if (resolvedNode) {
             try {
               compiled = LocatorPlanBuilder.buildCompiledPlan({
                 step: stepDraft,
                 resolvedNode,
-                pageUrl: page.url(),
+                pageUrl: urlBeforeAction,
                 pageTitle: await page.title().catch(() => undefined),
               });
             } catch (compileError) {
@@ -970,6 +982,10 @@ export class PreviewStepApplyService {
       const candidatesToTry = lintResult.candidates.slice(0, MAX_ATTEMPTS);
       let lastError: string | undefined;
       let attempts = 0;
+      
+      // V5: Capture URL BEFORE trying candidates for accurate compiled context
+      // This URL represents the page state when elements were found by lint
+      const urlBeforeAction = page.url();
 
       for (const candidate of candidatesToTry) {
         attempts++;
@@ -1007,6 +1023,7 @@ export class PreviewStepApplyService {
 
           // V3: Generate compiled plan from resolved node
           // Include pageSignature from session for staleness detection
+          // Use urlBeforeAction to record the context where element was found
           let compiled;
           let pageSignature: string | undefined;
           if (candidate.node) {
@@ -1018,7 +1035,7 @@ export class PreviewStepApplyService {
               compiled = LocatorPlanBuilder.buildCompiledPlan({
                 step: stepDraft,
                 resolvedNode: candidate.node,
-                pageUrl: page.url(),
+                pageUrl: urlBeforeAction,
                 pageTitle: await page.title().catch(() => undefined),
                 pageSignature,
               });

@@ -11,6 +11,7 @@ import { IntentTestCaseService } from './intent-test-case.service';
 import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type { IntentStep } from './preview.types';
+import { shouldSkipLookaheadAfter, waitForStepReadiness } from './step-readiness.service';
 
 /**
  * Internal state for active runs
@@ -89,20 +90,59 @@ export class PreviewRunService {
         throw new Error('Session has no active page');
       }
 
+      // 6. Get startUrl for initial navigation
+      const startUrl = testCase.startUrl || testCase.url;
+      if (!startUrl) {
+        throw new Error('Test case has no startUrl or url');
+      }
+
       logger.info('[PreviewRun] Starting run', {
         previewSessionId,
         intentTestCaseId,
         userId,
         totalSteps: savedSteps.length,
+        startUrl,
       });
 
-      // 6. Emit started event
+      // 7. Emit started event
       webSocketService.emitToUser(userId, 'preview:run:started', {
         previewSessionId,
         totalSteps: savedSteps.length,
+        startUrl,
         timestamp: new Date().toISOString(),
       });
       startedEmitted = true;
+
+      // 8. Navigate to startUrl before executing steps
+      // This ensures we start from the correct page regardless of current browser state
+      logger.info('[PreviewRun] Navigating to startUrl', {
+        previewSessionId,
+        startUrl,
+      });
+
+      try {
+        await session.page.goto(startUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000,
+        });
+
+        // Wait for network idle after initial navigation
+        await session.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {
+          logger.debug('[PreviewRun] Network idle timeout after initial navigation, continuing');
+        });
+
+        logger.info('[PreviewRun] Navigation to startUrl complete', {
+          previewSessionId,
+          currentUrl: session.page.url(),
+        });
+      } catch (navError) {
+        logger.error('[PreviewRun] Failed to navigate to startUrl', {
+          previewSessionId,
+          startUrl,
+          error: navError instanceof Error ? navError.message : String(navError),
+        });
+        throw new Error(`Failed to navigate to startUrl: ${navError instanceof Error ? navError.message : String(navError)}`);
+      }
 
       // Allow other events (cancel/isRunning) to observe activeRuns state.
       // This is effectively a no-op in real runs (applyStep is async anyway),
@@ -221,6 +261,45 @@ export class PreviewRunService {
               timestamp: new Date().toISOString(),
             });
             passedSteps++;
+
+            // ─────────────────────────────────────────────────────────────────────
+            // Lookahead wait: check next step readiness before executing it
+            // Uses fast Playwright checks only (no AI/embeddings)
+            // ─────────────────────────────────────────────────────────────────────
+            if (i < savedSteps.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+              const nextStep = savedSteps[i + 1];
+              try {
+                const lookahead = await waitForStepReadiness(session.page, nextStep, {
+                  maxWaitMs: 10000,
+                  settleMs: 3000,
+                  autoWaitThresholdMs: 2000,
+                });
+
+                if (lookahead.autoWaitApplied) {
+                  logger.info('[PreviewRun] Lookahead auto-wait applied before next step', {
+                    previewSessionId,
+                    currentStepIndex: i,
+                    nextStepIndex: i + 1,
+                    nextStepId: nextStep.id,
+                    waitedMs: lookahead.waited,
+                    ready: lookahead.ready,
+                  });
+                } else if (lookahead.skipReason) {
+                  logger.debug('[PreviewRun] Lookahead skipped', {
+                    previewSessionId,
+                    nextStepIndex: i + 1,
+                    reason: lookahead.skipReason,
+                  });
+                }
+              } catch (lookaheadError) {
+                // Lookahead failure is non-fatal, log and continue
+                logger.warn('[PreviewRun] Lookahead wait failed, continuing', {
+                  previewSessionId,
+                  nextStepIndex: i + 1,
+                  error: lookaheadError instanceof Error ? lookaheadError.message : String(lookaheadError),
+                });
+              }
+            }
 
             // Best-effort: persist appliedStep if result has it
             if (result.appliedStep) {

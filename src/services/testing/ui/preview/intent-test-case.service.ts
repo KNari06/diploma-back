@@ -7,7 +7,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import type { CompiledStepPlan, IntentStep, IntentTestCase, StepEvidence } from './preview.types';
-import { injectAutoWaitForUrlSteps } from './auto-wait-for-url.utils';
+import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 
 /**
  * Service for managing intent test cases
@@ -451,9 +451,9 @@ export class IntentTestCaseService {
       // Replace the step entirely with appliedStep
       steps[stepIndex] = appliedStep;
 
-      // V5: Auto-inject wait_for_url steps where navigation occurred
+      // V5: Auto-inject wait_for steps where navigation occurred
       // This ensures stability during background runs without requiring user to add waits manually
-      const stepsWithAutoWaits = injectAutoWaitForUrlSteps(steps);
+      const stepsWithAutoWaits = injectAutoWaitForSteps(steps);
 
       // Save back to DB
       const { error: updateError } = await supabaseAdmin
