@@ -347,19 +347,21 @@ async function ensureStability(
 
 /**
  * Execute an action on the page
+ * V7: Optionally accepts a pre-resolved locator (from compiled plan)
  */
 async function executeAction(
   page: Page,
   step: IntentStep,
-  candidate: LintCandidate
+  candidate: LintCandidate,
+  preResolvedLocator?: Locator
 ): Promise<{ success: boolean; error?: string; urlChanged: boolean }> {
   const urlBefore = page.url();
 
   try {
-    // Build selector - prioritize manual CSS override
-    const selector = buildSelector(step, candidate);
+    // Build selector (unless we have a pre-resolved locator from compiled plan)
+    const selector = preResolvedLocator ? '' : buildSelector(step, candidate);
 
-    if (!selector && step.type !== 'navigate' && step.type !== 'wait') {
+    if (!selector && !preResolvedLocator && step.type !== 'navigate' && step.type !== 'wait') {
       return { success: false, error: 'No valid selector for element', urlChanged: false };
     }
 
@@ -367,8 +369,8 @@ async function executeAction(
     const context = getLocatorContext(page, step);
     const timeout = step.options?.timeout || ACTION_TIMEOUT;
 
-    // Get locator if we have a selector
-    const locator = selector ? (context as Page | FrameLocator).locator(selector) : undefined;
+    // V7: Use pre-resolved locator if provided, otherwise build from selector
+    const locator = preResolvedLocator || (selector ? (context as Page | FrameLocator).locator(selector) : undefined);
 
     // Ensure element stability before action (unless disabled)
     if (locator && step.type !== 'navigate' && step.type !== 'wait') {
@@ -976,6 +978,97 @@ export class PreviewStepApplyService {
           }],
           attempts: 1,
         };
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V7: Try compiled locator plan first (if available) before lint
+      // This is a fast path that avoids expensive embeddings/AI when we have
+      // a cached, validated locator from a previous successful resolution
+      // ═══════════════════════════════════════════════════════════════════════
+      if (stepDraft.compiled && stepDraft.compiled.locatorPlan && stepDraft.compiled.locatorPlan.length > 0) {
+        logger.debug('[PREVIEW_APPLY] Trying compiled locator plan before lint', {
+          previewSessionId,
+          stepId: stepDraft.id,
+          locatorCount: stepDraft.compiled.locatorPlan.length,
+          pageUrl: stepDraft.compiled.context?.pageUrl,
+        });
+
+        try {
+          // Import and execute compiled plan
+          const { executeCompiledLocatorPlan } = await import('@/agent/execution/compiled-locator-executor');
+          
+          const compiledResult = await executeCompiledLocatorPlan(
+            page,
+            stepDraft.compiled,
+            stepDraft.type,
+            5000 // 5s timeout
+          );
+
+          if (compiledResult.success && compiledResult.locator) {
+            logger.info('[PREVIEW_APPLY] Compiled locator succeeded, skipping lint', {
+              previewSessionId,
+              stepId: stepDraft.id,
+              strategy: compiledResult.usedStrategy,
+            });
+
+            // Build candidate from compiled result
+            const compiledCandidate: LintCandidate = {
+              ref: '', // Not needed for execution
+              reason: `Compiled locator: ${compiledResult.usedStrategy}`,
+              confidence: compiledResult.confidence || 0.9,
+              label: '',
+            };
+
+            // Execute action with compiled locator
+            const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator);
+
+            if (result.success) {
+              // Wait for page to settle
+              await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
+
+              // Build resolution meta for compiled success
+              const resolutionMeta: ResolutionMeta = {
+                allowedCount: 1,
+                usedRules: ['compiled_plan'],
+                usedEmbeddings: false,
+                confidenceTier: 'high' as ConfidenceTier,
+              };
+
+              // Update step with success evidence
+              const updatedStep: IntentStep = {
+                ...stepDraft,
+                evidence: {
+                  ...stepDraft.evidence,
+                  lastSuccessRef: '', // Compiled doesn't use refs
+                  confidence: compiledResult.confidence || 0.9,
+                  resolutionMeta,
+                },
+              };
+
+              return {
+                success: true,
+                appliedStep: updatedStep,
+                urlChanged: result.urlChanged,
+                url: page.url(),
+                attempts: 1,
+              };
+            }
+          }
+
+          // Compiled failed or element not found - fallthrough to lint
+          logger.debug('[PREVIEW_APPLY] Compiled locator failed, falling back to lint', {
+            previewSessionId,
+            stepId: stepDraft.id,
+            reason: compiledResult.skipReason,
+          });
+        } catch (compiledError) {
+          // Compiled execution threw - fallthrough to lint
+          logger.debug('[PREVIEW_APPLY] Compiled execution error, falling back to lint', {
+            previewSessionId,
+            stepId: stepDraft.id,
+            error: compiledError instanceof Error ? compiledError.message : String(compiledError),
+          });
+        }
       }
 
       // Normal flow: Lint the step to get candidates

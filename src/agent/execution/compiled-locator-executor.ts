@@ -17,6 +17,7 @@ import type {
   LocatorEntry,
   RuntimeSource,
   StepRuntimeMeta,
+  TargetFingerprint,
 } from '@/services/testing/ui/preview/preview.types';
 import { isCompiledPlanExpired } from '@/services/testing/ui/preview/preview.types';
 import { logger } from '@/utils/core/logger';
@@ -123,6 +124,61 @@ async function checkPageSignature(
   });
 
   return { matched, currentSignature };
+}
+
+/**
+ * Quick fingerprint check to validate found element matches expected attributes
+ * Returns match score 0-1 (1 = perfect match)
+ */
+async function quickFingerprintCheck(
+  page: PageLike,
+  locator: Locator,
+  fingerprint: TargetFingerprint
+): Promise<number> {
+  try {
+    const element = await locator.evaluate((el: any) => ({
+      tag: el?.tagName?.toLowerCase(),
+      role: el?.getAttribute?.('role'),
+      ariaLabel: el?.getAttribute?.('aria-label'),
+      placeholder: el?.getAttribute?.('placeholder'),
+    }));
+
+    let matches = 0;
+    let total = 0;
+
+    // Compare tag
+    if (fingerprint.tag) {
+      total++;
+      if (element.tag === fingerprint.tag.toLowerCase()) matches++;
+    }
+
+    // Compare role
+    if (fingerprint.role) {
+      total++;
+      if (element.role === fingerprint.role) matches++;
+    }
+
+    // Compare ariaLabel
+    if (fingerprint.ariaLabel) {
+      total++;
+      if (element.ariaLabel === fingerprint.ariaLabel) matches++;
+    }
+
+    // Compare placeholder
+    if (fingerprint.placeholder) {
+      total++;
+      if (element.placeholder === fingerprint.placeholder) matches++;
+    }
+
+    // If no fingerprint attributes, return 1 (no validation needed)
+    if (total === 0) return 1;
+
+    const score = matches / total;
+    return score;
+  } catch {
+    // If fingerprint check fails, assume element is ok (best effort)
+    return 1;
+  }
 }
 
 /**
@@ -271,6 +327,31 @@ export async function executeCompiledLocatorPlan(
     const result = await tryLocatorEntry(page, entry, timeout);
 
     if (result.success && result.locator) {
+      // Validate fingerprint if available
+      if (compiled.targetFingerprint) {
+        const matchScore = await quickFingerprintCheck(page, result.locator, compiled.targetFingerprint);
+        
+        if (matchScore < 0.3) {
+          logger.warn('[COMPILED_EXECUTOR] Fingerprint mismatch - element found but may be wrong', {
+            strategy: entry.strategy,
+            matchScore: Math.round(matchScore * 100) / 100,
+            fingerprint: {
+              tag: compiled.targetFingerprint.tag,
+              role: compiled.targetFingerprint.role,
+              ariaLabel: compiled.targetFingerprint.ariaLabel,
+              placeholder: compiled.targetFingerprint.placeholder,
+            },
+          });
+          // Skip this locator, try next one
+          continue;
+        }
+
+        logger.debug('[COMPILED_EXECUTOR] Fingerprint validated', {
+          strategy: entry.strategy,
+          matchScore: Math.round(matchScore * 100) / 100,
+        });
+      }
+
       logger.info('[COMPILED_EXECUTOR] Locator succeeded', {
         strategy: entry.strategy,
         confidence: entry.confidence,
@@ -320,15 +401,18 @@ export function buildRuntimeMeta(
   let runtimeStatus: 'executed' | 'healed' | 'failed' = 'failed';
   let source = result.source;
   let confidenceTier: ConfidenceTier = 'low';
+  let resolutionPath: 'compiled' | 'self_heal' | undefined;
 
   if (result.success) {
     runtimeStatus = 'executed';
     confidenceTier = (result.confidence ?? 0) >= 0.8 ? 'high' :
                      (result.confidence ?? 0) >= 0.6 ? 'medium' : 'low';
+    resolutionPath = 'compiled';
   } else if (healResult?.success) {
     runtimeStatus = 'healed';
     source = 'self_heal';
     confidenceTier = (healResult.confidence ?? 0) >= 0.85 ? 'medium' : 'low';
+    resolutionPath = 'self_heal';
   }
 
   const meta: StepRuntimeMeta = {
@@ -339,6 +423,7 @@ export function buildRuntimeMeta(
     usedLocatorStrategy: result.usedStrategy,
     compiledExpired: result.expired,
     pageSignatureMatched: result.signatureMatched,
+    resolutionPath,
   };
 
   // Add failure reason and explanation if failed

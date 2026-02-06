@@ -99,11 +99,32 @@ function normalizeText(text: string | undefined): string {
 }
 
 /**
+ * Normalize text for "loose" comparison (space-insensitive).
+ *
+ * Why:
+ * - Users often type intents without spaces ("logout"), while UI text may contain spaces ("Log out").
+ * - In degraded modes (embeddings unavailable), rule-based fallback must still match reliably.
+ *
+ * We intentionally only remove whitespace here (not all punctuation) to keep behavior predictable.
+ */
+function normalizeTextLoose(text: string | undefined): string {
+  return normalizeText(text).replace(/\s+/g, '');
+}
+
+/**
  * Check if text contains keywords from intent
  */
 function containsKeywords(text: string, keywords: string[]): boolean {
   const normalized = normalizeText(text);
-  return keywords.some(kw => normalized.includes(normalizeText(kw)));
+  const normalizedLoose = normalizeTextLoose(text);
+  return keywords.some((kw) => {
+    const kwNorm = normalizeText(kw);
+    if (kwNorm.length === 0) return false;
+    if (normalized.includes(kwNorm)) return true;
+
+    const kwLoose = normalizeTextLoose(kw);
+    return kwLoose.length > 0 && normalizedLoose.includes(kwLoose);
+  });
 }
 
 /**
@@ -182,19 +203,20 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
   // ═══════════════════════════════════════════════════════════════════════════
   if (hints.label) {
     const labelNorm = normalizeText(hints.label);
+    const labelLoose = normalizeTextLoose(hints.label);
 
     // Priority 1: labelText exact match (highest)
-    if (normalizeText(node.labelText) === labelNorm) {
+    if (normalizeText(node.labelText) === labelNorm || normalizeTextLoose(node.labelText) === labelLoose) {
       score += WEIGHTS.LABEL_TEXT_EXACT;
       reasons.push('LabelText exact match');
     }
     // Priority 2: ariaLabel exact match
-    else if (normalizeText(node.ariaLabel) === labelNorm) {
+    else if (normalizeText(node.ariaLabel) === labelNorm || normalizeTextLoose(node.ariaLabel) === labelLoose) {
       score += WEIGHTS.LABEL_EXACT_MATCH;
       reasons.push('AriaLabel exact match');
     }
     // Priority 3: text exact match
-    else if (normalizeText(node.text) === labelNorm) {
+    else if (normalizeText(node.text) === labelNorm || normalizeTextLoose(node.text) === labelLoose) {
       score += WEIGHTS.ARIA_LABEL_MATCH;
       reasons.push('Text exact match');
     }

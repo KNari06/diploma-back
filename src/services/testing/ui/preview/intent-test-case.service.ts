@@ -166,7 +166,31 @@ export class IntentTestCaseService {
     if (description !== undefined) updates.description = description;
     if (startUrl !== undefined) updates.start_url = startUrl;
     if (url !== undefined) updates.url = url;
-    if (steps !== undefined) updates.steps_json = this.normalizeSteps(steps);
+    if (steps !== undefined) {
+      updates.steps_json = this.normalizeSteps(steps);
+
+      // V7: Log warning for targeting steps lacking compiled/evidence
+      // This helps identify steps that may be unreliable in background runs
+      const targetingActions = ['click', 'type', 'hover', 'select', 'check', 'uncheck'];
+      const stepsWithoutCompiled = steps.filter(step => 
+        targetingActions.includes(step.type) && (!step.compiled || !step.evidence)
+      );
+
+      if (stepsWithoutCompiled.length > 0) {
+        logger.warn('[INTENT_TEST_CASE] Saving steps without compiled/evidence data', {
+          id,
+          stepsCount: steps.length,
+          missingCount: stepsWithoutCompiled.length,
+          missingSteps: stepsWithoutCompiled.map(s => ({
+            stepId: s.id,
+            type: s.type,
+            description: s.description?.slice(0, 60),
+            hasCompiled: !!s.compiled,
+            hasEvidence: !!s.evidence,
+          })),
+        });
+      }
+    }
     if (flowId !== undefined) updates.flow_id = flowId;
     if (status !== undefined) updates.status = status;
     if (kind !== undefined) updates.kind = kind;

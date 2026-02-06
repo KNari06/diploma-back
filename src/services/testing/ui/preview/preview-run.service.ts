@@ -149,6 +149,13 @@ export class PreviewRunService {
       // but makes cancellation and concurrency behavior deterministic.
       await new Promise<void>((resolve) => setImmediate(resolve));
 
+      // Track URL for evidence shortcut policy (V7)
+      let trackedUrl = session.page.url();
+      logger.debug('[PreviewRun] Starting run with URL tracking', {
+        previewSessionId,
+        initialUrl: trackedUrl,
+      });
+
       for (let i = 0; i < savedSteps.length; i++) {
         // Check cancellation
         const currentRunState = activeRuns.get(previewSessionId);
@@ -227,19 +234,34 @@ export class PreviewRunService {
         }
 
         try {
+          // V7: URL-based evidence policy instead of blanket disableCaching
+          // If URL hasn't changed since last step, allow evidence shortcut
+          const currentUrl = session.page.url();
+          const urlChanged = currentUrl !== trackedUrl;
+          const disableCaching = urlChanged;
+
+          logger.debug('[PreviewRun] Evidence policy check', {
+            previewSessionId,
+            stepIndex: i,
+            stepId: step.id,
+            urlChanged,
+            disableCaching,
+            trackedUrl: trackedUrl.slice(0, 80),
+            currentUrl: currentUrl.slice(0, 80),
+          });
+
           // Execute step via PreviewStepApplyService
-          // V2: Disable evidence caching for batch replay to avoid stale refs after navigations
-          const stepWithCacheDisabled: IntentStep = {
+          const stepWithCachePolicy: IntentStep = {
             ...step,
             options: {
               ...step.options,
-              disableCaching: true, // Prevents evidence shortcut from using stale lastSuccessRef
+              disableCaching, // URL-based: true if URL changed, false if same page
             },
           };
 
           const result = await PreviewStepApplyService.applyStep({
             previewSessionId,
-            stepDraft: stepWithCacheDisabled,
+            stepDraft: stepWithCachePolicy,
             userId,
           });
 
@@ -261,6 +283,9 @@ export class PreviewRunService {
               timestamp: new Date().toISOString(),
             });
             passedSteps++;
+
+            // Update tracked URL after successful step execution
+            trackedUrl = session.page.url();
 
             // ─────────────────────────────────────────────────────────────────────
             // Lookahead wait: check next step readiness before executing it

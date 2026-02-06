@@ -268,6 +268,18 @@ export class ErrorCollectorService {
   }
 
   /**
+   * Get errors that occurred since a given timestamp (for step-scoped correlation)
+   */
+  getErrorsSince(since: number): ErrorSignals {
+    return {
+      consoleErrors: this.consoleErrors.filter(e => e.timestamp >= since),
+      networkErrors: this.networkErrors.filter(e => e.timestamp >= since),
+      uiErrors: this.uiErrors.filter(e => e.timestamp >= since),
+      accessibilityWarnings: this.accessibilityWarnings.filter(e => e.timestamp >= since),
+    };
+  }
+
+  /**
    * Clear all collected errors
    */
   clear(): void {

@@ -503,7 +503,29 @@ export type FailedReason =
   | 'assertion_failed'
   | 'heal_blocked'
   | 'timeout'
+  | 'silent_backend_failure'
   | 'unknown';
+
+/**
+ * Resolution path used to find element at runtime
+ */
+export type ResolutionPath = 
+  | 'compiled'
+  | 'evidence'
+  | 'embeddings'
+  | 'llm_disambiguation'
+  | 'rule_fallback'
+  | 'self_heal';
+
+/**
+ * Root cause classification for failures
+ */
+export type RootCause = 'backend' | 'ui' | 'logic';
+
+/**
+ * Network verdict classification
+ */
+export type NetworkVerdict = 'backend_error' | 'clean' | 'warning';
 
 /**
  * Runtime metadata for step execution
@@ -543,6 +565,39 @@ export interface StepRuntimeMeta {
    * V6: Milliseconds waited during lookahead (if autoWaitApplied is true)
    */
   autoWaitMs?: number;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V7: Resolution path and network correlation
+  // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * Which resolution path was used to find the element
+   */
+  resolutionPath?: ResolutionPath;
+  /**
+   * Root cause classification for step failures (from correlation)
+   */
+  rootCause?: RootCause;
+  /**
+   * Network verdict for this step
+   */
+  networkVerdict?: NetworkVerdict;
+  /**
+   * Network errors that occurred during step execution (as evidence)
+   */
+  networkEvidence?: Array<{
+    method: string;
+    url: string;
+    status?: number;
+    error: string;
+  }>;
+  /**
+   * Error counts during step execution window
+   */
+  stepErrors?: {
+    console: number;
+    network: number;
+    ui: number;
+  };
 }
 
 /**

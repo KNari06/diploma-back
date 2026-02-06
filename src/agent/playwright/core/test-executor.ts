@@ -1,7 +1,7 @@
 import { TestJobData } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
-import { getActionIcon } from '@/websocket/types/types';
+import { getActionIcon, type TestStepCompletedPayload } from '@/websocket/types/types';
 import { BrowserContext, Page } from 'playwright';
 import { IntelligentTestOrchestrator } from '../../core/intelligent-test-orchestrator';
 import { LiteEngine, ModeRouter } from '../../core/lite';
@@ -17,6 +17,74 @@ import { buildAllHintsWithMetadata } from '../setup/hints-builder';
 import { buildIntelligentTestConfig } from '../setup/test-config-builder';
 import { checkTestCancelled } from '../utils/test-cancellation-checker';
 import { createRunKey, TestRunRegistry } from './test-run-registry';
+import { waitForStepReadiness, shouldSkipLookaheadAfter } from '@/services/testing/ui/preview/step-readiness.service';
+import type { IntentStep, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
+
+/**
+ * Parse URL safely (never throws).
+ */
+function safeParseUrl(raw: string): URL | null {
+  try {
+    return new URL(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Best-effort same-origin check for network correlation.
+ * We intentionally bias toward safety (avoid false FAIL on 3rd-party / analytics errors).
+ */
+function isSameOriginUrl(requestUrl: string, baseUrl: string): boolean {
+  const req = safeParseUrl(requestUrl);
+  const base = safeParseUrl(baseUrl);
+  if (!req || !base) return false;
+  return req.protocol === base.protocol && req.host === base.host;
+}
+
+/**
+ * Decide whether we should FAIL the step on critical network errors.
+ *
+ * Why not only description-keywords?
+ * - Words are a weak signal and vary by language.
+ * - We already scope to the step time-window, and we only look at mutating HTTP methods.
+ * - We additionally require same-origin (reduces noise from 3rd-party/analytics).
+ *
+ * Final heuristic (safe + additive):
+ * - FAIL if we see same-origin critical errors AND actionType is likely to trigger mutations.
+ * - For `type`, we default to WARNING unless step text strongly suggests submit/save.
+ */
+function shouldFailOnCriticalNetworkErrors(params: {
+  actionType: string | undefined;
+  stepDescription: string;
+  baseUrl: string;
+  criticalErrors: Array<{ method: string; url: string; status?: number; error: string }>;
+}): { shouldFail: boolean; fatalErrors: Array<{ method: string; url: string; status?: number; error: string }> } {
+  const { actionType, stepDescription, baseUrl, criticalErrors } = params;
+
+  const fatalErrors = criticalErrors.filter((e) => isSameOriginUrl(e.url, baseUrl));
+  if (fatalErrors.length === 0) return { shouldFail: false, fatalErrors: [] };
+
+  const likelyMutatingActionTypes = new Set([
+    'click',
+    'press',
+    'check',
+    'uncheck',
+    'select',
+    'navigate',
+    'wait_for',
+  ]);
+
+  if (actionType && likelyMutatingActionTypes.has(actionType)) {
+    return { shouldFail: true, fatalErrors };
+  }
+
+  // For `type` (and unknown actionTypes), only fail when text strongly indicates a submit/save intent.
+  const desc = stepDescription.toLowerCase();
+  const strongKeywords = ['save', 'submit', 'confirm', 'checkout', 'pay', 'login', 'sign in', 'register', 'create', 'update', 'delete', 'remove'];
+  const looksLikeSubmit = strongKeywords.some((kw) => desc.includes(kw));
+  return { shouldFail: looksLikeSubmit, fatalErrors };
+}
 
 /**
  * Execute Playwright test
@@ -159,6 +227,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Import CommandExecutor
       const { CommandExecutor } = await import('@/agent/execution/command-executor');
 
+      // Import ErrorCollectorService for background monitoring
+      const { ErrorCollectorService } = await import('@/agent/utils/analysis/error-collector.service');
+
       // Create executor with self-healing enabled (for AI fallback without clarification)
       const executor = new CommandExecutor(page, {
         selfHealingEnabled: true,
@@ -167,6 +238,14 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           projectId: testData.projectId,
           userId: testData.userId,
         },
+      });
+
+      // Start error collection for background monitoring
+      const errorCollector = new ErrorCollectorService(page);
+      errorCollector.startCollecting();
+
+      logger.info('[PLAYWRIGHT] Started error collection for background replay', {
+        testId: testData.testId,
       });
 
       // Execute commands step-by-step
@@ -179,7 +258,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         for (const command of testData.commands) {
           currentStepIndex++;
           const action = (command as any).action ?? (command as any).type ?? 'action';
-          const intentMeta = (command as any).intentMeta as undefined | { elementDescription?: string };
+          const intentMeta = (command as any).intentMeta as undefined | { elementDescription?: string; stepId?: string };
 
           // Check cancellation
           await checkTestCancelled(testData.testId);
@@ -205,14 +284,103 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             description: intentMeta?.elementDescription,
           });
 
+          // Capture step start time for error correlation
+          const stepStartedAt = Date.now();
+
           try {
             // Execute command via CommandExecutor
             // This supports compiled plans, self-healing, AI fallback (no clarification in background)
             const stepResult = await executor.executeCommand(command);
 
+            // Get errors that occurred during this step's execution window
+            const stepErrors = errorCollector.getErrorsSince(stepStartedAt);
+
+            // Check for critical network errors (Case C: silent backend failure)
+            const criticalNetworkErrors = stepErrors.networkErrors.filter(e => {
+              // Only count errors on mutating HTTP methods
+              const isMutating = ['POST', 'PUT', 'DELETE', 'PATCH'].includes(e.method);
+              // status === undefined → requestfailed (no HTTP response at all)
+              // status >= 500 → server error
+              const isServerError = typeof e.status === 'number' && e.status >= 500;
+              const isRequestFailed = e.status === undefined;
+              return isMutating && (isServerError || isRequestFailed);
+            });
+
+            const stepDescription = intentMeta?.elementDescription || action;
+            const actionType = (command as any).intentMeta?.actionType as string | undefined;
+            const networkVerdict = shouldFailOnCriticalNetworkErrors({
+              actionType,
+              stepDescription,
+              baseUrl: testData.url,
+              criticalErrors: criticalNetworkErrors.map((e) => ({
+                method: e.method,
+                url: e.url,
+                status: e.status,
+                error: e.error,
+              })),
+            });
+
+            if (networkVerdict.shouldFail && networkVerdict.fatalErrors.length > 0) {
+              // Case C: UI passed but network failed = SILENT BACKEND FAILURE
+              const firstFatal = networkVerdict.fatalErrors[0];
+
+              logger.warn('[PLAYWRIGHT] Silent backend failure detected', {
+                testId: testData.testId,
+                stepIndex: currentStepIndex,
+                stepDescription,
+                actionType,
+                criticalErrors: networkVerdict.fatalErrors,
+              });
+
+              // Collect UI errors before breaking — DOM may show error banners
+              try { await errorCollector.collectUIErrors(); } catch { /* non-fatal */ }
+
+              // Re-fetch step errors after UI collection
+              const updatedStepErrors = errorCollector.getErrorsSince(stepStartedAt);
+
+              // Mark as failed despite UI success
+              allSuccess = false;
+              finalError = `Silent backend failure: ${firstFatal.method} ${firstFatal.url} → ${firstFatal.error}`;
+
+              // Enrich runtimeMeta with network evidence
+              const enrichedMeta: NonNullable<TestStepCompletedPayload['runtimeMeta']> = {
+                stepId: intentMeta?.stepId,
+                ...(stepResult.runtimeMeta || {}),
+                runtimeStatus: 'failed' as const,
+                failedReason: 'silent_backend_failure' as const,
+                failureExplanation: `Step "${stepDescription}" appeared to succeed in UI, but critical network error detected: ${firstFatal.method} ${firstFatal.url} → ${firstFatal.error}. This indicates a backend bug.`,
+                rootCause: 'backend' as const,
+                networkVerdict: 'backend_error' as const,
+                networkEvidence: networkVerdict.fatalErrors,
+                stepErrors: {
+                  console: updatedStepErrors.consoleErrors.length,
+                  network: updatedStepErrors.networkErrors.length,
+                  ui: updatedStepErrors.uiErrors.length,
+                },
+              };
+
+              webSocketService.emitTestStepCompleted(testData.testId, {
+                testId: testData.testId,
+                browser: testData.browser,
+                step: currentStepIndex,
+                stepDescription,
+                success: false,
+                timestamp: new Date().toISOString(),
+                runtimeMeta: enrichedMeta,
+              });
+
+              // Stop on first failure
+              break;
+            }
+
             logger.info('[PLAYWRIGHT] Replay mode step passed', {
               testId: testData.testId,
               stepIndex: currentStepIndex,
+              stepErrors: {
+                console: stepErrors.consoleErrors.length,
+                network: stepErrors.networkErrors.length,
+                ui: stepErrors.uiErrors.length,
+              },
             });
 
             // Emit test:step:completed with success
@@ -220,20 +388,134 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               testId: testData.testId,
               browser: testData.browser,
               step: currentStepIndex,
-              stepDescription: intentMeta?.elementDescription || action,
+              stepDescription,
               success: true,
               timestamp: new Date().toISOString(),
               runtimeMeta: stepResult.runtimeMeta,
             });
+
+            // Collect UI errors after successful step execution
+            try {
+              await errorCollector.collectUIErrors();
+            } catch (uiErrorCollectionError) {
+              // Non-fatal - log and continue
+              logger.debug('[PLAYWRIGHT] Failed to collect UI errors', {
+                testId: testData.testId,
+                stepIndex: currentStepIndex,
+                error: uiErrorCollectionError instanceof Error ? uiErrorCollectionError.message : String(uiErrorCollectionError),
+              });
+            }
+
+            // Auto-waiting (lookahead) for next step's readiness
+            const nextCommand = testData.commands[currentStepIndex]; // currentStepIndex is 1-based, array is 0-based
+            if (nextCommand) {
+              const prevActionType = (command as any).intentMeta?.actionType;
+              const nextIntentMeta = (nextCommand as any).intentMeta;
+              
+              if (prevActionType && nextIntentMeta && !shouldSkipLookaheadAfter(prevActionType)) {
+                try {
+                  const nextStepForLookahead: IntentStep = {
+                    id: nextIntentMeta.stepId || `cmd-${currentStepIndex}`,
+                    type: nextIntentMeta.actionType,
+                    description: nextIntentMeta.elementDescription || '',
+                    compiled: nextIntentMeta.compiled,
+                    evidence: nextIntentMeta.evidence,
+                    options: {
+                      disableLookaheadWait: nextIntentMeta.disableLookaheadWait,
+                    },
+                  };
+
+                  const lookahead = await waitForStepReadiness(page, nextStepForLookahead, {
+                    maxWaitMs: 10000,
+                    settleMs: 3000,
+                    autoWaitThresholdMs: 2000,
+                  });
+
+                  if (lookahead.autoWaitApplied) {
+                    logger.info('[PLAYWRIGHT] Lookahead auto-wait applied', {
+                      testId: testData.testId,
+                      currentStep: currentStepIndex,
+                      nextStep: currentStepIndex + 1,
+                      waitedMs: lookahead.waited,
+                    });
+                  } else if (lookahead.skipReason) {
+                    logger.debug('[PLAYWRIGHT] Lookahead skipped', {
+                      testId: testData.testId,
+                      nextStep: currentStepIndex + 1,
+                      reason: lookahead.skipReason,
+                    });
+                  }
+                } catch (lookaheadError) {
+                  // Lookahead failure is non-fatal, log and continue
+                  logger.warn('[PLAYWRIGHT] Lookahead wait failed, continuing', {
+                    testId: testData.testId,
+                    nextStep: currentStepIndex + 1,
+                    error: lookaheadError instanceof Error ? lookaheadError.message : String(lookaheadError),
+                  });
+                }
+              }
+            }
           } catch (stepError) {
             allSuccess = false;
             finalError = stepError instanceof Error ? stepError.message : 'Unexpected error';
+
+            // Collect UI errors at the moment of failure (DOM may show error banners)
+            try { await errorCollector.collectUIErrors(); } catch { /* non-fatal */ }
+
+            // Get errors that occurred during this step's execution window
+            const stepErrors = errorCollector.getErrorsSince(stepStartedAt);
+
+            // Get detailed runtimeMeta from executor (Case A or B)
+            const stepId = intentMeta?.stepId;
+            const detailedMeta = stepId ? executor.getStepRuntimeMetaById(stepId) : undefined;
+
+            // Check if step failure was accompanied by network errors (Case A: backend)
+            // status === undefined means requestfailed (no HTTP response at all)
+            // status >= 500 means server error
+            const hasNetworkErrors = stepErrors.networkErrors.some(e => 
+              (typeof e.status === 'number' && e.status >= 500) || e.status === undefined
+            );
+
+            const baseMeta: StepRuntimeMeta = detailedMeta || {
+              runtimeStatus: 'failed' as const,
+              failedReason: 'unknown' as const,
+              failureExplanation: finalError,
+              source: 'resolver' as const,
+              confidenceTier: 'low' as const,
+            };
+
+            const finalMeta: NonNullable<TestStepCompletedPayload['runtimeMeta']> = {
+              stepId,
+              ...baseMeta,
+            };
+
+            // Enrich with rootCause from correlation (Case A vs Case B)
+            if (hasNetworkErrors) {
+              // Case A: UI failed + network failed = backend bug
+              finalMeta.rootCause = 'backend';
+              finalMeta.networkEvidence = stepErrors.networkErrors
+                .filter(e => (e.status && e.status >= 500) || !e.status)
+                .map(e => ({ method: e.method, url: e.url, status: e.status, error: e.error }));
+            } else if (detailedMeta) {
+              // Case B: UI failed + network OK = UI bug (self-heal OK)
+              finalMeta.rootCause = 'ui';
+            }
+
+            // Add step-scoped error counts
+            finalMeta.stepErrors = {
+              console: stepErrors.consoleErrors.length,
+              network: stepErrors.networkErrors.length,
+              ui: stepErrors.uiErrors.length,
+            };
 
             logger.error('[PLAYWRIGHT] Replay mode step failed', {
               testId: testData.testId,
               stepIndex: currentStepIndex,
               command: action,
               error: finalError,
+              rootCause: finalMeta.rootCause,
+              failedReason: finalMeta.failedReason,
+              networkErrors: stepErrors.networkErrors.length,
             });
 
             // Emit test:step:completed with failure
@@ -244,11 +526,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               stepDescription: intentMeta?.elementDescription || action,
               success: false,
               timestamp: new Date().toISOString(),
-              runtimeMeta: {
-                stepId: (command as any).intentMeta?.stepId,
-                runtimeStatus: 'failed',
-                failedReason: 'unknown',
-              },
+              runtimeMeta: finalMeta,
             });
 
             // Stop on first failure
@@ -256,15 +534,36 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           }
         }
       } finally {
+        // Stop error collection
+        errorCollector.stopCollecting();
+        logger.info('[PLAYWRIGHT] Stopped error collection', {
+          testId: testData.testId,
+          summary: errorCollector.getSummary(),
+        });
+
         // Cleanup executor
         executor.dispose();
       }
 
       // Collect artifacts and return
       const finalScreenshot = await page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => null);
-      const logs: string[] = [];
-      const networkLogs: any[] = [];
-      const errors: any[] = [];
+      
+      // Get collected errors from ErrorCollectorService
+      const collectedErrors = errorCollector.getErrors();
+      const logs = collectedErrors.consoleErrors.map(e => `[${e.timestamp}] ${e.message}`);
+      const networkLogs = collectedErrors.networkErrors;
+      const errors: any[] = [
+        ...collectedErrors.consoleErrors.map(e => ({ type: 'console', message: e.message, timestamp: e.timestamp, source: e.source, line: e.line })),
+        ...collectedErrors.networkErrors.map(e => ({ type: 'network', message: `${e.method} ${e.url}: ${e.error}`, timestamp: e.timestamp, url: e.url, method: e.method, status: e.status })),
+        ...collectedErrors.uiErrors.map(e => ({ type: 'ui', message: e.text, timestamp: e.timestamp, selector: e.selector })),
+      ];
+
+      logger.info('[PLAYWRIGHT] Collected errors for AI analysis', {
+        testId: testData.testId,
+        consoleErrors: collectedErrors.consoleErrors.length,
+        networkErrors: collectedErrors.networkErrors.length,
+        uiErrors: collectedErrors.uiErrors.length,
+      });
 
       // Cleanup
       // Stop video streaming (best-effort) before closing context/page

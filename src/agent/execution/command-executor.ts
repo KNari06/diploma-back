@@ -908,6 +908,7 @@ export class CommandExecutor {
                   confidenceTier: 'high',
                   failedReason: 'assertion_failed',
                   failureExplanation: aiCheckResult.explanation,
+                  resolutionPath: 'embeddings', // ai_check uses embeddings-based resolution
                 });
               }
               throw new Error(aiCheckResult.explanation);
@@ -920,6 +921,7 @@ export class CommandExecutor {
                 source: 'resolver',
                 confidenceTier: aiCheckResult.confidence && aiCheckResult.confidence >= 0.85 ? 'high' :
                                 aiCheckResult.confidence && aiCheckResult.confidence >= 0.6 ? 'medium' : 'low',
+                resolutionPath: 'embeddings',
               });
             }
           } catch (error) {
@@ -931,6 +933,7 @@ export class CommandExecutor {
                 confidenceTier: 'low',
                 failedReason: 'assertion_failed',
                 failureExplanation: error instanceof Error ? error.message : String(error),
+                resolutionPath: 'embeddings',
               });
             }
             throw error;
@@ -1554,6 +1557,8 @@ export class CommandExecutor {
             confidenceTier: 'medium',
             executionMs: Date.now() - startTime,
             usedLocatorStrategy: 'smart',
+            // getSmartLocator() does NOT use embeddings; it uses deterministic scoring and (optionally) LLM disambiguation.
+            resolutionPath: smartResult.usedAI ? 'llm_disambiguation' : 'rule_fallback',
           };
           this.stepRuntimeMeta.set(stepId, runtimeMeta);
 
@@ -1561,6 +1566,7 @@ export class CommandExecutor {
             stepId,
             wasSmartSelected: smartResult.wasSmartSelected,
             totalMatches: smartResult.totalMatches,
+            resolutionPath: runtimeMeta.resolutionPath,
             iframe: !!iframeSelector,
           });
 
@@ -1617,6 +1623,7 @@ export class CommandExecutor {
               executionMs: Date.now() - startTime,
               usedLocatorStrategy: 'healed',
               healConfidence,
+              resolutionPath: 'self_heal',
               // GUARD RAILS: Flag for review even when heal succeeds
               needsReview,
               flaky,
@@ -1627,6 +1634,7 @@ export class CommandExecutor {
               stepId,
               newSelector: healingResult.newSelector,
               confidence: healConfidence,
+              resolutionPath: 'self_heal',
               needsReview,
               flaky,
             });
@@ -1669,6 +1677,7 @@ export class CommandExecutor {
               failedReason: 'heal_blocked',
               failureExplanation: `Self-healing was blocked due to low confidence (${Math.round(healConfidence * 100)}% < ${Math.round(this.selfHealingConfidenceThreshold * 100)}%). Cannot auto-apply potentially incorrect selector.`,
               healConfidence,
+              resolutionPath: 'self_heal',
               needsReview: true,
               flaky: true,
             };
@@ -1692,6 +1701,7 @@ export class CommandExecutor {
       failedReason: 'element_not_found',
       failureExplanation: `Element not found after trying all resolution methods (compiled → smart locator → self-healing). ${intentMeta?.intentDescription || command.description || 'Element'} may not exist on current page or selector may be invalid.`,
       needsReview: true,
+      resolutionPath: 'rule_fallback', // Failed all methods, no resolution path succeeded
     };
     this.stepRuntimeMeta.set(stepId, runtimeMeta);
 

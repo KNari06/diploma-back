@@ -222,7 +222,15 @@ export interface TestStepCompletedPayload {
     /** Confidence tier of the resolution */
     confidenceTier?: 'high' | 'medium' | 'low';
     /** Reason for failure (if status is failed) */
-    failedReason?: 'element_not_found' | 'assertion_failed' | 'heal_blocked' | 'timeout' | 'unknown';
+    failedReason?:
+      | 'element_not_found'
+      | 'assertion_failed'
+      | 'heal_blocked'
+      | 'timeout'
+      | 'silent_backend_failure'
+      | 'unknown';
+    /** Human-readable explanation for failure (for CI reports) */
+    failureExplanation?: string;
     /** Execution time in milliseconds */
     executionMs?: number;
     /** Which locator strategy was used */
@@ -237,6 +245,43 @@ export interface TestStepCompletedPayload {
     needsReview?: boolean;
     /** True if step is flagged as flaky */
     flaky?: boolean;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // V6: Lookahead auto-wait (inter-step stability)
+    // ─────────────────────────────────────────────────────────────────────────
+    /** True if lookahead auto-wait was applied (waited > threshold) */
+    autoWaitApplied?: boolean;
+    /** Milliseconds waited during lookahead (if autoWaitApplied is true) */
+    autoWaitMs?: number;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // V7: Resolution path + network correlation (background replay + preview run)
+    // ─────────────────────────────────────────────────────────────────────────
+    /** Which runtime resolution path was used */
+    resolutionPath?:
+      | 'compiled'
+      | 'evidence'
+      | 'embeddings'
+      | 'llm_disambiguation'
+      | 'rule_fallback'
+      | 'self_heal';
+    /** Root cause classification from correlated signals */
+    rootCause?: 'backend' | 'ui' | 'logic';
+    /** Network verdict for this step */
+    networkVerdict?: 'backend_error' | 'clean' | 'warning';
+    /** Network errors correlated to this step execution window */
+    networkEvidence?: Array<{
+      method: string;
+      url: string;
+      status?: number;
+      error: string;
+    }>;
+    /** Error counts in the step execution window */
+    stepErrors?: {
+      console: number;
+      network: number;
+      ui: number;
+    };
   };
 }
 
