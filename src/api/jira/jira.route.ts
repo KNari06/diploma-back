@@ -288,7 +288,7 @@ router.get('/projects', requireAuth, asyncHandler(getProjects));
  * /api/v1/jira/boards:
  *   get:
  *     summary: Получить список досок Jira
- *     description: Jira Agile API GET /rest/agile/1.0/board. Ответ { success: true, data: [ { id, name, type } ] }
+ *     description: "Jira Agile API GET /rest/agile/1.0/board. Ответ: { success: true, data: [ { id, name, type } ] }"
  *     tags: [Jira]
  *     security:
  *       - bearerAuth: []
@@ -539,7 +539,7 @@ router.get('/issues', requireAuth, asyncHandler(getIssues));
  * /api/v1/jira/issues:
  *   post:
  *     summary: Создать задачу в Jira (из Bugs-доски)
- *     description: Body: projectKey, summary, description?, issueType?, priority?
+ *     description: "Body: projectKey, summary, description?, issueType?, priority?"
  *     tags: [Jira]
  *     security:
  *       - bearerAuth: []
@@ -642,7 +642,7 @@ router.put('/issues', requireAuth, asyncHandler(updateIssue));
  * /api/v1/jira/issues:
  *   patch:
  *     summary: Обновить статус задачи в Jira
- *     description: Body: issueKey, status
+ *     description: "Body: issueKey, status"
  *     tags: [Jira]
  *     security:
  *       - bearerAuth: []
