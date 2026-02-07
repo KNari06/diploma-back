@@ -3,6 +3,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { GitWebhookService } from '@/services/integrations/git-webhook.service';
+import { NotificationService } from '@/services/notifications/notification.service';
 
 export class GitWebhookJobHandler {
   static async process(
@@ -142,10 +143,54 @@ export class GitWebhookJobHandler {
 
       await GitWebhookService.updateDeliveryStatus(provider, deliveryId, { status: 'processed' });
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      
       await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
         status: 'failed',
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage,
       });
+
+      // Check if it's an insufficient credits error
+      if (errorMessage.includes('Insufficient credits')) {
+        logger.warn('[GIT_WEBHOOK_JOB] Insufficient credits for git-triggered run', {
+          userId: project.user_id,
+          provider,
+          deliveryId,
+          suiteId: integration.suite_id,
+          error: errorMessage,
+        });
+
+        // Create in-app notification
+        try {
+          await NotificationService.createNotification({
+            userId: project.user_id,
+            type: 'personal',
+            category: 'billing',
+            title: 'Insufficient credits for CI run',
+            message: `Your ${provider} webhook triggered a test run but failed due to insufficient credits. Please add credits to continue.`,
+            metadata: {
+              provider,
+              deliveryId,
+              suiteId: integration.suite_id,
+              projectId: integration.project_id,
+              branch: decision.branch,
+              error: errorMessage,
+              dedupeKey: `git-webhook:${deliveryId}:insufficient`,
+            },
+          });
+
+          logger.info('[GIT_WEBHOOK_JOB] Created insufficient credits notification', {
+            userId: project.user_id,
+            deliveryId,
+          });
+        } catch (notifError) {
+          logger.error('[GIT_WEBHOOK_JOB] Failed to create insufficient credits notification', {
+            error: notifError instanceof Error ? notifError.message : String(notifError),
+            userId: project.user_id,
+          });
+        }
+      }
+      
       throw error;
     }
   }

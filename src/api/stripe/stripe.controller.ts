@@ -4,6 +4,7 @@ import { UserCreditsService } from '@/services/core/user-credits.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
+import { NotificationService } from '@/services/notifications/notification.service';
 
 // Initialize Stripe
 const stripe = env.STRIPE_SECRET_KEY
@@ -452,6 +453,55 @@ async function handleSubscriptionEvent(event: Stripe.Event): Promise<void> {
     status: subscription.status,
     eventType: event.type,
   });
+
+  // Create in-app notifications for subscription changes
+  try {
+    if (event.type === 'customer.subscription.deleted' || 
+        (event.type === 'customer.subscription.updated' && !isActive)) {
+      // Subscription cancelled or became inactive
+      const endsOn = currentPeriodEnd ? currentPeriodEnd.slice(0, 10) : null; // YYYY-MM-DD
+      await NotificationService.createNotification({
+        userId: user.id,
+        type: 'personal',
+        category: 'billing',
+        title: 'Subscription cancelled',
+        message: subscription.cancel_at_period_end
+          ? (endsOn ? `Your subscription will end on ${endsOn}` : 'Your subscription will end soon')
+          : 'Your subscription has been cancelled',
+        metadata: {
+          subscriptionId: subscription.id,
+          status: subscription.status,
+          planCode,
+          cancelAtPeriodEnd: subscription.cancel_at_period_end,
+          currentPeriodEnd: currentPeriodEnd,
+          dedupeKey: `subscription:${subscription.id}:${event.id}:cancelled`,
+        },
+      });
+    } else if (event.type === 'customer.subscription.updated' && isActive) {
+      // Subscription updated (plan change, reactivation, etc.)
+      await NotificationService.createNotification({
+        userId: user.id,
+        type: 'personal',
+        category: 'billing',
+        title: 'Subscription updated',
+        message: `Your subscription has been updated to ${subscriptionPlanLabel}`,
+        metadata: {
+          subscriptionId: subscription.id,
+          status: subscription.status,
+          planCode,
+          creditsPerPeriod,
+          dedupeKey: `subscription:${subscription.id}:${event.id}:updated`,
+        },
+      });
+    }
+  } catch (notifError) {
+    logger.error('[STRIPE_WEBHOOK] Failed to create subscription notification', {
+      error: notifError instanceof Error ? notifError.message : String(notifError),
+      userId: user.id,
+      eventType: event.type,
+    });
+    // Don't throw - notification failure shouldn't break webhook processing
+  }
 }
 
 async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void> {
@@ -710,6 +760,39 @@ async function handleInvoicePaymentFailed(event: Stripe.Event): Promise<void> {
         updated_at: new Date().toISOString(),
       })
       .eq('stripe_subscription_id', subscriptionId);
+  }
+
+  // Create in-app notification for payment failure
+  try {
+    const amount = invoice.amount_due ? (invoice.amount_due / 100).toFixed(2) : '0.00';
+    const currency = (invoice.currency || 'usd').toUpperCase();
+
+    await NotificationService.createNotification({
+      userId: user.id,
+      type: 'personal',
+      category: 'billing',
+      title: 'Payment failed',
+      message: `Your payment of ${currency} ${amount} failed. Please update your payment method.`,
+      metadata: {
+        invoiceId: invoice.id,
+        amount: invoice.amount_due || 0,
+        currency: invoice.currency || 'usd',
+        subscriptionId,
+        dedupeKey: `invoice:${invoice.id}:failed`,
+      },
+    });
+
+    logger.info('[STRIPE_WEBHOOK] Created payment failed notification', {
+      userId: user.id,
+      invoiceId: invoice.id,
+    });
+  } catch (notifError) {
+    logger.error('[STRIPE_WEBHOOK] Failed to create payment failed notification', {
+      error: notifError instanceof Error ? notifError.message : String(notifError),
+      userId: user.id,
+      invoiceId: invoice.id,
+    });
+    // Don't throw - notification failure shouldn't break webhook processing
   }
 }
 

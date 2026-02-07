@@ -3,6 +3,7 @@ import { TestResultsFormatterService } from '@/services/testing/results/test-res
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
+import { NotificationService } from '@/services/notifications/notification.service';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -51,10 +52,10 @@ export class TestCompletionHandlerService {
         // Continue to update regression runs even if no chat sessions
       }
 
-      // ✅ FIX #8: Get test data with proper field selection
+      // ✅ FIX #8: Get test data with proper field selection (including user_id for notifications)
       const { data: test, error: testError } = await supabaseAdmin
         .from('tests')
-        .select('id, url, status, browsers, created_at, completed_at') // ✅ Select only needed fields
+        .select('id, url, status, browsers, user_id, project_id, created_at, completed_at')
         .eq('id', testId)
         .single();
 
@@ -132,6 +133,9 @@ export class TestCompletionHandlerService {
             // Continue with other sessions
           }
         }
+      } else {
+        // No chat sessions = background/CI run → create in-app notification
+        await this.createBackgroundTestNotification(test, results || []);
       }
 
       // Update regression runs associated with this test
@@ -140,6 +144,90 @@ export class TestCompletionHandlerService {
       await this.updateRegressionRuns(testId);
     } catch (error) {
       logger.error('[TEST_COMPLETION] Unexpected error', { error, testId });
+    }
+  }
+
+  /**
+   * Create in-app notification for background test completion
+   * Only called when test has no linked chat sessions (background/CI run)
+   */
+  private static async createBackgroundTestNotification(
+    test: any,
+    results: any[]
+  ): Promise<void> {
+    try {
+      if (!test.user_id) {
+        logger.debug('[TEST_COMPLETION] No user_id, skipping notification', {
+          testId: test.id,
+        });
+        return;
+      }
+
+      // Count errors across all results
+      const errorsCount = results.reduce((sum, r) => {
+        return sum + (Array.isArray(r.errors) ? r.errors.length : 0);
+      }, 0);
+
+      // Count failed browsers
+      const failedBrowsers = results.filter(
+        (r) => r.status === 'failed' || r.status === 'timeout'
+      ).length;
+
+      // Determine notification title and message based on status
+      let title = '';
+      let message = '';
+      const status = test.status;
+
+      if (status === 'completed') {
+        if (errorsCount > 0 || failedBrowsers > 0) {
+          title = 'Background test completed with issues';
+          message = `Test completed with ${errorsCount} error(s) across ${failedBrowsers} browser(s)`;
+        } else {
+          title = 'Background test completed successfully';
+          message = `Test completed successfully across ${results.length} browser(s)`;
+        }
+      } else if (status === 'failed') {
+        title = 'Background test failed';
+        message = `Test failed with ${errorsCount} error(s)`;
+      } else if (status === 'cancelled') {
+        title = 'Background test cancelled';
+        message = 'Test was cancelled before completion';
+      } else {
+        // Unknown status, skip notification
+        return;
+      }
+
+      // Create notification
+      await NotificationService.createNotification({
+        userId: test.user_id,
+        type: 'personal',
+        category: 'test',
+        title,
+        message,
+        metadata: {
+          testId: test.id,
+          status: test.status,
+          url: test.url,
+          browsers: test.browsers,
+          errorsCount,
+          failedBrowsers,
+          totalBrowsers: results.length,
+          completedAt: test.completed_at,
+          dedupeKey: `test:${test.id}:${status}`,
+        },
+      });
+
+      logger.info('[TEST_COMPLETION] Created background test notification', {
+        testId: test.id,
+        userId: test.user_id,
+        status: test.status,
+      });
+    } catch (error) {
+      logger.error('[TEST_COMPLETION] Failed to create background test notification', {
+        error: error instanceof Error ? error.message : String(error),
+        testId: test.id,
+      });
+      // Don't throw - notification failure shouldn't break test completion
     }
   }
 
@@ -222,7 +310,7 @@ export class TestCompletionHandlerService {
       // Either directly (test_id) or in a suite (test_ids array)
       const { data: runs, error: runsError } = await supabaseAdmin
         .from('regression_runs')
-        .select('id, suite_id, saved_test_case_id, test_id, test_ids, status')
+        .select('id, suite_id, saved_test_case_id, test_id, test_ids, status, user_id, trigger')
         .or(`test_id.eq.${testId},test_ids.cs.["${testId}"]`)
         .in('status', ['running']); // Only update runs that are still in progress
 
@@ -255,6 +343,80 @@ export class TestCompletionHandlerService {
         error: error instanceof Error ? error.message : String(error),
         testId,
       });
+    }
+  }
+
+  /**
+   * Create in-app notification for scheduled regression run completion
+   * Only called for runs with trigger='scheduled'
+   */
+  private static async createScheduledRegressionNotification(
+    run: any,
+    finalStatus: 'completed' | 'failed' | 'cancelled',
+    summary: any
+  ): Promise<void> {
+    try {
+      // Only create notifications for scheduled runs
+      if (run.trigger !== 'scheduled') {
+        return;
+      }
+
+      if (!run.user_id) {
+        logger.debug('[TEST_COMPLETION] No user_id for regression run, skipping notification', {
+          runId: run.id,
+        });
+        return;
+      }
+
+      // Determine notification title and message
+      let title = '';
+      let message = '';
+
+      if (finalStatus === 'completed') {
+        const failedCount = summary.failed || 0;
+        if (failedCount > 0) {
+          title = 'Scheduled regression completed with failures';
+          message = `Regression run completed: ${summary.passed || 0} passed, ${failedCount} failed`;
+        } else {
+          title = 'Scheduled regression completed successfully';
+          message = `All ${summary.total || 0} test(s) passed successfully`;
+        }
+      } else if (finalStatus === 'failed') {
+        title = 'Scheduled regression failed';
+        message = `Regression run failed: ${summary.failed || 0} test(s) failed`;
+      } else if (finalStatus === 'cancelled') {
+        title = 'Scheduled regression cancelled';
+        message = 'Regression run was cancelled before completion';
+      }
+
+      // Create notification
+      await NotificationService.createNotification({
+        userId: run.user_id,
+        type: 'personal',
+        category: 'test',
+        title,
+        message,
+        metadata: {
+          runId: run.id,
+          status: finalStatus,
+          summary,
+          trigger: run.trigger,
+          suiteId: run.suite_id,
+          dedupeKey: `regression:${run.id}:${finalStatus}`,
+        },
+      });
+
+      logger.info('[TEST_COMPLETION] Created scheduled regression notification', {
+        runId: run.id,
+        userId: run.user_id,
+        status: finalStatus,
+      });
+    } catch (error) {
+      logger.error('[TEST_COMPLETION] Failed to create scheduled regression notification', {
+        error: error instanceof Error ? error.message : String(error),
+        runId: run.id,
+      });
+      // Don't throw - notification failure shouldn't break run completion
     }
   }
 
@@ -332,6 +494,9 @@ export class TestCompletionHandlerService {
             status: finalStatus,
             summary,
           });
+          
+          // Create notification for scheduled runs
+          await this.createScheduledRegressionNotification(run, finalStatus, summary);
         }
 
         return;
@@ -434,6 +599,9 @@ export class TestCompletionHandlerService {
           status: finalStatus,
           summary,
         });
+        
+        // Create notification for scheduled runs
+        await this.createScheduledRegressionNotification(run, finalStatus, summary);
       }
     } catch (error) {
       logger.error('[TEST_COMPLETION] Error recomputing run status', {

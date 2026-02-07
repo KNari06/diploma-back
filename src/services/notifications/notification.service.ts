@@ -13,6 +13,7 @@ import { logger } from '@/utils/core/logger';
 export class NotificationService {
   /**
    * Get user notifications with filters
+   * Single query with proper pagination
    */
   static async getUserNotifications(
     userId: string,
@@ -31,83 +32,58 @@ export class NotificationService {
       const validLimit = Math.min(Math.max(1, limit), 100);
       const validOffset = Math.max(0, offset);
 
-      // Build query for personal notifications
-      let personalQuery = supabaseAdmin
+      // Build single query with OR condition for visibility
+      // User can see: (1) their personal notifications OR (2) general/system notifications
+      let query = supabaseAdmin
         .from('notifications')
-        .select('*', { count: 'exact' })
-        .eq('user_id', userId)
-        .eq('type', 'personal')
-        .order('created_at', { ascending: false });
+        .select('*', { count: 'exact' });
 
-      // Build query for general/system notifications
-      let generalQuery = supabaseAdmin
-        .from('notifications')
-        .select('*', { count: 'exact' })
-        .is('user_id', null)
-        .in('type', ['general', 'system'])
-        .order('created_at', { ascending: false });
+      // Apply visibility filter based on type
+      if (type === 'personal') {
+        // Only personal notifications
+        query = query.eq('user_id', userId).eq('type', 'personal');
+      } else if (type === 'general') {
+        // Only general notifications
+        query = query.is('user_id', null).eq('type', 'general');
+      } else if (type === 'system') {
+        // Only system notifications
+        query = query.is('user_id', null).eq('type', 'system');
+      } else {
+        // type === 'all': personal OR general/system
+        // Use .or() with grouped conditions
+        query = query.or(
+          `and(user_id.eq.${userId},type.eq.personal),and(user_id.is.null,type.in.(general,system))`
+        );
+      }
 
-      // Apply filters
+      // Apply additional filters
       if (category) {
-        personalQuery = personalQuery.eq('category', category);
-        generalQuery = generalQuery.eq('category', category);
+        query = query.eq('category', category);
       }
 
       if (isRead !== undefined) {
-        personalQuery = personalQuery.eq('is_read', isRead);
-        generalQuery = generalQuery.eq('is_read', isRead);
+        query = query.eq('is_read', isRead);
       }
 
-      // Execute queries based on type filter
-      let personalData: any[] = [];
-      let personalCount = 0;
-      let generalData: any[] = [];
-      let generalCount = 0;
+      // Apply ordering and pagination
+      query = query
+        .order('created_at', { ascending: false })
+        .range(validOffset, validOffset + validLimit - 1);
 
-      if (type === 'all' || type === 'personal') {
-        const { data, error, count } = await personalQuery
-          .range(validOffset, validOffset + validLimit - 1);
+      // Execute query
+      const { data, error, count } = await query;
 
-        if (error) {
-          logger.error('[NOTIFICATIONS] Error fetching personal notifications', {
-            error: error.message,
-            userId,
-          });
-          throw error;
-        }
-
-        personalData = data || [];
-        personalCount = count || 0;
+      if (error) {
+        logger.error('[NOTIFICATIONS] Error fetching notifications', {
+          error: error.message,
+          userId,
+          filters,
+        });
+        throw error;
       }
-
-      if (type === 'all' || type === 'general' || type === 'system') {
-        const { data, error, count } = await generalQuery
-          .range(validOffset, validOffset + validLimit - 1);
-
-        if (error) {
-          logger.error('[NOTIFICATIONS] Error fetching general notifications', {
-            error: error.message,
-            userId,
-          });
-          throw error;
-        }
-
-        generalData = data || [];
-        generalCount = count || 0;
-      }
-
-      // Combine and sort by created_at
-      const allNotifications = [...personalData, ...generalData].sort(
-        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-      );
-
-      // Apply limit after combining (for 'all' type)
-      const limitedNotifications = type === 'all'
-        ? allNotifications.slice(0, validLimit)
-        : allNotifications;
 
       // Transform to Notification interface
-      const notifications: Notification[] = limitedNotifications.map((n) => ({
+      const notifications: Notification[] = (data || []).map((n) => ({
         id: n.id,
         userId: n.user_id,
         type: n.type,
@@ -123,11 +99,7 @@ export class NotificationService {
         updatedAt: n.updated_at,
       }));
 
-      const total = type === 'all'
-        ? personalCount + generalCount
-        : type === 'personal'
-        ? personalCount
-        : generalCount;
+      const total = count || 0;
 
       logger.debug('[NOTIFICATIONS] Fetched notifications', {
         userId,

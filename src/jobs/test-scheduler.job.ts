@@ -11,6 +11,7 @@
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import { logger } from '@/utils/core/logger';
+import { NotificationService } from '@/services/notifications/notification.service';
 
 /**
  * Test Scheduler Job Handler
@@ -126,36 +127,84 @@ export class TestSchedulerJobHandler {
   }): Promise<void> {
     const { targetType, targetId, userId, parameters } = schedule;
 
-    switch (targetType) {
-      case 'module':
-        await RegressionRunService.runModule({
-          moduleId: targetId,
-          userId,
-          trigger: 'scheduled',
-          parameters,
-        });
-        break;
+    try {
+      switch (targetType) {
+        case 'module':
+          await RegressionRunService.runModule({
+            moduleId: targetId,
+            userId,
+            trigger: 'scheduled',
+            parameters,
+          });
+          break;
 
-      case 'suite':
-        await RegressionRunService.runSuite({
-          suiteId: targetId,
-          userId,
-          trigger: 'scheduled',
-          parameters,
-        });
-        break;
+        case 'suite':
+          await RegressionRunService.runSuite({
+            suiteId: targetId,
+            userId,
+            trigger: 'scheduled',
+            parameters,
+          });
+          break;
 
-      case 'plan':
-        await RegressionRunService.runPlan({
-          planId: targetId,
-          userId,
-          trigger: 'scheduled',
-          parameters,
-        });
-        break;
+        case 'plan':
+          await RegressionRunService.runPlan({
+            planId: targetId,
+            userId,
+            trigger: 'scheduled',
+            parameters,
+          });
+          break;
 
-      default:
-        logger.warn('[TEST_SCHEDULER] Unknown target type', { targetType });
+        default:
+          logger.warn('[TEST_SCHEDULER] Unknown target type', { targetType });
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      
+      // Check if it's an insufficient credits error
+      if (errorMessage.includes('Insufficient credits')) {
+        logger.warn('[TEST_SCHEDULER] Insufficient credits for scheduled run', {
+          userId,
+          targetType,
+          targetId,
+          error: errorMessage,
+        });
+
+        // Create in-app notification
+        try {
+          await NotificationService.createNotification({
+            userId,
+            type: 'personal',
+            category: 'billing',
+            title: 'Insufficient credits for scheduled run',
+            message: `Your scheduled ${targetType} could not run due to insufficient credits. Please add credits to continue.`,
+            metadata: {
+              scheduleId: schedule.scheduleId,
+              targetType,
+              targetId,
+              projectId: schedule.projectId,
+              error: errorMessage,
+              // claimDueSchedule() already moves next_run_at forward, so this fires at most once per schedule execution.
+              // Use a stable key to avoid duplicates from retries/log replays.
+              dedupeKey: `schedule:${schedule.scheduleId}:insufficient`,
+            },
+          });
+
+          logger.info('[TEST_SCHEDULER] Created insufficient credits notification', {
+            userId,
+            scheduleId: schedule.scheduleId,
+          });
+        } catch (notifError) {
+          logger.error('[TEST_SCHEDULER] Failed to create insufficient credits notification', {
+            error: notifError instanceof Error ? notifError.message : String(notifError),
+            userId,
+          });
+        }
+      }
+      
+      // Re-throw to let the caller handle it
+      throw error;
     }
   }
 

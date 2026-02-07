@@ -12,6 +12,8 @@ import {
 } from '@/websocket/types/types';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { Job } from 'bullmq';
+import { NotificationService } from '@/services/notifications/notification.service';
+import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 
 // Types for better type safety
 interface BugSeverity {
@@ -105,6 +107,9 @@ export class AIAnalysisJobHandler {
       };
       webSocketService.emitAIAnalysisCompleted(testId, analysisCompletedPayload);
 
+      // Create in-app notifications for background tests
+      await this.createBackgroundAINotifications(testId, testResultId, aiSummary, testResult);
+
       // Send notifications if critical issues found
       await this.handleCriticalIssues(testId, aiSummary);
 
@@ -156,6 +161,104 @@ export class AIAnalysisJobHandler {
         location: bug.location || bug.selector || undefined,
       };
     });
+  }
+
+  /**
+   * Create in-app notifications for background AI analysis
+   * Only called when test has no linked chat sessions (background/CI run)
+   */
+  private static async createBackgroundAINotifications(
+    testId: string,
+    testResultId: string,
+    aiSummary: any,
+    testResult: any
+  ): Promise<void> {
+    try {
+      // Check if test has linked chat sessions
+      const chatSessions = await TestChatMappingService.getChatSessionsForTest(testId);
+      
+      if (chatSessions && chatSessions.length > 0) {
+        // Test is linked to chat = live run, don't create in-app notification
+        logger.debug('[AI-ANALYSIS] Test has chat sessions, skipping in-app notification', {
+          testId,
+          chatSessionsCount: chatSessions.length,
+        });
+        return;
+      }
+
+      // Get user_id from test result
+      const userId = testResult?.tests?.user_id;
+      if (!userId) {
+        logger.debug('[AI-ANALYSIS] No user_id, skipping notification', {
+          testId,
+          testResultId,
+        });
+        return;
+      }
+
+      const bugs = aiSummary?.bugs || [];
+      const criticalBugs = bugs.filter((b: any) => b.severity === 'critical');
+      const highBugs = bugs.filter((b: any) => b.severity === 'high');
+      const rawConfidence = Number(aiSummary?.confidence);
+      const confidence = Number.isFinite(rawConfidence) ? rawConfidence : 0;
+      // Some models return 0..1, others 0..100
+      const confidencePct = confidence <= 1 ? Math.round(confidence * 100) : Math.round(confidence);
+
+      // Create notification for AI report ready
+      await NotificationService.createNotification({
+        userId,
+        type: 'personal',
+        category: 'system',
+        title: 'AI analysis completed',
+        message: `Analysis found ${bugs.length} issue(s) with ${confidencePct}% confidence`,
+        metadata: {
+          testId,
+          resultId: testResultId,
+          bugsCount: bugs.length,
+          criticalCount: criticalBugs.length,
+          highCount: highBugs.length,
+          confidence: confidencePct,
+          rawConfidence: aiSummary?.confidence,
+          dedupeKey: `ai:${testResultId}:completed`,
+        },
+      });
+
+      // Create separate notification for critical bugs if found
+      if (criticalBugs.length > 0) {
+        const topIssues = criticalBugs.slice(0, 3).map((b: any) => 
+          b.message || b.description || 'Unknown issue'
+        );
+
+        await NotificationService.createNotification({
+          userId,
+          type: 'personal',
+          category: 'system',
+          title: 'Critical issues detected',
+          message: `Found ${criticalBugs.length} critical issue(s) in your test`,
+          metadata: {
+            testId,
+            resultId: testResultId,
+            criticalCount: criticalBugs.length,
+            topIssues,
+            dedupeKey: `ai:${testResultId}:critical`,
+          },
+        });
+      }
+
+      logger.info('[AI-ANALYSIS] Created background AI notifications', {
+        testId,
+        userId,
+        bugsCount: bugs.length,
+        criticalCount: criticalBugs.length,
+      });
+    } catch (error) {
+      logger.error('[AI-ANALYSIS] Failed to create background AI notifications', {
+        error: error instanceof Error ? error.message : String(error),
+        testId,
+        testResultId,
+      });
+      // Don't throw - notification failure shouldn't break AI analysis
+    }
   }
 
   /**
