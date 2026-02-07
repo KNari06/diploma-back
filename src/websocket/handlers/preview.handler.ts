@@ -1457,6 +1457,50 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // Handle network list request (on-demand, for initial load)
+  socket.on('preview:network:list:request', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId } = data;
+      if (!previewSessionId) return;
+
+      const { getPreviewSessionService, getPreviewDevToolsRegistry } =
+        await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      const devtoolsRegistry = getPreviewDevToolsRegistry();
+
+      // Check session ownership
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        return;
+      }
+
+      const collector = devtoolsRegistry.get(previewSessionId);
+      if (!collector) {
+        logger.debug('[WebSocket] DevTools collector not found', { previewSessionId });
+        return;
+      }
+
+      const items = collector.getNetworkItems();
+      socket.emit('preview:network:list', {
+        previewSessionId,
+        items,
+      });
+
+      logger.debug('[WebSocket] Emitted network list', {
+        socketId: socket.id,
+        previewSessionId,
+        itemCount: items.length,
+      });
+    } catch (error) {
+      logger.debug('[WebSocket] Error in preview:network:list:request', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // Handle HTML request (on-demand, heavy content)
   socket.on('preview:html:request', async (data) => {
     try {

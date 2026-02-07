@@ -38,8 +38,7 @@ const DEVTOOLS_CONFIG = {
   networkBatchDelayMs: 150,     // Batch network updates
   networkPushMaxItems: 20,      // Max items per push
   networkBodyMaxBytes: 64 * 1024, // 64KB max body size for detail
-  networkIgnorePatterns: [      // Ignore static assets and analytics
-    /\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|css)$/i,
+  networkIgnorePatterns: [      // Ignore only analytics (keep static assets for CSS/Img/Font tabs)
     /google-analytics\.com/i,
     /googletagmanager\.com/i,
     /facebook\.net/i,
@@ -233,6 +232,7 @@ interface NetworkRequestInfo {
   item: PreviewNetworkItem;
   requestBody?: string;
   responseBody?: string;
+  requestObject?: any; // Store request object for correlation
 }
 
 /**
@@ -240,6 +240,7 @@ interface NetworkRequestInfo {
  */
 export class PreviewNetworkCollector {
   private requests = new Map<string, NetworkRequestInfo>();
+  private requestToId = new WeakMap<any, string>(); // Map Request object to ID
   private orderedIds: string[] = [];
   private seq = 0;
   private page: Page | null = null;
@@ -279,6 +280,22 @@ export class PreviewNetworkCollector {
       if (this.shouldIgnore(url)) return;
 
       const id = this.generateRequestId();
+      const startTimeMs = Date.now();
+      
+      // Parse URL for domain/path
+      let domain: string | undefined;
+      let path: string | undefined;
+      try {
+        const urlObj = new URL(url);
+        domain = urlObj.hostname;
+        path = urlObj.pathname + urlObj.search;
+      } catch {
+        // Invalid URL, leave undefined
+      }
+
+      // Map resourceType to tab category
+      const tab = this.mapResourceTypeToTab(request.resourceType());
+
       const item: PreviewNetworkItem = {
         id,
         phase: 'request',
@@ -287,12 +304,20 @@ export class PreviewNetworkCollector {
         resourceType: request.resourceType(),
         startTs: new Date().toISOString(),
         requestHeaders: request.headers(),
+        domain,
+        path,
+        tab,
+        startTimeMs,
       };
 
       const info: NetworkRequestInfo = {
         item,
         requestBody: request.postData() || undefined,
+        requestObject: request,
       };
+
+      // Store request object -> ID mapping
+      this.requestToId.set(request, id);
 
       this.addRequest(id, info);
     };
@@ -302,24 +327,34 @@ export class PreviewNetworkCollector {
       const url = response.url();
       if (this.shouldIgnore(url)) return;
 
-      // Find matching request
-      const info = this.findRequestByUrl(url);
+      // Find matching request by request object (more reliable than URL)
+      const request = response.request();
+      const id = this.requestToId.get(request);
+      if (!id) return;
+
+      const info = this.requests.get(id);
       if (!info) return;
 
-      const now = new Date();
+      const endTimeMs = Date.now();
       info.item.phase = 'response';
       info.item.status = response.status();
       info.item.statusText = response.statusText();
-      info.item.endTs = now.toISOString();
+      info.item.endTs = new Date(endTimeMs).toISOString();
       info.item.responseHeaders = response.headers();
+      info.item.endTimeMs = endTimeMs;
 
-      // Calculate duration
-      if (info.item.startTs) {
-        const startTime = new Date(info.item.startTs).getTime();
-        info.item.durationMs = now.getTime() - startTime;
+      // Get content-type from response headers
+      const contentType = response.headers()['content-type'] || response.headers()['Content-Type'];
+      if (contentType) {
+        info.item.contentType = contentType;
       }
 
-      // Try to get response size
+      // Calculate duration
+      if (info.item.startTimeMs) {
+        info.item.durationMs = endTimeMs - info.item.startTimeMs;
+      }
+
+      // Try to get response size and body
       try {
         const body = await response.body().catch(() => null);
         if (body) {
@@ -338,12 +373,23 @@ export class PreviewNetworkCollector {
       const url = request.url();
       if (this.shouldIgnore(url)) return;
 
-      const info = this.findRequestByUrl(url);
+      // Find matching request by request object
+      const id = this.requestToId.get(request);
+      if (!id) return;
+
+      const info = this.requests.get(id);
       if (!info) return;
 
+      const endTimeMs = Date.now();
       info.item.phase = 'error';
       info.item.error = request.failure()?.errorText || 'Request failed';
-      info.item.endTs = new Date().toISOString();
+      info.item.endTs = new Date(endTimeMs).toISOString();
+      info.item.endTimeMs = endTimeMs;
+
+      // Calculate duration
+      if (info.item.startTimeMs) {
+        info.item.durationMs = endTimeMs - info.item.startTimeMs;
+      }
 
       this.addPendingUpdate(info.item);
     };
@@ -371,6 +417,25 @@ export class PreviewNetworkCollector {
   }
 
   /**
+   * Map Playwright resourceType to Network tab category
+   */
+  private mapResourceTypeToTab(resourceType: string): PreviewNetworkItem['tab'] {
+    const type = resourceType.toLowerCase();
+    
+    if (type === 'xhr' || type === 'fetch') return 'xhr';
+    if (type === 'script') return 'js';
+    if (type === 'stylesheet') return 'css';
+    if (type === 'image') return 'img';
+    if (type === 'media') return 'media';
+    if (type === 'font') return 'font';
+    if (type === 'document') return 'doc';
+    if (type === 'websocket') return 'ws';
+    if (type === 'manifest') return 'manifest';
+    
+    return 'other';
+  }
+
+  /**
    * Add new request
    */
   private addRequest(id: string, info: NetworkRequestInfo): void {
@@ -383,20 +448,6 @@ export class PreviewNetworkCollector {
     this.requests.set(id, info);
     this.orderedIds.push(id);
     this.addPendingUpdate(info.item);
-  }
-
-  /**
-   * Find request by URL (most recent match)
-   */
-  private findRequestByUrl(url: string): NetworkRequestInfo | undefined {
-    // Search from end (most recent)
-    for (let i = this.orderedIds.length - 1; i >= 0; i--) {
-      const info = this.requests.get(this.orderedIds[i]);
-      if (info && info.item.url === url && info.item.phase === 'request') {
-        return info;
-      }
-    }
-    return undefined;
   }
 
   /**
@@ -442,6 +493,13 @@ export class PreviewNetworkCollector {
     const info = this.requests.get(id);
     if (!info) return null;
 
+    // Determine if response is text-based
+    const contentType = info.item.contentType || '';
+    const isText = contentType.includes('text/') || 
+                   contentType.includes('application/json') ||
+                   contentType.includes('application/javascript') ||
+                   contentType.includes('application/xml');
+
     return {
       previewSessionId: this.previewSessionId,
       id,
@@ -450,6 +508,8 @@ export class PreviewNetworkCollector {
       requestBody: info.requestBody,
       responseBody: info.responseBody,
       truncated: (info.responseBody?.length || 0) >= DEVTOOLS_CONFIG.networkBodyMaxBytes,
+      contentType: info.item.contentType,
+      isText,
     };
   }
 

@@ -43,6 +43,7 @@ export interface ClientToServerEvents {
 
   // Preview DevTools (on-demand requests)
   'preview:network:detail:request': (data: PreviewNetworkDetailRequest) => void;
+  'preview:network:list:request': (data: PreviewNetworkListRequest) => void;
   'preview:html:request': (data: PreviewHtmlRequest) => void;
   'preview:accessibility:request': (data: PreviewAccessibilityRequest) => void;
   'preview:context:set': (data: PreviewContextSetRequest) => void;
@@ -121,6 +122,7 @@ export interface ServerToClientEvents {
   'preview:console:update': (data: PreviewConsoleUpdatePayload) => void;
   'preview:network:update': (data: PreviewNetworkUpdatePayload) => void;
   'preview:network:detail': (data: PreviewNetworkDetailPayload) => void;
+  'preview:network:list': (data: PreviewNetworkListPayload) => void;
   'preview:html:update': (data: PreviewHtmlUpdatePayload) => void;
   'preview:accessibility:update': (data: PreviewAccessibilityUpdatePayload) => void;
   'preview:context:update': (data: PreviewContextUpdatePayload) => void;
@@ -1176,6 +1178,13 @@ export interface PreviewNetworkItem {
   responseHeaders?: Record<string, string>;
   size?: number;                        // Response body size in bytes
   error?: string;
+  // New fields for enhanced Network tab
+  domain?: string;                      // Hostname from URL
+  path?: string;                        // Pathname + search
+  tab?: 'xhr' | 'js' | 'css' | 'img' | 'media' | 'font' | 'doc' | 'ws' | 'manifest' | 'other'; // Tab filter type
+  startTimeMs?: number;                 // Epoch ms for waterfall
+  endTimeMs?: number;                   // Epoch ms for waterfall
+  contentType?: string;                 // MIME type from response headers
 }
 
 /**
@@ -1196,6 +1205,23 @@ export interface PreviewNetworkDetailRequest {
 }
 
 /**
+ * Network list request (client -> server, on-demand)
+ * Used to get all collected network items when opening the Network tab
+ */
+export interface PreviewNetworkListRequest {
+  previewSessionId: string;
+}
+
+/**
+ * Network list payload (server -> client, on-demand)
+ * Returns all collected network items
+ */
+export interface PreviewNetworkListPayload {
+  previewSessionId: string;
+  items: PreviewNetworkItem[];
+}
+
+/**
  * Network detail payload (on-demand response with bodies)
  */
 export interface PreviewNetworkDetailPayload {
@@ -1206,6 +1232,9 @@ export interface PreviewNetworkDetailPayload {
   requestBody?: string;
   responseBody?: string;
   truncated?: boolean;                  // True if body was truncated
+  contentType?: string;                 // Content-Type from response headers
+  isText?: boolean;                     // True if response is text-based
+  responseBodyBase64?: string;          // Base64 encoded body for binary content
 }
 
 /**

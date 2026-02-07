@@ -55,6 +55,8 @@ interface FlowSummary {
   flowType: 'ui' | 'api' | 'mixed';
   priority?: string;
   orderIndex: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 interface TestCaseSummary {
@@ -309,7 +311,7 @@ export class PlatformTreeService {
     // Get paginated flows
     const { data: flows, error: flowsError } = await supabaseAdmin
       .from('test_flows')
-      .select('id, suite_id, name, flow_type, priority, order_index')
+      .select('id, suite_id, name, flow_type, priority, order_index, created_at, updated_at')
       .eq('suite_id', suiteId)
       .eq('user_id', userId)
       .order('order_index', { ascending: true })
@@ -337,6 +339,8 @@ export class PlatformTreeService {
           flowType: f.flow_type,
           priority: f.priority || undefined,
           orderIndex: f.order_index,
+          createdAt: f.created_at,
+          updatedAt: f.updated_at || f.created_at,
         })),
         pageInfo: {
           limit,
@@ -365,7 +369,7 @@ export class PlatformTreeService {
     // Get flow
     const { data: flowData, error: flowError } = await supabaseAdmin
       .from('test_flows')
-      .select('id, suite_id, name, flow_type, priority, order_index')
+      .select('id, suite_id, name, flow_type, priority, order_index, created_at, updated_at')
       .eq('id', flowId)
       .eq('user_id', userId)
       .single();
@@ -458,6 +462,8 @@ export class PlatformTreeService {
         flowType: flowData.flow_type,
         priority: flowData.priority || undefined,
         orderIndex: flowData.order_index,
+        createdAt: flowData.created_at,
+        updatedAt: flowData.updated_at || flowData.created_at,
       },
       testCases: {
         items: paginatedItems,
