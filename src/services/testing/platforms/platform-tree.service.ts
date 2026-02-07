@@ -126,7 +126,15 @@ export class PlatformTreeService {
       throw new Error(`Failed to get platforms: ${platformsError.message}`);
     }
 
-    const platformIds = (platforms || []).map((p: any) => p.id);
+    // Custom platform order for UI: web_ui first, then api (then anything else)
+    const preferredOrder: Record<string, number> = { web_ui: 0, api: 1 };
+    const sortedPlatforms = (platforms || []).slice().sort((a: any, b: any) => {
+      const wa = preferredOrder[a.platform_key] ?? 99;
+      const wb = preferredOrder[b.platform_key] ?? 99;
+      return wa - wb;
+    });
+
+    const platformIds = sortedPlatforms.map((p: any) => p.id);
     if (platformIds.length === 0) {
       return { platforms: { items: [] } };
     }
@@ -152,7 +160,7 @@ export class PlatformTreeService {
     // Build result with paginated modules per platform
     const platformResults: BaseModeResponse['platforms']['items'] = [];
 
-    for (const p of platforms || []) {
+    for (const p of sortedPlatforms) {
       const { data: modules, error: modulesError } = await supabaseAdmin
         .from('test_modules')
         .select('id, platform_id, name, description, priority')
