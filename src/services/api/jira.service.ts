@@ -933,3 +933,114 @@ export async function updateJiraIssueFields(params: UpdateJiraIssueParams): Prom
     throw new Error(`Jira update issue failed: ${response.status} ${errorText}`);
   }
 }
+
+/**
+ * Get single Jira issue by key (GET /rest/api/3/issue/{issueKey})
+ */
+export async function getJiraIssue(
+  accessToken: string,
+  cloudId: string,
+  issueKey: string
+): Promise<JiraIssueListItem> {
+  const fields = [
+    'summary',
+    'description',
+    'status',
+    'priority',
+    'issuetype',
+    'reporter',
+    'assignee',
+    'created',
+    'updated',
+    'labels',
+    'project',
+  ].join(',');
+  const url = `${JIRA_API_URL}/ex/jira/${cloudId}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${fields}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    logger.error('Jira get issue failed', { status: response.status, error: errorText, issueKey });
+    throw new Error(`Jira get issue failed: ${response.status} ${errorText}`);
+  }
+  const raw = (await response.json()) as { key: string; id: string; fields?: Record<string, unknown> };
+  const f = raw.fields || {};
+  const status = f.status as { id?: string; name?: string; statusCategory?: Record<string, unknown> } | undefined;
+  const project = f.project as { id?: string; key?: string; name?: string } | undefined;
+  const desc = f.description;
+  let description: string | null = null;
+  if (typeof desc === 'string') description = desc;
+  else if (desc && typeof desc === 'object' && 'content' in (desc as any))
+    description = extractPlainTextFromADF(desc as { content?: unknown[] });
+
+  return {
+    id: raw.id,
+    key: raw.key,
+    summary: (f.summary as string) ?? '',
+    description,
+    status: {
+      id: status?.id ?? '',
+      name: status?.name ?? 'Unknown',
+      statusCategory: status?.statusCategory,
+    },
+    priority: (f.priority as { id: string; name: string }) ?? null,
+    issuetype: (f.issuetype as { id: string; name: string }) ?? { id: '', name: 'Unknown' },
+    reporter: (f.reporter as JiraIssueListItem['reporter']) ?? null,
+    assignee: (f.assignee as JiraIssueListItem['assignee']) ?? null,
+    created: (f.created as string) ?? '',
+    updated: (f.updated as string) ?? '',
+    labels: Array.isArray(f.labels) ? f.labels : [],
+    project: {
+      id: project?.id ?? '',
+      key: project?.key ?? '',
+      name: project?.name ?? '',
+    },
+  };
+}
+
+function extractPlainTextFromADF(adf: { content?: unknown[] }): string {
+  if (!adf.content || !Array.isArray(adf.content)) return '';
+  const parts: string[] = [];
+  for (const node of adf.content) {
+    const n = node as { type?: string; content?: unknown[]; text?: string };
+    if (n.type === 'paragraph' && Array.isArray(n.content)) {
+      for (const c of n.content) {
+        const t = c as { type?: string; text?: string };
+        if (t.text) parts.push(t.text);
+      }
+    } else if (n.type === 'text' && n.text) parts.push(n.text);
+  }
+  return parts.join(' ');
+}
+
+/**
+ * Add comment to Jira issue (plain text → ADF)
+ */
+export async function addJiraComment(
+  accessToken: string,
+  cloudId: string,
+  issueKey: string,
+  bodyPlain: string
+): Promise<void> {
+  const body = plainTextToADF(bodyPlain);
+  const url = `${JIRA_API_URL}/ex/jira/${cloudId}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ body }),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    logger.error('Jira add comment failed', { status: response.status, error: errorText, issueKey });
+    throw new Error(`Jira add comment failed: ${response.status} ${errorText}`);
+  }
+}

@@ -20,6 +20,7 @@ import {
   updateJiraIssueFields,
 } from '@/services/api/jira.service';
 import { supabaseAdmin } from '@/db/supabase';
+import { JiraQaOrchestratorService } from '@/services/integrations/jira-qa-orchestrator.service';
 import type { JiraIssueListItem } from '@/types';
 
 // In-memory store for OAuth states (in production, use Redis)
@@ -811,6 +812,8 @@ export interface JiraSyncSettings {
   syncOnCreate?: boolean;
   autoSyncIssues?: boolean;
   projectKey?: string;
+  /** Status name to move issue to when sending back to rework (e.g. "To Do", "Rework") */
+  reworkStatusName?: string;
 }
 
 /**
@@ -873,6 +876,7 @@ export const getJiraSettings = async (req: Request, res: Response): Promise<void
       syncOnCreate: jira.syncOnCreate ?? false,
       autoSyncIssues: jira.autoSyncIssues ?? true,
       projectKey: jira.projectKey || undefined,
+      reworkStatusName: jira.reworkStatusName || undefined,
     };
 
     res.json({ success: true, data: settings, projectId: resolvedId });
@@ -890,7 +894,7 @@ export const getJiraSettings = async (req: Request, res: Response): Promise<void
 export const updateJiraSettings = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const { projectId, workspaceId, syncOnCreate, autoSyncIssues, projectKey } = req.body;
+    const { projectId, workspaceId, syncOnCreate, autoSyncIssues, projectKey, reworkStatusName } = req.body;
 
     const resolvedId = await resolveProjectId(
       userId,
@@ -922,6 +926,7 @@ export const updateJiraSettings = async (req: Request, res: Response): Promise<v
     if (typeof syncOnCreate === 'boolean') updates.syncOnCreate = syncOnCreate;
     if (typeof autoSyncIssues === 'boolean') updates.autoSyncIssues = autoSyncIssues;
     if (projectKey !== undefined) updates.projectKey = projectKey ? String(projectKey).trim() : undefined;
+    if (reworkStatusName !== undefined) updates.reworkStatusName = reworkStatusName ? String(reworkStatusName).trim() : undefined;
 
     const newSettings = {
       ...currentSettings,
@@ -947,5 +952,61 @@ export const updateJiraSettings = async (req: Request, res: Response): Promise<v
   } catch (error) {
     logger.error('Update Jira settings error:', error);
     res.status(500).json({ success: false, error: 'Failed to update Jira settings' });
+  }
+};
+
+/**
+ * Analyze Jira task for QA: run test, send to rework, or prepare manual test case
+ * POST /api/v1/jira/qa-analyze
+ * Body: { issueKey, projectId, cloudId? }
+ */
+export const qaAnalyze = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const { issueKey, projectId, cloudId } = req.body;
+
+    if (!issueKey || !projectId) {
+      res.status(400).json({
+        success: false,
+        error: 'issueKey and projectId are required',
+      });
+      return;
+    }
+
+    const settings = await JiraQaOrchestratorService.getProjectJiraQaSettings(
+      String(projectId).trim(),
+      userId
+    );
+
+    const result = await JiraQaOrchestratorService.analyzeAndExecute({
+      issueKey: String(issueKey).trim(),
+      projectId: String(projectId).trim(),
+      userId,
+      cloudId: cloudId ? String(cloudId).trim() : undefined,
+      reworkStatusName: settings.reworkStatusName,
+    });
+
+    if (!result.success && result.error) {
+      res.status(500).json({
+        success: false,
+        error: result.error,
+        outcome: result.outcome,
+      });
+      return;
+    }
+
+    res.json({
+      success: result.success,
+      outcome: result.outcome,
+      message: result.message,
+      testId: result.testId,
+      testCaseId: result.testCaseId,
+    });
+  } catch (error) {
+    logger.error('Jira QA analyze error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to analyze Jira task',
+    });
   }
 };
