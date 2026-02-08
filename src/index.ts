@@ -29,6 +29,7 @@ import testVisualizationRoutes from '@/api/testVisualization/testVisualization.r
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
+import invitesRoutes from '@/api/workspace/invites.routes';
 import { swaggerSpec } from '@/config/api/swagger';
 import { env, isDevelopment } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
@@ -1219,6 +1220,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 // API routes
 app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
 app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes);
+app.use(`/api/${env.API_VERSION}/invites`, invitesRoutes); // Workspace invites accept endpoint
 app.use(`/api/${env.API_VERSION}/projects`, projectRoutes);
 app.use(`/api/${env.API_VERSION}/manual-test`, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/intelligent-test`, intelligentTestRoutes);

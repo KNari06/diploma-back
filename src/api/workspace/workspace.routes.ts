@@ -12,6 +12,17 @@ import {
   getWorkspaces,
   updateWorkspace,
 } from './workspace.controller';
+import {
+  acceptInvite,
+  changeMemberRole,
+  createInvite,
+  getInvites,
+  getMembers,
+  removeMember,
+  resendInvite,
+  revokeInvite,
+  transferOwnership,
+} from './workspace-members.controller';
 
 const router = Router();
 
@@ -288,4 +299,346 @@ router.delete(
   asyncHandler(deleteWorkspace)
 );
 
+// ============================================================================
+// MEMBERS ENDPOINTS
+// ============================================================================
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/members:
+ *   get:
+ *     summary: Get workspace members
+ *     description: Returns all members of the workspace. Requires active membership.
+ *     tags: [Workspace Members]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *     responses:
+ *       200:
+ *         description: List of members
+ *       403:
+ *         description: Not a member of this workspace
+ */
+router.get(
+  '/:id/members',
+  requireAuth,
+  asyncHandler(getMembers)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/members/{userId}:
+ *   patch:
+ *     summary: Change member role
+ *     description: Change a member's role. Owner only.
+ *     tags: [Workspace Members]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Target user ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - role
+ *             properties:
+ *               role:
+ *                 type: string
+ *                 enum: [full_access, view]
+ *     responses:
+ *       200:
+ *         description: Role updated successfully
+ *       403:
+ *         description: Owner access required
+ */
+router.patch(
+  '/:id/members/:userId',
+  requireAuth,
+  asyncHandler(changeMemberRole)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/members/{userId}:
+ *   delete:
+ *     summary: Remove member
+ *     description: Remove a member from the workspace (soft delete). Owner only.
+ *     tags: [Workspace Members]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Target user ID
+ *     responses:
+ *       200:
+ *         description: Member removed successfully
+ *       403:
+ *         description: Owner access required
+ */
+router.delete(
+  '/:id/members/:userId',
+  requireAuth,
+  asyncHandler(removeMember)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/transfer-owner:
+ *   post:
+ *     summary: Transfer ownership
+ *     description: Transfer workspace ownership to another member. Current owner only.
+ *     tags: [Workspace Members]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - newOwnerUserId
+ *             properties:
+ *               newOwnerUserId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: User ID of the new owner
+ *     responses:
+ *       200:
+ *         description: Ownership transferred successfully
+ *       403:
+ *         description: Owner access required
+ */
+router.post(
+  '/:id/transfer-owner',
+  requireAuth,
+  asyncHandler(transferOwnership)
+);
+
+// ============================================================================
+// INVITES ENDPOINTS
+// ============================================================================
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/invites:
+ *   post:
+ *     summary: Create invite
+ *     description: Invite a user to the workspace by email. Owner only.
+ *     tags: [Workspace Invites]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - role
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               role:
+ *                 type: string
+ *                 enum: [full_access, view]
+ *     responses:
+ *       201:
+ *         description: Invite created successfully
+ *       403:
+ *         description: Owner access required
+ */
+router.post(
+  '/:id/invites',
+  requireAuth,
+  asyncHandler(createInvite)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/invites:
+ *   get:
+ *     summary: Get invites
+ *     description: Get all invites for the workspace. Owner only.
+ *     tags: [Workspace Invites]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *     responses:
+ *       200:
+ *         description: List of invites
+ *       403:
+ *         description: Owner access required
+ */
+router.get(
+  '/:id/invites',
+  requireAuth,
+  asyncHandler(getInvites)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/invites/{inviteId}/resend:
+ *   post:
+ *     summary: Resend invite
+ *     description: Resend an invite email and extend expiry. Owner only.
+ *     tags: [Workspace Invites]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *       - in: path
+ *         name: inviteId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Invite ID
+ *     responses:
+ *       200:
+ *         description: Invite resent successfully
+ *       403:
+ *         description: Owner access required
+ */
+router.post(
+  '/:id/invites/:inviteId/resend',
+  requireAuth,
+  asyncHandler(resendInvite)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/invites/{inviteId}/revoke:
+ *   post:
+ *     summary: Revoke invite
+ *     description: Revoke a pending invite. Owner only.
+ *     tags: [Workspace Invites]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *       - in: path
+ *         name: inviteId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Invite ID
+ *     responses:
+ *       200:
+ *         description: Invite revoked successfully
+ *       403:
+ *         description: Owner access required
+ */
+router.post(
+  '/:id/invites/:inviteId/revoke',
+  requireAuth,
+  asyncHandler(revokeInvite)
+);
+
+// ============================================================================
+// GLOBAL INVITE ACCEPT ENDPOINT
+// ============================================================================
+
+/**
+ * @swagger
+ * /api/v1/invites/{inviteId}/accept:
+ *   post:
+ *     summary: Accept invite
+ *     description: Accept a workspace invite. Authenticated user only. Email must match invite email.
+ *     tags: [Workspace Invites]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: inviteId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Invite ID
+ *     responses:
+ *       200:
+ *         description: Invite accepted successfully
+ *       400:
+ *         description: Invalid invite or email mismatch
+ */
+// Note: This route is defined here but should be mounted at /api/v1/invites in index.ts
+// For now, we'll add it as a separate route file or handle in a different way
+
 export default router;
+
+// Export accept invite handler for mounting at /api/v1/invites
+export { acceptInvite };

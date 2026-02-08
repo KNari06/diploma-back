@@ -157,8 +157,13 @@ export const requireAdmin = async (
 };
 
 /**
- * Middleware to check user credits before expensive operations
+ * Middleware to check credits before expensive operations
  * Must be used after requireAuth middleware
+ *
+ * Credit source priority:
+ * 1. Workspace credits (if workspaceId is provided via header, params, or body)
+ * 2. Fallback to user credits (legacy support during migration)
+ *
  * @param requiredCredits - Minimum credits required (default: 1, must be >= 0)
  */
 export const requireCredits = (requiredCredits: number = 1) => {
@@ -186,13 +191,26 @@ export const requireCredits = (requiredCredits: number = 1) => {
 
       const userId = req.user.id;
 
-      logger.debug('[AUTH] Checking user credits', {
+      // Try to resolve workspaceId from various sources
+      const workspaceId = resolveWorkspaceId(req);
+
+      // If we have a workspaceId, use workspace credits
+      if (workspaceId) {
+        const result = await checkWorkspaceCredits(workspaceId, userId, requiredCredits, req, res);
+        if (result === 'next') {
+          next();
+        }
+        // If result is not 'next', response was already sent
+        return;
+      }
+
+      // Fallback to user credits (legacy support)
+      logger.debug('[AUTH] No workspaceId found, using user credits', {
         userId,
         requiredCredits,
         path: req.path,
       });
 
-      // Get user credits from user_credits table
       const { UserCreditsService } = await import('@/services/core/user-credits.service');
       const userCredits = await UserCreditsService.getUserCredits(userId);
 
@@ -201,7 +219,6 @@ export const requireCredits = (requiredCredits: number = 1) => {
           userId,
           path: req.path,
         });
-        // Create user_credits record if it doesn't exist
         await UserCreditsService.getOrCreateUserCredits(userId);
         const retryCredits = await UserCreditsService.getUserCredits(userId);
         if (!retryCredits) {
@@ -237,12 +254,6 @@ export const requireCredits = (requiredCredits: number = 1) => {
           return;
         }
 
-        logger.debug('[AUTH] Credits check passed', {
-          userId,
-          currentCredits,
-          requiredCredits,
-          path: req.path,
-        });
         next();
         return;
       }
@@ -251,7 +262,6 @@ export const requireCredits = (requiredCredits: number = 1) => {
         ? (userCredits.credits_balance || 0)
         : 0;
 
-      // Check if user has sufficient credits
       if (currentCredits < requiredCredits) {
         logger.warn('[AUTH] Insufficient credits', {
           userId,
@@ -269,7 +279,7 @@ export const requireCredits = (requiredCredits: number = 1) => {
         return;
       }
 
-      logger.debug('[AUTH] Credits check passed', {
+      logger.debug('[AUTH] Credits check passed (user credits)', {
         userId,
         currentCredits,
         requiredCredits,
@@ -293,3 +303,125 @@ export const requireCredits = (requiredCredits: number = 1) => {
     }
   };
 };
+
+/**
+ * Helper to resolve workspaceId from request
+ * Priority: X-Workspace-Id header > params.workspaceId > body.workspace_id > query.workspace_id
+ */
+function resolveWorkspaceId(req: Request): string | null {
+  // Header (preferred)
+  const headerWorkspaceId = req.headers['x-workspace-id'];
+  if (headerWorkspaceId && typeof headerWorkspaceId === 'string') {
+    return headerWorkspaceId;
+  }
+
+  // URL params
+  if (req.params?.workspaceId) {
+    return req.params.workspaceId;
+  }
+
+  // For workspace-scoped routes like /workspaces/:id/...
+  if (req.params?.id && req.path.includes('/workspaces/')) {
+    return req.params.id;
+  }
+
+  // Body
+  if (req.body?.workspace_id) {
+    return req.body.workspace_id;
+  }
+
+  // Query
+  if (req.query?.workspace_id && typeof req.query.workspace_id === 'string') {
+    return req.query.workspace_id;
+  }
+
+  return null;
+}
+
+/**
+ * Helper to check workspace credits and verify membership
+ */
+async function checkWorkspaceCredits(
+  workspaceId: string,
+  userId: string,
+  requiredCredits: number,
+  req: Request,
+  res: Response
+): Promise<'next' | 'responded'> {
+  const { WorkspaceCreditsService } = await import('@/services/core/workspace-credits.service');
+  const { WorkspaceAccessService } = await import('@/services/core/workspace-access.service');
+
+  // First verify the user is a member of this workspace
+  const isMember = await WorkspaceAccessService.isMember(userId, workspaceId);
+  if (!isMember) {
+    logger.warn('[AUTH] User is not a member of workspace for credit check', {
+      userId,
+      workspaceId,
+      path: req.path,
+    });
+    res.status(403).json({
+      success: false,
+      error: 'Access denied',
+      message: 'You are not a member of this workspace',
+    });
+    return 'responded';
+  }
+
+  // Get or create workspace credits
+  let workspaceCredits = await WorkspaceCreditsService.getWorkspaceCredits(workspaceId);
+
+  if (!workspaceCredits) {
+    logger.warn('[AUTH] Workspace credits not found, creating record...', {
+      workspaceId,
+      path: req.path,
+    });
+    await WorkspaceCreditsService.getOrCreateWorkspaceCredits(workspaceId);
+    workspaceCredits = await WorkspaceCreditsService.getWorkspaceCredits(workspaceId);
+
+    if (!workspaceCredits) {
+      logger.error('[AUTH] Failed to create workspace credits', {
+        workspaceId,
+        path: req.path,
+      });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to check credits',
+        message: 'Database error while checking credits',
+      });
+      return 'responded';
+    }
+  }
+
+  const currentCredits = Number.isFinite(workspaceCredits.credits_balance)
+    ? workspaceCredits.credits_balance
+    : 0;
+
+  if (currentCredits < requiredCredits) {
+    logger.warn('[AUTH] Insufficient workspace credits', {
+      userId,
+      workspaceId,
+      currentCredits,
+      requiredCredits,
+      path: req.path,
+    });
+    res.status(402).json({
+      success: false,
+      error: 'Insufficient credits',
+      message: `Your organization needs at least ${requiredCredits} credits to perform this action. Current: ${currentCredits}`,
+      currentCredits,
+      requiredCredits,
+      workspaceId,
+    });
+    return 'responded';
+  }
+
+  logger.debug('[AUTH] Credits check passed (workspace credits)', {
+    userId,
+    workspaceId,
+    currentCredits,
+    requiredCredits,
+    path: req.path,
+  });
+
+  return 'next';
+}

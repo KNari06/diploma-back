@@ -1,0 +1,734 @@
+import {
+  AccessDeniedError,
+  WorkspaceAccessService,
+  WorkspaceRole,
+} from '@/services/core/workspace-access.service';
+import { WorkspaceMembersService } from '@/services/core/workspace-members.service';
+import { logger } from '@/utils/core/logger';
+import { Request, Response } from 'express';
+
+// UUID validation regex
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Helper to extract audit context from request
+function getAuditContext(req: Request) {
+  return {
+    ipAddress: req.ip || req.headers['x-forwarded-for']?.toString() || undefined,
+    userAgent: req.headers['user-agent'] || undefined,
+  };
+}
+
+// ============================================================================
+// MEMBERS ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/v1/workspaces/:id/members
+ * Get all members of a workspace
+ */
+export const getMembers = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const workspaceId = req.params.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId || !UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Check membership (any active member can view members)
+    try {
+      await WorkspaceAccessService.requireMembership(userId, workspaceId);
+    } catch (error) {
+      if (error instanceof AccessDeniedError) {
+        res.status(403).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const members = await WorkspaceMembersService.getMembers(workspaceId);
+
+    res.json({
+      success: true,
+      data: members,
+      count: members.length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error getting members', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get members',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * PATCH /api/v1/workspaces/:id/members/:userId
+ * Change a member's role (owner only)
+ */
+export const changeMemberRole = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const actorUserId = req.user?.id;
+    const workspaceId = req.params.id;
+    const targetUserId = req.params.userId;
+    const { role } = req.body;
+
+    if (!actorUserId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId || !UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!targetUserId || !UUID_REGEX.test(targetUserId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid target user ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!role || !['full_access', 'view'].includes(role)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid role. Must be "full_access" or "view"',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Only owner can change roles
+    try {
+      await WorkspaceAccessService.requireOwner(actorUserId, workspaceId);
+    } catch (error) {
+      if (error instanceof AccessDeniedError) {
+        res.status(403).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const result = await WorkspaceMembersService.changeRole(
+      workspaceId,
+      targetUserId,
+      role as WorkspaceRole,
+      actorUserId,
+      getAuditContext(req)
+    );
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: result.error,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: 'Member role updated successfully',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error changing member role', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to change member role',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * DELETE /api/v1/workspaces/:id/members/:userId
+ * Remove a member (owner only)
+ */
+export const removeMember = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const actorUserId = req.user?.id;
+    const workspaceId = req.params.id;
+    const targetUserId = req.params.userId;
+
+    if (!actorUserId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId || !UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!targetUserId || !UUID_REGEX.test(targetUserId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid target user ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Only owner can remove members
+    try {
+      await WorkspaceAccessService.requireOwner(actorUserId, workspaceId);
+    } catch (error) {
+      if (error instanceof AccessDeniedError) {
+        res.status(403).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const result = await WorkspaceMembersService.removeMember(
+      workspaceId,
+      targetUserId,
+      actorUserId,
+      getAuditContext(req)
+    );
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: result.error,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: 'Member removed successfully',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error removing member', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to remove member',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * POST /api/v1/workspaces/:id/transfer-owner
+ * Transfer ownership to another member (owner only)
+ */
+export const transferOwnership = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const currentOwnerUserId = req.user?.id;
+    const workspaceId = req.params.id;
+    const { newOwnerUserId } = req.body;
+
+    if (!currentOwnerUserId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId || !UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!newOwnerUserId || !UUID_REGEX.test(newOwnerUserId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid new owner user ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Only current owner can transfer ownership
+    try {
+      await WorkspaceAccessService.requireOwner(currentOwnerUserId, workspaceId);
+    } catch (error) {
+      if (error instanceof AccessDeniedError) {
+        res.status(403).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const result = await WorkspaceMembersService.transferOwnership(
+      workspaceId,
+      newOwnerUserId,
+      currentOwnerUserId,
+      getAuditContext(req)
+    );
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: result.error,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: 'Ownership transferred successfully',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error transferring ownership', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to transfer ownership',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+// ============================================================================
+// INVITES ENDPOINTS
+// ============================================================================
+
+/**
+ * POST /api/v1/workspaces/:id/invites
+ * Create an invite (owner only)
+ */
+export const createInvite = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const workspaceId = req.params.id;
+    const { email, role } = req.body;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId || !UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid email address',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!role || !['full_access', 'view'].includes(role)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid role. Must be "full_access" or "view"',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Only owner can create invites
+    try {
+      await WorkspaceAccessService.requireOwner(userId, workspaceId);
+    } catch (error) {
+      if (error instanceof AccessDeniedError) {
+        res.status(403).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const result = await WorkspaceMembersService.createInvite(
+      workspaceId,
+      email,
+      role as 'full_access' | 'view',
+      userId,
+      getAuditContext(req)
+    );
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: result.error,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.status(201).json({
+      success: true,
+      data: result.invite,
+      message: 'Invite created successfully',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error creating invite', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create invite',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * GET /api/v1/workspaces/:id/invites
+ * Get all invites for a workspace (owner only)
+ */
+export const getInvites = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const workspaceId = req.params.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId || !UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Only owner can view invites
+    try {
+      await WorkspaceAccessService.requireOwner(userId, workspaceId);
+    } catch (error) {
+      if (error instanceof AccessDeniedError) {
+        res.status(403).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const invites = await WorkspaceMembersService.getInvites(workspaceId);
+
+    res.json({
+      success: true,
+      data: invites,
+      count: invites.length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error getting invites', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get invites',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * POST /api/v1/workspaces/:id/invites/:inviteId/resend
+ * Resend an invite (owner only)
+ */
+export const resendInvite = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const workspaceId = req.params.id;
+    const inviteId = req.params.inviteId;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId || !UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!inviteId || !UUID_REGEX.test(inviteId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid invite ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Only owner can resend invites
+    try {
+      await WorkspaceAccessService.requireOwner(userId, workspaceId);
+    } catch (error) {
+      if (error instanceof AccessDeniedError) {
+        res.status(403).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const result = await WorkspaceMembersService.resendInvite(
+      inviteId,
+      userId,
+      getAuditContext(req)
+    );
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: result.error,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: 'Invite resent successfully',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error resending invite', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to resend invite',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * POST /api/v1/workspaces/:id/invites/:inviteId/revoke
+ * Revoke an invite (owner only)
+ */
+export const revokeInvite = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const workspaceId = req.params.id;
+    const inviteId = req.params.inviteId;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId || !UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!inviteId || !UUID_REGEX.test(inviteId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid invite ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Only owner can revoke invites
+    try {
+      await WorkspaceAccessService.requireOwner(userId, workspaceId);
+    } catch (error) {
+      if (error instanceof AccessDeniedError) {
+        res.status(403).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const result = await WorkspaceMembersService.revokeInvite(
+      inviteId,
+      userId,
+      getAuditContext(req)
+    );
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: result.error,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: 'Invite revoked successfully',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error revoking invite', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to revoke invite',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * POST /api/v1/invites/:inviteId/accept
+ * Accept an invite (authenticated user)
+ */
+export const acceptInvite = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const userEmail = req.user?.email;
+    const inviteId = req.params.inviteId;
+
+    if (!userId || !userEmail) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!inviteId || !UUID_REGEX.test(inviteId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid invite ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const result = await WorkspaceMembersService.acceptInvite(
+      inviteId,
+      userId,
+      userEmail,
+      getAuditContext(req)
+    );
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: result.error,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: result.membership,
+      message: 'Invite accepted successfully',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error accepting invite', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to accept invite',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};

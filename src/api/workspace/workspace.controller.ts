@@ -1,4 +1,9 @@
 import { supabaseAdmin } from '@/db/supabase';
+import {
+    PERMISSIONS,
+    WorkspaceAccessService,
+    WorkspaceRole
+} from '@/services/core/workspace-access.service';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { WorkspaceCreateRequest } from '@/types';
 import { logger } from '@/utils/core/logger';
@@ -8,29 +13,22 @@ import { Request, Response } from 'express';
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Check if user owns workspace
+ * Check if user has access to workspace (membership-based)
+ * Returns the user's role if they are a member, null otherwise
  */
-async function verifyWorkspaceOwnership(workspaceId: string, userId: string): Promise<boolean> {
+async function verifyWorkspaceMembership(
+  workspaceId: string,
+  userId: string
+): Promise<WorkspaceRole | null> {
   try {
-    // Validate UUIDs
     if (!UUID_REGEX.test(workspaceId) || !UUID_REGEX.test(userId)) {
-      return false;
+      return null;
     }
 
-    const { data, error } = await supabaseAdmin
-      .from('workspaces')
-      .select('user_id')
-      .eq('id', workspaceId)
-      .maybeSingle();
-
-    if (error || !data) {
-      return false;
-    }
-
-    return data.user_id === userId;
+    return await WorkspaceAccessService.getRole(userId, workspaceId);
   } catch (error) {
-    logger.error('[WORKSPACE_API] Error verifying ownership', { error, workspaceId, userId });
-    return false;
+    logger.error('[WORKSPACE_API] Error verifying membership', { error, workspaceId, userId });
+    return null;
   }
 }
 
@@ -194,7 +192,8 @@ export const createWorkspace = async (req: Request, res: Response): Promise<void
 
 /**
  * GET /api/v1/workspaces
- * Get all workspaces for the current user
+ * Get all workspaces for the current user (where they are a member)
+ * Returns workspaces with `my_role` indicating user's role in each
  */
 export const getWorkspaces = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -232,36 +231,67 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
       }
     });
 
-    let workspaces = await WorkspaceService.getUserWorkspaces(userId);
+    // Get all workspaces where user is a member (with role)
+    const userWorkspaces = await WorkspaceAccessService.getUserWorkspaces(userId);
 
-    // Auto-create workspace if none found (for both authenticated and anonymous users)
-    if (!workspaces || workspaces.length === 0) {
-      logger.info('[WORKSPACE_API] No workspaces found, creating default workspace', {
+    // If no memberships, check if user has legacy workspaces (owner via user_id) and auto-create if needed
+    if (userWorkspaces.length === 0) {
+      logger.info('[WORKSPACE_API] No workspace memberships found, creating default workspace', {
         userId: userId,
       });
 
-      const { workspace_id } = await WorkspaceService.checkOrCreateWorkspace(userId);
+      await WorkspaceService.checkOrCreateWorkspace(userId);
 
-      // Fetch the newly created workspace
-      workspaces = await WorkspaceService.getUserWorkspaces(userId);
+      // Re-fetch memberships after workspace creation (trigger creates membership)
+      const updatedMemberships = await WorkspaceAccessService.getUserWorkspaces(userId);
 
-      logger.info('[WORKSPACE_API] Created default workspace', {
-        userId: userId,
-        workspaceId: workspace_id,
-        count: workspaces?.length || 0
-      });
+      if (updatedMemberships.length === 0) {
+        // Fallback: return empty if still no memberships
+        res.json({
+          success: true,
+          data: [],
+          count: 0,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
     }
+
+    // Refetch memberships
+    const memberships = await WorkspaceAccessService.getUserWorkspaces(userId);
+    const workspaceIds = memberships.map((m) => m.workspace_id);
+
+    // Fetch full workspace details
+    const { data: workspacesData, error } = await supabaseAdmin
+      .from('workspaces')
+      .select('*')
+      .in('id', workspaceIds)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.error('[WORKSPACE_API] Error fetching workspace details', { error, userId });
+      throw error;
+    }
+
+    // Merge workspace data with role
+    const workspacesWithRole = (workspacesData || []).map((ws) => {
+      const membership = memberships.find((m) => m.workspace_id === ws.id);
+      return {
+        ...ws,
+        my_role: membership?.role || null,
+      };
+    });
 
     logger.info('[WORKSPACE_API] Found workspaces', {
       userId: userId,
-      count: workspaces?.length || 0,
-      workspaceIds: workspaces?.map(w => w.id) || []
+      count: workspacesWithRole.length,
+      workspaceIds: workspacesWithRole.map(w => w.id)
     });
 
     res.json({
       success: true,
-      data: workspaces,
-      count: workspaces.length,
+      data: workspacesWithRole,
+      count: workspacesWithRole.length,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -284,6 +314,7 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
 /**
  * GET /api/v1/workspaces/:id
  * Get workspace by ID
+ * Requires: any active membership (returns workspace with my_role)
  */
 export const getWorkspace = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -332,6 +363,18 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
 
     logger.info('[WORKSPACE_API] Getting workspace', { userId, workspaceId });
 
+    // Verify workspace membership (any role can read)
+    const role = await verifyWorkspaceMembership(workspaceId, userId);
+    if (!role) {
+      res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        message: 'Access denied to this workspace',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     const workspace = await WorkspaceService.getWorkspace(workspaceId);
 
     if (!workspace) {
@@ -344,21 +387,12 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    // Verify workspace ownership
-    const isOwner = await verifyWorkspaceOwnership(workspaceId, userId);
-    if (!isOwner) {
-      res.status(403).json({
-        success: false,
-        error: 'Access denied',
-        message: 'Access denied to this workspace',
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
     res.json({
       success: true,
-      data: workspace,
+      data: {
+        ...workspace,
+        my_role: role,
+      },
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -381,6 +415,7 @@ export const getWorkspace = async (req: Request, res: Response): Promise<void> =
 /**
  * PUT /api/v1/workspaces/:id
  * Update workspace
+ * Requires: owner or full_access role
  */
 export const updateWorkspace = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -428,9 +463,13 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    // Verify workspace ownership
-    const isOwner = await verifyWorkspaceOwnership(workspaceId, userId);
-    if (!isOwner) {
+    // Verify write access (owner or full_access)
+    const hasWriteAccess = await WorkspaceAccessService.hasPermission(
+      userId,
+      workspaceId,
+      PERMISSIONS.WORKSPACE_WRITE
+    );
+    if (!hasWriteAccess) {
       res.status(403).json({
         success: false,
         error: 'Access denied',
@@ -555,6 +594,7 @@ export const updateWorkspace = async (req: Request, res: Response): Promise<void
 /**
  * DELETE /api/v1/workspaces/:id
  * Delete workspace
+ * Requires: owner role only
  */
 export const deleteWorkspace = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -601,13 +641,17 @@ export const deleteWorkspace = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    // Verify workspace ownership before deletion
-    const isOwner = await verifyWorkspaceOwnership(workspaceId, userId);
-    if (!isOwner) {
+    // Verify owner access before deletion (only owner can delete workspace)
+    const hasDeleteAccess = await WorkspaceAccessService.hasPermission(
+      userId,
+      workspaceId,
+      PERMISSIONS.WORKSPACE_DELETE
+    );
+    if (!hasDeleteAccess) {
       res.status(403).json({
         success: false,
         error: 'Access denied',
-        message: 'Access denied to this workspace',
+        message: 'Only workspace owner can delete the workspace',
         timestamp: new Date().toISOString(),
       });
       return;

@@ -82,6 +82,11 @@ const envSchema = z.object({
   JIRA_USERNAME: z.string().optional(),
   JIRA_API_TOKEN: z.string().optional(),
   SLACK_WEBHOOK_URL: z.string().optional(),
+
+  // Feature Flags - B2B Organization/Members
+  // Staged rollout: enable reads first, then writes, then credits cutover
+  FEATURE_ORG_MEMBERS_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
 });
 
 // Parse and validate environment variables

@@ -1,50 +1,78 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { ProjectCreateRequest } from '@/types';
 import { logger } from '@/utils/core/logger';
+import {
+  PERMISSIONS,
+  WorkspaceAccessService,
+  WorkspaceRole,
+} from './workspace-access.service';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Project Service
  * Manages projects within workspaces
+ *
+ * Access model (B2B org-based):
+ * - owner & full_access: full CRUD on projects
+ * - view: read-only access
  */
 export class ProjectService {
   /**
-   * Verify workspace ownership
+   * Verify workspace membership (replaces legacy ownership check)
+   * Returns the user's role if they are a member, null otherwise
    */
-  private static async verifyWorkspaceOwnership(
+  private static async verifyWorkspaceMembership(
     workspaceId: string,
     userId: string
-  ): Promise<boolean> {
+  ): Promise<WorkspaceRole | null> {
     try {
       if (!UUID_REGEX.test(workspaceId) || !UUID_REGEX.test(userId)) {
-        return false;
+        return null;
       }
 
-      const { data, error } = await supabaseAdmin
-        .from('workspaces')
-        .select('user_id')
-        .eq('id', workspaceId)
-        .eq('user_id', userId)
-        .maybeSingle();
-
-      if (error || !data) {
-        return false;
-      }
-
-      return true;
+      return await WorkspaceAccessService.getRole(userId, workspaceId);
     } catch (error) {
-      logger.error('[PROJECT] Error verifying workspace ownership', {
+      logger.error('[PROJECT] Error verifying workspace membership', {
         error,
         workspaceId,
         userId,
       });
-      return false;
+      return null;
     }
   }
 
   /**
+   * Check if user has write access to workspace (owner or full_access)
+   */
+  private static async hasWriteAccess(
+    workspaceId: string,
+    userId: string
+  ): Promise<boolean> {
+    return await WorkspaceAccessService.hasPermission(
+      userId,
+      workspaceId,
+      PERMISSIONS.PROJECT_WRITE
+    );
+  }
+
+  /**
+   * Check if user has read access to workspace (any active member)
+   */
+  private static async hasReadAccess(
+    workspaceId: string,
+    userId: string
+  ): Promise<boolean> {
+    return await WorkspaceAccessService.hasPermission(
+      userId,
+      workspaceId,
+      PERMISSIONS.PROJECT_READ
+    );
+  }
+
+  /**
    * Create a new project
+   * Requires: owner or full_access role
    */
   static async createProject(
     userId: string,
@@ -68,9 +96,9 @@ export class ProjectService {
         throw new Error('Project name is too long (max 255 characters)');
       }
 
-      // Verify workspace ownership
-      const isOwner = await this.verifyWorkspaceOwnership(projectData.workspace_id, userId);
-      if (!isOwner) {
+      // Verify write access (owner or full_access)
+      const hasAccess = await this.hasWriteAccess(projectData.workspace_id, userId);
+      if (!hasAccess) {
         throw new Error('Workspace not found or access denied');
       }
 
@@ -125,6 +153,7 @@ export class ProjectService {
 
   /**
    * Get project by ID
+   * Requires: any active membership (owner, full_access, or view)
    */
   static async getProject(projectId: string, userId: string): Promise<any> {
     try {
@@ -132,11 +161,11 @@ export class ProjectService {
         throw new Error('Invalid ID format');
       }
 
-      const { data, error } = await supabaseAdmin
+      // First get the project to check workspace membership
+      const { data: project, error } = await supabaseAdmin
         .from('projects')
         .select('*')
         .eq('id', projectId)
-        .eq('user_id', userId)
         .maybeSingle();
 
       if (error) {
@@ -144,7 +173,17 @@ export class ProjectService {
         throw error;
       }
 
-      return data;
+      if (!project) {
+        return null;
+      }
+
+      // Check membership in the workspace
+      const hasAccess = await this.hasReadAccess(project.workspace_id, userId);
+      if (!hasAccess) {
+        return null; // Return null as if project doesn't exist (no info leak)
+      }
+
+      return project;
     } catch (error) {
       logger.error('[PROJECT] Failed to get project', {
         error: error instanceof Error ? error.message : String(error),
@@ -156,7 +195,8 @@ export class ProjectService {
   }
 
   /**
-   * Get all projects for a user (across all workspaces)
+   * Get all projects for a user (across all workspaces they are a member of)
+   * Returns projects from all workspaces where user has membership
    */
   static async getUserProjects(userId: string): Promise<any[]> {
     try {
@@ -164,10 +204,20 @@ export class ProjectService {
         throw new Error('Invalid user ID format');
       }
 
+      // Get all workspaces the user is a member of
+      const userWorkspaces = await WorkspaceAccessService.getUserWorkspaces(userId);
+
+      if (userWorkspaces.length === 0) {
+        return [];
+      }
+
+      const workspaceIds = userWorkspaces.map((w) => w.workspace_id);
+
+      // Get projects from all user's workspaces
       const { data, error } = await supabaseAdmin
         .from('projects')
         .select('*')
-        .eq('user_id', userId)
+        .in('workspace_id', workspaceIds)
         .order('created_at', { ascending: false });
 
       if (error) {
@@ -187,6 +237,7 @@ export class ProjectService {
 
   /**
    * Get all projects for a workspace
+   * Requires: any active membership
    */
   static async getProjectsByWorkspace(workspaceId: string, userId: string): Promise<any[]> {
     try {
@@ -194,17 +245,17 @@ export class ProjectService {
         throw new Error('Invalid ID format');
       }
 
-      // Verify workspace ownership
-      const isOwner = await this.verifyWorkspaceOwnership(workspaceId, userId);
-      if (!isOwner) {
+      // Verify workspace membership (any role can read)
+      const hasAccess = await this.hasReadAccess(workspaceId, userId);
+      if (!hasAccess) {
         throw new Error('Workspace not found or access denied');
       }
 
+      // Get all projects in the workspace (not filtered by user_id anymore)
       const { data, error } = await supabaseAdmin
         .from('projects')
         .select('*')
         .eq('workspace_id', workspaceId)
-        .eq('user_id', userId)
         .order('created_at', { ascending: false });
 
       if (error) {
@@ -225,6 +276,7 @@ export class ProjectService {
 
   /**
    * Update project
+   * Requires: owner or full_access role in the workspace
    */
   static async updateProject(
     projectId: string,
@@ -236,9 +288,25 @@ export class ProjectService {
         throw new Error('Invalid ID format');
       }
 
-      // Verify project ownership
-      const project = await this.getProject(projectId, userId);
+      // First get the project to check workspace membership
+      const { data: project, error: fetchError } = await supabaseAdmin
+        .from('projects')
+        .select('*')
+        .eq('id', projectId)
+        .maybeSingle();
+
+      if (fetchError) {
+        logger.error('[PROJECT] Error fetching project for update', { error: fetchError, projectId });
+        throw fetchError;
+      }
+
       if (!project) {
+        throw new Error('Project not found or access denied');
+      }
+
+      // Verify write access in the workspace
+      const hasAccess = await this.hasWriteAccess(project.workspace_id, userId);
+      if (!hasAccess) {
         throw new Error('Project not found or access denied');
       }
 
@@ -269,7 +337,6 @@ export class ProjectService {
         .from('projects')
         .update(updateData)
         .eq('id', projectId)
-        .eq('user_id', userId)
         .select('*')
         .single();
 
@@ -291,6 +358,7 @@ export class ProjectService {
 
   /**
    * Delete project
+   * Requires: owner or full_access role in the workspace
    */
   static async deleteProject(projectId: string, userId: string): Promise<void> {
     try {
@@ -298,17 +366,36 @@ export class ProjectService {
         throw new Error('Invalid ID format');
       }
 
-      // Verify project ownership
-      const project = await this.getProject(projectId, userId);
+      // First get the project to check workspace membership
+      const { data: project, error: fetchError } = await supabaseAdmin
+        .from('projects')
+        .select('id, workspace_id')
+        .eq('id', projectId)
+        .maybeSingle();
+
+      if (fetchError) {
+        logger.error('[PROJECT] Error fetching project for delete', { error: fetchError, projectId });
+        throw fetchError;
+      }
+
       if (!project) {
+        throw new Error('Project not found or access denied');
+      }
+
+      // Verify delete access in the workspace (requires PROJECT_DELETE permission)
+      const hasAccess = await WorkspaceAccessService.hasPermission(
+        userId,
+        project.workspace_id,
+        PERMISSIONS.PROJECT_DELETE
+      );
+      if (!hasAccess) {
         throw new Error('Project not found or access denied');
       }
 
       const { error } = await supabaseAdmin
         .from('projects')
         .delete()
-        .eq('id', projectId)
-        .eq('user_id', userId);
+        .eq('id', projectId);
 
       if (error) {
         logger.error('[PROJECT] Error deleting project', { error, projectId, userId });

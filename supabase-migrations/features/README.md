@@ -28,6 +28,22 @@ Feature-specific database migrations for QAIT Backend.
 - Adding workspace feature
 - Multi-project support needed
 
+#### `workspace-org-members.sql`
+- B2B org layer: `workspace_members`, `workspace_invites`, `workspace_credits`, `workspace_credit_transactions`, `workspace_audit_log`
+- Seeds owner membership and workspace credits from existing workspaces (only when `user_id` is a valid UUID)
+- Trigger: new workspace → owner membership + empty workspace_credits
+
+**Apply when:**
+- Adding multi-user workspaces (invites, roles, org credits)
+- After `workspaces.sql` and `auth-sync.sql`
+
+#### `workspace-org-rls-update.sql`
+- Updates RLS on `workspaces`, `projects`, `chat_sessions` to membership-based access (owner / full_access / view)
+- Keeps legacy `workspaces.user_id = auth.uid()` during migration
+
+**Apply when:**
+- After `workspace-org-members.sql`; enables membership-based access.
+
 #### `default-project.sql`
 - Creates default project for users
 - Auto-assignment logic
@@ -151,6 +167,8 @@ Feature-specific database migrations for QAIT Backend.
 -- 1. Core features first
 \i features/auth-sync.sql
 \i features/workspaces.sql
+\i features/workspace-org-members.sql
+\i features/workspace-org-rls-update.sql
 \i features/default-project.sql
 
 -- 2. Knowledge base
@@ -181,6 +199,8 @@ Some features depend on others:
 ```
 auth-sync.sql
 ├── workspaces.sql
+│   ├── workspace-org-members.sql
+│   │   └── workspace-org-rls-update.sql
 │   ├── default-project.sql
 │   └── api-configurations.sql
 └── token-based-credits-system.sql

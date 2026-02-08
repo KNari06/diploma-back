@@ -76,6 +76,8 @@ supabase-migrations/
 | -------------------------------- | -------------------- | ------------ |
 | `auth-sync.sql`                  | Auth synchronization | None         |
 | `workspaces.sql`                 | Workspace management | auth-sync    |
+| `workspace-org-members.sql`      | B2B org: members, invites, credits, audit | workspaces, auth-sync |
+| `workspace-org-rls-update.sql`   | RLS for membership-based access | workspace-org-members |
 | `default-project.sql`            | Default workspace    | workspaces   |
 | `api-configurations.sql`         | API environments     | workspaces   |
 | `knowledge-base-safe.sql`        | RAG/KB system        | workspaces   |
