@@ -672,10 +672,57 @@ export class SnapshotCollector {
           }
         });
 
-        // Extract truncated page text for credential extraction (never sent to LLM)
-        // @ts-expect-error - document available in browser context
-        const pageText = document.body?.innerText || '';
-        const pageTextForExtraction = pageText.slice(0, 10000); // Max 10k chars
+        // ═══════════════════════════════════════════════════════════════════════
+        // PHASE 0.1: Enhanced page text extraction for credential detection
+        // Prioritizes <pre>, <code>, <li>, and <td> blocks where demo credentials
+        // are commonly displayed on practice/test pages
+        // ═══════════════════════════════════════════════════════════════════════
+        const extractPageTextForCredentials = (): string => {
+          const textParts: string[] = [];
+
+          // Priority 1: <pre> and <code> blocks (highest - demo credentials often here)
+          // @ts-expect-error - document available in browser context
+          document.querySelectorAll('pre, code').forEach(el => {
+            const text = el.textContent?.trim();
+            if (text && text.length > 0 && text.length < 2000) {
+              textParts.push(`[code] ${text}`);
+            }
+          });
+
+          // Priority 2: List items and table cells (common for credential listings)
+          // @ts-expect-error - document available in browser context
+          document.querySelectorAll('li, td, th').forEach(el => {
+            const text = el.textContent?.trim();
+            // Only include if contains credential keywords and is reasonable length
+            if (text && text.length >= 8 && text.length < 200 &&
+                /username|user|login|email|password|pass|pwd|credential|demo|test/i.test(text)) {
+              textParts.push(text);
+            }
+          });
+
+          // Priority 3: Paragraphs and divs with credential keywords
+          // @ts-expect-error - document available in browser context
+          document.querySelectorAll('p, div').forEach(el => {
+            const text = el.textContent?.trim();
+            // Only include if contains credential keywords and is reasonable length
+            if (text && text.length >= 10 && text.length < 500 &&
+                /username|password|login|credential|demo|test|use.*:|email:|pass:/i.test(text)) {
+              textParts.push(text);
+            }
+          });
+
+          // Priority 4: All visible text as fallback (for edge cases)
+          // @ts-expect-error - document available in browser context
+          const bodyText = document.body?.innerText || '';
+          if (bodyText) {
+            textParts.push(bodyText);
+          }
+
+          // Join and limit to 10k chars
+          return textParts.join('\n').slice(0, 10000);
+        };
+
+        const pageTextForExtraction = extractPageTextForCredentials();
 
         return {
           // @ts-expect-error - window and document available in browser context

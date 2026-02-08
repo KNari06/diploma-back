@@ -470,6 +470,11 @@ export interface GoalContext {
     title: string;
   };
 
+  /** ✅ NEW: URL change tracking for login/register success detection */
+  urlBefore?: string;
+  urlAfter?: string;
+  urlChanged?: boolean;
+
   /**
    * Compact snapshot summary (max 50 elements)
    * Only forms, CTAs, headings, inputs - not all page elements
@@ -494,7 +499,52 @@ export interface GoalContext {
 
   /** Current iteration number */
   iteration: number;
+
+  /** ✅ NEW: Current flow state for multi-step processes */
+  flowState?: FlowState;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Flow State Tracking (Task #21)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Flow state for multi-step processes (login, register, checkout)
+ * Helps AI understand current step and make correct next decisions
+ */
+export interface FlowState {
+  /** Flow type */
+  flowType: 'login' | 'register' | 'checkout' | 'unknown';
+
+  /** Current step in the flow */
+  currentStep: FlowStep;
+
+  /** Previous step (for rollback detection) */
+  previousStep?: FlowStep;
+
+  /** When this state was set (timestamp) */
+  timestamp: number;
+
+  /** Confidence in state detection (0-1) */
+  confidence: number;
+}
+
+/**
+ * Individual step in a multi-step flow
+ */
+export type FlowStep =
+  | 'initial'              // Starting point, no form visible
+  | 'form_visible'         // Auth/checkout form is visible
+  | 'filling_credentials'  // User filling username/password
+  | 'submitting'           // Form submitted, waiting for response
+  | 'redirecting'          // URL change detected, navigating
+  | 'verify_email'         // Email verification required
+  | 'verify_phone'         // Phone/SMS verification required
+  | 'verify_2fa'           // 2FA/OTP verification required
+  | 'reset_password'       // Password reset flow
+  | 'complete_profile'     // Additional profile info required
+  | 'success'              // Flow completed successfully
+  | 'error';               // Error state
 
 /**
  * Result from AI Goal Evaluator (fallback)

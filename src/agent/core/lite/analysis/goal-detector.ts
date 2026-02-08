@@ -1490,6 +1490,10 @@ GOAL: ${context.goal}
 CURRENT URL: ${context.page.url}
 PAGE TITLE: ${context.page.title}
 
+${context.urlChanged && context.urlBefore && context.urlAfter
+? `URL CHANGE: ${context.urlBefore} → ${context.urlAfter} (redirect occurred)\n`
+: `URL STATUS: No redirect (stayed on ${context.page.url})\n`}
+
 PAGE CONTENT SUMMARY (key elements):
 ${context.snapshotSummary.slice(0, 40).join('\n') || 'No elements'}
 
@@ -1499,11 +1503,41 @@ TASK: Based on the page state, determine if:
 1. The goal has been FULLY achieved (isDone)
 2. The test is BLOCKED by something requiring user help (captcha, 2FA, verification code)
 
+CRITICAL RULES FOR LOGIN/REGISTER GOALS:
+- If goal contains "login", "signin", "register", "signup", "auth":
+
+  ✅ SUCCESS INDICATORS:
+  - URL changed from auth page to non-intermediate page (dashboard, home, profile, app, user)
+  - Page content shows success messages: "Welcome", "Logged in", "Successfully", "Dashboard"
+  - Page has user menu, logout button, profile settings (indicates authenticated state)
+
+  ❌ INTERMEDIATE STEPS (NOT success yet):
+  - URL contains: reset, forgot, verify, verification, confirm, 2fa, mfa, otp, code, complete-profile, onboarding
+  - Page content shows: "Reset Password", "Verify Email", "Enter Code", "2FA", "Complete Profile", "Setup Account"
+  - Page has verification code input, phone verification, email confirmation prompts
+
+  ⚠️ ERROR STATES (NOT success):
+  - URL contains: error, invalid, denied, failed
+  - Page content shows: "Invalid credentials", "Login failed", "Access denied", "Error"
+
+  VALIDATION LOGIC:
+  1. Check URL first (intermediate step keywords = NOT done)
+  2. Check page content (intermediate step headings/buttons = NOT done)
+  3. If both URL and content look good → isDone=true
+  4. If intermediate step detected → isDone=false, nextStepIfMissing="Complete [step name]"
+
+Examples:
+- URL: /dashboard, Content: "Welcome, John" → SUCCESS ✅
+- URL: /verify-email, Content: "Enter verification code" → NOT SUCCESS ❌
+- URL: /home, Content: "Reset your password" → NOT SUCCESS ❌
+
 Look for:
-- Success messages ("Thank you", "Confirmed", "Welcome")
+- Success messages ("Thank you", "Confirmed", "Welcome", "Logged in", "Successfully registered")
 - Error messages ("Invalid", "Error", "Failed")
+- Intermediate step indicators ("Reset", "Verify", "Enter code", "Complete profile")
 - Blocking elements (CAPTCHA, SMS code input, 2FA prompt)
 - Expected page state for the goal
+- URL redirects AND page content consistency
 
 Respond with JSON ONLY:
 {

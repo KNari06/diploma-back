@@ -30,6 +30,7 @@ import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
 import invitesRoutes from '@/api/workspace/invites.routes';
+import testCaseRoutes from '@/api/test-case/test-case.routes';
 import { swaggerSpec } from '@/config/api/swagger';
 import { env, isDevelopment } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
@@ -1224,6 +1225,7 @@ app.use(`/api/${env.API_VERSION}/invites`, invitesRoutes); // Workspace invites 
 app.use(`/api/${env.API_VERSION}/projects`, projectRoutes);
 app.use(`/api/${env.API_VERSION}/manual-test`, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/intelligent-test`, intelligentTestRoutes);
+app.use(`/api/${env.API_VERSION}/test-case`, testCaseRoutes); // ✅ NEW: Structured test case execution
 app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
 app.use(`/api/${env.API_VERSION}/chat/feedback`, feedbackRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);

@@ -18,6 +18,7 @@ import { ClarificationService } from '../../utils/context/clarification.service'
 import { buildSnapshotSummary } from './analysis/ai-goal-evaluator';
 import { isDownloadText, isFileUploadTarget, isPaymentContext } from './analysis/clarification-gates';
 import { classifyField } from './analysis/field-classifier';
+import { FlowStateDetector } from './analysis/flow-state-detector';
 import { FunnelAnalyzer, FunnelPhase } from './analysis/funnel-analyzer';
 import { GoalDetector } from './analysis/goal-detector';
 import { GoalExpander, type ExpandedGoal } from './analysis/goal-expander';
@@ -37,7 +38,7 @@ import { ActionExecutor } from './execution/action-executor';
 import { PageWatcher } from './execution/page-watcher';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
-import type { AICommand, AIDecision, ActionOutcome, CollectedError, ExecutionResult, FunnelPhaseType, GoalContext, GoalGuidance, LiteElement, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, RecoveryPoint, StateDiff, VisionHints } from './lite-types';
+import type { AICommand, AIDecision, ActionOutcome, CollectedError, ExecutionResult, FlowState, FunnelPhaseType, GoalContext, GoalGuidance, LiteElement, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, RecoveryPoint, StateDiff, VisionHints } from './lite-types';
 import { LitePromptBuilder, type TaskPlanContext, type ValidationErrorContext } from './prompt/lite-prompt-builder';
 import { LiteTraceWriter } from './trace/lite-trace-writer';
 
@@ -51,6 +52,8 @@ export class LiteEngine {
   private progressEmitter: TestProgressEmitter;
   private graphBuilder: GraphBuilder; // ✅ NEW: Full graph like Pro
   private goalDetector: GoalDetector; // ✅ NEW: Goal-first detection
+  private flowStateDetector: FlowStateDetector; // ✅ Task #21: Multi-step flow tracking
+  private currentFlowState: FlowState | null = null; // ✅ Task #21: Current flow state
   private traceWriter: LiteTraceWriter; // ✅ NEW: Always-on JSONL trace for debugging
   private semanticWeightCalculator: HybridSemanticWeightCalculator; // ✅ NEW: Hybrid semantic weight (Manus Style)
   private pageWatcher: PageWatcher | null = null; // ✅ Phase A: Multi-tab/popup detection
@@ -110,15 +113,17 @@ export class LiteEngine {
   private currentFunnelPhase: FunnelPhase = FunnelPhase.DISCOVERY;
   private previousFunnelPhase: FunnelPhase | null = null;
   private lastGoalRefinementTime: number = 0;
-  private readonly GOAL_REFINEMENT_COOLDOWN_MS = 5000; // Min time between refinements
+  private readonly _GOAL_REFINEMENT_COOLDOWN_MS = 5000; // Min time between refinements (reserved for future use)
   private consecutiveNoEffectCount: number = 0;
   private activeFrame: import('playwright').Frame | null = null; // L5: Store active frame for iframe execution
 
   // ═══════════════════════════════════════════════════════════════════════════
   // L6: PAGE CREDENTIALS EXTRACTION (one-time for login goals)
+  // PHASE 0.3: Credential auto-fill state machine
   // ═══════════════════════════════════════════════════════════════════════════
   private pageCredentialsAttempted = false; // Only try once per test
   private credentialClarificationAttempted = false; // Only ask user once per test
+  private credentialFillState: 'idle' | 'filling_username' | 'filling_password' | 'submitting' | 'done' = 'idle';
 
   // ═══════════════════════════════════════════════════════════════════════════
   // L7: ADDITIONAL CLARIFICATION GATES
@@ -140,6 +145,7 @@ export class LiteEngine {
     this.consoleCollector = new ConsoleCollector(page);
     this.graphBuilder = new GraphBuilder(); // ✅ NEW: Initialize graph builder
     this.goalDetector = new GoalDetector(config.goal, config.testId); // ✅ NEW: Initialize goal detector with testId for AI fallback
+    this.flowStateDetector = new FlowStateDetector(config.testId, config.goal); // ✅ Task #21: Initialize flow state detector
     this.traceWriter = new LiteTraceWriter({ testId: config.testId }); // ✅ NEW: Initialize trace writer
     this.semanticWeightCalculator = new HybridSemanticWeightCalculator(config.goal, config.testId); // ✅ NEW: Initialize hybrid semantic weight calculator
 
@@ -1109,6 +1115,86 @@ export class LiteEngine {
           },
         });
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // PHASE 0.3 FIX: Check credential auto-fill state FIRST (before all other logic)
+        // If state is active, execute auto-fill command and skip AI decision this iteration
+        // ═══════════════════════════════════════════════════════════════════════
+        if (this.credentialFillState !== 'idle' && this.credentialFillState !== 'done') {
+          const autoCommand = this.buildAutoCredentialCommand(snapshotBefore);
+
+          if (autoCommand) {
+            logger.info('[LITE_ENGINE] Auto-fill active, executing command (skipping AI)', {
+              testId: this.config.testId,
+              state: this.credentialFillState,
+              action: autoCommand.action,
+              iteration: i,
+            });
+
+            // Execute auto-command directly
+            const execResult = await this.executor.execute(autoCommand, snapshotBefore, {});
+
+            // Record iteration with auto-fill
+            const syntheticDiff: StateDiff = {
+              urlChanged: false,
+              urlBefore: snapshotBefore.url,
+              urlAfter: snapshotBefore.url,
+              addedElements: [],
+              removedRefs: [],
+              changedElements: [],
+              hasVisualChange: false,
+              meaningfulChange: false,
+              significantChange: false,
+              semanticWeight: 0,
+              progressSentiment: 'No Effect',
+              newPageErrors: [],
+              newConsoleErrors: [],
+            };
+
+            this.state.recordIteration({
+              iteration: i,
+              decision: {
+                thought: `Auto-fill: ${this.credentialFillState}`,
+                command: autoCommand,
+                done: false,
+              },
+              result: {
+                stateDiff: syntheticDiff,
+                outcome: execResult.success ? 'state_changed' : 'execution_error',
+                success: execResult.success,
+                duration: 0,
+              },
+              stateBefore: {
+                url: snapshotBefore.url,
+                elementCount: snapshotBefore.elements.length,
+                pageErrors: [],
+              },
+              stateAfter: {
+                url: snapshotBefore.url,
+                elementCount: snapshotBefore.elements.length,
+                pageErrors: [],
+              },
+            });
+
+            // Skip rest of this iteration (continue to next)
+            continue;
+          } else {
+            // Can't find element for auto-fill, reset state and let AI handle
+            logger.warn('[LITE_ENGINE] Auto-fill failed (element not found), falling back to AI', {
+              testId: this.config.testId,
+              state: this.credentialFillState,
+            });
+            this.credentialFillState = 'idle';
+            // Continue to normal AI flow below
+          }
+        }
+
+        // ✅ Task #21: Update flow state based on current page
+        this.currentFlowState = this.flowStateDetector.detect(
+          snapshotBefore.url,
+          snapshotBefore.elements,
+          this.currentFlowState || undefined
+        );
+
         // 2b. Build GoalContext for this iteration
         const goalContext = this.buildGoalContext(snapshotBefore, i, stuckCheck);
 
@@ -1159,14 +1245,34 @@ export class LiteEngine {
 
         // ═══════════════════════════════════════════════════════════════════════
         // L6: PAGE CREDENTIALS EXTRACTION (one-time for login goals)
+        // PHASE 0.2: Expanded trigger conditions - fallback to regex and login form detection
         // ═══════════════════════════════════════════════════════════════════════
         const goalForCredentials = this.goalDetector.getParsedGoal();
-        if (
+
+        // Detect login form in snapshot (password input present)
+        const hasLoginForm = snapshotBefore.elements.some(el =>
+          el.tag === 'input' &&
+          el.type === 'password' &&
+          el.visible &&
+          !el.disabled
+        );
+
+        // Multiple trigger conditions (OR logic):
+        // 1. Parsed goal action is 'login' or 'register'
+        // 2. Goal text contains login/auth keywords (regex fallback)
+        // 3. Login form detected in snapshot
+        const shouldExtractCredentials =
           LITE_ENGINE_FLAGS.enablePageCredentialsExtraction &&
           !this.pageCredentialsAttempted &&
           !this.config.credentials &&
-          goalForCredentials?.action === 'login'
-        ) {
+          (
+            goalForCredentials?.action === 'login' ||
+            goalForCredentials?.action === 'register' ||
+            /login|sign.?in|auth|register|sign.?up/i.test(this.config.goal) ||
+            hasLoginForm
+          );
+
+        if (shouldExtractCredentials) {
           this.pageCredentialsAttempted = true;
           const extractedCreds = extractPageCredentials(snapshotBefore, this.config.testId);
 
@@ -1184,6 +1290,12 @@ export class LiteEngine {
               confidence: extractedCreds.confidence,
               sourcePattern: extractedCreds.sourcePattern,
               // SECURITY: Never log actual credential values
+            });
+
+            // PHASE 0.3: Start auto-fill sequence (will execute in NEXT iteration via early check)
+            this.credentialFillState = 'filling_username';
+            logger.info('[LITE_ENGINE] Starting credential auto-fill sequence', {
+              testId: this.config.testId,
             });
           } else {
             logger.debug('[LITE_ENGINE] No page credentials found', {
@@ -1718,52 +1830,46 @@ export class LiteEngine {
           visionHints: visionHints || undefined, // ✅ NEW: L5 Vision hints when DOM is weak
         });
 
-        // ✅ NEW: Trace AI prompt
-        const aiPromptSpanId = this.traceWriter.generateSpanId();
-        this.traceWriter.write({
-          iteration: i,
-          stage: 'ai_decision',
-          eventType: 'ai_prompt',
-          spanId: aiPromptSpanId,
-          parentSpanId: iterationSpanId,
-          payload: {
-            prompt,
-            model: 'gpt-4o-mini', // Main decision model
-            promptLength: prompt.length,
-            estimatedTokens: Math.ceil(prompt.length / 4),
-          },
-        });
+        // ═══════════════════════════════════════════════════════════════════════
+        // PHASE 0.3: Credential auto-fill state machine (bypass AI if active)
+        // ═══════════════════════════════════════════════════════════════════════
+        let decision: AIDecision;
 
-        // 5. Ask AI (returns JSON command, not code)
-        // ✅ FIX: Wrap AI call with cancellation support
-        const decision = await withCancellation(
-          this.config.testId,
-          LitePromptBuilder.askAI(prompt),
-          'LitePromptBuilder.askAI'
-        );
+        if (this.credentialFillState !== 'idle' && this.credentialFillState !== 'done') {
+          // Try to auto-execute credential fill sequence
+          const autoCommand = this.buildAutoCredentialCommand(snapshotBefore);
 
-        // ✅ NEW: Trace AI response (smart redaction: only credential fields)
-        const safeCommand = this.buildSafeCommandForTrace(decision?.command, snapshotBefore);
-        const safeDecision = {
-          ...decision,
-          command: safeCommand,
-        };
-        this.traceWriter.write({
-          iteration: i,
-          stage: 'ai_decision',
-          eventType: 'ai_response',
-          spanId: this.traceWriter.generateSpanId(),
-          parentSpanId: aiPromptSpanId,
-          payload: {
-            decision: safeDecision,
-            thought: decision.thought,
-            command: safeCommand,
-            done: decision.done || false,
-            blocked: decision.blocked,
-            blockedInfo: decision.blockedInfo,
-            analysis: decision.analysis, // ✅ NEW: Include deep analysis if provided
-          },
-        });
+          if (autoCommand) {
+            logger.info('[LITE_ENGINE] Auto-executing credential sequence', {
+              testId: this.config.testId,
+              state: this.credentialFillState,
+              action: autoCommand.action,
+              ref: autoCommand.ref,
+            });
+
+            // Create synthetic AI decision for auto-command
+            decision = {
+              thought: `Auto-filling credentials (state: ${this.credentialFillState})`,
+              command: autoCommand,
+              done: false,
+            };
+
+            // Skip AI call, proceed to execution
+          } else {
+            // Can't find target element, fall back to AI
+            logger.warn('[LITE_ENGINE] Auto-fill failed, falling back to AI', {
+              testId: this.config.testId,
+              state: this.credentialFillState,
+            });
+            this.credentialFillState = 'idle';
+
+            // Continue to normal AI decision
+            decision = await this.getAIDecision(prompt, i, iterationSpanId, snapshotBefore);
+          }
+        } else {
+          // Normal AI decision
+          decision = await this.getAIDecision(prompt, i, iterationSpanId, snapshotBefore);
+        }
 
         // Check terminal states
         if (decision.done) {
@@ -2001,6 +2107,9 @@ export class LiteEngine {
             commandWithCredentials = this.overrideCredentialFillValue(guardedCommand, snapshotBefore);
           }
         }
+
+        // Build safe command for tracing (redact credentials)
+        const safeCommand = this.buildSafeCommandForTrace(commandWithCredentials, snapshotBefore);
 
         // ═══════════════════════════════════════════════════════════════════════
         // L7: CLARIFICATION GATES (payment, upload, external/download)
@@ -3017,12 +3126,21 @@ export class LiteEngine {
       .slice(-5)
       .map(e => ({ message: e.message.slice(0, 100), type: e.type }));
 
+    // ✅ NEW: Get URL change from last state diff for auditor context
+    const lastStateDiff = this.state.getLastStateDiff();
+    const urlBefore = lastStateDiff?.diff.urlBefore;
+    const urlAfter = lastStateDiff?.diff.urlAfter;
+    const urlChanged = lastStateDiff?.diff.urlChanged || false;
+
     return {
       goal: this.config.goal,
       page: {
         url: snapshot.url,
         title: snapshot.title,
       },
+      urlBefore,
+      urlAfter,
+      urlChanged,
       snapshotSummary,
       history: this.state.getFormattedHistory(5), // Last 5 iterations
       lastOutcome: this.state.getLastOutcome(),
@@ -3030,6 +3148,7 @@ export class LiteEngine {
       consecutiveStuckCount: this.state.getConsecutiveStuckCount(),
       recentErrors,
       iteration,
+      flowState: this.currentFlowState || undefined, // ✅ Task #21: Current flow state
     };
   }
 
@@ -4066,6 +4185,139 @@ export class LiteEngine {
       });
       return false;
     }
+  }
+
+  /**
+   * PHASE 0.3: Helper method to extract AI decision logic
+   * Wrapped for easier testing and auto-fill bypass
+   */
+  private async getAIDecision(
+    prompt: string,
+    iteration: number,
+    iterationSpanId: string,
+    snapshotBefore: LiteSnapshot
+  ): Promise<AIDecision> {
+    // Trace AI prompt
+    const aiPromptSpanId = this.traceWriter.generateSpanId();
+    this.traceWriter.write({
+      iteration,
+      stage: 'ai_decision',
+      eventType: 'ai_prompt',
+      spanId: aiPromptSpanId,
+      parentSpanId: iterationSpanId,
+      payload: {
+        prompt,
+        model: 'gpt-4o-mini',
+        promptLength: prompt.length,
+        estimatedTokens: Math.ceil(prompt.length / 4),
+      },
+    });
+
+    // Ask AI
+    const decision = await withCancellation(
+      this.config.testId,
+      LitePromptBuilder.askAI(prompt),
+      'LitePromptBuilder.askAI'
+    );
+
+    // Trace AI response (with redaction)
+    const safeCommand = this.buildSafeCommandForTrace(decision?.command, snapshotBefore);
+    const safeDecision = {
+      ...decision,
+      command: safeCommand,
+    };
+    this.traceWriter.write({
+      iteration,
+      stage: 'ai_decision',
+      eventType: 'ai_response',
+      spanId: this.traceWriter.generateSpanId(),
+      parentSpanId: aiPromptSpanId,
+      payload: {
+        decision: safeDecision,
+        thought: decision.thought,
+        command: safeCommand,
+        done: decision.done || false,
+        blocked: decision.blocked,
+        blockedInfo: decision.blockedInfo,
+        analysis: decision.analysis,
+      },
+    });
+
+    return decision;
+  }
+
+  /**
+   * PHASE 0.3: Build auto-credential command based on current fill state
+   * Returns command if target element found, null otherwise
+   */
+  private buildAutoCredentialCommand(snapshot: LiteSnapshot): AICommand | null {
+    const { username, password } = this.config.credentials || {};
+
+    switch (this.credentialFillState) {
+      case 'filling_username': {
+        // Find username field
+        const usernameField = snapshot.elements.find(el => {
+          if (el.tag !== 'input' || !el.visible || el.disabled) return false;
+
+          const classification = classifyField(el);
+          return (
+            classification.kind === 'username' ||
+            classification.kind === 'email'
+          ) && !el.hasValue; // Don't fill if already filled
+        });
+
+        if (usernameField && username) {
+          this.credentialFillState = 'filling_password';
+          return { action: 'fill', ref: usernameField.ref, value: username };
+        }
+
+        // Skip to password if username field not found or no username
+        this.credentialFillState = 'filling_password';
+        return this.buildAutoCredentialCommand(snapshot);
+      }
+
+      case 'filling_password': {
+        // Find password field
+        const passwordField = snapshot.elements.find(el => {
+          if (el.tag !== 'input' || !el.visible || el.disabled) return false;
+
+          const classification = classifyField(el);
+          return classification.kind === 'password' && !el.hasValue;
+        });
+
+        if (passwordField && password) {
+          this.credentialFillState = 'submitting';
+          return { action: 'fill', ref: passwordField.ref, value: password };
+        }
+
+        // Can't find password field
+        break;
+      }
+
+      case 'submitting': {
+        // Find submit button
+        const submitButton = snapshot.elements.find(el => {
+          if (!el.visible || el.disabled) return false;
+
+          const isButton = el.role === 'button' || el.tag === 'button' ||
+            (el.tag === 'input' && el.type === 'submit');
+
+          const hasSubmitText = /submit|login|sign.?in|log.?in|continue|enter|next/i.test(el.name);
+
+          return isButton && hasSubmitText;
+        });
+
+        if (submitButton) {
+          this.credentialFillState = 'done';
+          return { action: 'click', ref: submitButton.ref };
+        }
+
+        // Can't find submit button
+        break;
+      }
+    }
+
+    return null;
   }
 
 }

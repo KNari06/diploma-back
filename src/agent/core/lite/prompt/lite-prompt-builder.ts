@@ -235,6 +235,25 @@ IMPORTANT RULES:
     - Element disabled or hidden (check [DISABLED] flag)
     - If click fails on button, try pressing Enter on a focused input instead
 15. ✅ STATE DRIFT REASONING: Always analyze STATE DRIFT ANALYSIS section above. If URL and DOM unchanged after action, it FAILED - try different element/approach. Success = state changed.
+16. ✅ LOGIN/REGISTER SUCCESS DETECTION: For login/register goals, if STATE DRIFT shows URL changed from auth page (login, signin, register, auth) to non-auth page, this indicates SUCCESSFUL authentication - BUT check for intermediate steps first:
+
+    ✅ SUCCESS if URL changed to: dashboard, home, profile, welcome, account, app, user, my-account, logged-in, or any page WITHOUT intermediate step keywords
+
+    ❌ NOT SUCCESS if URL contains intermediate step keywords:
+    - reset, forgot, password-reset, recover (password reset flow)
+    - verify, verification, confirm, activate (email/phone verification)
+    - 2fa, mfa, otp, code, authenticator (2-factor auth)
+    - complete-profile, onboarding, setup (profile completion)
+    - error, invalid, denied, failed (error pages)
+
+    Examples:
+    - /login → /dashboard = SUCCESS ✅
+    - /signin → /logged-in-successfully = SUCCESS ✅
+    - /login → /reset-password = NOT SUCCESS ❌ (intermediate step)
+    - /login → /verify-email = NOT SUCCESS ❌ (intermediate step)
+    - /register → /complete-profile = NOT SUCCESS ❌ (intermediate step)
+
+    If intermediate step detected, continue with the flow (fill verification code, complete profile, etc.).
 
 RESPONSE FORMAT (JSON ONLY):
 You MUST respond with a Deep Reasoning Chain format:
@@ -250,6 +269,7 @@ You MUST respond with a Deep Reasoning Chain format:
 
 Special responses:
 - If goal is achieved: { "done": true, "thought": "Goal completed because..." }
+  Example for login: { "done": true, "thought": "Login successful - URL changed from /login to /dashboard" }
 - If blocked (login required, captcha, verification code needed):
   { "blockedInfo": { "reason": "CAPTCHA detected", "canUserHelp": true }, "thought": "..." }
 
