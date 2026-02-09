@@ -13,7 +13,7 @@ import { logger } from '@/utils/core/logger';
 
 /**
  * Service for managing test flows
- * Flows represent scenarios within a suite (Happy path, Error handling)
+ * Flows represent scenarios within a module (Happy path, Error handling)
  */
 export class FlowService {
   /**
@@ -23,7 +23,7 @@ export class FlowService {
    */
   static async create(params: CreateTestFlowParams): Promise<TestFlow> {
     const {
-      suiteId,
+      moduleId,
       userId,
       name,
       description,
@@ -36,7 +36,7 @@ export class FlowService {
     } = params;
 
     logger.info('[FLOW_SERVICE] Creating flow', {
-      suiteId,
+      moduleId,
       userId,
       name,
     });
@@ -47,7 +47,7 @@ export class FlowService {
       const { data: maxOrder } = await supabaseAdmin
         .from('test_flows')
         .select('order_index')
-        .eq('suite_id', suiteId)
+        .eq('module_id', moduleId)
         .order('order_index', { ascending: false })
         .limit(1)
         .single();
@@ -58,7 +58,7 @@ export class FlowService {
     const { data, error } = await supabaseAdmin
       .from('test_flows')
       .insert({
-        suite_id: suiteId,
+        module_id: moduleId,
         user_id: userId,
         name,
         description: description || null,
@@ -106,24 +106,24 @@ export class FlowService {
   }
 
   /**
-   * List flows for a suite
-   * @param suiteId - Suite ID
+   * List flows for a module
+   * @param moduleId - Module ID
    * @param userId - User ID for access control
    * @returns List of flows ordered by order_index
    */
-  static async listBySuite(
-    suiteId: string,
+  static async listByModule(
+    moduleId: string,
     userId: string
   ): Promise<TestFlow[]> {
     const { data, error } = await supabaseAdmin
       .from('test_flows')
       .select('*')
-      .eq('suite_id', suiteId)
+      .eq('module_id', moduleId)
       .eq('user_id', userId)
       .order('order_index', { ascending: true });
 
     if (error) {
-      logger.error('[FLOW_SERVICE] Failed to list flows', { error, suiteId });
+      logger.error('[FLOW_SERVICE] Failed to list flows', { error, moduleId });
       throw new Error(`Failed to list flows: ${error.message}`);
     }
 
@@ -208,17 +208,17 @@ export class FlowService {
   }
 
   /**
-   * Reorder flows within a suite
-   * @param suiteId - Suite ID
+   * Reorder flows within a module
+   * @param moduleId - Module ID
    * @param flowIds - Array of flow IDs in desired order
    * @param userId - User ID for access control
    */
   static async reorder(
-    suiteId: string,
+    moduleId: string,
     flowIds: string[],
     userId: string
   ): Promise<void> {
-    logger.info('[FLOW_SERVICE] Reordering flows', { suiteId, count: flowIds.length });
+    logger.info('[FLOW_SERVICE] Reordering flows', { moduleId, count: flowIds.length });
 
     // Update each flow's order_index
     const updates = flowIds.map((flowId, index) =>
@@ -226,7 +226,7 @@ export class FlowService {
         .from('test_flows')
         .update({ order_index: index })
         .eq('id', flowId)
-        .eq('suite_id', suiteId)
+        .eq('module_id', moduleId)
         .eq('user_id', userId)
     );
 
@@ -288,7 +288,7 @@ export class FlowService {
   private static mapToTestFlow(row: any): TestFlow {
     return {
       id: row.id,
-      suiteId: row.suite_id,
+      moduleId: row.module_id,
       userId: row.user_id,
       name: row.name,
       description: row.description || undefined,

@@ -20,13 +20,13 @@ const router = Router();
  * @swagger
  * /api/v1/flows:
  *   get:
- *     summary: List flows for a suite
+ *     summary: List flows for a module
  *     tags: [Flows]
  *     security:
  *       - bearerAuth: []
  *     parameters:
  *       - in: query
- *         name: suiteId
+ *         name: moduleId
  *         required: true
  *         schema:
  *           type: string
@@ -35,11 +35,10 @@ const router = Router();
  *       200:
  *         description: List of flows
  *   post:
- *     summary: Create a new flow (with optional moduleId for auto-suite resolution)
+ *     summary: Create a new flow
  *     description: |
- *       Create a new test flow. You can either:
- *       - Provide `suiteId` to create flow under existing suite
- *       - Provide `moduleId` to auto-create/resolve Default suite and create 1 initial test case
+ *       Create a new test flow under a module.
+ *       Provide `moduleId` to create flow and optionally create 1 initial test case.
  *
  *       When `moduleId` is provided with `baseUrl`, the baseUrl is stored as `startUrl`
  *       and `url` in the auto-created intent test case, enabling the editor to reopen
@@ -56,14 +55,10 @@ const router = Router();
  *             required:
  *               - name
  *             properties:
- *               suiteId:
- *                 type: string
- *                 format: uuid
- *                 description: Suite ID (either suiteId or moduleId required, not both)
  *               moduleId:
  *                 type: string
  *                 format: uuid
- *                 description: Module ID - will auto-create Default suite and initial test case
+ *                 description: Module ID (required) - will create flow under this module and optionally create initial test case
  *               name:
  *                 type: string
  *                 description: Flow name
@@ -132,7 +127,7 @@ router.post('/', requireAuth, createFlow);
  * @swagger
  * /api/v1/flows/reorder:
  *   post:
- *     summary: Reorder flows within a suite
+ *     summary: Reorder flows within a module
  *     tags: [Flows]
  *     security:
  *       - bearerAuth: []
@@ -143,10 +138,10 @@ router.post('/', requireAuth, createFlow);
  *           schema:
  *             type: object
  *             required:
- *               - suiteId
+ *               - moduleId
  *               - flowIds
  *             properties:
- *               suiteId:
+ *               moduleId:
  *                 type: string
  *                 format: uuid
  *               flowIds:

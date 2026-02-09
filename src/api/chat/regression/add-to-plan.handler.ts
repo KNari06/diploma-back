@@ -2,11 +2,11 @@
  * ADD TO PLAN HANDLER - Add Items to Regression Plan
  *
  * Handles the 'add_to_plan' intent detected by AI intent parser.
- * Adds modules, suites, flows, or test cases to an existing plan.
+ * Adds modules, flows, or test cases to an existing plan.
  *
  * Triggered by:
  * - "add module Orders to plan Pre-release"
- * - "add suite Checkout to regression plan"
+ * - "add flow Checkout to regression plan"
  * - "добавь модуль Orders в план"
  */
 
@@ -15,14 +15,13 @@ import { RegressionPlanService } from '@/services/testing/plans/regression-plan.
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
-import { getLocalizedMessages } from './localization';
 
 /**
  * Handler for add_to_plan intent
  * Adds items to an existing regression plan
  */
 export async function handleAddToPlanIntent(
-  req: Request,
+  _req: Request,
   res: Response,
   params: {
     message: string;
@@ -39,7 +38,6 @@ export async function handleAddToPlanIntent(
   const { parsedIntent, userId, workspace_id } = params;
 
   const userLanguage = parsedIntent?.userLanguage || 'neutral';
-  const localized = getLocalizedMessages(userLanguage);
 
   try {
     logger.info('[ADD_TO_PLAN_HANDLER] Processing add to plan intent', {
@@ -51,7 +49,6 @@ export async function handleAddToPlanIntent(
     const planId = parsedIntent?.planId;
     const planName = parsedIntent?.planName;
     const moduleName = parsedIntent?.moduleName;
-    const suiteName = parsedIntent?.suiteName;
     const flowName = parsedIntent?.flowName;
 
     // Get project from workspace
@@ -118,27 +115,6 @@ export async function handleAddToPlanIntent(
       }
     }
 
-    // Add suite
-    if (suiteName) {
-      const { data: suite } = await supabaseAdmin
-        .from('regression_suites')
-        .select('id, name')
-        .eq('project_id', project.id)
-        .ilike('name', suiteName)
-        .limit(1)
-        .single();
-
-      if (suite) {
-        addedItem = await RegressionPlanService.addItem({
-          planId: targetPlanId,
-          itemType: 'suite',
-          suiteId: suite.id,
-        });
-      } else {
-        throw new NotFoundError('Suite', suiteName);
-      }
-    }
-
     // Add flow
     if (flowName) {
       const { data: flow } = await supabaseAdmin
@@ -163,8 +139,8 @@ export async function handleAddToPlanIntent(
       res.json({
         success: true,
         message: userLanguage === 'ru'
-          ? 'Укажите что добавить (модуль, suite или flow)'
-          : 'Please specify what to add (module, suite, or flow)',
+          ? 'Укажите что добавить (модуль или flow)'
+          : 'Please specify what to add (module or flow)',
         data: {
           needsClarification: true,
           question: 'What would you like to add to the plan?',
@@ -206,7 +182,7 @@ export async function handleAddToPlanIntent(
 
     res.status(500).json({
       success: false,
-      error: localized.createSuite?.error || 'Failed to add to plan',
+      error: 'Failed to add to plan',
       details: error instanceof Error ? error.message : 'Unknown error',
     });
   }

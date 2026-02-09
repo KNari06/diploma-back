@@ -32,10 +32,10 @@ async function validateFlowLink(params: {
 }): Promise<{ valid: boolean; error?: string }> {
   const { flowId, userId, projectId } = params;
 
-  // Get flow with its suite to check project
+  // Get flow with its module to check project
   const { data: flow, error } = await supabaseAdmin
     .from('test_flows')
-    .select('id, user_id, suite_id, regression_suites(project_id)')
+    .select('id, user_id, module_id, test_modules(project_id)')
     .eq('id', flowId)
     .single();
 
@@ -48,9 +48,9 @@ async function validateFlowLink(params: {
     return { valid: false, error: 'Flow does not belong to user' };
   }
 
-  // Check project match via suite
-  const suiteProjectId = (flow as any).regression_suites?.project_id;
-  if (suiteProjectId !== projectId) {
+  // Check project match via module
+  const moduleProjectId = (flow as any).test_modules?.project_id;
+  if (moduleProjectId !== projectId) {
     return { valid: false, error: 'Flow does not belong to the specified project' };
   }
 

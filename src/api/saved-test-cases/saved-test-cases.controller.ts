@@ -199,7 +199,7 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
       if (flowId) {
         const { data: flow, error: flowError } = await supabaseAdmin
           .from('test_flows')
-          .select('id, regression_suites!inner(project_id, user_id)')
+          .select('id, module_id, test_modules!inner(project_id)')
           .eq('id', flowId)
           .eq('user_id', userId)
           .single();
@@ -209,7 +209,7 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
           return;
         }
 
-        const flowProjectId = (flow as any).regression_suites?.project_id;
+        const flowProjectId = (flow as any).test_modules?.project_id;
         if (!flowProjectId || flowProjectId !== (existing as any).project_id) {
           res.status(422).json({
             success: false,
@@ -316,10 +316,10 @@ export async function assignToFlow(req: AuthenticatedRequest, res: Response): Pr
       return;
     }
 
-    // Verify flow exists and belongs to user + same project via suite
+    // Verify flow exists and belongs to user + same project via module
     const { data: flow, error: flowError } = await supabaseAdmin
       .from('test_flows')
-      .select('id, regression_suites!inner(project_id, user_id)')
+      .select('id, module_id, test_modules!inner(project_id)')
       .eq('id', flowId)
       .eq('user_id', userId)
       .single();
@@ -329,7 +329,7 @@ export async function assignToFlow(req: AuthenticatedRequest, res: Response): Pr
       return;
     }
 
-    const flowProjectId = (flow as any).regression_suites?.project_id;
+    const flowProjectId = (flow as any).test_modules?.project_id;
     if (!flowProjectId || flowProjectId !== (savedCase as any).project_id) {
       res.status(422).json({
         success: false,

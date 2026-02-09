@@ -2,7 +2,7 @@
  * CREATE PLAN HANDLER - Regression Plan Creation
  *
  * Handles the 'create_plan' intent detected by AI intent parser.
- * Creates a new regression plan with specified modules/suites.
+ * Creates a new regression plan with specified modules.
  *
  * Triggered by:
  * - "create plan from Auth and Payments"
@@ -15,14 +15,13 @@ import { RegressionPlanService } from '@/services/testing/plans/regression-plan.
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
-import { getLocalizedMessages } from './localization';
 
 /**
  * Handler for create_plan intent
  * Creates a regression plan from specified items
  */
 export async function handleCreatePlanIntent(
-  req: Request,
+  _req: Request,
   res: Response,
   params: {
     message: string;
@@ -39,7 +38,6 @@ export async function handleCreatePlanIntent(
   const { parsedIntent, userId, workspace_id } = params;
 
   const userLanguage = parsedIntent?.userLanguage || 'neutral';
-  const localized = getLocalizedMessages(userLanguage);
 
   try {
     logger.info('[CREATE_PLAN_HANDLER] Processing create plan intent', {
@@ -50,7 +48,6 @@ export async function handleCreatePlanIntent(
     // Extract plan details from parsed intent
     const planName = parsedIntent?.suggestedName || parsedIntent?.planName;
     const moduleNames = parsedIntent?.moduleNames || [];
-    const suiteNames = parsedIntent?.suiteNames || [];
     const description = parsedIntent?.description;
 
     if (!planName) {
@@ -109,30 +106,10 @@ export async function handleCreatePlanIntent(
       }
     }
 
-    // Add suites if specified
-    for (const suiteName of suiteNames) {
-      const { data: suite } = await supabaseAdmin
-        .from('regression_suites')
-        .select('id')
-        .eq('project_id', project.id)
-        .ilike('name', suiteName)
-        .limit(1)
-        .single();
-
-      if (suite) {
-        await RegressionPlanService.addItem({
-          planId: plan.id,
-          itemType: 'suite',
-          suiteId: suite.id,
-        });
-      }
-    }
-
     logger.info('[CREATE_PLAN_HANDLER] Plan created', {
       planId: plan.id,
       planName,
       modulesAdded: moduleNames.length,
-      suitesAdded: suiteNames.length,
     });
 
     res.json({
@@ -143,7 +120,7 @@ export async function handleCreatePlanIntent(
       data: {
         planId: plan.id,
         planName: plan.name,
-        itemsAdded: moduleNames.length + suiteNames.length,
+        itemsAdded: moduleNames.length,
       },
       timestamp: new Date().toISOString(),
       sessionId: params.chatSessionId,
@@ -161,7 +138,7 @@ export async function handleCreatePlanIntent(
 
     res.status(500).json({
       success: false,
-      error: localized.createSuite?.error || 'Failed to create plan',
+      error: 'Failed to create plan',
       details: error instanceof Error ? error.message : 'Unknown error',
     });
   }

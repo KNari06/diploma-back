@@ -18,15 +18,9 @@ interface LocalizedMessages {
     success: (name: string, id: string, paramsCount: number) => string;
     error: string;
   };
-  createSuite: {
-    noTestCases: string;
-    success: (name: string, id: string, count: number) => string;
-    error: string;
-  };
   runRegression: {
     noId: string;
     testStarted: (runId: string, testId: string) => string;
-    suiteStarted: (runId: string, count: number) => string;
     error: string;
   };
 }
@@ -39,18 +33,10 @@ const messages: Record<Language, LocalizedMessages> = {
         `✅ Test saved successfully!\n\n**Name:** ${name}\n**ID:** ${id}\n**Parameters:** ${paramsCount}\n\nYou can run this test with: "run saved test ${id}"`,
       error: 'Failed to save test. Please try again.',
     },
-    createSuite: {
-      noTestCases: 'To create a suite, you need saved test case IDs. Please save some tests first or provide test case IDs.',
-      success: (name, id, count) =>
-        `✅ Regression suite created successfully!\n\n**Name:** ${name}\n**ID:** ${id}\n**Test cases:** ${count}\n\nYou can run this suite with: "run suite ${id}"`,
-      error: 'Failed to create suite. Please try again.',
-    },
     runRegression: {
-      noId: 'To run a regression test, you need a saved test case ID or suite ID.',
+      noId: 'To run a regression test, you need a saved test case ID.',
       testStarted: (runId, testId) =>
         `✅ Saved test started!\n\n**Run ID:** ${runId}\n**Test ID:** ${testId}\n\nThe test is running in the background. You will receive results when it completes.`,
-      suiteStarted: (runId, count) =>
-        `✅ Regression suite started!\n\n**Run ID:** ${runId}\n**Tests:** ${count}\n\nTests are running in the background. You will receive results when they complete.`,
       error: 'Failed to run regression test. Please try again.',
     },
   },
@@ -61,18 +47,10 @@ const messages: Record<Language, LocalizedMessages> = {
         `✅ Тест успешно сохранен!\n\n**Название:** ${name}\n**ID:** ${id}\n**Параметры:** ${paramsCount}\n\nВы можете запустить этот тест командой: "run saved test ${id}"`,
       error: 'Не удалось сохранить тест. Пожалуйста, попробуйте снова.',
     },
-    createSuite: {
-      noTestCases: 'Для создания набора тестов нужны ID сохраненных тест-кейсов. Сначала сохраните несколько тестов или укажите ID тест-кейсов.',
-      success: (name, id, count) =>
-        `✅ Regression suite успешно создан!\n\n**Название:** ${name}\n**ID:** ${id}\n**Тест-кейсов:** ${count}\n\nВы можете запустить этот набор командой: "run suite ${id}"`,
-      error: 'Не удалось создать набор тестов. Пожалуйста, попробуйте снова.',
-    },
     runRegression: {
-      noId: 'Для запуска regression теста нужен ID сохраненного теста или набора тестов.',
+      noId: 'Для запуска regression теста нужен ID сохраненного теста.',
       testStarted: (runId, testId) =>
         `✅ Запущен сохраненный тест!\n\n**Run ID:** ${runId}\n**Test ID:** ${testId}\n\nТест выполняется в фоне. Вы получите результаты когда он завершится.`,
-      suiteStarted: (runId, count) =>
-        `✅ Запущен regression suite!\n\n**Run ID:** ${runId}\n**Тестов:** ${count}\n\nТесты выполняются в фоне. Вы получите результаты когда они завершатся.`,
       error: 'Не удалось запустить regression тест. Пожалуйста, попробуйте снова.',
     },
   },
@@ -83,18 +61,10 @@ const messages: Record<Language, LocalizedMessages> = {
         `✅ Test saved successfully!\n\n**Name:** ${name}\n**ID:** ${id}\n**Parameters:** ${paramsCount}\n\nYou can run this test with: "run saved test ${id}"`,
       error: 'Failed to save test. Please try again.',
     },
-    createSuite: {
-      noTestCases: 'To create a suite, you need saved test case IDs. Please save some tests first or provide test case IDs.',
-      success: (name, id, count) =>
-        `✅ Regression suite created successfully!\n\n**Name:** ${name}\n**ID:** ${id}\n**Test cases:** ${count}\n\nYou can run this suite with: "run suite ${id}"`,
-      error: 'Failed to create suite. Please try again.',
-    },
     runRegression: {
-      noId: 'To run a regression test, you need a saved test case ID or suite ID.',
+      noId: 'To run a regression test, you need a saved test case ID.',
       testStarted: (runId, testId) =>
         `✅ Saved test started!\n\n**Run ID:** ${runId}\n**Test ID:** ${testId}\n\nThe test is running in the background. You will receive results when it completes.`,
-      suiteStarted: (runId, count) =>
-        `✅ Regression suite started!\n\n**Run ID:** ${runId}\n**Tests:** ${count}\n\nTests are running in the background. You will receive results when they complete.`,
       error: 'Failed to run regression test. Please try again.',
     },
   },

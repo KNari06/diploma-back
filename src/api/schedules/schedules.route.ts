@@ -65,9 +65,6 @@ const router = Router();
  *               moduleId:
  *                 type: string
  *                 format: uuid
- *               suiteId:
- *                 type: string
- *                 format: uuid
  *               planId:
  *                 type: string
  *                 format: uuid

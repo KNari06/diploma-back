@@ -129,141 +129,6 @@ export class RegressionRunService {
   }
 
   /**
-   * Run a regression suite (all test cases in order)
-   *
-   * @param params.suiteId - ID of suite to run
-   * @param params.userId - User ID for ownership verification
-   * @param params.trigger - Trigger type ('manual' or 'chat')
-   * @param params.parameters - Runtime parameters applied to all test cases
-   * @returns Regression run ID and array of underlying test IDs
-   * @throws {NotFoundError} If suite not found
-   * @throws {ValidationError} If validation fails or access denied
-   */
-  static async runSuite(params: {
-    suiteId: string;
-    userId: string;
-    trigger: 'manual' | 'chat' | 'scheduled';
-    parameters?: Record<string, any>;
-  }): Promise<{
-    runId: string;
-    testIds: string[];
-  }> {
-    const { suiteId, userId, trigger, parameters = {} } = params;
-
-    try {
-      logger.info('[REGRESSION_RUN] Running suite', { suiteId, userId, trigger });
-
-      // 1. Get suite with test cases
-      const { suite, testCases } = await this.getSuiteWithCases(suiteId, userId);
-
-      if (testCases.length === 0) {
-        throw new ValidationError('Suite has no test cases');
-      }
-
-      // 2. Create regression run record
-      const { data: run, error: runError } = await supabaseAdmin
-        .from('regression_runs')
-        .insert({
-          suite_id: suiteId,
-          project_id: suite.project_id,
-          user_id: userId,
-          trigger,
-          status: 'running',
-        })
-        .select('id')
-        .single();
-
-      if (runError || !run) {
-        throw new Error(`Failed to create suite run: ${runError?.message}`);
-      }
-
-      // 3. Execute each test case in order
-      const testIds: string[] = [];
-      const errors: string[] = [];
-
-      for (const testCase of testCases) {
-        try {
-          const testRequest = await this.buildTestRequest(testCase, userId, parameters);
-          const testResult = await ManualTestService.runTest(testRequest);
-
-          if (testResult.success && testResult.data?.id) {
-            testIds.push(testResult.data.id);
-          } else {
-            const errorMsg = `Test case ${testCase.name} failed to start`;
-            errors.push(errorMsg);
-            logger.warn('[REGRESSION_RUN] Test case failed to start', {
-              testCaseId: testCase.id,
-              testCaseName: testCase.name,
-            });
-          }
-        } catch (error) {
-          const errorMsg = `Error running test case ${testCase.name}: ${
-            error instanceof Error ? error.message : String(error)
-          }`;
-          errors.push(errorMsg);
-          logger.error('[REGRESSION_RUN] Failed to run test case in suite', {
-            error,
-            testCaseId: testCase.id,
-            suiteId,
-          });
-          // Continue with next test case even if one fails
-        }
-      }
-
-      // ✅ Improved: Check if any tests were started
-      if (testIds.length === 0) {
-        // All tests failed - mark run as failed immediately
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({
-            status: 'failed',
-            summary: {
-              total: testCases.length,
-              started: 0,
-              errors,
-            },
-            completed_at: new Date().toISOString(),
-          })
-          .eq('id', run.id);
-
-        throw new ValidationError(
-          `Failed to start any tests in suite. Errors: ${errors.join('; ')}`
-        );
-      }
-
-      // 4. Update regression run with test_ids for status tracking
-      const { error: updateError } = await supabaseAdmin
-        .from('regression_runs')
-        .update({ test_ids: testIds })
-        .eq('id', run.id);
-
-      if (updateError) {
-        logger.warn('[REGRESSION_RUN] Failed to update run with test_ids', {
-          error: updateError,
-          runId: run.id,
-          testIds,
-        });
-      }
-
-      logger.info('[REGRESSION_RUN] Suite execution started', {
-        runId: run.id,
-        testIds,
-        totalCases: testCases.length,
-        started: testIds.length,
-        failed: errors.length,
-      });
-
-      return {
-        runId: run.id,
-        testIds,
-      };
-    } catch (error) {
-      logger.error('[REGRESSION_RUN] Failed to run suite', { error, suiteId });
-      throw error;
-    }
-  }
-
-  /**
    * Get intent test case and verify access
    * Now fetches from intent_test_cases (unified table).
    *
@@ -294,50 +159,6 @@ export class RegressionRunService {
   }
 
   /**
-   * Get suite with all test cases
-   * Now fetches test cases from intent_test_cases (unified table).
-   *
-   * @throws {NotFoundError} If suite not found
-   * @throws {ValidationError} If access denied
-   */
-  private static async getSuiteWithCases(
-    suiteId: string,
-    userId: string
-  ): Promise<{ suite: any; testCases: any[] }> {
-    // Get suite
-    const { data: suite, error: suiteError } = await supabaseAdmin
-      .from('regression_suites')
-      .select('*, projects!inner(user_id)')
-      .eq('id', suiteId)
-      .single();
-
-    if (suiteError || !suite) {
-      throw new NotFoundError('Suite', suiteId);
-    }
-
-    // Verify user has access via project ownership
-    const projectUserId = (suite.projects as any)?.user_id;
-    if (!projectUserId || projectUserId !== userId) {
-      throw new ValidationError('Access denied to this suite');
-    }
-
-    // Get test cases from intent_test_cases via suite items
-    const { data: items, error: itemsError } = await supabaseAdmin
-      .from('regression_suite_items')
-      .select('*, intent_test_cases(*)')
-      .eq('suite_id', suiteId)
-      .order('order_index', { ascending: true });
-
-    if (itemsError) {
-      throw new Error(`Failed to get suite items: ${itemsError.message}`);
-    }
-
-    const testCases = (items || []).map((item: any) => item.intent_test_cases);
-
-    return { suite, testCases };
-  }
-
-  /**
    * Build test request from intent test case
    * Constructs a test execution request with parameterized values.
    * Uses url field with fallback to start_url for compatibility.
@@ -360,12 +181,27 @@ export class RegressionRunService {
 
     // Extract commands based on strategy
     if (intentCase.replay_strategy === 'commands' && intentCase.commands) {
-      commands = this.applyParameters(intentCase.commands, parameters);
+      commands = intentCase.commands;
     } else if (intentCase.replay_strategy === 'graph_extract' && intentCase.graph_ref?.steps) {
-      commands = this.applyParameters(intentCase.graph_ref.steps, parameters);
+      commands = intentCase.graph_ref.steps;
     } else {
       throw new ValidationError('Intent test case has no replayable data');
     }
+
+    // Resolve shared_steps references BEFORE applying parameters
+    const { SharedStepResolverService } = await import('../shared-steps/shared-step-resolver.service');
+    const { commands: resolvedCommands, warnings } =
+      await SharedStepResolverService.resolveCommands(commands, intentCase.project_id);
+
+    if (warnings.length > 0) {
+      logger.warn('[REGRESSION_RUN] Shared step resolution warnings', {
+        intentTestCaseId: intentCase.id,
+        warnings,
+      });
+    }
+
+    // Apply parameters AFTER resolution (so parent parameters apply to all expanded commands)
+    commands = this.applyParameters(resolvedCommands, parameters);
 
     // Validate URL exists (with fallback to start_url)
     const targetUrl = intentCase.url || intentCase.start_url;
@@ -488,39 +324,6 @@ export class RegressionRunService {
   }
 
   /**
-   * List suites for project
-   *
-   * @param projectId - Project ID to list suites for
-   * @param userId - User ID for ownership verification
-   * @param limit - Maximum number of results (default: 50, max: 500)
-   * @returns List of regression suites
-   */
-  static async listSuites(
-    projectId: string,
-    userId: string,
-    limit: number = DEFAULT_LIST_LIMIT
-  ): Promise<any[]> {
-    // Verify access
-    await this.verifyProjectAccess(projectId, userId);
-
-    // Apply limit bounds
-    const safeLimit = Math.min(Math.max(limit, 1), MAX_LIST_LIMIT);
-
-    const { data: suites, error } = await supabaseAdmin
-      .from('regression_suites')
-      .select('*')
-      .eq('project_id', projectId)
-      .order('created_at', { ascending: false})
-      .limit(safeLimit);
-
-    if (error) {
-      throw new Error(`Failed to list suites: ${error.message}`);
-    }
-
-    return suites || [];
-  }
-
-  /**
    * List runs for project
    *
    * @param projectId - Project ID to list runs for
@@ -638,7 +441,6 @@ export class RegressionRunService {
           testCaseId: tc.testCaseId,
           testType: tc.testType,
           moduleId: tc.moduleId,
-          suiteId: tc.suiteId,
           flowId: tc.flowId,
         }))
       );
@@ -714,26 +516,15 @@ export class RegressionRunService {
         platformKey,
       });
 
-      // 2. Get all suites in module
-      const { data: suites } = await supabaseAdmin
-        .from('regression_suites')
-        .select('id')
-        .eq('module_id', moduleId);
-
-      const suiteIds = (suites || []).map((s: any) => s.id);
-      if (suiteIds.length === 0) {
-        throw new ValidationError('Module has no suites');
-      }
-
-      // 3. Get all flows in suites
+      // 2. Get all flows in module
       const { data: flows } = await supabaseAdmin
         .from('test_flows')
         .select('id')
-        .in('suite_id', suiteIds);
+        .eq('module_id', moduleId);
 
       const flowIds = (flows || []).map((f: any) => f.id);
 
-      // 4. Get all test cases in flows
+      // 3. Get all test cases in flows
       const testCases = await this.getTestCasesInFlows(flowIds);
 
       if (testCases.length === 0) {
@@ -767,7 +558,6 @@ export class RegressionRunService {
           testCaseId: tc.testCaseId,
           testType: tc.testType,
           moduleId: tc.moduleId,
-          suiteId: tc.suiteId,
           flowId: tc.flowId,
         })),
         userId,
@@ -811,7 +601,7 @@ export class RegressionRunService {
       // 1. Get flow and verify access
       const { data: flow, error: flowError } = await supabaseAdmin
         .from('test_flows')
-        .select('*, regression_suites!inner(project_id, module_id, projects!inner(user_id))')
+        .select('*, test_modules!inner(project_id, projects!inner(user_id))')
         .eq('id', flowId)
         .single();
 
@@ -819,8 +609,8 @@ export class RegressionRunService {
         throw new NotFoundError('Flow', flowId);
       }
 
-      const suite = flow.regression_suites as any;
-      if (suite?.projects?.user_id !== userId) {
+      const module = flow.test_modules as any;
+      if (module?.projects?.user_id !== userId) {
         throw new ValidationError('Access denied to this flow');
       }
 
@@ -836,9 +626,8 @@ export class RegressionRunService {
         .from('regression_runs')
         .insert({
           flow_id: flowId,
-          suite_id: flow.suite_id,
-          module_id: suite.module_id,
-          project_id: suite.project_id,
+          module_id: flow.module_id,
+          project_id: module.project_id,
           user_id: userId,
           trigger,
           status: 'running',
@@ -860,7 +649,6 @@ export class RegressionRunService {
           testCaseId: tc.testCaseId,
           testType: tc.testType,
           moduleId: tc.moduleId,
-          suiteId: tc.suiteId,
           flowId: tc.flowId,
         })),
         userId,
@@ -1084,54 +872,26 @@ export class RegressionRunService {
     testCaseId: string;
     testType: 'ui' | 'api';
     moduleId?: string;
-    suiteId?: string;
     flowId?: string;
   }>> {
     if (flowIds.length === 0) {
       return [];
     }
 
-    // Map flow -> suite
+    // Map flow -> module (direct, no suite intermediary)
     const { data: flows, error: flowsError } = await supabaseAdmin
       .from('test_flows')
-      .select('id, suite_id')
+      .select('id, module_id')
       .in('id', flowIds);
 
     if (flowsError) {
       throw new Error(`Failed to load flows: ${flowsError.message}`);
     }
 
-    const flowToSuite = new Map<string, string>();
-    const suiteIdSet = new Set<string>();
+    const flowToModule = new Map<string, string | undefined>();
     for (const f of flows || []) {
-      if (f?.id && f?.suite_id) {
-        flowToSuite.set(f.id, f.suite_id);
-        suiteIdSet.add(f.suite_id);
-      }
-    }
-
-    const suiteIds = Array.from(suiteIdSet);
-    if (suiteIds.length === 0) {
-      // Flows might have been deleted or malformed; still try to return cases without hierarchy
-      logger.warn('[REGRESSION_RUN] No suites found for flows', { flowIdsCount: flowIds.length });
-    }
-
-    // Map suite -> module
-    const suiteToModule = new Map<string, string | undefined>();
-    if (suiteIds.length > 0) {
-      const { data: suites, error: suitesError } = await supabaseAdmin
-        .from('regression_suites')
-        .select('id, module_id')
-        .in('id', suiteIds);
-
-      if (suitesError) {
-        throw new Error(`Failed to load suites: ${suitesError.message}`);
-      }
-
-      for (const s of suites || []) {
-        if (s?.id) {
-          suiteToModule.set(s.id, s.module_id || undefined);
-        }
+      if (f?.id) {
+        flowToModule.set(f.id, f.module_id || undefined);
       }
     }
 
@@ -1139,7 +899,6 @@ export class RegressionRunService {
       testCaseId: string;
       testType: 'ui' | 'api';
       moduleId?: string;
-      suiteId?: string;
       flowId?: string;
     }> = [];
 
@@ -1155,13 +914,11 @@ export class RegressionRunService {
 
     for (const tc of uiCases || []) {
       const flowId = tc.flow_id || undefined;
-      const suiteId = flowId ? flowToSuite.get(flowId) : undefined;
-      const moduleId = suiteId ? suiteToModule.get(suiteId) : undefined;
+      const moduleId = flowId ? flowToModule.get(flowId) : undefined;
       testCases.push({
         testCaseId: tc.id,
         testType: 'ui',
         moduleId,
-        suiteId,
         flowId,
       });
     }
@@ -1178,13 +935,11 @@ export class RegressionRunService {
 
     for (const tc of apiCases || []) {
       const flowId = tc.flow_id || undefined;
-      const suiteId = flowId ? flowToSuite.get(flowId) : undefined;
-      const moduleId = suiteId ? suiteToModule.get(suiteId) : undefined;
+      const moduleId = flowId ? flowToModule.get(flowId) : undefined;
       testCases.push({
         testCaseId: tc.id,
         testType: 'api',
         moduleId,
-        suiteId,
         flowId,
       });
     }
@@ -1202,7 +957,6 @@ export class RegressionRunService {
       testCaseId: string;
       testType: 'ui' | 'api';
       moduleId?: string;
-      suiteId?: string;
       flowId?: string;
     }>,
     userId: string,

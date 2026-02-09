@@ -33,7 +33,7 @@ function sanitizeIntegration(row: any) {
  */
 export async function createIntegration(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, provider, repositoryUrl, webhookSecret, suiteId, events } = req.body;
+    const { projectId, provider, repositoryUrl, webhookSecret, events } = req.body;
     const userId = getUserId(req);
 
     if (!projectId || !provider || !repositoryUrl || !webhookSecret) {
@@ -60,7 +60,6 @@ export async function createIntegration(req: AuthenticatedRequest, res: Response
       provider: provider as GitProvider,
       repositoryUrl,
       webhookSecret,
-      suiteId: suiteId ?? null,
       events,
     });
 
@@ -135,14 +134,13 @@ export async function getIntegration(req: AuthenticatedRequest, res: Response): 
 export async function updateIntegration(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { webhookSecret, suiteId, events, enabled } = req.body;
+    const { webhookSecret, events, enabled } = req.body;
     const userId = getUserId(req);
 
     const integration = await GitIntegrationService.updateIntegration({
       integrationId: id,
       userId,
       webhookSecret,
-      suiteId,
       events,
       enabled,
     });

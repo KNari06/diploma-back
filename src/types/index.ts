@@ -829,13 +829,10 @@ export interface IntentResult {
   possibleIntents?: IntentType[]; // List of possible intents AI is considering
   clarificationReason?: string; // Why clarification is needed (for debugging)
 
-  // Regression test fields (for save_test, create_suite, run_regression intents)
+  // Regression test fields (for save_test, run_regression intents)
   sourceTestId?: string | null;        // For save_test: ID of test to save
-  suggestedName?: string | null;       // For save_test, create_suite: suggested name
-  suiteName?: string | null;           // For create_suite: name of suite
-  testCaseIds?: string[] | null;       // For create_suite: IDs of test cases
+  suggestedName?: string | null;       // For save_test: suggested name
   savedTestCaseId?: string | null;     // For run_regression: ID of saved test case
-  suiteId?: string | null;             // For run_regression: ID of suite
 }
 
 // Playwright Command types

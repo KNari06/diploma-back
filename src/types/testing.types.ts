@@ -1,6 +1,6 @@
 /**
  * Testing Types
- * Type definitions for test hierarchy: Module → Suite → Flow → TestCase → Step
+ * Type definitions for test hierarchy: Module → Flow → TestCase → Step
  */
 
 // ============================================================================
@@ -23,11 +23,6 @@ export type TestType = 'ui' | 'api';
 export type FlowType = 'ui' | 'api' | 'mixed';
 
 /**
- * Suite types
- */
-export type SuiteType = 'ui' | 'api' | 'mixed';
-
-/**
  * Execution status for test runs
  */
 export type ExecutionStatus =
@@ -46,12 +41,12 @@ export type RunTrigger = 'manual' | 'chat' | 'scheduled';
 /**
  * Fixture scope levels
  */
-export type FixtureScope = 'global' | 'project' | 'module' | 'suite' | 'flow';
+export type FixtureScope = 'global' | 'project' | 'module' | 'flow';
 
 /**
  * Plan item types
  */
-export type PlanItemType = 'module' | 'suite' | 'flow' | 'test_case';
+export type PlanItemType = 'module' | 'flow' | 'test_case';
 
 /**
  * Platform key types (top-level test category)
@@ -139,11 +134,11 @@ export interface UpdateTestModuleParams {
 // ============================================================================
 
 /**
- * Test flow - scenario within a suite (Happy path, Error handling)
+ * Test flow - scenario within a module (Happy path, Error handling)
  */
 export interface TestFlow {
   id: string;
-  suiteId: string;
+  moduleId: string;
   userId: string;
   name: string;
   description?: string;
@@ -161,7 +156,7 @@ export interface TestFlow {
  * Params for creating a test flow
  */
 export interface CreateTestFlowParams {
-  suiteId: string;
+  moduleId: string;
   userId: string;
   name: string;
   description?: string;
@@ -202,7 +197,6 @@ export interface TestSchedule {
   userId: string;
   name: string;
   moduleId?: string;
-  suiteId?: string;
   planId?: string;
   cronExpression: string;
   timezone: string;
@@ -223,7 +217,6 @@ export interface CreateTestScheduleParams {
   cronExpression: string;
   timezone?: string;
   moduleId?: string;
-  suiteId?: string;
   planId?: string;
   parameters?: Record<string, any>;
 }
@@ -378,6 +371,20 @@ export interface IntentTestCaseWithSuggestions extends IntentTestCase {
  */
 export type SavedTestCaseWithSuggestions = IntentTestCaseWithSuggestions;
 
+/**
+ * Shared step command - references another test case's commands
+ * When encountered during execution, the referenced test case's
+ * commands are loaded and executed inline in the same browser session.
+ *
+ * Usage: Insert into a test case's commands array to reuse steps from another test
+ * (e.g., login steps shared across checkout, profile, settings flows)
+ */
+export interface SharedStepCommand {
+  action: 'shared_steps';
+  test_case_id: string;   // UUID of the referenced intent_test_cases row
+  description?: string;   // Human-readable label (e.g., "Login as student")
+}
+
 // ============================================================================
 // REGRESSION PLAN
 // ============================================================================
@@ -440,7 +447,6 @@ export interface RegressionPlanItem {
   planId: string;
   itemType: PlanItemType;
   moduleId?: string;
-  suiteId?: string;
   flowId?: string;
   testCaseId?: string;
   testCaseType?: TestType;
@@ -456,7 +462,6 @@ export interface AddPlanItemParams {
   planId: string;
   itemType: PlanItemType;
   moduleId?: string;
-  suiteId?: string;
   flowId?: string;
   testCaseId?: string;
   testCaseType?: TestType;
@@ -477,7 +482,6 @@ export interface TestExecution {
   testType: TestType;
   testCaseId: string;
   moduleId?: string;
-  suiteId?: string;
   flowId?: string;
   status: ExecutionStatus;
   durationMs?: number;
@@ -500,7 +504,6 @@ export interface CreateTestExecutionParams {
   testType: TestType;
   testCaseId: string;
   moduleId?: string;
-  suiteId?: string;
   flowId?: string;
   browser?: string;
   environment?: string;
@@ -549,7 +552,6 @@ export interface ExpandedTestCase {
   testCaseId: string;
   testType: TestType;
   moduleId?: string;
-  suiteId?: string;
   flowId?: string;
   name: string;
   parameters?: Record<string, any>;
@@ -636,7 +638,7 @@ export interface DueSchedule {
   scheduleId: string;
   projectId: string;
   userId: string;
-  targetType: 'module' | 'suite' | 'plan';
+  targetType: 'module' | 'plan';
   targetId: string;
   parameters: Record<string, any>;
 }

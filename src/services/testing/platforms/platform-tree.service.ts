@@ -1,6 +1,6 @@
 /**
  * Platform Tree Service
- * Builds nested hierarchy for platforms -> modules -> suites -> flows -> testCases
+ * Builds nested hierarchy for platforms -> modules -> flows -> testCases
  * Supports pagination at each level via scoped calls
  */
 
@@ -39,18 +39,9 @@ interface ModuleSummary {
   priority?: string;
 }
 
-interface SuiteSummary {
-  id: string;
-  moduleId?: string;
-  name: string;
-  suiteType: 'ui' | 'api';
-  priority?: string;
-  createdAt: string;
-}
-
 interface FlowSummary {
   id: string;
-  suiteId: string;
+  moduleId: string;
   name: string;
   flowType: 'ui' | 'api' | 'mixed';
   priority?: string;
@@ -79,11 +70,6 @@ export interface BaseModeResponse {
 
 export interface ModuleModeResponse {
   module: ModuleSummary;
-  suites: PaginatedList<SuiteSummary>;
-}
-
-export interface SuiteModeResponse {
-  suite: SuiteSummary;
   flows: PaginatedList<FlowSummary>;
 }
 
@@ -202,10 +188,10 @@ export class PlatformTreeService {
   }
 
   /**
-   * Module mode: return module with paginated suites
+   * Module mode: return module with paginated flows
    * @param moduleId - Module ID
    * @param userId - User ID for access control
-   * @param options - Pagination options for suites
+   * @param options - Pagination options for flows
    */
   static async getModuleModeTree(
     moduleId: string,
@@ -226,30 +212,30 @@ export class PlatformTreeService {
       throw new Error('Module not found or access denied');
     }
 
-    // Get suites count
-    const { count: suitesCount, error: countError } = await supabaseAdmin
-      .from('regression_suites')
+    // Get flows count
+    const { count: flowsCount, error: countError } = await supabaseAdmin
+      .from('test_flows')
       .select('id', { count: 'exact', head: true })
       .eq('module_id', moduleId)
       .eq('user_id', userId);
 
     if (countError) {
-      logger.error('[PLATFORM_TREE] Failed to count suites', { error: countError });
-      throw new Error(`Failed to count suites: ${countError.message}`);
+      logger.error('[PLATFORM_TREE] Failed to count flows', { error: countError });
+      throw new Error(`Failed to count flows: ${countError.message}`);
     }
 
-    // Get paginated suites
-    const { data: suites, error: suitesError } = await supabaseAdmin
-      .from('regression_suites')
-      .select('id, module_id, name, suite_type, priority, created_at')
+    // Get paginated flows
+    const { data: flows, error: flowsError } = await supabaseAdmin
+      .from('test_flows')
+      .select('id, module_id, name, flow_type, priority, order_index, created_at, updated_at')
       .eq('module_id', moduleId)
       .eq('user_id', userId)
-      .order('created_at', { ascending: false })
+      .order('order_index', { ascending: true })
       .range(offset, offset + limit - 1);
 
-    if (suitesError) {
-      logger.error('[PLATFORM_TREE] Failed to get suites', { error: suitesError });
-      throw new Error(`Failed to get suites: ${suitesError.message}`);
+    if (flowsError) {
+      logger.error('[PLATFORM_TREE] Failed to get flows', { error: flowsError });
+      throw new Error(`Failed to get flows: ${flowsError.message}`);
     }
 
     return {
@@ -261,88 +247,10 @@ export class PlatformTreeService {
         description: moduleData.description || undefined,
         priority: moduleData.priority || undefined,
       },
-      suites: {
-        items: (suites || []).map((s: any) => ({
-          id: s.id,
-          moduleId: s.module_id || undefined,
-          name: s.name,
-          suiteType: s.suite_type,
-          priority: s.priority || undefined,
-          createdAt: s.created_at,
-        })),
-        pageInfo: {
-          limit,
-          offset,
-          total: suitesCount || 0,
-        },
-      },
-    };
-  }
-
-  /**
-   * Suite mode: return suite with paginated flows
-   * @param suiteId - Suite ID
-   * @param userId - User ID for access control
-   * @param options - Pagination options for flows
-   */
-  static async getSuiteModeTree(
-    suiteId: string,
-    userId: string,
-    options: { limit?: number; offset?: number } = {}
-  ): Promise<SuiteModeResponse> {
-    const { limit = 20, offset = 0 } = options;
-
-    // Get suite
-    const { data: suiteData, error: suiteError } = await supabaseAdmin
-      .from('regression_suites')
-      .select('id, module_id, name, suite_type, priority, created_at')
-      .eq('id', suiteId)
-      .eq('user_id', userId)
-      .single();
-
-    if (suiteError || !suiteData) {
-      throw new Error('Suite not found or access denied');
-    }
-
-    // Get flows count
-    const { count: flowsCount, error: countError } = await supabaseAdmin
-      .from('test_flows')
-      .select('id', { count: 'exact', head: true })
-      .eq('suite_id', suiteId)
-      .eq('user_id', userId);
-
-    if (countError) {
-      logger.error('[PLATFORM_TREE] Failed to count flows', { error: countError });
-      throw new Error(`Failed to count flows: ${countError.message}`);
-    }
-
-    // Get paginated flows
-    const { data: flows, error: flowsError } = await supabaseAdmin
-      .from('test_flows')
-      .select('id, suite_id, name, flow_type, priority, order_index, created_at, updated_at')
-      .eq('suite_id', suiteId)
-      .eq('user_id', userId)
-      .order('order_index', { ascending: true })
-      .range(offset, offset + limit - 1);
-
-    if (flowsError) {
-      logger.error('[PLATFORM_TREE] Failed to get flows', { error: flowsError });
-      throw new Error(`Failed to get flows: ${flowsError.message}`);
-    }
-
-    return {
-      suite: {
-        id: suiteData.id,
-        moduleId: suiteData.module_id || undefined,
-        name: suiteData.name,
-        suiteType: suiteData.suite_type,
-        priority: suiteData.priority || undefined,
-        createdAt: suiteData.created_at,
-      },
       flows: {
         items: (flows || []).map((f: any) => ({
           id: f.id,
-          suiteId: f.suite_id,
+          moduleId: f.module_id,
           name: f.name,
           flowType: f.flow_type,
           priority: f.priority || undefined,
@@ -377,7 +285,7 @@ export class PlatformTreeService {
     // Get flow
     const { data: flowData, error: flowError } = await supabaseAdmin
       .from('test_flows')
-      .select('id, suite_id, name, flow_type, priority, order_index, created_at, updated_at')
+      .select('id, module_id, name, flow_type, priority, order_index, created_at, updated_at')
       .eq('id', flowId)
       .eq('user_id', userId)
       .single();
@@ -465,7 +373,7 @@ export class PlatformTreeService {
     return {
       flow: {
         id: flowData.id,
-        suiteId: flowData.suite_id,
+        moduleId: flowData.module_id,
         name: flowData.name,
         flowType: flowData.flow_type,
         priority: flowData.priority || undefined,

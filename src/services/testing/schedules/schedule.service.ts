@@ -30,15 +30,14 @@ export class ScheduleService {
       cronExpression,
       timezone,
       moduleId,
-      suiteId,
       planId,
       parameters,
     } = params;
 
     // Validate exactly one target is set
-    const targetCount = [moduleId, suiteId, planId].filter(Boolean).length;
+    const targetCount = [moduleId, planId].filter(Boolean).length;
     if (targetCount !== 1) {
-      throw new Error('Exactly one of moduleId, suiteId, or planId must be set');
+      throw new Error('Exactly one of moduleId or planId must be set');
     }
 
     logger.info('[SCHEDULE_SERVICE] Creating schedule', {
@@ -60,7 +59,6 @@ export class ScheduleService {
         cron_expression: cronExpression,
         timezone: timezone || 'UTC',
         module_id: moduleId || null,
-        suite_id: suiteId || null,
         plan_id: planId || null,
         parameters: parameters || {},
         next_run_at: nextRunAt,
@@ -241,8 +239,8 @@ export class ScheduleService {
       scheduleId: row.id,
       projectId: row.project_id,
       userId: row.user_id,
-      targetType: row.module_id ? 'module' : row.suite_id ? 'suite' : 'plan',
-      targetId: row.module_id || row.suite_id || row.plan_id,
+      targetType: row.module_id ? 'module' : 'plan',
+      targetId: row.module_id || row.plan_id,
       parameters: row.parameters || {},
     }));
   }
@@ -357,7 +355,6 @@ export class ScheduleService {
       userId: row.user_id,
       name: row.name,
       moduleId: row.module_id || undefined,
-      suiteId: row.suite_id || undefined,
       planId: row.plan_id || undefined,
       cronExpression: row.cron_expression,
       timezone: row.timezone,

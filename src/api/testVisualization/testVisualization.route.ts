@@ -181,7 +181,7 @@ router.post('/validate', requireAuth, validateTestSteps);
  *                             format: uuid
  *                           entityType:
  *                             type: string
- *                             enum: [test_run, saved_case, suite]
+ *                             enum: [test_run, saved_case, module]
  *                           label:
  *                             type: string
  *                           statusFlag:

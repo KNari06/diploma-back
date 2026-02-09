@@ -210,27 +210,6 @@ export class ModuleService {
   }
 
   /**
-   * Get all suites in a module
-   * @param moduleId - Module ID
-   * @param userId - User ID for access control
-   * @returns List of suite IDs
-   */
-  static async getSuiteIds(moduleId: string, userId: string): Promise<string[]> {
-    const { data, error } = await supabaseAdmin
-      .from('regression_suites')
-      .select('id')
-      .eq('module_id', moduleId)
-      .eq('user_id', userId);
-
-    if (error) {
-      logger.error('[MODULE_SERVICE] Failed to get suite IDs', { error, moduleId });
-      throw new Error(`Failed to get suites: ${error.message}`);
-    }
-
-    return (data || []).map((s: any) => s.id);
-  }
-
-  /**
    * Map database row to TestModule type
    * Includes platformKey from joined test_platforms if available
    */

@@ -4,7 +4,6 @@
  * Runs periodically to check for due test schedules and execute them.
  * Supports scheduling for:
  * - Modules
- * - Suites
  * - Regression Plans
  */
 
@@ -121,7 +120,7 @@ export class TestSchedulerJobHandler {
     scheduleId: string;
     projectId: string;
     userId: string;
-    targetType: 'module' | 'suite' | 'plan';
+    targetType: 'module' | 'plan';
     targetId: string;
     parameters: Record<string, any>;
   }): Promise<void> {
@@ -132,15 +131,6 @@ export class TestSchedulerJobHandler {
         case 'module':
           await RegressionRunService.runModule({
             moduleId: targetId,
-            userId,
-            trigger: 'scheduled',
-            parameters,
-          });
-          break;
-
-        case 'suite':
-          await RegressionRunService.runSuite({
-            suiteId: targetId,
             userId,
             trigger: 'scheduled',
             parameters,

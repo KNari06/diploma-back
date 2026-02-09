@@ -6,9 +6,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { FlowService } from '@/services/testing/flows/flow.service';
 import { ModuleService } from '@/services/testing/modules/module.service';
-import { DefaultSuiteService } from '@/services/testing/regression/default-suite.service';
 import { NotFoundError, ValidationError } from '@/types';
-import type { PlatformKey } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
@@ -25,21 +23,16 @@ function getUserId(req: AuthenticatedRequest): string {
 
 /**
  * Create a new test flow
- * Accepts either suiteId (direct) or moduleId (resolves default suite)
- * When moduleId is provided, also creates 1 initial empty test case
+ * Accepts moduleId and creates a flow under that module
+ * Also creates 1 initial empty test case
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { suiteId, moduleId, name, description, flowType, tags, priority, preconditions, expectedResult, baseUrl } = req.body;
+    const { moduleId, name, description, flowType, tags, priority, preconditions, expectedResult, baseUrl } = req.body;
 
-    // Validate: either suiteId or moduleId required (but not both)
-    if (!suiteId && !moduleId) {
-      res.status(400).json({ success: false, error: 'Either suiteId or moduleId is required' });
-      return;
-    }
-
-    if (suiteId && moduleId) {
-      res.status(400).json({ success: false, error: 'Provide either suiteId or moduleId, not both' });
+    // Validate moduleId required
+    if (!moduleId) {
+      res.status(400).json({ success: false, error: 'moduleId is required' });
       return;
     }
 
@@ -50,33 +43,19 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
 
     const userId = getUserId(req);
 
-    // Resolve suiteId from moduleId if needed
-    let resolvedSuiteId = suiteId;
-    let platformKey: PlatformKey | undefined;
-    let projectId: string | undefined;
-
-    if (moduleId) {
-      // Get module info (includes project_id and platform_key)
-      const module = await ModuleService.getById(moduleId, userId);
-      if (!module) {
-        res.status(404).json({ success: false, error: 'Module not found' });
-        return;
-      }
-
-      platformKey = module.platformKey;
-      projectId = module.projectId;
-
-      resolvedSuiteId = await DefaultSuiteService.ensureDefaultSuite(moduleId, userId);
-      logger.info('[FLOWS_API] Resolved default suite for module', {
-        moduleId,
-        suiteId: resolvedSuiteId,
-        platformKey,
-      });
+    // Get module info (includes project_id and platform_key)
+    const module = await ModuleService.getById(moduleId, userId);
+    if (!module) {
+      res.status(404).json({ success: false, error: 'Module not found' });
+      return;
     }
+
+    const platformKey = module.platformKey;
+    const projectId = module.projectId;
 
     // Create flow
     const flow = await FlowService.create({
-      suiteId: resolvedSuiteId,
+      moduleId,
       userId,
       name,
       description,
@@ -87,12 +66,11 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
       expectedResult,
     });
 
-    // Create initial test case if moduleId was provided
+    // Create initial test case
     // UI test cases are now created in intent_test_cases (unified table)
     let createdTestCaseId: string | undefined;
 
-    if (moduleId && platformKey && projectId) {
-      if (platformKey === 'web_ui') {
+    if (platformKey === 'web_ui') {
         // Sanitize baseUrl if provided
         let sanitizedBaseUrl: string | null = null;
         if (baseUrl && typeof baseUrl === 'string' && baseUrl.trim()) {
@@ -150,13 +128,12 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
             hasBaseUrl: !!sanitizedBaseUrl,
           });
         }
-      } else {
-        // For API platform, defer test case creation (requires endpoint_id)
-        logger.info('[FLOWS_API] Skipping initial test case creation for API platform', {
-          flowId: flow.id,
-          platformKey,
-        });
-      }
+    } else {
+      // For API platform, defer test case creation (requires endpoint_id)
+      logger.info('[FLOWS_API] Skipping initial test case creation for API platform', {
+        flowId: flow.id,
+        platformKey,
+      });
     }
 
     res.json({
@@ -195,20 +172,20 @@ export async function getFlow(req: AuthenticatedRequest, res: Response): Promise
 }
 
 /**
- * List flows for a suite
+ * List flows for a module
  */
 export async function listFlows(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { suiteId } = req.query;
+    const { moduleId } = req.query;
 
-    if (!suiteId || typeof suiteId !== 'string') {
-      res.status(400).json({ success: false, error: 'suiteId is required' });
+    if (!moduleId || typeof moduleId !== 'string') {
+      res.status(400).json({ success: false, error: 'moduleId is required' });
       return;
     }
 
     const userId = getUserId(req);
 
-    const flows = await FlowService.listBySuite(suiteId, userId);
+    const flows = await FlowService.listByModule(moduleId, userId);
 
     res.json({ success: true, data: flows, timestamp: new Date() });
   } catch (error) {
@@ -264,20 +241,20 @@ export async function deleteFlow(req: AuthenticatedRequest, res: Response): Prom
 }
 
 /**
- * Reorder flows within a suite
+ * Reorder flows within a module
  */
 export async function reorderFlows(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { suiteId, flowIds } = req.body;
+    const { moduleId, flowIds } = req.body;
 
-    if (!suiteId || !flowIds || !Array.isArray(flowIds)) {
-      res.status(400).json({ success: false, error: 'suiteId and flowIds array are required' });
+    if (!moduleId || !flowIds || !Array.isArray(flowIds)) {
+      res.status(400).json({ success: false, error: 'moduleId and flowIds array are required' });
       return;
     }
 
     const userId = getUserId(req);
 
-    await FlowService.reorder(suiteId, flowIds, userId);
+    await FlowService.reorder(moduleId, flowIds, userId);
 
     res.json({ success: true, message: 'Flows reordered', timestamp: new Date() });
   } catch (error) {

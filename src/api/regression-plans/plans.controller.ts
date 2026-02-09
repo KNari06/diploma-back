@@ -141,7 +141,7 @@ export async function deletePlan(req: AuthenticatedRequest, res: Response): Prom
 export async function addItem(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { itemType, moduleId, suiteId, flowId, testCaseId, testCaseType, parametersOverride } = req.body;
+    const { itemType, moduleId, flowId, testCaseId, testCaseType, parametersOverride } = req.body;
 
     if (!itemType) {
       res.status(400).json({ success: false, error: 'itemType is required' });
@@ -152,7 +152,6 @@ export async function addItem(req: AuthenticatedRequest, res: Response): Promise
       planId: id,
       itemType: itemType as PlanItemType,
       moduleId,
-      suiteId,
       flowId,
       testCaseId,
       testCaseType: testCaseType as TestType,

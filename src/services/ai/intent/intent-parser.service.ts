@@ -495,20 +495,11 @@ function isIntentCompleteness(intentResult: IntentResult): boolean {
     }
   }
 
-  // Check create_suite requirements
-  if (intentResult.intent === 'create_suite') {
-    // create_suite requires testCaseIds
-    if (!intentResult.testCaseIds || intentResult.testCaseIds.length === 0) {
-      logger.debug('[INTENT_PARSER] create_suite incomplete: missing or empty testCaseIds');
-      return false;
-    }
-  }
-
   // Check run_regression requirements
   if (intentResult.intent === 'run_regression') {
-    // run_regression requires either savedTestCaseId or suiteId
-    if (!intentResult.savedTestCaseId && !intentResult.suiteId) {
-      logger.debug('[INTENT_PARSER] run_regression incomplete: missing both savedTestCaseId and suiteId');
+    // run_regression requires savedTestCaseId
+    if (!intentResult.savedTestCaseId) {
+      logger.debug('[INTENT_PARSER] run_regression incomplete: missing savedTestCaseId');
       return false;
     }
   }

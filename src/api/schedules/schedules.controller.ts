@@ -23,7 +23,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createSchedule(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, name, cronExpression, timezone, moduleId, suiteId, planId, parameters } = req.body;
+    const { projectId, name, cronExpression, timezone, moduleId, planId, parameters } = req.body;
 
     if (!projectId || !name || !cronExpression) {
       res.status(400).json({ success: false, error: 'projectId, name, and cronExpression are required' });
@@ -39,7 +39,6 @@ export async function createSchedule(req: AuthenticatedRequest, res: Response): 
       cronExpression,
       timezone,
       moduleId,
-      suiteId,
       planId,
       parameters,
     });

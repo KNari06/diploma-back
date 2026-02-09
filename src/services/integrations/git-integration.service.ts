@@ -11,7 +11,6 @@ export interface GitIntegrationRow {
   provider: GitProvider;
   repository_url: string;
   webhook_secret: string;
-  suite_id: string | null;
   events: GitEvent[];
   enabled: boolean;
   created_at: string;
@@ -24,7 +23,6 @@ export interface CreateGitIntegrationParams {
   provider: GitProvider;
   repositoryUrl: string;
   webhookSecret: string;
-  suiteId?: string | null;
   events?: GitEvent[];
 }
 
@@ -32,23 +30,18 @@ export interface UpdateGitIntegrationParams {
   integrationId: string;
   userId: string;
   webhookSecret?: string;
-  suiteId?: string | null;
   events?: GitEvent[];
   enabled?: boolean;
 }
 
 export class GitIntegrationService {
   static async createIntegration(params: CreateGitIntegrationParams): Promise<GitIntegrationRow> {
-    const { projectId, userId, provider, repositoryUrl, webhookSecret, suiteId, events } = params;
+    const { projectId, userId, provider, repositoryUrl, webhookSecret, events } = params;
 
     await this.verifyProjectAccess(projectId, userId);
 
     const normalizedRepositoryUrl = this.normalizeRepositoryUrl(repositoryUrl, provider);
     this.validateRepositoryUrl(normalizedRepositoryUrl, provider);
-
-    if (suiteId) {
-      await this.verifySuiteAccess({ suiteId, projectId, userId });
-    }
 
     const safeEvents = this.validateEvents(events);
 
@@ -59,7 +52,6 @@ export class GitIntegrationService {
         provider,
         repository_url: normalizedRepositoryUrl,
         webhook_secret: webhookSecret,
-        suite_id: suiteId ?? null,
         events: safeEvents,
         enabled: true,
       })
@@ -119,17 +111,12 @@ export class GitIntegrationService {
   }
 
   static async updateIntegration(params: UpdateGitIntegrationParams): Promise<GitIntegrationRow> {
-    const { integrationId, userId, webhookSecret, suiteId, events, enabled } = params;
+    const { integrationId, userId, webhookSecret, events, enabled } = params;
 
-    const current = await this.getIntegration(integrationId, userId);
-
-    if (suiteId !== undefined && suiteId !== null) {
-      await this.verifySuiteAccess({ suiteId, projectId: current.project_id, userId });
-    }
+    await this.getIntegration(integrationId, userId);
 
     const updateData: Record<string, unknown> = {};
     if (webhookSecret !== undefined) updateData.webhook_secret = webhookSecret;
-    if (suiteId !== undefined) updateData.suite_id = suiteId;
     if (events !== undefined) updateData.events = this.validateEvents(events);
     if (enabled !== undefined) updateData.enabled = enabled;
 
@@ -177,33 +164,6 @@ export class GitIntegrationService {
 
     if ((project as any).user_id !== userId) {
       throw new ValidationError('Access denied to this project');
-    }
-  }
-
-  private static async verifySuiteAccess(params: {
-    suiteId: string;
-    projectId: string;
-    userId: string;
-  }): Promise<void> {
-    const { suiteId, projectId, userId } = params;
-
-    const { data: suite, error } = await supabaseAdmin
-      .from('regression_suites')
-      .select('id, project_id, projects!inner(user_id)')
-      .eq('id', suiteId)
-      .single();
-
-    if (error || !suite) {
-      throw new NotFoundError('Regression suite', suiteId);
-    }
-
-    if ((suite as any).project_id !== projectId) {
-      throw new ValidationError('Suite does not belong to this project');
-    }
-
-    const projectUserId = ((suite as any).projects as any)?.user_id;
-    if (!projectUserId || projectUserId !== userId) {
-      throw new ValidationError('Access denied to this suite');
     }
   }
 

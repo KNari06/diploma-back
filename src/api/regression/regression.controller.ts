@@ -83,7 +83,7 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
       // Verify flow exists, belongs to user, and is within the same project
       const { data: flow, error: flowError } = await supabaseAdmin
         .from('test_flows')
-        .select('id, regression_suites!inner(project_id, user_id)')
+        .select('id, module_id, test_modules!inner(project_id)')
         .eq('id', flowId)
         .eq('user_id', userId)
         .single();
@@ -93,7 +93,7 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
         return;
       }
 
-      const flowProjectId = (flow as any).regression_suites?.project_id;
+      const flowProjectId = (flow as any).test_modules?.project_id;
       if (!flowProjectId || flowProjectId !== result.projectId) {
         res.status(422).json({
           success: false,
@@ -134,7 +134,7 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
         message: 'Test case saved successfully',
         nextActions: [
           `Run test case: POST /api/v1/regression/run with savedTestCaseId="${result.savedTestCaseId}"`,
-          `Add to suite: POST /api/v1/regression/suites with testCaseIds=["${result.savedTestCaseId}"]`,
+          `Add to plan: POST /api/v1/regression-plans/:planId/items with testCaseId="${result.savedTestCaseId}"`,
           flowId ? `Confirm dependencies: PATCH /api/v1/saved-test-cases/${result.savedTestCaseId}/dependencies` : null,
         ].filter(Boolean),
       },
@@ -152,137 +152,48 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
 }
 
 /**
- * Create a regression suite
- *
- * @route POST /api/v1/regression/suites
- * @body {string} projectId - Project ID for the suite
- * @body {string} name - Display name for the suite
- * @body {string} [description] - Optional description
- * @body {string[]} testCaseIds - Array of saved test case IDs to include
- * @returns {suiteId, projectId, testCasesCount}
- */
-export async function createSuite(req: AuthenticatedRequest, res: Response): Promise<void> {
-  try {
-    const { projectId, name, description, testCaseIds } = req.body;
-
-    // Validate required inputs
-    if (!projectId || !name || !testCaseIds || !Array.isArray(testCaseIds)) {
-      res.status(400).json({
-        success: false,
-        error: 'projectId, name, and testCaseIds array are required',
-      });
-      return;
-    }
-
-    if (testCaseIds.length === 0) {
-      res.status(400).json({
-        success: false,
-        error: 'testCaseIds array cannot be empty',
-      });
-      return;
-    }
-
-    const userId = getUserId(req);
-
-    logger.info('[REGRESSION_API] Creating suite', { projectId, name, userId });
-
-    const result = await RegressionSaveService.createSuite({
-      projectId,
-      userId,
-      name,
-      description,
-      testCaseIds,
-    });
-
-    res.json({
-      success: true,
-      data: {
-        suiteId: result.suiteId,
-        projectId,
-        testCasesCount: testCaseIds.length,
-        message: 'Suite created successfully',
-        nextActions: [
-          `Run suite: POST /api/v1/regression/run with suiteId="${result.suiteId}"`,
-        ],
-      },
-      timestamp: new Date(),
-    });
-
-    logger.info('[REGRESSION_API] Suite created successfully', {
-      suiteId: result.suiteId,
-    });
-  } catch (error) {
-    logger.error('[REGRESSION_API] Failed to create suite', { error });
-    handleControllerError(res, error, 'Failed to create suite');
-  }
-}
-
 /**
- * Run a saved test case or suite
+ * Run a saved test case
  *
  * @route POST /api/v1/regression/run
- * @body {string} [savedTestCaseId] - ID of saved test case to run
- * @body {string} [suiteId] - ID of suite to run
+ * @body {string} savedTestCaseId - ID of saved test case to run
  * @body {string} [trigger='manual'] - 'manual' or 'chat'
  * @body {object} [parameters] - Runtime parameters for test execution
- * @returns {runId, testId?, testIds?}
+ * @returns {runId, testId}
  */
 export async function runRegression(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { suiteId, savedTestCaseId, trigger, parameters } = req.body;
+    const { savedTestCaseId, trigger, parameters } = req.body;
 
-    // Validate that exactly one of suiteId or savedTestCaseId is provided
-    if (!suiteId && !savedTestCaseId) {
+    // Validate savedTestCaseId is provided
+    if (!savedTestCaseId) {
       res.status(400).json({
         success: false,
-        error: 'Either suiteId or savedTestCaseId is required',
-      });
-      return;
-    }
-
-    if (suiteId && savedTestCaseId) {
-      res.status(400).json({
-        success: false,
-        error: 'Cannot specify both suiteId and savedTestCaseId',
+        error: 'savedTestCaseId is required',
       });
       return;
     }
 
     const userId = getUserId(req);
 
-    logger.info('[REGRESSION_API] Running regression', {
-      suiteId,
+    logger.info('[REGRESSION_API] Running regression test case', {
       savedTestCaseId,
       userId,
     });
 
-    let result: { runId: string; testId?: string; testIds?: string[] };
-
-    if (savedTestCaseId) {
-      result = await RegressionRunService.runSavedTestCase({
-        savedTestCaseId,
-        userId,
-        trigger: trigger || 'manual',
-        parameters: parameters || {},
-      });
-    } else {
-      result = await RegressionRunService.runSuite({
-        suiteId: suiteId!,
-        userId,
-        trigger: trigger || 'manual',
-        parameters: parameters || {},
-      });
-    }
+    const result = await RegressionRunService.runSavedTestCase({
+      savedTestCaseId,
+      userId,
+      trigger: trigger || 'manual',
+      parameters: parameters || {},
+    });
 
     res.json({
       success: true,
       data: {
         runId: result.runId,
         testId: result.testId,
-        testIds: result.testIds,
-        message: suiteId
-          ? `Suite run started with ${result.testIds?.length || 0} tests`
-          : 'Test case run started',
+        message: 'Test case run started',
       },
       timestamp: new Date(),
     });
@@ -357,40 +268,6 @@ function mapSavedTestCaseToResponse(row: any): any {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
-}
-
-/**
- * List suites for project
- *
- * @route GET /api/v1/regression/suites?projectId=<uuid>
- * @query {string} projectId - Project ID to list suites for
- * @returns {array} List of regression suites
- */
-export async function listSuites(req: AuthenticatedRequest, res: Response): Promise<void> {
-  try {
-    const { projectId } = req.query;
-
-    if (!projectId || typeof projectId !== 'string') {
-      res.status(400).json({
-        success: false,
-        error: 'projectId query parameter is required',
-      });
-      return;
-    }
-
-    const userId = getUserId(req);
-
-    const suites = await RegressionRunService.listSuites(projectId, userId);
-
-    res.json({
-      success: true,
-      data: suites,
-      timestamp: new Date(),
-    });
-  } catch (error) {
-    logger.error('[REGRESSION_API] Failed to list suites', { error });
-    handleControllerError(res, error, 'Failed to list suites');
-  }
 }
 
 /**
@@ -704,6 +581,67 @@ export async function getRunStats(req: AuthenticatedRequest, res: Response): Pro
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to get run stats', { error });
     handleControllerError(res, error, 'Failed to get run stats');
+  }
+}
+
+/**
+ * Get test case commands for shared steps picker
+ *
+ * @route GET /api/v1/regression/test-cases/:id/commands
+ * @param {string} id - Intent test case ID
+ * @returns { commands, parametersSchema, name }
+ */
+export async function getTestCaseCommands(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { id } = req.params;
+    const userId = getUserId(req);
+
+    if (!id) {
+      res.status(400).json({
+        success: false,
+        error: 'Test case ID is required',
+      });
+      return;
+    }
+
+    // Query intent_test_cases for commands
+    const { data: testCase, error } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, name, commands, parameters_schema, project_id, projects!inner(user_id)')
+      .eq('id', id)
+      .single();
+
+    if (error || !testCase) {
+      res.status(404).json({
+        success: false,
+        error: 'Test case not found',
+      });
+      return;
+    }
+
+    // Verify user has access via project ownership
+    const projectUserId = (testCase.projects as any)?.user_id;
+    if (!projectUserId || projectUserId !== userId) {
+      res.status(403).json({
+        success: false,
+        error: 'Access denied to this test case',
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: testCase.id,
+        name: testCase.name,
+        commands: testCase.commands || [],
+        parametersSchema: testCase.parameters_schema || {},
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to get test case commands', { error });
+    handleControllerError(res, error, 'Failed to get test case commands');
   }
 }
 

@@ -67,13 +67,12 @@ router.get('/', requireAuth, listPlatforms);
  *   get:
  *     summary: Get nested platform tree with pagination
  *     description: |
- *       Returns nested hierarchy (platforms -> modules -> suites -> flows -> testCases).
+ *       Returns nested hierarchy (platforms -> modules -> flows -> testCases).
  *       Supports pagination at each level via scoped calls.
  *
  *       **Modes** (based on scope params, precedence order):
  *       - `flowId` provided: returns flow + paginated testCases
- *       - `suiteId` provided: returns suite + paginated flows
- *       - `moduleId` provided: returns module + paginated suites
+ *       - `moduleId` provided: returns module + paginated flows
  *       - no scope params: returns platforms + paginated modules (requires projectId)
  *     tags: [Platforms]
  *     security:
@@ -88,12 +87,6 @@ router.get('/', requireAuth, listPlatforms);
  *       - in: query
  *         name: flowId
  *         description: Scope to a specific flow (returns paginated testCases)
- *         schema:
- *           type: string
- *           format: uuid
- *       - in: query
- *         name: suiteId
- *         description: Scope to a specific suite (returns paginated flows)
  *         schema:
  *           type: string
  *           format: uuid
@@ -127,7 +120,7 @@ router.get('/', requireAuth, listPlatforms);
  *                   type: boolean
  *                 mode:
  *                   type: string
- *                   enum: [base, module, suite, flow]
+ *                   enum: [base, module, flow]
  *                 data:
  *                   type: object
  *                   description: Structure varies by mode

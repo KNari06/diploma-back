@@ -98,7 +98,7 @@ export class OverallBuilderService {
           projectId,
           totalTests: tests.length,
           totalSavedCases: 0, // Phase 2
-          totalSuites: 0, // Phase 2
+          totalModules: 0, // Phase 2
           generatedAt: new Date().toISOString(),
         },
       };

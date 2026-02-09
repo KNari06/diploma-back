@@ -9,7 +9,6 @@ import { logger } from '@/utils/core/logger';
  *
  * Extracts replay data from completed tests and creates:
  * - Intent test cases (unified table for UI test cases)
- * - Regression suites (collections of related test cases)
  *
  * Key Features:
  * - Automatic parameterization of sensitive values (passwords, tokens)
@@ -23,7 +22,6 @@ import { logger } from '@/utils/core/logger';
 
 // Limits to prevent resource abuse
 const MAX_PARAMETERS_PER_TEST = 50;
-const MAX_TEST_CASES_PER_SUITE = 100;
 const MAX_COMMAND_LENGTH = 10000;
 
 /**
@@ -32,13 +30,12 @@ const MAX_COMMAND_LENGTH = 10000;
  */
 export class RegressionSaveService {
   /**
-   * Save a test flow as a standalone test case or suite member
+   * Save a test flow as a reusable test case
    *
    * @param params.sourceTestId - ID of completed test to save
    * @param params.userId - User ID for ownership verification
    * @param params.name - Display name for saved test case
    * @param params.description - Optional description
-   * @param params.kind - 'standalone' for independent test or 'regression_member' for suite inclusion
    * @returns Saved test case metadata
    * @throws {NotFoundError} If source test not found
    * @throws {ValidationError} If test cannot be saved (not completed, no URL, etc.)
@@ -140,88 +137,6 @@ export class RegressionSaveService {
     }
   }
 
-  /**
-   * Create a regression suite with multiple test cases
-   * Test case IDs now refer to intent_test_cases (unified table).
-   *
-   * @param params.projectId - Project ID for the suite
-   * @param params.userId - User ID for ownership verification
-   * @param params.name - Display name for the suite
-   * @param params.description - Optional description
-   * @param params.testCaseIds - Array of intent_test_cases IDs to include
-   * @returns Suite metadata
-   * @throws {NotFoundError} If project not found
-   * @throws {ValidationError} If access denied or validation fails
-   */
-  static async createSuite(params: {
-    projectId: string;
-    userId: string;
-    name: string;
-    description?: string;
-    testCaseIds: string[]; // intent_test_cases IDs
-  }): Promise<{ suiteId: string }> {
-    const { projectId, userId, name, description, testCaseIds } = params;
-
-    try {
-      logger.info('[REGRESSION_SAVE] Creating suite', {
-        projectId,
-        userId,
-        name,
-        testCasesCount: testCaseIds.length,
-      });
-
-      // Validate suite size limit
-      if (testCaseIds.length > MAX_TEST_CASES_PER_SUITE) {
-        throw new ValidationError(
-          `Too many test cases for a single suite (${testCaseIds.length}). Maximum allowed: ${MAX_TEST_CASES_PER_SUITE}`
-        );
-      }
-
-      // Verify project access
-      await this.verifyProjectAccess(projectId, userId);
-
-      // Create suite
-      const { data: suite, error: suiteError } = await supabaseAdmin
-        .from('regression_suites')
-        .insert({
-          project_id: projectId,
-          user_id: userId,
-          name,
-          description: description || null,
-        })
-        .select('id')
-        .single();
-
-      if (suiteError || !suite) {
-        throw new Error(`Failed to create suite: ${suiteError?.message}`);
-      }
-
-      // Add test cases to suite (now uses intent_test_case_id)
-      const items = testCaseIds.map((caseId, index) => ({
-        suite_id: suite.id,
-        intent_test_case_id: caseId,
-        order_index: index + 1,
-      }));
-
-      const { error: itemsError } = await supabaseAdmin
-        .from('regression_suite_items')
-        .insert(items);
-
-      if (itemsError) {
-        throw new Error(`Failed to add test cases to suite: ${itemsError.message}`);
-      }
-
-      logger.info('[REGRESSION_SAVE] Suite created successfully', {
-        suiteId: suite.id,
-        testCasesCount: testCaseIds.length,
-      });
-
-      return { suiteId: suite.id };
-    } catch (error) {
-      logger.error('[REGRESSION_SAVE] Failed to create suite', { error, projectId });
-      throw error;
-    }
-  }
 
   /**
    * Get source test and verify access
@@ -468,28 +383,4 @@ export class RegressionSaveService {
     return `param_${base}_${Date.now().toString(36)}`;
   }
 
-  /**
-   * Verify user has access to project
-   *
-   * @throws {NotFoundError} If project not found
-   * @throws {ValidationError} If access denied
-   */
-  private static async verifyProjectAccess(
-    projectId: string,
-    userId: string
-  ): Promise<void> {
-    const { data: project, error } = await supabaseAdmin
-      .from('projects')
-      .select('user_id')
-      .eq('id', projectId)
-      .maybeSingle();
-
-    if (error || !project) {
-      throw new NotFoundError('Project', projectId);
-    }
-
-    if (project.user_id !== userId) {
-      throw new ValidationError('Access denied to this project');
-    }
-  }
 }

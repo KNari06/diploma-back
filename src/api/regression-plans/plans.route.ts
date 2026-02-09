@@ -136,11 +136,8 @@ router.delete('/:id', requireAuth, deletePlan);
  *             properties:
  *               itemType:
  *                 type: string
- *                 enum: [module, suite, flow, test_case]
+ *                 enum: [module, flow, test_case]
  *               moduleId:
- *                 type: string
- *                 format: uuid
- *               suiteId:
  *                 type: string
  *                 format: uuid
  *               flowId:

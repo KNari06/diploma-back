@@ -29,7 +29,6 @@ export class ExecutionService {
       testType,
       testCaseId,
       moduleId,
-      suiteId,
       flowId,
       browser,
       environment,
@@ -42,7 +41,6 @@ export class ExecutionService {
         test_type: testType,
         test_case_id: testCaseId,
         module_id: moduleId || null,
-        suite_id: suiteId || null,
         flow_id: flowId || null,
         browser: browser || null,
         environment: environment || null,
@@ -71,7 +69,6 @@ export class ExecutionService {
       testCaseId: string;
       testType: 'ui' | 'api';
       moduleId?: string;
-      suiteId?: string;
       flowId?: string;
       browser?: string;
       environment?: string;
@@ -91,7 +88,6 @@ export class ExecutionService {
       test_type: tc.testType,
       test_case_id: tc.testCaseId,
       module_id: tc.moduleId || null,
-      suite_id: tc.suiteId || null,
       flow_id: tc.flowId || null,
       browser: tc.browser || null,
       environment: tc.environment || null,
@@ -239,32 +235,6 @@ export class ExecutionService {
   }
 
   /**
-   * Get execution statistics for a suite
-   * @param suiteId - Suite ID
-   * @param days - Number of days to include (default: 30)
-   * @returns Aggregated stats
-   */
-  static async getStatsBySuite(
-    suiteId: string,
-    days: number = 30
-  ): Promise<ExecutionStats> {
-    const since = new Date();
-    since.setDate(since.getDate() - days);
-
-    const { data, error } = await supabaseAdmin
-      .from('test_executions')
-      .select('status, duration_ms')
-      .eq('suite_id', suiteId)
-      .gte('created_at', since.toISOString());
-
-    if (error) {
-      throw new Error(`Failed to get suite stats: ${error.message}`);
-    }
-
-    return this.calculateStats(data || []);
-  }
-
-  /**
    * Calculate statistics from execution records
    */
   private static calculateStats(
@@ -312,7 +282,6 @@ export class ExecutionService {
       testType: row.test_type,
       testCaseId: row.test_case_id,
       moduleId: row.module_id || undefined,
-      suiteId: row.suite_id || undefined,
       flowId: row.flow_id || undefined,
       status: row.status,
       durationMs: row.duration_ms || undefined,

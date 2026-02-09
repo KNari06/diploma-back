@@ -1,7 +1,7 @@
 import { Job } from 'bullmq';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
-import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
+
 import { GitWebhookService } from '@/services/integrations/git-webhook.service';
 import { NotificationService } from '@/services/notifications/notification.service';
 
@@ -95,14 +95,6 @@ export class GitWebhookJobHandler {
       return;
     }
 
-    if (!integration.suite_id) {
-      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-        status: 'ignored',
-        error: 'suite_not_configured',
-      });
-      return;
-    }
-
     // Resolve project owner for RegressionRunService access checks
     const { data: project, error: projectError } = await supabaseAdmin
       .from('projects')
@@ -118,27 +110,18 @@ export class GitWebhookJobHandler {
       throw new Error('Project not found for integration');
     }
 
-    logger.info('[GIT_WEBHOOK_JOB] Triggering regression suite', {
+    logger.info('[GIT_WEBHOOK_JOB] Triggering regression run', {
       provider,
       deliveryId,
-      suiteId: integration.suite_id,
       branch: decision.branch,
       reason: decision.reason,
     });
 
     try {
-      await RegressionRunService.runSuite({
-        suiteId: integration.suite_id,
-        userId: project.user_id,
-        trigger: 'scheduled',
-        parameters: {
-          provider,
-          eventType: deliveryEventType,
-          repositoryUrl: delivery.repository_url,
-          branch: decision.branch,
-          deliveryId,
-          triggerReason: decision.reason,
-        },
+      // TODO: Update to use module or plan instead of suite (suite_id removed)
+      logger.warn('[GIT_WEBHOOK_JOB] Suite-based git integrations no longer supported', {
+        integrationId: integration.id,
+        deliveryId,
       });
 
       await GitWebhookService.updateDeliveryStatus(provider, deliveryId, { status: 'processed' });
@@ -156,7 +139,6 @@ export class GitWebhookJobHandler {
           userId: project.user_id,
           provider,
           deliveryId,
-          suiteId: integration.suite_id,
           error: errorMessage,
         });
 
@@ -171,7 +153,6 @@ export class GitWebhookJobHandler {
             metadata: {
               provider,
               deliveryId,
-              suiteId: integration.suite_id,
               projectId: integration.project_id,
               branch: decision.branch,
               error: errorMessage,

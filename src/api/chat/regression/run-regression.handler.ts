@@ -4,17 +4,16 @@
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * Handles the 'run_regression' intent detected by AI intent parser.
- * Executes a saved test case or regression suite.
+ * Executes a saved test case.
  *
  * Flow:
- * 1. Extract savedTestCaseId or suiteId from parsedIntent
- * 2. Validate at least one ID is provided
- * 3. Call RegressionRunService to execute test/suite
+ * 1. Extract savedTestCaseId from parsedIntent
+ * 2. Validate an ID is provided
+ * 3. Call RegressionRunService to execute test
  * 4. Return localized success message with run ID
  *
  * Triggered by commands like:
  * - "run saved test abc123"
- * - "run suite xyz789"
  * - "execute the checkout regression"
  * - "запусти сохраненный тест"
  */
@@ -27,12 +26,12 @@ import { getLocalizedMessages } from './localization';
 
 /**
  * Handler for run_regression intent
- * Runs a saved test case or regression suite
+ * Runs a saved test case
  *
  * @param req - Express request object
  * @param res - Express response object
  * @param params - Handler parameters from routing system
- * @param params.parsedIntent - Parsed intent from AI (contains savedTestCaseId or suiteId)
+ * @param params.parsedIntent - Parsed intent from AI (contains savedTestCaseId)
  * @param params.userId - User ID for running regression
  */
 export async function handleRunRegressionIntent(
@@ -65,16 +64,15 @@ export async function handleRunRegressionIntent(
 
     // Extract parameters from parsed intent
     const savedTestCaseId = parsedIntent?.savedTestCaseId;
-    const suiteId = parsedIntent?.suiteId;
 
-    // Validate we have either a test case ID or suite ID
-    if (!savedTestCaseId && !suiteId) {
+    // Validate we have a test case ID
+    if (!savedTestCaseId) {
       res.json({
         success: true,
         message: localized.runRegression.noId,
         data: {
           needsClarification: true,
-          question: 'Which saved test or suite would you like to run? Please provide a test case ID or suite ID.',
+          question: 'Which saved test would you like to run? Please provide a test case ID.',
         },
         timestamp: new Date().toISOString(),
         sessionId: params.chatSessionId,
@@ -84,7 +82,7 @@ export async function handleRunRegressionIntent(
 
     let result: { runId: string; testId?: string; testIds?: string[] };
 
-    // Run saved test case or suite
+    // Run saved test case
     if (savedTestCaseId) {
       result = await RegressionRunService.runSavedTestCase({
         savedTestCaseId,
@@ -104,30 +102,6 @@ export async function handleRunRegressionIntent(
           runId: result.runId,
           testId: result.testId,
           type: 'saved_test_case',
-        },
-        timestamp: new Date().toISOString(),
-        sessionId: params.chatSessionId,
-      });
-    } else if (suiteId) {
-      result = await RegressionRunService.runSuite({
-        suiteId,
-        userId,
-        trigger: 'chat',
-      });
-
-      logger.info('[RUN_REGRESSION_HANDLER] Suite started', {
-        runId: result.runId,
-        testCount: result.testIds?.length || 0,
-      });
-
-      res.json({
-        success: true,
-        message: localized.runRegression.suiteStarted(result.runId, result.testIds?.length || 0),
-        data: {
-          runId: result.runId,
-          testIds: result.testIds,
-          testCount: result.testIds?.length || 0,
-          type: 'suite',
         },
         timestamp: new Date().toISOString(),
         sessionId: params.chatSessionId,

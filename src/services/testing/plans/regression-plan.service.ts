@@ -247,7 +247,6 @@ export class RegressionPlanService {
       planId,
       itemType,
       moduleId,
-      suiteId,
       flowId,
       testCaseId,
       testCaseType,
@@ -280,7 +279,6 @@ export class RegressionPlanService {
         plan_id: planId,
         item_type: itemType,
         module_id: moduleId || null,
-        suite_id: suiteId || null,
         flow_id: flowId || null,
         test_case_id: testCaseId || null,
         test_case_type: testCaseType || null,
@@ -370,7 +368,7 @@ export class RegressionPlanService {
 
   /**
    * Expand a plan to individual test cases
-   * Resolves modules → suites → flows → test cases
+   * Resolves modules → flows → test cases
    * @param planId - Plan ID
    * @returns Array of expanded test cases
    */
@@ -384,12 +382,6 @@ export class RegressionPlanService {
           if (item.moduleId) {
             const moduleCases = await this.expandModule(item.moduleId);
             expandedCases.push(...moduleCases);
-          }
-          break;
-        case 'suite':
-          if (item.suiteId) {
-            const suiteCases = await this.expandSuite(item.suiteId);
-            expandedCases.push(...suiteCases);
           }
           break;
         case 'flow':
@@ -422,31 +414,11 @@ export class RegressionPlanService {
    * Expand a module to its test cases
    */
   private static async expandModule(moduleId: string): Promise<ExpandedTestCase[]> {
-    // Get all suites in module
-    const { data: suites } = await supabaseAdmin
-      .from('regression_suites')
-      .select('id')
-      .eq('module_id', moduleId);
-
-    const cases: ExpandedTestCase[] = [];
-    for (const suite of suites || []) {
-      const suiteCases = await this.expandSuite(suite.id);
-      cases.push(...suiteCases);
-    }
-
-    return cases;
-  }
-
-  /**
-   * Expand a suite to its test cases
-   */
-  private static async expandSuite(suiteId: string): Promise<ExpandedTestCase[]> {
-    // Get all flows in suite
+    // Get all flows in module
     const { data: flows } = await supabaseAdmin
       .from('test_flows')
       .select('id')
-      .eq('suite_id', suiteId)
-      .order('order_index', { ascending: true });
+      .eq('module_id', moduleId);
 
     const cases: ExpandedTestCase[] = [];
     for (const flow of flows || []) {
@@ -463,25 +435,14 @@ export class RegressionPlanService {
   private static async expandFlow(flowId: string): Promise<ExpandedTestCase[]> {
     const cases: ExpandedTestCase[] = [];
 
-    // Get flow info for context
+    // Get flow info for module context
     const { data: flow } = await supabaseAdmin
       .from('test_flows')
-      .select('suite_id')
+      .select('module_id')
       .eq('id', flowId)
       .single();
 
-    const suiteId = flow?.suite_id;
-
-    // Get module_id from suite
-    let moduleId: string | undefined;
-    if (suiteId) {
-      const { data: suite } = await supabaseAdmin
-        .from('regression_suites')
-        .select('module_id')
-        .eq('id', suiteId)
-        .single();
-      moduleId = suite?.module_id;
-    }
+    const moduleId = flow?.module_id;
 
     // Get UI test cases from intent_test_cases (unified table)
     const { data: uiCases } = await supabaseAdmin
@@ -494,7 +455,6 @@ export class RegressionPlanService {
         testCaseId: tc.id,
         testType: 'ui',
         moduleId,
-        suiteId,
         flowId,
         name: tc.name,
       });
@@ -511,7 +471,6 @@ export class RegressionPlanService {
         testCaseId: tc.id,
         testType: 'api',
         moduleId,
-        suiteId,
         flowId,
         name: tc.name,
       });
@@ -538,33 +497,23 @@ export class RegressionPlanService {
 
     if (!data) return null;
 
-    // Get hierarchy info
+    // Get module_id from flow
     let moduleId: string | undefined;
-    let suiteId: string | undefined;
 
     if (data.flow_id) {
       const { data: flow } = await supabaseAdmin
         .from('test_flows')
-        .select('suite_id')
+        .select('module_id')
         .eq('id', data.flow_id)
         .single();
 
-      if (flow?.suite_id) {
-        suiteId = flow.suite_id;
-        const { data: suite } = await supabaseAdmin
-          .from('regression_suites')
-          .select('module_id')
-          .eq('id', suiteId)
-          .single();
-        moduleId = suite?.module_id;
-      }
+      moduleId = flow?.module_id;
     }
 
     return {
       testCaseId: data.id,
       testType,
       moduleId,
-      suiteId,
       flowId: data.flow_id,
       name: data.name,
     };
@@ -594,7 +543,6 @@ export class RegressionPlanService {
       planId: row.plan_id,
       itemType: row.item_type,
       moduleId: row.module_id || undefined,
-      suiteId: row.suite_id || undefined,
       flowId: row.flow_id || undefined,
       testCaseId: row.test_case_id || undefined,
       testCaseType: row.test_case_type || undefined,

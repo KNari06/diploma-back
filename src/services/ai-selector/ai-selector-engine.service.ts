@@ -21,7 +21,7 @@ import { logger } from '@/utils/core/logger';
  * Key Features:
  * - Chat notification with rich metadata
  * - Automatic regression run status updates
- * - Support for both single test and suite runs
+ * - Support for both single test and batch runs
  */
 
 /**
@@ -135,32 +135,28 @@ export class TestCompletionHandlerService {
       }
 
       // Update regression runs associated with this test
-      await this.updateRegressionRuns(testId, test.status);
+      await this.updateRegressionRuns(testId);
     } catch (error) {
       logger.error('[TEST_COMPLETION] Unexpected error', { error, testId });
     }
   }
 
   /**
-   * Update regression runs that reference this test
-   * Recomputes run status based on underlying test results
+   * Update regression runs that reference this test.
+   * Recomputes run status by querying all underlying tests (does not use
+   * the completed test's status directly).
    *
-   * Called automatically after test completion to keep regression_runs.status in sync
+   * Called automatically after test completion to keep regression_runs.status in sync.
    *
    * @param testId - UUID of completed test
-   * @param testStatus - Status of completed test ('completed', 'failed', etc.)
    */
-  private static async updateRegressionRuns(
-    testId: string,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    _testStatus: string
-  ): Promise<void> {
+  private static async updateRegressionRuns(testId: string): Promise<void> {
     try {
       // Find regression runs that reference this test
-      // Either directly (test_id) or in a suite (test_ids array)
+      // Either directly (test_id) or in a batch (test_ids array)
       const { data: runs, error: runsError } = await supabaseAdmin
         .from('regression_runs')
-        .select('id, suite_id, saved_test_case_id, test_id, test_ids, status')
+        .select('id, saved_test_case_id, test_id, test_ids, status')
         .or(`test_id.eq.${testId},test_ids.cs.["${testId}"]`)
         .in('status', ['running']); // Only update runs that are still in progress
 
@@ -217,7 +213,7 @@ export class TestCompletionHandlerService {
         // Single test case run
         underlyingTestIds = [run.test_id];
       } else if (run.test_ids && Array.isArray(run.test_ids)) {
-        // Suite run
+        // Batch run
         underlyingTestIds = run.test_ids;
       } else {
         logger.warn('[TEST_COMPLETION] Run has no test_id or test_ids', { runId: run.id });
@@ -318,24 +314,44 @@ export class TestCompletionHandlerService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// AI SELECTOR ENGINE (TEMPORARY STUB)
+// AI SELECTOR ENGINE (BASIC FALLBACK)
 // ═══════════════════════════════════════════════════════════════════════════
-// ⚠️ CRITICAL: This is a temporary stub. The actual AISelectorEngine class
-// was replaced with TestCompletionHandlerService. This needs to be restored.
-// The resolve method will throw an error to prevent silent failures.
+// ⚠️ NOTE: This is a basic fallback implementation. The full AI-powered
+// selector engine is not yet implemented. This returns a "not available" response
+// to allow calling code to handle gracefully instead of throwing errors.
 
 import type { SelectorResolveRequest, SelectorResolveResponse } from './types';
 
 export class AISelectorEngine {
   /**
    * Resolve selector using AI
-   * ⚠️ TEMPORARY STUB - This will throw an error until the class is restored
+   * ⚠️ FALLBACK IMPLEMENTATION - Returns "not available" response
+   *
+   * TODO: Implement full AI-powered selector resolution:
+   * - Intent parsing (natural language → structured intent)
+   * - Vision AI for screenshot analysis (optional)
+   * - DOM analysis and candidate generation
+   * - Selector stability scoring
+   * - Result caching
    */
-  static async resolve(_request: SelectorResolveRequest): Promise<SelectorResolveResponse> {
-    logger.error('[AI_SELECTOR_ENGINE] AISelectorEngine.resolve called but class is not implemented');
-    throw new Error(
-      'AISelectorEngine.resolve is not implemented. The class was replaced with TestCompletionHandlerService. ' +
-      'Please restore the original AISelectorEngine implementation.'
-    );
+  static async resolve(request: SelectorResolveRequest): Promise<SelectorResolveResponse> {
+    const startTime = Date.now();
+
+    logger.warn('[AI_SELECTOR_ENGINE] AI selector engine not yet implemented, returning fallback', {
+      intent: request.intent,
+      url: request.metadata.url,
+    });
+
+    // Return a "not available" response that calling code can handle
+    return {
+      success: false,
+      fallbackSelectors: [],
+      explanation: 'AI selector engine is not yet implemented. Please use manual selectors.',
+      warning: 'AI-powered selector resolution is currently unavailable. Consider using Playwright locators (getByRole, getByText, etc.) directly.',
+      metrics: {
+        totalDuration: Date.now() - startTime,
+        cacheHit: false,
+      },
+    };
   }
 }

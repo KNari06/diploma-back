@@ -3,12 +3,12 @@
  * REGRESSION CONTEXT BUILDER
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Builds context about recent tests, saved test cases, and regression suites
+ * Builds context about recent tests and saved test cases
  * to help AI intent parser understand user's regression-related requests.
  *
  * This context is injected into the intent parsing prompt so AI can:
  * - Know which test to save when user says "save this"
- * - Understand available saved cases and suites
+ * - Understand available saved cases
  * - Provide better intent detection for regression commands
  */
 
@@ -36,10 +36,9 @@ export async function buildRegressionContext(params: {
 
   try {
     // Run all DB queries in parallel for ~4x speedup
-    const [lastTest, savedCasesCount, suitesCount, recentTestIds] = await Promise.all([
+    const [lastTest, savedCasesCount, recentTestIds] = await Promise.all([
       chatSessionId ? getLastTestFromSession(chatSessionId, userId, projectId) : null,
       projectId ? getSavedCasesCount(projectId, userId) : 0,
-      projectId ? getSuitesCount(projectId, userId) : 0,
       chatSessionId ? getRecentTestIds(chatSessionId) : [],
     ]);
 
@@ -47,7 +46,6 @@ export async function buildRegressionContext(params: {
       lastTestId: lastTest?.id,
       lastTestGoal: lastTest?.goal,
       savedCasesCount,
-      suitesCount,
       recentTestIds,
     };
   } catch (error) {
@@ -164,30 +162,6 @@ async function getSavedCasesCount(
     return count || 0;
   } catch (error) {
     logger.warn('[REGRESSION_CONTEXT] Error getting intent test cases count', { error });
-    return 0;
-  }
-}
-
-/**
- * Get count of regression suites for a project
- * Used to provide context about available suites
- *
- * @param projectId - Project ID to count suites for
- * @param userId - User ID for filtering
- * @returns Number of regression suites (0 on error)
- */
-async function getSuitesCount(projectId: string, userId: string): Promise<number> {
-  try {
-    const { count, error } = await supabaseAdmin
-      .from('regression_suites')
-      .select('id', { count: 'exact', head: true })
-      .eq('project_id', projectId)
-      .eq('user_id', userId);
-
-    if (error) throw error;
-    return count || 0;
-  } catch (error) {
-    logger.warn('[REGRESSION_CONTEXT] Error getting suites count', { error });
     return 0;
   }
 }

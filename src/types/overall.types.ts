@@ -3,7 +3,7 @@
  * Used by /api/v1/test-visualization/project/:projectId/overall
  */
 
-export type EntityType = 'test_run' | 'saved_case' | 'suite';
+export type EntityType = 'test_run' | 'saved_case' | 'module';
 
 export type StatusFlag = 'success' | 'failed' | 'danger' | 'cancelled';
 
@@ -15,7 +15,7 @@ export type RelationshipType = 'url' | 'page_flow' | 'semantic' | 'temporal';
  * Node in the project overall graph (represents a test entity)
  */
 export interface OverallNode {
-  id: string; // UUID of test/saved_case/suite
+  id: string; // UUID of test/saved_case/module
   entityType: EntityType;
   label: string;
   statusFlag: StatusFlag;
@@ -66,7 +66,7 @@ export interface ProjectOverallData {
     projectId: string;
     totalTests: number;
     totalSavedCases: number;
-    totalSuites: number;
+    totalModules: number;
     generatedAt: string;
   };
 }

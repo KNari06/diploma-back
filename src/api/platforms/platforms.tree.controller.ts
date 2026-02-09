@@ -4,8 +4,7 @@
  *
  * Modes (based on scope params, precedence order):
  * - flowId: return flow + paginated testCases
- * - suiteId: return suite + paginated flows
- * - moduleId: return module + paginated suites
+ * - moduleId: return module + paginated flows
  * - none: return platforms + paginated modules (per platform)
  */
 
@@ -33,7 +32,7 @@ function getUserId(req: AuthenticatedRequest): string {
  *
  * Query params:
  * - projectId (required for base mode)
- * - flowId, suiteId, moduleId (scope params - mutually exclusive)
+ * - flowId, moduleId (scope params - mutually exclusive)
  * - limit (default 20)
  * - offset (default 0)
  * - depth (1-4, for future nested expansion)
@@ -42,7 +41,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function getPlatformTree(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, flowId, suiteId, moduleId } = req.query;
+    const { projectId, flowId, moduleId } = req.query;
     const limit = parseInt(req.query.limit as string) || 20;
     const offset = parseInt(req.query.offset as string) || 0;
 
@@ -64,23 +63,8 @@ export async function getPlatformTree(req: AuthenticatedRequest, res: Response):
       return;
     }
 
-    if (suiteId && typeof suiteId === 'string') {
-      // Suite mode: return suite + paginated flows
-      logger.info('[PLATFORM_TREE_API] Suite mode', { suiteId, userId, limit, offset });
-
-      const result = await PlatformTreeService.getSuiteModeTree(suiteId, userId, { limit, offset });
-
-      res.json({
-        success: true,
-        mode: 'suite',
-        data: result,
-        timestamp: new Date(),
-      });
-      return;
-    }
-
     if (moduleId && typeof moduleId === 'string') {
-      // Module mode: return module + paginated suites
+      // Module mode: return module + paginated flows
       logger.info('[PLATFORM_TREE_API] Module mode', { moduleId, userId, limit, offset });
 
       const result = await PlatformTreeService.getModuleModeTree(moduleId, userId, { limit, offset });

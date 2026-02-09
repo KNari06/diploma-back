@@ -1,11 +1,10 @@
 import { requireAuth } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import {
-  createSuite,
   getRunStats,
+  getTestCaseCommands,
   listRuns,
   listSavedTestCases,
-  listSuites,
   runByPriority,
   runByTag,
   runFlow,
@@ -23,11 +22,10 @@ const router = Router();
  * Key concepts (to avoid confusion with other "test" routes):
  * - `tests` (execution): results of an actual run (produced by running UI/API tests)
  * - `intent_test_cases` (definition): unified UI test definitions used for authoring and replay/regression
- * - `regression_suites` (collection): groups of test cases to run together
  *
  * This router mainly does 2 things:
  * 1) Save: convert an already executed test (`tests`) into a reusable test case (`intent_test_cases` with status=published)
- * 2) Run: execute saved definitions (test case / suite / module / flow / plan) and create new executions
+ * 2) Run: execute saved definitions (test case / module / flow / plan) and create new executions
  *
  * It does NOT provide "step editor" endpoints to manually author `intent_test_cases.commands`.
  * Manual authoring is handled by the Preview/Intent Test Case endpoints (`/api/v1/preview/...`) in this codebase.
@@ -80,71 +78,11 @@ router.post('/save', requireAuth, saveTestCase);
 
 /**
  * @swagger
- * /api/v1/regression/suites:
- *   post:
- *     summary: Create a regression suite
- *     description: Creates a collection of related test cases to run together
- *     tags: [Regression]
- *     security:
- *       - bearerAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - projectId
- *               - name
- *               - testCaseIds
- *             properties:
- *               projectId:
- *                 type: string
- *                 format: uuid
- *               name:
- *                 type: string
- *               description:
- *                 type: string
- *               testCaseIds:
- *                 type: array
- *                 items:
- *                   type: string
- *                   format: uuid
- *     responses:
- *       200:
- *         description: Suite created successfully
- *       400:
- *         description: Bad request
- *       403:
- *         description: Access denied
- *   get:
- *     summary: List suites for project
- *     tags: [Regression]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: query
- *         name: projectId
- *         required: true
- *         schema:
- *           type: string
- *           format: uuid
- *     responses:
- *       200:
- *         description: List of suites
- */
-// List suites (collections of saved test cases) for a project.
-router.get('/suites', requireAuth, listSuites);
-// Create a suite (collection of saved test cases) for a project.
-router.post('/suites', requireAuth, createSuite);
-
-/**
- * @swagger
  * /api/v1/regression/run:
  *   post:
- *     summary: Run a saved test case or suite
+ *     summary: Run a saved test case
  *     description: |
- *       Executes a saved test case or entire suite.
+ *       Executes a saved test case.
  *       Applies provided parameters to parameterized values.
  *     tags: [Regression]
  *     security:
@@ -155,10 +93,9 @@ router.post('/suites', requireAuth, createSuite);
  *         application/json:
  *           schema:
  *             type: object
+ *             required:
+ *               - savedTestCaseId
  *             properties:
- *               suiteId:
- *                 type: string
- *                 format: uuid
  *               savedTestCaseId:
  *                 type: string
  *                 format: uuid
@@ -177,7 +114,7 @@ router.post('/suites', requireAuth, createSuite);
  *       404:
  *         description: Resource not found
  */
-// Run/replay: execute a saved test case OR a suite (creates new execution run records).
+// Run/replay: execute a saved test case (creates new execution run records).
 router.post('/run', requireAuth, runRegression);
 
 /**
@@ -393,5 +330,32 @@ router.post('/run-by-priority', requireAuth, runByPriority);
  */
 // Get aggregated execution stats for a specific runId (progress, pass/fail counts, etc.).
 router.get('/runs/:runId/stats', requireAuth, getRunStats);
+
+/**
+ * @swagger
+ * /api/v1/regression/test-cases/{id}/commands:
+ *   get:
+ *     summary: Get test case commands for shared steps picker
+ *     description: Returns commands, parameters schema, and name for a test case (used by frontend shared steps picker)
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Test case commands retrieved successfully
+ *       403:
+ *         description: Access denied
+ *       404:
+ *         description: Test case not found
+ */
+// Get test case commands (for shared steps picker in frontend).
+router.get('/test-cases/:id/commands', requireAuth, getTestCaseCommands);
 
 export default router;

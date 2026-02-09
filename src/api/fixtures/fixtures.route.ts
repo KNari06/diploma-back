@@ -34,7 +34,7 @@ const router = Router();
  *         name: scope
  *         schema:
  *           type: string
- *           enum: [global, project, module, suite, flow]
+ *           enum: [global, project, module, flow]
  *     responses:
  *       200:
  *         description: List of fixtures
@@ -65,7 +65,7 @@ const router = Router();
  *                 type: object
  *               scope:
  *                 type: string
- *                 enum: [global, project, module, suite, flow]
+ *                 enum: [global, project, module, flow]
  *               moduleId:
  *                 type: string
  *                 format: uuid

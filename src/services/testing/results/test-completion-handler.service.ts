@@ -22,7 +22,7 @@ import { NotificationService } from '@/services/notifications/notification.servi
  * Key Features:
  * - Chat notification with rich metadata
  * - Automatic regression run status updates
- * - Support for both single test and suite runs
+ * - Support for both single test and batch runs
  */
 
 /**
@@ -307,10 +307,10 @@ export class TestCompletionHandlerService {
   ): Promise<void> {
     try {
       // Find regression runs that reference this test
-      // Either directly (test_id) or in a suite (test_ids array)
+      // Either directly (test_id) or in a batch (test_ids array)
       const { data: runs, error: runsError } = await supabaseAdmin
         .from('regression_runs')
-        .select('id, suite_id, saved_test_case_id, test_id, test_ids, status, user_id, trigger')
+        .select('id, saved_test_case_id, test_id, test_ids, status, user_id, trigger')
         .or(`test_id.eq.${testId},test_ids.cs.["${testId}"]`)
         .in('status', ['running']); // Only update runs that are still in progress
 
@@ -401,7 +401,6 @@ export class TestCompletionHandlerService {
           status: finalStatus,
           summary,
           trigger: run.trigger,
-          suiteId: run.suite_id,
           dedupeKey: `regression:${run.id}:${finalStatus}`,
         },
       });
@@ -509,7 +508,7 @@ export class TestCompletionHandlerService {
         // Single test case run
         underlyingTestIds = [run.test_id];
       } else if (run.test_ids && Array.isArray(run.test_ids)) {
-        // Suite run
+        // Batch run
         underlyingTestIds = run.test_ids;
       } else {
         logger.warn('[TEST_COMPLETION] Run has no test_id or test_ids', { runId: run.id });
