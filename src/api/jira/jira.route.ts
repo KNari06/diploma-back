@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { startJiraAuth, getConnectUrl, handleJiraCallback, getProjects, getBoards, getBoardConfigurationHandler, getIssues, createIssue, updateIssue, updateIssueStatus, getConnectionStatus, disconnectJira, getConnections, getJiraSettings, updateJiraSettings } from './jira.controller';
+import { startJiraAuth, getConnectUrl, handleJiraCallback, getProjects, getBoards, getBoardConfigurationHandler, getIssues, createIssue, updateIssue, updateIssueStatus, getConnectionStatus, disconnectJira, getConnections, getJiraSettings, updateJiraSettings, qaAnalyze } from './jira.controller';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { requireAuth } from '@/middleware/auth.middleware';
 
@@ -672,6 +672,40 @@ router.put('/issues', requireAuth, asyncHandler(updateIssue));
  *         description: Ошибка Jira API
  */
 router.patch('/issues', requireAuth, asyncHandler(updateIssueStatus));
+
+/**
+ * @swagger
+ * /api/v1/jira/qa-analyze:
+ *   post:
+ *     summary: Analyze Jira task for QA (run test / rework / prepare manual)
+ *     description: Analyzes task with KB + context, then runs platform test, sends to rework, or creates test case for manual QA.
+ *     tags: [Jira]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [issueKey, projectId]
+ *             properties:
+ *               issueKey:
+ *                 type: string
+ *                 example: "KAN-42"
+ *               projectId:
+ *                 type: string
+ *                 format: uuid
+ *               cloudId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Analysis result (outcome, message, testId or testCaseId)
+ *       400:
+ *         description: issueKey and projectId required
+ *       500:
+ *         description: Analysis or Jira error
+ */
+router.post('/qa-analyze', requireAuth, asyncHandler(qaAnalyze));
 
 /**
  * @swagger
