@@ -44,7 +44,7 @@ export type IntentHandler = (
     answers?: Record<string, any>;
     context?: any;
     abortSignal?: AbortSignal;
-    mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
+    mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
   }
 ) => Promise<void>;
 
@@ -104,6 +104,7 @@ const handleGeneralChat: IntentHandler = async (req, res, params) => {
     context: params.context,
     userLanguage: params.parsedIntent?.userLanguage,
     abortSignal: params.abortSignal,
+    mode: params.mode,
   });
 };
 

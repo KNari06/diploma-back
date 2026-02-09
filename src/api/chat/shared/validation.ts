@@ -5,7 +5,7 @@ import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { ChatRequest } from '../chat.types';
 import { CONSTANTS, MESSAGES } from './constants';
-import { PROGRESS, emitProcessingStep, getOrCreateChatSession } from './utils';
+import { PROGRESS, emitProcessingStep, getOrCreateWorkspaceChat } from './utils';
 
 /**
  * STEP 0: INPUT VALIDATION (FIX #1 & #2)
@@ -17,7 +17,7 @@ export interface Step0Result {
   sessionId?: string;
   conversationId?: string;
   answers?: Record<string, any>;
-  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
+  mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -92,7 +92,7 @@ export function validateInput(
     sessionId,
     conversationId,
     answers,
-    mode: mode || 'lite', // Default to 'lite' mode
+    mode: (mode as 'lite' | 'pro' | 'editor') || 'lite', // Default to 'lite' mode
   };
 }
 
@@ -110,12 +110,12 @@ export async function checkWorkspace(
 
   try {
     // 1) If sessionId is provided, treat chat_sessions.workspace_id as the source of truth
+    // NOTE: No user_id filter — session is shared across workspace members
     if (sessionId) {
       const { data: session, error: sessionError } = await supabaseAdmin
         .from('chat_sessions')
         .select('id, workspace_id')
         .eq('id', sessionId)
-        .eq('user_id', userId)
         .maybeSingle();
 
       if (sessionError) {
@@ -140,8 +140,7 @@ export async function checkWorkspace(
         const { error: updateError } = await supabaseAdmin
           .from('chat_sessions')
           .update({ workspace_id: fallbackWorkspaceId })
-          .eq('id', sessionId)
-          .eq('user_id', userId);
+          .eq('id', sessionId);
 
         if (updateError) {
           logger.warn('[CHAT] Failed to backfill chat_sessions.workspace_id (non-fatal)', {
@@ -214,11 +213,11 @@ export async function manageChatSession(
 
   let chatSessionId: string | undefined;
   try {
-    const getOrCreateChatSessionWithLogging = functionLogger
-      ? withFunctionLogging(getOrCreateChatSession, 'getOrCreateChatSession', functionLogger)
-      : getOrCreateChatSession;
-    chatSessionId = await getOrCreateChatSessionWithLogging(userId, sessionId, workspace_id);
-    logger.debug('[CHAT] Chat session ready', {
+    const getOrCreateWorkspaceChatWithLogging = functionLogger
+      ? withFunctionLogging(getOrCreateWorkspaceChat, 'getOrCreateWorkspaceChat', functionLogger)
+      : getOrCreateWorkspaceChat;
+    chatSessionId = await getOrCreateWorkspaceChatWithLogging(userId, workspace_id, sessionId);
+    logger.debug('[CHAT] Workspace chat session ready', {
       chatSessionId: chatSessionId || 'none',
       providedSessionId: sessionId || 'none',
     });

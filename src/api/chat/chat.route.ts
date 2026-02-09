@@ -4,9 +4,10 @@ import { logger } from '@/utils/core/logger';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import {
-  createNewChatSession,
+  clearWorkspaceChat,
   deleteChatSession,
   getChatSessionById,
+  getWorkspaceChat,
   listUserChatSessions,
   updateChatSessionTitle,
 } from './chat-sessions.controller';
@@ -22,7 +23,7 @@ const chatRequestSchema = z.object({
   conversationId: z.string().optional(),
   answers: z.record(z.any()).optional(),
   userId: z.string().optional(),
-  mode: z.enum(['lite', 'pro']).optional().default('lite'), // Test execution mode
+  mode: z.enum(['lite', 'pro', 'editor']).optional().default('lite'), // Test execution mode
 });
 
 /**
@@ -870,7 +871,9 @@ router.get('/debug', requireAuth, asyncHandler(debugChatData));
  *       500:
  *         description: Ошибка сервера
  */
-router.post('/sessions/new', requireAuth, asyncHandler(createNewChatSession));
+// POST /sessions/new removed — workspace chat is auto-created
+// Replaced by GET /workspace-chat which auto-creates the single workspace session
+router.get('/workspace-chat', requireAuth, asyncHandler(getWorkspaceChat));
 
 
 /**
@@ -1078,6 +1081,7 @@ router.patch('/sessions/:sessionId', requireAuth, asyncHandler(updateChatSession
  *       401:
  *         description: Не авторизован
  */
+router.post('/sessions/:sessionId/clear', requireAuth, asyncHandler(clearWorkspaceChat));
 router.delete('/sessions/:sessionId', requireAuth, asyncHandler(deleteChatSession));
 
 export default router;

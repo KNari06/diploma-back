@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
 import { isValidUUID } from '@/utils/validation/validation';
@@ -82,12 +83,76 @@ export function compressMessageContent(content: string): string {
 }
 
 /**
- * Get or create chat session with multi-chat support
- * @param userId - User ID
- * @param providedSessionId - Existing session ID (optional)
+ * Get or create the single workspace chat session.
+ * Each workspace has exactly ONE shared chat session used by all members.
+ *
+ * @param userId - User ID (must be a workspace member)
  * @param workspaceId - Workspace ID
- * @param createNew - Force create new session (for multi-chat support)
- * @returns Chat session ID or undefined for anonymous
+ * @param providedSessionId - Optional session ID for backward compatibility
+ * @returns Chat session ID or undefined for anonymous users
+ */
+export async function getOrCreateWorkspaceChat(
+  userId: string,
+  workspaceId: string,
+  providedSessionId?: string
+): Promise<string | undefined> {
+  if (!isValidUUID(userId)) {
+    return undefined;
+  }
+
+  // Validate workspace membership
+  const isMember = await WorkspaceAccessService.isMember(userId, workspaceId);
+  if (!isMember) {
+    logger.warn('[CHAT_SESSION] User is not a workspace member', { userId, workspaceId });
+    throw new Error('Not a member of this workspace');
+  }
+
+  // If providedSessionId given, validate it belongs to this workspace
+  if (providedSessionId) {
+    const { data: existing } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('id, workspace_id')
+      .eq('id', providedSessionId)
+      .maybeSingle();
+
+    if (existing && existing.workspace_id === workspaceId) {
+      logger.info('[CHAT_SESSION] Using provided workspace session', { sessionId: existing.id, workspaceId });
+      return existing.id;
+    }
+    // If session doesn't match workspace, fall through to find/create the correct one
+    if (existing) {
+      logger.warn('[CHAT_SESSION] Provided session belongs to different workspace, ignoring', {
+        providedSessionId,
+        sessionWorkspace: existing.workspace_id,
+        requestedWorkspace: workspaceId,
+      });
+    }
+  }
+
+  // Find the single workspace chat session (no user_id filter — shared)
+  const { data: workspaceSession } = await supabaseAdmin
+    .from('chat_sessions')
+    .select('id')
+    .eq('workspace_id', workspaceId)
+    .order('created_at', { ascending: true }) // Use the first (oldest) session
+    .limit(1)
+    .maybeSingle();
+
+  if (workspaceSession) {
+    logger.info('[CHAT_SESSION] Using existing workspace session', {
+      sessionId: workspaceSession.id,
+      workspaceId,
+    });
+    return workspaceSession.id;
+  }
+
+  // No session exists — create the workspace's single chat session
+  logger.info('[CHAT_SESSION] Creating workspace chat session', { userId, workspaceId });
+  return await ChatService.createChatSession(userId, workspaceId);
+}
+
+/**
+ * @deprecated Use getOrCreateWorkspaceChat instead. Kept for backward compatibility.
  */
 export async function getOrCreateChatSession(
   userId: string,
@@ -95,67 +160,7 @@ export async function getOrCreateChatSession(
   workspaceId: string,
   createNew: boolean = false
 ): Promise<string | undefined> {
-  // FIX #7: Use centralized UUID validation
-  if (!isValidUUID(userId)) {
-    // Anonymous user - no session
-    return undefined;
-  }
-
-  // If providedSessionId exists, verify and use it
-  if (providedSessionId) {
-    const { data: existing } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('id, workspace_id')
-      .eq('id', providedSessionId)
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    if (existing) {
-      // Workspace is fixed per chat session; prefer the provided session as-is.
-      // If caller passed a different workspaceId, we keep the session anyway (caller should resolve workspace by sessionId).
-      if (existing.workspace_id && workspaceId && existing.workspace_id !== workspaceId) {
-        logger.warn('[CHAT_SESSION] Provided session workspace mismatch (using session workspace)', {
-          sessionId: existing.id,
-          userId,
-          sessionWorkspaceId: existing.workspace_id,
-          requestedWorkspaceId: workspaceId,
-        });
-      }
-      logger.info('[CHAT_SESSION] Using provided session', { sessionId: existing.id, userId });
-      return existing.id;
-    } else {
-      logger.warn('[CHAT_SESSION] Provided session not found, will create new', {
-        providedSessionId,
-        userId,
-      });
-    }
-  }
-
-  // If createNew = true, always create new session (multi-chat support)
-  if (createNew) {
-    logger.info('[CHAT_SESSION] Creating new chat session (multi-chat)', { userId, workspaceId });
-    return await ChatService.createChatSession(userId, workspaceId);
-  }
-
-  // Otherwise, find latest session (backward compatibility)
-  const { data: existing } = await supabaseAdmin
-    .from('chat_sessions')
-    .select('id')
-    .eq('user_id', userId)
-    // Multi-workspace: do not accidentally reuse a chat session from another workspace
-    .eq('workspace_id', workspaceId)
-    .order('updated_at', { ascending: false }) // Sort by updated_at for recent activity
-    .limit(1)
-    .maybeSingle();
-
-  if (existing) {
-    logger.info('[CHAT_SESSION] Using existing session', { sessionId: existing.id, userId });
-    return existing.id;
-  }
-
-  // Create new session if none exists
-  logger.info('[CHAT_SESSION] No existing session, creating new', { userId, workspaceId });
-  return await ChatService.createChatSession(userId, workspaceId);
+  return getOrCreateWorkspaceChat(userId, workspaceId, providedSessionId);
 }
 
 /**

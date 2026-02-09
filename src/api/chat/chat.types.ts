@@ -12,17 +12,26 @@ export interface ChatRequestContext {
   projectId?: string;
   action?: 'run_api_test' | string; // Explicit action keyword for fast path
   apiTest?: ApiTestContext; // API test data when action is 'run_api_test'
+  // Editor mode fields
+  editorMode?: boolean; // Signals chat is from preview/editor
+  previewSessionId?: string; // Active preview session ID
+  pageContext?: {
+    url?: string; // Current page URL in preview
+    title?: string; // Page title
+    domSummary?: string; // Compact DOM summary (~1500 tokens max)
+    testSteps?: Array<{ id: string; type: string; description: string }>;
+  };
   [key: string]: any;
 }
 
 export interface ChatRequest {
   message: string;
   context?: string | ChatRequestContext; // For RAG integration with projectId and API test data
-  sessionId?: string; // Existing chat session ID
+  sessionId?: string; // Optional: auto-resolved from workspace if not provided
   conversationId?: string; // For multi-turn conversations (questions/answers)
   answers?: Record<string, any>; // Answers to clarifying questions
   userId?: string; // Optional userId for testing/dev (when no auth token)
-  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
+  mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
 }
 
 export interface ChatResponse {
@@ -43,6 +52,7 @@ export interface ChatMessageWithTimestamp {
   content: string;
   created_at: string;
   metadata?: any;
+  author_id?: string; // Who sent this message (for shared workspace chat)
 }
 
 export interface ChatMessage {

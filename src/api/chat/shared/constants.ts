@@ -4,7 +4,7 @@
 
 export const CONSTANTS = {
   // Chat history
-  RECENT_MESSAGES_LIMIT: 20,
+  RECENT_MESSAGES_LIMIT: 30, // Increased from 20 for single workspace chat with richer context
 
   // Knowledge base search
   KB_MATCH_COUNT: 3,
@@ -17,6 +17,12 @@ export const CONSTANTS = {
 
   // Test plan expiration
   TEST_PLAN_EXPIRY_HOURS: 72, // 3 days
+
+  // Auto-summarization
+  SUMMARIZE_THRESHOLD: 50, // Trigger summarization when total messages exceed this
+  MESSAGES_TO_SUMMARIZE: 30, // Number of oldest messages to summarize per batch
+  KEEP_RECENT: 20, // Never summarize the last N messages
+  MAX_SUMMARY_TOKENS: 2000, // Cap total summary context in tokens
 } as const;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

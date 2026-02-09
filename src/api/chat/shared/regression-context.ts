@@ -35,25 +35,13 @@ export async function buildRegressionContext(params: {
   const { chatSessionId, userId, projectId } = params;
 
   try {
-    // Get last test from chat session
-    const lastTest = chatSessionId
-      ? await getLastTestFromSession(chatSessionId, userId, projectId)
-      : null;
-
-    // Get saved test cases count for project (if projectId available)
-    const savedCasesCount = projectId
-      ? await getSavedCasesCount(projectId, userId)
-      : 0;
-
-    // Get suites count for project (if projectId available)
-    const suitesCount = projectId
-      ? await getSuitesCount(projectId, userId)
-      : 0;
-
-    // Get recent test IDs from chat session
-    const recentTestIds = chatSessionId
-      ? await getRecentTestIds(chatSessionId)
-      : [];
+    // Run all DB queries in parallel for ~4x speedup
+    const [lastTest, savedCasesCount, suitesCount, recentTestIds] = await Promise.all([
+      chatSessionId ? getLastTestFromSession(chatSessionId, userId, projectId) : null,
+      projectId ? getSavedCasesCount(projectId, userId) : 0,
+      projectId ? getSuitesCount(projectId, userId) : 0,
+      chatSessionId ? getRecentTestIds(chatSessionId) : [],
+    ]);
 
     return {
       lastTestId: lastTest?.id,

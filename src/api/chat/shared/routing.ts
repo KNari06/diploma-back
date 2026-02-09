@@ -24,7 +24,7 @@ export async function routeToHandler(
     context?: any;
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
-    mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
+    mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════

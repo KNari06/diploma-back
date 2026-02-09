@@ -1,9 +1,8 @@
 import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
-import { detectUserApproval, extractUrlWithGPT } from '@/services/ai/helpers/ai-helpers.service';
-// TODO: KB Search temporarily disabled - will be re-enabled later
-// import { detectLanguage, searchKB } from '@/services/kb/kb.service';
-// import { RulesCacheService } from '@/services/kb/rules-cache.service';
+import { extractUrlWithGPT } from '@/services/ai/helpers/ai-helpers.service';
+import { searchKB } from '@/services/kb/kb.service';
+import { RulesCacheService } from '@/services/kb/rules-cache.service';
 import { IntentResult, IntentType, VALID_SCOPES } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
@@ -24,9 +23,18 @@ const VALID_HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 
 // const CACHE_TTL = 60000; // 1 minute
 // const MAX_CACHE_SIZE = 500; // Maximum cache entries to prevent memory leak
 
-// Timeout configuration (currently unused - may be used in future)
-// const RAG_TIMEOUT = 10000; // 5 seconds for KB search
-// const GPT_TIMEOUT = 10000; // 10 seconds for GPT parsing
+// Timeout configuration
+const KB_RULES_TIMEOUT = 5000; // 5 seconds for KB rules search
+
+/**
+ * Helper: wrap a promise with a timeout
+ */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs)
+  );
+  return Promise.race([promise, timeoutPromise]);
+}
 
 // Metrics reset interval
 const METRICS_RESET_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
@@ -151,18 +159,15 @@ export async function parseUserIntent(
     // const cacheKey = buildCacheKey(trimmedMessage, projectId, availableIntents);
     // const cachedResult = getCachedResult(cacheKey);
     // if (cachedResult) return cachedResult;
-    const cacheKey = ''; // Placeholder for API compatibility (cache disabled)
 
     // Step 3: Get KB rules context (FAST/SLOW path)
-    // TODO: KB Search temporarily disabled - will be re-enabled later
-    // When re-enabled, use: const { kbRulesContext, userLanguage } = await getKBRulesContext(...)
-
-    // Temporary: Use empty context and default values
-    const kbRulesContext: IntentParserContext = context || {};
-
-    // Detect user language from message (simple heuristic for now)
-    // TODO: Re-enable AI-based detection when KB service is re-enabled
     const userLanguage = detectLanguageSimple(trimmedMessage);
+    const { kbRulesContext } = await getKBRulesContext(
+      trimmedMessage,
+      userLanguage,
+      context,
+      projectId
+    );
 
     // Step 4: Parse intent with GPT
     const intentResult = await parseIntentWithGPT(trimmedMessage, kbRulesContext, availableIntents);
@@ -184,25 +189,25 @@ export async function parseUserIntent(
         confidence,
       });
       // Force needs_clarification for incomplete intents
-      return createFallbackResult(intentResult, Math.min(confidence, 0.65), cacheKey, userLanguage);
+      return createFallbackResult(intentResult, Math.min(confidence, 0.65), userLanguage);
     }
 
     // Step 7: Handle high confidence results
     const highConfidenceResult = handleHighConfidenceResult(
       intentResult,
       confidence,
-      cacheKey,
       userLanguage
     );
     if (highConfidenceResult) return highConfidenceResult;
 
     // Step 8: Handle low confidence (< 0.7)
-    // Note: RAG/KB is temporarily disabled, so we just return fallback result
+    // KB rules are already included in context from Step 3.
+    // Additional RAG-enhanced re-parsing could be added here if needed.
     logger.info('[INTENT_PARSER] Low confidence, returning fallback result', {
       confidence,
       intent: intentResult.intent,
     });
-    return createFallbackResult(intentResult, confidence, cacheKey, userLanguage);
+    return createFallbackResult(intentResult, confidence, userLanguage);
 
   } catch (error) {
     logger.error('[INTENT_PARSER] Intent parsing failed', { error, message });
@@ -264,113 +269,99 @@ function validateAndPrepareMessage(message: string): string | null {
 
 /**
  * Get KB rules context using FAST path (cache) or SLOW path (searchKB)
- * FIX #4: Returns userLanguage to avoid re-detection
- *
- * TODO: KB Search temporarily disabled - will be re-enabled later
+ * Uses pre-detected language to avoid expensive AI language detection call.
  */
-// async function getKBRulesContext(
-//   trimmedMessage: string,
-//   context?: IntentParserContext,
-//   projectId?: string
-// ): Promise<{
-//   kbRulesContext: IntentParserContext;
-//   kbRulesUsed: boolean;
-//   userLanguage: 'en' | 'ru' | 'neutral';
-// }> {
-//     let kbRulesContext: IntentParserContext = context || {};
-//     let kbRulesUsed = false;
+async function getKBRulesContext(
+  trimmedMessage: string,
+  userLanguage: 'en' | 'ru' | 'neutral',
+  context?: IntentParserContext,
+  projectId?: string
+): Promise<{
+  kbRulesContext: IntentParserContext;
+  kbRulesUsed: boolean;
+}> {
+  let kbRulesContext: IntentParserContext = context || {};
+  let kbRulesUsed = false;
 
-//   // Detect user language from message (ONLY ONCE!)
-//   const userLanguage = await detectLanguage(trimmedMessage);
+  try {
+    // Try to get rules from cache first (FAST PATH - ~0ms)
+    const cachedRules = getCachedRulesWithFallback(userLanguage);
 
-//     logger.info('[INTENT_PARSER] Detected user language', {
-//       language: userLanguage,
-//       message: trimmedMessage.substring(0, 50),
-//     });
+    if (cachedRules) {
+      // Rules found in cache! No need for searchKB()
+      kbRulesContext = buildRulesContext(context, cachedRules.content);
+      kbRulesUsed = true;
 
-//     try {
-//       // Try to get rules from cache first (FAST PATH - ~0ms)
-//     const cachedRules = await getCachedRulesWithFallback(userLanguage);
+      logger.info('[INTENT_PARSER] Using cached rules (FAST PATH)', {
+        language: userLanguage,
+        cacheLanguage: cachedRules.language,
+        rulesLength: cachedRules.content.length,
+        fallbackUsed: cachedRules.fallbackUsed,
+      });
+    } else {
+      // Fallback to searchKB if cache miss (SLOW PATH - ~200-300ms)
+      logger.warn('[INTENT_PARSER] Rules cache miss, falling back to searchKB', {
+        language: userLanguage,
+      });
 
-//       if (cachedRules) {
-//         // Rules found in cache! No need for searchKB()
-//       kbRulesContext = buildRulesContext(context, cachedRules.content);
-//         kbRulesUsed = true;
+      const kbRulesSearch = await withTimeout(
+        searchKB(trimmedMessage, projectId, {
+          matchCount: 3,
+          matchThreshold: 0.5,
+          language: userLanguage,
+        }),
+        KB_RULES_TIMEOUT,
+        'KB rules search timeout'
+      );
 
-//         logger.info('[INTENT_PARSER] Using cached rules (FAST PATH)', {
-//           language: userLanguage,
-//         cacheLanguage: cachedRules.language,
-//         rulesLength: cachedRules.content.length,
-//           cacheHit: true,
-//         fallbackUsed: cachedRules.fallbackUsed,
-//         });
-//       } else {
-//         // Fallback to searchKB if cache miss (SLOW PATH - ~200-300ms)
-//         logger.warn('[INTENT_PARSER] Rules cache miss, falling back to searchKB', {
-//           language: userLanguage,
-//         });
+      if (kbRulesSearch.chunks.length > 0) {
+        const rulesContext = kbRulesSearch.chunks
+          .filter(chunk => chunk.source_file?.includes('rules') || chunk.source_file?.includes('general'))
+          .map(chunk => chunk.content)
+          .join('\n\n');
 
-//         const kbRulesSearch = await withTimeout(
-//           searchKB(trimmedMessage, projectId, {
-//             matchCount: 3,
-//             matchThreshold: 0.5,
-//             language: userLanguage,
-//           }),
-//           RAG_TIMEOUT,
-//           'KB rules search timeout'
-//         );
+        if (rulesContext) {
+          kbRulesContext = buildRulesContext(context, rulesContext);
+          kbRulesUsed = true;
 
-//         if (kbRulesSearch.chunks.length > 0) {
-//           const rulesContext = kbRulesSearch.chunks
-//             .filter(chunk => chunk.source_file?.includes('rules') || chunk.source_file?.includes('general'))
-//             .map(chunk => chunk.content)
-//             .join('\n\n');
+          logger.info('[INTENT_PARSER] Found KB rules via searchKB (SLOW PATH)', {
+            chunksCount: kbRulesSearch.chunks.length,
+            rulesContextLength: rulesContext.length,
+          });
+        }
+      }
+    }
+  } catch (error) {
+    logger.warn('[INTENT_PARSER] Failed to get rules, continuing without them', { error });
+    // Continue without KB rules - not critical
+  }
 
-//           if (rulesContext) {
-//           kbRulesContext = buildRulesContext(context, rulesContext);
-//             kbRulesUsed = true;
-
-//             logger.info('[INTENT_PARSER] Found KB rules via searchKB (SLOW PATH)', {
-//               chunksCount: kbRulesSearch.chunks.length,
-//               sources: kbRulesSearch.sources.global,
-//               rulesContextLength: rulesContext.length,
-//               cacheHit: false,
-//             });
-//           }
-//         }
-//       }
-//     } catch (error) {
-//       logger.warn('[INTENT_PARSER] Failed to get rules, continuing without them', { error });
-//       // Continue without KB rules - not critical
-//     }
-
-//   return { kbRulesContext, kbRulesUsed, userLanguage };
-// }
+  return { kbRulesContext, kbRulesUsed };
+}
 
 /**
  * Build rules context with consistent formatting
- * TODO: KB Search temporarily disabled - will be re-enabled later
  */
-// function buildRulesContext(
-//   baseContext?: IntentParserContext,
-//   rulesContent?: string
-// ): IntentParserContext {
-//   if (!rulesContent) return baseContext || {};
+function buildRulesContext(
+  baseContext?: IntentParserContext,
+  rulesContent?: string
+): IntentParserContext {
+  if (!rulesContent) return baseContext || {};
 
-//   return {
-//     ...baseContext,
-//     documentation: [
-//       ...(baseContext?.documentation || []),
-//       `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 📚 RESPONSE GUIDELINES FROM KNOWLEDGE BASE:
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  return {
+    ...baseContext,
+    documentation: [
+      ...(baseContext?.documentation || []),
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 RESPONSE GUIDELINES FROM KNOWLEDGE BASE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// ${rulesContent}
+${rulesContent}
 
-// IMPORTANT: Follow these guidelines when parsing user intent and generating responses.`,
-//     ],
-//   };
-// }
+IMPORTANT: Follow these guidelines when parsing user intent and generating responses.`,
+    ],
+  };
+}
 
 /**
  * Handle high confidence results (>= 0.7)
@@ -379,7 +370,6 @@ function validateAndPrepareMessage(message: string): string | null {
 function handleHighConfidenceResult(
   intentResult: IntentResult,
   confidence: number,
-  cacheKey: string, // TODO: Cache disabled, but kept for API compatibility
   userLanguage: 'en' | 'ru' | 'neutral'
 ): IntentResult | null {
     logger.info('[INTENT_PARSER] Initial parse confidence', {
@@ -564,7 +554,6 @@ function isIntentCompleteness(intentResult: IntentResult): boolean {
 function createFallbackResult(
   intentResult: IntentResult,
   confidence: number,
-  cacheKey: string,
   userLanguage: 'en' | 'ru' | 'neutral' = 'neutral'
 ): IntentResult {
   // If AI explicitly returned needs_clarification, respect its decision
@@ -932,27 +921,22 @@ async function extractUrlFromChatHistory(
       return { extractedUrl: null, extractedMethod: null };
     }
 
-    // OPTIMIZATION: AI-powered fast pre-filtering
-    // Use cheap detection to skip expensive URL extraction when obviously not approval
-    // This saves ~200ms + cost for greetings/questions while staying universal
-    const approvalResult = await detectUserApproval(message);
+    // OPTIMIZATION: Skip approval detection here — it's already handled by
+    // checkPendingApproval() in chat.controller.ts (Step 4) BEFORE intent parsing.
+    // This eliminates a redundant AI call (~200ms + $0.0004 per message).
+    // Instead, use simple heuristic to detect potential approval messages.
+    const approvalKeywords = /^(да|yes|ок|ok|go|run|запусти|подтвер|approve|confirm|давай|start|lgtm|выполн)/i;
+    const isLikelyApproval = approvalKeywords.test(message.trim());
 
-    // Early exit: If clearly NOT approval (greeting, question, discussion)
-    // Skip expensive URL extraction (saves ~200ms + $0.0004)
-    if (approvalResult.approved !== true || approvalResult.confidence < 0.7) {
+    if (!isLikelyApproval) {
       logger.info('[INTENT_PARSER] ⚡ Fast path: Message is not approval, skipping URL extraction', {
         message: message.substring(0, 30),
-        approved: approvalResult.approved,
-        confidence: approvalResult.confidence,
-        reasoning: approvalResult.reasoning,
       });
       return { extractedUrl: null, extractedMethod: null };
     }
 
-    // Only extract URL if approval detected with high confidence
-    logger.info('[INTENT_PARSER] Approval detected, extracting URL from history', {
+    logger.info('[INTENT_PARSER] Possible approval detected, extracting URL from history', {
       message: message.substring(0, 30),
-      confidence: approvalResult.confidence,
     });
 
     const extractionResult = await extractUrlWithGPT(userMessages, message);
@@ -971,7 +955,6 @@ async function extractUrlFromChatHistory(
     logger.info('[INTENT_PARSER] ✅ Successfully extracted URL from history!', {
       url: extractionResult.url,
       method: extractionResult.method,
-      approvalConfidence: approvalResult.confidence,
       extractionConfidence: extractionResult.confidence,
       reasoning: extractionResult.reasoning,
     });
@@ -2080,66 +2063,59 @@ export function calculateConfidence(intentResult: IntentResult, message: string)
 
 /**
  * Get cached rules with smart fallback logic
- * FIX #3: Optimize fallback to avoid duplicate getRules calls
- *
- * TODO: KB Search temporarily disabled - will be re-enabled later
+ * Tries exact language match first, then falls back to other languages.
  */
-// async function getCachedRulesWithFallback(
-//   userLanguage: 'en' | 'ru' | 'neutral'
-// ): Promise<{ content: string; language: 'en' | 'ru'; fallbackUsed: boolean } | null> {
-//   try {
-//     // Step 1: Try exact language match (if not neutral)
-//     if (userLanguage !== 'neutral') {
-//       const exactRules = RulesCacheService.getRules(userLanguage);
-//       if (exactRules) {
-//         return {
-//           content: exactRules,
-//           language: userLanguage,
-//           fallbackUsed: false,
-//         };
-//       }
-//     }
+function getCachedRulesWithFallback(
+  userLanguage: 'en' | 'ru' | 'neutral'
+): { content: string; language: 'en' | 'ru'; fallbackUsed: boolean } | null {
+  try {
+    // Step 1: Try exact language match (if not neutral)
+    if (userLanguage !== 'neutral') {
+      const exactRules = RulesCacheService.getRules(userLanguage as 'en' | 'ru');
+      if (exactRules) {
+        return {
+          content: exactRules,
+          language: userLanguage as 'en' | 'ru',
+          fallbackUsed: false,
+        };
+      }
+    }
 
-//     // FIX #3: Only try OTHER languages (not the one we just tried)
-//     // Step 2: Try English fallback (if we didn't just try it)
-//     if (userLanguage !== 'en') {
-//       const enRules = RulesCacheService.getRules('en');
-//       if (enRules) {
-//         return {
-//           content: enRules,
-//           language: 'en',
-//           fallbackUsed: true,
-//         };
-//       }
-//     }
+    // Step 2: Try English fallback (if we didn't just try it)
+    if (userLanguage !== 'en') {
+      const enRules = RulesCacheService.getRules('en');
+      if (enRules) {
+        return {
+          content: enRules,
+          language: 'en',
+          fallbackUsed: true,
+        };
+      }
+    }
 
-//     // Step 3: Try Russian fallback (if we didn't just try it)
-//     if (userLanguage !== 'ru') {
-//       const ruRules = RulesCacheService.getRules('ru');
-//       if (ruRules) {
-//         return {
-//           content: ruRules,
-//           language: 'ru',
-//           fallbackUsed: true,
-//         };
-//       }
-//     }
+    // Step 3: Try Russian fallback (if we didn't just try it)
+    if (userLanguage !== 'ru') {
+      const ruRules = RulesCacheService.getRules('ru');
+      if (ruRules) {
+        return {
+          content: ruRules,
+          language: 'ru',
+          fallbackUsed: true,
+        };
+      }
+    }
 
-//     // Step 4: No rules found in cache
-//     logger.warn('[INTENT_PARSER] No cached rules found for any language', {
-//       requestedLanguage: userLanguage,
-//       cacheStatus: {
-//         en: !!RulesCacheService.getRules('en'),
-//         ru: !!RulesCacheService.getRules('ru'),
-//       },
-//     });
+    // Step 4: No rules found in cache
+    logger.warn('[INTENT_PARSER] No cached rules found for any language', {
+      requestedLanguage: userLanguage,
+    });
 
-//     return null;
-//   } catch (error) {
-//     logger.error('[INTENT_PARSER] Error getting cached rules', {
-//       error: error instanceof Error ? error.message : String(error),
-//       userLanguage,
-//     });
-//     return null;
-//   }
-// }
+    return null;
+  } catch (error) {
+    logger.error('[INTENT_PARSER] Error getting cached rules', {
+      error: error instanceof Error ? error.message : String(error),
+      userLanguage,
+    });
+    return null;
+  }
+}

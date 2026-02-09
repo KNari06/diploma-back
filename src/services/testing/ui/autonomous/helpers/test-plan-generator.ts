@@ -28,7 +28,7 @@ export async function generateTestPlanFromExploration(params: {
   explorationId?: string;
   additionalInfo?: Record<string, any>;
   emitProgress: (step: string, message: string, progress: number) => void;
-  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
+  mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
 }): Promise<{ testPlan: any; message: string }> {
   const {
     exploration,

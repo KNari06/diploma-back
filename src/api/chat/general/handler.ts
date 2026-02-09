@@ -4,6 +4,9 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { autoEmbedOldMessages, searchChatHistory } from '@/services/ai/embeddings/chat-embeddings.service';
 import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
+import { getSummariesForContext, summarizeOldMessages } from '@/services/ai/summarization/chat-summarization.service';
+import { formatPageContextForChat, getPageContext, type PageContext } from '@/services/chat/editor-context.service';
+import { searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
@@ -12,7 +15,7 @@ import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
 import { CONSTANTS } from '../shared/constants';
 import { checkRequestAborted } from '../shared/request-cancellation';
-import { checkChatCredits, compressMessageContent, deductChatCredits, emitProcessingStep } from '../shared/utils';
+import { compressMessageContent, deductChatCredits, emitProcessingStep } from '../shared/utils';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -30,9 +33,10 @@ export async function handleGeneralChat(
     userLanguage?: 'en' | 'ru' | 'neutral'; // Language from intent parser (avoid re-detection)
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
+    mode?: 'lite' | 'pro' | 'editor'; // Test execution mode
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context, abortSignal, logger: functionLogger } = params;
+  const { message, userId, chatSessionId, context, abortSignal, logger: functionLogger, mode } = params;
 
   if (abortSignal) {
     const checkRequestAbortedWithLogging = functionLogger
@@ -45,13 +49,6 @@ export async function handleGeneralChat(
     hasSession: !!chatSessionId,
     messageLength: message.length
   });
-
-  if (abortSignal) {
-    const checkRequestAbortedWithLogging = functionLogger
-      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
-      : checkRequestAborted;
-    checkRequestAbortedWithLogging(abortSignal);
-  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 1: BUILD CONTEXT WITH HISTORY
@@ -86,28 +83,15 @@ export async function handleGeneralChat(
     // ═══════════════════════════════════════════════════════════════════════
 
     // Check if we need vector search (only if we have old messages beyond last 20)
-    // We check recentMessages.length to see if there might be more messages
+    // If recentMessages returned exactly LIMIT messages, there are likely more old messages
     if (recentMessages.length >= CONSTANTS.RECENT_MESSAGES_LIMIT && chatSessionId) {
-      // Get total message count to confirm we have old messages
-      const { count: totalMessageCount, error: countError } = await supabaseAdmin
-        .from('chat_messages')
-        .select('id', { count: 'exact', head: true })
-        .eq('session_id', chatSessionId);
-
-      if (countError) {
-        logger.error('[GENERAL_CHAT] Failed to count messages', { error: countError });
-      }
-
-      const totalMessages = totalMessageCount || 0;
-
-      logger.info('[GENERAL_CHAT] Message count check for vector search', {
+      logger.info('[GENERAL_CHAT] Recent messages at limit, using vector search for old context', {
         sessionId: chatSessionId,
-        totalMessages,
         recentCount: recentMessages.length
       });
 
-      // Only do vector search if we have more than 20 messages
-      if (totalMessages > CONSTANTS.RECENT_MESSAGES_LIMIT) {
+      // recentMessages.length >= LIMIT implies there are older messages
+      {
         logger.info('[GENERAL_CHAT] Chat has old messages, using vector search');
 
         try {
@@ -234,22 +218,109 @@ export async function handleGeneralChat(
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2: SEARCH GLOBAL KB FOR GENERAL CHAT (ALWAYS!)
+  // STEP 2: SEARCH KNOWLEDGE BASE (ALWAYS!)
   // ═══════════════════════════════════════════════════════════════════════
-  // TODO: KB Search temporarily disabled - will be re-enabled later
+  // KB search provides persistent background context from global + project KB.
+  // Non-fatal: continues without KB on error.
 
-  // KB context variables (disabled) - removed unused variables
+  let kbContext = '';
+  const projectId = typeof context === 'object' ? context?.projectId : undefined;
+
+  try {
+    const kbResults = await searchKB(message, projectId, {
+      matchThreshold: 0.5,
+      matchCount: 3,
+    });
+
+    if (kbResults.chunks.length > 0) {
+      kbContext = kbResults.chunks.map(chunk => chunk.content).join('\n---\n');
+      logger.info('[GENERAL_CHAT] KB search returned results', {
+        chunksCount: kbResults.chunks.length,
+        sources: {
+          global: kbResults.sources.global.length,
+          project: kbResults.sources.project.length,
+        },
+      });
+    }
+  } catch (kbError) {
+    logger.warn('[GENERAL_CHAT] KB search failed, continuing without KB context', {
+      error: kbError instanceof Error ? kbError.message : String(kbError),
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2.5: LOAD AGENT MEMORY (SUMMARIES)
+  // ═══════════════════════════════════════════════════════════════════════
+  let agentMemory = '';
+  if (chatSessionId) {
+    agentMemory = await getSummariesForContext(chatSessionId);
+    if (agentMemory) {
+      logger.info('[GENERAL_CHAT] Loaded agent memory (summaries)', {
+        memoryLength: agentMemory.length,
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2.7: EDITOR MODE — GET PAGE CONTEXT
+  // ═══════════════════════════════════════════════════════════════════════
+  let editorPageContext: PageContext | null = null;
+  const parsedContext = typeof context === 'object' && context !== null && !Array.isArray(context)
+    ? context
+    : undefined;
+
+  if (mode === 'editor' && parsedContext?.previewSessionId) {
+    try {
+      editorPageContext = await getPageContext(parsedContext.previewSessionId, userId);
+
+      // Merge frontend-provided pageContext (test steps, title) if available
+      if (editorPageContext && parsedContext.pageContext) {
+        if (parsedContext.pageContext.title) editorPageContext.title = parsedContext.pageContext.title;
+        if (parsedContext.pageContext.testSteps) editorPageContext.testSteps = parsedContext.pageContext.testSteps;
+      }
+
+      if (editorPageContext) {
+        logger.info('[GENERAL_CHAT] Editor mode: page context loaded', {
+          url: editorPageContext.url,
+          domSummaryLength: editorPageContext.domSummary.length,
+          hasTestSteps: !!editorPageContext.testSteps?.length,
+        });
+      }
+    } catch (editorError) {
+      logger.warn('[GENERAL_CHAT] Editor mode: failed to get page context', {
+        error: editorError instanceof Error ? editorError.message : String(editorError),
+      });
+    }
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: BUILD MESSAGES ARRAY FOR OPENAI
   // ═══════════════════════════════════════════════════════════════════════
+  // Context assembly order:
+  // 1. System prompt (+ editor instructions if applicable)
+  // 2. Agent Memory (summaries from chat_summaries)
+  // 3. KB Context (global + project knowledge base)
+  // 4. Editor page context (DOM, URL, test steps)
+  // 5. Vector search old context
+  // 6. Additional context (legacy)
+  // 7. Conversation history (recent messages)
+  // 8. Current user message
 
   const buildChatSystemPromptWithLogging = functionLogger
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
     : buildChatSystemPrompt;
-  const systemPrompt = buildChatSystemPromptWithLogging();
+  let systemPrompt = buildChatSystemPromptWithLogging();
 
-  // Enhance system prompt with old context summary
+  // Append editor-specific instructions if in editor mode
+  if (mode === 'editor') {
+    systemPrompt += `\n\n--- EDITOR MODE ---
+You are connected to the user's AI Editor (browser preview). The user can see a live web page.
+When referencing page elements, use their ref IDs (e.g., ref=b1, ref=i3).
+You can suggest test actions like "click button ref=b1" or "type 'hello' into input ref=i2".
+If the user asks to test something on the current page, prefer platform_test intent with the current URL.`;
+  }
+
+  // Enhance system prompt with old context summary from vector search
   const enhancedSystemPrompt = oldContextSummary
     ? `${systemPrompt}\n--- Previous Conversation Context ---\n${oldContextSummary}\n\nNote: The above is a summary of earlier messages. Recent messages follow below.`
     : systemPrompt;
@@ -257,6 +328,30 @@ export async function handleGeneralChat(
   const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
     { role: 'system', content: enhancedSystemPrompt },
   ];
+
+  // Add agent memory (summaries of old conversations)
+  if (agentMemory) {
+    messages.push({
+      role: 'system',
+      content: `--- Agent Memory (Conversation History Summaries) ---\n${agentMemory}\n\nThis is a compressed summary of earlier conversations in this workspace chat.`,
+    });
+  }
+
+  // Add KB context if available (persistent background knowledge)
+  if (kbContext) {
+    messages.push({
+      role: 'system',
+      content: `--- Knowledge Base ---\n${kbContext}\nUse this documentation for accurate, product-specific answers.`,
+    });
+  }
+
+  // Add editor page context if available
+  if (editorPageContext) {
+    messages.push({
+      role: 'system',
+      content: formatPageContextForChat(editorPageContext),
+    });
+  }
 
   // Add additional context if provided (legacy support)
   const contextString = typeof context === 'string' ? context : undefined;
@@ -275,30 +370,16 @@ export async function handleGeneralChat(
 
   logger.info('[GENERAL_CHAT] Built context for AI', {
     totalMessages: messages.length,
+    hasAgentMemory: !!agentMemory,
     hasOldSummary: !!oldContextSummary,
+    hasKBContext: !!kbContext,
+    hasEditorContext: !!editorPageContext,
+    isEditorMode: mode === 'editor',
     recentHistoryCount: conversationHistory.length,
   });
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2.5: CHECK CREDITS BEFORE OPENAI REQUEST
-  // ═══════════════════════════════════════════════════════════════════════
-  // Check user has enough credits (1 credit per chat message)
-  // This prevents wasting OpenAI API calls if user has no credits
-
-  const checkChatCreditsWithLogging = functionLogger
-    ? withFunctionLogging(checkChatCredits, 'checkChatCredits', functionLogger)
-    : checkChatCredits;
-  const hasEnoughCredits = await checkChatCreditsWithLogging(userId, res);
-  if (!hasEnoughCredits) {
-    return; // Response already sent in checkChatCredits
-  }
-
-  if (abortSignal) {
-    const checkRequestAbortedWithLogging = functionLogger
-      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
-      : checkRequestAborted;
-    checkRequestAbortedWithLogging(abortSignal);
-  }
+  // NOTE: Credit check removed here — already performed in chat.controller.ts
+  // (Step 1.5) before any handler is invoked. No need to check twice.
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3: GET AI RESPONSE
@@ -319,7 +400,7 @@ export async function handleGeneralChat(
       : getChatCompletionWithMessages;
     gptResponse = await getChatCompletionWithMessagesWithLogging(messages, {
       temperature: 0.3, // Lowered from 0.5 for more consistent responses
-      max_tokens: 1000,
+      max_tokens: 2000, // Increased from 1000 for richer responses in single workspace chat
       abortSignal,
     });
 
@@ -460,6 +541,25 @@ export async function handleGeneralChat(
           error: error instanceof Error ? error.message : String(error),
           timeout: CONSTANTS.AUTO_EMBED_TIMEOUT,
           sessionId: chatSessionId
+        });
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // AUTO-SUMMARIZE OLD MESSAGES (AFTER SAVING - "Agent Memory")
+    // ═══════════════════════════════════════════════════════════════════════
+    // If total messages exceed threshold, summarize oldest batch in background.
+    // Fire-and-forget — doesn't block the response.
+    if (totalMessagesNow > CONSTANTS.SUMMARIZE_THRESHOLD) {
+      logger.info('[GENERAL_CHAT] Triggering auto-summarization (background)', {
+        sessionId: chatSessionId,
+        totalMessages: totalMessagesNow,
+      });
+      // summarizeOldMessages() already does threshold check internally, no need to call shouldSummarize()
+      summarizeOldMessages(chatSessionId).catch(error => {
+        logger.warn('[GENERAL_CHAT] Background summarization failed', {
+          error: error instanceof Error ? error.message : String(error),
+          sessionId: chatSessionId,
         });
       });
     }

@@ -32,7 +32,7 @@ export async function runAutonomousExploration(params: {
   userId: string;
   projectId: string;
   sessionId?: string;
-  mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
+  mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
 }): Promise<{
   exploration: any;
   testPlan: any;

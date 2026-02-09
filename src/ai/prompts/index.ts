@@ -50,34 +50,33 @@ export {
 // UTILITY FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
-// TODO: KB Search temporarily disabled - will be re-enabled later
-// /**
-//  * Build context string for prompts
-//  * Formats context (documentation, traces, projectInfo) into a readable string for AI prompts
-//  */
-// export function buildContextString(context?: {
-//   documentation?: string[];
-//   traces?: string;
-//   projectInfo?: string;
-// }): string {
-//   if (!context) return '';
+/**
+ * Build context string for prompts
+ * Formats context (documentation, traces, projectInfo) into a readable string for AI prompts
+ */
+export function buildContextString(context?: {
+  documentation?: string[];
+  traces?: string;
+  projectInfo?: string;
+}): string {
+  if (!context) return '';
 
-//   let contextStr = '\nAVAILABLE CONTEXT:\n';
+  let contextStr = '\nAVAILABLE CONTEXT:\n';
 
-//   if (context.documentation && context.documentation.length > 0) {
-//     contextStr += `\nDocumentation:\n${context.documentation.join('\n')}`;
-//   }
+  if (context.documentation && context.documentation.length > 0) {
+    contextStr += `\nDocumentation:\n${context.documentation.join('\n')}`;
+  }
 
-//   if (context.traces) {
-//     contextStr += `\nPrevious Test Traces:\n${context.traces}`;
-//   }
+  if (context.traces) {
+    contextStr += `\nPrevious Test Traces:\n${context.traces}`;
+  }
 
-//   if (context.projectInfo) {
-//     contextStr += `\nProject Information:\n${context.projectInfo}`;
-//   }
+  if (context.projectInfo) {
+    contextStr += `\nProject Information:\n${context.projectInfo}`;
+  }
 
-//   return contextStr;
-// }
+  return contextStr;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // EXPORT ALL PROMPT BUILDERS (for backward compatibility)
@@ -137,7 +136,7 @@ export const Prompts = {
   buildCustomScopeStrategySystemPrompt,
 
   // 12. Utilities
-  // buildContextString, // TODO: Temporarily disabled (KB disabled)
+  buildContextString,
 
   // 13. Editor resolver (step editor AI matching)
   buildEditorResolverUserPrompt,
