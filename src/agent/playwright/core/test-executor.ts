@@ -103,6 +103,10 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   traceUrl?: string;
   tracePath?: string;
   error?: string;
+  /** Step-level runtime metadata for reporting (keyed by stepId) */
+  stepRuntimeMeta?: Record<string, any>;
+  /** Non-UI quality checks: performance, broken resources, a11y, slow APIs */
+  qualityChecks?: any;
 }> {
   let page: Page | null = null;
   let context: BrowserContext | null = null;
@@ -144,6 +148,19 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       context,
       page,
     });
+
+    // Enable Performance Observers for Web Vitals collection (must run before navigation)
+    try {
+      await page.evaluate(`
+        if (typeof PerformanceObserver !== 'undefined') {
+          try { new PerformanceObserver(function(){}).observe({ type: 'longtask', buffered: true }); } catch(e) {}
+          try { new PerformanceObserver(function(){}).observe({ type: 'largest-contentful-paint', buffered: true }); } catch(e) {}
+          try { new PerformanceObserver(function(){}).observe({ type: 'layout-shift', buffered: true }); } catch(e) {}
+        }
+      `);
+    } catch {
+      // Non-fatal: observer types may not be supported
+    }
 
     // Start video streaming for Chrome (CDP screencast)
     if (testData.browser.toLowerCase().includes('chrome') || testData.browser.toLowerCase().includes('chromium')) {
@@ -543,26 +560,131 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
         // Cleanup executor
         executor.dispose();
+
+        // Clean up temporary bg-X refs from background DOM collection
+        try {
+          const { cleanupTemporaryRefs } = await import('@/agent/execution/background-dom-collector');
+          await cleanupTemporaryRefs(page);
+        } catch {
+          // Non-fatal: page may already be closed
+        }
       }
 
       // Collect artifacts and return
       const finalScreenshot = await page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => null);
       
+      // ═══════════════════════════════════════════════════════════════════════
+      // Quality Checks: Run final non-UI checks before collecting results
+      // These are non-fatal and enrich the test result for user visibility
+      // ═══════════════════════════════════════════════════════════════════════
+
+      // Run broken resource detection (adds findings to uiErrors)
+      try {
+        await errorCollector.collectBrokenResources();
+      } catch { /* non-fatal */ }
+
+      // Run enhanced accessibility scan (11 WCAG checks, once at end)
+      try {
+        await errorCollector.collectAccessibilityWarnings();
+      } catch { /* non-fatal */ }
+
+      // Collect Web Vitals performance metrics
+      let performanceMetrics: any = null;
+      try {
+        performanceMetrics = await page.evaluate(`
+          (function() {
+            var entries = performance.getEntries();
+            var navEntry = entries.find(function(e) { return e.entryType === 'navigation'; });
+            var paintEntries = entries.filter(function(e) { return e.entryType === 'paint'; });
+            var fcp = paintEntries.find(function(e) { return e.name === 'first-contentful-paint'; });
+            var lcpEntries = []; try { lcpEntries = performance.getEntriesByType('largest-contentful-paint'); } catch(e) {}
+            var lcp = lcpEntries.length > 0 ? lcpEntries[lcpEntries.length - 1] : null;
+            var lsEntries = []; try { lsEntries = performance.getEntriesByType('layout-shift'); } catch(e) {}
+            var cls = 0;
+            for (var i = 0; i < lsEntries.length; i++) { if (!lsEntries[i].hadRecentInput) cls += lsEntries[i].value; }
+            var ltEntries = []; try { ltEntries = performance.getEntriesByType('longtask'); } catch(e) {}
+            var tbt = 0;
+            for (var j = 0; j < ltEntries.length; j++) { tbt += Math.max(0, ltEntries[j].duration - 50); }
+            var loadTime = 0;
+            var domContentLoaded = 0;
+            if (navEntry && navEntry.loadEventEnd > 0 && navEntry.fetchStart > 0) {
+              var calcLoad = Math.round(navEntry.loadEventEnd - navEntry.fetchStart);
+              loadTime = calcLoad > 0 ? calcLoad : 0;
+            }
+            if (navEntry && navEntry.domContentLoadedEventEnd > 0 && navEntry.fetchStart > 0) {
+              var calcDCL = Math.round(navEntry.domContentLoadedEventEnd - navEntry.fetchStart);
+              domContentLoaded = calcDCL > 0 ? calcDCL : 0;
+            }
+            return {
+              loadTime: loadTime,
+              domContentLoaded: domContentLoaded,
+              firstContentfulPaint: fcp ? Math.round(fcp.startTime) : 0,
+              largestContentfulPaint: lcp ? Math.round(lcp.startTime) : 0,
+              firstInputDelay: 0,
+              cumulativeLayoutShift: Math.round(cls * 1000) / 1000,
+              totalBlockingTime: Math.round(tbt),
+            };
+          })()
+        `);
+      } catch {
+        // Non-fatal: performance API may not be available
+      }
+
       // Get collected errors from ErrorCollectorService
       const collectedErrors = errorCollector.getErrors();
+
+      // Build QualityCheckReport (persisted in test_results for user viewing)
+      const brokenResources = errorCollector.getBrokenResources();
+      const slowApiCalls = errorCollector.getSlowApiCalls();
+      const allApiCalls = errorCollector.getAllApiCalls();
+
+      // Calculate API performance metrics
+      let averageResponseTime = 0;
+      let p95ResponseTime = 0;
+      if (allApiCalls.length > 0) {
+        const responseTimes = allApiCalls.map(c => c.responseTime).sort((a, b) => a - b);
+        const sum = responseTimes.reduce((acc, val) => acc + val, 0);
+        averageResponseTime = Math.round(sum / responseTimes.length);
+        const p95Index = Math.floor(responseTimes.length * 0.95);
+        p95ResponseTime = responseTimes[p95Index] || responseTimes[responseTimes.length - 1] || 0;
+      }
+
+      const qualityChecks = {
+        performance: performanceMetrics || {
+          loadTime: 0, domContentLoaded: 0, firstContentfulPaint: 0,
+          largestContentfulPaint: 0, firstInputDelay: 0, cumulativeLayoutShift: 0, totalBlockingTime: 0,
+        },
+        brokenResources: brokenResources.map(r => ({ type: r.type, url: r.url, element: r.element })),
+        accessibility: {
+          warnings: collectedErrors.accessibilityWarnings.map(w => ({ message: w.message, selector: w.selector, wcag: (w as any).wcag })),
+          totalWarnings: collectedErrors.accessibilityWarnings.length,
+        },
+        apiPerformance: {
+          totalRequests: allApiCalls.length,
+          averageResponseTime,
+          p95ResponseTime,
+          slowCalls: slowApiCalls.map(c => ({ url: c.url, method: c.method, status: c.status, responseTime: c.responseTime })),
+        },
+      };
       const logs = collectedErrors.consoleErrors.map(e => `[${e.timestamp}] ${e.message}`);
       const networkLogs = collectedErrors.networkErrors;
       const errors: any[] = [
         ...collectedErrors.consoleErrors.map(e => ({ type: 'console', message: e.message, timestamp: e.timestamp, source: e.source, line: e.line })),
         ...collectedErrors.networkErrors.map(e => ({ type: 'network', message: `${e.method} ${e.url}: ${e.error}`, timestamp: e.timestamp, url: e.url, method: e.method, status: e.status })),
         ...collectedErrors.uiErrors.map(e => ({ type: 'ui', message: e.text, timestamp: e.timestamp, selector: e.selector })),
+        // Include accessibility warnings as errors for AI analysis visibility
+        ...collectedErrors.accessibilityWarnings.map(w => ({ type: 'accessibility', message: w.message, timestamp: w.timestamp, selector: w.selector, wcag: (w as any).wcag })),
       ];
 
-      logger.info('[PLAYWRIGHT] Collected errors for AI analysis', {
+      logger.info('[PLAYWRIGHT] Collected errors and quality checks for reporting', {
         testId: testData.testId,
         consoleErrors: collectedErrors.consoleErrors.length,
         networkErrors: collectedErrors.networkErrors.length,
         uiErrors: collectedErrors.uiErrors.length,
+        accessibilityWarnings: collectedErrors.accessibilityWarnings.length,
+        brokenResources: brokenResources.length,
+        slowApiCalls: slowApiCalls.length,
+        performanceLCP: performanceMetrics?.largestContentfulPaint || 0,
       });
 
       // Cleanup
@@ -594,6 +716,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       TestRunRegistry.setCompleted(runKey);
       TestRunRegistry.unregister(runKey);
 
+      // Aggregate step-level runtime metadata for reporting
+      const stepRuntimeMeta = Object.fromEntries(executor.getStepRuntimeMeta());
+
       return {
         success: allSuccess,
         status: allSuccess ? 'completed' : 'failed',
@@ -601,9 +726,12 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         logs,
         networkLogs,
         errors,
+        performance: performanceMetrics, // Web Vitals — stored in test_results.performance
         error: allSuccess ? undefined : finalError,
         videoPath: artifacts.videoPath,
         tracePath: artifacts.tracePath,
+        stepRuntimeMeta, // Step-level execution intelligence for reporting
+        qualityChecks, // Non-UI quality checks — stored in test_results for user viewing
       };
     }
 

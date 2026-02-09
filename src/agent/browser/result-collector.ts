@@ -36,6 +36,10 @@ interface PerformanceMetrics {
   loadTime: number;
   domContentLoaded: number;
   firstContentfulPaint: number;
+  largestContentfulPaint: number;
+  firstInputDelay: number;
+  cumulativeLayoutShift: number;
+  totalBlockingTime: number;
 }
 
 /**
@@ -257,29 +261,60 @@ export class ResultCollector {
       logger.error('Failed to capture DOM', { error });
     }
 
-    // Performance metrics (simplified for compatibility)
+    // Performance metrics (full Web Vitals)
     try {
-      const metrics = await page.evaluate(() => {
-        const entries = performance.getEntries();
-        const navigationEntry = entries.find((e: any) => e.entryType === 'navigation') as any;
-        const paintEntries = entries.filter((e: any) => e.entryType === 'paint');
-        const fcp = paintEntries.find((e: any) => e.name === 'first-contentful-paint') as any;
+      const metrics = await page.evaluate(`
+        (function() {
+          var entries = performance.getEntries();
+          var navigationEntry = entries.find(function(e) { return e.entryType === 'navigation'; });
+          var paintEntries = entries.filter(function(e) { return e.entryType === 'paint'; });
+          var fcp = paintEntries.find(function(e) { return e.name === 'first-contentful-paint'; });
 
-        if (navigationEntry) {
+          // LCP: last entry of largest-contentful-paint
+          var lcpEntries = [];
+          try { lcpEntries = performance.getEntriesByType('largest-contentful-paint'); } catch(e) {}
+          var lcp = lcpEntries.length > 0 ? lcpEntries[lcpEntries.length - 1] : null;
+
+          // CLS: sum of layout-shift entries without recent input
+          var layoutShiftEntries = [];
+          try { layoutShiftEntries = performance.getEntriesByType('layout-shift'); } catch(e) {}
+          var cls = 0;
+          for (var i = 0; i < layoutShiftEntries.length; i++) {
+            if (!layoutShiftEntries[i].hadRecentInput) {
+              cls += layoutShiftEntries[i].value;
+            }
+          }
+
+          // TBT: sum of (duration - 50ms) for long tasks
+          var longTaskEntries = [];
+          try { longTaskEntries = performance.getEntriesByType('longtask'); } catch(e) {}
+          var tbt = 0;
+          for (var j = 0; j < longTaskEntries.length; j++) {
+            tbt += Math.max(0, longTaskEntries[j].duration - 50);
+          }
+
+          var loadTime = 0;
+          var domContentLoaded = 0;
+          if (navigationEntry && navigationEntry.loadEventEnd > 0 && navigationEntry.fetchStart > 0) {
+            var calcLoadTime = Math.round(navigationEntry.loadEventEnd - navigationEntry.fetchStart);
+            loadTime = calcLoadTime > 0 ? calcLoadTime : 0;
+          }
+          if (navigationEntry && navigationEntry.domContentLoadedEventEnd > 0 && navigationEntry.fetchStart > 0) {
+            var calcDCL = Math.round(navigationEntry.domContentLoadedEventEnd - navigationEntry.fetchStart);
+            domContentLoaded = calcDCL > 0 ? calcDCL : 0;
+          }
+
           return {
-            loadTime: Math.round(navigationEntry.loadEventEnd - navigationEntry.fetchStart),
-            domContentLoaded: Math.round(navigationEntry.domContentLoadedEventEnd - navigationEntry.fetchStart),
+            loadTime: loadTime,
+            domContentLoaded: domContentLoaded,
             firstContentfulPaint: fcp ? Math.round(fcp.startTime) : 0,
+            largestContentfulPaint: lcp ? Math.round(lcp.startTime) : 0,
+            firstInputDelay: 0,
+            cumulativeLayoutShift: Math.round(cls * 1000) / 1000,
+            totalBlockingTime: Math.round(tbt),
           };
-        }
-
-        // Fallback to simple timing
-        return {
-          loadTime: 0,
-          domContentLoaded: 0,
-          firstContentfulPaint: 0,
-        };
-      });
+        })()
+      `) as PerformanceMetrics;
 
       results.performance = metrics;
       logger.debug('Performance metrics captured', metrics);

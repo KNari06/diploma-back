@@ -9,7 +9,9 @@ import { logger } from '@/utils/core/logger';
 import type { DomAnalysisData, InteractiveNode } from './preview.types';
 
 // Constants
-const MAX_INTERACTIVE_NODES = 200; // Limit to prevent huge payloads
+// P2 FIX: Increased from 200 to 500 for complex enterprise dashboards
+// Modern admin panels, data grids, and dashboards routinely have 300+ interactive elements
+const MAX_INTERACTIVE_NODES = 500; // Limit to prevent huge payloads
 const MAX_TEXT_LENGTH = 100; // Truncate text content
 const MAX_PARENT_CHAIN_LENGTH = 6; // Limit parent chain depth
 const DOM_ANALYSIS_VERSION = '2.0'; // V2: ARIA state, validation, labels, hierarchy

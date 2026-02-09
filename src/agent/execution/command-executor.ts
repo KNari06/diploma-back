@@ -1533,7 +1533,119 @@ export class CommandExecutor {
       });
     }
 
-    // 2. Try smart locator from selector
+    // 2. Try embeddings-based resolution (intent-aware, accurate)
+    // This is the P0 critical fix: collect fresh DOM + use embeddings for resolution
+    if (intentMeta?.intentDescription && intentMeta?.actionType) {
+      try {
+        logger.info('[COMMAND_EXECUTOR] Trying embeddings-based resolution', {
+          stepId,
+          intent: intentMeta.intentDescription.slice(0, 80),
+          actionType: intentMeta.actionType,
+        });
+
+        // Collect fresh interactive nodes from current page
+        const { collectInteractiveNodes } = await import('./background-dom-collector');
+        const domNodes = await collectInteractiveNodes(this.page);
+
+        if (domNodes.length === 0) {
+          logger.warn('[COMMAND_EXECUTOR] No interactive nodes collected', { stepId });
+        } else {
+          // Run embeddings-based resolution
+          const { resolveWithEmbeddings } = await import('@/services/testing/ui/preview/embeddings-resolver.service');
+          const resolveResult = await resolveWithEmbeddings({
+            previewSessionId: 'background', // Not a preview session
+            stepDraft: {
+              id: stepId,
+              type: intentMeta.actionType as any,
+              description: intentMeta.intentDescription,
+              bindingHints: intentMeta.bindingHints,
+              evidence: intentMeta.evidence,
+            },
+            domNodes,
+            pageUrl: this.page.url(),
+            disableCaching: true, // Always fresh resolution in background
+            includeAlternatives: false,
+            enableLLMDisambiguation: true, // Use aggressive LLM disambiguation
+          });
+
+          if (resolveResult.status === 'resolved' && resolveResult.candidates.length > 0) {
+            const topCandidate = resolveResult.candidates[0];
+
+            if (topCandidate.ref) {
+              // Build locator from resolved ref (temporary data-agent-ref="bg-X")
+              const locator = this.page.locator(`[data-agent-ref="${topCandidate.ref}"]`).first();
+
+              // Apply iframe context if needed
+              const finalLocator = iframeSelector
+                ? this.page.frameLocator(iframeSelector).locator(`[data-agent-ref="${topCandidate.ref}"]`).first()
+                : locator;
+
+              await finalLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
+
+              // Validate element fingerprint: verify the resolved element matches expectations
+              // Catches race conditions where DOM changed between collection and resolution
+              const expectedNode = topCandidate.node;
+              if (expectedNode) {
+                const actualTag = await finalLocator.evaluate((el: any) => el?.tagName?.toLowerCase()).catch(() => '');
+                if (actualTag && expectedNode.tag && actualTag !== expectedNode.tag.toLowerCase()) {
+                  logger.warn('[COMMAND_EXECUTOR] Element fingerprint mismatch after resolution', {
+                    stepId,
+                    expectedTag: expectedNode.tag,
+                    actualTag,
+                    ref: topCandidate.ref,
+                  });
+                  // Don't use this element - fall through to smart locator / self-heal
+                  throw new Error(`Element mismatch: expected <${expectedNode.tag}>, found <${actualTag}>`);
+                }
+              }
+
+              const runtimeMeta: StepRuntimeMeta = {
+                runtimeStatus: 'healed', // Mark as healed since compiled failed
+                source: 'resolver', // Embeddings-based resolution from resolver service
+                confidenceTier: topCandidate.confidence >= 0.85 ? 'high' :
+                               topCandidate.confidence >= 0.6 ? 'medium' : 'low',
+                executionMs: Date.now() - startTime,
+                usedLocatorStrategy: 'embeddings',
+                healConfidence: topCandidate.confidence,
+                resolutionPath: 'embeddings',
+                needsReview: topCandidate.confidence < 0.85,
+                flaky: topCandidate.confidence < 0.75,
+              };
+              this.stepRuntimeMeta.set(stepId, runtimeMeta);
+
+              logger.info('[COMMAND_EXECUTOR] Embeddings resolution succeeded', {
+                stepId,
+                ref: topCandidate.ref,
+                confidence: topCandidate.confidence,
+                label: topCandidate.label?.slice(0, 50),
+                resolutionPath: 'embeddings',
+              });
+
+              // TODO P1: Persist healed ref back to intent test case for future runs
+              // if (topCandidate.confidence >= 0.85 && intentMeta.intentTestCaseId) {
+              //   await IntentTestCaseService.updateStep(...)
+              // }
+
+              return { locator: finalLocator, runtimeMeta };
+            }
+          }
+
+          logger.info('[COMMAND_EXECUTOR] Embeddings resolution unsuccessful', {
+            stepId,
+            status: resolveResult.status,
+            candidateCount: resolveResult.candidates.length,
+            message: resolveResult.message,
+          });
+        }
+      } catch (embeddingsError) {
+        logger.warn('[COMMAND_EXECUTOR] Embeddings resolution failed', {
+          stepId,
+          error: embeddingsError instanceof Error ? embeddingsError.message : String(embeddingsError),
+        });
+      }
+    }
+
+    // 3. Try smart locator from selector (legacy fallback)
     if (command.selector) {
       try {
         const smartResult = await getSmartLocator(

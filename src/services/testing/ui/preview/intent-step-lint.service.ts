@@ -12,6 +12,7 @@ import {
     type ResolverResponse,
 } from '@/ai/prompts/editor-resolver-prompts';
 import { logger } from '@/utils/core/logger';
+import { extractKeywordsSync } from '@/utils/text-processing/ai-keyword-extractor';
 import {
     invalidateEmbeddingCache,
     prefetchEmbeddings,
@@ -128,31 +129,15 @@ function containsKeywords(text: string, keywords: string[]): boolean {
 }
 
 /**
- * Extract keywords from intent description
- */
-function extractKeywords(description: string): string[] {
-  const stopWords = new Set([
-    'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'with', 'and', 'or',
-    'enter', 'fill', 'type', 'click', 'press', 'select', 'input', 'field',
-    'button', 'link', 'into', 'please', 'should', 'want', 'need',
-  ]);
-
-  return description
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .filter(word => word.length > 2 && !stopWords.has(word));
-}
-
-/**
  * Score a candidate element against an intent step (V2)
  * Includes state-awareness, better label scoring, and hierarchy disambiguation
+ * V4: Uses extractKeywordsSync for fallback mode (when embeddings unavailable)
  */
 function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: number; reasons: string[]; hardReject: boolean } {
   let score = 0;
   const reasons: string[] = [];
   let hardReject = false;
-  const keywords = extractKeywords(step.description);
+  const keywords = extractKeywordsSync(step.description);
   const hints = step.bindingHints || {};
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -371,6 +356,33 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
   }
 
   return { score, reasons, hardReject };
+}
+
+/**
+ * P2 FIX: Normalize URL for comparison (ignore hash, sort query params)
+ * Catches SPA navigations that would otherwise bypass evidence cache invalidation
+ */
+function normalizeUrlForComparison(url: string): string {
+  try {
+    const parsed = new URL(url);
+
+    // Remove hash (SPA navigation)
+    parsed.hash = '';
+
+    // Sort query parameters for consistent comparison
+    const params = Array.from(parsed.searchParams.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]));
+
+    parsed.search = '';
+    for (const [key, value] of params) {
+      parsed.searchParams.append(key, value);
+    }
+
+    return parsed.toString();
+  } catch {
+    // Invalid URL - return as-is
+    return url;
+  }
 }
 
 /**
@@ -742,11 +754,31 @@ export class IntentStepLintService {
 
     if (!disableCaching && stepDraft.evidence?.lastSuccessRef) {
       const cachedRef = stepDraft.evidence.lastSuccessRef;
-      const cachedNode = domNodes.find(n => n.ref === cachedRef);
 
-      if (cachedNode) {
-        // V6: Validate cached node is compatible with action type (not just visible/enabled)
-        const compat = this.isEvidenceShortcutNodeCompatible(stepDraft, cachedNode, snapshot.url);
+      // P2 FIX: URL validation - bypass cache if page URL changed significantly
+      // This prevents reusing evidence from page A on page B (common in SPAs)
+      let urlMismatch = false;
+      if (stepDraft.compiled?.context?.pageUrl) {
+        const compiledUrl = normalizeUrlForComparison(stepDraft.compiled.context.pageUrl);
+        const currentUrl = normalizeUrlForComparison(snapshot.url);
+
+        if (compiledUrl !== currentUrl) {
+          urlMismatch = true;
+          logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - URL changed', {
+            previewSessionId,
+            cachedRef,
+            compiledUrl: compiledUrl.slice(0, 80),
+            currentUrl: currentUrl.slice(0, 80),
+          });
+        }
+      }
+
+      if (!urlMismatch) {
+        const cachedNode = domNodes.find(n => n.ref === cachedRef);
+
+        if (cachedNode) {
+          // V6: Validate cached node is compatible with action type (not just visible/enabled)
+          const compat = this.isEvidenceShortcutNodeCompatible(stepDraft, cachedNode, snapshot.url);
 
         if (compat.ok) {
           logger.debug('[INTENT_LINT_V5] Evidence shortcut hit', {
@@ -787,13 +819,14 @@ export class IntentStepLintService {
           nodeType: cachedNode.type || cachedNode.inputType,
           reason: compat.reason,
         });
-      } else {
-        // Evidence ref not found in current DOM
-        logger.debug('[INTENT_LINT_V5] Evidence shortcut miss - node not found', {
-          previewSessionId,
-          cachedRef,
-        });
-      }
+        } else {
+          // Evidence ref not found in current DOM
+          logger.debug('[INTENT_LINT_V5] Evidence shortcut miss - node not found', {
+            previewSessionId,
+            cachedRef,
+          });
+        }
+      } // if (!urlMismatch)
     }
 
     // Step 1: Try embeddings-based resolver (PRIMARY) with includeAlternatives flag

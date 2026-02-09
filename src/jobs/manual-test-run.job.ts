@@ -388,6 +388,7 @@ export class ManualTestRunJobHandler {
         network_logs: result.networkLogs || [],
         errors: result.errors || [],
         performance: result.performance,
+        quality_checks: result.qualityChecks, // Non-UI quality checks (Web Vitals, a11y, broken resources, slow APIs)
         video_url: result.videoUrl, // Supabase Storage URL
         trace_url: result.traceUrl, // Supabase Storage URL
         completed_at: new Date().toISOString(),
@@ -509,6 +510,7 @@ export class ManualTestRunJobHandler {
       network_logs: result?.networkLogs || [],
       errors: result?.errors || [],
       performance: result?.performance,
+      quality_checks: result?.qualityChecks, // Non-UI quality checks
       video_url: result?.videoUrl, // Supabase Storage URL (even for failed tests)
       trace_url: result?.traceUrl, // Supabase Storage URL (even for failed tests)
       completed_at: new Date().toISOString(),

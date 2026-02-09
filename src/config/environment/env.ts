@@ -37,6 +37,15 @@ const envSchema = z.object({
   OPENAI_MODEL: z.string().default('gpt-4o'),
   OPENAI_MAX_TOKENS: z.string().transform(Number).default('4000'),
 
+  // Google Gemini
+  GEMINI_API_KEY: z.string().optional(),
+
+  // AI Provider Configuration
+  // Which provider to use for fast tasks (keyword extraction, classification)
+  AI_PROVIDER_FAST: z.enum(['gemini', 'openai']).default('gemini'),
+  // Which provider to use for smart tasks (complex analysis, code generation)
+  AI_PROVIDER_SMART: z.enum(['openai', 'gemini']).default('openai'),
+
   // Queue
   QUEUE_CONCURRENCY: z.string().transform(Number).default('5'),
   QUEUE_RETRY_ATTEMPTS: z.string().transform(Number).default('3'),

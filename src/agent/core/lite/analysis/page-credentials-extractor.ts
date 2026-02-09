@@ -28,23 +28,99 @@ export interface PageCredentialsResult {
 
 /**
  * Regex patterns for extracting credentials from page text
+ * Multilingual support: EN, RU, TR, KZ, UK, DE, FR, ES, PT, IT, PL, ZH, JA, AR
  * Covers common demo page formats like:
- * - "username is student"
- * - "Username: admin"
- * - "password = Password123"
+ * - "username is student" / "Логин: admin" / "Kullanıcı adı: test"
+ * - "password = Password123" / "Пароль: 123456" / "Şifre: demo"
  */
 const USERNAME_PATTERNS = [
-  // "username is xxx" / "login is xxx"
+  // English: username, user, login, email, user id, userid
   /(?:username|user|login|email|user\s*id|userid)\s*(?:is|:|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
-  // "User: xxx"
   /(?:^|\s)(?:user|login|email|userid|user\s*id)\s*:\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Russian: логин, пользователь, имя пользователя, почта, емейл
+  /(?:логин|пользователь|имя\s+пользователя|почта|емейл|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Turkish: kullanıcı adı, kullanıcı, giriş, e-posta
+  /(?:kullanıcı\s+adı|kullanıcı|giriş|e-posta|eposta)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Kazakh: пайдаланушы, кіру, электрондық пошта
+  /(?:пайдаланушы|кіру|электрондық\s+пошта)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Ukrainian: користувач, логін, електронна пошта
+  /(?:користувач|логін|електронна\s+пошта|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // German: benutzername, benutzer, anmelden, e-mail
+  /(?:benutzername|benutzer|anmelden|e-mail)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // French: nom d'utilisateur, utilisateur, connexion, e-mail
+  /(?:nom\s+d'utilisateur|nom\s+utilisateur|utilisateur|connexion|e-mail|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Spanish: nombre de usuario, usuario, iniciar sesión, correo
+  /(?:nombre\s+de\s+usuario|usuario|iniciar\s+sesión|correo|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Portuguese: nome de usuário, usuário, login, e-mail
+  /(?:nome\s+de\s+usuário|usuário|login|e-mail|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Italian: nome utente, utente, accesso, e-mail
+  /(?:nome\s+utente|utente|accesso|e-mail|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Polish: nazwa użytkownika, użytkownik, login, e-mail
+  /(?:nazwa\s+użytkownika|użytkownik|login|e-mail|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Chinese: 用户名, 用户, 登录, 邮箱
+  /(?:用户名|用户|登录|邮箱)\s*(?::|：|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Japanese: ユーザー名, ユーザー, ログイン, メール
+  /(?:ユーザー名|ユーザー|ログイン|メール)\s*(?::|：|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Arabic: اسم المستخدم, المستخدم, تسجيل الدخول, البريد الإلكتروني
+  /(?:اسم\s+المستخدم|المستخدم|تسجيل\s+الدخول|البريد\s+الإلكتروني)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
 ];
 
 const PASSWORD_PATTERNS = [
-  // "password is xxx" or "password is: xxx" or "default password is xxx"
-  /(?:password|pass|pwd|pin|passcode)\s*(?:is\s*:?|:|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
-  // "Password: xxx" standalone
+  // English: password, pass, pwd, pin, passcode, secret
+  /(?:password|pass|pwd|pin|passcode|secret)\s*(?:is\s*:?|:|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
   /(?:^|\s)(?:password|pass|pwd|pin|passcode)\s*:\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Russian: пароль, пасс, секрет, код
+  /(?:пароль|пасс|секрет|код)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Turkish: şifre, parola, gizli kod
+  /(?:şifre|parola|gizli\s+kod)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Kazakh: құпия сөз, пароль, код
+  /(?:құпия\s+сөз|пароль|код)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Ukrainian: пароль, секретний код
+  /(?:пароль|секретний\s+код)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // German: passwort, kennwort, geheimcode
+  /(?:passwort|kennwort|geheimcode)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // French: mot de passe, code secret
+  /(?:mot\s+de\s+passe|code\s+secret)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Spanish: contraseña, clave, código secreto
+  /(?:contraseña|clave|código\s+secreto)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Portuguese: senha, código secreto
+  /(?:senha|código\s+secreto)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Italian: password, parola d'ordine, codice segreto
+  /(?:password|parola\s+d'ordine|codice\s+segreto)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Polish: hasło, kod tajny
+  /(?:hasło|kod\s+tajny)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Chinese: 密码, 口令
+  /(?:密码|口令)\s*(?::|：|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Japanese: パスワード, 暗証番号
+  /(?:パスワード|暗証番号)\s*(?::|：|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+
+  // Arabic: كلمة المرور, كلمة السر, الرمز السري
+  /(?:كلمة\s+المرور|كلمة\s+السر|الرمز\s+السري)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
 ];
 
 // Only used when we know the field kind (e.g., placeholder of a username/password input).

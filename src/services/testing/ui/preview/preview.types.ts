@@ -598,6 +598,14 @@ export interface StepRuntimeMeta {
     network: number;
     ui: number;
   };
+  /**
+   * Slow API calls during this step execution window (>2s response time)
+   */
+  slowApiCalls?: Array<{
+    url: string;
+    method: string;
+    responseTime: number;
+  }>;
 }
 
 /**

@@ -147,6 +147,7 @@ export interface ErrorSignals {
     message: string;
     selector?: string;
     timestamp: number;
+    wcag?: string;
   }>;
 }
 

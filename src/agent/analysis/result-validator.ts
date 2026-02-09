@@ -6,6 +6,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
+import { extractKeywordsWithAI } from '@/utils/text-processing/ai-keyword-extractor';
 import {
   ActionResult,
   DynamicAction,
@@ -429,7 +430,7 @@ export class ResultValidator {
     try {
       // Extract element identifier from expectation
       // e.g., "success message appears" → look for success-related elements
-      const keywords = this.extractKeywords(expected);
+      const keywords = await this.extractKeywords(expected);
 
       // Try common selectors for success/error messages
       const selectors = this.buildSelectorsFromKeywords(keywords);
@@ -481,7 +482,7 @@ export class ResultValidator {
     page: Page
   ): Promise<ValidationResult> {
     try {
-      const keywords = this.extractKeywords(expected);
+      const keywords = await this.extractKeywords(expected);
       const selectors = this.buildSelectorsFromKeywords(keywords);
 
       for (const selector of selectors) {
@@ -738,7 +739,7 @@ export class ResultValidator {
     // Try to find any text matching the expectation
     try {
       // Extract keywords from expected text (remove stop words)
-      const keywords = this.extractKeywords(expected);
+      const keywords = await this.extractKeywords(expected);
 
       // For click actions, be more lenient - check if any keyword appears
       const isClickAction = action?.action === 'click';
@@ -786,12 +787,22 @@ export class ResultValidator {
 
   /**
    * Extract keywords from expectation string
+   * Uses AI-powered keyword extraction for multilingual support
    */
-  private static extractKeywords(expected: string): string[] {
-    const stopWords = ['should', 'appear', 'show', 'display', 'the', 'a', 'an'];
-    const words = expected.toLowerCase().split(/\s+/);
+  private static async extractKeywords(expected: string): Promise<string[]> {
+    try {
+      // Use AI keyword extraction (supports all languages)
+      return await extractKeywordsWithAI(expected);
+    } catch (error) {
+      // Fallback to simple regex if AI fails
+      logger.warn('[RESULT_VALIDATOR] AI keyword extraction failed, using fallback', {
+        error: error instanceof Error ? error.message : String(error),
+      });
 
-    return words.filter(word => !stopWords.includes(word) && word.length > 2);
+      const stopWords = ['should', 'appear', 'show', 'display', 'the', 'a', 'an'];
+      const words = expected.toLowerCase().split(/\s+/);
+      return words.filter(word => !stopWords.includes(word) && word.length > 2);
+    }
   }
 
   /**

@@ -124,6 +124,34 @@ export interface PerformanceMetrics {
   totalBlockingTime: number;
 }
 
+export interface QualityCheckReport {
+  performance: PerformanceMetrics;
+  brokenResources: Array<{
+    type: 'broken_image' | 'failed_stylesheet' | 'failed_script';
+    url: string;
+    element?: string;
+  }>;
+  accessibility: {
+    warnings: Array<{
+      message: string;
+      selector?: string;
+      wcag?: string;
+    }>;
+    totalWarnings: number;
+  };
+  apiPerformance: {
+    totalRequests: number;
+    averageResponseTime: number;
+    p95ResponseTime: number;
+    slowCalls: Array<{
+      url: string;
+      method: string;
+      status: number;
+      responseTime: number;
+    }>;
+  };
+}
+
 export interface AISummary {
   summary: string;
   bugs: BugReport[];

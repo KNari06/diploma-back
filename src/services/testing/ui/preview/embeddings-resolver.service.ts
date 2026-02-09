@@ -15,6 +15,7 @@
 import { generateEmbedding, generateEmbeddings } from '@/services/ai/core/embedding.service';
 import { logger } from '@/utils/core/logger';
 import { cosineSimilarity } from '@/utils/text-processing/vector';
+import { extractKeywordsWithAI } from '@/utils/text-processing/ai-keyword-extractor';
 import {
     disambiguateWithLLM,
     nodeToDisambiguationCandidate,
@@ -63,10 +64,11 @@ const AMBIGUOUS_SIMILARITY_DELTA = 0.05;
 /**
  * Action type to expected element tags mapping (HardAllowed filter)
  * Elements not in this list are excluded for the action
+ * P1 FIX: Expanded click to include modern UI patterns (list items, table cells, images, etc.)
  */
 const ACTION_TO_TAGS: Record<string, string[]> = {
   type: ['input', 'textarea'],
-  click: ['button', 'a', 'input', 'div', 'span', 'label'],
+  click: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'summary', 'nav', 'header', 'footer', 'section', 'article'],
   select: ['select'],
   check: ['input'],
   uncheck: ['input'],
@@ -77,6 +79,25 @@ const ACTION_TO_TAGS: Record<string, string[]> = {
   scroll: ['div', 'section', 'main', 'body', 'html'],
   press: ['input', 'textarea', 'button'],
 };
+
+/**
+ * Role-based allowlist for click actions
+ * P1 FIX: Elements with these ARIA roles are allowed for click regardless of tag
+ */
+const CLICK_ALLOWED_ROLES = new Set([
+  'button',
+  'link',
+  'tab',
+  'menuitem',
+  'option',
+  'treeitem',
+  'row',
+  'cell',
+  'gridcell',
+  'columnheader',
+  'rowheader',
+  'switch',
+]);
 
 /** Actions that require writable state (not readonly) */
 const WRITABLE_ACTIONS = new Set(['fill', 'type', 'clear']);
@@ -239,43 +260,88 @@ function matchesExactQuotedText(node: InteractiveNode, intentText: string): bool
 }
 
 /**
- * Extract meaningful keywords from intent text
- * Filters out common stop words and action words
- */
-function extractIntentKeywords(intentText: string): string[] {
-  const stopWords = new Set([
-    'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'with', 'and', 'or',
-    'enter', 'type', 'click', 'press', 'select', 'input', 'field',
-    'button', 'link', 'into', 'please', 'should', 'want', 'need', 'put',
-    'this', 'value', 'box', 'form', 'element',
-  ]);
-  
-  return intentText
-    .toLowerCase()
-    .replace(/[^a-zа-яё0-9\s]/gi, ' ')
-    .split(/\s+/)
-    .filter(word => word.length > 2 && !stopWords.has(word));
-}
-
-/**
  * Build HardAllowed and SoftAllowed sets based on deterministic rules
  * V3: Core function for element filtering before embeddings
+ * V4: Uses AI-powered keyword extraction (multilingual)
  */
-export function buildAllowedSets(
+export async function buildAllowedSets(
   nodes: InteractiveNode[],
   actionType: IntentActionType,
   intentText: string
-): AllowedSetResult {
+): Promise<AllowedSetResult> {
   const hardAllowed: InteractiveNode[] = [];
   const softAllowed: InteractiveNode[] = [];
   const ruleTrace: RuleTraceEntry[] = [];
   let shortCircuitRef: string | undefined;
-  
+
   const intentIsPassword = isPasswordIntent(intentText);
-  const intentKeywords = extractIntentKeywords(intentText);
-  
+  const intentKeywords = await extractKeywordsWithAI(intentText);
+
   // Track exact quote match candidates for potential short-circuit
   const exactMatchRefs: string[] = [];
+
+  // P1+P2 CRITICAL: Position-aware modal/dialog/popup layer detection
+  // If a modal is present, visible, AND covers a significant portion of the viewport,
+  // elements behind it should be HARD excluded.
+  // Cookie banners (small, bottom/top-positioned) should NOT trigger full modal exclusion.
+  const modalNode = nodes.find(
+    (n) =>
+      n.isVisible &&
+      (n.role === 'dialog' ||
+        n.role === 'alertdialog' ||
+        n.tag === 'dialog' ||
+        (n.isTopMostAtCenter === true &&
+         (n.role === 'region' || n.role === 'presentation') &&
+         (n.ariaLabel?.toLowerCase().includes('modal') ||
+          n.ariaLabel?.toLowerCase().includes('dialog'))))
+  );
+
+  // Position-aware: only treat as blocking modal if it covers significant viewport area
+  // Cookie banners are typically small (< 30% viewport area) and positioned at edges
+  let hasVisibleModal = false;
+  if (modalNode) {
+    const bb = modalNode.boundingBox;
+    if (bb && bb.width > 0 && bb.height > 0) {
+      // Estimate viewport as max bounding box across all visible nodes
+      let maxRight = 0;
+      let maxBottom = 0;
+      for (const n of nodes) {
+        if (n.boundingBox && n.isVisible) {
+          maxRight = Math.max(maxRight, n.boundingBox.x + n.boundingBox.width);
+          maxBottom = Math.max(maxBottom, n.boundingBox.y + n.boundingBox.height);
+        }
+      }
+      const viewportArea = maxRight * maxBottom;
+      const modalArea = bb.width * bb.height;
+      // Modal must cover at least 30% of visible area to be considered blocking
+      // This filters out cookie banners, notification bars, etc.
+      const coverageRatio = viewportArea > 0 ? modalArea / viewportArea : 0;
+      hasVisibleModal = coverageRatio >= 0.3;
+
+      if (!hasVisibleModal) {
+        ruleTrace.push({
+          ruleId: 'modal.small_overlay_skipped',
+          version: 'v2',
+          action: 'penalize',
+          evidence: `Dialog/modal found but only covers ${(coverageRatio * 100).toFixed(0)}% of viewport (< 30% threshold)`,
+          affectedRefs: modalNode.ref ? [modalNode.ref] : [],
+        });
+      }
+    } else {
+      // No bounding box info — fall back to treating it as blocking
+      hasVisibleModal = true;
+    }
+  }
+
+  if (hasVisibleModal) {
+    ruleTrace.push({
+      ruleId: 'modal.detected',
+      version: 'v2',
+      action: 'exclude',
+      evidence: 'Blocking modal/dialog layer detected - background elements will be hard-excluded',
+      affectedRefs: modalNode?.ref ? [modalNode.ref] : [],
+    });
+  }
   
   for (const node of nodes) {
     // Skip nodes without valid ref
@@ -370,14 +436,20 @@ export function buildAllowedSets(
     if (!excluded) {
       const allowedTags = ACTION_TO_TAGS[actionType];
       if (allowedTags && allowedTags.length > 0) {
+        const tagMatches = allowedTags.includes(node.tag.toLowerCase());
+
+        // P1 FIX: Role-based allowlist for click actions
+        // Elements with interactive ARIA roles should be allowed regardless of tag
+        const roleMatches = actionType === 'click' && node.role && CLICK_ALLOWED_ROLES.has(node.role);
+
         // Exception: allow non-standard textbox components for type as SoftAllowed.
-        if (!allowedTags.includes(node.tag.toLowerCase()) && !isNonStandardTextbox) {
+        if (!tagMatches && !isNonStandardTextbox && !roleMatches) {
           excluded = true;
           nodeRules.push({
             ruleId: 'tag.incompatible',
             version: 'v1',
             action: 'exclude',
-            evidence: `tag=${node.tag} not in [${allowedTags.join(',')}] for action=${actionType}`,
+            evidence: `tag=${node.tag}, role=${node.role || 'none'} not in allowed [${allowedTags.join(',')}] for action=${actionType}`,
             affectedRefs: [node.ref],
           });
         } else if (isNonStandardTextbox) {
@@ -387,6 +459,15 @@ export function buildAllowedSets(
             version: 'v1',
             action: 'penalize',
             evidence: 'div with role=textbox allowed as soft candidate',
+            affectedRefs: [node.ref],
+          });
+        } else if (roleMatches && !tagMatches) {
+          // Role-based match: allow but log for visibility
+          nodeRules.push({
+            ruleId: 'role.click_allowed',
+            version: 'v1',
+            action: 'boost',
+            evidence: `tag=${node.tag} allowed via role=${node.role} for click`,
             affectedRefs: [node.ref],
           });
         }
@@ -420,18 +501,32 @@ export function buildAllowedSets(
     // ═══════════════════════════════════════════════════════════════════════
     // SOFT RULES: Penalize but don't exclude
     // ═══════════════════════════════════════════════════════════════════════
-    
+
     if (!excluded) {
-      // Soft Rule 1: Covered by overlay
+      // P1 CRITICAL: When modal is present, covered elements must be HARD excluded
+      // Otherwise, soft penalty only
       if (node.isTopMostAtCenter === false) {
-        isSoft = true;
-        nodeRules.push({
-          ruleId: 'visibility.covered',
-          version: 'v1',
-          action: 'penalize',
-          evidence: 'isTopMostAtCenter=false',
-          affectedRefs: [node.ref],
-        });
+        if (hasVisibleModal) {
+          // HARD exclude: element is behind modal layer
+          excluded = true;
+          nodeRules.push({
+            ruleId: 'modal.background_element',
+            version: 'v1',
+            action: 'exclude',
+            evidence: 'isTopMostAtCenter=false with modal present',
+            affectedRefs: [node.ref],
+          });
+        } else {
+          // SOFT penalty: element is covered but no modal detected
+          isSoft = true;
+          nodeRules.push({
+            ruleId: 'visibility.covered',
+            version: 'v1',
+            action: 'penalize',
+            evidence: 'isTopMostAtCenter=false (no modal)',
+            affectedRefs: [node.ref],
+          });
+        }
       }
       
       // Soft Rule 2: Dynamic ID (less reliable)
@@ -1245,8 +1340,8 @@ export async function resolveWithEmbeddings(params: {
   // Step 1: Prepare intent text
   const intentText = sanitizeIntent(stepDraft);
 
-  // Step 2: Build HardAllowed/SoftAllowed sets via deterministic rules
-  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, intentText);
+  // Step 2: Build HardAllowed/SoftAllowed sets via deterministic rules (with AI keyword extraction)
+  const allowedResult = await buildAllowedSets(domNodes, stepDraft.type, intentText);
   const { hardAllowed, softAllowed, ruleTrace, shortCircuitRef } = allowedResult;
   
   // Combine allowed sets (hardAllowed first, then softAllowed)

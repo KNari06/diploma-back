@@ -1,0 +1,202 @@
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { env } from '@/config/environment/env';
+import { logger } from '@/utils/core/logger';
+
+/**
+ * Gemini AI Service
+ * Fast, multilingual text generation using Google Gemini 1.5 Flash
+ */
+
+let genAI: GoogleGenerativeAI | null = null;
+
+/**
+ * Initialize Gemini client lazily
+ */
+function getGeminiClient(): GoogleGenerativeAI {
+  if (!genAI) {
+    if (!env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY is not configured in environment');
+    }
+    genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
+  }
+  return genAI;
+}
+
+/**
+ * Gemini response with usage tracking
+ */
+export interface GeminiResponse {
+  content: string;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    model: string;
+  };
+}
+
+/**
+ * Generate text with Gemini (simple prompt → text)
+ * Best for: keyword extraction, classification, simple Q&A
+ */
+export async function generateTextWithGemini(params: {
+  prompt: string;
+  model?: 'gemini-1.5-flash' | 'gemini-1.5-pro' | 'gemini-2.0-flash-exp';
+  temperature?: number;
+  maxTokens?: number;
+  timeout?: number;
+}): Promise<GeminiResponse> {
+  const {
+    prompt,
+    model = 'gemini-1.5-flash',
+    temperature = 0,
+    maxTokens = 100,
+    timeout = 5000,
+  } = params;
+
+  try {
+    const client = getGeminiClient();
+    const genModel = client.getGenerativeModel({
+      model,
+      generationConfig: {
+        temperature,
+        maxOutputTokens: maxTokens,
+      },
+    });
+
+    // Create timeout promise
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
+    });
+
+    // Race between generation and timeout
+    const resultPromise = genModel.generateContent(prompt);
+    const result = await Promise.race([resultPromise, timeoutPromise]);
+
+    const response = result.response;
+    const text = response.text();
+
+    // Extract token usage (Gemini provides this in response metadata)
+    const usage = response.usageMetadata || {
+      promptTokenCount: 0,
+      candidatesTokenCount: 0,
+      totalTokenCount: 0,
+    };
+
+    return {
+      content: text,
+      usage: {
+        inputTokens: usage.promptTokenCount || 0,
+        outputTokens: usage.candidatesTokenCount || 0,
+        totalTokens: usage.totalTokenCount || 0,
+        model,
+      },
+    };
+  } catch (error) {
+    logger.error('[GEMINI] Text generation failed', {
+      error: error instanceof Error ? error.message : String(error),
+      model,
+      promptLength: prompt.length,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Generate chat completion with Gemini (messages array)
+ * Compatible with OpenAI-style messages
+ */
+export async function getChatCompletionWithGemini(params: {
+  messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
+  model?: 'gemini-1.5-flash' | 'gemini-1.5-pro' | 'gemini-2.0-flash-exp';
+  temperature?: number;
+  maxTokens?: number;
+  timeout?: number;
+}): Promise<GeminiResponse> {
+  const {
+    messages,
+    model = 'gemini-1.5-flash',
+    temperature = 0,
+    maxTokens = 1000,
+    timeout = 10000,
+  } = params;
+
+  try {
+    const client = getGeminiClient();
+    const genModel = client.getGenerativeModel({
+      model,
+      generationConfig: {
+        temperature,
+        maxOutputTokens: maxTokens,
+      },
+    });
+
+    // Convert OpenAI-style messages to Gemini format
+    // Gemini uses: system instruction + chat history
+    let systemInstruction = '';
+    const chatHistory: Array<{ role: 'user' | 'model'; parts: [{ text: string }] }> = [];
+
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        systemInstruction += msg.content + '\n';
+      } else if (msg.role === 'user') {
+        chatHistory.push({
+          role: 'user',
+          parts: [{ text: msg.content }],
+        });
+      } else if (msg.role === 'assistant') {
+        chatHistory.push({
+          role: 'model',
+          parts: [{ text: msg.content }],
+        });
+      }
+    }
+
+    // Start chat with history
+    const chat = genModel.startChat({
+      history: chatHistory.slice(0, -1), // All except last message
+      systemInstruction,
+    });
+
+    // Get last user message
+    const lastMessage = chatHistory[chatHistory.length - 1];
+    if (!lastMessage || lastMessage.role !== 'user') {
+      throw new Error('Last message must be from user');
+    }
+
+    // Create timeout promise
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
+    });
+
+    // Send last message and get response
+    const resultPromise = chat.sendMessage(lastMessage.parts[0].text);
+    const result = await Promise.race([resultPromise, timeoutPromise]);
+
+    const response = result.response;
+    const text = response.text();
+
+    const usage = response.usageMetadata || {
+      promptTokenCount: 0,
+      candidatesTokenCount: 0,
+      totalTokenCount: 0,
+    };
+
+    return {
+      content: text,
+      usage: {
+        inputTokens: usage.promptTokenCount || 0,
+        outputTokens: usage.candidatesTokenCount || 0,
+        totalTokens: usage.totalTokenCount || 0,
+        model,
+      },
+    };
+  } catch (error) {
+    logger.error('[GEMINI] Chat completion failed', {
+      error: error instanceof Error ? error.message : String(error),
+      model,
+      messageCount: messages.length,
+    });
+    throw error;
+  }
+}
