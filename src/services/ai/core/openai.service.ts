@@ -2,7 +2,7 @@ import { buildChatSystemPrompt } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
-import { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import { ChatCompletionMessageParam, ChatCompletionTool, ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
 
 /**
  * ✅ FIX: Configure OpenAI client with timeout and retry settings
@@ -22,6 +22,7 @@ const openai = new OpenAI({
 
 export interface OpenAIResponse {
   content: string;
+  tool_calls?: ChatCompletionMessageToolCall[];
   usage: {
     inputTokens: number;
     outputTokens: number;
@@ -44,6 +45,8 @@ export async function getChatCompletionWithMessages(
     response_format?: { type: 'json_object' };
     model?: string; // Allow custom model (e.g., gpt-3.5-turbo)
     abortSignal?: AbortSignal;
+    tools?: ChatCompletionTool[];
+    tool_choice?: 'auto' | 'none' | 'required';
   }
 ): Promise<OpenAIResponse> {
   try {
@@ -74,6 +77,8 @@ export async function getChatCompletionWithMessages(
       max_tokens: options?.max_tokens || env.OPENAI_MAX_TOKENS || 1000,
       temperature: options?.temperature ?? 0.5,
       ...(options?.response_format && { response_format: options.response_format }),
+      ...(options?.tools && { tools: options.tools }),
+      ...(options?.tool_choice && { tool_choice: options.tool_choice }),
     });
 
     const response = abortPromise
@@ -86,9 +91,13 @@ export async function getChatCompletionWithMessages(
       throw new Error('No response choices from OpenAI');
     }
 
-    const reply = response.choices[0]?.message?.content;
-    if (!reply) {
-      logger.error('[OPENAI] Empty content in response', {
+    const message = response.choices[0]?.message;
+    const reply = message?.content || '';
+    const toolCalls = message?.tool_calls;
+
+    // When tools are used, content can be null (tool_calls present instead)
+    if (!reply && !toolCalls?.length) {
+      logger.error('[OPENAI] Empty content in response (no tool calls either)', {
         model,
         messageCount: messages.length,
         finishReason: response.choices[0]?.finish_reason,
@@ -105,6 +114,8 @@ export async function getChatCompletionWithMessages(
       model,
       messageCount: messages.length,
       replyLength: reply.length,
+      hasToolCalls: !!toolCalls?.length,
+      toolCallCount: toolCalls?.length || 0,
       inputTokens: usage?.prompt_tokens || 0,
       outputTokens: usage?.completion_tokens || 0,
       totalTokens: usage?.total_tokens || 0,
@@ -112,6 +123,7 @@ export async function getChatCompletionWithMessages(
 
     return {
       content: reply,
+      tool_calls: toolCalls,
       usage: {
         inputTokens: usage?.prompt_tokens || 0,
         outputTokens: usage?.completion_tokens || 0,

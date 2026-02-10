@@ -83,6 +83,9 @@ const envSchema = z.object({
   FRONTEND_URL: z.string().url().optional().default('http://localhost:3000'),
   ALLOWED_ORIGINS: z.string().optional(),
 
+  // Backend URL (used for OAuth callbacks)
+  BACKEND_URL: z.string().optional(),
+
   // Integrations
   JIRA_CLIENT_ID: z.string().optional(),
   JIRA_CLIENT_SECRET: z.string().optional(),
@@ -91,6 +94,17 @@ const envSchema = z.object({
   JIRA_USERNAME: z.string().optional(),
   JIRA_API_TOKEN: z.string().optional(),
   SLACK_WEBHOOK_URL: z.string().optional(),
+
+  // GitHub OAuth
+  GITHUB_CLIENT_ID: z.string().optional(),
+  GITHUB_CLIENT_SECRET: z.string().optional(),
+
+  // Notion OAuth
+  NOTION_CLIENT_ID: z.string().optional(),
+  NOTION_CLIENT_SECRET: z.string().optional(),
+
+  // Telegram Bot
+  TELEGRAM_BOT_TOKEN: z.string().optional(),
 
   // Feature Flags - B2B Organization/Members
   // Staged rollout: enable reads first, then writes, then credits cutover

@@ -7,6 +7,7 @@ import fixturesRoutes from '@/api/fixtures/fixtures.route';
 import flowsRoutes from '@/api/flows/flows.route';
 import gitIntegrationRoutes from '@/api/gitIntegration/git-integration.route';
 import intelligentTestRoutes from '@/api/intelligentTest/intelligentTest.route';
+import integrationsRoutes from '@/api/integrations/integrations.route';
 import jiraRoutes from '@/api/jira/jira.route';
 import kbRoutes from '@/api/kb/kb.route';
 import rulesReloadRoutes from '@/api/kb/rules-reload.route';
@@ -1244,6 +1245,7 @@ app.use(`/api/${env.API_VERSION}/schedules`, schedulesRoutes); // Test schedules
 app.use(`/api/${env.API_VERSION}/fixtures`, fixturesRoutes); // Test fixtures
 app.use(`/api/${env.API_VERSION}/regression-plans`, regressionPlansRoutes); // Regression plans
 app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes); // ✅ NEW: Git integrations (CRUD)
+app.use(`/api/${env.API_VERSION}/integrations`, integrationsRoutes); // ✅ NEW: Unified OAuth integrations (Jira, GitHub, Notion, etc.)
 app.use(`/api/${env.API_VERSION}/user`, userRoutes);
 app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications
@@ -1343,6 +1345,17 @@ const startServer = async () => {
     } catch (rulesCacheError) {
       logger.warn('[SERVER] Failed to initialize rules cache, continuing without it', {
         error: rulesCacheError instanceof Error ? rulesCacheError.message : String(rulesCacheError),
+      });
+    }
+
+    // Register all skills (Jira, GitHub, Notion, etc.)
+    try {
+      const { registerAllSkills } = await import('@/services/skills');
+      registerAllSkills();
+      logger.info('✓ Skills registered successfully');
+    } catch (skillsError) {
+      logger.warn('[SERVER] Failed to register skills, continuing without them', {
+        error: skillsError instanceof Error ? skillsError.message : String(skillsError),
       });
     }
 

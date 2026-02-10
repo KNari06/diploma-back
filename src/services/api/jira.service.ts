@@ -169,10 +169,11 @@ export async function getAccessibleResources(
 
 /**
  * Save Jira token to database
+ * Now saves to integration_tokens table using IntegrationTokenService
  * @param userId - User ID
  * @param tokenData - Token response from OAuth
- * @param cloudId - Jira cloud ID
- * @param siteUrl - Jira site URL
+ * @param cloudId - Jira cloud ID (maps to external_id)
+ * @param siteUrl - Jira site URL (maps to external_url)
  * @returns Saved token data
  */
 export async function saveJiraToken(
@@ -186,53 +187,44 @@ export async function saveJiraToken(
       throw new Error('cloud_id is required to save Jira token');
     }
 
-    const expiresAt = tokenData.expires_in
-      ? new Date(Date.now() + tokenData.expires_in * 1000)
-      : undefined;
+    // Import IntegrationTokenService dynamically to avoid circular dependencies
+    const { IntegrationTokenService } = await import('./integration-token.service');
 
-    const tokenRecord: Partial<JiraTokenData> = {
-      user_id: userId,
-      access_token: tokenData.access_token,
-      refresh_token: tokenData.refresh_token,
-      expires_at: expiresAt?.toISOString(),
-      scope: tokenData.scope,
-      cloud_id: cloudId,
-      site_url: siteUrl,
-      token_type: tokenData.token_type,
-    };
+    const expiresIn = tokenData.expires_in;
 
-    // Check if token already exists for this user and cloud_id
-    const { data: existing } = await supabaseAdmin
-      .from('jira_tokens')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('cloud_id', cloudId)
-      .maybeSingle();
+    // Save to integration_tokens using the centralized service
+    const savedToken = await IntegrationTokenService.saveToken(
+      userId,
+      undefined, // workspace_id - Jira doesn't use workspace scoping yet
+      'jira',
+      {
+        access_token: tokenData.access_token,
+        refresh_token: tokenData.refresh_token,
+        expires_in: expiresIn,
+        scope: tokenData.scope,
+        token_type: tokenData.token_type,
+        external_id: cloudId,
+        external_url: siteUrl,
+        metadata: {}, // Empty metadata for now
+      }
+    );
 
-    if (existing) {
-      // Update existing token
-      const { data, error } = await supabaseAdmin
-        .from('jira_tokens')
-        .update(tokenRecord)
-        .eq('id', existing.id)
-        .select()
-        .single();
+    logger.info('[JIRA] Token saved to integration_tokens', { userId, cloudId });
 
-      if (error) throw error;
-      logger.info('Jira token updated', { userId, cloudId });
-      return data as JiraTokenData;
-    }
-
-    // Create new token
-    const { data, error } = await supabaseAdmin
-      .from('jira_tokens')
-      .insert(tokenRecord)
-      .select()
-      .single();
-
-    if (error) throw error;
-    logger.info('Jira token saved', { userId, cloudId });
-    return data as JiraTokenData;
+    // Return in JiraTokenData format for backward compatibility
+    return {
+      id: savedToken.id,
+      user_id: savedToken.user_id,
+      access_token: savedToken.access_token,
+      refresh_token: savedToken.refresh_token,
+      expires_at: savedToken.expires_at,
+      scope: savedToken.scope,
+      cloud_id: savedToken.external_id || cloudId,
+      site_url: savedToken.external_url,
+      token_type: savedToken.token_type,
+      created_at: savedToken.created_at,
+      updated_at: savedToken.updated_at,
+    } as JiraTokenData;
   } catch (error) {
     logger.error('Failed to save Jira token', error);
     throw error;
@@ -241,8 +233,9 @@ export async function saveJiraToken(
 
 /**
  * Get Jira token for user
+ * Dual-read pattern: checks integration_tokens first, falls back to jira_tokens
  * @param userId - User ID
- * @param cloudId - Optional cloud ID filter
+ * @param cloudId - Optional cloud ID filter (maps to external_id in integration_tokens)
  * @returns Token data or null
  */
 export async function getJiraToken(
@@ -250,24 +243,68 @@ export async function getJiraToken(
   cloudId?: string
 ): Promise<JiraTokenData | null> {
   try {
+    // Try new integration_tokens table first
     let query = supabaseAdmin
+      .from('integration_tokens')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('provider', 'jira')
+      .eq('enabled', true);
+
+    if (cloudId) {
+      query = query.eq('external_id', cloudId);
+    }
+
+    const { data: newData, error: newError } = await query
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (newError) {
+      logger.error('Failed to query integration_tokens for Jira', newError);
+      // Don't throw, fall through to legacy table
+    }
+
+    if (newData) {
+      logger.debug('[JIRA] Token retrieved from integration_tokens', { userId, cloudId });
+      // Map integration_tokens fields to JiraTokenData format
+      return {
+        id: newData.id,
+        user_id: newData.user_id,
+        access_token: newData.access_token,
+        refresh_token: newData.refresh_token,
+        expires_at: newData.expires_at,
+        scope: newData.scope,
+        cloud_id: newData.external_id || '',
+        site_url: newData.external_url,
+        token_type: newData.token_type,
+        created_at: newData.created_at,
+        updated_at: newData.updated_at,
+      } as JiraTokenData;
+    }
+
+    // Fallback to legacy jira_tokens table
+    let legacyQuery = supabaseAdmin
       .from('jira_tokens')
       .select('*')
       .eq('user_id', userId);
 
     if (cloudId) {
-      query = query.eq('cloud_id', cloudId);
+      legacyQuery = legacyQuery.eq('cloud_id', cloudId);
     }
 
-    // Return the most recently added token if multiple exist (and no cloudId specified)
-    // Use limit(1) to avoid error with maybeSingle if multiple rows exist
-    const { data, error } = await query
+    const { data: legacyData, error: legacyError } = await legacyQuery
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
 
-    if (error) throw error;
-    return data as JiraTokenData | null;
+    if (legacyError) throw legacyError;
+
+    if (legacyData) {
+      logger.debug('[JIRA] Token retrieved from jira_tokens (legacy)', { userId, cloudId });
+    }
+
+    return legacyData as JiraTokenData | null;
   } catch (error) {
     logger.error('Failed to get Jira token', error);
     throw error;
@@ -293,25 +330,56 @@ export async function ensureValidToken(tokenData: JiraTokenData): Promise<string
     logger.info('Refreshing expired Jira token', { userId: tokenData.user_id });
     const newTokenData = await refreshJiraToken(tokenData.refresh_token);
 
-    // Update token in database
+    // Update token in database - try integration_tokens first, fallback to jira_tokens
     const newExpiresAt = newTokenData.expires_in
       ? new Date(Date.now() + newTokenData.expires_in * 1000)
       : undefined;
 
-    const { error } = await supabaseAdmin
-      .from('jira_tokens')
-      .update({
-        access_token: newTokenData.access_token,
-        refresh_token: newTokenData.refresh_token || tokenData.refresh_token,
-        expires_at: newExpiresAt?.toISOString(),
-        scope: newTokenData.scope,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', tokenData.id);
+    // Import IntegrationTokenService
+    const { IntegrationTokenService } = await import('./integration-token.service');
 
-    if (error) {
-      logger.error('Failed to update refreshed token', error);
-      throw error;
+    // Try to find token in integration_tokens first
+    const { data: integrationToken } = await supabaseAdmin
+      .from('integration_tokens')
+      .select('id')
+      .eq('user_id', tokenData.user_id)
+      .eq('provider', 'jira')
+      .eq('external_id', tokenData.cloud_id)
+      .maybeSingle();
+
+    if (integrationToken) {
+      // Update in integration_tokens using centralized service
+      await IntegrationTokenService.refreshToken(
+        integrationToken.id,
+        newTokenData.access_token,
+        newTokenData.refresh_token || tokenData.refresh_token,
+        newTokenData.expires_in
+      );
+      logger.info('[JIRA] Refreshed token updated in integration_tokens', {
+        userId: tokenData.user_id,
+        cloudId: tokenData.cloud_id,
+      });
+    } else {
+      // Fallback to jira_tokens (legacy)
+      const { error } = await supabaseAdmin
+        .from('jira_tokens')
+        .update({
+          access_token: newTokenData.access_token,
+          refresh_token: newTokenData.refresh_token || tokenData.refresh_token,
+          expires_at: newExpiresAt?.toISOString(),
+          scope: newTokenData.scope,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', tokenData.id);
+
+      if (error) {
+        logger.error('Failed to update refreshed token in jira_tokens', error);
+        throw error;
+      }
+      logger.info('[JIRA] Refreshed token updated in jira_tokens (legacy)', {
+        userId: tokenData.user_id,
+        cloudId: tokenData.cloud_id,
+      });
     }
 
     return newTokenData.access_token;

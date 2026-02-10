@@ -262,6 +262,32 @@ export async function handleGeneralChat(
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2.6: LOAD WORKSPACE MEMORY (PERSISTENT SEMANTIC MEMORY)
+  // ═══════════════════════════════════════════════════════════════════════
+  let workspaceMemory = '';
+  const workspaceId = typeof context === 'object' && context !== null && !Array.isArray(context)
+    ? context?.workspaceId || context?.workspace_id
+    : undefined;
+
+  if (workspaceId) {
+    try {
+      const { WorkspaceMemoryService } = await import('@/services/ai/memory/workspace-memory.service');
+      workspaceMemory = await WorkspaceMemoryService.getMemoryForContext(workspaceId, 2000);
+      if (workspaceMemory) {
+        logger.info('[GENERAL_CHAT] Loaded workspace memory', {
+          workspaceId,
+          memoryLength: workspaceMemory.length,
+        });
+      }
+    } catch (memoryError) {
+      logger.warn('[GENERAL_CHAT] Failed to load workspace memory', {
+        error: memoryError instanceof Error ? memoryError.message : String(memoryError),
+        workspaceId,
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // STEP 2.7: EDITOR MODE — GET PAGE CONTEXT
   // ═══════════════════════════════════════════════════════════════════════
   let editorPageContext: PageContext | null = null;
@@ -306,10 +332,41 @@ export async function handleGeneralChat(
   // 7. Conversation history (recent messages)
   // 8. Current user message
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2.8: COLLECT AVAILABLE TOOLS (SKILLS + MEMORY)
+  // ═══════════════════════════════════════════════════════════════════════
+  let availableTools: any[] = [];
+  let skillDescriptions = '';
+
+  if (workspaceId) {
+    try {
+      const { SkillRegistry } = await import('@/services/skills');
+      const { MEMORY_TOOLS } = await import('@/services/ai/memory/memory-tools');
+
+      // Get available skill tools
+      const skillContext = { userId, workspaceId, chatSessionId };
+      const skillTools = await SkillRegistry.getAvailableTools(skillContext);
+      skillDescriptions = await SkillRegistry.getSkillDescriptions(skillContext);
+
+      // Combine skill tools + memory tools
+      availableTools = [...skillTools, ...MEMORY_TOOLS];
+
+      logger.info('[GENERAL_CHAT] Tools collected', {
+        totalTools: availableTools.length,
+        skillTools: skillTools.length,
+        memoryTools: MEMORY_TOOLS.length,
+      });
+    } catch (toolsError) {
+      logger.warn('[GENERAL_CHAT] Failed to load tools, continuing without them', {
+        error: toolsError instanceof Error ? toolsError.message : String(toolsError),
+      });
+    }
+  }
+
   const buildChatSystemPromptWithLogging = functionLogger
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
     : buildChatSystemPrompt;
-  let systemPrompt = buildChatSystemPromptWithLogging();
+  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions);
 
   // Append editor-specific instructions if in editor mode
   if (mode === 'editor') {
@@ -334,6 +391,14 @@ If the user asks to test something on the current page, prefer platform_test int
     messages.push({
       role: 'system',
       content: `--- Agent Memory (Conversation History Summaries) ---\n${agentMemory}\n\nThis is a compressed summary of earlier conversations in this workspace chat.`,
+    });
+  }
+
+  // Add workspace memory (persistent semantic memory)
+  if (workspaceMemory) {
+    messages.push({
+      role: 'system',
+      content: `--- Workspace Memory (Persistent Facts & Preferences) ---\n${workspaceMemory}\n\nThese are important facts, preferences, and patterns you've remembered about this workspace.`,
     });
   }
 
@@ -382,29 +447,126 @@ If the user asks to test something on the current page, prefer platform_test int
   // (Step 1.5) before any handler is invoked. No need to check twice.
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 3: GET AI RESPONSE
+  // STEP 3: AGENTIC TOOL-CALLING LOOP
   // ═══════════════════════════════════════════════════════════════════════
-  // ✅ FIX: Emit "Thinking..." only AFTER credit check and abort check
-  // This prevents sending event when request will fail (no credits, cancelled, etc.)
   const emitProcessingStepWithLogging = functionLogger
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
   emitProcessingStepWithLogging(chatSessionId, 'generating_response', '💬 Thinking...', 90);
 
   let gptResponse: { content: string; usage?: any };
-  let shouldDeductCredits = false; // Track if we should deduct credits
+  let shouldDeductCredits = false;
+  const MAX_TOOL_ROUNDS = 5; // Prevent infinite loops
 
   try {
-    const getChatCompletionWithMessagesWithLogging = functionLogger
-      ? withFunctionLogging(getChatCompletionWithMessages, 'getChatCompletionWithMessages', functionLogger)
-      : getChatCompletionWithMessages;
-    gptResponse = await getChatCompletionWithMessagesWithLogging(messages, {
-      temperature: 0.3, // Lowered from 0.5 for more consistent responses
-      max_tokens: 2000, // Increased from 1000 for richer responses in single workspace chat
-      abortSignal,
-    });
+    let toolRound = 0;
+    let finalResponse: string | null = null;
 
-    // Mark that we should deduct credits (only if we got a real response, not fallback)
+    // Agentic loop: keep calling OpenAI until no more tool calls
+    while (toolRound < MAX_TOOL_ROUNDS) {
+      toolRound++;
+
+      logger.info('[GENERAL_CHAT] Tool round', { round: toolRound, messagesCount: messages.length });
+
+      const getChatCompletionWithMessagesWithLogging = functionLogger
+        ? withFunctionLogging(getChatCompletionWithMessages, 'getChatCompletionWithMessages', functionLogger)
+        : getChatCompletionWithMessages;
+
+      // Call OpenAI with tools (if available)
+      const response = await getChatCompletionWithMessagesWithLogging(messages, {
+        temperature: 0.3,
+        max_tokens: 2000,
+        abortSignal,
+        tools: availableTools.length > 0 ? availableTools : undefined,
+        tool_choice: availableTools.length > 0 ? 'auto' : undefined,
+      });
+
+      // Check for tool calls
+      const toolCalls = response.tool_calls;
+
+      if (!toolCalls || toolCalls.length === 0) {
+        // No tool calls - this is the final text response
+        finalResponse = response.content;
+        break;
+      }
+
+      // Execute tool calls
+      logger.info('[GENERAL_CHAT] Executing tool calls', {
+        count: toolCalls.length,
+        tools: toolCalls.map((tc) => tc.function.name),
+      });
+
+      // Add assistant message with tool calls to history
+      messages.push({
+        role: 'assistant',
+        content: response.content || '',
+        tool_calls: toolCalls,
+      } as any);
+
+      // Execute each tool call
+      for (const toolCall of toolCalls) {
+        const toolName = toolCall.function.name;
+        const toolArgs = JSON.parse(toolCall.function.arguments);
+
+        logger.info('[GENERAL_CHAT] Executing tool', {
+          toolName,
+          args: JSON.stringify(toolArgs),
+        });
+
+        try {
+          let toolResult: any;
+
+          // Route to appropriate executor
+          if (['remember_fact', 'search_memory', 'forget_fact'].includes(toolName)) {
+            // Memory tools
+            const { executeMemoryTool } = await import('@/services/ai/memory/memory-tools');
+            toolResult = await executeMemoryTool(toolName, toolArgs, workspaceId!, userId);
+          } else {
+            // Skill tools
+            const { SkillRegistry } = await import('@/services/skills');
+            const skillContext = { userId, workspaceId: workspaceId!, chatSessionId };
+            toolResult = await SkillRegistry.executeTool(toolName, toolArgs, skillContext);
+          }
+
+          // Add tool result to messages
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: JSON.stringify(toolResult),
+          } as any);
+
+          logger.info('[GENERAL_CHAT] Tool executed', {
+            toolName,
+            success: toolResult.success,
+          });
+        } catch (toolError) {
+          logger.error('[GENERAL_CHAT] Tool execution error', {
+            toolName,
+            error: toolError instanceof Error ? toolError.message : String(toolError),
+          });
+
+          // Add error result to messages
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({
+              success: false,
+              message: `Tool execution failed: ${toolError instanceof Error ? toolError.message : String(toolError)}`,
+            }),
+          } as any);
+        }
+      }
+
+      // Continue loop to get next response from OpenAI
+    }
+
+    if (!finalResponse) {
+      // Max rounds reached without final response
+      finalResponse = "I've completed the requested actions. Is there anything else you'd like me to help with?";
+      logger.warn('[GENERAL_CHAT] Max tool rounds reached', { rounds: MAX_TOOL_ROUNDS });
+    }
+
+    gptResponse = { content: finalResponse, usage: undefined };
     shouldDeductCredits = true;
   } catch (openaiError: any) {
     // Check if request was aborted (client closed connection)
