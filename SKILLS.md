@@ -32,13 +32,14 @@ src/services/skills/
 ├── index.ts                          # registerAllSkills() entry point (called from src/index.ts)
 └── integrations/
     ├── jira.skill.ts                 # Jira skill implementation
-    ├── SKILL.jira.md                 # Jira skill documentation (585 lines)
     ├── github.skill.ts               # GitHub skill implementation
-    ├── SKILL.github.md               # GitHub skill documentation (822 lines)
     ├── notion.skill.ts               # Notion skill implementation
-    ├── SKILL.notion.md               # Notion skill documentation (1092 lines)
     ├── telegram.skill.ts             # Telegram skill implementation
-    └── SKILL.telegram.md             # Telegram skill documentation (915 lines)
+    └── skills/                       # Skill documentation (for AI/model context)
+        ├── SKILL.jira.md             # Jira skill documentation (585 lines)
+        ├── SKILL.github.md           # GitHub skill documentation (822 lines)
+        ├── SKILL.notion.md           # Notion skill documentation (1092 lines)
+        └── SKILL.telegram.md         # Telegram skill documentation (915 lines)
 
 src/services/ai/memory/
 ├── workspace-memory.service.ts       # Memory CRUD + vector search + context loading
@@ -59,10 +60,10 @@ src/services/api/
 
 | # | Skill | Provider | Tools | Auth | API | Documentation |
 |---|-------|----------|-------|------|-----|---------------|
-| 1 | **Jira** | `jira` | 5 | OAuth 2.0 (3LO) | Atlassian REST API v3 | `src/services/skills/integrations/SKILL.jira.md` |
-| 2 | **GitHub** | `github` | 4 | OAuth 2.0 | GitHub REST API v3 | `src/services/skills/integrations/SKILL.github.md` |
-| 3 | **Notion** | `notion` | 4 | OAuth 2.0 | Notion API (2022-06-28) | `src/services/skills/integrations/SKILL.notion.md` |
-| 4 | **Telegram** | `telegram` | 4 | Bot Token | Telegram Bot API | `src/services/skills/integrations/SKILL.telegram.md` |
+| 1 | **Jira** | `jira` | 5 | OAuth 2.0 (3LO) | Atlassian REST API v3 | `src/services/skills/integrations/skills/SKILL.jira.md` |
+| 2 | **GitHub** | `github` | 4 | OAuth 2.0 | GitHub REST API v3 | `src/services/skills/integrations/skills/SKILL.github.md` |
+| 3 | **Notion** | `notion` | 4 | OAuth 2.0 | Notion API (2022-06-28) | `src/services/skills/integrations/skills/SKILL.notion.md` |
+| 4 | **Telegram** | `telegram` | 4 | Bot Token | Telegram Bot API | `src/services/skills/integrations/skills/SKILL.telegram.md` |
 | 5 | **Memory** | `internal` | 3 | None (internal) | Supabase + OpenAI Embeddings | `src/services/ai/memory/SKILL.memory.md` |
 
 ---
@@ -184,7 +185,7 @@ Follow these steps to add a new integration skill:
 
 1. **API Service** — Create `src/services/api/<provider>.service.ts` with typed API client functions
 2. **Skill Implementation** — Create `src/services/skills/integrations/<provider>.skill.ts` implementing `SkillDefinition`
-3. **Skill Documentation** — Create `src/services/skills/integrations/SKILL.<provider>.md` with full detail (see existing files for format)
+3. **Skill Documentation** — Create `src/services/skills/integrations/skills/SKILL.<provider>.md` with full detail (see existing files for format)
 4. **Provider Type** — Add the provider to `IntegrationProvider` in both:
    - `src/services/skills/types.ts`
    - `src/services/api/integration-token.service.ts`
