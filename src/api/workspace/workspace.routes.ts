@@ -1,6 +1,8 @@
 import { requireAuth } from '@/middleware/auth.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { Router } from 'express';
+import multer from 'multer';
+import path from 'path';
 import {
   getOnboarding,
   saveOnboarding,
@@ -23,8 +25,41 @@ import {
   revokeInvite,
   transferOwnership,
 } from './workspace-members.controller';
+import {
+  uploadWorkspaceLogo,
+  deleteWorkspaceLogo,
+} from './workspace-logo.controller';
 
 const router = Router();
+
+// ============================================================================
+// MULTER CONFIGURATION FOR LOGO UPLOADS
+// ============================================================================
+
+const storage = multer.memoryStorage();
+
+const logoFileFilter = (
+  req: any,
+  file: Express.Multer.File,
+  cb: multer.FileFilterCallback
+) => {
+  const allowedExtensions = ['.png', '.jpg', '.jpeg', '.svg', '.webp'];
+  const ext = path.extname(file.originalname).toLowerCase();
+
+  if (allowedExtensions.includes(ext)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Only PNG, JPG, SVG, and WebP files are allowed'));
+  }
+};
+
+const uploadLogo = multer({
+  storage,
+  fileFilter: logoFileFilter,
+  limits: {
+    fileSize: 2 * 1024 * 1024, // 2MB max file size
+  },
+});
 
 /**
  * @swagger
@@ -297,6 +332,121 @@ router.delete(
   '/:id',
   requireAuth,
   asyncHandler(deleteWorkspace)
+);
+
+// ============================================================================
+// LOGO ENDPOINTS
+// ============================================================================
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/logo:
+ *   post:
+ *     summary: Upload workspace logo
+ *     description: |
+ *       Upload a logo for the workspace. Replaces existing logo if present.
+ *       Requires owner or full_access role (WORKSPACE_WRITE permission).
+ *     tags: [Workspaces]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - logo
+ *             properties:
+ *               logo:
+ *                 type: string
+ *                 format: binary
+ *                 description: Logo image file (PNG, JPG, SVG, WebP, max 2MB)
+ *     responses:
+ *       200:
+ *         description: Logo uploaded successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     logo_url:
+ *                       type: string
+ *                       example: "https://xxx.supabase.co/storage/v1/object/public/workspace-logos/..."
+ *                     file_name:
+ *                       type: string
+ *                       example: "logo_1234567890.png"
+ *                     file_size:
+ *                       type: number
+ *                       example: 102400
+ *                     uploaded_at:
+ *                       type: string
+ *                       format: date-time
+ *                 message:
+ *                   type: string
+ *                   example: "Logo uploaded successfully"
+ *       400:
+ *         description: Invalid request (missing file, invalid format, file too large)
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Access denied (requires owner or full_access role)
+ *       404:
+ *         description: Workspace not found
+ */
+router.post(
+  '/:id/logo',
+  requireAuth,
+  uploadLogo.single('logo'),
+  asyncHandler(uploadWorkspaceLogo)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/logo:
+ *   delete:
+ *     summary: Delete workspace logo
+ *     description: |
+ *       Delete the workspace logo. Requires owner or full_access role (WORKSPACE_WRITE permission).
+ *     tags: [Workspaces]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *     responses:
+ *       200:
+ *         description: Logo deleted successfully
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Access denied (requires owner or full_access role)
+ *       404:
+ *         description: Workspace not found or no logo exists
+ */
+router.delete(
+  '/:id/logo',
+  requireAuth,
+  asyncHandler(deleteWorkspaceLogo)
 );
 
 // ============================================================================
@@ -637,6 +787,41 @@ router.post(
  */
 // Note: This route is defined here but should be mounted at /api/v1/invites in index.ts
 // For now, we'll add it as a separate route file or handle in a different way
+
+// ============================================================================
+// MULTER ERROR HANDLING FOR LOGO UPLOADS
+// ============================================================================
+
+// Error handler middleware for logo upload errors
+router.use((error: any, req: any, res: any, next: any) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({
+        success: false,
+        error: 'File too large',
+        message: 'Logo file must be smaller than 2MB',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    return res.status(400).json({
+      success: false,
+      error: 'Upload error',
+      message: error.message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  if (error.message === 'Only PNG, JPG, SVG, and WebP files are allowed') {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid file type',
+      message: error.message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  next(error);
+});
 
 export default router;
 

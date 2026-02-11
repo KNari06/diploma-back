@@ -220,6 +220,18 @@ export interface WorkspaceCreateRequest {
 
 export type BrowserTypeEnum = 'chrome' | 'firefox' | 'safari' | 'edge';
 
+// Workspace onboarding role enum
+export type WorkspaceRole =
+  | 'qaEngineer'
+  | 'developer'
+  | 'productManager'
+  | 'teamLead'
+  | 'cto'
+  | 'other';
+
+// Workspace account type enum
+export type WorkspaceAccountType = 'company' | 'individual';
+
 export interface WorkspaceOnboardingRequest {
   name: string; // Project/Workspace name
   baseUrls: string[]; // Array of base URLs
@@ -229,18 +241,38 @@ export interface WorkspaceOnboardingRequest {
     prod?: string;
   };
   browserType: BrowserTypeEnum; // Default: 'chrome'
+  // NEW FIELDS
+  role: WorkspaceRole; // User's role
+  position?: string; // User's position (optional, max 255 chars)
+  accountType: WorkspaceAccountType; // Account type
+  companyName?: string; // Company name (required when accountType === 'company')
 }
 
 export interface WorkspaceOnboardingResponse {
-  name: string;
-  baseUrls: string[];
-  environments: {
+  workspace_id?: string; // Workspace ID returned in response (only when completed)
+  name?: string;
+  baseUrls?: string[];
+  environments?: {
     dev?: string;
     predprod?: string;
     prod?: string;
   };
-  browserType: BrowserTypeEnum;
+  browserType?: BrowserTypeEnum;
   completed: boolean; // Whether onboarding was completed
+  // NEW FIELDS
+  role?: WorkspaceRole;
+  position?: string;
+  accountType?: WorkspaceAccountType;
+  companyName?: string;
+  logo_url?: string; // Workspace logo URL if present
+}
+
+// Logo upload response
+export interface WorkspaceLogoUploadResponse {
+  logo_url: string; // Public URL to uploaded logo
+  file_name: string; // Generated filename
+  file_size: number; // File size in bytes
+  uploaded_at: string; // ISO timestamp
 }
 
 export interface Project {

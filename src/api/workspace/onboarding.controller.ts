@@ -146,11 +146,70 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       return;
     }
 
+    // Validate role (required)
+    const validRoles = ['qaEngineer', 'developer', 'productManager', 'teamLead', 'cto', 'other'];
+    if (!body.role || !validRoles.includes(body.role)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid or missing field: role',
+        message: `Field role must be one of: ${validRoles.join(', ')}`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate position (optional, max 255 chars)
+    if (body.position !== undefined && (typeof body.position !== 'string' || body.position.length > 255)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid field: position',
+        message: 'Field position must be a string with max 255 characters',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate accountType (required)
+    const validAccountTypes = ['company', 'individual'];
+    if (!body.accountType || !validAccountTypes.includes(body.accountType)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid or missing field: accountType',
+        message: `Field accountType must be one of: ${validAccountTypes.join(', ')}`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Validate companyName (required when accountType === 'company')
+    if (body.accountType === 'company') {
+      if (!body.companyName || typeof body.companyName !== 'string' || body.companyName.trim().length === 0) {
+        res.status(400).json({
+          success: false,
+          error: 'Missing required field: companyName',
+          message: 'Field companyName is required when accountType is "company"',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      if (body.companyName.length > 255) {
+        res.status(400).json({
+          success: false,
+          error: 'Invalid field: companyName',
+          message: 'Field companyName is too long (max 255 characters)',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+
     logger.info('[ONBOARDING] Saving onboarding data', {
       userId,
       projectName: body.name,
       baseUrlsCount: body.baseUrls.length,
       browserType: body.browserType,
+      role: body.role,
+      accountType: body.accountType,
     });
 
     // Get or create workspace for user
@@ -196,6 +255,11 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       environments: normalizedEnvironments,
       browserType: body.browserType,
       defaultBrowser: body.browserType, // For backward compatibility
+      // NEW FIELDS
+      role: body.role,
+      position: body.position || null,
+      accountType: body.accountType,
+      companyName: body.companyName || null,
     };
 
     // Extract dev and prod URLs for backward compatibility
@@ -226,11 +290,18 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
     }
 
     const response: WorkspaceOnboardingResponse = {
+      workspace_id: workspace_id, // Return workspace_id in response
       name: updatedWorkspace.name,
       baseUrls: normalizedBaseUrls,
       environments: normalizedEnvironments,
       browserType: body.browserType,
       completed: true,
+      // NEW FIELDS
+      role: body.role,
+      position: body.position,
+      accountType: body.accountType,
+      companyName: body.companyName,
+      logo_url: updatedWorkspace.logo_url,
     };
 
     res.status(200).json({
@@ -351,11 +422,18 @@ export const getOnboarding = async (req: Request, res: Response): Promise<void> 
     }
 
     const response: WorkspaceOnboardingResponse = {
+      workspace_id: workspace.id, // Return workspace_id
       name: workspace.name,
       baseUrls,
       environments,
       browserType: settings.browserType || settings.defaultBrowser || 'chrome',
       completed: true,
+      // NEW FIELDS
+      role: settings.role,
+      position: settings.position,
+      accountType: settings.accountType,
+      companyName: settings.companyName,
+      logo_url: workspace.logo_url,
     };
 
     res.json({
