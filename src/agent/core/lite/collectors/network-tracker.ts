@@ -42,6 +42,8 @@ export class NetworkTracker {
   private validationErrors: NetworkValidationError[] = [];
   // Track only fetch/xhr requests for smart filtering
   private trackedRequests: Map<string, TrackedRequest> = new Map();
+  // P1: Captured request bodies for POST/PUT/PATCH (keyed by URL)
+  private capturedRequestBodies: Map<string, any> = new Map();
 
   // Manus Style: Analytics blacklist (ignore even POST to these domains)
   private static readonly ANALYTICS_DOMAINS = [
@@ -187,10 +189,10 @@ export class NetworkTracker {
         resourceType,
         timestamp: Date.now(),
       });
-    }
 
-    // For pending tracking (all requests)
-    this.pendingRequests.add(url);
+      // Only track fetch/xhr in pendingRequests to avoid blocking on WebSocket/SSE
+      this.pendingRequests.add(url);
+    }
   };
 
   private onRequestFinished = (request: Request) => {
@@ -303,11 +305,30 @@ export class NetworkTracker {
           iteration: this.currentIteration,
         });
       } else if (status >= 400 && status < 500) {
-        // Validation error - extract body
+        // P1: Enhanced validation error capture with full body parsing
         try {
           const body = await response.json().catch(() => null);
           const message = body?.message || body?.error?.message || `HTTP ${status}`;
           const errors = body?.errors || (body?.error ? [body.error] : []);
+
+          // P1: Get captured request body (if any)
+          const requestBody = this.capturedRequestBodies.get(url) ?? null;
+          this.capturedRequestBodies.delete(url); // Cleanup after use
+
+          // P1: Parse field-level errors
+          const fieldErrors = this.parseValidationErrors(body);
+
+          // P1: Parse rate limit info from response headers
+          let headers: Record<string, string> = {};
+          try {
+            headers = response.headers();
+          } catch {
+            // Ignore header access errors
+          }
+          const rateLimitInfo = this.parseRateLimitHeaders(headers);
+
+          // P1: Parse auth error hint
+          const authErrorHint = this.parseAuthErrorHint(status, body);
 
           this.validationErrors.push({
             url,
@@ -317,16 +338,28 @@ export class NetworkTracker {
             message: typeof message === 'string' ? message : String(message),
             errors: Array.isArray(errors) ? errors.map(String) : [],
             iteration: this.currentIteration,
+            // P1: Enhanced fields
+            requestBody,
+            responseBody: body,
+            headers,
+            fieldErrors: fieldErrors.length > 0 ? fieldErrors : undefined,
+            rateLimitInfo: rateLimitInfo || undefined,
+            authErrorHint: authErrorHint || undefined,
           });
-          logger.debug('[NETWORK_TRACKER] Validation error', {
+
+          logger.debug('[NETWORK_TRACKER] Enhanced validation error captured', {
             url,
             method,
             status,
             message,
+            fieldErrorCount: fieldErrors.length,
+            hasRequestBody: requestBody !== null,
+            hasRateLimit: !!rateLimitInfo,
+            authHint: authErrorHint,
             iteration: this.currentIteration,
           });
         } catch {
-          // If not JSON - save without body
+          // Fallback: save without body if parsing fails
           this.validationErrors.push({
             url,
             method,
@@ -363,11 +396,184 @@ export class NetworkTracker {
 
     // Remove from tracked after processing
     this.trackedRequests.delete(url);
+
+    // P1: Cleanup old tracked requests and captured bodies to prevent memory leak
+    if (this.trackedRequests.size > 1000) {
+      const now = Date.now();
+      for (const [trackedUrl, tracked] of this.trackedRequests.entries()) {
+        if (now - tracked.timestamp > 30000) { // 30 seconds
+          this.trackedRequests.delete(trackedUrl);
+          this.capturedRequestBodies.delete(trackedUrl);
+        }
+      }
+    }
   };
 
   constructor(page: Page) {
     this.page = page;
     this.startTracking();
+    this.setupRequestInterception();
+  }
+
+  /**
+   * P1: Setup request body capture
+   * Captures POST/PUT/PATCH request bodies before they are sent.
+   * Uses page.on('request') to read body without re-fetching (no route.fetch()).
+   * Response body capture is done in onResponse handler.
+   */
+  private setupRequestInterception(): void {
+    // Capture request bodies from tracked requests (non-blocking, no route interception)
+    this.page.on('request', (request: Request) => {
+      const method = request.method();
+      if (!['POST', 'PUT', 'PATCH'].includes(method)) return;
+
+      const url = request.url();
+      let requestBody: any = null;
+      try {
+        const postData = request.postData();
+        if (postData) {
+          try {
+            requestBody = JSON.parse(postData);
+          } catch {
+            requestBody = postData;
+          }
+        } else {
+          try {
+            requestBody = request.postDataJSON();
+          } catch {
+            // No body available
+          }
+        }
+      } catch {
+        // Ignore body capture errors
+      }
+
+      if (requestBody !== null) {
+        this.capturedRequestBodies.set(url, requestBody);
+      }
+    });
+
+    logger.debug('[NETWORK_TRACKER] Request body capture enabled');
+  }
+
+  /**
+   * Parse field-level validation errors from response body
+   * Handles common API error formats:
+   * - Object-based: { email: 'invalid', password: 'too short' }
+   * - Array-based: [{ field: 'email', message: 'invalid' }]
+   * - Laravel: { errors: { email: ['invalid'], password: ['too short'] } }
+   * - Rails: { errors: { email: ['invalid'], password: ['too short'] } }
+   */
+  private parseValidationErrors(body: any): Array<{ field: string; message: string }> {
+    if (!body) return [];
+
+    const fieldErrors: Array<{ field: string; message: string }> = [];
+
+    try {
+      // Format 1: Array-based with field/message objects
+      if (Array.isArray(body.errors)) {
+        for (const error of body.errors) {
+          if (typeof error === 'object' && error.field && error.message) {
+            fieldErrors.push({
+              field: String(error.field),
+              message: String(error.message),
+            });
+          }
+        }
+      }
+      // Format 2: Object-based { email: 'invalid', password: 'too short' }
+      else if (typeof body.errors === 'object' && body.errors !== null) {
+        for (const [field, value] of Object.entries(body.errors)) {
+          if (Array.isArray(value)) {
+            // Laravel/Rails format: { email: ['invalid', 'required'] }
+            for (const msg of value) {
+              fieldErrors.push({ field, message: String(msg) });
+            }
+          } else if (typeof value === 'string') {
+            fieldErrors.push({ field, message: value });
+          }
+        }
+      }
+      // Format 3: Top-level object { email: 'invalid', password: 'too short' }
+      else if (typeof body === 'object' && !body.message && !body.error) {
+        for (const [field, value] of Object.entries(body)) {
+          if (typeof value === 'string') {
+            fieldErrors.push({ field, message: value });
+          }
+        }
+      }
+    } catch {
+      // Ignore parsing errors
+    }
+
+    return fieldErrors;
+  }
+
+  /**
+   * Parse rate limit info from response headers
+   * Checks common headers: retry-after, x-ratelimit-*, ratelimit-*
+   */
+  private parseRateLimitHeaders(
+    headers: Record<string, string>
+  ): { retryAfter?: number; limit?: number; remaining?: number; reset?: number } | null {
+    const retryAfter = headers['retry-after'];
+    const limit = headers['x-ratelimit-limit'] || headers['ratelimit-limit'];
+    const remaining = headers['x-ratelimit-remaining'] || headers['ratelimit-remaining'];
+    const reset = headers['x-ratelimit-reset'] || headers['ratelimit-reset'];
+
+    if (!retryAfter && !limit && !remaining && !reset) {
+      return null;
+    }
+
+    return {
+      retryAfter: retryAfter ? parseInt(retryAfter, 10) : undefined,
+      limit: limit ? parseInt(limit, 10) : undefined,
+      remaining: remaining ? parseInt(remaining, 10) : undefined,
+      reset: reset ? parseInt(reset, 10) : undefined,
+    };
+  }
+
+  /**
+   * Parse authentication error hint from response
+   * Common hints: 'token_expired', 'invalid_credentials', 'unauthorized', etc.
+   */
+  private parseAuthErrorHint(status: number, body: any): string | null {
+    if (status !== 401 && status !== 403) {
+      return null;
+    }
+
+    try {
+      // Check for common auth error codes
+      const code = body?.code || body?.error_code || body?.errorCode;
+      if (typeof code === 'string') {
+        const lowerCode = code.toLowerCase();
+        if (
+          lowerCode.includes('token') ||
+          lowerCode.includes('auth') ||
+          lowerCode.includes('credential') ||
+          lowerCode.includes('unauthorized') ||
+          lowerCode.includes('forbidden')
+        ) {
+          return code;
+        }
+      }
+
+      // Check message for hints
+      const message = body?.message || body?.error?.message || '';
+      if (typeof message === 'string') {
+        const lowerMsg = message.toLowerCase();
+        if (lowerMsg.includes('token expired')) return 'token_expired';
+        if (lowerMsg.includes('invalid token')) return 'invalid_token';
+        if (lowerMsg.includes('invalid credentials')) return 'invalid_credentials';
+        if (lowerMsg.includes('unauthorized')) return 'unauthorized';
+        if (lowerMsg.includes('forbidden')) return 'forbidden';
+        if (lowerMsg.includes('access denied')) return 'access_denied';
+      }
+    } catch {
+      // Ignore parsing errors
+    }
+
+    return null;
   }
 
   /**
@@ -402,14 +608,34 @@ export class NetworkTracker {
   async waitForNetworkIdle(timeout: number = 5000): Promise<void> {
     const startTime = Date.now();
     const checkInterval = 100; // Check every 100ms
+    const staleThresholdMs = 10000; // Consider requests older than 10s as stale
 
     try {
-      // First wait for Playwright's built-in networkidle
-      await this.page.waitForLoadState('networkidle', {
-        timeout: Math.min(timeout, 3000)
-      }).catch(() => {
-        // Ignore timeout - we'll do our own check
-      });
+      // Cleanup stale pending requests (safety net for WebSocket/SSE leaks)
+      const now = Date.now();
+      const stalePendingUrls: string[] = [];
+      for (const url of this.pendingRequests) {
+        const tracked = this.trackedRequests.get(url);
+        if (tracked && now - tracked.timestamp > staleThresholdMs) {
+          stalePendingUrls.push(url);
+        }
+      }
+      if (stalePendingUrls.length > 0) {
+        logger.debug('[NETWORK_TRACKER] Removing stale pending requests', {
+          staleCount: stalePendingUrls.length,
+        });
+        stalePendingUrls.forEach((url) => this.pendingRequests.delete(url));
+      }
+
+      // Skip Playwright wait if already idle
+      if (this.pendingRequests.size > 0) {
+        // First wait for Playwright's built-in networkidle (reduced timeout)
+        await this.page.waitForLoadState('networkidle', {
+          timeout: Math.min(timeout, 2000)
+        }).catch(() => {
+          // Ignore timeout - we'll do our own check
+        });
+      }
 
       // Then verify our tracking shows no pending requests
       while (this.pendingRequests.size > 0) {
@@ -485,6 +711,7 @@ export class NetworkTracker {
     this.networkErrors = [];
     this.successfulResponses = [];
     this.validationErrors = [];
+    this.capturedRequestBodies.clear();
   }
 
   /**
@@ -501,6 +728,10 @@ export class NetworkTracker {
     } catch {
       // Ignore listener removal errors
     }
+
+    // P1: Clear tracked requests and captured bodies to prevent memory leak
+    this.trackedRequests.clear();
+    this.capturedRequestBodies.clear();
 
     this.isTracking = false;
     logger.debug('[NETWORK_TRACKER] Stopped tracking');

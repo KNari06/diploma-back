@@ -12,6 +12,7 @@ import type {
   ActionOutcome,
   FunnelPhaseType,
   IterationRecord,
+  LiteSnapshot,
   RecoveryPoint,
   StateDiff,
   StuckCheck,
@@ -32,6 +33,33 @@ export class LiteState {
   private consecutiveStuckCount: number = 0; // Track consecutive stuck iterations for AI fallback trigger
   // Visual Anchors: Store signatures for interacted elements (fallback when ref changes)
   private visualSignatures: Map<string, VisualSignature> = new Map();
+
+  // P1: Cached regex patterns for performance (avoid recompiling in filterDynamicElements)
+  private static readonly DYNAMIC_PATTERNS = [
+    // Time-related
+    /time/i,
+    /clock/i,
+    /timer/i,
+    /countdown/i,
+    /\d{1,2}:\d{2}(:\d{2})?/, // HH:MM:SS format
+    // Ads and dynamic content
+    /ad[_-]?banner/i,
+    /advertisement/i,
+    /sponsored/i,
+    /promo/i,
+    // Animations and loaders
+    /spinner/i,
+    /loading/i,
+    /skeleton/i,
+    /placeholder/i,
+    // Counters and stats
+    /\d+\s*(views?|likes?|shares?)/i,
+    /visitor[_-]?count/i,
+    // Live updates
+    /live[_-]?update/i,
+    /realtime/i,
+    /streaming/i,
+  ];
 
   // ═══════════════════════════════════════════════════════════════════════════
   // WORKSTREAM 4: Recovery State
@@ -274,8 +302,29 @@ export class LiteState {
       };
     }
 
-    // Not stuck - reset counter
-    this.consecutiveStuckCount = 0;
+    // ✅ FIX P2: Not stuck - but only reset counter on SIGNIFICANT progress
+    // This prevents false resets when minor changes occur (ads, timers, etc.)
+    const lastIteration = this.iterations[this.iterations.length - 1];
+    if (lastIteration) {
+      const lastDiff = lastIteration.result.stateDiff;
+      // Reset only on real progress (URL change or significant DOM change)
+      if (lastDiff.urlChanged || lastDiff.significantChange) {
+        this.consecutiveStuckCount = 0;
+        logger.debug('[LITE_STATE] Reset stuck count - significant progress detected', {
+          urlChanged: lastDiff.urlChanged,
+          significantChange: lastDiff.significantChange,
+        });
+      } else if (this.consecutiveStuckCount > 0) {
+        // Full reset on minor progress (fix for non-consecutive accumulation bug)
+        this.consecutiveStuckCount = 0;
+        logger.debug('[LITE_STATE] Reset stuck count - minor progress detected', {
+          newCount: this.consecutiveStuckCount,
+        });
+      }
+    } else {
+      // No iterations yet - reset
+      this.consecutiveStuckCount = 0;
+    }
     return { stuck: false };
   }
 
@@ -341,36 +390,11 @@ export class LiteState {
    * @returns Filtered stable elements
    */
   private filterDynamicElements(elements: string[]): string[] {
-    const DYNAMIC_PATTERNS = [
-      // Time-related
-      /time/i,
-      /clock/i,
-      /timer/i,
-      /countdown/i,
-      /\d{1,2}:\d{2}(:\d{2})?/, // HH:MM:SS format
-      // Ads and dynamic content
-      /ad[_-]?banner/i,
-      /advertisement/i,
-      /sponsored/i,
-      /promo/i,
-      // Animations and loaders
-      /spinner/i,
-      /loading/i,
-      /skeleton/i,
-      /placeholder/i,
-      // Counters and stats
-      /\d+\s*(views?|likes?|shares?)/i,
-      /visitor[_-]?count/i,
-      // Live updates
-      /live[_-]?update/i,
-      /realtime/i,
-      /streaming/i,
-    ];
-
     const filtered = elements.filter((el) => {
       const lowerEl = el.toLowerCase();
       // Keep element if it doesn't match any dynamic pattern
-      return !DYNAMIC_PATTERNS.some((pattern) => pattern.test(lowerEl));
+      // P1: Use cached static patterns for performance
+      return !LiteState.DYNAMIC_PATTERNS.some((pattern) => pattern.test(lowerEl));
     });
 
     // Log if we filtered out elements (for debugging)
@@ -737,14 +761,42 @@ export class LiteState {
    * Build a recovery key from goal and URL
    * Used for loop-proof attempt counting
    */
-  buildRecoveryKey(goal: string, url: string): string {
+  /**
+   * Compute content hash for SPA-aware recovery (TASK 8)
+   * Creates a fingerprint of interactive elements to detect SPA changes
+   */
+  computeContentHash(snapshot: LiteSnapshot): string {
+    // Collect interactive elements (buttons, links, inputs)
+    const interactiveElements = snapshot.elements
+      .filter(el => ['button', 'a', 'input', 'select', 'textarea'].includes(el.tag))
+      .map(el => {
+        const tag = el.tag;
+        const name = (el.name || '').slice(0, 30);
+        const type = el.type || '';
+        return `${tag}:${name}:${type}`;
+      })
+      .sort(); // Sort for consistency
+
+    // Simple DJB2 hash
+    let hash = 5381;
+    const combined = interactiveElements.join('|');
+    for (let i = 0; i < combined.length; i++) {
+      hash = ((hash << 5) + hash) + combined.charCodeAt(i);
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return hash.toString(36); // Base-36 for shorter string
+  }
+
+  buildRecoveryKey(goal: string, url: string, contentHash?: string): string {
     try {
       const urlObj = new URL(url);
       const normalizedUrl = urlObj.origin + urlObj.pathname + urlObj.hash; // Ignore query, include hash
       const normalizedGoal = goal.toLowerCase().trim().slice(0, 100);
-      return `${normalizedGoal}|${normalizedUrl}`;
+      const hashPart = contentHash ? `|${contentHash}` : '';
+      return `${normalizedGoal}|${normalizedUrl}${hashPart}`;
     } catch {
-      return `${goal.slice(0, 100)}|${url.slice(0, 100)}`;
+      const hashPart = contentHash ? `|${contentHash}` : '';
+      return `${goal.slice(0, 100)}|${url.slice(0, 100)}${hashPart}`;
     }
   }
 

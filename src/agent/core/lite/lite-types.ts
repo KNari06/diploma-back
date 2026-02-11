@@ -34,6 +34,12 @@ export interface LiteElement {
   context?: string; // "inside: Product Card 'iPhone 15'"
   isInsideActiveModal?: boolean; // True if element is inside active modal
   isInsideShadowDOM?: boolean;   // PHASE D: True if element is inside a shadow DOM
+  /** True if element is slotted content (light DOM rendered in shadow DOM slot) */
+  isSlotted?: boolean;
+  /** Name of the slot (default, named, or undefined if not slotted) */
+  slotName?: string;
+  /** Shadow DOM nesting depth (0 = light DOM, 1 = first level shadow, etc.) */
+  shadowDepth?: number;
   // Semantic attributes for field classification (Level 1 signals)
   autocomplete?: string;  // e.g., "current-password", "email", "tel", "username"
   inputmode?: string;     // e.g., "tel", "email", "numeric"
@@ -146,6 +152,27 @@ export interface TransientStateInfo {
 }
 
 /**
+ * Visual content metadata for proactive vision detection
+ * NEW: P0 Feature - Proactive Vision Detection
+ */
+export interface SnapshotMetadata {
+  /** Whether page contains canvas elements */
+  hasCanvas: boolean;
+  /** Whether page contains SVG elements */
+  hasSVG: boolean;
+  /** Canvas coverage as percentage of viewport (0-1) */
+  canvasArea: number;
+  /** SVG coverage as percentage of viewport (0-1) */
+  svgArea: number;
+  /** Whether DOM has few interactive elements (<10) */
+  isDOMWeak: boolean;
+  /** Number of interactive elements (buttons, inputs, links) */
+  interactiveElementCount: number;
+  /** Whether vision analysis is recommended for this page */
+  recommendVision: boolean;
+}
+
+/**
  * Snapshot of page state at a point in time
  */
 export interface LiteSnapshot {
@@ -158,6 +185,8 @@ export interface LiteSnapshot {
   transientState?: TransientStateInfo;
   /** Truncated page text for credential extraction only (never sent to LLM/logs) */
   pageTextForExtraction?: string;
+  /** Visual content metadata for proactive vision detection - NEW: P0 Feature */
+  metadata?: SnapshotMetadata;
 }
 
 /**
@@ -216,6 +245,8 @@ export interface NetworkSuccess {
 /**
  * Network validation error (400-499 with parsed body)
  * Manus Style: extract message/errors from response body to help AI understand why validation failed
+ *
+ * P1 Enhancement: Full request/response interception for AI debugging
  */
 export interface NetworkValidationError {
   url: string;
@@ -227,6 +258,25 @@ export interface NetworkValidationError {
   /** Extracted from response body: body.errors array */
   errors?: string[];
   iteration?: number;
+
+  // P1: Full Request/Response Interception
+  /** Request body (for POST/PUT/PATCH) - helps AI understand what was sent */
+  requestBody?: any;
+  /** Full response body - provides complete error context */
+  responseBody?: any;
+  /** Response headers (especially retry-after for rate limiting) */
+  headers?: Record<string, string>;
+  /** Parsed field-level validation errors: [{field: 'email', message: 'invalid format'}] */
+  fieldErrors?: Array<{ field: string; message: string }>;
+  /** Rate limit info extracted from headers */
+  rateLimitInfo?: {
+    retryAfter?: number; // seconds
+    limit?: number;
+    remaining?: number;
+    reset?: number; // timestamp
+  };
+  /** Authentication error hint (e.g., 'token_expired', 'invalid_credentials') */
+  authErrorHint?: string;
 }
 
 /**
@@ -669,4 +719,6 @@ export interface RecoveryPoint {
   iteration: number;
   /** Whether this point has been invalidated (zombie) */
   invalidated?: boolean;
+  /** Content hash for SPA-aware recovery (TASK 8) */
+  contentHash?: string;
 }

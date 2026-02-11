@@ -12,7 +12,7 @@
  */
 
 import { logger } from '@/utils/core/logger';
-import type { GoalContext, GoalEval, LiteSnapshot, StateDiff } from '../lite-types';
+import type { GoalContext, GoalEval, LiteElement, LiteSnapshot, StateDiff } from '../lite-types';
 import { LitePromptBuilder } from '../prompt/lite-prompt-builder';
 import { AIGoalEvaluator } from './ai-goal-evaluator';
 
@@ -1681,5 +1681,71 @@ Set isBlocked=true ONLY for hard blocks (captcha, 2FA, phone verification).`;
       form: 'form',
     };
     return roleMap[tag.toLowerCase()] || 'generic';
+  }
+
+  /**
+   * TASK 9: Identify the goal-relevant form by grouping elements and scoring
+   * Returns refs of fields in the best matching form container
+   */
+  identifyGoalForm(elements: LiteElement[], goal: string): string[] {
+    const goalLower = goal.toLowerCase();
+    const isLoginGoal = /login|sign\s*in/i.test(goalLower);
+    const isRegisterGoal = /register|sign\s*up|create.*account/i.test(goalLower);
+    const isCheckoutGoal = /checkout|payment|purchase/i.test(goalLower);
+
+    // Group elements by containerRef (form parent)
+    const containerGroups = new Map<string, LiteElement[]>();
+    for (const el of elements) {
+      if (el.tag !== 'input' && el.tag !== 'select' && el.tag !== 'textarea') continue;
+
+      const container = el.context?.match(/inside:\s*([^"]+)/)?.[1] || 'root';
+      if (!containerGroups.has(container)) {
+        containerGroups.set(container, []);
+      }
+      containerGroups.get(container)!.push(el);
+    }
+
+    // Score each container based on expected field types
+    let bestScore = 0;
+    let bestRefs: string[] = [];
+
+    for (const [container, fields] of containerGroups) {
+      let score = 0;
+
+      const fieldTypes = fields.map(f => (f.type || f.htmlName || '').toLowerCase());
+      const fieldNames = fields.map(f => (f.name || '').toLowerCase());
+      const allText = [...fieldTypes, ...fieldNames].join(' ');
+
+      // Login: email/username + password
+      if (isLoginGoal) {
+        if (/email|username|login/i.test(allText)) score += 2;
+        if (/password/i.test(allText)) score += 2;
+      }
+
+      // Register: email + password + (confirm password or name)
+      if (isRegisterGoal) {
+        if (/email/i.test(allText)) score += 2;
+        if (/password/i.test(allText)) score += 2;
+        if (/name|first.*name|last.*name/i.test(allText)) score += 1;
+        if (/confirm|repeat/i.test(allText)) score += 1;
+      }
+
+      // Checkout: card/address fields
+      if (isCheckoutGoal) {
+        if (/card|credit|debit/i.test(allText)) score += 2;
+        if (/address|street|city|zip|postal/i.test(allText)) score += 2;
+        if (/name|cardholder/i.test(allText)) score += 1;
+      }
+
+      // Bonus: more fields = more likely to be the right form
+      score += Math.min(fields.length / 10, 1);
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestRefs = fields.map(f => f.ref);
+      }
+    }
+
+    return bestRefs;
   }
 }

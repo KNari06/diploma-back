@@ -4,10 +4,12 @@
  * SECURITY: AI returns structured commands, not arbitrary code
  */
 
+import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import type { TaskPlanStep } from '../analysis/task-plan-builder';
 import type { AIDecision, GoalGuidance, ModalDismissInfo, StuckCheck, VisionHints } from '../lite-types';
+import { PromptSanitizer } from '../security/prompt-sanitizer';
 
 /**
  * Task plan context for prompt
@@ -89,10 +91,28 @@ export class LitePromptBuilder {
     goalOrientedSummary?: string;
     /** ✅ NEW: Vision hints from GPT-4o Vision when DOM is weak */
     visionHints?: VisionHints;
+    /** ✅ TASK 9: Form focus hint with refs of goal-relevant form fields */
+    formFocusHint?: string;
   }): string {
+    // ✅ NEW: Sanitize snapshot to prevent prompt injection attacks
+    const sanitizationResult = PromptSanitizer.sanitizeSnapshot(
+      params.snapshot,
+      params.progressSignals?.currentUrl || 'unknown'
+    );
+
     // ✅ FIX: Truncate snapshot if too large (prevent token overflow)
     const MAX_SNAPSHOT_LENGTH = 100_000; // 100k chars (~25k tokens)
-    const snapshot = LitePromptBuilder.truncateSnapshot(params.snapshot, MAX_SNAPSHOT_LENGTH);
+    const snapshot = LitePromptBuilder.truncateSnapshot(sanitizationResult.sanitized, MAX_SNAPSHOT_LENGTH);
+
+    // Log security events if high-severity injection attempts detected
+    if (sanitizationResult.highSeverityCount > 0) {
+      logger.warn('[LITE_PROMPT] Prompt injection attempts blocked in snapshot', {
+        totalBlocked: sanitizationResult.totalBlocked,
+        highSeverity: sanitizationResult.highSeverityCount,
+        mediumSeverity: sanitizationResult.mediumSeverityCount,
+        url: params.progressSignals?.currentUrl || 'unknown',
+      });
+    }
 
     // Build stuck warning if agent is stuck
     const stuckWarning = params.stuckCheck.stuck
@@ -191,32 +211,18 @@ Use this summary to understand what's relevant to your goal. Key changes are hig
 `
       : '';
 
-    // Build complete prompt with JSON-only response format
-    return `You are a browser automation agent testing a web application.
-Your job is to REACH THE TARGET STATE through intermediate steps. Navigation is expected.
+    // ✅ TASK 9: Form focus hint section
+    const formFocusSection = params.formFocusHint
+      ? `
+🎯 TARGET FORM:
+${params.formFocusHint}
+`
+      : '';
 
-GOAL: ${params.goal}
-
-CURRENT PAGE:
-${snapshot}
-${taskPlanSection}${goalOrientedSummarySection}${stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${visionHintsSection}${modalDismissSection}${validationErrorSection}
-HISTORY:
-${params.history}
-
-AVAILABLE ACTIONS (choose ONE):
-- click: { "action": "click", "ref": "e5" }
-- fill: { "action": "fill", "ref": "e2", "value": "text to type" }
-- fill (credential): { "action": "fill", "ref": "e2", "value": "placeholder", "isSensitive": true }
-- press: { "action": "press", "key": "Enter" }
-- goto: { "action": "goto", "url": "https://..." }
-- scroll: { "action": "scroll", "direction": "down", "amount": 600 }
-- scroll_to: { "action": "scroll", "targetRef": "e10" }
-- select: { "action": "select", "ref": "e3", "value": "option" }
-- hover: { "action": "hover", "ref": "e4" }
-- wait: { "action": "wait" }
-
-IMPORTANT RULES:
-1. Use data-agent-ref values (e.g., "e5") to target elements
+    // ═══════════════════════════════════════════════════════════════════════
+    // Build conditional rules based on context (save ~2-3k tokens per request)
+    // ═══════════════════════════════════════════════════════════════════════
+    const coreRules = `1. Use data-agent-ref values (e.g., "e5") to target elements
 2. Look at parent context to understand element location
 3. If an action fails repeatedly, try a different approach
 4. Check for error messages or validation warnings
@@ -225,17 +231,46 @@ IMPORTANT RULES:
 7. Your job is to REACH the target state - intermediate navigation steps are expected!
 8. If you detect "HTTP 429" / "Too Many Requests" / rate limiting, use "wait" (back off) before trying again.
 9. For multi-step forms: "Continue/Продолжить" button = step forward (keep going), "Register/Finish/Зарегистрироваться" = final step
-10. For Registration goal: If you see only "Login/Вход" form, look for "Register/Зарегистрироваться" toggle inside it - don't give up!
-11. ✅ EXPLORATION RULE: If your target form (e.g., registration, checkout) is not visible, look for entry points like "Login/Вход", "Profile/Профиль", "Account/Кабинет", or a user icon. Clicking these is a VALID and often NECESSARY step to reach your goal.
-12. ✅ MODAL HANDLING: If ACTIVE_MODAL appears and blocks your goal, first try "press Escape", then look for close/dismiss buttons inside the modal. If modal contains your goal form, interact with it instead of dismissing.
-13. ✅ SEMANTIC SEARCH: Use ARIA labels (aria-label="..."), placeholder text, and parent context (inside: Form "Login") to find correct elements. Don't rely only on visible text - custom UI frameworks often use hidden labels.
-14. ✅ OBSTACLE DETECTION: If action fails, check for:
+10. For Registration goal: If you see only "Login/Вход" form, look for "Register/Зарегистрироваться" toggle inside it - don't give up!`;
+
+    const conditionalRules: string[] = [];
+
+    // Rule 11: EXPLORATION - only for auth goals when form not found
+    const isAuthGoal = /login|register|sign\s*in|sign\s*up|auth/i.test(params.goal);
+    const hasAuthForm = /password|email.*input|username.*input/i.test(snapshot);
+    if (isAuthGoal && !hasAuthForm) {
+      conditionalRules.push(`11. ✅ EXPLORATION RULE: If your target form (e.g., registration, checkout) is not visible, look for entry points like "Login/Вход", "Profile/Профиль", "Account/Кабинет", or a user icon. Clicking these is a VALID and often NECESSARY step to reach your goal.`);
+    }
+
+    // Rule 12: MODAL - only when ACTIVE_MODAL is present
+    if (snapshot.includes('ACTIVE_MODAL')) {
+      conditionalRules.push(`12. ✅ MODAL HANDLING: If ACTIVE_MODAL appears and blocks your goal, first try "press Escape", then look for close/dismiss buttons inside the modal. If modal contains your goal form, interact with it instead of dismissing.`);
+    }
+
+    // Rule 13: SEMANTIC SEARCH - only when stuck
+    if (params.stuckCheck.stuck) {
+      conditionalRules.push(`13. ✅ SEMANTIC SEARCH: Use ARIA labels (aria-label="..."), placeholder text, and parent context (inside: Form "Login") to find correct elements. Don't rely only on visible text - custom UI frameworks often use hidden labels.`);
+    }
+
+    // Rule 14: OBSTACLE DETECTION - when stuck or last action failed
+    const hasFailure = params.lastOutcome && /fail|error|not found|timeout/i.test(params.lastOutcome);
+    if (params.stuckCheck.stuck || hasFailure) {
+      conditionalRules.push(`14. ✅ OBSTACLE DETECTION: If action fails, check for:
     - Overlays/modals blocking the element (look for ACTIVE_MODAL or z-index issues)
     - Element outside viewport (use scroll_to with targetRef to bring into view)
     - Element disabled or hidden (check [DISABLED] flag)
-    - If click fails on button, try pressing Enter on a focused input instead
-15. ✅ STATE DRIFT REASONING: Always analyze STATE DRIFT ANALYSIS section above. If URL and DOM unchanged after action, it FAILED - try different element/approach. Success = state changed.
-16. ✅ LOGIN/REGISTER SUCCESS DETECTION: For login/register goals, if STATE DRIFT shows URL changed from auth page (login, signin, register, auth) to non-auth page, this indicates SUCCESSFUL authentication - BUT check for intermediate steps first:
+    - If click fails on button, try pressing Enter on a focused input instead`);
+    }
+
+    // Rule 15: STATE DRIFT - only when stateDriftAnalysis is present
+    if (params.stateDriftAnalysis) {
+      conditionalRules.push(`15. ✅ STATE DRIFT REASONING: Always analyze STATE DRIFT ANALYSIS section above. If URL and DOM unchanged after action, it FAILED - try different element/approach. Success = state changed.`);
+    }
+
+    // Rule 16: LOGIN SUCCESS - only for login/register goals
+    const isLoginRegisterGoal = /login|register|sign\s*in|sign\s*up/i.test(params.goal);
+    if (isLoginRegisterGoal) {
+      conditionalRules.push(`16. ✅ LOGIN/REGISTER SUCCESS DETECTION: For login/register goals, if STATE DRIFT shows URL changed from auth page (login, signin, register, auth) to non-auth page, this indicates SUCCESSFUL authentication - BUT check for intermediate steps first:
 
     ✅ SUCCESS if URL changed to: dashboard, home, profile, welcome, account, app, user, my-account, logged-in, or any page WITHOUT intermediate step keywords
 
@@ -253,7 +288,39 @@ IMPORTANT RULES:
     - /login → /verify-email = NOT SUCCESS ❌ (intermediate step)
     - /register → /complete-profile = NOT SUCCESS ❌ (intermediate step)
 
-    If intermediate step detected, continue with the flow (fill verification code, complete profile, etc.).
+    If intermediate step detected, continue with the flow (fill verification code, complete profile, etc.).`);
+    }
+
+    const allRules = conditionalRules.length > 0
+      ? `${coreRules}\n${conditionalRules.join('\n')}`
+      : coreRules;
+
+    // Build complete prompt with JSON-only response format
+    return `You are a browser automation agent testing a web application.
+Your job is to REACH THE TARGET STATE through intermediate steps. Navigation is expected.
+
+GOAL: ${params.goal}
+
+CURRENT PAGE:
+${snapshot}
+${taskPlanSection}${goalOrientedSummarySection}${formFocusSection}${stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${visionHintsSection}${modalDismissSection}${validationErrorSection}
+HISTORY:
+${params.history}
+
+AVAILABLE ACTIONS (choose ONE):
+- click: { "action": "click", "ref": "e5" }
+- fill: { "action": "fill", "ref": "e2", "value": "text to type" }
+- fill (credential): { "action": "fill", "ref": "e2", "value": "placeholder", "isSensitive": true }
+- press: { "action": "press", "key": "Enter" }
+- goto: { "action": "goto", "url": "https://..." }
+- scroll: { "action": "scroll", "direction": "down", "amount": 600 }
+- scroll_to: { "action": "scroll", "targetRef": "e10" }
+- select: { "action": "select", "ref": "e3", "value": "option" }
+- hover: { "action": "hover", "ref": "e4" }
+- wait: { "action": "wait" }
+
+IMPORTANT RULES:
+${allRules}
 
 RESPONSE FORMAT (JSON ONLY):
 You MUST respond with a Deep Reasoning Chain format:
@@ -309,10 +376,10 @@ Analyze state changes after each action. Success = state changed.`;
       const response = await getChatCompletionWithMessages(
         [{ role: 'user', content: prompt }],
         {
-          model: 'gpt-4o-mini',
+          model: LITE_ENGINE_FLAGS.coreBrainModel,
           temperature: 0.1,
           response_format: { type: 'json_object' },
-          max_tokens: 500,
+          max_tokens: LITE_ENGINE_FLAGS.coreBrainMaxTokens,
         }
       );
 

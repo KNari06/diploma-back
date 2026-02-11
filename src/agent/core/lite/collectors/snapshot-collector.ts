@@ -23,6 +23,18 @@ export class SnapshotCollector {
       // Wait for visual stability first
       await VisualStability.waitForStable(page);
 
+      // ✅ P1: Inject Shadow DOM flags into page context before evaluation
+      await page.evaluate(() => {
+        // @ts-expect-error - window available in browser context
+        if (typeof window.__LITE_ENGINE_FLAGS === 'undefined') {
+          // @ts-expect-error - window available in browser context
+          window.__LITE_ENGINE_FLAGS = {
+            enableShadowDOMSupport: true,
+            shadowDOMMaxDepth: 5,
+          };
+        }
+      });
+
       // Collect snapshot in page context
       // @ts-expect-error - DOM types available in browser context
       const snapshot = await page.evaluate(() => {
@@ -33,6 +45,30 @@ export class SnapshotCollector {
         const win = window as any;
         if (typeof win.__agentRefCounter !== 'number') {
           win.__agentRefCounter = 0;
+        }
+
+        // ✅ TASK 10: Fingerprint-based ref stability for React re-renders
+        // Persist refs across DOM rebuilds using element fingerprints
+        if (!win.__agentFingerprintMap) {
+          win.__agentFingerprintMap = new Map();
+        }
+
+        /**
+         * TASK 10: Get element fingerprint for ref stability
+         * Creates a unique signature for an element based on stable attributes
+         */
+        function getElementFingerprint(el: any): string {
+          const tag = el.tagName.toLowerCase();
+          const role = el.getAttribute('role') || '';
+          const type = el.getAttribute('type') || '';
+          const name = el.getAttribute('name') || '';
+          const ariaLabel = el.getAttribute('aria-label') || '';
+          const placeholder = el.getAttribute('placeholder') || '';
+          const text = (el.textContent || '').trim().slice(0, 30);
+          const parentTag = el.parentElement?.tagName.toLowerCase() || '';
+          const parentId = el.parentElement?.getAttribute('id') || '';
+
+          return `${tag}|${role}|${type}|${name}|${ariaLabel}|${placeholder}|${text}|${parentTag}|${parentId}`;
         }
 
         /**
@@ -379,26 +415,43 @@ export class SnapshotCollector {
           'canvas' // ✅ L5: Include canvas for vision escalation trigger
         ];
 
-        // WORKSTREAM D: Performance limits
-        const MAX_SHADOW_DEPTH = 8; // Prevent infinite/deep recursion
+        // ═══════════════════════════════════════════════════════════════════════
+        // P1 FEATURE: Enhanced Shadow DOM Support
+        // ═══════════════════════════════════════════════════════════════════════
+        // @ts-expect-error - window.__LITE_ENGINE_FLAGS available from config
+        const SHADOW_DOM_ENABLED = typeof window.__LITE_ENGINE_FLAGS !== 'undefined'
+          ? window.__LITE_ENGINE_FLAGS.enableShadowDOMSupport !== false
+          : true; // Default: enabled
+
+        // @ts-expect-error - window.__LITE_ENGINE_FLAGS available from config
+        const MAX_SHADOW_DEPTH = typeof window.__LITE_ENGINE_FLAGS !== 'undefined'
+          ? window.__LITE_ENGINE_FLAGS.shadowDOMMaxDepth || 5
+          : 5; // Default: 5 levels
+
         const visitedRoots = new WeakSet<object>(); // Cache visited roots to avoid reprocessing
+
+        // Track shadow depth for each element
+        const elementShadowDepth = new WeakMap<Element, number>();
+
+        // P1: Guard against circular references in shadow host chain
+        const visitedShadowHosts = new WeakSet<Element>();
 
         /**
          * Recursively collect elements from a root (document or shadow root)
          * Traverses open shadow DOMs for web component support
-         * WORKSTREAM D: Bounded by depth and visited cache
+         * P1 FEATURE: Enhanced with depth tracking, slotted content detection, unique ref prefixing
          */
         const collectFromRoot = (
           root: Document | ShadowRoot | Element,
           collected: Element[],
           depth: number = 0
         ): void => {
-          // WORKSTREAM D: Depth guard
+          // Depth guard (configurable)
           if (depth > MAX_SHADOW_DEPTH) {
             return;
           }
 
-          // WORKSTREAM D: Visited cache guard
+          // Visited cache guard
           if (visitedRoots.has(root)) {
             return;
           }
@@ -411,26 +464,36 @@ export class SnapshotCollector {
             const matches = root.querySelectorAll?.(selectorString) || [];
             for (const match of matches) {
               collected.push(match);
+              // ✅ P1: Track shadow depth for this element
+              elementShadowDepth.set(match, depth);
             }
           } catch {
             // querySelectorAll may fail on some shadow roots
           }
 
-          // 2. Find all elements with open shadowRoot and recurse
-          try {
-            const allChildren = root.querySelectorAll?.('*') || [];
-            for (const child of allChildren) {
-              // Check for open shadow root
-              if (child.shadowRoot && !visitedRoots.has(child.shadowRoot)) {
-                // Mark shadow host for debugging
-                // @ts-expect-error - custom property
-                child.__hasShadowRoot = true;
-                // Recursively collect from shadow root (with incremented depth)
-                collectFromRoot(child.shadowRoot, collected, depth + 1);
+          // 2. Find all elements with open shadowRoot and recurse (if enabled)
+          if (SHADOW_DOM_ENABLED) {
+            try {
+              const allChildren = root.querySelectorAll?.('*') || [];
+              for (const child of allChildren) {
+                // Check for open shadow root
+                if (child.shadowRoot && !visitedRoots.has(child.shadowRoot)) {
+                  // P1: Guard against circular shadow host references
+                  if (visitedShadowHosts.has(child)) {
+                    continue; // Skip if already processed this host
+                  }
+                  visitedShadowHosts.add(child);
+
+                  // Mark shadow host for debugging
+                  // @ts-expect-error - custom property
+                  child.__hasShadowRoot = true;
+                  // Recursively collect from shadow root (with incremented depth)
+                  collectFromRoot(child.shadowRoot, collected, depth + 1);
+                }
               }
+            } catch {
+              // Shadow root traversal may fail on closed roots - ignore gracefully
             }
-          } catch {
-            // Shadow root traversal may fail on closed roots - ignore
           }
         };
 
@@ -462,12 +525,42 @@ export class SnapshotCollector {
             // @ts-expect-error - window available in browser context
             if (rect.bottom < -1000 || rect.top > window.innerHeight + 1000) return;
 
-            // Reuse existing ref if present, otherwise assign a new one.
-            // This makes refs stable across iterations (unless DOM node is replaced).
+            // ✅ P1: Detect if element is inside shadow DOM for ref prefixing
+            let isInsideShadowDOM = false;
+            let shadowDepth = 0;
+            let current: Node | null = el;
+            while (current) {
+              if (current instanceof ShadowRoot) {
+                isInsideShadowDOM = true;
+                shadowDepth++;
+              }
+              current = current.parentNode;
+            }
+
+            // ✅ TASK 10: Fingerprint-based ref stability
+            // Priority: (1) existing data-agent-ref, (2) restore from fingerprint, (3) assign new
+            const refPrefix = isInsideShadowDOM ? 's' : 'e';
+            const refPattern = isInsideShadowDOM ? /^s\d+$/ : /^e\d+$/;
             const existingRef = el.getAttribute('data-agent-ref');
-            const ref = existingRef && /^e\d+$/.test(existingRef)
-              ? existingRef
-              : `e${win.__agentRefCounter++}`;
+
+            let ref: string;
+            if (existingRef && refPattern.test(existingRef)) {
+              // Case 1: Element already has a valid ref, reuse it
+              ref = existingRef;
+            } else {
+              // Case 2: Check fingerprint map for restoration
+              const fingerprint = getElementFingerprint(el);
+              const restoredRef = win.__agentFingerprintMap.get(fingerprint);
+              if (restoredRef && refPattern.test(restoredRef)) {
+                ref = restoredRef;
+              } else {
+                // Case 3: Assign new ref
+                ref = `${refPrefix}${win.__agentRefCounter++}`;
+              }
+              // Store fingerprint → ref mapping
+              win.__agentFingerprintMap.set(fingerprint, ref);
+            }
+
             if (!existingRef || existingRef !== ref) {
               el.setAttribute('data-agent-ref', ref);
             }
@@ -480,18 +573,11 @@ export class SnapshotCollector {
               ? activeModalElement.contains(el)
               : false;
 
-            // ═══════════════════════════════════════════════════════════════
-            // PHASE D: Detect if element is inside shadow DOM
-            // ═══════════════════════════════════════════════════════════════
-            let isInsideShadowDOM = false;
-            let current: Node | null = el;
-            while (current) {
-              if (current instanceof ShadowRoot) {
-                isInsideShadowDOM = true;
-                break;
-              }
-              current = current.parentNode;
-            }
+            // ✅ P1: Detect slotted content (light DOM content rendered in shadow DOM slot)
+            // @ts-expect-error - assignedSlot is available on HTMLElement
+            const isSlotted = !!(el as HTMLElement).assignedSlot;
+            // @ts-expect-error - assignedSlot is available on HTMLElement
+            const slotName = isSlotted ? ((el as HTMLElement).assignedSlot?.name || 'default') : undefined;
 
             // ═══════════════════════════════════════════════════════════════
             // Z-Index / Layering signals (no hardcoded thresholds)
@@ -629,6 +715,10 @@ export class SnapshotCollector {
               context: getParentContext(el),  // Parent context (legacy, keep for compatibility)
               isInsideActiveModal,  // Mark elements inside modal
               isInsideShadowDOM,    // PHASE D: Mark elements from shadow DOM
+              // ✅ P1: Shadow DOM enhancement fields
+              isSlotted,            // True if element is slotted content (light DOM in shadow slot)
+              slotName,             // Name of the slot (default, named, or undefined)
+              shadowDepth,          // Shadow DOM nesting depth (0 = light DOM, 1+ = shadow)
               // Semantic attributes for field classification (Level 1 signals)
               autocomplete: isInput ? el.getAttribute('autocomplete') || undefined : undefined,
               inputmode: isInput ? el.getAttribute('inputmode') || undefined : undefined,
@@ -724,6 +814,94 @@ export class SnapshotCollector {
 
         const pageTextForExtraction = extractPageTextForCredentials();
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // P0 FEATURE: Proactive Vision Detection
+        // Detect canvas/SVG content to enable early vision escalation
+        // ═══════════════════════════════════════════════════════════════════════
+        const detectVisualContentMetadata = (): any => {
+          // Find visible canvas elements
+          // @ts-expect-error - document available in browser context
+          const canvases = Array.from(document.querySelectorAll('canvas')).filter((c: Element) => {
+            const style = window.getComputedStyle(c);
+            return style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0.1;
+          });
+
+          // Find visible SVG elements
+          // @ts-expect-error - document available in browser context
+          const svgs = Array.from(document.querySelectorAll('svg')).filter((s: Element) => {
+            const style = window.getComputedStyle(s);
+            return style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity) > 0.1;
+          });
+
+          // @ts-expect-error - window available in browser context
+          const viewportArea = window.innerWidth * window.innerHeight;
+
+          // Calculate canvas coverage
+          let canvasArea = 0;
+          for (const canvas of canvases) {
+            const rect = canvas.getBoundingClientRect();
+            const area = rect.width * rect.height;
+            canvasArea += area / viewportArea;
+          }
+
+          // Calculate SVG coverage
+          let svgArea = 0;
+          for (const svg of svgs) {
+            const rect = svg.getBoundingClientRect();
+            const area = rect.width * rect.height;
+            svgArea += area / viewportArea;
+          }
+
+          // Count interactive elements
+          // @ts-expect-error - document available in browser context
+          const interactiveElements = document.querySelectorAll(
+            'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [role="button"]:not([aria-disabled="true"]), [onclick]'
+          );
+
+          const interactiveElementCount = interactiveElements.length;
+          const isDOMWeak = interactiveElementCount < 10;
+          const hasSignificantCanvas = canvasArea > 0.3; // >30% viewport
+          const hasSignificantSVG = svgArea > 0.2; // >20% viewport
+
+          // Recommend vision if:
+          // - DOM is weak (<10 interactive elements), OR
+          // - Significant canvas coverage (>30%), OR
+          // - Significant SVG coverage (>20%)
+          const recommendVision = isDOMWeak || hasSignificantCanvas || hasSignificantSVG;
+
+          return {
+            hasCanvas: canvases.length > 0,
+            hasSVG: svgs.length > 0,
+            canvasArea: Math.min(canvasArea, 1.0), // Cap at 100%
+            svgArea: Math.min(svgArea, 1.0), // Cap at 100%
+            isDOMWeak,
+            interactiveElementCount,
+            recommendVision,
+          };
+        };
+
+        const metadata = detectVisualContentMetadata();
+
+        // ✅ TASK 10: Cleanup stale fingerprint map entries (>1000 entries)
+        if (win.__agentFingerprintMap.size > 1000) {
+          const currentRefs = new Set();
+          for (const el of elements) {
+            currentRefs.add(el.ref);
+          }
+
+          // Remove fingerprints whose refs are not in current DOM
+          const fingerprintsToDelete: string[] = [];
+          for (const [fingerprint, ref] of win.__agentFingerprintMap.entries()) {
+            if (!currentRefs.has(ref)) {
+              fingerprintsToDelete.push(fingerprint);
+            }
+          }
+
+          for (const fingerprint of fingerprintsToDelete) {
+            win.__agentFingerprintMap.delete(fingerprint);
+          }
+        }
+
         return {
           // @ts-expect-error - window and document available in browser context
           url: window.location.href,
@@ -734,6 +912,7 @@ export class SnapshotCollector {
           activeModalRef, // Include detected modal ref
           transientState, // Include transient state info (loading indicators)
           pageTextForExtraction, // For credential extraction only
+          metadata, // P0: Visual content metadata for proactive vision detection
         };
       });
 

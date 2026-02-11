@@ -9,7 +9,7 @@
 import { TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { GraphBuilder, GraphUpdate } from '@/agent/utils/visualization/graph-builder.service';
 import { TestProgressEmitter } from '@/agent/utils/visualization/progress-emitter';
-import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
+import { AdaptiveTimeoutConfig, computeAdaptiveTimeouts, LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Page } from 'playwright';
@@ -40,6 +40,7 @@ import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter
 import { LiteState } from './lite-state';
 import type { AICommand, AIDecision, ActionOutcome, CollectedError, ExecutionResult, FlowState, FunnelPhaseType, GoalContext, GoalGuidance, LiteElement, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, RecoveryPoint, StateDiff, VisionHints } from './lite-types';
 import { LitePromptBuilder, type TaskPlanContext, type ValidationErrorContext } from './prompt/lite-prompt-builder';
+import { PromptSanitizer } from './security/prompt-sanitizer';
 import { LiteTraceWriter } from './trace/lite-trace-writer';
 
 export class LiteEngine {
@@ -58,6 +59,7 @@ export class LiteEngine {
   private semanticWeightCalculator: HybridSemanticWeightCalculator; // ✅ NEW: Hybrid semantic weight (Manus Style)
   private pageWatcher: PageWatcher | null = null; // ✅ Phase A: Multi-tab/popup detection
   private startTime: number = 0;
+  private adaptiveTimeouts: AdaptiveTimeoutConfig | null = null; // ✅ TASK 7: Adaptive timeouts based on site speed
 
   // Track emitted node IDs to avoid duplicates
   private emittedNodeIds = new Set<string>();
@@ -117,6 +119,10 @@ export class LiteEngine {
   private consecutiveNoEffectCount: number = 0;
   private activeFrame: import('playwright').Frame | null = null; // L5: Store active frame for iframe execution
 
+  // ✅ P0 FEATURE: Proactive Vision Detection
+  // Track pages where we've already attempted vision to avoid redundant calls
+  private visionAttemptedForPage = new Set<string>(); // URL → attempted
+
   // ═══════════════════════════════════════════════════════════════════════════
   // L6: PAGE CREDENTIALS EXTRACTION (one-time for login goals)
   // PHASE 0.3: Credential auto-fill state machine
@@ -124,6 +130,9 @@ export class LiteEngine {
   private pageCredentialsAttempted = false; // Only try once per test
   private credentialClarificationAttempted = false; // Only ask user once per test
   private credentialFillState: 'idle' | 'filling_username' | 'filling_password' | 'submitting' | 'done' = 'idle';
+  // ✅ FIX P0: Auto-fill timeout tracking to prevent infinite loops
+  private autoFillIterationCount = 0;
+  private readonly MAX_AUTO_FILL_ITERATIONS = 3; // Max consecutive auto-fill attempts
 
   // ═══════════════════════════════════════════════════════════════════════════
   // L7: ADDITIONAL CLARIFICATION GATES
@@ -893,7 +902,27 @@ export class LiteEngine {
       await this.flushPendingGraphScreenshotUploads();
 
       return await this.buildResult(false, `Engine error: ${errorMessage}`);
+    } finally {
+      // P1: Cleanup all collections to prevent memory leaks
+      this.cleanup();
     }
+  }
+
+  /**
+   * P1: Cleanup all collections to prevent memory leaks
+   * Called at the end of test execution
+   */
+  private cleanup(): void {
+    this.emittedNodeIds.clear();
+    this.emittedEdgeIds.clear();
+    this.seenErrorMessages.clear();
+    this.visionAttemptedForPage.clear();
+    this.fileUploadApprovalAskedForRefs.clear();
+    this.skippedFileUploadRefs.clear();
+    this.approvedExternalOrigins.clear();
+    this.deniedExternalOrigins.clear();
+    this.downloadApprovalAskedForRefs.clear();
+    this.deniedDownloadRefs.clear();
   }
 
   /**
@@ -1022,6 +1051,45 @@ export class LiteEngine {
       },
     });
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TASK 7: Measure initial page load time and compute adaptive timeouts
+    // ═══════════════════════════════════════════════════════════════════════════
+    try {
+      const loadStartTime = Date.now();
+      await this.page.goto(this.config.url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 15000,
+      });
+      const loadTimeMs = Date.now() - loadStartTime;
+      this.adaptiveTimeouts = computeAdaptiveTimeouts(loadTimeMs);
+
+      logger.info('[LITE_ENGINE] Adaptive timeouts computed', {
+        testId: this.config.testId,
+        loadTimeMs,
+        profile: this.adaptiveTimeouts.siteProfile,
+        networkIdleMs: this.adaptiveTimeouts.networkIdleMs,
+      });
+
+      this.traceWriter.write({
+        stage: 'initialization',
+        eventType: 'adaptive_timeouts_computed',
+        spanId: this.traceWriter.generateSpanId(),
+        parentSpanId: this.traceWriter.getRootSpanId(),
+        payload: {
+          loadTimeMs,
+          profile: this.adaptiveTimeouts.siteProfile,
+          config: this.adaptiveTimeouts,
+        },
+      });
+    } catch (error) {
+      // Use default normal profile on error
+      this.adaptiveTimeouts = computeAdaptiveTimeouts(2000);
+      logger.warn('[LITE_ENGINE] Failed to measure initial load, using normal profile', {
+        testId: this.config.testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     try {
       for (let i = 0; i < this.MAX_ITERATIONS; i++) {
         logger.debug('[LITE_ENGINE] Starting iteration', { iteration: i });
@@ -1118,73 +1186,97 @@ export class LiteEngine {
         // ═══════════════════════════════════════════════════════════════════════
         // PHASE 0.3 FIX: Check credential auto-fill state FIRST (before all other logic)
         // If state is active, execute auto-fill command and skip AI decision this iteration
+        // ✅ FIX P0: Added timeout to prevent infinite auto-fill loops
         // ═══════════════════════════════════════════════════════════════════════
         if (this.credentialFillState !== 'idle' && this.credentialFillState !== 'done') {
           const autoCommand = this.buildAutoCredentialCommand(snapshotBefore);
 
           if (autoCommand) {
-            logger.info('[LITE_ENGINE] Auto-fill active, executing command (skipping AI)', {
-              testId: this.config.testId,
-              state: this.credentialFillState,
-              action: autoCommand.action,
-              iteration: i,
-            });
+            // ✅ FIX P0: Check if auto-fill is stuck (element keeps disappearing)
+            if (this.autoFillIterationCount >= this.MAX_AUTO_FILL_ITERATIONS) {
+              logger.warn('[LITE_ENGINE] Auto-fill stuck (max iterations reached), resetting to AI control', {
+                testId: this.config.testId,
+                state: this.credentialFillState,
+                attemptCount: this.autoFillIterationCount,
+                maxIterations: this.MAX_AUTO_FILL_ITERATIONS,
+              });
+              this.credentialFillState = 'idle';
+              this.autoFillIterationCount = 0;
+              // Don't continue - let AI take over this iteration
+            } else {
+              this.autoFillIterationCount++;
 
-            // Execute auto-command directly
-            const execResult = await this.executor.execute(autoCommand, snapshotBefore, {});
+              logger.info('[LITE_ENGINE] Auto-fill active, executing command (skipping AI)', {
+                testId: this.config.testId,
+                state: this.credentialFillState,
+                action: autoCommand.action,
+                iteration: i,
+                attemptCount: this.autoFillIterationCount,
+              });
 
-            // Record iteration with auto-fill
-            const syntheticDiff: StateDiff = {
-              urlChanged: false,
-              urlBefore: snapshotBefore.url,
-              urlAfter: snapshotBefore.url,
-              addedElements: [],
-              removedRefs: [],
-              changedElements: [],
-              hasVisualChange: false,
-              meaningfulChange: false,
-              significantChange: false,
-              semanticWeight: 0,
-              progressSentiment: 'No Effect',
-              newPageErrors: [],
-              newConsoleErrors: [],
-            };
+              // Execute auto-command directly
+              const execResult = await this.executor.execute(autoCommand, snapshotBefore, {});
 
-            this.state.recordIteration({
-              iteration: i,
-              decision: {
-                thought: `Auto-fill: ${this.credentialFillState}`,
-                command: autoCommand,
-                done: false,
-              },
-              result: {
-                stateDiff: syntheticDiff,
-                outcome: execResult.success ? 'state_changed' : 'execution_error',
-                success: execResult.success,
-                duration: 0,
-              },
-              stateBefore: {
-                url: snapshotBefore.url,
-                elementCount: snapshotBefore.elements.length,
-                pageErrors: [],
-              },
-              stateAfter: {
-                url: snapshotBefore.url,
-                elementCount: snapshotBefore.elements.length,
-                pageErrors: [],
-              },
-            });
+              // Record iteration with auto-fill
+              const syntheticDiff: StateDiff = {
+                urlChanged: false,
+                urlBefore: snapshotBefore.url,
+                urlAfter: snapshotBefore.url,
+                addedElements: [],
+                removedRefs: [],
+                changedElements: [],
+                hasVisualChange: false,
+                meaningfulChange: false,
+                significantChange: false,
+                semanticWeight: 0,
+                progressSentiment: 'No Effect',
+                newPageErrors: [],
+                newConsoleErrors: [],
+              };
 
-            // Skip rest of this iteration (continue to next)
-            continue;
+              this.state.recordIteration({
+                iteration: i,
+                decision: {
+                  thought: `Auto-fill: ${this.credentialFillState}`,
+                  command: autoCommand,
+                  done: false,
+                },
+                result: {
+                  stateDiff: syntheticDiff,
+                  outcome: execResult.success ? 'state_changed' : 'execution_error',
+                  success: execResult.success,
+                  duration: 0,
+                },
+                stateBefore: {
+                  url: snapshotBefore.url,
+                  elementCount: snapshotBefore.elements.length,
+                  pageErrors: [],
+                },
+                stateAfter: {
+                  url: snapshotBefore.url,
+                  elementCount: snapshotBefore.elements.length,
+                  pageErrors: [],
+                },
+              });
+
+              // Skip rest of this iteration (continue to next)
+              continue;
+            }
           } else {
             // Can't find element for auto-fill, reset state and let AI handle
             logger.warn('[LITE_ENGINE] Auto-fill failed (element not found), falling back to AI', {
               testId: this.config.testId,
               state: this.credentialFillState,
+              attemptCount: this.autoFillIterationCount,
             });
             this.credentialFillState = 'idle';
+            this.autoFillIterationCount = 0; // ✅ FIX P0: Reset counter
             // Continue to normal AI flow below
+          }
+        } else {
+          // ✅ FIX P0: Reset auto-fill counter when state is idle/done
+          if (this.autoFillIterationCount > 0) {
+            this.autoFillIterationCount = 0;
           }
         }
 
@@ -1197,6 +1289,21 @@ export class LiteEngine {
 
         // 2b. Build GoalContext for this iteration
         const goalContext = this.buildGoalContext(snapshotBefore, i, stuckCheck);
+
+        // ✅ FIX P1: Check guidance lifetime and clear if expired
+        if (this.currentGuidance) {
+          const GUIDANCE_LIFETIME_ITERATIONS = 2;
+          const lifetimeElapsed = i - this.currentGuidance.addedAtIteration;
+          if (lifetimeElapsed >= GUIDANCE_LIFETIME_ITERATIONS) {
+            logger.debug('[LITE_ENGINE] Guidance lifetime expired, clearing', {
+              testId: this.config.testId,
+              addedAt: this.currentGuidance.addedAtIteration,
+              currentIteration: i,
+              lifetimeElapsed,
+            });
+            this.currentGuidance = null;
+          }
+        }
 
         // ✅ NEW (Lite Autonomy v3): Evaluate task plan progress
         // Used for guidance and context, but NOT as primary completion criterion
@@ -1447,9 +1554,22 @@ export class LiteEngine {
         // ✅ NEW: Goal-first check BEFORE asking AI (using heuristic)
         const goalCheck = this.goalDetector.detectHeuristic(goalContext);
 
-        // ✅ NEW: Decrement audit cooldown each iteration
+        // ✅ FIX P0: Decrement audit cooldown ONLY if heuristic doesn't claim done
+        // This prevents wasting iterations when heuristic says "done" but cooldown is active
         if (this.auditCooldownRemaining > 0) {
-          this.auditCooldownRemaining--;
+          if (goalCheck.goalReached && goalCheck.confidence !== 'low') {
+            // Heuristic claims done - force cooldown to 0 for immediate auditor call
+            logger.debug('[LITE_ENGINE] Heuristic claims done - forcing audit cooldown to 0', {
+              testId: this.config.testId,
+              progressScore: Math.round(goalCheck.progressScore * 100) + '%',
+              confidence: goalCheck.confidence,
+              cooldownWas: this.auditCooldownRemaining,
+            });
+            this.auditCooldownRemaining = 0;
+          } else {
+            // Normal decrement (not done yet)
+            this.auditCooldownRemaining--;
+          }
         }
 
         // ✅ NEW: Check if audit cooldown should be bypassed (state changed significantly)
@@ -1791,18 +1911,57 @@ export class LiteEngine {
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // L5 MANUS: Check Vision Escalation
+        // P0 FEATURE: Proactive Vision Detection
+        // Check metadata first before reactive "No Effect" detection
         // ═══════════════════════════════════════════════════════════════════════
         let visionHints: VisionHints | null = null;
-        if (LITE_ENGINE_FLAGS.enableVisionEscalation && this.shouldEscalateToVision(snapshotBefore)) {
-          visionHints = await this.tryVisionFallback();
-          if (visionHints) {
-            logger.info('[L5_VISION] Vision hints acquired', {
+        if (LITE_ENGINE_FLAGS.enableVisionEscalation) {
+          // NEW: Proactive vision detection based on snapshot metadata
+          if (snapshotBefore.metadata?.recommendVision && !this.visionAttemptedForPage.has(snapshotBefore.url)) {
+            logger.info('[P0_VISION] Proactive vision escalation (canvas/SVG/weak DOM detected)', {
               testId: this.config.testId,
-              buttonCount: visionHints.visibleButtons.length,
-              fieldCount: visionHints.formFields.length,
+              hasCanvas: snapshotBefore.metadata.hasCanvas,
+              hasSVG: snapshotBefore.metadata.hasSVG,
+              canvasArea: Math.round(snapshotBefore.metadata.canvasArea * 100) + '%',
+              svgArea: Math.round(snapshotBefore.metadata.svgArea * 100) + '%',
+              isDOMWeak: snapshotBefore.metadata.isDOMWeak,
+              interactiveElements: snapshotBefore.metadata.interactiveElementCount,
             });
+
+            visionHints = await this.tryVisionFallback();
+            this.visionAttemptedForPage.add(snapshotBefore.url);
+
+            if (visionHints) {
+              logger.info('[P0_VISION] Vision hints acquired proactively', {
+                testId: this.config.testId,
+                buttonCount: visionHints.visibleButtons.length,
+                fieldCount: visionHints.formFields.length,
+              });
+            }
           }
+          // Fallback: Reactive vision escalation (original logic)
+          else if (this.shouldEscalateToVision(snapshotBefore)) {
+            visionHints = await this.tryVisionFallback();
+            if (visionHints) {
+              logger.info('[L5_VISION] Vision hints acquired reactively (No Effect fallback)', {
+                testId: this.config.testId,
+                buttonCount: visionHints.visibleButtons.length,
+                fieldCount: visionHints.formFields.length,
+              });
+            }
+          }
+        }
+
+        // 3a. TASK 9: Identify goal-relevant form
+        let formFocusHint: string | undefined;
+        const goalFormRefs = this.goalDetector.identifyGoalForm(snapshotBefore.elements, this.config.goal);
+        if (goalFormRefs.length > 0) {
+          formFocusHint = `The following fields belong to the goal-relevant form:\n${goalFormRefs.map(ref => `- ${ref}`).join('\n')}\n\nPrioritize interacting with these fields to complete your goal.`;
+          logger.debug('[LITE_ENGINE] Goal form identified', {
+            testId: this.config.testId,
+            fieldCount: goalFormRefs.length,
+            refs: goalFormRefs.slice(0, 5),
+          });
         }
 
         // 4. Build prompt with stuck warning + progress signals + AI guidance + contextual hints + task plan + state drift
@@ -1828,6 +1987,7 @@ export class LiteEngine {
           lastAction: lastStateDiff?.action, // ✅ NEW: Last action for context
           goalOrientedSummary: this.lastGoalOrientedSummary || undefined, // ✅ NEW: Goal-Oriented Summary (Secret Sauce)
           visionHints: visionHints || undefined, // ✅ NEW: L5 Vision hints when DOM is weak
+          formFocusHint, // ✅ TASK 9: Goal form identification
         });
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -2232,6 +2392,16 @@ export class LiteEngine {
           const currentUrl = snapshotBefore.url;
           const targetUrl = commandWithCredentials.url || '';
 
+          // ✅ NEW: Security check for malicious URLs (data:, javascript:, etc.)
+          if (PromptSanitizer.isUrlSuspicious(targetUrl)) {
+            logger.warn('[SECURITY] Blocked suspicious URL navigation attempt', {
+              testId: this.config.testId,
+              targetUrl: targetUrl.slice(0, 100),
+            });
+            closeIteration({ skipped: true, reason: 'suspicious_url_blocked', url: targetUrl.slice(0, 50) });
+            continue;
+          }
+
           let currentOrigin: string | null = null;
           let targetOrigin: string | null = null;
           let resolvedTargetUrl: string | null = null;
@@ -2420,9 +2590,24 @@ export class LiteEngine {
         // ✅ NEW (Lite Autonomy v3): Store modal dismiss info for next iteration's prompt
         this.lastModalDismissInfo = execResult.modalDismissInfo || null;
 
-        // ✅ NEW (Lite Autonomy v3): Handle validation error modal (rollback)
+        // ✅ FIX P2: Handle validation error modal (rollback) with timeout
         if (execResult.modalDismissInfo?.modalType === 'validation') {
-          await this.handleValidationError(execResult.modalDismissInfo, snapshotBefore.url);
+          try {
+            const VALIDATION_HANDLER_TIMEOUT_MS = 10000; // 10s timeout
+            await Promise.race([
+              this.handleValidationError(execResult.modalDismissInfo, snapshotBefore.url),
+              new Promise<void>((_, reject) =>
+                setTimeout(() => reject(new Error('Validation error handler timeout')), VALIDATION_HANDLER_TIMEOUT_MS)
+              ),
+            ]);
+          } catch (validationHandlerError) {
+            logger.warn('[LITE_ENGINE] Validation error handler failed or timed out', {
+              testId: this.config.testId,
+              iteration: i,
+              error: validationHandlerError instanceof Error ? validationHandlerError.message : String(validationHandlerError),
+            });
+            // Continue execution - validation error handling is best-effort
+          }
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -2466,7 +2651,7 @@ export class LiteEngine {
         // ✅ FIX: Wrap stability waits with cancellation for immediate abort
         await withCancellation(
           this.config.testId,
-          this.networkTracker.waitForNetworkIdle(5000),
+          this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000),
           'networkTracker.waitForNetworkIdle'
         );
         await withCancellation(
@@ -2581,13 +2766,35 @@ export class LiteEngine {
           this.config.goal // ✅ NEW: Goal for dynamic semantic weight priority
         );
 
-        // 10.1 ✅ NEW: Enrich with AI (async) for gray zone elements (Hybrid Semantic Weight)
+        // 10.1 ✅ FIX P1: Enrich with AI (async) with timeout and fallback
         // This improves semantic weight accuracy for ambiguous elements (buttons, links, headers)
         const removedElements = snapshotBefore.elements.filter(el => baseDiff.removedRefs.includes(el.ref));
-        const enrichedDiff = await this.semanticWeightCalculator.enrichWithAI(baseDiff, removedElements);
+        let enrichedDiff: StateDiff;
+        let goalOrientedSummary: string | null = null;
+        try {
+          // ✅ FIX P1: Add 5s timeout to prevent iteration blocking
+          const AI_ENRICHMENT_TIMEOUT_MS = 5000;
+          const enrichedResult = await Promise.race([
+            this.semanticWeightCalculator.enrichWithAI(baseDiff, removedElements),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('AI enrichment timeout')), AI_ENRICHMENT_TIMEOUT_MS)
+            ),
+          ]);
+          enrichedDiff = enrichedResult;
 
-        // 10.2 ✅ NEW: Build Goal-Oriented Summary (Secret Sauce for Core Brain)
-        const goalOrientedSummary = this.semanticWeightCalculator.buildGoalOrientedSummary(enrichedDiff);
+          // 10.2 ✅ NEW: Build Goal-Oriented Summary (Secret Sauce for Core Brain)
+          goalOrientedSummary = this.semanticWeightCalculator.buildGoalOrientedSummary(enrichedResult);
+        } catch (enrichmentError) {
+          logger.warn('[LITE_ENGINE] AI enrichment failed, using base diff', {
+            testId: this.config.testId,
+            iteration: i,
+            error: enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError),
+          });
+          // ✅ FIX P1: Fallback to base diff if AI enrichment fails or times out
+          enrichedDiff = baseDiff;
+          // Goal-oriented summary not available without enrichment
+          goalOrientedSummary = null;
+        }
 
         // ✅ Store for next iteration prompt (Secret Sauce for Core Brain)
         this.lastGoalOrientedSummary = goalOrientedSummary;
@@ -2788,7 +2995,7 @@ export class LiteEngine {
 
           try {
             await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
-            await this.networkTracker.waitForNetworkIdle(5000);
+            await this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000);
             await VisualStability.waitForStable(this.page);
           } catch (reloadError) {
             logger.error('[LITE_ENGINE] Failed to reload page after critical error', {
@@ -3003,6 +3210,50 @@ export class LiteEngine {
    * @param currentUrl - Current page URL
    * @returns Object with navigation status and final URL
    */
+  /**
+   * Verify that the page contains goal-relevant content
+   * Prevents false positives from 404→redirect scenarios
+   */
+  private verifyGoalRelevantPage(
+    snapshot: LiteSnapshot,
+    isRegistrationGoal: boolean,
+    isLoginGoal: boolean
+  ): boolean {
+    // Minimum element count check
+    if (snapshot.elements.length < 3) {
+      return false;
+    }
+
+    const lowerText = snapshot.elements
+      .map(el => `${el.name} ${el.context || ''}`.toLowerCase())
+      .join(' ');
+
+    // For registration goals: look for registration-specific fields or text
+    if (isRegistrationGoal) {
+      const hasEmailField = snapshot.elements.some(
+        el => el.tag === 'input' && /email/i.test(el.name || el.type || '')
+      );
+      const hasPasswordField = snapshot.elements.some(
+        el => el.tag === 'input' && /password/i.test(el.type || '')
+      );
+      const hasRegisterText = /register|sign\s*up|create.*account|зарегистр|регистрац/i.test(lowerText);
+
+      return (hasEmailField && hasPasswordField) || hasRegisterText;
+    }
+
+    // For login goals: look for login-specific fields or text
+    if (isLoginGoal) {
+      const hasPasswordField = snapshot.elements.some(
+        el => el.tag === 'input' && /password/i.test(el.type || '')
+      );
+      const hasLoginText = /login|sign\s*in|log\s*in|вход|войти/i.test(lowerText);
+
+      return hasPasswordField || hasLoginText;
+    }
+
+    return true; // Default: accept for non-auth goals
+  }
+
   private async tryDirectUrlFallback(
     currentUrl: string,
     options?: { forceLogin?: boolean }
@@ -3064,16 +3315,34 @@ export class LiteEngine {
 
         // Check if navigation was successful (not 404/error)
         if (response && response.ok() && finalUrl !== currentUrl) {
+          // Verify page contains goal-relevant content (not 404→redirect)
+          await this.page.waitForTimeout(1000);
+          const verificationSnapshot = await SnapshotCollector.collect(this.page);
+
+          const contentVerified = this.verifyGoalRelevantPage(
+            verificationSnapshot,
+            isRegistrationGoal,
+            isLoginGoal
+          );
+
+          if (!contentVerified) {
+            logger.debug('[LITE_ENGINE] Direct URL fallback rejected - no goal-relevant content', {
+              testId: this.config.testId,
+              path,
+              finalUrl,
+              elementCount: verificationSnapshot.elements.length,
+            });
+            continue; // Try next path
+          }
+
           logger.info('[LITE_ENGINE] Direct URL fallback successful', {
             testId: this.config.testId,
             attemptedPath: path,
             targetUrl,
             finalUrl,
             statusCode: response.status(),
+            contentVerified: true,
           });
-
-          // Wait a bit for page to load
-          await this.page.waitForTimeout(1000);
 
           return {
             navigated: true,
@@ -3565,7 +3834,7 @@ export class LiteEngine {
       logger.info('[RECOVERY] Priority 1: Reload + retry', { testId: this.config.testId });
 
       await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
-      await this.networkTracker.waitForNetworkIdle(5000);
+      await this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000);
       await VisualStability.waitForStable(this.page);
 
       const newSnapshot = await SnapshotCollector.collect(this.page);
@@ -3596,7 +3865,18 @@ export class LiteEngine {
 
       // Only treat as recovered if state changed meaningfully
       const meaningfulChange = this.isMeaningfulSnapshotChange(snapshotBefore, newSnapshot);
-      if (meaningfulChange) {
+
+      // TASK 8: SPA-aware recovery - check content hash for SPA changes
+      const newContentHash = this.state.computeContentHash(newSnapshot);
+      const oldContentHash = recoveryPoint?.contentHash;
+      const spaDetected = oldContentHash && newContentHash !== oldContentHash;
+
+      if (meaningfulChange || spaDetected) {
+        logger.debug('[RECOVERY] State changed', {
+          meaningfulChange,
+          spaDetected,
+          testId: this.config.testId,
+        });
         return { recovered: true, method: 'reload', newSnapshot, shouldEscalate: false };
       }
     } catch (reloadError) {
@@ -3628,20 +3908,36 @@ export class LiteEngine {
         // Try goBack first
         try {
           await this.page.goBack({ timeout: 10000 });
-          await this.networkTracker.waitForNetworkIdle(5000);
+          await this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000);
           await VisualStability.waitForStable(this.page);
 
           const newSnapshot = await SnapshotCollector.collect(this.page);
-          logger.info('[RECOVERY] GoBack successful', { testId: this.config.testId });
+
+          // TASK 8: Verify content changed for SPA success detection
+          const newContentHash = this.state.computeContentHash(newSnapshot);
+          const contentChanged = !recoveryPoint.contentHash || newContentHash !== recoveryPoint.contentHash;
+
+          logger.info('[RECOVERY] GoBack successful', {
+            testId: this.config.testId,
+            contentChanged,
+          });
           return { recovered: true, method: 'goBack', newSnapshot, shouldEscalate: false };
         } catch {
           // GoBack failed, try direct goto
           await this.page.goto(recoveryPoint.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-          await this.networkTracker.waitForNetworkIdle(5000);
+          await this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000);
           await VisualStability.waitForStable(this.page);
 
           const newSnapshot = await SnapshotCollector.collect(this.page);
-          logger.info('[RECOVERY] Goto recovery URL successful', { testId: this.config.testId });
+
+          // TASK 8: Verify content matches recovery point for SPA detection
+          const newContentHash = this.state.computeContentHash(newSnapshot);
+          const contentMatches = recoveryPoint.contentHash === newContentHash;
+
+          logger.info('[RECOVERY] Goto recovery URL successful', {
+            testId: this.config.testId,
+            contentMatches,
+          });
           return { recovered: true, method: 'goto', newSnapshot, shouldEscalate: false };
         }
       } catch (navError) {
@@ -3725,7 +4021,7 @@ export class LiteEngine {
     }
 
     await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
-    await this.networkTracker.waitForNetworkIdle(5000);
+    await this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000);
     await VisualStability.waitForStable(this.page);
     return await SnapshotCollector.collect(this.page);
   }
@@ -3735,12 +4031,14 @@ export class LiteEngine {
    */
   private setRecoveryPointForCurrentState(snapshot: LiteSnapshot, iteration: number): void {
     const phaseType = this.currentFunnelPhase as unknown as FunnelPhaseType;
+    const contentHash = this.state.computeContentHash(snapshot);
     const point: RecoveryPoint = {
       url: snapshot.url,
       snapshot,
       funnelPhase: phaseType,
       timestamp: Date.now(),
       iteration,
+      contentHash,
     };
     this.state.setRecoveryPoint(point);
   }
@@ -4207,7 +4505,7 @@ export class LiteEngine {
       parentSpanId: iterationSpanId,
       payload: {
         prompt,
-        model: 'gpt-4o-mini',
+        model: LITE_ENGINE_FLAGS.coreBrainModel,
         promptLength: prompt.length,
         estimatedTokens: Math.ceil(prompt.length / 4),
       },

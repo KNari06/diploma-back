@@ -94,6 +94,18 @@ export const LITE_ENGINE_FLAGS = {
   enableShadowDOMCrosscheck: true,
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // SHADOW DOM SUPPORT (P1 Feature)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable full Shadow DOM traversal in snapshot collector */
+  enableShadowDOMSupport: true,
+
+  /** Maximum recursion depth for nested shadow roots (prevent infinite loops) */
+  shadowDOMMaxDepth: 5,
+
+  /** Timeout for shadow DOM traversal (ms) */
+  shadowDOMTraversalTimeoutMs: 3000,
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // L6: PAGE CREDENTIALS EXTRACTION
   // ═══════════════════════════════════════════════════════════════════════════
   /** Enable extraction of demo credentials from page text (e.g., "username is student") */
@@ -128,7 +140,63 @@ export const LITE_ENGINE_FLAGS = {
 
   /** Timeout for external/download approval clarification (ms) */
   externalDownloadApprovalTimeoutMs: 60000,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CORE BRAIN MODEL CONFIGURATION
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Model to use for core brain decision making (upgraded from gpt-4o-mini) */
+  coreBrainModel: 'gpt-4o' as const,
+
+  /** Maximum tokens for core brain responses */
+  coreBrainMaxTokens: 800,
 } as const;
+
+/**
+ * Adaptive timeout configuration based on site performance profile
+ */
+export interface AdaptiveTimeoutConfig {
+  networkIdleMs: number;
+  typingDelayMs: number;
+  scrollAmountPx: number;
+  actionTimeoutMs: number;
+  siteProfile: 'fast' | 'normal' | 'slow';
+}
+
+/**
+ * Compute adaptive timeouts based on initial page load time
+ */
+export function computeAdaptiveTimeouts(loadTimeMs: number): AdaptiveTimeoutConfig {
+  // Fast sites: < 1000ms load time
+  if (loadTimeMs < 1000) {
+    return {
+      networkIdleMs: 3000,
+      typingDelayMs: 50,
+      scrollAmountPx: 800,
+      actionTimeoutMs: 5000,
+      siteProfile: 'fast',
+    };
+  }
+
+  // Slow sites: >= 3000ms load time
+  if (loadTimeMs >= 3000) {
+    return {
+      networkIdleMs: 8000,
+      typingDelayMs: 150,
+      scrollAmountPx: 500,
+      actionTimeoutMs: 15000,
+      siteProfile: 'slow',
+    };
+  }
+
+  // Normal sites: 1000-3000ms load time
+  return {
+    networkIdleMs: 5000,
+    typingDelayMs: 100,
+    scrollAmountPx: 600,
+    actionTimeoutMs: 10000,
+    siteProfile: 'normal',
+  };
+}
 
 /**
  * Get human-readable time from milliseconds

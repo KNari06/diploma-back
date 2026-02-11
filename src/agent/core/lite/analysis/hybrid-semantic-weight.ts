@@ -1013,10 +1013,19 @@ export class HybridSemanticWeightCalculator {
         addedCount: enrichedAdded.length,
         removedCount: enrichedRemoved.length,
       });
+      // Calculate total weight for early return
+      const totalWeight =
+        enrichedAdded.reduce((sum, el) => sum + el.semanticWeight, 0) +
+        enrichedRemoved.reduce((sum, el) => sum + el.semanticWeight, 0);
+
       return {
         ...diff,
         addedElements: enrichedAdded,
         removedElements: enrichedRemoved,
+        semanticWeight: totalWeight,
+        meaningfulChange: totalWeight >= 0.1,
+        significantChange: totalWeight >= 0.5,
+        progressSentiment: this.calculateProgressSentiment(diff, totalWeight),
       };
     }
 
@@ -1106,7 +1115,57 @@ export class HybridSemanticWeightCalculator {
       semanticWeight: totalWeight,
       meaningfulChange: totalWeight >= 0.1,
       significantChange: totalWeight >= 0.5,
+      progressSentiment: this.calculateProgressSentiment(diff, totalWeight),
     };
+  }
+
+  /**
+   * Calculate progress sentiment based on diff and semantic weight
+   * CRITICAL: This method fixes the bug where progressSentiment was always 'No Effect'
+   */
+  private calculateProgressSentiment(diff: StateDiff, totalWeight: number): ProgressSentiment {
+    // 1. Check for errors first - highest priority
+    const hasErrors =
+      (diff.newPageErrors && diff.newPageErrors.length > 0) ||
+      (diff.newConsoleErrors && diff.newConsoleErrors.length > 0) ||
+      (diff.newNetworkErrors && diff.newNetworkErrors.length > 0) ||
+      (diff.validationApiErrors && diff.validationApiErrors.length > 0);
+
+    if (hasErrors) {
+      return 'Negative Change';
+    }
+
+    // 2. Check for major progress indicators
+    // URL change is always major progress
+    if (diff.urlChanged) {
+      return 'Major Progress';
+    }
+
+    // Goal-relevant form with high semantic weight
+    const hasRelevantForm = diff.addedElements?.some(
+      (el) => el.tag === 'input' && totalWeight >= 0.5
+    );
+    if (hasRelevantForm) {
+      return 'Major Progress';
+    }
+
+    // 3. Check for significant change
+    if (totalWeight >= 0.5) {
+      return 'Significant Change';
+    }
+
+    // Successful API responses indicate significant change even without visual changes
+    if (diff.successfulApiResponses && diff.successfulApiResponses.length > 0) {
+      return 'Significant Change';
+    }
+
+    // 4. Check for minor change
+    if (totalWeight >= 0.1) {
+      return 'Minor Change';
+    }
+
+    // 5. Default: no effect
+    return 'No Effect';
   }
 
   /**
