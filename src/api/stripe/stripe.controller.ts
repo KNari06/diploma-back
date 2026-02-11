@@ -1,6 +1,8 @@
 import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { UserCreditsService } from '@/services/core/user-credits.service';
+import { WorkspaceCreditsService } from '@/services/core/workspace-credits.service';
+import { SUBSCRIPTION_PLANS } from '@/services/core/token-calculator.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -685,6 +687,91 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     }
   }
 
+  // Provision workspace credits for Business plan
+  const isBusinessPlan = planCode === 'business' || planCode === 'Business';
+  if (isBusinessPlan) {
+    try {
+      // Find the workspace where this user is the owner
+      const { data: ownerMembership } = await supabaseAdmin
+        .from('workspace_members')
+        .select('workspace_id')
+        .eq('user_id', user.id)
+        .eq('role', 'owner')
+        .eq('status', 'active')
+        .maybeSingle();
+
+      if (ownerMembership) {
+        const workspaceId = ownerMembership.workspace_id;
+        const businessCredits = SUBSCRIPTION_PLANS.business.credits; // 30,000
+
+        // Reset monthly usage and provision fresh credits
+        const wsCredits = await WorkspaceCreditsService.getOrCreateWorkspaceCredits(workspaceId);
+        const now = new Date();
+
+        const { error: wsUpdateError } = await supabaseAdmin
+          .from('workspace_credits')
+          .update({
+            credits_balance: businessCredits,
+            credits_used_this_period: 0,
+            monthly_credit_limit: businessCredits,
+            period_start_date: now.toISOString().split('T')[0],
+            warning_80_sent: false,
+            warning_95_sent: false,
+            subscription_plan: 'business',
+            subscription_status: 'active',
+            credits_purchased_at: now.toISOString(),
+            updated_at: now.toISOString(),
+          })
+          .eq('workspace_id', workspaceId);
+
+        if (wsUpdateError) {
+          logger.error('[STRIPE_WEBHOOK] Failed to provision business plan workspace credits', {
+            error: wsUpdateError.message,
+            workspaceId,
+            userId: user.id,
+          });
+        } else {
+          // Record the provisioning transaction
+          await supabaseAdmin.from('workspace_credit_transactions').insert({
+            workspace_id: workspaceId,
+            user_id: user.id,
+            amount: businessCredits,
+            balance_after: businessCredits,
+            transaction_type: 'purchase',
+            description: `Business plan subscription payment`,
+            metadata: {
+              invoice_id: invoice.id,
+              event_type: event.type,
+              plan_code: planCode,
+              type: 'business_plan_renewal',
+              previous_balance: wsCredits.credits_balance,
+              previous_used: wsCredits.credits_used_this_period || 0,
+            },
+          });
+
+          logger.info('[STRIPE_WEBHOOK] Business plan workspace credits provisioned', {
+            workspaceId,
+            userId: user.id,
+            credits: businessCredits,
+            invoiceId: invoice.id,
+          });
+        }
+      } else {
+        logger.warn('[STRIPE_WEBHOOK] No owned workspace found for business plan user', {
+          userId: user.id,
+          invoiceId: invoice.id,
+        });
+      }
+    } catch (wsError) {
+      logger.error('[STRIPE_WEBHOOK] Exception provisioning business plan workspace credits', {
+        error: wsError instanceof Error ? wsError.message : String(wsError),
+        userId: user.id,
+        invoiceId: invoice.id,
+      });
+      // Don't fail the webhook - user credits were already handled
+    }
+  }
+
   const userUpdateData: Record<string, any> = {
     last_credits_invoice_id: invoice.id,
     updated_at: new Date().toISOString(),
@@ -697,7 +784,7 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
 
   if (plan?.id) {
     userUpdateData.plan_id = plan.id;
-    userUpdateData.plan = 'pro';
+    userUpdateData.plan = isBusinessPlan ? 'business' : 'pro';
     userUpdateData.plan_status = 'paid';
   }
 

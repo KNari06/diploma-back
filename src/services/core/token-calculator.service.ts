@@ -7,6 +7,7 @@ import { logger } from '@/utils/core/logger';
  * PRICING MODEL (as of 2024):
  * - Pro Plan: $28.9/month = 1000 credits
  * - Ultra Plan: $43.9/month = 1000 credits
+ * - Business Plan: $590/month = 30,000 credits (up to 5 QA engineers)
  * - 1 credit = 562.5 tokens
  * - Margin: 83-89%
  */
@@ -54,6 +55,7 @@ export const TEST_CREDITS = {
 export const SUBSCRIPTION_PLANS = {
   pro: { price: 28.9, credits: 1000 },
   ultra: { price: 43.9, credits: 1000 },
+  business: { price: 590, credits: 30000, maxEngineers: 5 },
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -12,11 +12,16 @@ export interface WorkspaceCredits {
   credits_balance: number;
   total_purchased: number;
   total_used: number;
-  subscription_plan: 'free' | 'basic' | 'pro' | 'enterprise';
+  subscription_plan: 'free' | 'basic' | 'pro' | 'enterprise' | 'business';
   subscription_status: 'active' | 'inactive' | 'expired';
   subscription_expires_at: string | null;
   last_credit_usage: string | null;
   credits_purchased_at: string | null;
+  monthly_credit_limit: number | null;
+  credits_used_this_period: number;
+  period_start_date: string | null;
+  warning_80_sent: boolean;
+  warning_95_sent: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -216,15 +221,31 @@ export class WorkspaceCreditsService {
         return null;
       }
 
+      // Check monthly credit limit (Business plan cap)
+      const monthlyLimit = credits.monthly_credit_limit;
+      const usedThisPeriod = credits.credits_used_this_period || 0;
+
+      if (monthlyLimit != null && usedThisPeriod + amount > monthlyLimit) {
+        logger.warn('[WORKSPACE_CREDITS] Monthly credit limit exceeded', {
+          workspaceId,
+          monthlyLimit,
+          usedThisPeriod,
+          requestedAmount: amount,
+        });
+        return null;
+      }
+
       const newBalance = currentBalance - amount;
       const newTotalUsed = (credits.total_used || 0) + amount;
+      const newUsedThisPeriod = usedThisPeriod + amount;
 
-      // Update credits
+      // Update credits (including period usage tracking)
       const { data: updatedCredits, error: updateError } = await supabaseAdmin
         .from('workspace_credits')
         .update({
           credits_balance: newBalance,
           total_used: newTotalUsed,
+          credits_used_this_period: newUsedThisPeriod,
           last_credit_usage: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         })
@@ -281,8 +302,21 @@ export class WorkspaceCreditsService {
         amount,
         previousBalance: currentBalance,
         newBalance,
+        usedThisPeriod: newUsedThisPeriod,
         userId,
       });
+
+      // Check usage thresholds and send notifications (fire-and-forget)
+      if (monthlyLimit != null && monthlyLimit > 0) {
+        this.checkUsageThresholds(workspaceId, newUsedThisPeriod, monthlyLimit, credits).catch(
+          (err) => {
+            logger.error('[WORKSPACE_CREDITS] Error checking usage thresholds', {
+              error: err instanceof Error ? err.message : String(err),
+              workspaceId,
+            });
+          }
+        );
+      }
 
       return updatedCredits;
     } catch (error) {
@@ -292,6 +326,98 @@ export class WorkspaceCreditsService {
         amount,
       });
       return null;
+    }
+  }
+
+  /**
+   * Check usage thresholds and send warning notifications to workspace owner
+   */
+  private static async checkUsageThresholds(
+    workspaceId: string,
+    usedThisPeriod: number,
+    monthlyLimit: number,
+    credits: WorkspaceCredits
+  ): Promise<void> {
+    const usagePercent = usedThisPeriod / monthlyLimit;
+
+    // 95% threshold (28,500 of 30,000)
+    if (usagePercent >= 0.95 && !credits.warning_95_sent) {
+      await supabaseAdmin
+        .from('workspace_credits')
+        .update({ warning_95_sent: true, updated_at: new Date().toISOString() })
+        .eq('workspace_id', workspaceId);
+
+      await this.sendUsageWarning(workspaceId, 95, usedThisPeriod, monthlyLimit);
+    }
+    // 80% threshold (24,000 of 30,000)
+    else if (usagePercent >= 0.8 && !credits.warning_80_sent) {
+      await supabaseAdmin
+        .from('workspace_credits')
+        .update({ warning_80_sent: true, updated_at: new Date().toISOString() })
+        .eq('workspace_id', workspaceId);
+
+      await this.sendUsageWarning(workspaceId, 80, usedThisPeriod, monthlyLimit);
+    }
+  }
+
+  /**
+   * Send a usage warning notification to the workspace owner
+   */
+  private static async sendUsageWarning(
+    workspaceId: string,
+    thresholdPercent: number,
+    used: number,
+    limit: number
+  ): Promise<void> {
+    try {
+      const { WorkspaceAccessService } = await import('./workspace-access.service');
+      const { NotificationService } = await import('../notifications/notification.service');
+
+      const owner = await WorkspaceAccessService.getOwner(workspaceId);
+      if (!owner) {
+        logger.warn('[WORKSPACE_CREDITS] No owner found for usage warning', { workspaceId });
+        return;
+      }
+
+      const remaining = Math.max(0, limit - used);
+      const title =
+        thresholdPercent >= 95
+          ? 'Credit usage critical'
+          : 'Credit usage warning';
+      const message =
+        thresholdPercent >= 95
+          ? `Your workspace has used ${thresholdPercent}% of its monthly credits (${Math.round(used).toLocaleString()} / ${limit.toLocaleString()}). Only ${Math.round(remaining).toLocaleString()} credits remaining.`
+          : `Your workspace has used ${thresholdPercent}% of its monthly credits (${Math.round(used).toLocaleString()} / ${limit.toLocaleString()}). ${Math.round(remaining).toLocaleString()} credits remaining.`;
+
+      await NotificationService.createNotification({
+        userId: owner.user_id,
+        type: 'personal',
+        category: 'billing',
+        title,
+        message,
+        metadata: {
+          workspaceId,
+          thresholdPercent,
+          creditsUsed: used,
+          creditsLimit: limit,
+          creditsRemaining: remaining,
+          dedupeKey: `workspace-credits:${workspaceId}:warning-${thresholdPercent}`,
+        },
+      });
+
+      logger.info('[WORKSPACE_CREDITS] Usage warning sent', {
+        workspaceId,
+        ownerId: owner.user_id,
+        thresholdPercent,
+        used,
+        limit,
+      });
+    } catch (error) {
+      logger.error('[WORKSPACE_CREDITS] Error sending usage warning', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+        thresholdPercent,
+      });
     }
   }
 
@@ -410,6 +536,120 @@ export class WorkspaceCreditsService {
         workspaceId,
       });
       return [];
+    }
+  }
+
+  /**
+   * Get monthly usage for the current billing period
+   */
+  static async getMonthlyUsage(workspaceId: string): Promise<{
+    used: number;
+    limit: number | null;
+    periodStart: string | null;
+    percentUsed: number | null;
+  }> {
+    try {
+      const credits = await this.getWorkspaceCredits(workspaceId);
+      if (!credits) {
+        return { used: 0, limit: null, periodStart: null, percentUsed: null };
+      }
+
+      const used = credits.credits_used_this_period || 0;
+      const limit = credits.monthly_credit_limit;
+      const percentUsed = limit != null && limit > 0 ? (used / limit) * 100 : null;
+
+      return {
+        used,
+        limit,
+        periodStart: credits.period_start_date,
+        percentUsed: percentUsed != null ? Math.round(percentUsed * 100) / 100 : null,
+      };
+    } catch (error) {
+      logger.error('[WORKSPACE_CREDITS] Error getting monthly usage', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+      });
+      return { used: 0, limit: null, periodStart: null, percentUsed: null };
+    }
+  }
+
+  /**
+   * Reset monthly usage for a workspace (called on billing cycle renewal)
+   * - Resets credits_used_this_period to 0
+   * - Resets warning flags
+   * - Sets credits_balance to exactly monthly_credit_limit (no rollover)
+   * - Records a 'purchase' transaction for the replenishment
+   */
+  static async resetMonthlyUsage(workspaceId: string): Promise<WorkspaceCredits | null> {
+    try {
+      const credits = await this.getWorkspaceCredits(workspaceId);
+      if (!credits) {
+        logger.warn('[WORKSPACE_CREDITS] Workspace not found for monthly reset', { workspaceId });
+        return null;
+      }
+
+      const monthlyLimit = credits.monthly_credit_limit;
+      if (monthlyLimit == null || monthlyLimit <= 0) {
+        logger.warn('[WORKSPACE_CREDITS] No monthly limit set, skipping reset', { workspaceId });
+        return null;
+      }
+
+      const now = new Date();
+
+      // Reset balance to exactly the monthly limit (no rollover)
+      const { data: updatedCredits, error: updateError } = await supabaseAdmin
+        .from('workspace_credits')
+        .update({
+          credits_balance: monthlyLimit,
+          credits_used_this_period: 0,
+          period_start_date: now.toISOString().split('T')[0],
+          warning_80_sent: false,
+          warning_95_sent: false,
+          credits_purchased_at: now.toISOString(),
+          updated_at: now.toISOString(),
+        })
+        .eq('workspace_id', workspaceId)
+        .select()
+        .single();
+
+      if (updateError) {
+        logger.error('[WORKSPACE_CREDITS] Error resetting monthly usage', {
+          error: updateError.message,
+          workspaceId,
+        });
+        return null;
+      }
+
+      // Record replenishment transaction
+      await supabaseAdmin.from('workspace_credit_transactions').insert({
+        workspace_id: workspaceId,
+        amount: monthlyLimit,
+        balance_after: monthlyLimit,
+        transaction_type: 'purchase',
+        description: `Monthly credit replenishment - ${credits.subscription_plan} plan`,
+        metadata: {
+          type: 'monthly_reset',
+          previous_balance: credits.credits_balance,
+          previous_used: credits.credits_used_this_period,
+          monthly_limit: monthlyLimit,
+        },
+      });
+
+      logger.info('[WORKSPACE_CREDITS] Monthly usage reset', {
+        workspaceId,
+        previousBalance: credits.credits_balance,
+        previousUsed: credits.credits_used_this_period,
+        newBalance: monthlyLimit,
+        plan: credits.subscription_plan,
+      });
+
+      return updatedCredits;
+    } catch (error) {
+      logger.error('[WORKSPACE_CREDITS] Exception resetting monthly usage', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+      });
+      return null;
     }
   }
 }
