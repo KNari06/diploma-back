@@ -296,6 +296,7 @@ export class PreviewSessionService {
           pageState: {
             url: initialUrl,
             domNodes: domAnalysis.interactiveNodes,
+            pageText: snapshot.pageTextForExtraction?.slice(0, 3000),
           },
           createdAt: Date.now(),
           lastSeenAt: Date.now(),
@@ -1054,6 +1055,7 @@ export class PreviewSessionService {
       session.pageState = {
         url: currentUrl,
         domNodes: domAnalysis.interactiveNodes,
+        pageText: snapshot.pageTextForExtraction?.slice(0, 3000),
       };
       session.lastSnapshotEmit = now;
 

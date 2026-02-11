@@ -16,6 +16,7 @@ export interface PageContext {
   url: string;
   title?: string;
   domSummary: string;
+  pageText?: string;
   testSteps?: Array<{ id: string; type: string; description: string }>;
 }
 
@@ -39,6 +40,16 @@ export async function getPageContext(previewSessionId: string, userId?: string):
       return null;
     }
 
+    // Collect a fresh snapshot so DOM nodes are up-to-date
+    try {
+      await service.getSnapshot(previewSessionId, userId, { force: true, includeDomNodes: true });
+    } catch (snapshotError) {
+      logger.warn('[EDITOR_CONTEXT] Fresh snapshot failed, using cached pageState', {
+        error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError),
+        previewSessionId,
+      });
+    }
+
     const pageState = session.pageState;
     if (!pageState) {
       logger.warn('[EDITOR_CONTEXT] No page state in session', { previewSessionId });
@@ -50,8 +61,9 @@ export async function getPageContext(previewSessionId: string, userId?: string):
 
     return {
       url: pageState.url || session.startUrl,
-      title: undefined, // Title is not stored in pageState, will be extracted if needed
+      title: undefined,
       domSummary,
+      pageText: pageState.pageText,
     };
   } catch (error) {
     logger.error('[EDITOR_CONTEXT] Failed to get page context', {
@@ -145,7 +157,11 @@ export function formatPageContextForChat(pageContext: PageContext): string {
     result += `Page: ${pageContext.title}\n`;
   }
 
-  result += `Elements:\n${pageContext.domSummary}\n`;
+  result += `Interactive Elements:\n${pageContext.domSummary}\n`;
+
+  if (pageContext.pageText) {
+    result += `\nVisible Page Text:\n${pageContext.pageText}\n`;
+  }
 
   if (pageContext.testSteps && pageContext.testSteps.length > 0) {
     result += `Test Steps:\n`;

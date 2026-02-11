@@ -171,8 +171,8 @@ export async function generateTestPlanFromExploration(params: {
         focusAreas: scopeStrategy.focusAreas,
         testTypes: scopeStrategy.testTypes,
         estimatedDuration: scopeStrategy.estimatedDuration,
-        // Add test execution mode
-        mode: mode || 'lite',
+        // Add test execution mode ('editor' is a chat mode, not a test execution mode)
+        mode: mode === 'editor' ? 'lite' : (mode || 'lite'),
       },
     };
 

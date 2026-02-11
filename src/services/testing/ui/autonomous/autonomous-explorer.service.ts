@@ -63,6 +63,8 @@ export interface ExplorationResult {
     hasAuth: boolean;
   };
   recommendations: string[];
+  /** Visible text content of the page (up to 5k chars) */
+  pageText?: string;
 }
 
 // Re-export NavigationRequiresClarificationError for external use
@@ -148,6 +150,18 @@ export async function exploreProduct(options: {
       pageInfo.title
     );
 
+    // 8.5. Extract visible page text for AI context (up to 5k chars)
+    let pageText: string | undefined;
+    try {
+      pageText = await page.evaluate(() => {
+        // @ts-expect-error - document available in browser context
+        const text = document.body?.innerText || '';
+        return text.trim().slice(0, 5000);
+      });
+    } catch {
+      // Page may be closed or navigating, ignore
+    }
+
     // 9. Cleanup
     await cleanupBrowserResources(page, context);
 
@@ -161,6 +175,7 @@ export async function exploreProduct(options: {
       domAnalysis,
       pageInfo,
       recommendations,
+      pageText,
     };
 
     logger.info('Product exploration completed successfully', {

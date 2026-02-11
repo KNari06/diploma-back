@@ -248,7 +248,7 @@ export async function saveTestPlan(
         intelligent_mode: testPlan.intelligentMode || false,
         estimated_pages: testPlan.estimatedPages,
         estimated_cost: testPlan.estimatedCost,
-        mode: testPlan.mode || 'lite', // Test execution mode
+        mode: ((testPlan.mode as string) === 'editor' ? 'lite' : testPlan.mode) || 'lite', // Test execution mode (only 'lite' or 'pro')
       });
 
     if (error) {

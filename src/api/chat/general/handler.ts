@@ -36,7 +36,17 @@ export async function handleGeneralChat(
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context, abortSignal, logger: functionLogger, mode } = params;
+  const { message, userId, chatSessionId, context: rawContext, abortSignal, logger: functionLogger, mode } = params;
+
+  // Normalize context: parse JSON string into object if needed (frontend may send stringified JSON)
+  let context: any = rawContext;
+  if (typeof rawContext === 'string' && rawContext.startsWith('{')) {
+    try {
+      context = JSON.parse(rawContext);
+    } catch {
+      // Not valid JSON, keep as string
+    }
+  }
 
   if (abortSignal) {
     const checkRequestAbortedWithLogging = functionLogger
@@ -292,7 +302,7 @@ export async function handleGeneralChat(
   // ═══════════════════════════════════════════════════════════════════════
   let editorPageContext: PageContext | null = null;
   const parsedContext = typeof context === 'object' && context !== null && !Array.isArray(context)
-    ? context
+    ? context as Record<string, any>
     : undefined;
 
   if (mode === 'editor' && parsedContext?.previewSessionId) {
@@ -370,8 +380,11 @@ export async function handleGeneralChat(
 
   // Append editor-specific instructions if in editor mode
   if (mode === 'editor') {
-    systemPrompt += `\n\n--- EDITOR MODE ---
-You are connected to the user's AI Editor (browser preview). The user can see a live web page.
+    systemPrompt += `\n\n--- EDITOR MODE (CRITICAL) ---
+You are connected to the user's AI Editor with a live browser preview.
+You CAN see the current page. A "CURRENT PAGE CONTEXT" system message contains the URL and interactive elements (buttons, inputs, links) visible on the page right now.
+NEVER say "I can't view the page" or "I don't have the ability to view web pages" — you DO have page context provided below.
+When the user asks about elements on the page, ALWAYS refer to the page context provided to you.
 When referencing page elements, use their ref IDs (e.g., ref=b1, ref=i3).
 You can suggest test actions like "click button ref=b1" or "type 'hello' into input ref=i2".
 If the user asks to test something on the current page, prefer platform_test intent with the current URL.`;

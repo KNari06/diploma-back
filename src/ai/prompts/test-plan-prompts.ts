@@ -242,6 +242,9 @@ export function buildTestPlanPrompt(
 
   const safeVisualString = visual ? truncate(typeof visual === 'string' ? visual : JSON.stringify(visual, null, 2)) : '(none)';
   const recommendationsString = recs.length > 0 ? recs.slice(0, 20).map((r: any) => `- ${r}`).join('\n') : '  (no recommendations)';
+  const pageTextSection = exploration?.pageText
+    ? `\nVISIBLE PAGE TEXT (use this to understand page content and context):\n${truncate(exploration.pageText, 5000)}\n`
+    : '';
 
   // Extract additional context if provided
   const additionalInfo = userRequest.additionalInfo || {};
@@ -306,7 +309,7 @@ ${linksList}
 
 RECOMMENDATIONS:
 ${recommendationsString}
-
+${pageTextSection}
 ---
 
 IMPORTANT: You MUST return a single valid JSON object only. NO MARKDOWN, NO EXTRA TEXT, NO COMMENTS. The JSON must be parsable by JSON.parse. Follow schema EXACTLY.

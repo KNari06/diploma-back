@@ -657,6 +657,8 @@ export interface PreviewSession {
     pageType?: string;
     domNodes: InteractiveNode[];
     screenshot?: string;
+    /** Visible text content of the page (up to 3k chars, for AI chat context) */
+    pageText?: string;
   };
   /** Creation timestamp */
   createdAt: number;
