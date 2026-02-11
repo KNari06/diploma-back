@@ -241,10 +241,10 @@ export interface WorkspaceOnboardingRequest {
     prod?: string;
   };
   browserType: BrowserTypeEnum; // Default: 'chrome'
-  // NEW FIELDS
-  role: WorkspaceRole; // User's role
+  // NEW FIELDS (all optional)
+  role?: WorkspaceRole; // User's role (optional)
   position?: string; // User's position (optional, max 255 chars)
-  accountType: WorkspaceAccountType; // Account type
+  accountType?: WorkspaceAccountType; // Account type (optional)
   companyName?: string; // Company name (required when accountType === 'company')
 }
 

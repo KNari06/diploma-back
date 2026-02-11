@@ -146,12 +146,12 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Validate role (required)
+    // Validate role (optional)
     const validRoles = ['qaEngineer', 'developer', 'productManager', 'teamLead', 'cto', 'other'];
-    if (!body.role || !validRoles.includes(body.role)) {
+    if (body.role !== undefined && !validRoles.includes(body.role)) {
       res.status(400).json({
         success: false,
-        error: 'Invalid or missing field: role',
+        error: 'Invalid field: role',
         message: `Field role must be one of: ${validRoles.join(', ')}`,
         timestamp: new Date().toISOString(),
       });
@@ -169,19 +169,19 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Validate accountType (required)
+    // Validate accountType (optional)
     const validAccountTypes = ['company', 'individual'];
-    if (!body.accountType || !validAccountTypes.includes(body.accountType)) {
+    if (body.accountType !== undefined && !validAccountTypes.includes(body.accountType)) {
       res.status(400).json({
         success: false,
-        error: 'Invalid or missing field: accountType',
+        error: 'Invalid field: accountType',
         message: `Field accountType must be one of: ${validAccountTypes.join(', ')}`,
         timestamp: new Date().toISOString(),
       });
       return;
     }
 
-    // Validate companyName (required when accountType === 'company')
+    // Validate companyName (optional, but required when accountType === 'company')
     if (body.accountType === 'company') {
       if (!body.companyName || typeof body.companyName !== 'string' || body.companyName.trim().length === 0) {
         res.status(400).json({
