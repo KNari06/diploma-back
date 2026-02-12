@@ -88,9 +88,11 @@ export interface FlowModeResponse {
 export class PlatformTreeService {
   /**
    * Base mode: return platforms with paginated modules
-   * @param projectId - Project ID
-   * @param userId - User ID for access control
-   * @param options - Pagination options for modules
+   *
+   * Queries:
+   *   1. Fetch platforms (1 query)
+   *   2. Fetch paginated modules + counts per platform (parallel, 1 per platform)
+   * Total: 1 + N parallel queries (N = number of platforms, typically 2)
    */
   static async getBaseModeTree(
     projectId: string,
@@ -120,78 +122,65 @@ export class PlatformTreeService {
       return wa - wb;
     });
 
-    const platformIds = sortedPlatforms.map((p: any) => p.id);
-    if (platformIds.length === 0) {
+    if (sortedPlatforms.length === 0) {
       return { platforms: { items: [] } };
     }
 
-    // Get modules count per platform
-    const { data: moduleCounts, error: countError } = await supabaseAdmin
-      .from('test_modules')
-      .select('platform_id')
-      .in('platform_id', platformIds)
-      .eq('user_id', userId);
+    // Fetch paginated modules + count per platform in parallel
+    const platformResults = await Promise.all(
+      sortedPlatforms.map(async (p: any) => {
+        const [modulesResult, countResult] = await Promise.all([
+          supabaseAdmin
+            .from('test_modules')
+            .select('id, platform_id, name, description, priority')
+            .eq('platform_id', p.id)
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .range(offset, offset + limit - 1),
+          supabaseAdmin
+            .from('test_modules')
+            .select('id', { count: 'exact', head: true })
+            .eq('platform_id', p.id)
+            .eq('user_id', userId),
+        ]);
 
-    if (countError) {
-      logger.error('[PLATFORM_TREE] Failed to count modules', { error: countError });
-      throw new Error(`Failed to count modules: ${countError.message}`);
-    }
+        if (modulesResult.error) {
+          logger.error('[PLATFORM_TREE] Failed to get modules', { error: modulesResult.error, platformId: p.id });
+          throw new Error(`Failed to get modules: ${modulesResult.error.message}`);
+        }
 
-    // Count per platform
-    const countMap = new Map<string, number>();
-    for (const m of moduleCounts || []) {
-      countMap.set(m.platform_id, (countMap.get(m.platform_id) || 0) + 1);
-    }
-
-    // Build result with paginated modules per platform
-    const platformResults: BaseModeResponse['platforms']['items'] = [];
-
-    for (const p of sortedPlatforms) {
-      const { data: modules, error: modulesError } = await supabaseAdmin
-        .from('test_modules')
-        .select('id, platform_id, name, description, priority')
-        .eq('platform_id', p.id)
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .range(offset, offset + limit - 1);
-
-      if (modulesError) {
-        logger.error('[PLATFORM_TREE] Failed to get modules', { error: modulesError, platformId: p.id });
-        throw new Error(`Failed to get modules: ${modulesError.message}`);
-      }
-
-      platformResults.push({
-        id: p.id,
-        projectId: p.project_id,
-        platformKey: p.platform_key,
-        name: p.name,
-        description: p.description || undefined,
-        modules: {
-          items: (modules || []).map((m: any) => ({
-            id: m.id,
-            platformId: m.platform_id,
-            platformKey: p.platform_key,
-            name: m.name,
-            description: m.description || undefined,
-            priority: m.priority || undefined,
-          })),
-          pageInfo: {
-            limit,
-            offset,
-            total: countMap.get(p.id) || 0,
+        return {
+          id: p.id,
+          projectId: p.project_id,
+          platformKey: p.platform_key,
+          name: p.name,
+          description: p.description || undefined,
+          modules: {
+            items: (modulesResult.data || []).map((m: any) => ({
+              id: m.id,
+              platformId: m.platform_id,
+              platformKey: p.platform_key,
+              name: m.name,
+              description: m.description || undefined,
+              priority: m.priority || undefined,
+            })),
+            pageInfo: {
+              limit,
+              offset,
+              total: countResult.count || 0,
+            },
           },
-        },
-      });
-    }
+        };
+      })
+    );
 
     return { platforms: { items: platformResults } };
   }
 
   /**
    * Module mode: return module with paginated flows
-   * @param moduleId - Module ID
-   * @param userId - User ID for access control
-   * @param options - Pagination options for flows
+   *
+   * Queries: 1 (module + join) + 2 parallel (flows page + count) = 3 queries
    */
   static async getModuleModeTree(
     moduleId: string,
@@ -212,30 +201,25 @@ export class PlatformTreeService {
       throw new Error('Module not found or access denied');
     }
 
-    // Get flows count
-    const { count: flowsCount, error: countError } = await supabaseAdmin
-      .from('test_flows')
-      .select('id', { count: 'exact', head: true })
-      .eq('module_id', moduleId)
-      .eq('user_id', userId);
+    // Get paginated flows + count in parallel
+    const [flowsResult, countResult] = await Promise.all([
+      supabaseAdmin
+        .from('test_flows')
+        .select('id, module_id, name, flow_type, priority, order_index, created_at, updated_at')
+        .eq('module_id', moduleId)
+        .eq('user_id', userId)
+        .order('order_index', { ascending: true })
+        .range(offset, offset + limit - 1),
+      supabaseAdmin
+        .from('test_flows')
+        .select('id', { count: 'exact', head: true })
+        .eq('module_id', moduleId)
+        .eq('user_id', userId),
+    ]);
 
-    if (countError) {
-      logger.error('[PLATFORM_TREE] Failed to count flows', { error: countError });
-      throw new Error(`Failed to count flows: ${countError.message}`);
-    }
-
-    // Get paginated flows
-    const { data: flows, error: flowsError } = await supabaseAdmin
-      .from('test_flows')
-      .select('id, module_id, name, flow_type, priority, order_index, created_at, updated_at')
-      .eq('module_id', moduleId)
-      .eq('user_id', userId)
-      .order('order_index', { ascending: true })
-      .range(offset, offset + limit - 1);
-
-    if (flowsError) {
-      logger.error('[PLATFORM_TREE] Failed to get flows', { error: flowsError });
-      throw new Error(`Failed to get flows: ${flowsError.message}`);
+    if (flowsResult.error) {
+      logger.error('[PLATFORM_TREE] Failed to get flows', { error: flowsResult.error });
+      throw new Error(`Failed to get flows: ${flowsResult.error.message}`);
     }
 
     return {
@@ -248,7 +232,7 @@ export class PlatformTreeService {
         priority: moduleData.priority || undefined,
       },
       flows: {
-        items: (flows || []).map((f: any) => ({
+        items: (flowsResult.data || []).map((f: any) => ({
           id: f.id,
           moduleId: f.module_id,
           name: f.name,
@@ -261,7 +245,7 @@ export class PlatformTreeService {
         pageInfo: {
           limit,
           offset,
-          total: flowsCount || 0,
+          total: countResult.count || 0,
         },
       },
     };
@@ -269,11 +253,12 @@ export class PlatformTreeService {
 
   /**
    * Flow mode: return flow with paginated test cases (merged from UI + API)
-   * UI test cases are now sourced from intent_test_cases (unified table).
-   * API test cases continue to come from api_test_configs.
-   * @param flowId - Flow ID
-   * @param userId - User ID for access control
-   * @param options - Pagination options for test cases
+   *
+   * Strategy: fetch paginated slices from both tables, merge and re-sort.
+   * Over-fetch slightly (limit from each source) to ensure correct merged ordering,
+   * then trim to the requested page size.
+   *
+   * Queries: 1 (flow) + 4 parallel (ui page + api page + ui count + api count) = 5 queries
    */
   static async getFlowModeTree(
     flowId: string,
@@ -282,71 +267,61 @@ export class PlatformTreeService {
   ): Promise<FlowModeResponse> {
     const { limit = 20, offset = 0 } = options;
 
-    // Get flow
-    const { data: flowData, error: flowError } = await supabaseAdmin
-      .from('test_flows')
-      .select('id, module_id, name, flow_type, priority, order_index, created_at, updated_at')
-      .eq('id', flowId)
-      .eq('user_id', userId)
-      .single();
-
-    if (flowError || !flowData) {
-      throw new Error('Flow not found or access denied');
-    }
-
-    // Get UI test cases count from intent_test_cases (unified table)
-    const { count: uiCount, error: uiCountError } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('id', { count: 'exact', head: true })
-      .eq('flow_id', flowId)
-      .eq('user_id', userId);
-
-    if (uiCountError) {
-      logger.error('[PLATFORM_TREE] Failed to count UI test cases', { error: uiCountError });
-      throw new Error(`Failed to count UI test cases: ${uiCountError.message}`);
-    }
-
-    // Get API test cases count (unchanged)
-    const { count: apiCount, error: apiCountError } = await supabaseAdmin
-      .from('api_test_configs')
-      .select('id', { count: 'exact', head: true })
-      .eq('flow_id', flowId)
-      .eq('user_id', userId);
-
-    if (apiCountError) {
-      logger.error('[PLATFORM_TREE] Failed to count API test cases', { error: apiCountError });
-      throw new Error(`Failed to count API test cases: ${apiCountError.message}`);
-    }
-
-    const totalTestCases = (uiCount || 0) + (apiCount || 0);
-
-    // Get all test cases from both sources (for proper merge/pagination)
-    // UI cases now come from intent_test_cases with status field
-    const [uiResult, apiResult] = await Promise.all([
+    // Fetch flow + counts + paginated data all in parallel
+    const [flowResult, uiCountResult, apiCountResult, uiDataResult, apiDataResult] = await Promise.all([
+      // 1. Flow itself
+      supabaseAdmin
+        .from('test_flows')
+        .select('id, module_id, name, flow_type, priority, order_index, created_at, updated_at')
+        .eq('id', flowId)
+        .eq('user_id', userId)
+        .single(),
+      // 2. UI test case count
+      supabaseAdmin
+        .from('intent_test_cases')
+        .select('id', { count: 'exact', head: true })
+        .eq('flow_id', flowId)
+        .eq('user_id', userId),
+      // 3. API test case count
+      supabaseAdmin
+        .from('api_test_configs')
+        .select('id', { count: 'exact', head: true })
+        .eq('flow_id', flowId)
+        .eq('user_id', userId),
+      // 4. UI test cases — fetch offset+limit rows (enough to cover the merge window)
       supabaseAdmin
         .from('intent_test_cases')
         .select('id, name, priority, status, created_at')
         .eq('flow_id', flowId)
         .eq('user_id', userId)
-        .order('created_at', { ascending: false }),
+        .order('created_at', { ascending: false })
+        .range(0, offset + limit - 1),
+      // 5. API test cases — same window
       supabaseAdmin
         .from('api_test_configs')
         .select('id, name, priority, created_at')
         .eq('flow_id', flowId)
         .eq('user_id', userId)
-        .order('created_at', { ascending: false }),
+        .order('created_at', { ascending: false })
+        .range(0, offset + limit - 1),
     ]);
 
-    if (uiResult.error) {
-      throw new Error(`Failed to get UI test cases: ${uiResult.error.message}`);
+    if (flowResult.error || !flowResult.data) {
+      throw new Error('Flow not found or access denied');
     }
-    if (apiResult.error) {
-      throw new Error(`Failed to get API test cases: ${apiResult.error.message}`);
+    if (uiDataResult.error) {
+      throw new Error(`Failed to get UI test cases: ${uiDataResult.error.message}`);
+    }
+    if (apiDataResult.error) {
+      throw new Error(`Failed to get API test cases: ${apiDataResult.error.message}`);
     }
 
-    // Merge and tag with testType; UI cases include status
+    const flowData = flowResult.data;
+    const totalTestCases = (uiCountResult.count || 0) + (apiCountResult.count || 0);
+
+    // Merge and tag with testType
     const merged: TestCaseSummary[] = [
-      ...(uiResult.data || []).map((tc: any) => ({
+      ...(uiDataResult.data || []).map((tc: any) => ({
         id: tc.id,
         testType: 'ui' as const,
         name: tc.name,
@@ -354,20 +329,19 @@ export class PlatformTreeService {
         status: tc.status as 'draft' | 'published' | 'archived',
         createdAt: tc.created_at,
       })),
-      ...(apiResult.data || []).map((tc: any) => ({
+      ...(apiDataResult.data || []).map((tc: any) => ({
         id: tc.id,
         testType: 'api' as const,
         name: tc.name,
         priority: tc.priority || undefined,
-        // API test cases don't have status concept yet
         createdAt: tc.created_at,
       })),
     ];
 
-    // Sort by createdAt desc (stable)
+    // Sort by createdAt desc (stable merge of two pre-sorted arrays)
     merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
-    // Apply pagination
+    // Apply pagination on the merged set
     const paginatedItems = merged.slice(offset, offset + limit);
 
     return {

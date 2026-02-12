@@ -89,10 +89,13 @@ export async function getPlatformTree(req: AuthenticatedRequest, res: Response):
 
     logger.info('[PLATFORM_TREE_API] Base mode', { projectId, userId, limit, offset });
 
-    // Ensure platforms exist (auto-seed if missing)
-    await PlatformService.ensurePlatformsExist(projectId, userId);
+    let result = await PlatformTreeService.getBaseModeTree(projectId, userId, { limit, offset });
 
-    const result = await PlatformTreeService.getBaseModeTree(projectId, userId, { limit, offset });
+    // Auto-seed platforms only if none exist (first-time project setup)
+    if (result.platforms.items.length === 0) {
+      await PlatformService.ensurePlatformsExist(projectId, userId);
+      result = await PlatformTreeService.getBaseModeTree(projectId, userId, { limit, offset });
+    }
 
     res.json({
       success: true,

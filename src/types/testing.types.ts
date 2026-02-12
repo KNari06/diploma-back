@@ -412,6 +412,31 @@ export interface RegressionPlanWithItems extends RegressionPlan {
 }
 
 /**
+ * Regression plan enriched with latest run stats (for list view)
+ */
+export interface RegressionPlanWithStats extends RegressionPlan {
+  scope: {
+    testCount: number;
+    flowCount: number;
+  };
+  lastRun: {
+    runId: string;
+    status: string;
+    startedAt: string;
+    completedAt: string | null;
+    durationMs: number | null;
+  } | null;
+  health: {
+    state: 'passing' | 'warning' | 'failing' | 'unknown';
+    passRate: number;
+    passed: number;
+    failed: number;
+    flaky: number;
+    total: number;
+  };
+}
+
+/**
  * Params for creating a regression plan
  */
 export interface CreateRegressionPlanParams {

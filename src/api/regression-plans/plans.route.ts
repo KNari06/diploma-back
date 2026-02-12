@@ -22,7 +22,8 @@ const router = Router();
  * @swagger
  * /api/v1/regression-plans:
  *   get:
- *     summary: List regression plans for a project
+ *     summary: List regression plans for a project (with stats)
+ *     description: Returns plans enriched with scope (test/flow counts), latest run info, and health status
  *     tags: [Regression Plans]
  *     security:
  *       - bearerAuth: []
@@ -35,7 +36,7 @@ const router = Router();
  *           format: uuid
  *     responses:
  *       200:
- *         description: List of plans
+ *         description: List of plans with stats
  *   post:
  *     summary: Create a new regression plan
  *     tags: [Regression Plans]

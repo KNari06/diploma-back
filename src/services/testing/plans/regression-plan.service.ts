@@ -11,6 +11,7 @@ import type {
     RegressionPlan,
     RegressionPlanItem,
     RegressionPlanWithItems,
+    RegressionPlanWithStats,
     UpdateRegressionPlanParams,
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
@@ -111,15 +112,20 @@ export class RegressionPlanService {
   }
 
   /**
-   * List plans for a project
-   * @param projectId - Project ID
-   * @param userId - User ID for access control
-   * @returns List of plans
+   * List plans for a project with latest run stats and scope info
+   *
+   * Query strategy (optimized to avoid N+1):
+   *   1. Fetch all plans (1 query)
+   *   2. Batch-fetch all plan items for all plans (1 query)
+   *   3. Batch-resolve module→flows + count test cases per flow (2-4 queries)
+   *   4. Batch-fetch latest run per plan (N parallel, each hits index)
+   *   5. Batch-fetch all executions for health + flaky (1 query)
+   * Total: ~6 + N queries, all indexed, runs in 2 parallel phases
    */
   static async listByProject(
     projectId: string,
     userId: string
-  ): Promise<RegressionPlan[]> {
+  ): Promise<RegressionPlanWithStats[]> {
     const { data, error } = await supabaseAdmin
       .from('regression_plans')
       .select('*')
@@ -132,7 +138,286 @@ export class RegressionPlanService {
       throw new Error(`Failed to list plans: ${error.message}`);
     }
 
-    return (data || []).map(this.mapToRegressionPlan);
+    const plans = (data || []).map(this.mapToRegressionPlan);
+    if (plans.length === 0) return [];
+
+    const planIds = plans.map((p) => p.id);
+
+    // Run scope + lastRun fetches in parallel
+    const [scopeMap, lastRunMap] = await Promise.all([
+      this.batchGetPlanScopes(planIds),
+      this.batchGetLatestRuns(planIds),
+    ]);
+
+    // Batch-fetch health for all runs that exist
+    const runIds = [...lastRunMap.values()]
+      .filter(Boolean)
+      .map((r) => r!.id);
+    const healthMap = runIds.length > 0
+      ? await this.batchGetRunHealths(runIds)
+      : new Map<string, RegressionPlanWithStats['health']>();
+
+    const defaultHealth: RegressionPlanWithStats['health'] = {
+      state: 'unknown', passRate: 0, passed: 0, failed: 0, flaky: 0, total: 0,
+    };
+
+    return plans.map((plan) => {
+      const lastRunRow = lastRunMap.get(plan.id) || null;
+      const runId = lastRunRow?.id;
+
+      return {
+        ...plan,
+        scope: scopeMap.get(plan.id) || { testCount: 0, flowCount: 0 },
+        lastRun: lastRunRow
+          ? {
+              runId: lastRunRow.id,
+              status: lastRunRow.status,
+              startedAt: lastRunRow.started_at,
+              completedAt: lastRunRow.completed_at,
+              durationMs:
+                lastRunRow.completed_at && lastRunRow.started_at
+                  ? new Date(lastRunRow.completed_at).getTime() -
+                    new Date(lastRunRow.started_at).getTime()
+                  : null,
+            }
+          : null,
+        health: (runId && healthMap.get(runId)) || defaultHealth,
+      };
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // BATCH: Scope (test count + flow count) for all plans
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Batch-fetch scope for multiple plans.
+   * Steps:
+   *   1. Fetch all plan_items for the given planIds (1 query)
+   *   2. Resolve module items → flow IDs (1 query)
+   *   3. Batch-count test cases per flow (1 query)
+   *   4. Resolve test_case items → flow IDs for flow counting (1 query)
+   */
+  private static async batchGetPlanScopes(
+    planIds: string[]
+  ): Promise<Map<string, { testCount: number; flowCount: number }>> {
+    // 1. Fetch all items for all plans in one query
+    const { data: allItems, error } = await supabaseAdmin
+      .from('regression_plan_items')
+      .select('plan_id, item_type, module_id, flow_id, test_case_id')
+      .in('plan_id', planIds);
+
+    if (error || !allItems) {
+      logger.error('[REGRESSION_PLAN_SERVICE] Failed to batch fetch plan items', { error });
+      return new Map(planIds.map((id) => [id, { testCount: 0, flowCount: 0 }]));
+    }
+
+    // Group items by plan
+    const itemsByPlan = new Map<string, typeof allItems>();
+    for (const item of allItems) {
+      if (!itemsByPlan.has(item.plan_id)) itemsByPlan.set(item.plan_id, []);
+      itemsByPlan.get(item.plan_id)!.push(item);
+    }
+
+    // 2. Collect all module IDs to resolve → flows
+    const allModuleIds = [
+      ...new Set(
+        allItems
+          .filter((i) => i.item_type === 'module' && i.module_id)
+          .map((i) => i.module_id as string)
+      ),
+    ];
+
+    // Resolve modules → flows in one query
+    let moduleFlowMap = new Map<string, string[]>(); // moduleId → flowId[]
+    if (allModuleIds.length > 0) {
+      const { data: moduleFlows } = await supabaseAdmin
+        .from('test_flows')
+        .select('id, module_id')
+        .in('module_id', allModuleIds);
+
+      for (const f of moduleFlows || []) {
+        if (!moduleFlowMap.has(f.module_id)) moduleFlowMap.set(f.module_id, []);
+        moduleFlowMap.get(f.module_id)!.push(f.id);
+      }
+    }
+
+    // 3. Collect ALL flow IDs we need test counts for
+    const allFlowIds = new Set<string>();
+    for (const item of allItems) {
+      if (item.item_type === 'module' && item.module_id) {
+        for (const fid of moduleFlowMap.get(item.module_id) || []) {
+          allFlowIds.add(fid);
+        }
+      } else if (item.item_type === 'flow' && item.flow_id) {
+        allFlowIds.add(item.flow_id);
+      }
+    }
+
+    // Batch-count test cases per flow in one query
+    const flowTestCounts = new Map<string, number>();
+    if (allFlowIds.size > 0) {
+      const { data: flowCounts } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('flow_id')
+        .in('flow_id', [...allFlowIds]);
+
+      // Count per flow_id
+      for (const row of flowCounts || []) {
+        flowTestCounts.set(row.flow_id, (flowTestCounts.get(row.flow_id) || 0) + 1);
+      }
+    }
+
+    // 4. Resolve test_case items → flow_id for flow counting
+    const testCaseIds = allItems
+      .filter((i) => i.item_type === 'test_case' && i.test_case_id)
+      .map((i) => i.test_case_id as string);
+
+    const testCaseFlowMap = new Map<string, string | null>();
+    if (testCaseIds.length > 0) {
+      const { data: tcFlows } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, flow_id')
+        .in('id', testCaseIds);
+
+      for (const tc of tcFlows || []) {
+        testCaseFlowMap.set(tc.id, tc.flow_id);
+      }
+    }
+
+    // 5. Build scope per plan
+    const result = new Map<string, { testCount: number; flowCount: number }>();
+    for (const planId of planIds) {
+      const items = itemsByPlan.get(planId) || [];
+      const flowIds = new Set<string>();
+      let testCount = 0;
+
+      for (const item of items) {
+        switch (item.item_type) {
+          case 'module': {
+            const flows = moduleFlowMap.get(item.module_id!) || [];
+            for (const fid of flows) {
+              flowIds.add(fid);
+              testCount += flowTestCounts.get(fid) || 0;
+            }
+            break;
+          }
+          case 'flow': {
+            flowIds.add(item.flow_id!);
+            testCount += flowTestCounts.get(item.flow_id!) || 0;
+            break;
+          }
+          case 'test_case': {
+            testCount += 1;
+            const flowId = testCaseFlowMap.get(item.test_case_id!);
+            if (flowId) flowIds.add(flowId);
+            break;
+          }
+        }
+      }
+
+      result.set(planId, { testCount, flowCount: flowIds.size });
+    }
+
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // BATCH: Latest run per plan
+  // ---------------------------------------------------------------------------
+
+  private static async batchGetLatestRuns(
+    planIds: string[]
+  ): Promise<
+    Map<string, { id: string; plan_id: string; status: string; started_at: string; completed_at: string | null }>
+  > {
+    // Fetch the single latest run per plan using parallel queries (uses idx_regression_runs_plan index).
+    const entries = await Promise.all(
+      planIds.map(async (planId) => {
+        const { data: row } = await supabaseAdmin
+          .from('regression_runs')
+          .select('id, plan_id, status, started_at, completed_at')
+          .eq('plan_id', planId)
+          .order('started_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        return row ? ([planId, row] as const) : null;
+      })
+    );
+
+    const result = new Map<
+      string,
+      { id: string; plan_id: string; status: string; started_at: string; completed_at: string | null }
+    >();
+    for (const entry of entries) {
+      if (entry) result.set(entry[0], entry[1]);
+    }
+
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // BATCH: Health (execution stats + flaky) for multiple runs
+  // ---------------------------------------------------------------------------
+
+  private static async batchGetRunHealths(
+    runIds: string[]
+  ): Promise<Map<string, RegressionPlanWithStats['health']>> {
+    // Fetch all execution rows for these runs in one query
+    // (used for both stats and flaky detection)
+    const { data: executions, error } = await supabaseAdmin
+      .from('test_executions')
+      .select('run_id, test_case_id, status')
+      .in('run_id', runIds);
+
+    if (error || !executions) {
+      logger.error('[REGRESSION_PLAN_SERVICE] Failed to batch fetch executions', { error });
+      return new Map();
+    }
+
+    // Group by run_id
+    const execsByRun = new Map<string, Array<{ test_case_id: string; status: string }>>();
+    for (const exec of executions) {
+      if (!execsByRun.has(exec.run_id)) execsByRun.set(exec.run_id, []);
+      execsByRun.get(exec.run_id)!.push(exec);
+    }
+
+    const result = new Map<string, RegressionPlanWithStats['health']>();
+
+    for (const runId of runIds) {
+      const execs = execsByRun.get(runId) || [];
+      const total = execs.length;
+      const passed = execs.filter((e) => e.status === 'passed').length;
+      const failed = execs.filter((e) => e.status === 'failed').length;
+      const completed = passed + failed;
+      const passRate = completed > 0
+        ? Math.round((passed / completed) * 100 * 10) / 10
+        : 0;
+
+      // Flaky: test cases with both passed and failed in same run
+      const groups = new Map<string, Set<string>>();
+      for (const exec of execs) {
+        if (!exec.test_case_id) continue;
+        if (!groups.has(exec.test_case_id)) groups.set(exec.test_case_id, new Set());
+        groups.get(exec.test_case_id)!.add(exec.status);
+      }
+      let flaky = 0;
+      for (const statuses of groups.values()) {
+        if (statuses.has('passed') && statuses.has('failed')) flaky++;
+      }
+
+      let state: 'passing' | 'warning' | 'failing' | 'unknown' = 'passing';
+      if (total === 0) {
+        state = 'unknown';
+      } else if (failed > 0) {
+        state = passRate >= 90 ? 'warning' : 'failing';
+      }
+
+      result.set(runId, { state, passRate, passed, failed, flaky, total });
+    }
+
+    return result;
   }
 
   /**
