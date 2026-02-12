@@ -199,6 +199,10 @@ const options: swaggerJsdoc.Options = {
         name: 'Waitlist',
         description: 'Регистрация в waitlist для раннего доступа (публичный endpoint, не требует auth)',
       },
+      {
+        name: 'Analytics',
+        description: 'Workspace test analytics: summary, results, failures, critical checks, heatmap, deployments, time series',
+      },
     ],
   },
   apis: [

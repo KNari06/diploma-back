@@ -1,3 +1,4 @@
+import analyticsRoutes from '@/api/analytics/analytics.route';
 import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import authRoutes from '@/api/auth/auth.route';
@@ -1220,6 +1221,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 });
 
 // API routes
+app.use(`/api/${env.API_VERSION}/analytics`, analyticsRoutes); // ✅ NEW: Workspace analytics
 app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
 app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes);
 app.use(`/api/${env.API_VERSION}/invites`, invitesRoutes); // Workspace invites accept endpoint
