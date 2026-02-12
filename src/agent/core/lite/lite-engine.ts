@@ -26,6 +26,7 @@ import { HybridSemanticWeightCalculator, matchesKeyword } from './analysis/hybri
 import { extractPageCredentials, parseCredentialsFromResponse } from './analysis/page-credentials-extractor';
 import { PlanProgressEvaluator } from './analysis/plan-progress-evaluator';
 import { StateDiffComputer } from './analysis/state-diff';
+import { StateDriftAuditor } from './analysis/state-drift-auditor';
 import { StateValidator } from './analysis/state-validator';
 import { TargetAudit, type RankedCandidate } from './analysis/target-audit';
 import { TaskPlanBuilder, type TaskPlan } from './analysis/task-plan-builder';
@@ -36,9 +37,11 @@ import { SnapshotCollector } from './collectors/snapshot-collector';
 import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
 import { PageWatcher } from './execution/page-watcher';
+import { MultiAgentOrchestrator } from './agents/multi-agent-orchestrator';
+import type { MultiAgentInput } from './agents/types';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
-import type { AICommand, AIDecision, ActionOutcome, CollectedError, ExecutionResult, FlowState, FunnelPhaseType, GoalContext, GoalGuidance, LiteElement, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, RecoveryPoint, StateDiff, VisionHints } from './lite-types';
+import type { AICommand, AIDecision, ActionOutcome, BlacklistedAction, CollectedError, ExecutionResult, FlowState, FunnelPhaseType, GoalContext, GoalGuidance, LiteElement, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, RecoveryPoint, StateDiff, StateDriftAuditResult, VisionHints } from './lite-types';
 import { LitePromptBuilder, type TaskPlanContext, type ValidationErrorContext } from './prompt/lite-prompt-builder';
 import { PromptSanitizer } from './security/prompt-sanitizer';
 import { LiteTraceWriter } from './trace/lite-trace-writer';
@@ -123,6 +126,15 @@ export class LiteEngine {
   // Track pages where we've already attempted vision to avoid redundant calls
   private visionAttemptedForPage = new Set<string>(); // URL → attempted
 
+  // Multi-Agent Brain: Observer → Strategist → Actor orchestrator
+  private multiAgentOrchestrator: MultiAgentOrchestrator | null = null;
+  // Manus-style: Store previous snapshot for spatial diff
+  private previousFormattedSnapshot: string | null = null;
+  // Store previous snapshot for state drift auditor (lost-field detection needs real elements)
+  private lastSnapshotForAuditor: LiteSnapshot | null = null;
+  // Manus-style: Store last expectedOutcome for expectation validation loop
+  private lastExpectedOutcome: string | undefined;
+
   // ═══════════════════════════════════════════════════════════════════════════
   // L6: PAGE CREDENTIALS EXTRACTION (one-time for login goals)
   // PHASE 0.3: Credential auto-fill state machine
@@ -157,6 +169,11 @@ export class LiteEngine {
     this.flowStateDetector = new FlowStateDetector(config.testId, config.goal); // ✅ Task #21: Initialize flow state detector
     this.traceWriter = new LiteTraceWriter({ testId: config.testId }); // ✅ NEW: Initialize trace writer
     this.semanticWeightCalculator = new HybridSemanticWeightCalculator(config.goal, config.testId); // ✅ NEW: Initialize hybrid semantic weight calculator
+
+    // Multi-Agent Brain: Initialize orchestrator if enabled
+    if (LITE_ENGINE_FLAGS.enableMultiAgentBrain) {
+      this.multiAgentOrchestrator = new MultiAgentOrchestrator();
+    }
 
     // WebSocket progress
     this.progressEmitter = new TestProgressEmitter(
@@ -1889,6 +1906,30 @@ export class LiteEngine {
           ? StateDiffComputer.formatForAI(lastStateDiff.diff, lastStateDiff.action)
           : undefined;
 
+        // State Drift Auditor: Compute audited drift (replaces raw drift when enabled)
+        let auditedDrift: StateDriftAuditResult | undefined;
+        if (LITE_ENGINE_FLAGS.enableStateDriftAuditor && lastStateDiff) {
+          // Use current snapshotBefore as "after" (it's the state we're about to act on)
+          // and the previous snapshot stored in state for "before" (for lost-field detection)
+          auditedDrift = StateDriftAuditor.audit(
+            lastStateDiff.diff,
+            this.lastSnapshotForAuditor || snapshotBefore,
+            snapshotBefore,
+            this.state,
+          );
+        }
+        // Store snapshot for next iteration's auditor (lost-field detection needs real elements)
+        this.lastSnapshotForAuditor = snapshotBefore;
+
+        // Negative Reinforcement: Get blacklisted actions
+        let failedActions: BlacklistedAction[] | undefined;
+        if (LITE_ENGINE_FLAGS.enableNegativeReinforcement) {
+          const blacklisted = this.state.getBlacklistedActions();
+          if (blacklisted.length > 0) {
+            failedActions = blacklisted;
+          }
+        }
+
         // ═══════════════════════════════════════════════════════════════════════
         // L2 MANUS: Detect Funnel Phase
         // ═══════════════════════════════════════════════════════════════════════
@@ -1988,6 +2029,8 @@ export class LiteEngine {
           goalOrientedSummary: this.lastGoalOrientedSummary || undefined, // ✅ NEW: Goal-Oriented Summary (Secret Sauce)
           visionHints: visionHints || undefined, // ✅ NEW: L5 Vision hints when DOM is weak
           formFocusHint, // ✅ TASK 9: Goal form identification
+          failedActions, // Negative Reinforcement: blacklisted actions
+          auditedDrift, // State Drift Auditor: enriched drift analysis
         });
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -2025,10 +2068,35 @@ export class LiteEngine {
 
             // Continue to normal AI decision
             decision = await this.getAIDecision(prompt, i, iterationSpanId, snapshotBefore);
+            this.previousFormattedSnapshot = formattedSnapshot;
           }
         } else {
-          // Normal AI decision
-          decision = await this.getAIDecision(prompt, i, iterationSpanId, snapshotBefore);
+          // Normal AI decision (with multi-agent context when enabled)
+          const multiAgentCtx = LITE_ENGINE_FLAGS.enableMultiAgentBrain ? {
+            snapshot: formattedSnapshot,
+            goal: this.config.goal,
+            history: this.state.getFormattedHistory(),
+            stateDrift: stateDriftAnalysis,
+            visionHints: visionHints || undefined,
+            taskPlanSummary: taskPlanContext ? `Step ${taskPlanContext.currentStepIndex + 1}/${taskPlanContext.totalSteps}: ${taskPlanContext.currentStep.goal}` : undefined,
+            guidance: this.currentGuidance?.guidance,
+            progressScore: goalCheck.progressScore,
+            failedActions,
+            auditedDrift,
+            isStuck: stuckCheck.stuck,
+            lastOutcome: this.state.getLastOutcome(),
+            hasCredentials: !!this.config.credentials,
+            snapshotElements: formattedSnapshot,
+            // Manus-style enhancements
+            previousSnapshot: this.previousFormattedSnapshot || undefined,
+            networkActivity: this.networkTracker.getNetworkActivityState(),
+            lastAction: i > 0 ? this.state.getAllIterations()[i - 1]?.decision.command.action : undefined,
+            lastExpectation: this.lastExpectedOutcome, // Manus-style: Feed Strategist's expectedOutcome to Observer
+          } : undefined;
+          decision = await this.getAIDecision(prompt, i, iterationSpanId, snapshotBefore, multiAgentCtx);
+
+          // Store snapshot for next iteration's spatial diff
+          this.previousFormattedSnapshot = formattedSnapshot;
         }
 
         // Check terminal states
@@ -3040,6 +3108,49 @@ export class LiteEngine {
 
         this.state.recordFocusedMetrics(snapshotAfter.url, goalRelevantElements, highWeightCount);
 
+        // 13b. Negative Reinforcement: Record failed/successful actions
+        if (LITE_ENGINE_FLAGS.enableNegativeReinforcement && decision.command.ref) {
+          // Clear all failed actions on URL change first (new page = new elements)
+          if (diff.urlChanged) {
+            this.state.clearFailedActions();
+          } else {
+            const failureOutcomes: ActionOutcome[] = ['no_effect', 'execution_error', 'validation_error'];
+            if (failureOutcomes.includes(outcome)) {
+              // Find element name for display
+              const targetEl = snapshotBefore.elements.find(el => el.ref === decision.command.ref);
+              const elementName = targetEl?.name || targetEl?.ariaLabel || targetEl?.placeholder || decision.command.ref;
+              this.state.recordFailedAction(
+                decision.command.action,
+                decision.command.ref,
+                elementName,
+                outcome,
+                i,
+                execResult.error,
+              );
+            } else if (outcome === 'state_changed') {
+              // Action succeeded — remove from failed actions
+              this.state.removeFailedAction(decision.command.action, decision.command.ref);
+            }
+          }
+        }
+
+        // 13b2. Multi-Agent Brain: Invalidate observer cache on state change or URL change
+        if (LITE_ENGINE_FLAGS.enableMultiAgentBrain && this.multiAgentOrchestrator) {
+          if (outcome === 'state_changed' || diff.urlChanged) {
+            this.multiAgentOrchestrator.invalidateCache(snapshotBefore.url);
+          }
+        }
+
+        // 13c. State Drift Auditor: Record tracking data
+        if (LITE_ENGINE_FLAGS.enableStateDriftAuditor) {
+          this.state.recordUrlVisit(snapshotAfter.url);
+          const allErrors = [...diff.newPageErrors, ...diff.newConsoleErrors];
+          this.state.recordErrors(allErrors);
+          this.state.recordErrorCount(allErrors.length);
+          const currentRefs = new Set(snapshotAfter.elements.filter(el => el.visible).map(el => el.ref));
+          this.state.recordElementRefSet(currentRefs);
+        }
+
         // 14. Emit progress via WebSocket (with diff for frontend highlighting)
         this.emitIterationProgress(i, decision, outcome, diff);
 
@@ -3580,6 +3691,9 @@ export class LiteEngine {
         errorTypes: [...new Set(this.collectedErrors.map((e) => e.type))],
         hasFinalScreenshot: !!finalScreenshotUrl,
         endTime: new Date().toISOString(),
+        ...(this.multiAgentOrchestrator && {
+          multiAgent: this.multiAgentOrchestrator.getRunMetrics(),
+        }),
       },
     });
 
@@ -3739,6 +3853,9 @@ export class LiteEngine {
       }
     }
 
+    // Multi-agent metrics (when enabled)
+    const multiAgentMetrics = this.multiAgentOrchestrator?.getRunMetrics();
+
     return {
       success,
       reason,
@@ -3748,6 +3865,7 @@ export class LiteEngine {
       duration, // Track actual execution time
       errors: this.collectedErrors, // ✅ Pro-grade error collection
       graphData, // ✅ Full graph like Pro
+      ...(multiAgentMetrics && { multiAgentMetrics }),
     };
   }
 
@@ -4488,13 +4606,90 @@ export class LiteEngine {
   /**
    * PHASE 0.3: Helper method to extract AI decision logic
    * Wrapped for easier testing and auto-fill bypass
+   * Multi-Agent Brain: When enabled, tries orchestrator first, falls back to monolithic
    */
   private async getAIDecision(
     prompt: string,
     iteration: number,
     iterationSpanId: string,
-    snapshotBefore: LiteSnapshot
+    snapshotBefore: LiteSnapshot,
+    multiAgentContext?: Omit<MultiAgentInput, 'url' | 'title' | 'iteration' | 'contentHash'>,
   ): Promise<AIDecision> {
+    // Multi-Agent Brain: Try orchestrator first when enabled
+    if (LITE_ENGINE_FLAGS.enableMultiAgentBrain && this.multiAgentOrchestrator && multiAgentContext) {
+      try {
+        const contentHash = this.state.computeContentHash(snapshotBefore);
+        const result = await this.multiAgentOrchestrator.execute({
+          ...multiAgentContext,
+          url: snapshotBefore.url,
+          title: snapshotBefore.title,
+          iteration,
+          contentHash,
+        });
+
+        if (result.success && result.decision) {
+          // Trace multi-agent debug info
+          this.traceWriter.write({
+            iteration,
+            stage: 'ai_decision',
+            eventType: 'multi_agent_debug',
+            spanId: this.traceWriter.generateSpanId(),
+            parentSpanId: iterationSpanId,
+            payload: {
+              success: true,
+              debug: result.debug,
+              thought: result.decision.thought,
+              command: this.buildSafeCommandForTrace(result.decision.command, snapshotBefore),
+            },
+          });
+
+          // Manus-style: Store expectedOutcome for next iteration's expectation validation
+          this.lastExpectedOutcome = result.expectedOutcome;
+
+          return result.decision as AIDecision;
+        }
+
+        // Fall through to monolithic if orchestrator failed
+        // Clear stale expectation so next Observer doesn't validate against wrong prediction
+        this.lastExpectedOutcome = undefined;
+        this.traceWriter.write({
+          iteration,
+          stage: 'ai_decision',
+          eventType: 'multi_agent_debug',
+          spanId: this.traceWriter.generateSpanId(),
+          parentSpanId: iterationSpanId,
+          payload: {
+            success: false,
+            fallbackReason: 'orchestrator_failed',
+          },
+        });
+        logger.info('[LITE_ENGINE] Multi-agent failed, falling back to monolithic', {
+          testId: this.config.testId,
+          iteration,
+        });
+      } catch (error) {
+        this.lastExpectedOutcome = undefined;
+        this.traceWriter.write({
+          iteration,
+          stage: 'ai_decision',
+          eventType: 'multi_agent_debug',
+          spanId: this.traceWriter.generateSpanId(),
+          parentSpanId: iterationSpanId,
+          payload: {
+            success: false,
+            fallbackReason: 'orchestrator_error',
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+        logger.warn('[LITE_ENGINE] Multi-agent error, falling back to monolithic', {
+          testId: this.config.testId,
+          iteration,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // Monolithic path (existing behavior)
     // Trace AI prompt
     const aiPromptSpanId = this.traceWriter.generateSpanId();
     this.traceWriter.write({

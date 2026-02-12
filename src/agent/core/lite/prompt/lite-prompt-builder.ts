@@ -8,7 +8,7 @@ import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import type { TaskPlanStep } from '../analysis/task-plan-builder';
-import type { AIDecision, GoalGuidance, ModalDismissInfo, StuckCheck, VisionHints } from '../lite-types';
+import type { AIDecision, BlacklistedAction, GoalGuidance, ModalDismissInfo, StateDriftAuditResult, StuckCheck, VisionHints } from '../lite-types';
 import { PromptSanitizer } from '../security/prompt-sanitizer';
 
 /**
@@ -93,6 +93,10 @@ export class LitePromptBuilder {
     visionHints?: VisionHints;
     /** ✅ TASK 9: Form focus hint with refs of goal-relevant form fields */
     formFocusHint?: string;
+    /** Blacklisted failed actions (negative reinforcement) */
+    failedActions?: BlacklistedAction[];
+    /** Audited state drift result (replaces raw stateDriftAnalysis when available) */
+    auditedDrift?: StateDriftAuditResult;
   }): string {
     // ✅ NEW: Sanitize snapshot to prevent prompt injection attacks
     const sanitizationResult = PromptSanitizer.sanitizeSnapshot(
@@ -219,6 +223,14 @@ ${params.formFocusHint}
 `
       : '';
 
+    // Negative Reinforcement: Failed actions section
+    const failedActionsSection = LitePromptBuilder.buildFailedActionsSection(params.failedActions);
+
+    // State Drift Auditor: Audited drift section (replaces raw drift when available)
+    const auditedDriftSection = params.auditedDrift
+      ? LitePromptBuilder.formatAuditedDrift(params.auditedDrift)
+      : '';
+
     // ═══════════════════════════════════════════════════════════════════════
     // Build conditional rules based on context (save ~2-3k tokens per request)
     // ═══════════════════════════════════════════════════════════════════════
@@ -303,7 +315,7 @@ GOAL: ${params.goal}
 
 CURRENT PAGE:
 ${snapshot}
-${taskPlanSection}${goalOrientedSummarySection}${formFocusSection}${stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${visionHintsSection}${modalDismissSection}${validationErrorSection}
+${taskPlanSection}${goalOrientedSummarySection}${formFocusSection}${auditedDriftSection || stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${visionHintsSection}${modalDismissSection}${validationErrorSection}${failedActionsSection}
 HISTORY:
 ${params.history}
 
@@ -739,6 +751,89 @@ What should the agent do next? Respond with JSON:
     const warning = '\n\n[⚠️ SNAPSHOT TRUNCATED: Page is very large, showing first 100k chars. Focus on visible elements.]';
 
     return truncated + warning;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NEGATIVE REINFORCEMENT: Failed Actions Section
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build the FAILED ACTIONS prompt section
+   * Shows blacklisted actions that AI should not repeat
+   */
+  private static buildFailedActionsSection(failedActions?: BlacklistedAction[]): string {
+    if (!failedActions || failedActions.length === 0) {
+      return '';
+    }
+
+    const lines: string[] = ['\n🚫 FAILED ACTIONS (DO NOT REPEAT):'];
+
+    for (const fa of failedActions) {
+      const errorDetail = fa.lastError ? `: ${fa.lastError.slice(0, 50)}` : '';
+      lines.push(`- ${fa.action}(${fa.ref}) "${fa.elementName}" failed ${fa.failureCount}x (${fa.lastOutcome}${errorDetail}). Try different element.`);
+    }
+
+    lines.push('Pick an ALTERNATIVE element or approach. Do NOT use these refs.');
+    return lines.join('\n') + '\n';
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STATE DRIFT AUDITOR: Formatted Output
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Format audited state drift result for AI prompt
+   * ~100 tokens, replaces raw stateDriftAnalysis when auditor is enabled
+   */
+  static formatAuditedDrift(audit: StateDriftAuditResult): string {
+    const confidenceEmoji = audit.confidence.score >= 0.7 ? '🟢' : audit.confidence.score >= 0.4 ? '🟡' : '🔴';
+    const confidencePct = Math.round(audit.confidence.score * 100);
+
+    const lines: string[] = [];
+    lines.push(`\n📊 STATE DRIFT AUDIT (confidence: ${confidenceEmoji} ${confidencePct}%)`);
+
+    // Attribution
+    if (audit.attribution.summary) {
+      lines.push(`WHY: ${audit.attribution.summary}`);
+    }
+
+    // Loop detection
+    if (audit.repetition.loopDetected && audit.repetition.loopDescription) {
+      lines.push(`🔄 LOOP: ${audit.repetition.loopDescription}`);
+    }
+
+    // Repeated errors
+    if (audit.repetition.repeatedErrors && audit.repetition.repeatedErrors.length > 0) {
+      for (const err of audit.repetition.repeatedErrors.slice(0, 2)) {
+        lines.push(`⚠️ "${err.message.slice(0, 50)}" seen ${err.count}x`);
+      }
+    }
+
+    // Anomalies
+    if (audit.anomalies.flickeringElements.length > 0) {
+      lines.push(`⚡ Flickering elements: ${audit.anomalies.flickeringElements.slice(0, 3).join(', ')}`);
+    }
+    if (audit.anomalies.lostFormFields.length > 0) {
+      lines.push(`⚠️ Lost form fields: ${audit.anomalies.lostFormFields.join(', ')}`);
+    }
+    if (audit.anomalies.errorTrend === 'increasing') {
+      lines.push(`📈 Error trend: INCREASING — errors are getting worse`);
+    }
+
+    // Diff quality warnings
+    if (audit.diffQuality.loadingDetected) {
+      lines.push(`⏳ Loading indicator detected — diff may be incomplete`);
+    }
+    if (audit.diffQuality.pendingNetworkRequests) {
+      lines.push(`🌐 Pending network requests — state may change`);
+    }
+
+    // Confidence degradation
+    if (audit.confidence.degradationReasons.length > 0 && audit.confidence.score < 0.7) {
+      lines.push(`Confidence degraded: ${audit.confidence.degradationReasons.join(', ')}`);
+    }
+
+    return lines.join('\n') + '\n';
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

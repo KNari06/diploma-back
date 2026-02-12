@@ -149,6 +149,45 @@ export const LITE_ENGINE_FLAGS = {
 
   /** Maximum tokens for core brain responses */
   coreBrainMaxTokens: 800,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NEGATIVE REINFORCEMENT (Action Blacklist)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable negative reinforcement to prevent repeating failed actions */
+  enableNegativeReinforcement: true,
+
+  /** Number of failures before an action is blacklisted */
+  negativeReinforcementThreshold: 2,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STATE DRIFT AUDITOR
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable state drift auditor for confidence scoring, attribution, loop/anomaly detection */
+  enableStateDriftAuditor: true,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MULTI-AGENT BRAIN (Observer → Strategist → Actor)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable multi-agent brain (Observer → Strategist → Actor → Critic pipeline) */
+  enableMultiAgentBrain: true,
+
+  /** Timeout for Observer agent AI call (ms) */
+  multiAgentObserverTimeoutMs: 5000,
+
+  /** Timeout for Strategist agent AI call (ms) */
+  multiAgentStrategistTimeoutMs: 5000,
+
+  /** Timeout for Actor agent AI call (ms) */
+  multiAgentActorTimeoutMs: 3000,
+
+  /** Enable Observer cache for unchanged pages */
+  multiAgentObserverCacheEnabled: true,
+
+  // Manus-style Critic Agent
+  enableCriticAgent: true,
+  multiAgentCriticTimeoutMs: 2000,
+  /** Max reasoning history entries for consistency check */
+  criticReasoningHistorySize: 10,
 } as const;
 
 /**

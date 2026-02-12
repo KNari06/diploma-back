@@ -435,6 +435,8 @@ export interface LiteTestResult {
       version: string;
     };
   };
+  /** Multi-agent pipeline metrics (present when enableMultiAgentBrain=true) */
+  multiAgentMetrics?: import('./agents/types').MultiAgentRunMetrics;
 }
 
 /**
@@ -690,6 +692,134 @@ export interface VisionHints {
     /** Human-readable explanation */
     note: string;
   }>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NEGATIVE REINFORCEMENT: Failed Action Tracking
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Entry tracking a failed action attempt
+ * Keyed by "{action}:{ref}" (e.g., "click:e5")
+ */
+export interface FailedActionEntry {
+  /** Action type (click, fill, etc.) */
+  action: string;
+  /** Element ref */
+  ref: string;
+  /** Element name/label for prompt display */
+  elementName: string;
+  /** Number of times this action failed */
+  failureCount: number;
+  /** Last failure outcome (no_effect, execution_error, validation_error) */
+  lastOutcome: ActionOutcome;
+  /** Last error message (if any) */
+  lastError?: string;
+  /** Iteration when first failure occurred */
+  firstFailureIteration: number;
+  /** Iteration when last failure occurred */
+  lastFailureIteration: number;
+}
+
+/**
+ * A blacklisted action that should not be repeated
+ * Created when failureCount >= threshold
+ */
+export interface BlacklistedAction {
+  /** Action key "{action}:{ref}" */
+  key: string;
+  /** Action type */
+  action: string;
+  /** Element ref */
+  ref: string;
+  /** Element name for display */
+  elementName: string;
+  /** Total failure count */
+  failureCount: number;
+  /** Last outcome type */
+  lastOutcome: ActionOutcome;
+  /** Last error message */
+  lastError?: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE DRIFT AUDITOR TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Confidence scoring for state drift reliability
+ */
+export interface DriftConfidence {
+  /** Confidence score 0-1 */
+  score: number;
+  /** Suggested AI behavior based on confidence */
+  suggestedBehavior: 'conservative' | 'normal' | 'aggressive';
+  /** Reasons for degradation */
+  degradationReasons: string[];
+}
+
+/**
+ * Change attribution explaining WHY progress was assessed
+ */
+export interface ChangeAttribution {
+  /** Top contributors with percentages */
+  contributors: Array<{ factor: string; percentage: number }>;
+  /** Human-readable summary */
+  summary: string;
+}
+
+/**
+ * Repetition detection for loop/error patterns
+ */
+export interface RepetitionDetection {
+  /** Whether a navigation loop is detected */
+  loopDetected: boolean;
+  /** Human-readable loop description */
+  loopDescription?: string;
+  /** URL visit counts that triggered detection */
+  urlVisitCounts?: Record<string, number>;
+  /** Repeated error messages */
+  repeatedErrors?: Array<{ message: string; count: number }>;
+}
+
+/**
+ * Anomaly detection for unusual state changes
+ */
+export interface AnomalyDetection {
+  /** Elements that flicker (appear-disappear-appear) */
+  flickeringElements: string[];
+  /** Form fields that were lost */
+  lostFormFields: string[];
+  /** Error trend direction */
+  errorTrend: 'increasing' | 'decreasing' | 'stable';
+}
+
+/**
+ * Diff quality metrics
+ */
+export interface DiffQualityMetrics {
+  /** Whether loading indicators were detected */
+  loadingDetected: boolean;
+  /** Whether pending network requests exist */
+  pendingNetworkRequests: boolean;
+  /** Number of gray-zone elements (no AI confirmation) */
+  grayZoneElementCount: number;
+}
+
+/**
+ * Complete state drift audit result
+ */
+export interface StateDriftAuditResult {
+  /** Confidence in the diff */
+  confidence: DriftConfidence;
+  /** Attribution of progress assessment */
+  attribution: ChangeAttribution;
+  /** Loop and repetition detection */
+  repetition: RepetitionDetection;
+  /** Anomaly detection */
+  anomalies: AnomalyDetection;
+  /** Diff quality metrics */
+  diffQuality: DiffQualityMetrics;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

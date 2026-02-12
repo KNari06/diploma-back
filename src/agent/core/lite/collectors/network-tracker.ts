@@ -698,6 +698,38 @@ export class NetworkTracker {
   }
 
   /**
+   * Get network activity state (Manus-style for Observer)
+   * Returns current pending state + recent requests (last 3s)
+   */
+  getNetworkActivityState(): {
+    hasPendingRequests: boolean;
+    recentRequests: Array<{ url: string; method: string; status?: number }>;
+    asyncWorkTriggered: boolean;
+  } {
+    const now = Date.now();
+    const RECENT_WINDOW = 3000; // 3 seconds
+
+    // Get recent successful responses
+    const recentSuccessful = this.successfulResponses.filter(s => now - s.timestamp < RECENT_WINDOW);
+
+    // Async work triggered if we have recent successful requests or pending requests
+    const asyncWorkTriggered = this.pendingRequests.size > 0 || recentSuccessful.length > 0;
+
+    // Build recent requests list (from successful responses)
+    const recentRequests = recentSuccessful.map(s => ({
+      url: s.url,
+      method: s.method,
+      status: s.status,
+    }));
+
+    return {
+      hasPendingRequests: this.pendingRequests.size > 0,
+      recentRequests,
+      asyncWorkTriggered,
+    };
+  }
+
+  /**
    * Clear pending requests tracking
    */
   clear(): void {

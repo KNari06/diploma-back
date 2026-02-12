@@ -8,8 +8,11 @@
 
 import { logger } from '@/utils/core/logger';
 import { StateDiffComputer } from './analysis/state-diff';
+import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import type {
   ActionOutcome,
+  BlacklistedAction,
+  FailedActionEntry,
   FunnelPhaseType,
   IterationRecord,
   LiteSnapshot,
@@ -60,6 +63,28 @@ export class LiteState {
     /realtime/i,
     /streaming/i,
   ];
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NEGATIVE REINFORCEMENT: Failed Action Tracking
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Failed actions map: key = "{action}:{ref}", value = FailedActionEntry */
+  private failedActions: Map<string, FailedActionEntry> = new Map();
+  /** Maximum number of failed action entries (LRU eviction) */
+  private readonly MAX_FAILED_ACTIONS = 50;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STATE DRIFT AUDITOR: Tracking State
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** URL path → visit count (for loop detection) */
+  private urlVisitCounts: Map<string, number> = new Map();
+  /** Normalized error message → occurrence count */
+  private errorOccurrenceCounts: Map<string, number> = new Map();
+  /** Ring buffer of recent element ref sets for flicker detection (last 5 iterations) */
+  private recentElementRefSets: Array<Set<string>> = [];
+  /** Error count per iteration for trend detection (last 5) */
+  private errorCountHistory: number[] = [];
+  /** Ring buffer max size */
+  private readonly RING_BUFFER_SIZE = 5;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // WORKSTREAM 4: Recovery State
@@ -661,6 +686,13 @@ export class LiteState {
     this.focusedHighWeightCounts = []; // WORKSTREAM C: Clear high-weight counts
     this.consecutiveStuckCount = 0;
     this.visualSignatures.clear();
+    // Negative reinforcement: Clear failed actions
+    this.failedActions.clear();
+    // State drift auditor: Clear tracking
+    this.urlVisitCounts.clear();
+    this.errorOccurrenceCounts.clear();
+    this.recentElementRefSets = [];
+    this.errorCountHistory = [];
     // WORKSTREAM 4: Clear recovery state
     this.recoveryPointByPhase.clear();
     this.recoveryAttemptsByKey.clear();
@@ -751,6 +783,204 @@ export class LiteState {
     } catch {
       return url.slice(0, 50);
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NEGATIVE REINFORCEMENT: Failed Action Methods
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Record a failed action attempt
+   * Increments failure count for the action+ref combination
+   */
+  recordFailedAction(
+    action: string,
+    ref: string,
+    elementName: string,
+    outcome: ActionOutcome,
+    iteration: number,
+    error?: string,
+  ): void {
+    const key = `${action}:${ref}`;
+    const existing = this.failedActions.get(key);
+
+    if (existing) {
+      existing.failureCount++;
+      existing.lastOutcome = outcome;
+      existing.lastError = error;
+      existing.lastFailureIteration = iteration;
+    } else {
+      // LRU eviction if at capacity
+      if (this.failedActions.size >= this.MAX_FAILED_ACTIONS) {
+        // Remove oldest entry by firstFailureIteration
+        let oldestKey: string | null = null;
+        let oldestIteration = Infinity;
+        for (const [k, v] of this.failedActions) {
+          if (v.firstFailureIteration < oldestIteration) {
+            oldestIteration = v.firstFailureIteration;
+            oldestKey = k;
+          }
+        }
+        if (oldestKey) {
+          this.failedActions.delete(oldestKey);
+        }
+      }
+
+      this.failedActions.set(key, {
+        action,
+        ref,
+        elementName,
+        failureCount: 1,
+        lastOutcome: outcome,
+        lastError: error,
+        firstFailureIteration: iteration,
+        lastFailureIteration: iteration,
+      });
+    }
+
+    logger.debug('[LITE_STATE] Recorded failed action', {
+      key,
+      failureCount: this.failedActions.get(key)?.failureCount,
+      outcome,
+    });
+  }
+
+  /**
+   * Remove a failed action entry (action succeeded)
+   */
+  removeFailedAction(action: string, ref: string): void {
+    const key = `${action}:${ref}`;
+    if (this.failedActions.delete(key)) {
+      logger.debug('[LITE_STATE] Removed failed action (succeeded)', { key });
+    }
+  }
+
+  /**
+   * Clear all failed actions (e.g., URL changed = new page)
+   */
+  clearFailedActions(): void {
+    if (this.failedActions.size > 0) {
+      logger.debug('[LITE_STATE] Cleared failed actions (URL changed)', {
+        count: this.failedActions.size,
+      });
+      this.failedActions.clear();
+    }
+  }
+
+  /**
+   * Get blacklisted actions (failed >= threshold)
+   * Returns max 5 entries sorted by failure count descending
+   */
+  getBlacklistedActions(): BlacklistedAction[] {
+    const threshold = LITE_ENGINE_FLAGS.negativeReinforcementThreshold;
+    const blacklisted: BlacklistedAction[] = [];
+
+    for (const [key, entry] of this.failedActions) {
+      if (entry.failureCount >= threshold) {
+        blacklisted.push({
+          key,
+          action: entry.action,
+          ref: entry.ref,
+          elementName: entry.elementName,
+          failureCount: entry.failureCount,
+          lastOutcome: entry.lastOutcome,
+          lastError: entry.lastError,
+        });
+      }
+    }
+
+    // Sort by failure count descending, limit to 5
+    return blacklisted
+      .sort((a, b) => b.failureCount - a.failureCount)
+      .slice(0, 5);
+  }
+
+  /**
+   * Check if an action is blacklisted
+   */
+  isActionBlacklisted(action: string, ref: string): boolean {
+    const key = `${action}:${ref}`;
+    const entry = this.failedActions.get(key);
+    if (!entry) return false;
+    return entry.failureCount >= LITE_ENGINE_FLAGS.negativeReinforcementThreshold;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STATE DRIFT AUDITOR: Tracking Methods
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Record a URL visit for loop detection
+   * Uses URL path only (ignoring query params)
+   */
+  recordUrlVisit(url: string): void {
+    try {
+      const path = new URL(url).pathname;
+      const count = (this.urlVisitCounts.get(path) || 0) + 1;
+      this.urlVisitCounts.set(path, count);
+    } catch {
+      // Invalid URL, ignore
+    }
+  }
+
+  /**
+   * Get URL visit counts (for auditor)
+   */
+  getUrlVisitCounts(): Map<string, number> {
+    return this.urlVisitCounts;
+  }
+
+  /**
+   * Record error occurrences for repetition detection
+   */
+  recordErrors(errors: string[]): void {
+    for (const err of errors) {
+      const normalized = err.toLowerCase().trim().slice(0, 100);
+      if (normalized.length === 0) continue;
+      const count = (this.errorOccurrenceCounts.get(normalized) || 0) + 1;
+      this.errorOccurrenceCounts.set(normalized, count);
+    }
+  }
+
+  /**
+   * Get error occurrence counts (for auditor)
+   */
+  getErrorOccurrenceCounts(): Map<string, number> {
+    return this.errorOccurrenceCounts;
+  }
+
+  /**
+   * Record element ref set for flicker detection (ring buffer of 5)
+   */
+  recordElementRefSet(refs: Set<string>): void {
+    this.recentElementRefSets.push(refs);
+    if (this.recentElementRefSets.length > this.RING_BUFFER_SIZE) {
+      this.recentElementRefSets.shift();
+    }
+  }
+
+  /**
+   * Get recent element ref sets (for flicker detection)
+   */
+  getRecentElementRefSets(): Array<Set<string>> {
+    return this.recentElementRefSets;
+  }
+
+  /**
+   * Record error count for trend detection
+   */
+  recordErrorCount(count: number): void {
+    this.errorCountHistory.push(count);
+    if (this.errorCountHistory.length > this.RING_BUFFER_SIZE) {
+      this.errorCountHistory.shift();
+    }
+  }
+
+  /**
+   * Get error count history (for trend detection)
+   */
+  getErrorCountHistory(): number[] {
+    return this.errorCountHistory;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
