@@ -16,6 +16,8 @@ import { Request, Response } from 'express';
 import { CONSTANTS } from '../shared/constants';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { compressMessageContent, deductChatCredits, emitProcessingStep } from '../shared/utils';
+import { withAIContext } from '@/services/ai/tracking/ai-context';
+import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -469,14 +471,27 @@ If the user asks to test something on the current page, prefer platform_test int
 
   let gptResponse: { content: string; usage?: any };
   let shouldDeductCredits = false;
+  let requestCancelled = false;
   const MAX_TOOL_ROUNDS = 5; // Prevent infinite loops
 
-  try {
-    let toolRound = 0;
-    let finalResponse: string | null = null;
+  // Wrap AI calls with tracking context
+  const executeAgenticLoop = async () => {
+    // Begin AI usage tracking session (only if workspaceId exists)
+    const trackingSessionId = workspaceId ? chatSessionId : null;
+    if (trackingSessionId && workspaceId) {
+      AIUsageTracker.beginSession(trackingSessionId, {
+        workspaceId,
+        userId,
+        operationType: 'chat',
+      });
+    }
 
-    // Agentic loop: keep calling OpenAI until no more tool calls
-    while (toolRound < MAX_TOOL_ROUNDS) {
+    try {
+      let toolRound = 0;
+      let finalResponse: string | null = null;
+
+      // Agentic loop: keep calling OpenAI until no more tool calls
+      while (toolRound < MAX_TOOL_ROUNDS) {
       toolRound++;
 
       logger.info('[GENERAL_CHAT] Tool round', { round: toolRound, messagesCount: messages.length });
@@ -592,17 +607,21 @@ If the user asks to test something on the current page, prefer platform_test int
       });
 
       // Check if response already sent
-      if (res.headersSent) {
-        return;
+      if (!res.headersSent) {
+        res.status(499).json({
+          success: false,
+          error: 'Request was cancelled',
+          message: 'The request was cancelled. Please try again.',
+          timestamp: new Date().toISOString(),
+        });
       }
 
-      res.status(499).json({
-        success: false,
-        error: 'Request was cancelled',
-        message: 'The request was cancelled. Please try again.',
-        timestamp: new Date().toISOString(),
-      });
-      return;
+      // Signal to outer handler that request was cancelled
+      requestCancelled = true;
+      return {
+        gptResponse: { content: '', usage: undefined },
+        shouldDeductCredits: false,
+      };
     }
 
     // Fallback response if OpenAI fails
@@ -624,17 +643,51 @@ If the user asks to test something on the current page, prefer platform_test int
       fallbackMessage = 'The request took too long to process. Please try again with a shorter message.';
     }
 
-    gptResponse = {
-      content: fallbackMessage,
-      usage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        totalTokens: 0,
-        model: 'fallback',
-      },
-    };
-    // Don't deduct credits for fallback responses
-    shouldDeductCredits = false;
+      gptResponse = {
+        content: fallbackMessage,
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          model: 'fallback',
+        },
+      };
+      // Don't deduct credits for fallback responses
+      shouldDeductCredits = false;
+    } finally {
+      // End AI usage tracking session
+      if (trackingSessionId) {
+        const usageStats = await AIUsageTracker.endSession(trackingSessionId);
+        if (usageStats) {
+          logger.info('[GENERAL_CHAT] AI usage stats', {
+            chatSessionId: trackingSessionId,
+            workspaceId,
+            ...usageStats,
+          });
+        }
+      }
+    }
+
+    return { gptResponse, shouldDeductCredits };
+  };
+
+  // Execute agentic loop within AI tracking context
+  if (workspaceId) {
+    const agenticResult = await withAIContext(
+      { workspaceId, userId, operationType: 'chat' },
+      executeAgenticLoop
+    );
+    gptResponse = agenticResult.gptResponse;
+    shouldDeductCredits = agenticResult.shouldDeductCredits;
+  } else {
+    const agenticResult = await executeAgenticLoop();
+    gptResponse = agenticResult.gptResponse;
+    shouldDeductCredits = agenticResult.shouldDeductCredits;
+  }
+
+  // If request was cancelled, stop all further processing (no message saving, no response)
+  if (requestCancelled) {
+    return;
   }
 
   // ═══════════════════════════════════════════════════════════════════════

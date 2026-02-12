@@ -29,6 +29,12 @@ import {
   uploadWorkspaceLogo,
   deleteWorkspaceLogo,
 } from './workspace-logo.controller';
+import {
+  getWorkspaceAIUsage,
+  getWorkspaceAIUsageHistory,
+  getWorkspaceAIUsageDaily,
+  getTestAIUsage,
+} from './ai-usage.controller';
 
 const router = Router();
 
@@ -448,6 +454,189 @@ router.delete(
   requireAuth,
   asyncHandler(deleteWorkspaceLogo)
 );
+
+// ============================================================================
+// AI USAGE ENDPOINTS
+// ============================================================================
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/ai-usage:
+ *   get:
+ *     summary: Get AI usage statistics for workspace
+ *     description: Returns aggregated AI token usage and cost statistics for the workspace
+ *     tags: [AI Usage]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: Start date for filtering (ISO 8601)
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: End date for filtering (ISO 8601)
+ *       - in: query
+ *         name: operationType
+ *         schema:
+ *           type: string
+ *           enum: [lite-test, pro-test, chat, test-plan, api-test, analysis]
+ *         description: Filter by operation type
+ *     responses:
+ *       200:
+ *         description: AI usage statistics
+ *       403:
+ *         description: Access denied
+ */
+router.get(
+  '/:id/ai-usage',
+  requireAuth,
+  asyncHandler(getWorkspaceAIUsage)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/ai-usage/history:
+ *   get:
+ *     summary: Get AI usage history
+ *     description: Returns list of AI usage records for the workspace
+ *     tags: [AI Usage]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: Start date for filtering
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: End date for filtering
+ *       - in: query
+ *         name: operationType
+ *         schema:
+ *           type: string
+ *         description: Filter by operation type
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 100
+ *         description: Number of records to return
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *         description: Number of records to skip
+ *     responses:
+ *       200:
+ *         description: List of AI usage records
+ *       403:
+ *         description: Access denied
+ */
+router.get(
+  '/:id/ai-usage/history',
+  requireAuth,
+  asyncHandler(getWorkspaceAIUsageHistory)
+);
+
+/**
+ * @swagger
+ * /api/v1/workspaces/{id}/ai-usage/daily:
+ *   get:
+ *     summary: Get daily AI usage statistics
+ *     description: Returns daily aggregated usage for charting
+ *     tags: [AI Usage]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Workspace ID
+ *       - in: query
+ *         name: startDate
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: Start date (required)
+ *       - in: query
+ *         name: endDate
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: End date (required)
+ *     responses:
+ *       200:
+ *         description: Daily usage statistics
+ *       400:
+ *         description: Missing required parameters
+ *       403:
+ *         description: Access denied
+ */
+router.get(
+  '/:id/ai-usage/daily',
+  requireAuth,
+  asyncHandler(getWorkspaceAIUsageDaily)
+);
+
+/**
+ * @swagger
+ * /api/v1/tests/{testId}/ai-usage:
+ *   get:
+ *     summary: Get AI usage for a specific test
+ *     description: Returns AI token usage and cost for a single test execution
+ *     tags: [AI Usage]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: testId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Test ID
+ *     responses:
+ *       200:
+ *         description: Test AI usage data
+ *       403:
+ *         description: Access denied
+ *       404:
+ *         description: No usage data found for test
+ */
+// Note: This route should be mounted at a different base path (e.g., /api/v1/tests)
+// For now, we export the handler for use in other route files
+export { getTestAIUsage };
 
 // ============================================================================
 // MEMBERS ENDPOINTS

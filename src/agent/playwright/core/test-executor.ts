@@ -5,6 +5,9 @@ import { getActionIcon, type TestStepCompletedPayload } from '@/websocket/types/
 import { BrowserContext, Page } from 'playwright';
 import { IntelligentTestOrchestrator } from '../../core/intelligent-test-orchestrator';
 import { LiteEngine, ModeRouter } from '../../core/lite';
+import { withAIContext } from '@/services/ai/tracking/ai-context';
+import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
+import { supabaseAdmin } from '@/db/supabase';
 import { saveIntelligentTestResults, uploadArtifacts, uploadIntelligentTestScreenshots } from '../artifacts/artifacts-handler';
 import { collectArtifactsAndCleanup } from '../artifacts/test-cleanup';
 import { formatTestResult } from '../artifacts/test-result-formatter';
@@ -19,6 +22,26 @@ import { checkTestCancelled } from '../utils/test-cancellation-checker';
 import { createRunKey, TestRunRegistry } from './test-run-registry';
 import { waitForStepReadiness, shouldSkipLookaheadAfter } from '@/services/testing/ui/preview/step-readiness.service';
 import type { IntentStep, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
+
+/**
+ * Resolve workspaceId from projectId (for AI usage tracking).
+ */
+async function resolveWorkspaceFromProject(projectId: string): Promise<string> {
+  try {
+    const { data } = await supabaseAdmin
+      .from('projects')
+      .select('workspace_id')
+      .eq('id', projectId)
+      .single();
+    return data?.workspace_id || 'unknown';
+  } catch (error) {
+    logger.warn('[PLAYWRIGHT] Failed to resolve workspace from project', {
+      projectId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return 'unknown';
+  }
+}
 
 /**
  * Parse URL safely (never throws).
@@ -759,19 +782,56 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         goal,
       });
 
-      const liteEngine = new LiteEngine(page, {
-        testId: testData.testId,
-        userId: testData.userId,
-        browser: testData.browser,
-        goal,
-        url: testData.url,
-        timeout: 5 * 60 * 1000, // 5 minutes
-        // Pass credentials for secure fill (never sent to LLM)
-        credentials: testData.options?.credentials,
-        chatSessionId: testData.chatSessionId, // Chat session for routing isolation
-      });
+      // Resolve workspaceId for AI usage tracking
+      const workspaceId = await resolveWorkspaceFromProject(testData.projectId);
 
-      const liteResult = await liteEngine.execute();
+      // Wrap execution with AI tracking context
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let usageStats: any = null;
+      const liteResult = await withAIContext(
+        {
+          workspaceId,
+          testId: testData.testId,
+          userId: testData.userId,
+          operationType: 'lite-test',
+        },
+        async () => {
+          AIUsageTracker.beginSession(testData.testId, {
+            workspaceId,
+            testId: testData.testId,
+            userId: testData.userId,
+            operationType: 'lite-test',
+          });
+
+          try {
+            const engine = new LiteEngine(page!, {
+              testId: testData.testId,
+              userId: testData.userId,
+              browser: testData.browser,
+              goal,
+              url: testData.url,
+              timeout: 5 * 60 * 1000, // 5 minutes
+              // Pass credentials for secure fill (never sent to LLM)
+              credentials: testData.options?.credentials,
+              chatSessionId: testData.chatSessionId, // Chat session for routing isolation
+            });
+
+            return engine.execute();
+          } finally {
+            // Always end AI usage tracking session (even on error)
+            usageStats = await AIUsageTracker.endSession(testData.testId);
+          }
+        },
+      );
+
+      if (usageStats) {
+        logger.info('[PLAYWRIGHT] AI usage stats', {
+          testId: testData.testId,
+          aiCallCount: usageStats.aiCallCount,
+          totalTokens: usageStats.totalTokens,
+          totalCostUSD: usageStats.totalCostUSD.toFixed(6),
+        });
+      }
 
       logger.info('[PLAYWRIGHT] Lite Engine completed', {
         testId: testData.testId,

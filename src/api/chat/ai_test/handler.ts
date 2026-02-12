@@ -16,6 +16,8 @@ import { ChatTestUpdatePayload } from '@/websocket/types/types';
 import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
+import { withAIContext } from '@/services/ai/tracking/ai-context';
+import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // REDIS LOCK HELPER: Prevents concurrent test starts for the same chat session
@@ -241,14 +243,24 @@ export async function handlePlatformTest(
 ): Promise<void> {
   const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal, logger: functionLogger, mode } = params;
 
-  if (abortSignal) {
-    const checkRequestAbortedWithLogging = functionLogger
-      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
-      : checkRequestAborted;
-    checkRequestAbortedWithLogging(abortSignal);
-  }
+  // Wrap entire test plan flow with AI tracking context
+  const executePlatformTest = async () => {
+    // Begin AI usage tracking session
+    const sessionId = chatSessionId || `test-plan-${Date.now()}`;
+    AIUsageTracker.beginSession(sessionId, {
+      workspaceId: workspace_id,
+      userId,
+      operationType: 'test-plan',
+    });
 
-  // FIX #3: Setup timeout for entire platform test flow
+    if (abortSignal) {
+      const checkRequestAbortedWithLogging = functionLogger
+        ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+        : checkRequestAborted;
+      checkRequestAbortedWithLogging(abortSignal);
+    }
+
+    // FIX #3: Setup timeout for entire platform test flow
   const flowStartTime = Date.now();
   const flowTimeout = 60000; // 60 seconds
   const checkTimeout = (step?: string) => {
@@ -1285,5 +1297,22 @@ export async function handlePlatformTest(
       timestamp: new Date().toISOString(),
       sessionId: chatSessionId,
     });
+  } finally {
+    // End AI usage tracking session
+    const usageStats = await AIUsageTracker.endSession(sessionId);
+    if (usageStats) {
+      logger.info('[PLATFORM_TEST] AI usage stats', {
+        sessionId,
+        workspaceId: workspace_id,
+        ...usageStats,
+      });
+    }
   }
+};
+
+// Execute platform test within AI tracking context
+return withAIContext(
+  { workspaceId: workspace_id, userId, operationType: 'test-plan' },
+  executePlatformTest
+);
 }

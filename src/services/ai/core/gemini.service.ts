@@ -1,6 +1,7 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
+import { AIUsageTracker, calculateGeminiCost } from '../tracking/ai-usage-tracker';
 
 /**
  * Gemini AI Service
@@ -71,9 +72,9 @@ export async function generateTextWithGemini(params: {
 
     // Race between generation and timeout
     const resultPromise = genModel.generateContent(prompt);
-    const result = await Promise.race([resultPromise, timeoutPromise]);
+    const genResult = await Promise.race([resultPromise, timeoutPromise]);
 
-    const response = result.response;
+    const response = genResult.response;
     const text = response.text();
 
     // Extract token usage (Gemini provides this in response metadata)
@@ -83,7 +84,7 @@ export async function generateTextWithGemini(params: {
       totalTokenCount: 0,
     };
 
-    return {
+    const result: GeminiResponse = {
       content: text,
       usage: {
         inputTokens: usage.promptTokenCount || 0,
@@ -92,6 +93,19 @@ export async function generateTextWithGemini(params: {
         model,
       },
     };
+
+    // Track AI usage for billing/analytics
+    AIUsageTracker.record({
+      provider: 'gemini',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      totalTokens: result.usage.totalTokens,
+      costUSD: calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens),
+      timestamp: Date.now(),
+    });
+
+    return result;
   } catch (error) {
     logger.error('[GEMINI] Text generation failed', {
       error: error instanceof Error ? error.message : String(error),
@@ -171,9 +185,9 @@ export async function getChatCompletionWithGemini(params: {
 
     // Send last message and get response
     const resultPromise = chat.sendMessage(lastMessage.parts[0].text);
-    const result = await Promise.race([resultPromise, timeoutPromise]);
+    const genResult = await Promise.race([resultPromise, timeoutPromise]);
 
-    const response = result.response;
+    const response = genResult.response;
     const text = response.text();
 
     const usage = response.usageMetadata || {
@@ -182,7 +196,7 @@ export async function getChatCompletionWithGemini(params: {
       totalTokenCount: 0,
     };
 
-    return {
+    const result: GeminiResponse = {
       content: text,
       usage: {
         inputTokens: usage.promptTokenCount || 0,
@@ -191,6 +205,19 @@ export async function getChatCompletionWithGemini(params: {
         model,
       },
     };
+
+    // Track AI usage for billing/analytics
+    AIUsageTracker.record({
+      provider: 'gemini',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      totalTokens: result.usage.totalTokens,
+      costUSD: calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens),
+      timestamp: Date.now(),
+    });
+
+    return result;
   } catch (error) {
     logger.error('[GEMINI] Chat completion failed', {
       error: error instanceof Error ? error.message : String(error),

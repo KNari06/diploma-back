@@ -3,6 +3,7 @@ import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 import { ChatCompletionMessageParam, ChatCompletionTool, ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
+import { AIUsageTracker, calculateOpenAICost } from '../tracking/ai-usage-tracker';
 
 /**
  * ✅ FIX: Configure OpenAI client with timeout and retry settings
@@ -121,7 +122,7 @@ export async function getChatCompletionWithMessages(
       totalTokens: usage?.total_tokens || 0,
     });
 
-    return {
+    const result: OpenAIResponse = {
       content: reply,
       tool_calls: toolCalls,
       usage: {
@@ -131,6 +132,19 @@ export async function getChatCompletionWithMessages(
         model,
       },
     };
+
+    // Track AI usage for billing/analytics
+    AIUsageTracker.record({
+      provider: 'openai',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      totalTokens: result.usage.totalTokens,
+      costUSD: calculateOpenAICost(model, result.usage.inputTokens, result.usage.outputTokens),
+      timestamp: Date.now(),
+    });
+
+    return result;
   } catch (error: unknown) {
     // Handle abort signal errors (client closed connection, timeout, etc.)
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -225,7 +239,7 @@ export async function getChatCompletion(
       totalTokens: usage?.total_tokens || 0,
     });
 
-    return {
+    const result: OpenAIResponse = {
       content: reply,
       usage: {
         inputTokens: usage?.prompt_tokens || 0,
@@ -234,6 +248,19 @@ export async function getChatCompletion(
         model,
       },
     };
+
+    // Track AI usage for billing/analytics
+    AIUsageTracker.record({
+      provider: 'openai',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      totalTokens: result.usage.totalTokens,
+      costUSD: calculateOpenAICost(model, result.usage.inputTokens, result.usage.outputTokens),
+      timestamp: Date.now(),
+    });
+
+    return result;
   } catch (error: any) {
     // Handle abort signal errors (client closed connection, timeout, etc.)
     if (error?.message?.includes('aborted') || error?.message?.includes('signal')) {
