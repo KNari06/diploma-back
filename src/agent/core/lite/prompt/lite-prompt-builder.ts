@@ -9,6 +9,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { logger } from '@/utils/core/logger';
 import type { TaskPlanStep } from '../analysis/task-plan-builder';
 import type { AIDecision, BlacklistedAction, GoalGuidance, ModalDismissInfo, StateDriftAuditResult, StuckCheck, VisionHints } from '../lite-types';
+import type { AccumulatedContext } from '../agents/types';
 import { PromptSanitizer } from '../security/prompt-sanitizer';
 
 /**
@@ -834,6 +835,41 @@ What should the agent do next? Respond with JSON:
     }
 
     return lines.join('\n') + '\n';
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ACCUMULATED CONTEXT: Injected into monolithic prompt on multi-agent fallback
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Format accumulated context from multi-agent brain for monolithic fallback.
+   * Produces a narrative section that helps the monolithic LLM continue
+   * from where the multi-agent pipeline left off (instead of starting blind).
+   */
+  static formatAccumulatedContext(ctx: AccumulatedContext): string {
+    const parts: string[] = ['\n🧠 MULTI-AGENT CONTEXT (prior analysis):'];
+
+    if (ctx.formProgress) {
+      parts.push(`Form progress: ${ctx.formProgress}`);
+    }
+
+    if (ctx.recentInsights && ctx.recentInsights.length > 0) {
+      parts.push(`Insights: ${ctx.recentInsights.map(i => `"${i.slice(0, 80)}"`).join(', ')}`);
+    }
+
+    if (ctx.lastExpectedOutcome) {
+      parts.push(`Expected: ${ctx.lastExpectedOutcome.slice(0, 100)}`);
+    }
+
+    if (ctx.accomplishments && ctx.accomplishments.length > 0) {
+      parts.push(`Done so far: ${ctx.accomplishments.join(', ')}`);
+    }
+
+    // Only return section if there's meaningful content beyond the header
+    if (parts.length <= 1) return '';
+
+    parts.push('→ Continue from where the multi-agent brain left off.\n');
+    return parts.join('\n');
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

@@ -123,12 +123,91 @@ export interface ObserverInput {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Working Memory Types (Cognitive Agent)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Structured strategy action — replaces free-form text between Strategist→Actor */
+export interface StrategyAction {
+  /** What type of action to take */
+  actionType: 'fill' | 'click' | 'scroll' | 'wait' | 'goto' | 'select' | 'press' | 'hover';
+  /** Target description (e.g., "email field", "submit button") */
+  target: string;
+  /** Optional target ref if Strategist can identify it from Observer's formAnalysis */
+  targetRef?: string;
+  /** Value to fill (for fill/select) */
+  value?: string;
+  /** Whether this targets a sensitive field */
+  isSensitive?: boolean;
+}
+
+/** Visited page entry in working memory */
+export interface VisitedPageEntry {
+  pageType: string;
+  visitCount: number;
+  lastIteration: number;
+}
+
+/** Successful action record in working memory */
+export interface SuccessfulActionRecord {
+  iteration: number;
+  action: string;
+  ref: string;
+  outcome: string;
+}
+
+/** Critic rejection record — captures WHY an action was rejected (cross-ref pattern learning) */
+export interface CriticRejectionRecord {
+  /** Iteration when rejection occurred */
+  iteration: number;
+  /** The action that was rejected (e.g., "click") */
+  action: string;
+  /** The element ref that was targeted — optional because some actions have no ref */
+  ref?: string;
+  /** Why the Critic rejected this action (the pattern-level lesson) */
+  reason: string;
+  /** Risk assessment from the Critic */
+  riskAssessment: string;
+}
+
+/** Structured working memory persisted across iterations */
+export interface WorkingMemory {
+  /** Form fields we've interacted with: ref → status */
+  formProgress: Record<string, 'filled' | 'failed' | 'skipped'>;
+  /** Elements we've successfully interacted with (bounded, last 20) */
+  successfulActions: SuccessfulActionRecord[];
+  /** Current sub-goal from Strategist decomposition */
+  currentSubGoal?: string;
+  /** What the agent has accomplished so far (structured, not narrative) */
+  accomplishments: string[];
+  /** Known page topology: URL → page info */
+  visitedPages: Record<string, VisitedPageEntry>;
+  /** Accumulated form state from Observer across iterations */
+  lastFormAnalysis?: FormAnalysis;
+  /** Critic rejection history: captures rejection reasons for cross-ref pattern avoidance (bounded) */
+  criticRejections?: CriticRejectionRecord[];
+}
+
+/** Accumulated context for monolithic fallback — don't lose knowledge */
+export interface AccumulatedContext {
+  /** Last known form progress (formatted string) */
+  formProgress?: string;
+  /** Recent reasoning insights */
+  recentInsights?: string[];
+  /** Last expected outcome (for continuity) */
+  lastExpectedOutcome?: string;
+  /** Accomplishments so far */
+  accomplishments?: string[];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Strategist Agent Types
 // ═══════════════════════════════════════════════════════════════════════════
 
 export interface StrategistOutput {
   /** High-level strategy description */
   strategy: string;
+  /** Structured strategy action — used by Actor directly without regex parsing */
+  structuredStrategy?: StrategyAction;
   /** Reasoning behind the strategy */
   thought: string;
   /** What we expect to happen after executing this strategy */
@@ -137,6 +216,8 @@ export interface StrategistOutput {
   verificationCriteria?: string;
   /** Alternative strategies if primary fails — ordered by preference */
   alternatives: string[];
+  /** Structured alternatives with confidence — validated before branching */
+  structuredAlternatives?: Array<{ action: StrategyAction; confidence: number }>;
   /** Confidence in this strategy (0-1) */
   confidence: number;
   /** Action cost awareness: estimated risk level of chosen strategy */
@@ -170,6 +251,10 @@ export interface StrategistInput {
   isStuck: boolean;
   /** Last outcome description */
   lastOutcome?: string;
+  /** Cognitive: Structured working memory from previous iterations */
+  workingMemory?: WorkingMemory;
+  /** Critic feedback from a rejected action — re-strategize with this as negative constraint */
+  criticFeedback?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -184,8 +269,10 @@ export interface ActorOutput {
 }
 
 export interface ActorInput {
-  /** Strategy from Strategist */
+  /** Strategy from Strategist (text fallback) */
   strategy: string;
+  /** Structured strategy action — bypasses regex parsing when available */
+  structuredStrategy?: StrategyAction;
   /** Filtered elements relevant to the strategy (max 30) */
   relevantElements: string;
   /** Form analysis for deterministic shortcuts */
@@ -229,8 +316,10 @@ export interface CriticVerdict {
   riskAssessment: string;
   /** At least one reason this action could fail (Red Teaming) */
   failureRisk: string;
-  /** If override: what action the Critic thinks should be taken instead */
+  /** If override: what action the Critic thinks should be taken instead (text, for logs) */
   suggestedAction?: string;
+  /** Structured override command — actionable, not just advisory */
+  structuredOverride?: { action: string; ref?: string; value?: string };
   /** Confidence in verdict (0-1) */
   confidence: number;
   /** Whether the chosen ref was hallucinated (not in real elements) */
@@ -264,6 +353,8 @@ export interface CriticInput {
   iteration: number;
   /** Strategist's thought (for reasoning consistency — but NOT shown to AI critic) */
   strategistThought: string;
+  /** Vision-detected conflicts for the target element (covered/hidden/disabled) */
+  visionConflicts?: VisionHints['conflicts'];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -348,6 +439,16 @@ export interface MultiAgentRunMetrics {
   alternativeUsedCount: number;
   policyViolationCount: number;
 
+  // Cognitive enhancements
+  /** Times circuit breaker skipped multi-agent */
+  circuitBreakerSkipCount: number;
+  /** Times critic was skipped for low-risk actions */
+  criticLowRiskSkipCount: number;
+  /** Times critic override was applied */
+  criticOverrideAppliedCount: number;
+  /** Times re-strategize was attempted after critic rejection */
+  reStrategizeCount: number;
+
   // Computed (for convenience)
   avgPipelineMs: number;
   observerCacheHitRate: number;
@@ -391,5 +492,20 @@ export interface MultiAgentResult {
     criticVerdict?: 'approve' | 'reject' | 'override' | 'skipped';
     /** Number of policy violations found */
     policyViolations?: number;
+    /** Whether circuit breaker skipped this iteration */
+    circuitBreakerSkipped?: boolean;
+    /** Whether critic was skipped for low-risk action */
+    criticSkippedLowRisk?: boolean;
+    /** Whether critic override was applied */
+    criticOverrideApplied?: boolean;
+    /** Whether re-strategize was attempted after critic rejection */
+    reStrategized?: boolean;
+  };
+  /** Action rejected by Critic (for blacklist recording by caller) */
+  rejectedAction?: {
+    action: string;
+    ref: string;
+    elementHint: string;
+    reason: string;
   };
 }

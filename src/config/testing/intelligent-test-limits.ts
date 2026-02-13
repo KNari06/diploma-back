@@ -188,6 +188,40 @@ export const LITE_ENGINE_FLAGS = {
   multiAgentCriticTimeoutMs: 2000,
   /** Max reasoning history entries for consistency check */
   criticReasoningHistorySize: 10,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // COGNITIVE ENHANCEMENTS (Working Memory, Structured Strategy, Adaptive)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable structured working memory across iterations */
+  enableWorkingMemory: true,
+  /** Enable structured strategy interface (Strategist → Actor without regex) */
+  enableStructuredStrategy: true,
+  /** Enable adaptive circuit breaker (auto-disable multi-agent on high failure rate) */
+  enableCircuitBreaker: true,
+  /** Sliding window size for circuit breaker failure rate calculation */
+  circuitBreakerWindowSize: 5,
+  /** Failure rate threshold to trip circuit breaker (0-1) */
+  circuitBreakerFailThreshold: 0.6,
+  /** How often (iterations) to retry when circuit breaker is open */
+  circuitBreakerRetryInterval: 3,
+  /** Skip critic for low-risk deterministic actions (saves ~2s) */
+  criticSkipForLowRisk: true,
+  /** Enable critic override — apply structured override commands instead of just logging */
+  enableCriticOverride: true,
+  /** Preserve accumulated context when falling back to monolithic */
+  preserveContextOnFallback: true,
+  /** Enable pre-validation of alternatives before branching */
+  enableValidatedAlternatives: true,
+  /** Enable deterministic precondition checks before trying alternative hypotheses */
+  enableHypothesisPreconditions: true,
+  /** Track critic rejection reasons in working memory for cross-ref pattern avoidance */
+  enableCriticRejectionMemory: true,
+  /** Maximum number of critic rejections to keep in working memory */
+  criticRejectionMemorySize: 5,
+  /** Re-run Strategist with critic feedback when all alternatives exhausted (one retry, no loops) */
+  enableReStrategizeOnReject: true,
+  /** Check vision conflicts (covered/hidden/disabled elements) in Critic Phase 1 (zero AI cost) */
+  enableCriticVisualCheck: true,
 } as const;
 
 /**

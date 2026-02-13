@@ -28,6 +28,8 @@ interface AICriticResponse {
   riskAssessment: string;
   failureRisk: string;
   suggestedAction?: string;
+  /** Cognitive: Structured override command — actionable, not just advisory */
+  structuredOverride?: { action: string; ref?: string; value?: string };
   confidence: number;
 }
 
@@ -55,6 +57,12 @@ export class CriticAgent {
 
     // 1c. Reasoning consistency across iterations
     const reasoningInconsistencies = CriticAgent.checkReasoningConsistency(input);
+
+    // 1d. Visual conflict check (covered/hidden/disabled elements from VisionHints)
+    if (LITE_ENGINE_FLAGS.enableCriticVisualCheck) {
+      const visualConflictViolations = CriticAgent.checkVisualConflicts(input);
+      policyViolations.push(...visualConflictViolations);
+    }
 
     // If critical policy violation found, reject immediately (no AI call needed)
     const blockingViolations = policyViolations.filter(v => v.severity === 'block');
@@ -115,6 +123,7 @@ export class CriticAgent {
       riskAssessment: aiResult.riskAssessment,
       failureRisk: aiResult.failureRisk,
       suggestedAction: aiResult.suggestedAction,
+      structuredOverride: aiResult.structuredOverride,
       confidence: aiResult.confidence,
       refExists,
       policyViolations,
@@ -154,7 +163,13 @@ export class CriticAgent {
     }
     // Check security policies
     const violations = CriticAgent.checkSecurityPolicies(input);
-    return !violations.some(v => v.severity === 'block');
+    if (violations.some(v => v.severity === 'block')) return false;
+    // Check visual conflicts
+    if (LITE_ENGINE_FLAGS.enableCriticVisualCheck) {
+      const visualViolations = CriticAgent.checkVisualConflicts(input);
+      if (visualViolations.some(v => v.severity === 'block')) return false;
+    }
+    return true;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -315,6 +330,49 @@ export class CriticAgent {
     return inconsistencies.slice(0, 3);
   }
 
+  /**
+   * Visual conflict check: Does the target ref have a known vision conflict?
+   * Zero AI cost, <1ms — purely deterministic lookup against VisionHints.conflicts.
+   *
+   * Severity rules:
+   * - 'covered' or 'hidden' → block (element not interactable)
+   * - 'disabled' → warn (element exists but may not respond)
+   * - 'not_found' → skip (already caught by checkRefExists)
+   */
+  private static checkVisualConflicts(input: CriticInput): PolicyViolation[] {
+    const violations: PolicyViolation[] = [];
+
+    if (!input.visionConflicts || input.visionConflicts.length === 0) {
+      return violations;
+    }
+
+    const targetRef = input.proposedCommand.ref;
+    if (!targetRef) return violations;
+
+    for (const conflict of input.visionConflicts) {
+      if (conflict.domRef !== targetRef) continue;
+
+      // Skip 'not_found' — already handled by checkRefExists
+      if (conflict.issue === 'not_found') continue;
+
+      if (conflict.issue === 'covered' || conflict.issue === 'hidden') {
+        violations.push({
+          type: 'unsafe_action',
+          description: `Target element ${targetRef} ("${conflict.domName || conflict.visionText}") is ${conflict.issue} by another element. ${conflict.note}`,
+          severity: 'block',
+        });
+      } else if (conflict.issue === 'disabled') {
+        violations.push({
+          type: 'unsafe_action',
+          description: `Target element ${targetRef} ("${conflict.domName || conflict.visionText}") is disabled. ${conflict.note}`,
+          severity: 'warn',
+        });
+      }
+    }
+
+    return violations;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // AI Red Teaming prompt (Double-Blind)
   // ═══════════════════════════════════════════════════════════════════════
@@ -379,6 +437,7 @@ If overriding:
   "riskAssessment": "Wrong element selected. The correct submit button is e12, not e5.",
   "failureRisk": "e5 is a decorative element that won't trigger form submission",
   "suggestedAction": "click e12 instead — it is the actual form submit button",
+  "structuredOverride": { "action": "click", "ref": "e12" },
   "confidence": 0.85
 }
 

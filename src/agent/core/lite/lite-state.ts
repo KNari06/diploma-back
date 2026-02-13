@@ -582,6 +582,9 @@ export class LiteState {
       case 'rate_limited':
         return `⏳ Rate limited (HTTP 429): Backing off and waiting before retrying.`;
 
+      case 'critic_rejected':
+        return `🛡️ Critic rejected: Action was vetoed by safety critic before execution. Try a different approach.`;
+
       default:
         return undefined;
     }
@@ -722,6 +725,7 @@ export class LiteState {
       execution_error: 0,
       critical_error: 0,
       rate_limited: 0,
+      critic_rejected: 0,
     };
 
     let totalElementChanges = 0;
@@ -767,6 +771,8 @@ export class LiteState {
         return '🔴';
       case 'rate_limited':
         return '⏳';
+      case 'critic_rejected':
+        return '🛡️';
       default:
         return '❓';
     }

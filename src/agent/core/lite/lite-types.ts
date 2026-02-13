@@ -288,7 +288,8 @@ export type ActionOutcome =
   | 'no_effect'          // Action executed but no state change
   | 'execution_error'    // Action failed to execute
   | 'critical_error'     // Critical error - page crashed/blank (needs reload)
-  | 'rate_limited';      // HTTP 429 / rate limiting detected - should back off and wait
+  | 'rate_limited'       // HTTP 429 / rate limiting detected - should back off and wait
+  | 'critic_rejected';   // Critic agent vetoed the action before execution
 
 /**
  * Modal dismiss attempt result

@@ -1,5 +1,5 @@
 /**
- * Multi-Agent Orchestrator (Manus Architecture)
+ * Multi-Agent Orchestrator (Manus Architecture — Cognitive Enhancement)
  * Coordinates Observer → Strategist → Actor → Critic pipeline.
  * Falls back gracefully — if any agent fails, returns { success: false }
  * so the caller can use the existing monolithic prompt.
@@ -9,6 +9,14 @@
  * - Critic (Phase 4): Red Teaming + Security Policy + Reasoning Consistency
  * - Expectation Loop: Stores expectedOutcome for next iteration validation
  * - Reasoning History: Tracks strategy thoughts for consistency checking
+ *
+ * Cognitive enhancements:
+ * - Working Memory: Structured form progress, accomplishments, visited pages across iterations
+ * - Structured Strategy: Typed action interface replaces free-form text between agents
+ * - Adaptive Circuit Breaker: Auto-disable multi-agent on sustained failure rate
+ * - Critic Override: Structured override commands are applied, not just logged
+ * - Context Preservation: Accumulated knowledge passed to monolithic fallback
+ * - Validated Alternatives: Pre-validate alternatives for semantic diversity before branching
  */
 
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
@@ -18,7 +26,15 @@ import { CriticAgent } from './critic-agent';
 import { ObserverCache } from './observer-cache';
 import { ObserverAgent } from './observer-agent';
 import { StrategistAgent } from './strategist-agent';
-import type { MultiAgentInput, MultiAgentResult, MultiAgentRunMetrics, ObserverOutput } from './types';
+import type {
+  AccumulatedContext,
+  MultiAgentInput,
+  MultiAgentResult,
+  MultiAgentRunMetrics,
+  ObserverOutput,
+  StrategyAction,
+  WorkingMemory,
+} from './types';
 
 export class MultiAgentOrchestrator {
   private observerCache: ObserverCache;
@@ -28,6 +44,22 @@ export class MultiAgentOrchestrator {
   private lastVerificationCriteria: string | undefined;
   /** Manus-style: Rolling reasoning history for consistency checks (bounded) */
   private reasoningHistory: string[] = [];
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Cognitive: Working Memory
+  // ═══════════════════════════════════════════════════════════════════════════
+  private workingMemory: WorkingMemory = {
+    formProgress: {},
+    successfulActions: [],
+    accomplishments: [],
+    visitedPages: {},
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Cognitive: Circuit Breaker
+  // ═══════════════════════════════════════════════════════════════════════════
+  private circuitState: 'closed' | 'open' | 'half-open' = 'closed';
+  private recentResults: boolean[] = [];
 
   /** Run-level metrics accumulated across all iterations */
   private metrics = {
@@ -48,6 +80,10 @@ export class MultiAgentOrchestrator {
     criticSkippedCount: 0,
     alternativeUsedCount: 0,
     policyViolationCount: 0,
+    circuitBreakerSkipCount: 0,
+    criticLowRiskSkipCount: 0,
+    criticOverrideAppliedCount: 0,
+    reStrategizeCount: 0,
   };
 
   constructor() {
@@ -64,13 +100,44 @@ export class MultiAgentOrchestrator {
     return this.lastVerificationCriteria;
   }
 
+  /** Get accumulated context for monolithic fallback — don't lose knowledge */
+  getAccumulatedContext(): AccumulatedContext | undefined {
+    if (!LITE_ENGINE_FLAGS.preserveContextOnFallback) return undefined;
+
+    const formEntries = Object.entries(this.workingMemory.formProgress);
+    const formProgress = formEntries.length > 0
+      ? formEntries.map(([ref, status]) => `${ref}[${status}]`).join(', ')
+      : undefined;
+
+    return {
+      formProgress,
+      recentInsights: this.reasoningHistory.slice(-2),
+      lastExpectedOutcome: this.lastExpectedOutcome,
+      accomplishments: this.workingMemory.accomplishments.slice(-3),
+    };
+  }
+
   /**
    * Execute the full Observer → Strategist → Actor → Critic pipeline
-   * Manus-style: Tries alternatives (branching) before falling back to monolithic
+   * Cognitive: Circuit breaker, working memory, structured strategy, validated alternatives
    * Returns { success: false } if all branches fail (caller should fall through to monolithic)
    */
   async execute(input: MultiAgentInput): Promise<MultiAgentResult> {
     this.metrics.totalIterations++;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Cognitive: Circuit Breaker — skip if failure rate too high
+    // ═══════════════════════════════════════════════════════════════════════
+    if (LITE_ENGINE_FLAGS.enableCircuitBreaker && this.circuitState === 'open') {
+      if (this.metrics.totalIterations % LITE_ENGINE_FLAGS.circuitBreakerRetryInterval === 0) {
+        this.circuitState = 'half-open';
+        logger.info('[MULTI_AGENT] Circuit breaker half-open, retrying');
+      } else {
+        this.metrics.circuitBreakerSkipCount++;
+        this.metrics.monolithicFallbackCount++;
+        return { success: false, debug: { observerCacheHit: false, actorDeterministic: false, observerMs: 0, strategistMs: 0, actorMs: 0, criticMs: 0, totalMs: 0, circuitBreakerSkipped: true } };
+      }
+    }
 
     const totalStart = Date.now();
     let observerMs = 0;
@@ -80,6 +147,9 @@ export class MultiAgentOrchestrator {
     let observerCacheHit = false;
     let actorDeterministic = false;
     let criticVerdict: 'approve' | 'reject' | 'override' | 'skipped' = 'skipped';
+    let criticSkippedLowRisk = false;
+    let criticOverrideApplied = false;
+    let reStrategized = false;
 
     try {
       // ═══════════════════════════════════════════════════════════════════════
@@ -112,6 +182,7 @@ export class MultiAgentOrchestrator {
 
         if (!observation) {
           logger.warn('[MULTI_AGENT] Observer failed, falling back to monolithic');
+          this.recordCircuitBreakerResult(false);
           this.metrics.monolithicFallbackCount++;
           return { success: false };
         }
@@ -122,6 +193,13 @@ export class MultiAgentOrchestrator {
         }
       }
       observerMs = Date.now() - observerStart;
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // Cognitive: Update Working Memory from Observer
+      // ═══════════════════════════════════════════════════════════════════════
+      if (LITE_ENGINE_FLAGS.enableWorkingMemory) {
+        this.updateWorkingMemoryFromObserver(observation, input.url, input.iteration);
+      }
 
       // ═══════════════════════════════════════════════════════════════════════
       // Phase 2: Strategist — "What should I do?"
@@ -139,10 +217,12 @@ export class MultiAgentOrchestrator {
         iteration: input.iteration,
         isStuck: input.isStuck,
         lastOutcome: input.lastOutcome,
+        workingMemory: LITE_ENGINE_FLAGS.enableWorkingMemory ? this.workingMemory : undefined,
       });
 
       if (!strategy) {
         logger.warn('[MULTI_AGENT] Strategist failed, falling back to monolithic');
+        this.recordCircuitBreakerResult(false);
         this.metrics.monolithicFallbackCount++;
         return { success: false };
       }
@@ -161,6 +241,7 @@ export class MultiAgentOrchestrator {
 
       // Handle done/blocked from Strategist
       if (strategy.done) {
+        this.recordCircuitBreakerResult(true);
         this.metrics.multiAgentSuccessCount++;
         this.metrics.totalObserverMs += observerMs;
         this.metrics.totalStrategistMs += strategistMs;
@@ -194,6 +275,7 @@ export class MultiAgentOrchestrator {
       }
 
       if (strategy.blockedInfo) {
+        this.recordCircuitBreakerResult(true);
         this.metrics.multiAgentSuccessCount++;
         this.metrics.totalObserverMs += observerMs;
         this.metrics.totalStrategistMs += strategistMs;
@@ -228,19 +310,73 @@ export class MultiAgentOrchestrator {
 
       // ═══════════════════════════════════════════════════════════════════════
       // Phase 3: Actor — "Which element exactly?"
-      // Manus-style Branching: Try primary strategy, then alternatives
+      // Cognitive: Pass structured strategy for direct resolution
+      // Manus: Branching with validated alternatives
       // ═══════════════════════════════════════════════════════════════════════
       const actorStart = Date.now();
 
       // Build hypothesis tree: primary strategy + alternatives
       const hypotheses = [strategy.strategy, ...strategy.alternatives];
+
+      // Cognitive: Validate alternatives before branching — filter duplicates and non-existent refs
+      // Use index-preserving map so structured alternatives stay aligned with text alternatives
+      const structuredAlts = strategy.structuredAlternatives;
+      const structuredAltByIndex = new Map<number, { action: StrategyAction; confidence: number }>();
+      if (LITE_ENGINE_FLAGS.enableValidatedAlternatives && structuredAlts && strategy.structuredStrategy) {
+        for (let i = 0; i < structuredAlts.length; i++) {
+          const alt = structuredAlts[i];
+          // Alternative must NOT target same ref as primary (semantic diversity)
+          if (alt.action.targetRef && alt.action.targetRef === strategy.structuredStrategy!.targetRef) {
+            continue;
+          }
+          // Alternative ref must exist in page elements (if specified)
+          if (alt.action.targetRef && !input.snapshotElements.includes(alt.action.targetRef)) {
+            continue;
+          }
+          structuredAltByIndex.set(i, alt);
+        }
+      } else if (structuredAlts) {
+        // No validation — pass through all
+        for (let i = 0; i < structuredAlts.length; i++) {
+          structuredAltByIndex.set(i, structuredAlts[i]);
+        }
+      }
+
       let action = null;
       let usedHypothesisIndex = 0;
 
       for (let h = 0; h < hypotheses.length; h++) {
         const hypothesis = hypotheses[h];
+
+        // Cognitive: Deterministic precondition filtering for alternatives (skip primary h=0)
+        if (h > 0 && LITE_ENGINE_FLAGS.enableHypothesisPreconditions) {
+          const alt = structuredAltByIndex.get(h - 1);
+          if (alt) {
+            // Confidence check (available on the wrapper, not inside StrategyAction)
+            if (!input.isStuck && alt.confidence < 0.3) {
+              logger.debug('[MULTI_AGENT] Hypothesis skipped: low confidence', { h, confidence: alt.confidence });
+              continue;
+            }
+            if (!this.evaluateAlternativePreconditions(alt.action, observation, input)) {
+              logger.debug('[MULTI_AGENT] Hypothesis skipped: preconditions not met', {
+                h,
+                actionType: alt.action.actionType,
+                target: alt.action.target?.slice(0, 30),
+              });
+              continue;
+            }
+          }
+        }
+
+        // Cognitive: Pass structured strategy for primary (h=0), structured alternatives for others
+        // h-1 maps to the alternative index in structuredAlternatives (parallel with strategy.alternatives)
+        const structuredForThisHypothesis = h === 0
+          ? (LITE_ENGINE_FLAGS.enableStructuredStrategy ? strategy.structuredStrategy : undefined)
+          : (LITE_ENGINE_FLAGS.enableStructuredStrategy && structuredAltByIndex.get(h - 1)?.action);
+
         action = await ActorAgent.act({
           strategy: hypothesis,
+          structuredStrategy: structuredForThisHypothesis || undefined,
           relevantElements: input.snapshotElements,
           formAnalysis: observation.formAnalysis,
           goal: input.goal,
@@ -266,6 +402,7 @@ export class MultiAgentOrchestrator {
 
       if (!action) {
         logger.warn('[MULTI_AGENT] All hypotheses failed Actor, falling back to monolithic');
+        this.recordCircuitBreakerResult(false);
         this.metrics.monolithicFallbackCount++;
         return { success: false };
       }
@@ -276,11 +413,17 @@ export class MultiAgentOrchestrator {
 
       // ═══════════════════════════════════════════════════════════════════════
       // Phase 4: Critic — "Should we really do this?" (Manus Red Teaming)
-      // Independent audit: does NOT see Strategist's reasoning
+      // Cognitive: Skip for low-risk deterministic actions, apply structured overrides
       // ═══════════════════════════════════════════════════════════════════════
       let policyViolationCount = 0;
 
-      if (LITE_ENGINE_FLAGS.enableCriticAgent) {
+      // Cognitive: Skip critic for low-risk deterministic actions
+      const shouldSkipCritic = LITE_ENGINE_FLAGS.criticSkipForLowRisk
+        && actorDeterministic
+        && strategy.confidence >= 0.9
+        && strategy.riskLevel === 'low';
+
+      if (LITE_ENGINE_FLAGS.enableCriticAgent && !shouldSkipCritic) {
         const criticStart = Date.now();
 
         const verdict = await CriticAgent.critique({
@@ -295,6 +438,7 @@ export class MultiAgentOrchestrator {
           reasoningHistory: this.reasoningHistory.slice(0, -1), // Exclude current (already in strategistThought)
           iteration: input.iteration,
           strategistThought: strategy.thought,
+          visionConflicts: input.visionHints?.conflicts,
         });
 
         criticMs = Date.now() - criticStart;
@@ -311,12 +455,33 @@ export class MultiAgentOrchestrator {
               inconsistencies: verdict.reasoningInconsistencies.length,
             });
 
+            // Cognitive: Record critic rejection in working memory for cross-ref pattern avoidance
+            if (LITE_ENGINE_FLAGS.enableCriticRejectionMemory && LITE_ENGINE_FLAGS.enableWorkingMemory) {
+              this.workingMemory.criticRejections ??= [];
+              this.workingMemory.criticRejections.push({
+                iteration: input.iteration,
+                action: action.command.action,
+                ref: action.command.ref,
+                reason: verdict.failureRisk || verdict.riskAssessment || 'Critic rejected',
+                riskAssessment: verdict.riskAssessment,
+              });
+              const maxRejections = LITE_ENGINE_FLAGS.criticRejectionMemorySize;
+              if (this.workingMemory.criticRejections.length > maxRejections) {
+                this.workingMemory.criticRejections = this.workingMemory.criticRejections.slice(-maxRejections);
+              }
+            }
+
             // Try next alternative hypothesis if available
             // Re-run deterministic security checks on fallback (skip AI to avoid latency)
             let fallbackAction = null;
             for (let h = usedHypothesisIndex + 1; h < hypotheses.length; h++) {
+              // Pass structured alternative if available (same as primary hypothesis loop)
+              const fallbackStructured = LITE_ENGINE_FLAGS.enableStructuredStrategy
+                ? structuredAltByIndex.get(h - 1)?.action
+                : undefined;
               const candidate = await ActorAgent.act({
                 strategy: hypotheses[h],
+                structuredStrategy: fallbackStructured || undefined,
                 relevantElements: input.snapshotElements,
                 formAnalysis: observation.formAnalysis,
                 goal: input.goal,
@@ -335,6 +500,7 @@ export class MultiAgentOrchestrator {
                   formAnalysis: observation.formAnalysis,
                   iteration: input.iteration,
                   strategistThought: strategy.thought,
+                  visionConflicts: input.visionHints?.conflicts,
                 });
                 if (fallbackSafe) {
                   usedHypothesisIndex = h;
@@ -352,20 +518,151 @@ export class MultiAgentOrchestrator {
             }
 
             if (!fallbackAction) {
-              logger.warn('[MULTI_AGENT] Critic rejected and no safe alternatives, falling back to monolithic');
-              this.metrics.monolithicFallbackCount++;
-              this.metrics.criticRejectCount++;
-              this.metrics.policyViolationCount += policyViolationCount;
-              return { success: false };
+              // ═══════════════════════════════════════════════════════════════
+              // Cognitive: Re-Strategize on Rejection (one attempt, no loops)
+              // Middle path between "try alternatives" and "bail to monolithic"
+              // ═══════════════════════════════════════════════════════════════
+              if (LITE_ENGINE_FLAGS.enableReStrategizeOnReject) {
+                logger.info('[MULTI_AGENT] Re-strategizing after critic rejection');
+                this.metrics.reStrategizeCount++;
+
+                const reStrategistStart = Date.now();
+                const reStrategy = await StrategistAgent.strategize({
+                  observation,
+                  goal: input.goal,
+                  history: input.history,
+                  taskPlanSummary: input.taskPlanSummary,
+                  guidance: input.guidance,
+                  progressScore: input.progressScore,
+                  failedActions: input.failedActions,
+                  auditedDrift: input.auditedDrift,
+                  iteration: input.iteration,
+                  isStuck: input.isStuck,
+                  lastOutcome: input.lastOutcome,
+                  workingMemory: LITE_ENGINE_FLAGS.enableWorkingMemory ? this.workingMemory : undefined,
+                  criticFeedback: `${verdict.riskAssessment}. ${verdict.failureRisk}`,
+                });
+                strategistMs += Date.now() - reStrategistStart;
+
+                if (reStrategy && !reStrategy.done && !reStrategy.blockedInfo) {
+                  const reActorStart = Date.now();
+                  const reStructured = LITE_ENGINE_FLAGS.enableStructuredStrategy
+                    ? reStrategy.structuredStrategy
+                    : undefined;
+                  const reAction = await ActorAgent.act({
+                    strategy: reStrategy.strategy,
+                    structuredStrategy: reStructured || undefined,
+                    relevantElements: input.snapshotElements,
+                    formAnalysis: observation.formAnalysis,
+                    goal: input.goal,
+                    hasCredentials: input.hasCredentials,
+                  });
+                  actorMs += Date.now() - reActorStart;
+
+                  if (reAction) {
+                    // Quick deterministic safety check on the re-strategized action
+                    const reSafe = CriticAgent.quickSafetyCheck({
+                      proposedCommand: reAction.command,
+                      actorReasoning: reAction.reasoning,
+                      goal: input.goal,
+                      availableElements: input.snapshotElements,
+                      observation,
+                      currentUrl: input.url,
+                      hasCredentials: input.hasCredentials,
+                      formAnalysis: observation.formAnalysis,
+                      iteration: input.iteration,
+                      strategistThought: reStrategy.thought,
+                      visionConflicts: input.visionHints?.conflicts,
+                    });
+
+                    if (reSafe) {
+                      action = reAction;
+                      criticVerdict = 'approve';
+                      reStrategized = true;
+                      this.lastExpectedOutcome = reStrategy.expectedOutcome;
+                      this.lastVerificationCriteria = reStrategy.verificationCriteria;
+
+                      // Update reasoning history
+                      this.reasoningHistory.push(reStrategy.thought);
+                      if (this.reasoningHistory.length > LITE_ENGINE_FLAGS.criticReasoningHistorySize) {
+                        this.reasoningHistory = this.reasoningHistory.slice(-LITE_ENGINE_FLAGS.criticReasoningHistorySize);
+                      }
+
+                      logger.info('[MULTI_AGENT] Re-strategize succeeded', {
+                        strategy: reStrategy.strategy.slice(0, 60),
+                        action: reAction.command.action,
+                        ref: reAction.command.ref,
+                      });
+                    }
+                  }
+                }
+              }
+
+              // If re-strategize was not attempted or did not produce a safe action, fall back
+              if (criticVerdict !== 'approve') {
+                logger.warn('[MULTI_AGENT] Critic rejected and no safe alternatives (including re-strategize), falling back to monolithic');
+                // Record failed action in working memory
+                if (LITE_ENGINE_FLAGS.enableWorkingMemory && action?.command?.ref && action.command.action === 'fill') {
+                  this.workingMemory.formProgress[action.command.ref] = 'failed';
+                }
+                this.recordCircuitBreakerResult(false);
+                this.metrics.monolithicFallbackCount++;
+                this.metrics.criticRejectCount++;
+                this.metrics.policyViolationCount += policyViolationCount;
+                return {
+                  success: false,
+                  rejectedAction: action?.command?.ref ? {
+                    action: action.command.action,
+                    ref: action.command.ref,
+                    elementHint: action.reasoning?.slice(0, 60) || action.command.ref,
+                    reason: verdict.failureRisk || verdict.riskAssessment || 'Critic rejected',
+                  } : undefined,
+                };
+              }
             }
-          } else if (verdict.verdict === 'override' && verdict.suggestedAction) {
-            logger.info('[MULTI_AGENT] Critic override suggestion', {
-              suggestion: verdict.suggestedAction.slice(0, 80),
-            });
-            // Log the override suggestion but don't act on it — Critic AI suggestions
-            // are advisory. The Actor's deterministic/AI-chosen element is more reliable
-            // than the Critic's text-based suggestion which can't be parsed to a command.
-            // Override is used for logging/tracing only.
+          } else if (verdict.verdict === 'override') {
+            // Cognitive: Apply structured override if available and valid
+            const VALID_ACTIONS = new Set(['click', 'fill', 'press', 'goto', 'scroll', 'select', 'hover', 'wait']);
+            if (LITE_ENGINE_FLAGS.enableCriticOverride && verdict.structuredOverride?.ref) {
+              const overrideRef = verdict.structuredOverride.ref;
+              const overrideAction = verdict.structuredOverride.action;
+              // Validate action type at runtime (AI output can be anything)
+              if (!VALID_ACTIONS.has(overrideAction)) {
+                logger.debug('[MULTI_AGENT] Critic override has invalid action type, ignoring', {
+                  action: overrideAction,
+                });
+              } else {
+                // Validate that override ref actually exists on the page
+                const refPattern = new RegExp(`\\b${overrideRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+                if (refPattern.test(input.snapshotElements)) {
+                  action = {
+                    command: {
+                      action: overrideAction as 'click' | 'fill' | 'press' | 'goto' | 'scroll' | 'select' | 'hover' | 'wait',
+                      ref: overrideRef,
+                      value: verdict.structuredOverride.value,
+                    },
+                    reasoning: `Critic override: ${verdict.suggestedAction || 'alternative element selected'}`,
+                  };
+                  criticOverrideApplied = true;
+                  this.metrics.criticOverrideAppliedCount++;
+                  logger.info('[MULTI_AGENT] Critic override applied', {
+                    ref: overrideRef,
+                    action: overrideAction,
+                  });
+                } else {
+                  // Override ref invalid — treat as approve with warning
+                  logger.debug('[MULTI_AGENT] Critic override ref not found, proceeding with Actor choice', {
+                    overrideRef,
+                  });
+                  criticVerdict = 'approve';
+                }
+              }
+            } else if (verdict.suggestedAction) {
+              // Legacy: Log text-based override suggestion (advisory only)
+              logger.info('[MULTI_AGENT] Critic override suggestion (advisory)', {
+                suggestion: verdict.suggestedAction.slice(0, 80),
+              });
+            }
           }
 
           // Log inconsistencies for debugging
@@ -376,10 +673,28 @@ export class MultiAgentOrchestrator {
             });
           }
         }
+      } else if (shouldSkipCritic) {
+        criticSkippedLowRisk = true;
+        this.metrics.criticLowRiskSkipCount++;
+        this.metrics.criticSkippedCount++;
+        logger.debug('[MULTI_AGENT] Critic skipped: low-risk deterministic action', {
+          confidence: strategy.confidence,
+          riskLevel: strategy.riskLevel,
+        });
       }
 
       const totalMs = Date.now() - totalStart;
       const finalStrategy = hypotheses[usedHypothesisIndex];
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // Cognitive: Update Working Memory from successful action
+      // ═══════════════════════════════════════════════════════════════════════
+      if (LITE_ENGINE_FLAGS.enableWorkingMemory) {
+        this.updateWorkingMemoryFromAction(action.command, finalStrategy, input.iteration);
+      }
+
+      // Record circuit breaker result
+      this.recordCircuitBreakerResult(true);
 
       // Accumulate run-level metrics
       this.metrics.multiAgentSuccessCount++;
@@ -406,6 +721,8 @@ export class MultiAgentOrchestrator {
         observerCacheHit,
         actorDeterministic,
         criticVerdict,
+        criticSkippedLowRisk,
+        criticOverrideApplied,
         observerMs,
         strategistMs,
         actorMs,
@@ -415,6 +732,8 @@ export class MultiAgentOrchestrator {
         action: action.command.action,
         ref: action.command.ref,
         usedAlternative: usedHypothesisIndex > 0,
+        reStrategized,
+        circuitState: this.circuitState,
       });
 
       return {
@@ -442,6 +761,9 @@ export class MultiAgentOrchestrator {
           alternativeIndex: usedHypothesisIndex > 0 ? usedHypothesisIndex : undefined,
           criticVerdict,
           policyViolations: policyViolationCount > 0 ? policyViolationCount : undefined,
+          criticSkippedLowRisk: criticSkippedLowRisk || undefined,
+          criticOverrideApplied: criticOverrideApplied || undefined,
+          reStrategized: reStrategized || undefined,
         },
       };
     } catch (error) {
@@ -449,10 +771,139 @@ export class MultiAgentOrchestrator {
         error: error instanceof Error ? error.message : String(error),
         elapsed: Date.now() - totalStart,
       });
+      this.recordCircuitBreakerResult(false);
       this.metrics.monolithicFallbackCount++;
       return { success: false };
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Cognitive: Working Memory Management
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** Update working memory from Observer's form analysis */
+  private updateWorkingMemoryFromObserver(observation: ObserverOutput, url: string, iteration: number): void {
+    // Track visited pages
+    const urlKey = this.normalizeUrl(url);
+    const existing = this.workingMemory.visitedPages[urlKey];
+    if (existing) {
+      existing.visitCount++;
+      existing.lastIteration = iteration;
+      existing.pageType = observation.pageType;
+    } else {
+      this.workingMemory.visitedPages[urlKey] = {
+        pageType: observation.pageType,
+        visitCount: 1,
+        lastIteration: iteration,
+      };
+    }
+
+    // Update form progress from Observer's formAnalysis
+    if (observation.formAnalysis) {
+      this.workingMemory.lastFormAnalysis = observation.formAnalysis;
+      for (const field of observation.formAnalysis.fields) {
+        const current = this.workingMemory.formProgress[field.ref];
+        if (field.hasValue && current !== 'filled') {
+          this.workingMemory.formProgress[field.ref] = 'filled';
+        } else if (!field.hasValue && !current) {
+          // Field exists but not yet interacted with — don't overwrite 'failed'
+        }
+      }
+    }
+  }
+
+  /** Update working memory after a successful action */
+  private updateWorkingMemoryFromAction(
+    command: { action: string; ref?: string; value?: string },
+    strategyDescription: string,
+    iteration: number,
+  ): void {
+    // Record successful action (bounded to last 20)
+    if (command.ref) {
+      this.workingMemory.successfulActions.push({
+        iteration,
+        action: command.action,
+        ref: command.ref,
+        outcome: 'executed',
+      });
+      if (this.workingMemory.successfulActions.length > 20) {
+        this.workingMemory.successfulActions = this.workingMemory.successfulActions.slice(-20);
+      }
+    }
+
+    // Track accomplishment
+    const accomplishment = this.describeAccomplishment(command, strategyDescription);
+    if (accomplishment) {
+      this.workingMemory.accomplishments.push(accomplishment);
+      if (this.workingMemory.accomplishments.length > 10) {
+        this.workingMemory.accomplishments = this.workingMemory.accomplishments.slice(-10);
+      }
+    }
+  }
+
+  /** Generate human-readable accomplishment from action */
+  private describeAccomplishment(
+    command: { action: string; ref?: string; value?: string },
+    strategy: string,
+  ): string | undefined {
+    switch (command.action) {
+      case 'fill': return `Filled ${command.ref}`;
+      case 'click': return `Clicked ${command.ref}`;
+      case 'goto': return `Navigated to new page`;
+      case 'select': return `Selected option in ${command.ref}`;
+      default: return strategy.length > 60 ? strategy.slice(0, 57) + '...' : strategy;
+    }
+  }
+
+  /** Normalize URL for working memory (strip query params for grouping) */
+  private normalizeUrl(url: string): string {
+    try {
+      const parsed = new URL(url);
+      return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      return url;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Cognitive: Circuit Breaker
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** Record pipeline result for circuit breaker sliding window */
+  private recordCircuitBreakerResult(success: boolean): void {
+    if (!LITE_ENGINE_FLAGS.enableCircuitBreaker) return;
+
+    this.recentResults.push(success);
+    const windowSize = LITE_ENGINE_FLAGS.circuitBreakerWindowSize;
+    if (this.recentResults.length > windowSize) {
+      this.recentResults = this.recentResults.slice(-windowSize);
+    }
+
+    // Only evaluate after minimum window
+    if (this.recentResults.length < windowSize) return;
+
+    const failRate = this.recentResults.filter(r => !r).length / this.recentResults.length;
+
+    if (this.circuitState === 'half-open') {
+      if (success) {
+        this.circuitState = 'closed';
+        logger.info('[MULTI_AGENT] Circuit breaker closed (recovered)');
+      } else {
+        this.circuitState = 'open';
+        logger.warn('[MULTI_AGENT] Circuit breaker re-opened (half-open test failed)');
+      }
+    } else if (failRate > LITE_ENGINE_FLAGS.circuitBreakerFailThreshold) {
+      this.circuitState = 'open';
+      logger.warn('[MULTI_AGENT] Circuit breaker opened', {
+        failRate: Math.round(failRate * 100),
+        window: this.recentResults.length,
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Metrics & Cache Management
+  // ═══════════════════════════════════════════════════════════════════════════
 
   /** Get accumulated run-level metrics with computed averages */
   getRunMetrics(): MultiAgentRunMetrics {
@@ -485,5 +936,49 @@ export class MultiAgentOrchestrator {
    */
   clearCache(): void {
     this.observerCache.clear();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Hypothesis Precondition Evaluation (deterministic, <1ms)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Evaluate whether an alternative hypothesis should be attempted.
+   * Returns false if preconditions are clearly not met — skips the Actor call.
+   * Only used for alternatives (h > 0), never for the primary hypothesis.
+   */
+  private evaluateAlternativePreconditions(
+    alt: StrategyAction,
+    observation: ObserverOutput,
+    input: MultiAgentInput,
+  ): boolean {
+    // Rule 1: Skip fill if the target field is already filled in working memory
+    if (alt.actionType === 'fill' && alt.targetRef) {
+      if (this.workingMemory.formProgress[alt.targetRef] === 'filled') {
+        return false;
+      }
+    }
+
+    // Rule 2: Skip if action+ref is in the blacklist (already failed execution)
+    if (alt.targetRef && input.failedActions) {
+      const isBlacklisted = input.failedActions.some(
+        fa => fa.action === alt.actionType && fa.ref === alt.targetRef
+      );
+      if (isBlacklisted) return false;
+    }
+
+    // Rule 3: Skip non-click actions when a modal is blocking the page
+    // (modals typically need a click to dismiss before other actions work)
+    if (observation.modalInfo && alt.actionType !== 'click' && alt.actionType !== 'wait') {
+      return false;
+    }
+
+    // Rule 4: Skip non-wait actions when our last action triggered async work
+    // (DOM is actively changing from our action — not just background requests)
+    if (observation.networkActivity?.asyncWorkTriggered && alt.actionType !== 'wait') {
+      return false;
+    }
+
+    return true;
   }
 }

@@ -11,12 +11,17 @@
  * В) Verification Criteria — concrete success conditions, not vague expectations
  * Г) Rolling Context — compressed old history + detailed recent iterations
  * D) Negative Constraints — explicit "do NOT" rules to prevent common mistakes
+ *
+ * Cognitive enhancements:
+ * E) Working Memory — structured form progress, accomplishments, visited pages
+ * F) Structured Strategy — typed StrategyAction for Actor direct resolution
+ * G) Structured Alternatives — with confidence scores and semantic diversity
  */
 
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
 import { LitePromptBuilder } from '../prompt/lite-prompt-builder';
-import type { StrategistInput, StrategistOutput } from './types';
+import type { StrategistInput, StrategistOutput, WorkingMemory } from './types';
 
 export class StrategistAgent {
   /**
@@ -50,6 +55,8 @@ export class StrategistAgent {
       blocked: !!result.blockedInfo,
       alternativeCount: result.alternatives.length,
       hasVerification: !!result.verificationCriteria,
+      hasStructured: !!result.structuredStrategy,
+      structuredAltCount: result.structuredAlternatives?.length ?? 0,
     });
 
     return result;
@@ -111,13 +118,64 @@ export class StrategistAgent {
     return parts.join(', ') + '.';
   }
 
+  /**
+   * Cognitive: Format working memory into a concise prompt section
+   */
+  private static formatWorkingMemory(memory: WorkingMemory): string {
+    const parts: string[] = [];
+
+    // Form progress
+    const formEntries = Object.entries(memory.formProgress);
+    if (formEntries.length > 0) {
+      const formStatus = formEntries.map(([ref, status]) => `${ref}[${status}]`).join(', ');
+      parts.push(`Form fields: ${formStatus}`);
+    }
+
+    // Recent accomplishments (last 5)
+    if (memory.accomplishments.length > 0) {
+      const recent = memory.accomplishments.slice(-5);
+      parts.push(`Done: ${recent.join(' → ')}`);
+    }
+
+    // Visited pages
+    const pageEntries = Object.entries(memory.visitedPages);
+    if (pageEntries.length > 0) {
+      const pages = pageEntries.map(([url, info]) => {
+        const path = url.replace(/^https?:\/\/[^/]+/, '');
+        return `${path}(${info.pageType}, ${info.visitCount}x)`;
+      });
+      parts.push(`Visited: ${pages.join(', ')}`);
+    }
+
+    // Current sub-goal
+    if (memory.currentSubGoal) {
+      parts.push(`Current sub-goal: ${memory.currentSubGoal}`);
+    }
+
+    // Critic rejections (cross-ref pattern avoidance)
+    if (memory.criticRejections && memory.criticRejections.length > 0) {
+      const rejections = memory.criticRejections.map(r =>
+        `- [iter ${r.iteration}] ${r.action}${r.ref ? `(${r.ref})` : ''}: ${r.reason}`
+      );
+      parts.push(`\n🛡️ CRITIC REJECTIONS (avoid these patterns):\n${rejections.join('\n')}`);
+    }
+
+    return parts.length > 0 ? parts.join('\n') : 'No accumulated memory yet';
+  }
+
   private static buildPrompt(input: StrategistInput): string {
     // ═══════════════════════════════════════════════════════════════════════
     // Context sections
     // ═══════════════════════════════════════════════════════════════════════
 
     const failedActionsSection = input.failedActions && input.failedActions.length > 0
-      ? `\n🚫 BLACKLISTED ACTIONS (DO NOT use these — already failed):\n${input.failedActions.map(fa => `- ${fa.action}(${fa.ref}) "${fa.elementName}" failed ${fa.failureCount}x (${fa.lastOutcome})`).join('\n')}\n`
+      ? `\n🚫 BLACKLISTED ACTIONS (DO NOT use these — already failed):\n${input.failedActions.map(fa => {
+        const reason = fa.lastError ? `: ${fa.lastError.slice(0, 60)}` : '';
+        if (fa.lastOutcome === 'critic_rejected') {
+          return `- ${fa.action}(${fa.ref}) "${fa.elementName}" VETOED by safety critic ${fa.failureCount}x${reason}`;
+        }
+        return `- ${fa.action}(${fa.ref}) "${fa.elementName}" failed ${fa.failureCount}x (${fa.lastOutcome}${reason})`;
+      }).join('\n')}\n`
       : '';
 
     const auditSection = input.auditedDrift
@@ -126,6 +184,10 @@ export class StrategistAgent {
 
     const stuckSection = input.isStuck
       ? '\n⚠️ AGENT IS STUCK. You MUST choose a fundamentally different approach. Do NOT repeat any previous strategy.\n'
+      : '';
+
+    const criticFeedbackSection = input.criticFeedback
+      ? `\n⚠️ CRITIC FEEDBACK: ${input.criticFeedback}\nYour previous strategy was REJECTED by the safety critic. You MUST propose a DIFFERENT approach that avoids this risk.\n`
       : '';
 
     const guidanceSection = input.guidance
@@ -159,6 +221,39 @@ export class StrategistAgent {
     // Rolling context: compress old history, keep recent detailed
     const rollingHistory = StrategistAgent.buildRollingHistory(input.history);
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Cognitive: Working Memory section
+    // ═══════════════════════════════════════════════════════════════════════
+    const workingMemorySection = input.workingMemory
+      ? `\n═══ WORKING MEMORY (accumulated across iterations) ═══\n${StrategistAgent.formatWorkingMemory(input.workingMemory)}\n`
+      : '';
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Cognitive: Structured Strategy output format
+    // ═══════════════════════════════════════════════════════════════════════
+    const structuredStrategyFormat = LITE_ENGINE_FLAGS.enableStructuredStrategy
+      ? `,
+  "structuredStrategy": {
+    "actionType": "fill",
+    "target": "email field",
+    "targetRef": "e5",
+    "isSensitive": true
+  },
+  "structuredAlternatives": [
+    { "action": { "actionType": "click", "target": "Google sign-in button" }, "confidence": 0.7 }
+  ]`
+      : '';
+
+    const structuredStrategyRules = LITE_ENGINE_FLAGS.enableStructuredStrategy
+      ? `\n- "structuredStrategy": Typed action for the Actor — actionType + target + optional targetRef from form fields. If you know the exact ref from form analysis, include targetRef
+- "structuredAlternatives": Typed alternatives with confidence. Alternatives MUST target different elements/approaches than primary (semantic diversity)`
+      : '';
+
+    // Build form field refs hint for Strategist (so it can populate targetRef)
+    const formRefsHint = input.observation.formAnalysis
+      ? `\nForm field refs: ${input.observation.formAnalysis.fields.map(f => `${f.ref}="${f.label}"(${f.type}${f.hasValue ? ',filled' : ''})`).join(', ')}${input.observation.formAnalysis.submitButtonRef ? ` | Submit: ${input.observation.formAnalysis.submitButtonRef}="${input.observation.formAnalysis.submitButtonText}"` : ''}`
+      : '';
+
     return `You are a Strategy Agent (Manus architecture). Decide the next action based on structured observation.
 
 GOAL: ${input.goal}
@@ -169,8 +264,8 @@ GOAL: ${input.goal}
 - Obstacles: ${input.observation.obstacles.join(', ') || 'none'}
 - Form: ${input.observation.formAnalysis ? `${input.observation.formAnalysis.fields.length} fields, submit="${input.observation.formAnalysis.submitButtonText || 'unknown'}"` : 'none'}
 - Error state: ${input.observation.errorState || 'none'}
-- Modal: ${input.observation.modalInfo || 'none'}
-${impactSection}${spatialSection}${networkStateSection}${expectationSection}
+- Modal: ${input.observation.modalInfo || 'none'}${formRefsHint}
+${impactSection}${spatialSection}${networkStateSection}${expectationSection}${workingMemorySection}
 ═══ TOOL COST & RISK MATRIX ═══
 Before choosing an action, consider its cost and risk:
 | Action   | Cost   | Risk   | When to use                              |
@@ -184,7 +279,7 @@ Before choosing an action, consider its cost and risk:
 | press    | MEDIUM | MEDIUM | Keyboard shortcut. May trigger submit.   |
 | goto     | HIGH   | HIGH   | Navigate to new URL. Loses current page. |
 Prefer LOW-cost actions when multiple paths exist. Use HIGH-risk actions only when necessary.
-${planSection}${guidanceSection}${stuckSection}${failedActionsSection}${auditSection}
+${planSection}${guidanceSection}${stuckSection}${criticFeedbackSection}${failedActionsSection}${auditSection}
 ═══ PROGRESS ═══
 Progress: ${Math.round(input.progressScore * 100)}% | Iteration: ${input.iteration}
 Last outcome: ${input.lastOutcome || 'none'}
@@ -211,7 +306,7 @@ Respond with JSON:
   "confidence": 0.85,
   "riskLevel": "low",
   "done": false,
-  "blockedInfo": null
+  "blockedInfo": null${structuredStrategyFormat}
 }
 
 Rules:
@@ -220,7 +315,7 @@ Rules:
 - "expectedOutcome": What you predict will happen after this action
 - "verificationCriteria": Concrete check using DOM/URL (e.g., "URL contains /dashboard OR element with text 'Welcome' visible"). NOT vague descriptions
 - "riskLevel": "low" (scroll/hover/wait/fill), "medium" (click/select/press), "high" (goto/submit with side effects)
-- "confidence": 0-1. Lower if obstacles present, history shows failures, or expectation mismatch
+- "confidence": 0-1. Lower if obstacles present, history shows failures, or expectation mismatch${structuredStrategyRules}
 - If goal is achieved: set "done": true
 - If blocked (captcha, 2FA, verification): set "blockedInfo": {"reason": "...", "canUserHelp": true/false}
 - Return ONLY valid JSON`;

@@ -4,13 +4,16 @@
  * Temperature: 0.0 (fully deterministic)
  * ~4k input tokens, ~150 output tokens
  *
- * Deterministic path: Skip AI when form analysis gives clear ref
+ * Resolution priority:
+ * 1. Structured Strategy (cognitive) — direct ref from Strategist, zero parsing
+ * 2. Deterministic path — regex matching against form analysis
+ * 3. AI path — LLM picks element from available list
  */
 
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
 import { LitePromptBuilder } from '../prompt/lite-prompt-builder';
-import type { ActorInput, ActorOutput, FormAnalysis } from './types';
+import type { ActorInput, ActorOutput, FormAnalysis, StrategyAction } from './types';
 
 export class ActorAgent {
   /**
@@ -18,6 +21,18 @@ export class ActorAgent {
    * Returns null if cannot determine action
    */
   static async act(input: ActorInput): Promise<ActorOutput | null> {
+    // Cognitive: Try structured strategy first (direct resolution, no parsing)
+    if (input.structuredStrategy) {
+      const structured = ActorAgent.tryStructuredPath(input.structuredStrategy, input);
+      if (structured) {
+        logger.debug('[ACTOR] Structured strategy resolved', {
+          action: structured.command.action,
+          ref: structured.command.ref,
+        });
+        return structured;
+      }
+    }
+
     // Deterministic path: try to resolve without AI
     const deterministic = ActorAgent.tryDeterministicPath(input);
     if (deterministic) {
@@ -50,6 +65,115 @@ export class ActorAgent {
     });
 
     return result;
+  }
+
+  /**
+   * Cognitive: Resolve action directly from structured strategy
+   * Bypasses regex parsing entirely — Strategist provides typed action
+   */
+  private static tryStructuredPath(strategy: StrategyAction, input: ActorInput): ActorOutput | null {
+    // If Strategist provided a target ref, use it directly
+    if (strategy.targetRef) {
+      // Verify ref exists in available elements
+      const refPattern = new RegExp(`\\b${strategy.targetRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+      if (!refPattern.test(input.relevantElements)) {
+        logger.debug('[ACTOR] Structured strategy ref not found in elements', {
+          ref: strategy.targetRef,
+        });
+        return null; // Fall through to deterministic/AI
+      }
+
+      if (strategy.actionType === 'fill') {
+        return {
+          command: {
+            action: 'fill',
+            ref: strategy.targetRef,
+            value: strategy.value || 'placeholder',
+            isSensitive: input.hasCredentials && (strategy.isSensitive ?? false),
+          },
+          reasoning: `Structured: ${strategy.actionType} "${strategy.target}" (${strategy.targetRef})`,
+        };
+      }
+
+      if (strategy.actionType === 'select') {
+        return {
+          command: {
+            action: 'select',
+            ref: strategy.targetRef,
+            value: strategy.value || '',
+          },
+          reasoning: `Structured: ${strategy.actionType} "${strategy.target}" (${strategy.targetRef})`,
+        };
+      }
+
+      // click, hover, scroll_to
+      return {
+        command: {
+          action: strategy.actionType as 'click' | 'hover',
+          ref: strategy.targetRef,
+        },
+        reasoning: `Structured: ${strategy.actionType} "${strategy.target}" (${strategy.targetRef})`,
+      };
+    }
+
+    // No targetRef — try to resolve via form analysis using target description
+    if (input.formAnalysis && strategy.target) {
+      if (strategy.actionType === 'fill') {
+        const matchingField = ActorAgent.findMatchingField(input.formAnalysis, strategy.target);
+        if (matchingField) {
+          const isSensitive = strategy.isSensitive ?? /password|email|phone|username/i.test(matchingField.type);
+          return {
+            command: {
+              action: 'fill',
+              ref: matchingField.ref,
+              value: strategy.value || 'placeholder',
+              isSensitive: input.hasCredentials && isSensitive,
+            },
+            reasoning: `Structured: matched "${strategy.target}" to field "${matchingField.label}" (${matchingField.ref})`,
+          };
+        }
+      }
+
+      if (strategy.actionType === 'click' && /submit|login|sign.?in|register|send|save/i.test(strategy.target)) {
+        if (input.formAnalysis.submitButtonRef) {
+          return {
+            command: { action: 'click', ref: input.formAnalysis.submitButtonRef },
+            reasoning: `Structured: submit button "${input.formAnalysis.submitButtonText}" from strategy target "${strategy.target}"`,
+          };
+        }
+      }
+    }
+
+    // Ref-less actions
+    if (strategy.actionType === 'wait') {
+      return {
+        command: { action: 'wait' },
+        reasoning: `Structured: wait`,
+      };
+    }
+
+    if (strategy.actionType === 'press' && strategy.value) {
+      return {
+        command: { action: 'press', key: strategy.value },
+        reasoning: `Structured: press "${strategy.value}"`,
+      };
+    }
+
+    if (strategy.actionType === 'goto' && strategy.value) {
+      return {
+        command: { action: 'goto', url: strategy.value },
+        reasoning: `Structured: goto "${strategy.value}"`,
+      };
+    }
+
+    if (strategy.actionType === 'scroll') {
+      return {
+        command: { action: 'scroll', direction: 'down', amount: 600 },
+        reasoning: `Structured: scroll to find "${strategy.target}"`,
+      };
+    }
+
+    return null; // Could not resolve structured — fall through
   }
 
   /**

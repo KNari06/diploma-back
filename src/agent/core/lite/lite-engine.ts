@@ -4649,6 +4649,18 @@ export class LiteEngine {
           return result.decision as AIDecision;
         }
 
+        // Record critic-rejected action in blacklist so Strategist avoids it next iteration
+        if (LITE_ENGINE_FLAGS.enableNegativeReinforcement && result.rejectedAction) {
+          this.state.recordFailedAction(
+            result.rejectedAction.action,
+            result.rejectedAction.ref,
+            result.rejectedAction.elementHint,
+            'critic_rejected',
+            iteration,
+            result.rejectedAction.reason,
+          );
+        }
+
         // Fall through to monolithic if orchestrator failed
         // Clear stale expectation so next Observer doesn't validate against wrong prediction
         this.lastExpectedOutcome = undefined;
@@ -4690,6 +4702,24 @@ export class LiteEngine {
     }
 
     // Monolithic path (existing behavior)
+    // Inject accumulated context from multi-agent brain if available
+    let monolithicPrompt = prompt;
+    if (LITE_ENGINE_FLAGS.preserveContextOnFallback && this.multiAgentOrchestrator) {
+      const accCtx = this.multiAgentOrchestrator.getAccumulatedContext();
+      if (accCtx) {
+        const ctxSection = LitePromptBuilder.formatAccumulatedContext(accCtx);
+        if (ctxSection) {
+          const historyMarker = '\nHISTORY:\n';
+          const idx = monolithicPrompt.indexOf(historyMarker);
+          if (idx !== -1) {
+            monolithicPrompt = monolithicPrompt.slice(0, idx) + ctxSection + monolithicPrompt.slice(idx);
+          } else {
+            monolithicPrompt = monolithicPrompt + '\n' + ctxSection;
+          }
+        }
+      }
+    }
+
     // Trace AI prompt
     const aiPromptSpanId = this.traceWriter.generateSpanId();
     this.traceWriter.write({
@@ -4699,17 +4729,17 @@ export class LiteEngine {
       spanId: aiPromptSpanId,
       parentSpanId: iterationSpanId,
       payload: {
-        prompt,
+        prompt: monolithicPrompt,
         model: LITE_ENGINE_FLAGS.coreBrainModel,
-        promptLength: prompt.length,
-        estimatedTokens: Math.ceil(prompt.length / 4),
+        promptLength: monolithicPrompt.length,
+        estimatedTokens: Math.ceil(monolithicPrompt.length / 4),
       },
     });
 
     // Ask AI
     const decision = await withCancellation(
       this.config.testId,
-      LitePromptBuilder.askAI(prompt),
+      LitePromptBuilder.askAI(monolithicPrompt),
       'LitePromptBuilder.askAI'
     );
 
