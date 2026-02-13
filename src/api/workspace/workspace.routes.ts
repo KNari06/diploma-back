@@ -35,8 +35,28 @@ import {
   getWorkspaceAIUsageDaily,
   getTestAIUsage,
 } from './ai-usage.controller';
+import { checkInviteConfig } from './health-check.controller';
 
 const router = Router();
+
+// ============================================================================
+// HEALTH & CONFIGURATION CHECK
+// ============================================================================
+
+/**
+ * @swagger
+ * /api/v1/workspaces/config-check:
+ *   get:
+ *     summary: Check workspace invite configuration
+ *     description: Verify that SMTP and other required settings are configured correctly
+ *     tags: [Workspaces]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Configuration check results
+ */
+router.get('/config-check', requireAuth, asyncHandler(checkInviteConfig));
 
 // ============================================================================
 // MULTER CONFIGURATION FOR LOGO UPLOADS

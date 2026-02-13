@@ -86,6 +86,9 @@ const envSchema = z.object({
   // Backend URL (used for OAuth callbacks)
   BACKEND_URL: z.string().optional(),
 
+  // Email / SMTP
+  SMTP_PASSWORD: z.string().optional(), // Gmail app password for noreply@qait.dev
+
   // Integrations
   JIRA_CLIENT_ID: z.string().optional(),
   JIRA_CLIENT_SECRET: z.string().optional(),

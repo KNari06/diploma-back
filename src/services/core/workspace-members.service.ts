@@ -6,6 +6,7 @@ import {
   WorkspaceRole,
 } from './workspace-access.service';
 import { WorkspaceAuditService } from './workspace-audit.service';
+import { EmailService } from './email.service';
 
 // ============================================================================
 // WORKSPACE INVITE INTERFACE
@@ -339,7 +340,14 @@ export class WorkspaceMembersService {
     role: 'full_access' | 'view',
     invitedByUserId: string,
     auditContext?: { ipAddress?: string; userAgent?: string }
-  ): Promise<{ success: boolean; invite?: WorkspaceInvite; error?: string }> {
+  ): Promise<{
+    success: boolean;
+    invite?: WorkspaceInvite;
+    error?: string;
+    emailSent?: boolean;
+    userExists?: boolean;
+    inviteUrl?: string;
+  }> {
     try {
       const normalizedEmail = email.trim().toLowerCase();
 
@@ -404,31 +412,97 @@ export class WorkspaceMembersService {
         return { success: false, error: 'Failed to create invite' };
       }
 
-      // Send Supabase auth invite
+      // Send email notification
+      let emailSent = false;
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      const redirectTo = `${frontendUrl}/invite/accept?inviteId=${invite.id}&workspaceId=${workspaceId}`;
+
       try {
-        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-        const redirectTo = `${frontendUrl}/invite/accept?inviteId=${invite.id}&workspaceId=${workspaceId}`;
+        logger.info('[WORKSPACE_MEMBERS] Sending invite email', {
+          email: normalizedEmail,
+          redirectTo,
+          frontendUrl,
+          userExists: !!existingUser,
+        });
 
-        const { data: authInvite, error: authError } = await supabaseAdmin.auth.admin.inviteUserByEmail(
-          normalizedEmail,
-          { redirectTo }
-        );
-
-        if (authError) {
-          logger.warn('[WORKSPACE_MEMBERS] Supabase auth invite failed, invite still created', {
-            error: authError.message,
+        if (existingUser) {
+          // For existing users: send custom email via nodemailer
+          // Supabase Auth doesn't send emails to existing users via inviteUserByEmail
+          logger.info('[WORKSPACE_MEMBERS] User exists - sending custom email', {
             email: normalizedEmail,
+            userId: existingUser.id,
           });
-        } else if (authInvite?.user?.id) {
-          // Update invite with Supabase user ID
+
+          // Update invite with existing user ID
           await supabaseAdmin
             .from('workspace_invites')
-            .update({ supabase_invite_user_id: authInvite.user.id })
+            .update({ supabase_invite_user_id: existingUser.id })
             .eq('id', invite.id);
+
+          // Get workspace name for email
+          const { data: workspace } = await supabaseAdmin
+            .from('workspaces')
+            .select('project_name')
+            .eq('id', workspaceId)
+            .single();
+
+          // Send custom email
+          const emailResult = await EmailService.sendWorkspaceInvite({
+            inviteId: invite.id,
+            workspaceId,
+            workspaceName: workspace?.project_name,
+            recipientEmail: normalizedEmail,
+            role,
+            frontendUrl,
+          });
+
+          emailSent = emailResult.success;
+
+          if (!emailSent) {
+            logger.warn('[WORKSPACE_MEMBERS] Custom email failed for existing user', {
+              email: normalizedEmail,
+              error: emailResult.error,
+            });
+          }
+        } else {
+          // For new users, use inviteUserByEmail
+          const { data: authInvite, error: authError } = await supabaseAdmin.auth.admin.inviteUserByEmail(
+            normalizedEmail,
+            { redirectTo }
+          );
+
+          if (authError) {
+            logger.error('[WORKSPACE_MEMBERS] Supabase auth invite failed', {
+              error: authError.message,
+              errorCode: authError.code,
+              email: normalizedEmail,
+              redirectTo,
+            });
+          } else if (authInvite?.user?.id) {
+            emailSent = true;
+            // Update invite with Supabase user ID
+            await supabaseAdmin
+              .from('workspace_invites')
+              .update({ supabase_invite_user_id: authInvite.user.id })
+              .eq('id', invite.id);
+
+            logger.info('[WORKSPACE_MEMBERS] Invite email sent successfully', {
+              email: normalizedEmail,
+              userId: authInvite.user.id,
+              inviteId: invite.id,
+            });
+          } else {
+            logger.warn('[WORKSPACE_MEMBERS] Invite email response unclear', {
+              email: normalizedEmail,
+              hasData: !!authInvite,
+              hasUserId: !!authInvite?.user?.id,
+            });
+          }
         }
       } catch (authError) {
-        logger.warn('[WORKSPACE_MEMBERS] Exception sending Supabase auth invite', {
+        logger.error('[WORKSPACE_MEMBERS] Exception sending email', {
           error: authError instanceof Error ? authError.message : String(authError),
+          stack: authError instanceof Error ? authError.stack : undefined,
           email: normalizedEmail,
         });
       }
@@ -448,9 +522,17 @@ export class WorkspaceMembersService {
         inviteId: invite.id,
         email: normalizedEmail,
         role,
+        emailSent,
+        userExists: !!existingUser,
       });
 
-      return { success: true, invite };
+      return {
+        success: true,
+        invite,
+        emailSent,
+        userExists: !!existingUser,
+        inviteUrl: redirectTo,
+      };
     } catch (error) {
       logger.error('[WORKSPACE_MEMBERS] Exception creating invite', {
         error: error instanceof Error ? error.message : String(error),
@@ -463,6 +545,7 @@ export class WorkspaceMembersService {
 
   /**
    * Get all invites for a workspace
+   * Returns only pending (invited) invites by default
    */
   static async getInvites(workspaceId: string): Promise<WorkspaceInvite[]> {
     try {
@@ -470,6 +553,7 @@ export class WorkspaceMembersService {
         .from('workspace_invites')
         .select('*')
         .eq('workspace_id', workspaceId)
+        .eq('status', 'invited') // Only return pending invites
         .order('created_at', { ascending: false });
 
       if (error) {
@@ -583,7 +667,7 @@ export class WorkspaceMembersService {
     inviteId: string,
     actorUserId: string,
     auditContext?: { ipAddress?: string; userAgent?: string }
-  ): Promise<{ success: boolean; error?: string }> {
+  ): Promise<{ success: boolean; error?: string; emailSent?: boolean }> {
     try {
       // Get invite
       const invite = await this.getInvite(inviteId);
@@ -616,14 +700,39 @@ export class WorkspaceMembersService {
       }
 
       // Resend Supabase auth invite
+      let emailResent = false;
       try {
         const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
         const redirectTo = `${frontendUrl}/invite/accept?inviteId=${invite.id}&workspaceId=${invite.workspace_id}`;
 
-        await supabaseAdmin.auth.admin.inviteUserByEmail(invite.email, { redirectTo });
+        logger.info('[WORKSPACE_MEMBERS] Resending invite email', {
+          email: invite.email,
+          redirectTo,
+          inviteId,
+        });
+
+        const { data: authInvite, error: authError } = await supabaseAdmin.auth.admin.inviteUserByEmail(
+          invite.email,
+          { redirectTo }
+        );
+
+        if (authError) {
+          logger.error('[WORKSPACE_MEMBERS] Supabase auth resend failed', {
+            error: authError.message,
+            errorCode: authError.code,
+            email: invite.email,
+          });
+        } else {
+          emailResent = true;
+          logger.info('[WORKSPACE_MEMBERS] Invite email resent successfully', {
+            email: invite.email,
+            inviteId,
+          });
+        }
       } catch (authError) {
-        logger.warn('[WORKSPACE_MEMBERS] Exception resending Supabase auth invite', {
+        logger.error('[WORKSPACE_MEMBERS] Exception resending Supabase auth invite', {
           error: authError instanceof Error ? authError.message : String(authError),
+          stack: authError instanceof Error ? authError.stack : undefined,
           email: invite.email,
         });
       }
@@ -640,9 +749,10 @@ export class WorkspaceMembersService {
       logger.info('[WORKSPACE_MEMBERS] Invite resent', {
         inviteId,
         email: invite.email,
+        emailResent,
       });
 
-      return { success: true };
+      return { success: true, emailSent: emailResent };
     } catch (error) {
       logger.error('[WORKSPACE_MEMBERS] Exception resending invite', {
         error: error instanceof Error ? error.message : String(error),

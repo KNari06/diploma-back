@@ -429,10 +429,17 @@ export const createInvite = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
+    const message = result.userExists
+      ? 'Invite created. User already registered - they should check their workspace invites in the app.'
+      : 'Invite created and email sent successfully';
+
     res.status(201).json({
       success: true,
       data: result.invite,
-      message: 'Invite created successfully',
+      message,
+      emailSent: result.emailSent,
+      userExists: result.userExists,
+      inviteUrl: result.inviteUrl,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -577,6 +584,7 @@ export const resendInvite = async (req: Request, res: Response): Promise<void> =
     res.json({
       success: true,
       message: 'Invite resent successfully',
+      emailSent: result.emailSent,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
