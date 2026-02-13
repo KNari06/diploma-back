@@ -4,6 +4,7 @@ import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapp
 import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
 import { NotificationService } from '@/services/notifications/notification.service';
+import { getTelegramToken, sendMessage as sendTelegramMessage } from '@/services/api/telegram.service';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -310,7 +311,7 @@ export class TestCompletionHandlerService {
       // Either directly (test_id) or in a batch (test_ids array)
       const { data: runs, error: runsError } = await supabaseAdmin
         .from('regression_runs')
-        .select('id, saved_test_case_id, test_id, test_ids, status, user_id, trigger')
+        .select('id, saved_test_case_id, test_id, test_ids, status, user_id, trigger, plan_id')
         .or(`test_id.eq.${testId},test_ids.cs.["${testId}"]`)
         .in('status', ['running']); // Only update runs that are still in progress
 
@@ -347,26 +348,47 @@ export class TestCompletionHandlerService {
   }
 
   /**
-   * Create in-app notification for scheduled regression run completion
-   * Only called for runs with trigger='scheduled'
+   * Create in-app notification + Telegram for regression run completion
+   * Called for ALL trigger types (manual, chat, scheduled, webhook)
    */
-  private static async createScheduledRegressionNotification(
+  private static async createRegressionRunNotification(
     run: any,
     finalStatus: 'completed' | 'failed' | 'cancelled',
     summary: any
   ): Promise<void> {
     try {
-      // Only create notifications for scheduled runs
-      if (run.trigger !== 'scheduled') {
-        return;
-      }
-
       if (!run.user_id) {
         logger.debug('[TEST_COMPLETION] No user_id for regression run, skipping notification', {
           runId: run.id,
         });
         return;
       }
+
+      // Check if plan has notifications disabled
+      if (run.plan_id) {
+        const { data: plan } = await supabaseAdmin
+          .from('regression_plans')
+          .select('notifications_enabled')
+          .eq('id', run.plan_id)
+          .maybeSingle();
+
+        if (plan && plan.notifications_enabled === false) {
+          logger.debug('[TEST_COMPLETION] Notifications disabled for plan, skipping', {
+            runId: run.id,
+            planId: run.plan_id,
+          });
+          return;
+        }
+      }
+
+      // Determine trigger label
+      const triggerLabels: Record<string, string> = {
+        scheduled: 'Scheduled',
+        webhook: 'Git-triggered',
+        manual: 'Manual',
+        chat: 'Chat-triggered',
+      };
+      const triggerLabel = triggerLabels[run.trigger] || 'Automated';
 
       // Determine notification title and message
       let title = '';
@@ -375,21 +397,21 @@ export class TestCompletionHandlerService {
       if (finalStatus === 'completed') {
         const failedCount = summary.failed || 0;
         if (failedCount > 0) {
-          title = 'Scheduled regression completed with failures';
+          title = `${triggerLabel} regression completed with failures`;
           message = `Regression run completed: ${summary.passed || 0} passed, ${failedCount} failed`;
         } else {
-          title = 'Scheduled regression completed successfully';
+          title = `${triggerLabel} regression completed successfully`;
           message = `All ${summary.total || 0} test(s) passed successfully`;
         }
       } else if (finalStatus === 'failed') {
-        title = 'Scheduled regression failed';
+        title = `${triggerLabel} regression failed`;
         message = `Regression run failed: ${summary.failed || 0} test(s) failed`;
       } else if (finalStatus === 'cancelled') {
-        title = 'Scheduled regression cancelled';
+        title = `${triggerLabel} regression cancelled`;
         message = 'Regression run was cancelled before completion';
       }
 
-      // Create notification
+      // Create in-app notification
       await NotificationService.createNotification({
         userId: run.user_id,
         type: 'personal',
@@ -405,17 +427,57 @@ export class TestCompletionHandlerService {
         },
       });
 
-      logger.info('[TEST_COMPLETION] Created scheduled regression notification', {
+      logger.info('[TEST_COMPLETION] Created regression run notification', {
         runId: run.id,
         userId: run.user_id,
         status: finalStatus,
+        trigger: run.trigger,
       });
+
+      // Send Telegram notification
+      await this.sendTelegramNotification(run.user_id, title, message, run.id);
     } catch (error) {
-      logger.error('[TEST_COMPLETION] Failed to create scheduled regression notification', {
+      logger.error('[TEST_COMPLETION] Failed to create regression run notification', {
         error: error instanceof Error ? error.message : String(error),
         runId: run.id,
       });
       // Don't throw - notification failure shouldn't break run completion
+    }
+  }
+
+  /**
+   * Send Telegram notification for regression run completion
+   * Failures are logged but never thrown (don't break completion pipeline)
+   */
+  private static async sendTelegramNotification(
+    userId: string,
+    title: string,
+    message: string,
+    runId: string
+  ): Promise<void> {
+    try {
+      const tokenData = await getTelegramToken(userId);
+      if (!tokenData || !tokenData.external_id) {
+        // User has no Telegram integration or no chat_id configured
+        return;
+      }
+
+      const htmlMessage = `<b>${title}</b>\n\n${message}\n\n<i>Run ID: ${runId}</i>`;
+
+      await sendTelegramMessage(tokenData.access_token, tokenData.external_id, htmlMessage, 'HTML');
+
+      logger.info('[TEST_COMPLETION] Sent Telegram notification', {
+        userId,
+        runId,
+        chatId: tokenData.external_id,
+      });
+    } catch (error) {
+      logger.warn('[TEST_COMPLETION] Failed to send Telegram notification', {
+        error: error instanceof Error ? error.message : String(error),
+        userId,
+        runId,
+      });
+      // Don't throw - Telegram failure shouldn't break completion pipeline
     }
   }
 
@@ -494,8 +556,8 @@ export class TestCompletionHandlerService {
             summary,
           });
           
-          // Create notification for scheduled runs
-          await this.createScheduledRegressionNotification(run, finalStatus, summary);
+          // Create notification for regression run
+          await this.createRegressionRunNotification(run, finalStatus, summary);
         }
 
         return;
@@ -599,8 +661,8 @@ export class TestCompletionHandlerService {
           summary,
         });
         
-        // Create notification for scheduled runs
-        await this.createScheduledRegressionNotification(run, finalStatus, summary);
+        // Create notification for regression run
+        await this.createRegressionRunNotification(run, finalStatus, summary);
       }
     } catch (error) {
       logger.error('[TEST_COMPLETION] Error recomputing run status', {

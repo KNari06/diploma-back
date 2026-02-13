@@ -36,7 +36,7 @@ export type ExecutionStatus =
 /**
  * Trigger types for test runs
  */
-export type RunTrigger = 'manual' | 'chat' | 'scheduled';
+export type RunTrigger = 'manual' | 'chat' | 'scheduled' | 'webhook';
 
 /**
  * Fixture scope levels
@@ -386,6 +386,62 @@ export interface SharedStepCommand {
 }
 
 // ============================================================================
+// PLAN AUTOMATION CONFIG
+// ============================================================================
+
+/**
+ * Automation environment options
+ */
+export type AutomationEnvironment = 'staging' | 'production' | 'development';
+
+/**
+ * Automation browser options
+ */
+export type AutomationBrowser = 'chrome' | 'firefox' | 'safari' | 'edge';
+
+/**
+ * Git trigger types
+ */
+export type GitTriggerType = 'merge_to_main' | 'pr_opened' | 'release';
+
+/**
+ * Schedule configuration for plan automation
+ */
+export interface PlanScheduleConfig {
+  enabled: boolean;
+  days: string[];    // ["*"] or ["monday","tuesday",...]
+  time: string;      // "HH:MM"
+  timezone: string;
+  customCron?: string; // Raw cron expression — when present, bypasses days/time parsing
+}
+
+/**
+ * Git triggers configuration for plan automation
+ */
+export interface PlanGitTriggersConfig {
+  enabled: boolean;
+  triggerTypes: GitTriggerType[];
+  branch: string;
+}
+
+/**
+ * Runtime configuration for plan automation
+ */
+export interface PlanRuntimeConfig {
+  environment?: AutomationEnvironment;
+  browser?: AutomationBrowser;
+}
+
+/**
+ * Full automation configuration stored as JSONB on regression_plans
+ */
+export interface PlanAutomationConfig {
+  schedule?: PlanScheduleConfig;
+  gitTriggers?: PlanGitTriggersConfig;
+  runtime?: PlanRuntimeConfig;
+}
+
+// ============================================================================
 // REGRESSION PLAN
 // ============================================================================
 
@@ -400,6 +456,9 @@ export interface RegressionPlan {
   description?: string;
   isDefault: boolean;
   tags: string[];
+  automationConfig?: PlanAutomationConfig;
+  notificationsEnabled: boolean;
+  scheduleId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -446,6 +505,8 @@ export interface CreateRegressionPlanParams {
   description?: string;
   isDefault?: boolean;
   tags?: string[];
+  automationConfig?: PlanAutomationConfig;
+  notificationsEnabled?: boolean;
 }
 
 /**
@@ -458,6 +519,8 @@ export interface UpdateRegressionPlanParams {
   description?: string;
   isDefault?: boolean;
   tags?: string[];
+  automationConfig?: PlanAutomationConfig;
+  notificationsEnabled?: boolean;
 }
 
 // ============================================================================

@@ -8,6 +8,8 @@ import type {
     AddPlanItemParams,
     CreateRegressionPlanParams,
     ExpandedTestCase,
+    PlanGitTriggersConfig,
+    PlanScheduleConfig,
     RegressionPlan,
     RegressionPlanItem,
     RegressionPlanWithItems,
@@ -27,12 +29,13 @@ export class RegressionPlanService {
    * @returns Created plan
    */
   static async create(params: CreateRegressionPlanParams): Promise<RegressionPlan> {
-    const { projectId, userId, name, description, isDefault, tags } = params;
+    const { projectId, userId, name, description, isDefault, tags, automationConfig, notificationsEnabled } = params;
 
     logger.info('[REGRESSION_PLAN_SERVICE] Creating plan', {
       projectId,
       userId,
       name,
+      hasAutomation: !!automationConfig,
     });
 
     // If setting as default, unset existing default
@@ -53,6 +56,8 @@ export class RegressionPlanService {
         description: description || null,
         is_default: isDefault || false,
         tags: tags || [],
+        automation_config: automationConfig || null,
+        notifications_enabled: notificationsEnabled !== undefined ? notificationsEnabled : true,
       })
       .select('*')
       .single();
@@ -62,7 +67,23 @@ export class RegressionPlanService {
       throw new Error(`Failed to create plan: ${error.message}`);
     }
 
-    return this.mapToRegressionPlan(data);
+    const plan = this.mapToRegressionPlan(data);
+
+    // Sync schedule and git integration if automation config provided
+    if (automationConfig) {
+      const scheduleId = await this.syncSchedule(plan, automationConfig.schedule);
+      await this.syncGitIntegration(plan, automationConfig.gitTriggers);
+
+      if (scheduleId) {
+        await supabaseAdmin
+          .from('regression_plans')
+          .update({ schedule_id: scheduleId })
+          .eq('id', plan.id);
+        plan.scheduleId = scheduleId;
+      }
+    }
+
+    return plan;
   }
 
   /**
@@ -426,12 +447,14 @@ export class RegressionPlanService {
    * @returns Updated plan
    */
   static async update(params: UpdateRegressionPlanParams): Promise<RegressionPlan> {
-    const { id, userId, name, description, isDefault, tags } = params;
+    const { id, userId, name, description, isDefault, tags, automationConfig, notificationsEnabled } = params;
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
     if (description !== undefined) updates.description = description;
     if (tags !== undefined) updates.tags = tags;
+    if (automationConfig !== undefined) updates.automation_config = automationConfig;
+    if (notificationsEnabled !== undefined) updates.notifications_enabled = notificationsEnabled;
 
     // Handle is_default separately
     if (isDefault !== undefined) {
@@ -472,7 +495,23 @@ export class RegressionPlanService {
       throw new Error(`Failed to update plan: ${error.message}`);
     }
 
-    return this.mapToRegressionPlan(data);
+    const plan = this.mapToRegressionPlan(data);
+
+    // Re-sync schedule and git integration when automation config changes
+    if (automationConfig !== undefined) {
+      const scheduleId = await this.syncSchedule(plan, automationConfig?.schedule);
+      await this.syncGitIntegration(plan, automationConfig?.gitTriggers);
+
+      if (scheduleId !== plan.scheduleId) {
+        await supabaseAdmin
+          .from('regression_plans')
+          .update({ schedule_id: scheduleId })
+          .eq('id', plan.id);
+        plan.scheduleId = scheduleId || undefined;
+      }
+    }
+
+    return plan;
   }
 
   /**
@@ -483,6 +522,15 @@ export class RegressionPlanService {
    */
   static async delete(id: string, userId: string): Promise<boolean> {
     logger.info('[REGRESSION_PLAN_SERVICE] Deleting plan', { id });
+
+    // Deactivate linked schedule before delete (belt-and-suspenders — CASCADE handles it)
+    const plan = await this.getById(id, userId);
+    if (plan?.scheduleId) {
+      await supabaseAdmin
+        .from('test_schedules')
+        .update({ is_active: false })
+        .eq('id', plan.scheduleId);
+    }
 
     const { error } = await supabaseAdmin
       .from('regression_plans')
@@ -692,7 +740,16 @@ export class RegressionPlanService {
       }
     }
 
-    return expandedCases;
+    // Deduplicate by testCaseId + testType (e.g. module + flow from same module selected)
+    const seen = new Set<string>();
+    const deduplicated = expandedCases.filter((tc) => {
+      const key = `${tc.testType}:${tc.testCaseId}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    return deduplicated;
   }
 
   /**
@@ -805,6 +862,216 @@ export class RegressionPlanService {
   }
 
   // =========================================================================
+  // AUTOMATION HELPERS
+  // =========================================================================
+
+  /**
+   * Build a cron expression from schedule config
+   * Converts { days: ["monday","wednesday","friday"], time: "02:00" } → "0 2 * * 1,3,5"
+   */
+  private static buildCronExpression(schedule: PlanScheduleConfig): string {
+    const [hourStr, minuteStr] = (schedule.time || '00:00').split(':');
+    const hour = parseInt(hourStr, 10) || 0;
+    const minute = parseInt(minuteStr, 10) || 0;
+
+    // Map day names to cron day-of-week numbers (0=Sun, 1=Mon, ..., 6=Sat)
+    const dayMap: Record<string, number> = {
+      sunday: 0,
+      monday: 1,
+      tuesday: 2,
+      wednesday: 3,
+      thursday: 4,
+      friday: 5,
+      saturday: 6,
+    };
+
+    let dayOfWeek = '*';
+    if (schedule.days.length > 0 && !schedule.days.includes('*')) {
+      const dayNums = schedule.days
+        .map((d) => dayMap[d.toLowerCase()])
+        .filter((n) => n !== undefined)
+        .sort((a, b) => a - b);
+      if (dayNums.length > 0) {
+        dayOfWeek = dayNums.join(',');
+      }
+    }
+
+    return `${minute} ${hour} * * ${dayOfWeek}`;
+  }
+
+  /**
+   * Create/update/deactivate linked test_schedules record
+   * Returns scheduleId or null
+   */
+  private static async syncSchedule(
+    plan: RegressionPlan,
+    scheduleConfig?: PlanScheduleConfig
+  ): Promise<string | null> {
+    try {
+      const existingScheduleId = plan.scheduleId;
+
+      // No schedule config or disabled → deactivate existing
+      if (!scheduleConfig || !scheduleConfig.enabled) {
+        if (existingScheduleId) {
+          await supabaseAdmin
+            .from('test_schedules')
+            .update({ is_active: false })
+            .eq('id', existingScheduleId);
+          logger.info('[REGRESSION_PLAN_SERVICE] Deactivated schedule', {
+            planId: plan.id,
+            scheduleId: existingScheduleId,
+          });
+        }
+        return existingScheduleId || null;
+      }
+
+      const cronExpression = scheduleConfig.customCron || this.buildCronExpression(scheduleConfig);
+      const timezone = scheduleConfig.timezone || 'UTC';
+
+      // Calculate next_run_at using a simple approach
+      const nextRunAt = this.calculateNextRunFromSchedule(cronExpression, timezone);
+
+      if (existingScheduleId) {
+        // Update existing schedule
+        const { error } = await supabaseAdmin
+          .from('test_schedules')
+          .update({
+            cron_expression: cronExpression,
+            timezone,
+            is_active: true,
+            next_run_at: nextRunAt,
+          })
+          .eq('id', existingScheduleId);
+
+        if (error) {
+          logger.error('[REGRESSION_PLAN_SERVICE] Failed to update schedule', { error, planId: plan.id });
+        } else {
+          logger.info('[REGRESSION_PLAN_SERVICE] Updated schedule', {
+            planId: plan.id,
+            scheduleId: existingScheduleId,
+            cronExpression,
+          });
+        }
+        return existingScheduleId;
+      }
+
+      // Create new schedule
+      const { data, error } = await supabaseAdmin
+        .from('test_schedules')
+        .insert({
+          project_id: plan.projectId,
+          user_id: plan.userId,
+          name: `Auto: ${plan.name}`,
+          plan_id: plan.id,
+          cron_expression: cronExpression,
+          timezone,
+          is_active: true,
+          next_run_at: nextRunAt,
+          parameters: {},
+        })
+        .select('id')
+        .single();
+
+      if (error) {
+        logger.error('[REGRESSION_PLAN_SERVICE] Failed to create schedule', { error, planId: plan.id });
+        return null;
+      }
+
+      logger.info('[REGRESSION_PLAN_SERVICE] Created schedule', {
+        planId: plan.id,
+        scheduleId: data.id,
+        cronExpression,
+      });
+      return data.id;
+    } catch (error) {
+      logger.error('[REGRESSION_PLAN_SERVICE] syncSchedule error', {
+        error: error instanceof Error ? error.message : String(error),
+        planId: plan.id,
+      });
+      return plan.scheduleId || null;
+    }
+  }
+
+  /**
+   * Simple next-run calculation for schedule sync
+   */
+  private static calculateNextRunFromSchedule(cronExpression: string, _timezone: string): string {
+    void _timezone;
+
+    const now = new Date();
+    const parts = cronExpression.split(' ');
+    if (parts.length !== 5) {
+      return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+    }
+
+    const [minuteStr, hourStr] = parts;
+    const minute = parseInt(minuteStr, 10);
+    const hour = parseInt(hourStr, 10);
+
+    if (!isNaN(minute) && !isNaN(hour)) {
+      const nextRun = new Date(now);
+      nextRun.setHours(hour, minute, 0, 0);
+      if (nextRun <= now) {
+        nextRun.setDate(nextRun.getDate() + 1);
+      }
+      return nextRun.toISOString();
+    }
+
+    return new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  /**
+   * Link/unlink git_integrations.plan_id for this plan
+   */
+  private static async syncGitIntegration(
+    plan: RegressionPlan,
+    gitConfig?: PlanGitTriggersConfig
+  ): Promise<void> {
+    try {
+      if (!gitConfig || !gitConfig.enabled) {
+        // Unlink any integrations pointing to this plan
+        await supabaseAdmin
+          .from('git_integrations')
+          .update({ plan_id: null })
+          .eq('plan_id', plan.id);
+        return;
+      }
+
+      // Find the project's git integration and link to this plan
+      const { data: integration } = await supabaseAdmin
+        .from('git_integrations')
+        .select('id')
+        .eq('project_id', plan.projectId)
+        .eq('enabled', true)
+        .limit(1)
+        .maybeSingle();
+
+      if (!integration) {
+        logger.warn('[REGRESSION_PLAN_SERVICE] No git integration found for project', {
+          planId: plan.id,
+          projectId: plan.projectId,
+        });
+        return;
+      }
+
+      await supabaseAdmin
+        .from('git_integrations')
+        .update({ plan_id: plan.id })
+        .eq('id', integration.id);
+
+      logger.info('[REGRESSION_PLAN_SERVICE] Linked git integration to plan', {
+        planId: plan.id,
+        integrationId: integration.id,
+      });
+    } catch (error) {
+      logger.error('[REGRESSION_PLAN_SERVICE] syncGitIntegration error', {
+        error: error instanceof Error ? error.message : String(error),
+        planId: plan.id,
+      });
+    }
+  }
+
+  // =========================================================================
   // MAPPERS
   // =========================================================================
 
@@ -817,6 +1084,9 @@ export class RegressionPlanService {
       description: row.description || undefined,
       isDefault: row.is_default,
       tags: row.tags || [],
+      automationConfig: row.automation_config || undefined,
+      notificationsEnabled: row.notifications_enabled ?? true,
+      scheduleId: row.schedule_id || undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -834,6 +1104,203 @@ export class RegressionPlanService {
       orderIndex: row.order_index,
       parametersOverride: row.parameters_override || {},
       createdAt: row.created_at,
+    };
+  }
+
+  // =========================================================================
+  // SCOPE ITEMS — for "Create Regression" step 2 picker
+  // =========================================================================
+
+  /**
+   * Get all modules, flows, and test cases for the scope picker.
+   *
+   * Returns three lists with counts and platform info, suitable for the
+   * "Modules | Flows | Test Cases" tabs in the Create Regression modal.
+   *
+   * Query strategy (5 parallel queries):
+   *   1. Modules with platform join
+   *   2. Flows with module join (for platformKey)
+   *   3. UI test case counts per flow
+   *   4. API test case counts per flow
+   *   5. Flow counts per module
+   */
+  static async getScopeItems(
+    projectId: string,
+    userId: string
+  ): Promise<{
+    modules: Array<{
+      id: string;
+      name: string;
+      platformKey: 'web_ui' | 'api';
+      testCount: number;
+      flowCount: number;
+    }>;
+    flows: Array<{
+      id: string;
+      moduleId: string;
+      name: string;
+      flowType: string;
+      platformKey: 'web_ui' | 'api';
+      testCount: number;
+    }>;
+    testCases: Array<{
+      id: string;
+      flowId: string;
+      moduleId: string;
+      name: string;
+      testType: 'ui' | 'api';
+      platformKey: 'web_ui' | 'api';
+    }>;
+  }> {
+    // 1. Fetch modules + platforms, flows + module platform, and all test cases in parallel
+    const [modulesResult, flowsResult, uiTestCasesResult, apiTestCasesResult] = await Promise.all([
+      // Modules with platform_key
+      supabaseAdmin
+        .from('test_modules')
+        .select('id, name, platform_id, test_platforms!inner(platform_key)')
+        .eq('project_id', projectId)
+        .eq('user_id', userId)
+        .order('name', { ascending: true }),
+
+      // Flows with module_id (to resolve platformKey via module)
+      supabaseAdmin
+        .from('test_flows')
+        .select('id, module_id, name, flow_type')
+        .eq('user_id', userId)
+        .order('order_index', { ascending: true }),
+
+      // UI test cases
+      supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, flow_id, name')
+        .eq('project_id', projectId)
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false }),
+
+      // API test cases
+      supabaseAdmin
+        .from('api_test_configs')
+        .select('id, flow_id, name')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false }),
+    ]);
+
+    if (modulesResult.error) {
+      throw new Error(`Failed to get modules: ${modulesResult.error.message}`);
+    }
+    if (flowsResult.error) {
+      throw new Error(`Failed to get flows: ${flowsResult.error.message}`);
+    }
+
+    const modules = modulesResult.data || [];
+    const allFlows = flowsResult.data || [];
+    const uiTestCases = uiTestCasesResult.data || [];
+    const apiTestCases = apiTestCasesResult.data || [];
+
+    // Build lookup: moduleId → platformKey
+    const modulePlatformMap = new Map<string, 'web_ui' | 'api'>();
+    const moduleIdSet = new Set<string>();
+    for (const m of modules) {
+      const pk = (m.test_platforms as any)?.platform_key as 'web_ui' | 'api';
+      modulePlatformMap.set(m.id, pk);
+      moduleIdSet.add(m.id);
+    }
+
+    // Filter flows to only those belonging to this project's modules
+    const projectFlows = allFlows.filter((f: any) => moduleIdSet.has(f.module_id));
+
+    // Build lookup: flowId → moduleId
+    const flowModuleMap = new Map<string, string>();
+    for (const f of projectFlows) {
+      flowModuleMap.set(f.id, f.module_id);
+    }
+    const projectFlowIds = new Set(projectFlows.map((f: any) => f.id));
+
+    // Count test cases per flow
+    const flowUiCount = new Map<string, number>();
+    const flowApiCount = new Map<string, number>();
+
+    for (const tc of uiTestCases) {
+      if (tc.flow_id && projectFlowIds.has(tc.flow_id)) {
+        flowUiCount.set(tc.flow_id, (flowUiCount.get(tc.flow_id) || 0) + 1);
+      }
+    }
+    for (const tc of apiTestCases) {
+      if (tc.flow_id && projectFlowIds.has(tc.flow_id)) {
+        flowApiCount.set(tc.flow_id, (flowApiCount.get(tc.flow_id) || 0) + 1);
+      }
+    }
+
+    // Count flows + tests per module
+    const moduleFlowCount = new Map<string, number>();
+    const moduleTestCount = new Map<string, number>();
+    for (const f of projectFlows) {
+      const mid = f.module_id;
+      moduleFlowCount.set(mid, (moduleFlowCount.get(mid) || 0) + 1);
+      const tc = (flowUiCount.get(f.id) || 0) + (flowApiCount.get(f.id) || 0);
+      moduleTestCount.set(mid, (moduleTestCount.get(mid) || 0) + tc);
+    }
+
+    // Build response
+    const scopeModules = modules.map((m: any) => ({
+      id: m.id,
+      name: m.name,
+      platformKey: modulePlatformMap.get(m.id) || 'web_ui',
+      testCount: moduleTestCount.get(m.id) || 0,
+      flowCount: moduleFlowCount.get(m.id) || 0,
+    }));
+
+    const scopeFlows = projectFlows.map((f: any) => ({
+      id: f.id,
+      moduleId: f.module_id,
+      name: f.name,
+      flowType: f.flow_type,
+      platformKey: modulePlatformMap.get(f.module_id) || 'web_ui',
+      testCount: (flowUiCount.get(f.id) || 0) + (flowApiCount.get(f.id) || 0),
+    }));
+
+    // Build test cases list with platform info
+    const scopeTestCases: Array<{
+      id: string;
+      flowId: string;
+      moduleId: string;
+      name: string;
+      testType: 'ui' | 'api';
+      platformKey: 'web_ui' | 'api';
+    }> = [];
+
+    for (const tc of uiTestCases) {
+      if (tc.flow_id && projectFlowIds.has(tc.flow_id)) {
+        const moduleId = flowModuleMap.get(tc.flow_id) || '';
+        scopeTestCases.push({
+          id: tc.id,
+          flowId: tc.flow_id,
+          moduleId,
+          name: tc.name,
+          testType: 'ui',
+          platformKey: modulePlatformMap.get(moduleId) || 'web_ui',
+        });
+      }
+    }
+
+    for (const tc of apiTestCases) {
+      if (tc.flow_id && projectFlowIds.has(tc.flow_id)) {
+        const moduleId = flowModuleMap.get(tc.flow_id) || '';
+        scopeTestCases.push({
+          id: tc.id,
+          flowId: tc.flow_id,
+          moduleId,
+          name: tc.name,
+          testType: 'api',
+          platformKey: modulePlatformMap.get(moduleId) || 'api',
+        });
+      }
+    }
+
+    return {
+      modules: scopeModules,
+      flows: scopeFlows,
+      testCases: scopeTestCases,
     };
   }
 }

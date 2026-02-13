@@ -4,6 +4,7 @@ import { logger } from '@/utils/core/logger';
 
 import { GitWebhookService } from '@/services/integrations/git-webhook.service';
 import { NotificationService } from '@/services/notifications/notification.service';
+import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 
 export class GitWebhookJobHandler {
   static async process(
@@ -80,11 +81,61 @@ export class GitWebhookJobHandler {
       return;
     }
 
+    // Check if a plan is linked to this integration
+    const planId = integration.plan_id as string | null;
+    if (!planId) {
+      logger.warn('[GIT_WEBHOOK_JOB] No plan linked to git integration, skipping', {
+        integrationId: integration.id,
+        deliveryId,
+      });
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'no_plan_linked',
+      });
+      return;
+    }
+
+    // Read plan-level automation config for branch filtering
+    const planAutomationConfig = await (async () => {
+      const { data: planRow } = await supabaseAdmin
+        .from('regression_plans')
+        .select('automation_config')
+        .eq('id', planId)
+        .maybeSingle();
+      return planRow?.automation_config;
+    })();
+
+    // Determine allowed branches from plan config (falls back to default main/master)
+    const allowedBranches = planAutomationConfig?.gitTriggers?.branch
+      ? [planAutomationConfig.gitTriggers.branch]
+      : undefined;
+
+    // Check plan-level triggerTypes filter
+    const planTriggerTypes = planAutomationConfig?.gitTriggers?.triggerTypes as string[] | undefined;
+    if (planTriggerTypes && planTriggerTypes.length > 0) {
+      // Map webhook event type to plan trigger type
+      const eventToTriggerMap: Record<string, string> = {
+        pull_request: 'merge_to_main',
+        merge_request: 'merge_to_main',
+        push: 'merge_to_main',
+        release: 'release',
+      };
+      const mappedTrigger = eventToTriggerMap[deliveryEventType];
+      if (mappedTrigger && !planTriggerTypes.includes(mappedTrigger)) {
+        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+          status: 'ignored',
+          error: 'trigger_type_not_enabled',
+        });
+        return;
+      }
+    }
+
     // Decide if we should trigger regression based on payload + branch filters
     const decision = GitWebhookService.shouldTrigger({
       provider,
       eventType: deliveryEventType as any,
       payload: delivery.payload,
+      allowedBranches,
     });
 
     if (!decision.trigger) {
@@ -113,14 +164,24 @@ export class GitWebhookJobHandler {
     logger.info('[GIT_WEBHOOK_JOB] Triggering regression run', {
       provider,
       deliveryId,
+      planId,
       branch: decision.branch,
       reason: decision.reason,
     });
 
     try {
-      // TODO: Update to use module or plan instead of suite (suite_id removed)
-      logger.warn('[GIT_WEBHOOK_JOB] Suite-based git integrations no longer supported', {
-        integrationId: integration.id,
+
+      // Trigger plan execution via webhook
+      const result = await RegressionRunService.runPlan({
+        planId,
+        userId: project.user_id,
+        trigger: 'webhook',
+      });
+
+      logger.info('[GIT_WEBHOOK_JOB] Plan execution triggered', {
+        planId,
+        runId: result.runId,
+        totalTests: result.totalTests,
         deliveryId,
       });
 

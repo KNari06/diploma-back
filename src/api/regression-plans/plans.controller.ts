@@ -24,7 +24,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createPlan(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, name, description, isDefault, tags } = req.body;
+    const { projectId, name, description, isDefault, tags, automationConfig, notificationsEnabled } = req.body;
 
     if (!projectId || !name) {
       res.status(400).json({ success: false, error: 'projectId and name are required' });
@@ -40,6 +40,8 @@ export async function createPlan(req: AuthenticatedRequest, res: Response): Prom
       description,
       isDefault,
       tags,
+      automationConfig,
+      notificationsEnabled,
     });
 
     res.json({ success: true, data: plan, timestamp: new Date() });
@@ -99,7 +101,7 @@ export async function listPlans(req: AuthenticatedRequest, res: Response): Promi
 export async function updatePlan(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { name, description, isDefault, tags } = req.body;
+    const { name, description, isDefault, tags, automationConfig, notificationsEnabled } = req.body;
     const userId = getUserId(req);
 
     const plan = await RegressionPlanService.update({
@@ -109,6 +111,8 @@ export async function updatePlan(req: AuthenticatedRequest, res: Response): Prom
       description,
       isDefault,
       tags,
+      automationConfig,
+      notificationsEnabled,
     });
 
     res.json({ success: true, data: plan, timestamp: new Date() });
@@ -202,6 +206,29 @@ export async function expandPlan(req: AuthenticatedRequest, res: Response): Prom
   } catch (error) {
     logger.error('[PLANS_API] Failed to expand plan', { error });
     handleError(res, error, 'Failed to expand plan');
+  }
+}
+
+/**
+ * Get scope items for regression plan builder (modules, flows, test cases with counts)
+ */
+export async function getScopeItems(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { projectId } = req.query;
+
+    if (!projectId || typeof projectId !== 'string') {
+      res.status(400).json({ success: false, error: 'projectId is required' });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    const data = await RegressionPlanService.getScopeItems(projectId, userId);
+
+    res.json({ success: true, data, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[PLANS_API] Failed to get scope items', { error });
+    handleError(res, error, 'Failed to get scope items');
   }
 }
 

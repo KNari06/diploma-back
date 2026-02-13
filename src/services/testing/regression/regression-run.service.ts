@@ -48,7 +48,7 @@ export class RegressionRunService {
   static async runSavedTestCase(params: {
     savedTestCaseId: string;
     userId: string;
-    trigger: 'manual' | 'chat' | 'scheduled';
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
     parameters?: Record<string, any>;
   }): Promise<{
     runId: string;
@@ -168,7 +168,8 @@ export class RegressionRunService {
   private static async buildTestRequest(
     intentCase: any,
     userId: string,
-    parameters: Record<string, any>
+    parameters: Record<string, any>,
+    browserOverride?: string
   ): Promise<any> {
     // Get source test for base configuration (optional - only for browsers/options)
     const { data: sourceTest } = await supabaseAdmin
@@ -216,7 +217,7 @@ export class RegressionRunService {
       url: targetUrl, // Use url with fallback to start_url
       projectId: intentCase.project_id,
       userId,
-      browsers: sourceTest?.browsers || ['chrome'],
+      browsers: browserOverride ? [browserOverride] : (sourceTest?.browsers || ['chrome']),
       intelligentMode: true, // Use intelligent mode for regression cases
       testGoal: intentCase.description || intentCase.name,
       commands, // Pre-generated commands
@@ -398,7 +399,7 @@ export class RegressionRunService {
   static async runPlan(params: {
     planId: string;
     userId: string;
-    trigger: 'manual' | 'chat' | 'scheduled';
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
     parameters?: Record<string, any>;
   }): Promise<RunResult> {
     const { planId, userId, trigger, parameters = {} } = params;
@@ -445,21 +446,30 @@ export class RegressionRunService {
         }))
       );
 
-      // 4. Start executing tests (async, don't wait)
+      // 4. Read runtime config from plan's automation_config
+      const browserOverride = plan.automationConfig?.runtime?.browser;
+
+      // 5. Start executing tests (async, don't wait)
       this.executeTestCasesAsync(
         run.id,
         expandedCases,
         userId,
         trigger,
-        parameters
-      ).catch((error) => {
+        parameters,
+        browserOverride
+      ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({ status: 'failed', completed_at: new Date().toISOString() })
+          .eq('id', run.id);
       });
 
       logger.info('[REGRESSION_RUN] Plan execution started', {
         runId: run.id,
         planId,
         totalCases: expandedCases.length,
+        browserOverride,
       });
 
       return {
@@ -486,7 +496,7 @@ export class RegressionRunService {
   static async runModule(params: {
     moduleId: string;
     userId: string;
-    trigger: 'manual' | 'chat' | 'scheduled';
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
     parameters?: Record<string, any>;
   }): Promise<RunResult> {
     const { moduleId, userId, trigger, parameters = {} } = params;
@@ -590,7 +600,7 @@ export class RegressionRunService {
   static async runFlow(params: {
     flowId: string;
     userId: string;
-    trigger: 'manual' | 'chat' | 'scheduled';
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
     parameters?: Record<string, any>;
   }): Promise<RunResult> {
     const { flowId, userId, trigger, parameters = {} } = params;
@@ -682,7 +692,7 @@ export class RegressionRunService {
     projectId: string;
     tag: string;
     userId: string;
-    trigger: 'manual' | 'chat' | 'scheduled';
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
   }): Promise<RunResult> {
     const { projectId, tag, userId, trigger } = params;
 
@@ -777,7 +787,7 @@ export class RegressionRunService {
     projectId: string;
     priority: Priority;
     userId: string;
-    trigger: 'manual' | 'chat' | 'scheduled';
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
   }): Promise<RunResult> {
     const { projectId, priority, userId, trigger } = params;
 
@@ -960,8 +970,9 @@ export class RegressionRunService {
       flowId?: string;
     }>,
     userId: string,
-    trigger: 'manual' | 'chat' | 'scheduled',
-    parameters: Record<string, any>
+    trigger: 'manual' | 'chat' | 'scheduled' | 'webhook',
+    parameters: Record<string, any>,
+    browserOverride?: string
   ): Promise<void> {
     const startedAt = new Date().toISOString();
 
@@ -996,7 +1007,7 @@ export class RegressionRunService {
         if (testCase.testType === 'ui') {
           // Run UI test without creating nested regression_runs
           const savedCase = await this.getSavedTestCase(testCase.testCaseId, userId);
-          const testRequest = await this.buildTestRequest(savedCase, userId, parameters);
+          const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
           const testResult = await ManualTestService.runTest(testRequest);
 
           if (!testResult.success || !testResult.data?.id) {
@@ -1051,11 +1062,18 @@ export class RegressionRunService {
         });
 
         if (execId) {
-          await ExecutionService.updateStatus({
-            id: execId,
-            status: 'failed',
-            errorMessage: error instanceof Error ? error.message : String(error),
-          });
+          try {
+            await ExecutionService.updateStatus({
+              id: execId,
+              status: 'failed',
+              errorMessage: error instanceof Error ? error.message : String(error),
+            });
+          } catch (statusError) {
+            logger.error('[REGRESSION_RUN] Failed to update execution status', {
+              execId,
+              statusError: statusError instanceof Error ? statusError.message : String(statusError),
+            });
+          }
         }
       }
     }

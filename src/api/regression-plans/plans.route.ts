@@ -11,6 +11,7 @@ import {
     deletePlan,
     expandPlan,
     getPlan,
+    getScopeItems,
     listPlans,
     removeItem,
     updatePlan,
@@ -65,12 +66,76 @@ const router = Router();
  *                 type: array
  *                 items:
  *                   type: string
+ *               automationConfig:
+ *                 type: object
+ *                 description: Automation settings (schedule, git triggers, runtime)
+ *                 properties:
+ *                   schedule:
+ *                     type: object
+ *                     properties:
+ *                       enabled:
+ *                         type: boolean
+ *                       days:
+ *                         type: array
+ *                         items:
+ *                           type: string
+ *                       time:
+ *                         type: string
+ *                         description: "HH:MM format"
+ *                       timezone:
+ *                         type: string
+ *                   gitTriggers:
+ *                     type: object
+ *                     properties:
+ *                       enabled:
+ *                         type: boolean
+ *                       triggerTypes:
+ *                         type: array
+ *                         items:
+ *                           type: string
+ *                           enum: [merge_to_main, pr_opened, release]
+ *                       branch:
+ *                         type: string
+ *                   runtime:
+ *                     type: object
+ *                     properties:
+ *                       environment:
+ *                         type: string
+ *                         enum: [staging, production, development]
+ *                       browser:
+ *                         type: string
+ *                         enum: [chrome, firefox, safari, edge]
+ *               notificationsEnabled:
+ *                 type: boolean
+ *                 default: true
  *     responses:
  *       200:
  *         description: Plan created
  */
 router.get('/', requireAuth, listPlans);
 router.post('/', requireAuth, createPlan);
+
+/**
+ * @swagger
+ * /api/v1/regression-plans/scope-items:
+ *   get:
+ *     summary: Get scope items for plan builder (modules, flows, test cases with counts)
+ *     description: Returns all modules, flows, and test cases for a project with test/flow counts and platform info. Used by the "Create Regression" scope picker UI.
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: projectId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Scope items with counts
+ */
+router.get('/scope-items', requireAuth, getScopeItems);
 
 /**
  * @swagger
@@ -95,6 +160,27 @@ router.post('/', requireAuth, createPlan);
  *     tags: [Regression Plans]
  *     security:
  *       - bearerAuth: []
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name:
+ *                 type: string
+ *               description:
+ *                 type: string
+ *               isDefault:
+ *                 type: boolean
+ *               tags:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *               automationConfig:
+ *                 type: object
+ *                 description: Automation settings (schedule, git triggers, runtime)
+ *               notificationsEnabled:
+ *                 type: boolean
  *     responses:
  *       200:
  *         description: Plan updated

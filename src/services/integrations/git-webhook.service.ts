@@ -50,10 +50,11 @@ export class GitWebhookService {
     provider: GitProvider;
     eventType: GitWebhookEventType;
     payload: any;
+    allowedBranches?: string[];
   }): { trigger: boolean; reason: string; branch?: string } {
     const { provider, eventType, payload } = params;
 
-    const allowedBranches = new Set(['main', 'master']);
+    const allowedBranches = new Set(params.allowedBranches || ['main', 'master']);
 
     if (provider === 'github') {
       if (eventType === 'pull_request') {
