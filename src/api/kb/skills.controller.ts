@@ -211,9 +211,9 @@ export async function getSkill(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    // Verify the skill belongs to user's workspace
-    const workspaceId = await resolveWorkspaceId(userId);
-    if (memory.workspace_id !== workspaceId) {
+    // Verify the skill belongs to one of user's workspaces
+    const userWorkspaces = await WorkspaceService.getUserWorkspaces(userId);
+    if (!userWorkspaces.some(w => w.id === memory.workspace_id)) {
       errorResponse(res, 'Access denied', 403);
       return;
     }
@@ -251,8 +251,8 @@ export async function updateSkill(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const workspaceId = await resolveWorkspaceId(userId);
-    if (existing.workspace_id !== workspaceId) {
+    const userWorkspaces = await WorkspaceService.getUserWorkspaces(userId);
+    if (!userWorkspaces.some(w => w.id === existing.workspace_id)) {
       errorResponse(res, 'Access denied', 403);
       return;
     }
@@ -327,8 +327,8 @@ export async function deleteSkill(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const workspaceId = await resolveWorkspaceId(userId);
-    if (existing.workspace_id !== workspaceId) {
+    const userWorkspaces = await WorkspaceService.getUserWorkspaces(userId);
+    if (!userWorkspaces.some(w => w.id === existing.workspace_id)) {
       errorResponse(res, 'Access denied', 403);
       return;
     }
@@ -376,8 +376,8 @@ export async function toggleSkill(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const workspaceId = await resolveWorkspaceId(userId);
-    if (existing.workspace_id !== workspaceId) {
+    const userWorkspaces = await WorkspaceService.getUserWorkspaces(userId);
+    if (!userWorkspaces.some(w => w.id === existing.workspace_id)) {
       errorResponse(res, 'Access denied', 403);
       return;
     }
@@ -429,6 +429,14 @@ export async function batchCreateSkills(req: Request, res: Response): Promise<vo
       }
       if (!skill.content || typeof skill.content !== 'string' || skill.content.trim().length === 0) {
         errorResponse(res, `Skill "${skill.key}" must have non-empty content`, 400);
+        return;
+      }
+      if (skill.key.length > 200) {
+        errorResponse(res, `Skill "${skill.key.substring(0, 30)}..." key is too long (max 200 characters)`, 400);
+        return;
+      }
+      if (skill.content.length > 5000) {
+        errorResponse(res, `Skill "${skill.key}" content is too long (max 5000 characters)`, 400);
         return;
       }
       if (!skill.category || !VALID_CATEGORIES.includes(skill.category)) {

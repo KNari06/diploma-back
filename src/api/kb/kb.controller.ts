@@ -394,6 +394,24 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
       });
     }
 
+    // Get patterns count (total test sessions for the project)
+    let patternsTotal = 0;
+    if (projectId) {
+      try {
+        const { count, error: countError } = await supabaseAdmin
+          .from('intelligent_test_sessions')
+          .select('id', { count: 'exact', head: true })
+          .eq('project_id', projectId);
+        if (!countError && count !== null) {
+          patternsTotal = count;
+        }
+      } catch (err) {
+        logger.warn('[KB_STATS] Failed to get patterns count (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     successResponse(res, {
       global: {
         type: 'local',
@@ -405,6 +423,7 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
       },
       project: projectStats,
       skills: { total: skillsTotal },
+      patterns: { total: patternsTotal },
     });
   } catch (error: any) {
     logger.error('Get KB stats failed', { error });

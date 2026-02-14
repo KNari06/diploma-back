@@ -77,18 +77,20 @@ export class PatternsQueryService {
         ? Math.round(validDurations.reduce((sum, s) => sum + s.duration_ms, 0) / validDurations.length)
         : 0;
 
-      // Get findings count
+      // Get findings count (batched to avoid URL length limits)
       const sessionIds = all.map(s => s.id);
       let totalFindings = 0;
 
-      if (sessionIds.length > 0) {
+      const batchSize = 100;
+      for (let i = 0; i < sessionIds.length; i += batchSize) {
+        const batch = sessionIds.slice(i, i + batchSize);
         const { count, error: findingsError } = await supabaseAdmin
           .from('intelligent_test_findings')
           .select('id', { count: 'exact', head: true })
-          .in('session_id', sessionIds);
+          .in('session_id', batch);
 
         if (!findingsError && count !== null) {
-          totalFindings = count;
+          totalFindings += count;
         }
       }
 
@@ -127,15 +129,25 @@ export class PatternsQueryService {
 
       const sessionIds = sessions.map(s => s.id);
 
-      // Get all page visits for these sessions
-      const { data: visits, error: visitsError } = await supabaseAdmin
-        .from('intelligent_page_visits')
-        .select('url, page_type, created_at')
-        .in('session_id', sessionIds)
-        .order('created_at', { ascending: false });
+      // Get all page visits for these sessions (batched to avoid URL length limits)
+      const batchSize = 100;
+      const visits: any[] = [];
+      for (let i = 0; i < sessionIds.length; i += batchSize) {
+        const batch = sessionIds.slice(i, i + batchSize);
+        const { data, error: visitsError } = await supabaseAdmin
+          .from('intelligent_page_visits')
+          .select('url, page_type, created_at')
+          .in('session_id', batch)
+          .order('created_at', { ascending: false });
 
-      if (visitsError || !visits) {
-        logger.error('[PATTERNS] Failed to query page visits', { error: visitsError?.message });
+        if (visitsError) {
+          logger.error('[PATTERNS] Failed to query page visits batch', { error: visitsError.message });
+        } else if (data) {
+          visits.push(...data);
+        }
+      }
+
+      if (visits.length === 0) {
         return [];
       }
 
@@ -195,15 +207,25 @@ export class PatternsQueryService {
 
       const sessionIds = sessions.map(s => s.id);
 
-      // Get all findings
-      const { data: findings, error: findingsError } = await supabaseAdmin
-        .from('intelligent_test_findings')
-        .select('finding_type, description, found_at')
-        .in('session_id', sessionIds)
-        .order('found_at', { ascending: false });
+      // Get all findings (batched to avoid URL length limits)
+      const batchSize = 100;
+      const findings: any[] = [];
+      for (let i = 0; i < sessionIds.length; i += batchSize) {
+        const batch = sessionIds.slice(i, i + batchSize);
+        const { data, error: findingsError } = await supabaseAdmin
+          .from('intelligent_test_findings')
+          .select('finding_type, description, found_at')
+          .in('session_id', batch)
+          .order('found_at', { ascending: false });
 
-      if (findingsError || !findings) {
-        logger.error('[PATTERNS] Failed to query findings', { error: findingsError?.message });
+        if (findingsError) {
+          logger.error('[PATTERNS] Failed to query findings batch', { error: findingsError.message });
+        } else if (data) {
+          findings.push(...data);
+        }
+      }
+
+      if (findings.length === 0) {
         return [];
       }
 

@@ -388,10 +388,11 @@ export class WorkspaceMemoryService {
         new Map(allMemories.map(m => [m.id, m])).values()
       ) as WorkspaceMemory[]).filter(m => m.metadata?.enabled !== false);
 
-      // Sort by relevance (access_count + recency)
+      // Sort by relevance (access_count + recency bonus)
+      // Recency: newer memories get a higher score (created_at timestamp as bonus)
       uniqueMemories.sort((a, b) => {
-        const scoreA = a.access_count + (Date.now() - new Date(a.created_at).getTime()) / 1000000;
-        const scoreB = b.access_count + (Date.now() - new Date(b.created_at).getTime()) / 1000000;
+        const scoreA = a.access_count + new Date(a.created_at).getTime() / 1000000000;
+        const scoreB = b.access_count + new Date(b.created_at).getTime() / 1000000000;
         return scoreB - scoreA;
       });
 
@@ -553,19 +554,26 @@ export class WorkspaceMemoryService {
    * Update access tracking for a memory (internal)
    */
   private static async updateAccessTracking(memoryId: string): Promise<void> {
-    // Read current count then increment (Supabase JS client doesn't support raw SQL expressions)
-    const { data } = await supabaseAdmin
-      .from('workspace_memory')
-      .select('access_count')
-      .eq('id', memoryId)
-      .single();
+    // Use RPC for atomic increment to avoid read-then-write race condition
+    const { error: rpcError } = await supabaseAdmin.rpc('increment_memory_access_count', {
+      p_memory_id: memoryId,
+    });
 
-    await supabaseAdmin
-      .from('workspace_memory')
-      .update({
-        access_count: (data?.access_count || 0) + 1,
-        last_accessed_at: new Date().toISOString(),
-      })
-      .eq('id', memoryId);
+    if (rpcError) {
+      // Fallback: non-atomic read-then-write (acceptable for access tracking)
+      const { data } = await supabaseAdmin
+        .from('workspace_memory')
+        .select('access_count')
+        .eq('id', memoryId)
+        .single();
+
+      await supabaseAdmin
+        .from('workspace_memory')
+        .update({
+          access_count: (data?.access_count || 0) + 1,
+          last_accessed_at: new Date().toISOString(),
+        })
+        .eq('id', memoryId);
+    }
   }
 }

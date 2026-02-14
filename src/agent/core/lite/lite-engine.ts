@@ -963,6 +963,7 @@ export class LiteEngine {
     this.deniedExternalOrigins.clear();
     this.downloadApprovalAskedForRefs.clear();
     this.deniedDownloadRefs.clear();
+    this.skillsContext = '';
   }
 
   /**
