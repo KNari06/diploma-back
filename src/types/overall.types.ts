@@ -9,7 +9,7 @@ export type StatusFlag = 'success' | 'failed' | 'danger' | 'cancelled';
 
 export type TestSource = 'manual' | 'intelligent' | 'api' | 'regression';
 
-export type RelationshipType = 'url' | 'page_flow' | 'semantic' | 'temporal';
+export type RelationshipType = 'url' | 'page_flow' | 'command';
 
 /**
  * Node in the project overall graph (represents a test entity)
@@ -29,7 +29,19 @@ export interface OverallNode {
     durationMs?: number;
     hasFindings?: boolean;
     findingsSeverity?: 'critical' | 'high' | 'medium' | 'low';
+    fingerprint?: CommandFingerprint;
   };
+}
+
+/**
+ * Extracted "meaning" of a test from its steps
+ * Built once per test, used for comparing tests
+ */
+export interface CommandFingerprint {
+  actions: string[];    // Unique action types: ["click", "fill", "goto"]
+  selectors: string[];  // Normalized selectors: ["input[name=email]", "button.submit"]
+  urls: string[];       // Visited paths: ["/login", "/dashboard"]
+  summary: string;      // Auto-generated: "login form (fill email, fill password, click submit)"
 }
 
 /**
@@ -41,6 +53,7 @@ export interface OverallEdge {
   target: string; // node id
   relationshipType: RelationshipType;
   confidence: number; // 0..1
+  distance: number; // 1 - confidence, used by frontend for edge length
   reasons: string[]; // 1-3 short explanations
 }
 

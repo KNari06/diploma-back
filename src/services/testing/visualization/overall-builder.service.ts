@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { NotFoundError, ValidationError } from '@/types';
 import type {
+  CommandFingerprint,
   OverallNode,
   ProjectOverallData,
   StatusFlag,
@@ -74,14 +75,14 @@ export class OverallBuilderService {
         tests.map(t => t.id)
       );
 
-      // 4. Build nodes
-      const nodes = await this.buildNodes(tests, sessionsMap);
-
-      // 5. Build edges and clusters using RelationshipService
-      const { edges, clusters } = await OverallRelationshipService.buildRelationshipsAndClusters(
+      // 4. Build edges, clusters, and fingerprints using RelationshipService
+      const { edges, clusters, fingerprints } = await OverallRelationshipService.buildRelationshipsAndClusters(
         tests,
         sessionsMap
       );
+
+      // 5. Build nodes (with fingerprints attached)
+      const nodes = await this.buildNodes(tests, sessionsMap, fingerprints);
 
       logger.info('[OVERALL_BUILDER] Project overall built', {
         projectId,
@@ -219,7 +220,8 @@ export class OverallBuilderService {
    */
   private static async buildNodes(
     tests: any[],
-    sessionsMap: Map<string, any>
+    sessionsMap: Map<string, any>,
+    fingerprints: Map<string, CommandFingerprint>
   ): Promise<OverallNode[]> {
     const nodes: OverallNode[] = [];
 
@@ -244,12 +246,17 @@ export class OverallBuilderService {
         durationMs: session?.duration_ms,
       };
 
+      // Attach fingerprint (pre-computed by RelationshipService)
+      const fp = fingerprints.get(test.id);
+      if (fp) {
+        meta.fingerprint = fp;
+      }
+
       // Check for findings
       if (session?.id) {
         const hasFindings = await this.checkForFindings(session.id);
         if (hasFindings) {
           meta.hasFindings = true;
-          // Could also fetch severity, but keep it simple for MVP
         }
       }
 

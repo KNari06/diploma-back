@@ -1,5 +1,5 @@
-import { cosineSimilarity, generateEmbedding } from '@/services/ai/core/embedding.service';
-import type { OverallCluster, OverallEdge } from '@/types/overall.types';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import type { CommandFingerprint, OverallCluster, OverallEdge } from '@/types/overall.types';
 import { logger } from '@/utils/core/logger';
 import crypto from 'crypto';
 
@@ -8,22 +8,17 @@ import crypto from 'crypto';
  * OVERALL RELATIONSHIP SERVICE - Test relationship analysis and clustering
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Analyzes relationships between tests using multiple strategies:
+ * Analyzes relationships between tests using three strategies:
  * 1. URL relationships (flow continuation, shared URLs, same domain)
  * 2. Page flow patterns (logical sequences like login → dashboard)
- * 3. Temporal proximity (tests run close in time)
- * 4. Semantic similarity (embeddings-based goal matching)
+ * 3. Command fingerprint (shared selectors/actions extracted from test steps)
  *
  * Key Features:
+ * - Command fingerprinting: extracts "meaning" of each test from its steps
  * - Multi-factor relationship scoring
  * - Automatic cluster detection
- * - Rate-limited embedding calls
- * - Graceful degradation on errors
+ * - Distance field for frontend edge length (1 - confidence)
  */
-
-// Limits for performance and API costs
-const MAX_SEMANTIC_COMPARISONS = 200; // Limit expensive embedding comparisons
-const SEMANTIC_SIMILARITY_THRESHOLD = 0.7; // Min similarity for edge creation
 
 /**
  * Service for analyzing relationships between tests and building clusters
@@ -40,24 +35,30 @@ export class OverallRelationshipService {
   static async buildRelationshipsAndClusters(
     tests: any[],
     sessionsMap: Map<string, any>
-  ): Promise<{ edges: OverallEdge[]; clusters: OverallCluster[] }> {
+  ): Promise<{ edges: OverallEdge[]; clusters: OverallCluster[]; fingerprints: Map<string, CommandFingerprint> }> {
     try {
       logger.info('[RELATIONSHIP] Building relationships and clusters', {
         testsCount: tests.length,
       });
 
       if (tests.length === 0) {
-        return { edges: [], clusters: [] };
+        return { edges: [], clusters: [], fingerprints: new Map() };
       }
 
-      // Build edges based on relationships
+      // Phase 1: Build fingerprints for all tests (once)
+      const fingerprints = new Map<string, CommandFingerprint>();
+      for (const test of tests) {
+        const session = sessionsMap.get(test.id);
+        fingerprints.set(test.id, this.extractFingerprint(test, session));
+      }
+
+      // Phase 2: Get AI similarity scores via GPT-4o-mini (single batch call)
+      const aiScores = await this.getAISimilarityScores(tests, fingerprints);
+
+      // Phase 3: Compare each test pair using URL/page_flow + AI scores
       const edges: OverallEdge[] = [];
       const relationshipScores = new Map<string, Map<string, RelationshipScore>>();
 
-      // ✅ Performance: Limit semantic comparisons for large projects
-      let semanticComparisonsCount = 0;
-
-      // Compare each test pair
       for (let i = 0; i < tests.length; i++) {
         for (let j = i + 1; j < tests.length; j++) {
           const test1 = tests[i];
@@ -65,22 +66,17 @@ export class OverallRelationshipService {
           const session1 = sessionsMap.get(test1.id);
           const session2 = sessionsMap.get(test2.id);
 
-          // ✅ Performance: Skip semantic similarity if limit reached
-          const skipSemantic =
-            semanticComparisonsCount >= MAX_SEMANTIC_COMPARISONS;
+          // Get pre-computed AI score for this pair
+          const pairKey = `${i}-${j}`;
+          const aiScore = aiScores.get(pairKey);
 
-          // Calculate relationship score
-          const score = await this.calculateRelationshipScore(
+          const score = this.calculateRelationshipScore(
             test1,
             test2,
             session1,
             session2,
-            skipSemantic
+            aiScore
           );
-
-          if (!skipSemantic && score.usedSemantic) {
-            semanticComparisonsCount++;
-          }
 
           // Only create edge if confidence is high enough
           if (score.totalConfidence >= 0.5) {
@@ -95,6 +91,7 @@ export class OverallRelationshipService {
               target: test2.id,
               relationshipType: score.primaryType,
               confidence: score.totalConfidence,
+              distance: 1 - score.totalConfidence,
               reasons: score.reasons,
             });
 
@@ -112,16 +109,6 @@ export class OverallRelationshipService {
         }
       }
 
-      if (semanticComparisonsCount >= MAX_SEMANTIC_COMPARISONS) {
-        logger.warn(
-          '[RELATIONSHIP] Semantic comparison limit reached, remaining comparisons skipped',
-          {
-            limit: MAX_SEMANTIC_COMPARISONS,
-            totalPairs: (tests.length * (tests.length - 1)) / 2,
-          }
-        );
-      }
-
       // Build clusters from edges
       const clusters = this.buildClusters(tests, relationshipScores);
 
@@ -130,33 +117,25 @@ export class OverallRelationshipService {
         clustersCount: clusters.length,
       });
 
-      return { edges, clusters };
+      return { edges, clusters, fingerprints };
     } catch (error) {
       logger.error('[RELATIONSHIP] Failed to build relationships', { error });
-      // Return empty on error rather than failing completely
-      return { edges: [], clusters: [] };
+      return { edges: [], clusters: [], fingerprints: new Map() };
     }
   }
 
   /**
    * Calculate relationship score between two tests
-   * Uses multiple strategies and returns the strongest relationship
-   *
-   * @param test1 - First test record
-   * @param test2 - Second test record
-   * @param session1 - First test's intelligent session (may be null)
-   * @param session2 - Second test's intelligent session (may be null)
-   * @param skipSemantic - If true, skip expensive semantic similarity check
-   * @returns Relationship score with type, confidence, and reasons
+   * Uses URL, page flow, and AI-based command analysis
    */
-  private static async calculateRelationshipScore(
+  private static calculateRelationshipScore(
     test1: any,
     test2: any,
     session1: any,
     session2: any,
-    skipSemantic = false
-  ): Promise<RelationshipScore> {
-    const scores: Array<{ type: any; score: number; reason: string }> = [];
+    aiScore?: { score: number; reason: string }
+  ): RelationshipScore {
+    const scores: Array<{ type: 'url' | 'page_flow' | 'command'; score: number; reason: string }> = [];
 
     // 1. URL relationship
     const urlScore = this.checkUrlRelationship(test1, test2, session1, session2);
@@ -170,37 +149,22 @@ export class OverallRelationshipService {
       scores.push({ type: 'page_flow', ...flowScore });
     }
 
-    // 3. Temporal proximity
-    const temporalScore = this.checkTemporalProximity(test1, test2);
-    if (temporalScore.score > 0) {
-      scores.push({ type: 'temporal', ...temporalScore });
-    }
-
-    // 4. Semantic similarity (with safe limits)
-    let usedSemantic = false;
-    if (!skipSemantic) {
-      const semanticScore = await this.checkSemanticSimilarity(
-        session1,
-        session2
-      );
-      if (semanticScore.score > 0) {
-        scores.push({ type: 'semantic', ...semanticScore });
-        usedSemantic = true;
-      }
+    // 3. AI-based command similarity (from GPT-4o-mini batch)
+    if (aiScore && aiScore.score > 0) {
+      scores.push({ type: 'command', ...aiScore });
     }
 
     // Determine primary type (highest score)
     scores.sort((a, b) => b.score - a.score);
-    const primaryType = scores.length > 0 ? scores[0].type : 'semantic';
+    const primaryType = scores.length > 0 ? scores[0].type : 'url';
     const totalConfidence = scores.length > 0 ? scores[0].score : 0;
-    const reasons = scores.slice(0, 3).map(s => s.reason); // Top 3 reasons
+    const reasons = scores.map(s => s.reason).filter(r => r.length > 0);
 
     return {
       primaryType,
       totalConfidence,
       reasons,
       allScores: scores,
-      usedSemantic,
     };
   }
 
@@ -241,9 +205,11 @@ export class OverallRelationshipService {
       };
     }
 
-    // Check for common URLs
-    const urls1Set = new Set(urls1.map(u => this.normalizeUrl(u)));
-    const urls2Set = new Set(urls2.map(u => this.normalizeUrl(u)));
+    // Check for common URLs (filter out null from failed normalization)
+    const urls1Normalized = urls1.map(u => this.normalizeUrl(u)).filter((u): u is string => u !== null);
+    const urls2Normalized = urls2.map(u => this.normalizeUrl(u)).filter((u): u is string => u !== null);
+    const urls1Set = new Set(urls1Normalized);
+    const urls2Set = new Set(urls2Normalized);
     const commonUrls = [...urls1Set].filter(u => urls2Set.has(u));
 
     if (commonUrls.length > 0) {
@@ -338,113 +304,380 @@ export class OverallRelationshipService {
     return { score: 0, reason: '' };
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // COMMAND FINGERPRINTING - Extract "meaning" from test steps
+  // ═══════════════════════════════════════════════════════════════════════
+
   /**
-   * Check temporal proximity (tests run close in time)
-   * Tests run within same session/timeframe are likely related
+   * Extract fingerprint from a test's steps
+   * Parses graph_data.nodes to understand what the test does
    *
-   * @returns Score (0-0.7) and reason
+   * Example output:
+   *   actions: ["goto", "fill", "click", "assertVisible"]
+   *   selectors: ["input[name=email]", "button.submit", ".dashboard"]
+   *   urls: ["/login", "/dashboard"]
+   *   summary: "login flow (fill email, fill password, click submit)"
    */
-  private static checkTemporalProximity(
-    test1: any,
-    test2: any
-  ): { score: number; reason: string } {
-    // ✅ Improved: Use completed_at if available (more accurate)
-    const timestamp1 = test1.completed_at || test1.created_at;
-    const timestamp2 = test2.completed_at || test2.created_at;
+  static extractFingerprint(test: any, session: any): CommandFingerprint {
+    const actions: Set<string> = new Set();
+    const selectors: Set<string> = new Set();
+    const urls: Set<string> = new Set();
+    const stepDescriptions: string[] = [];
 
-    if (!timestamp1 || !timestamp2) {
-      return { score: 0, reason: '' };
+    // Extract from graph_data nodes
+    const nodes = session?.graph_data?.nodes;
+    if (Array.isArray(nodes)) {
+      for (const node of nodes) {
+        if (!node || node.type === 'start' || node.type === 'end') continue;
+
+        // Action type (click, fill, goto, assertVisible, etc.)
+        if (node.stepType && typeof node.stepType === 'string') {
+          actions.add(node.stepType);
+        }
+
+        // Selector — normalize to remove dynamic parts
+        if (node.selector && typeof node.selector === 'string') {
+          selectors.add(this.normalizeSelector(node.selector));
+        }
+
+        // URLs from navigation
+        if (node.stepType === 'goto' && node.value && typeof node.value === 'string') {
+          const path = this.extractPath(node.value);
+          if (path) urls.add(path);
+        }
+        if (node.meta?.urlAfter && typeof node.meta.urlAfter === 'string') {
+          const path = this.extractPath(node.meta.urlAfter);
+          if (path) urls.add(path);
+        }
+
+        // Step description for summary
+        if (node.stepType && node.stepType !== 'goto') {
+          const target = node.selector
+            ? this.selectorToHumanName(node.selector)
+            : '';
+          if (target) {
+            stepDescriptions.push(`${node.stepType} ${target}`);
+          }
+        }
+      }
     }
 
-    const date1 = new Date(timestamp1).getTime();
-    const date2 = new Date(timestamp2).getTime();
-
-    // ✅ Validation: Check for invalid dates
-    if (isNaN(date1) || isNaN(date2)) {
-      logger.warn('[RELATIONSHIP] Invalid date for temporal proximity', {
-        timestamp1,
-        timestamp2,
-      });
-      return { score: 0, reason: '' };
+    // Also extract from test.commands if available (for non-intelligent tests)
+    if (Array.isArray(test.commands)) {
+      for (const cmd of test.commands) {
+        if (!cmd) continue;
+        if (cmd.action) actions.add(cmd.action);
+        if (cmd.selector) selectors.add(this.normalizeSelector(cmd.selector));
+        if (cmd.action === 'goto' && cmd.url) {
+          const path = this.extractPath(cmd.url);
+          if (path) urls.add(path);
+        }
+      }
     }
 
-    const diffHours = Math.abs(date1 - date2) / (1000 * 60 * 60);
-
-    if (diffHours < 1) {
-      return { score: 0.7, reason: 'Run within 1 hour' };
-    }
-    if (diffHours < 24) {
-      return { score: 0.5, reason: 'Run within 24 hours' };
-    }
-    if (diffHours < 168) {
-      return { score: 0.3, reason: 'Run within 1 week' };
+    // Start URL
+    if (test.url && typeof test.url === 'string') {
+      const path = this.extractPath(test.url);
+      if (path) urls.add(path);
     }
 
-    return { score: 0, reason: '' };
+    // Build summary: "login → dashboard (fill email, fill password, click submit)"
+    const urlParts = [...urls].map(u => u.replace(/^\//, '')).filter(Boolean);
+    const flow = urlParts.length > 0 ? urlParts.join(' → ') : 'unknown';
+    const uniqueSteps = [...new Set(stepDescriptions)];
+    const topSteps = uniqueSteps.slice(0, 4).join(', ');
+    const summary = topSteps ? `${flow} (${topSteps})` : flow;
+
+    return {
+      actions: [...actions],
+      selectors: [...selectors],
+      urls: [...urls],
+      summary,
+    };
   }
 
   /**
-   * Check semantic similarity using embeddings
-   * With safe rate limits to avoid overloading OpenAI API
-   *
-   * @param session1 - First test's intelligent session
-   * @param session2 - Second test's intelligent session
-   * @returns Similarity score and reason
+   * Get AI similarity scores for all test pairs via GPT-4o-mini
+   * Sends fingerprint summaries in batch requests, including cross-batch comparisons
+   * Returns a map of "i-j" → { score, reason }
    */
-  private static async checkSemanticSimilarity(
-    session1: any,
-    session2: any
-  ): Promise<{ score: number; reason: string }> {
-    // Only use embeddings if we have goals/summaries
-    const text1 = session1?.goal || session1?.summary;
-    const text2 = session2?.goal || session2?.summary;
+  private static async getAISimilarityScores(
+    tests: any[],
+    fingerprints: Map<string, CommandFingerprint>
+  ): Promise<Map<string, { score: number; reason: string }>> {
+    const results = new Map<string, { score: number; reason: string }>();
 
-    // ✅ Validation: Check text exists and has minimum length
-    if (
-      !text1 ||
-      !text2 ||
-      typeof text1 !== 'string' ||
-      typeof text2 !== 'string' ||
-      text1.length < 10 ||
-      text2.length < 10
-    ) {
-      return { score: 0, reason: '' };
+    // Build test summaries list (keep original indices for mapping back)
+    const summaries: Array<{ index: number; summary: string }> = [];
+    for (let i = 0; i < tests.length; i++) {
+      const fp = fingerprints.get(tests[i].id);
+      if (fp && fp.summary && fp.summary !== 'unknown') {
+        summaries.push({ index: i, summary: fp.summary });
+      }
     }
 
-    // ✅ Performance: Truncate very long texts (API limit protection)
-    const MAX_TEXT_LENGTH = 8000; // OpenAI limit is ~8K tokens
-    const truncatedText1 = text1.substring(0, MAX_TEXT_LENGTH);
-    const truncatedText2 = text2.substring(0, MAX_TEXT_LENGTH);
+    if (summaries.length < 2) {
+      return results;
+    }
+
+    // For small sets (<=50), single call covers all pairs
+    // For larger sets, we batch but also need cross-batch comparisons
+    const BATCH_SIZE = 50;
+
+    if (summaries.length <= BATCH_SIZE) {
+      // Single batch — all pairs covered
+      try {
+        const batchResults = await this.callGPTForSimilarity(summaries);
+        for (const [key, value] of batchResults) {
+          results.set(key, value);
+        }
+      } catch (error) {
+        logger.warn('[RELATIONSHIP] GPT similarity failed, falling back to URL/page_flow only', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } else {
+      // Multiple batches: intra-batch + cross-batch with overlap
+      for (let i = 0; i < summaries.length; i += BATCH_SIZE) {
+        // Intra-batch: compare within this chunk
+        const batch = summaries.slice(i, i + BATCH_SIZE);
+        try {
+          const batchResults = await this.callGPTForSimilarity(batch);
+          for (const [key, value] of batchResults) {
+            results.set(key, value);
+          }
+        } catch (error) {
+          logger.warn('[RELATIONSHIP] GPT similarity batch failed', {
+            error: error instanceof Error ? error.message : String(error),
+            batchStart: i,
+          });
+        }
+
+        // Cross-batch: take last 10 from previous + first 10 of next
+        if (i + BATCH_SIZE < summaries.length) {
+          const overlapStart = Math.max(i + BATCH_SIZE - 10, i);
+          const overlapEnd = Math.min(i + BATCH_SIZE + 10, summaries.length);
+          const crossBatch = summaries.slice(overlapStart, overlapEnd);
+          if (crossBatch.length >= 2) {
+            try {
+              const crossResults = await this.callGPTForSimilarity(crossBatch);
+              for (const [key, value] of crossResults) {
+                if (!results.has(key)) {
+                  results.set(key, value);
+                }
+              }
+            } catch {
+              // Cross-batch is best-effort
+            }
+          }
+        }
+      }
+    }
+
+    logger.info('[RELATIONSHIP] AI similarity scores computed', {
+      testsAnalyzed: summaries.length,
+      pairsFound: results.size,
+    });
+
+    return results;
+  }
+
+  /**
+   * Single GPT-4o-mini call to analyze similarity between a batch of tests
+   * Returns pairs with confidence >= 0.5
+   */
+  private static async callGPTForSimilarity(
+    batch: Array<{ index: number; summary: string }>
+  ): Promise<Map<string, { score: number; reason: string }>> {
+    const results = new Map<string, { score: number; reason: string }>();
+
+    const testList = batch
+      .map(t => `[${t.index}] ${t.summary}`)
+      .join('\n');
+
+    const response = await getChatCompletionWithMessages(
+      [
+        {
+          role: 'system',
+          content: `You are a QA test relationship analyzer. You receive summaries of automated UI test cases. Each summary has this format:
+"[index] url_path (action element, action element, ...)"
+
+Example: "[3] login → dashboard (fill email, fill password, click submit-btn)"
+This means: test #3 navigates from /login to /dashboard, fills email and password fields, then clicks submit.
+
+Your job: identify pairs of tests that are FUNCTIONALLY RELATED — they test the same feature, page, form, or user flow.
+
+Scoring guide:
+- 0.8-0.9: Tests interact with the SAME form/elements (e.g., both fill email + password = both test login)
+- 0.6-0.7: Tests cover the SAME feature area but different scenarios (e.g., login success vs login with wrong password)
+- 0.5-0.6: Tests share a page/flow but do different things (e.g., both start at /settings but test different settings)
+- Below 0.5: Do NOT include. Different features that happen to share generic elements (like a navbar) are NOT related.
+
+Important:
+- Use the original [index] numbers from input, not array positions
+- "reason" should be 3-8 words explaining WHY they are related
+- Do not hallucinate pairs — if tests are clearly about different features, omit them`,
+        },
+        {
+          role: 'user',
+          content: `Analyze these ${batch.length} test cases and find related pairs:
+
+${testList}
+
+Return JSON:
+{"pairs": [{"a": <index>, "b": <index>, "score": <0.5-1.0>, "reason": "<short reason>"}]}
+
+If no tests are related, return: {"pairs": []}`,
+        },
+      ],
+      {
+        model: 'gpt-4o-mini',
+        temperature: 0.1,
+        max_tokens: 2000,
+        response_format: { type: 'json_object' },
+      }
+    );
 
     try {
-      // Generate embeddings for both texts and compare
-      const [embedding1, embedding2] = await Promise.all([
-        generateEmbedding(truncatedText1),
-        generateEmbedding(truncatedText2),
-      ]);
+      const parsed = JSON.parse(response.content);
+      const pairs: Array<{ a: number; b: number; score: number; reason: string }> =
+        parsed.pairs || parsed.results || [];
 
-      const similarity = cosineSimilarity(embedding1, embedding2);
-
-      if (similarity > SEMANTIC_SIMILARITY_THRESHOLD) {
-        return {
-          score: similarity,
-          reason: `Similar goals (${Math.round(similarity * 100)}% match)`,
-        };
+      if (!Array.isArray(pairs)) {
+        logger.warn('[RELATIONSHIP] GPT returned non-array pairs', { parsed: typeof parsed });
+        return results;
       }
 
-      return { score: 0, reason: '' };
-    } catch (error) {
-      logger.warn('[RELATIONSHIP] Failed to compute semantic similarity', {
-        error: error instanceof Error ? error.message : String(error),
-        text1Length: text1.length,
-        text2Length: text2.length,
+      for (const pair of pairs) {
+        if (
+          typeof pair.a !== 'number' ||
+          typeof pair.b !== 'number' ||
+          typeof pair.score !== 'number' ||
+          pair.a === pair.b ||
+          pair.score < 0.5
+        ) {
+          continue;
+        }
+
+        // Validate indices exist in batch
+        const validIndices = new Set(batch.map(b => b.index));
+        if (!validIndices.has(pair.a) || !validIndices.has(pair.b)) {
+          logger.warn('[RELATIONSHIP] GPT returned invalid index', {
+            a: pair.a,
+            b: pair.b,
+            validRange: `${batch[0]?.index}-${batch[batch.length - 1]?.index}`,
+          });
+          continue;
+        }
+
+        const lo = Math.min(pair.a, pair.b);
+        const hi = Math.max(pair.a, pair.b);
+        const key = `${lo}-${hi}`;
+
+        results.set(key, {
+          score: Math.min(1, pair.score),
+          reason: pair.reason || 'Related tests',
+        });
+      }
+    } catch (parseError) {
+      logger.warn('[RELATIONSHIP] Failed to parse GPT similarity response', {
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+        content: response.content.substring(0, 200),
       });
-      return { score: 0, reason: '' };
+    }
+
+    return results;
+  }
+
+  /**
+   * Normalize selector — remove dynamic IDs, indices, and noise
+   * "div#app > form > input[name='email']" → "input[name=email]"
+   * "#id-12345 .btn-primary" → ".btn-primary"
+   */
+  private static normalizeSelector(selector: string): string {
+    if (!selector || typeof selector !== 'string') return '';
+
+    let s = selector.trim();
+
+    // Remove dynamic IDs (e.g., #react-12a4b5c6, #el-5f3a2b, #:r1:, #radix-123)
+    // Only targets IDs with hex-heavy patterns or framework prefixes, not stable IDs like #main or #login-form
+    s = s.replace(/#:r\d+:/g, '');                          // React auto IDs (#:r1:, #:r2:)
+    s = s.replace(/#[a-zA-Z]*[-_][0-9a-f]{6,}/g, '');      // Hex-heavy IDs (#el-abc123def)
+    s = s.replace(/#[0-9a-f]{8,}/g, '');                    // Pure hex IDs (#a1b2c3d4e5f6)
+
+    // Remove nth-child / nth-of-type indices (volatile)
+    s = s.replace(/:nth-child\(\d+\)/g, '');
+    s = s.replace(/:nth-of-type\(\d+\)/g, '');
+
+    // Keep only the last meaningful part (the target element)
+    // "div > section > form > input[name=email]" → "input[name=email]"
+    const parts = s.split(/\s*>\s*|\s+/);
+    const meaningful = parts.filter(p => {
+      const trimmed = p.trim();
+      // Keep parts with attributes, classes, or semantic tags
+      return (
+        trimmed.includes('[') ||
+        trimmed.includes('.') ||
+        /^(input|button|select|textarea|a|form|nav|header|footer|main|h[1-6])/.test(trimmed)
+      );
+    });
+
+    if (meaningful.length > 0) {
+      // Return last 2 meaningful parts max
+      return meaningful.slice(-2).join(' > ').replace(/['"]/g, '');
+    }
+
+    // Fallback: return cleaned full selector
+    return s.replace(/['"]/g, '');
+  }
+
+  /**
+   * Convert selector to human-readable name for summary
+   * "input[name=email]" → "email"
+   * "button.submit-btn" → "submit-btn"
+   * "[data-testid=login-form]" → "login-form"
+   */
+  private static selectorToHumanName(selector: string): string {
+    // data-testid
+    const testIdMatch = selector.match(/data-testid[=~]*["']?([^"'\]\s]+)/);
+    if (testIdMatch) return testIdMatch[1];
+
+    // name attribute
+    const nameMatch = selector.match(/name[=~]*["']?([^"'\]\s]+)/);
+    if (nameMatch) return nameMatch[1];
+
+    // class
+    const classMatch = selector.match(/\.([a-zA-Z][\w-]*)/);
+    if (classMatch) return classMatch[1];
+
+    // id
+    const idMatch = selector.match(/#([a-zA-Z][\w-]*)/);
+    if (idMatch) return idMatch[1];
+
+    // placeholder/aria-label
+    const placeholderMatch = selector.match(/placeholder[=~]*["']?([^"'\]\s]+)/);
+    if (placeholderMatch) return placeholderMatch[1];
+
+    return '';
+  }
+
+  /**
+   * Extract path from URL (strip origin)
+   * "https://example.com/login?next=/dashboard" → "/login"
+   */
+  private static extractPath(url: string): string | null {
+    if (!url || typeof url !== 'string') return null;
+    try {
+      const u = new URL(url);
+      return u.pathname;
+    } catch {
+      // Maybe it's already a path
+      if (url.startsWith('/')) return url.split('?')[0];
+      return null;
     }
   }
 
   /**
-   * Build clusters from relationship scores
    * Groups tests into clusters based on relationship confidence
    *
    * @param tests - Array of test records
@@ -681,9 +914,8 @@ export class OverallRelationshipService {
  * Internal type for relationship scoring
  */
 interface RelationshipScore {
-  primaryType: 'url' | 'page_flow' | 'semantic' | 'temporal';
+  primaryType: 'url' | 'page_flow' | 'command';
   totalConfidence: number;
   reasons: string[];
-  allScores: Array<{ type: any; score: number; reason: string }>;
-  usedSemantic?: boolean; // Track if semantic analysis was used (for rate limiting)
+  allScores: Array<{ type: 'url' | 'page_flow' | 'command'; score: number; reason: string }>;
 }
