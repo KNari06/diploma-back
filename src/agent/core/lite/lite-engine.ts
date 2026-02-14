@@ -892,18 +892,23 @@ export class LiteEngine {
       setTimeout(() => reject(new Error('TIMEOUT')), timeoutMs);
     });
 
-    // Load workspace skills for AI context (non-blocking, best-effort)
+    // Load workspace skills for AI context (best-effort, 5s timeout to avoid blocking test start)
     if (this.config.userId) {
       try {
-        const workspaceId = await WorkspaceService.getActiveWorkspaceForUser(this.config.userId);
-        if (workspaceId) {
-          this.skillsContext = await WorkspaceMemoryService.getMemoryForContext(workspaceId, 1500);
-          if (this.skillsContext) {
-            logger.info('[LITE_ENGINE] Skills loaded for AI context', {
-              testId: this.config.testId,
-              skillsLength: this.skillsContext.length,
-            });
+        const skillsPromise = (async () => {
+          const workspaceId = await WorkspaceService.getActiveWorkspaceForUser(this.config.userId!);
+          if (workspaceId) {
+            return await WorkspaceMemoryService.getMemoryForContext(workspaceId, 1500);
           }
+          return '';
+        })();
+        const skillsTimeout = new Promise<string>((resolve) => setTimeout(() => resolve(''), 5000));
+        this.skillsContext = await Promise.race([skillsPromise, skillsTimeout]);
+        if (this.skillsContext) {
+          logger.info('[LITE_ENGINE] Skills loaded for AI context', {
+            testId: this.config.testId,
+            skillsLength: this.skillsContext.length,
+          });
         }
       } catch (err) {
         logger.warn('[LITE_ENGINE] Failed to load skills (non-fatal)', {
