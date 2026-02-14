@@ -941,6 +941,123 @@ export class CommandExecutor {
           break;
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        // V6: FILE UPLOAD
+        // ═══════════════════════════════════════════════════════════════
+        case 'upload': {
+          logger.info('[COMMAND_EXECUTOR] Executing upload action', {
+            stepId: isIntentCommand ? intentCommand.intentMeta?.stepId : undefined,
+            hasUploadConfig: !!command.upload,
+            fileUrl: command.upload?.fileUrl?.substring(0, 100),
+            sourceType: command.upload?.sourceType,
+          });
+
+          if (!command.upload?.fileUrl) {
+            throw new Error('Upload config with fileUrl is required for upload action');
+          }
+
+          // Step 1: Download/prepare the file
+          const { downloadFileForUpload, cleanupUploadTempFile } = await import('./file-download.service');
+          let localFilePath: string;
+          let downloadResult: Awaited<ReturnType<typeof downloadFileForUpload>> | undefined;
+
+          try {
+            // Both 'url' and 'storage' sources are public URLs — download to temp dir
+            downloadResult = await downloadFileForUpload(command.upload.fileUrl, {
+              filename: command.upload.filename,
+              maxSizeBytes: command.upload.maxSizeBytes,
+            });
+            localFilePath = downloadResult.localPath;
+
+            logger.info('[COMMAND_EXECUTOR] File prepared for upload', {
+              localFilePath,
+              sizeBytes: downloadResult?.sizeBytes,
+            });
+
+            // Step 2: Resolve the file input locator and upload
+            const performUpload = async (locator: Locator) => {
+              // File inputs are often hidden; wait for attached instead of visible
+              await locator.waitFor({ state: 'attached', timeout: timeout || 10000 });
+              await locator.setInputFiles(localFilePath, { timeout: timeout || 30000 });
+            };
+
+            // Intent-based locator resolution
+            if (isIntentCommand && intentCommand.intentMeta) {
+              const { locator: intentLocator } = await this.getLocatorForIntentCommand(
+                intentCommand,
+                'upload',
+                timeout || 30000
+              );
+              await performUpload(intentLocator);
+            } else {
+              // Standard selector-based flow
+              if (!selector) throw new Error('Selector is required for upload action');
+
+              const uploadSmartResult = await getSmartLocator(
+                this.page,
+                selector,
+                'upload',
+                description
+              );
+
+              try {
+                await performUpload(uploadSmartResult.locator);
+              } catch (uploadError) {
+                logger.warn('[COMMAND_EXECUTOR] Smart locator upload failed, trying self-healing', {
+                  selector: selector.substring(0, 50),
+                  error: uploadError instanceof Error ? uploadError.message : String(uploadError),
+                });
+
+                await this.executeWithSelfHealing(
+                  async () => {
+                    const locator = getLocator(this.page, selector);
+                    await locator.waitFor({ state: 'attached', timeout: timeout || 30000 });
+                    await locator.setInputFiles(localFilePath, { timeout: timeout || 30000 });
+                  },
+                  {
+                    selector,
+                    intent: description || 'upload file',
+                    action: 'upload',
+                    timeout,
+                    value: localFilePath,
+                  }
+                );
+              }
+            }
+
+            // Step 3: Store env var if requested
+            if (command.upload.envVar) {
+              this.extractedData.set(command.upload.envVar, localFilePath);
+              logger.debug('[COMMAND_EXECUTOR] Upload file path stored in env var', {
+                envVar: command.upload.envVar,
+                localFilePath,
+              });
+            }
+
+            // Step 4: Schedule temp file cleanup (deferred to let Playwright finish reading)
+            if (downloadResult) {
+              const tempPath = downloadResult.localPath;
+              setTimeout(() => {
+                cleanupUploadTempFile(tempPath).catch(() => {});
+              }, 10_000);
+            }
+          } catch (error) {
+            // Record failure in runtime meta for intent commands
+            if (isIntentCommand && intentCommand.intentMeta?.stepId) {
+              this.stepRuntimeMeta.set(intentCommand.intentMeta.stepId, {
+                runtimeStatus: 'failed',
+                source: 'resolver',
+                confidenceTier: 'low',
+                failedReason: 'unknown',
+                failureExplanation: error instanceof Error ? error.message : String(error),
+              });
+            }
+            throw error;
+          }
+
+          break;
+        }
+
         default:
           throw new Error(`Unknown action: ${action}`);
       }
@@ -2080,7 +2197,8 @@ export class CommandExecutor {
     // Wait for element to be visible first (except for assertions and waits)
     const skipVisibilityCheck = [
       'wait', 'waitForSelector', 'waitForTimeout', 'waitForLoadState', 'waitForNavigation',
-      'assertHidden', 'assertDisabled', 'screenshot', 'evaluate', 'extract'
+      'assertHidden', 'assertDisabled', 'screenshot', 'evaluate', 'extract',
+      'upload' // File inputs are often hidden via CSS
     ];
     if (!skipVisibilityCheck.includes(actionType)) {
       await locator.waitFor({ state: 'visible', timeout: defaultTimeout }).catch(() => {
@@ -2244,6 +2362,15 @@ export class CommandExecutor {
         logger.warn('[COMMAND_EXECUTOR] Extract action in self-healing not fully supported', {
           actionType,
         });
+        break;
+
+      case 'upload':
+        // Upload in self-healing context: value holds the local file path
+        if (value) {
+          await locator.setInputFiles(String(value), { timeout: defaultTimeout });
+        } else {
+          logger.warn('[COMMAND_EXECUTOR] Upload action in self-healing has no file path', { actionType });
+        }
         break;
 
       case 'evaluate':

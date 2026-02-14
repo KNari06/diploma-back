@@ -92,6 +92,9 @@ function mapActionType(intentAction: IntentActionType): string {
     // V5: URL wait
     case 'wait_for':
       return 'waitFor'; // SPA-safe URL waiting
+    // V6: File upload
+    case 'upload':
+      return 'upload';
     default:
       return 'click'; // Fallback
   }
@@ -254,6 +257,20 @@ export function convertIntentStepToCommand(
     case 'scroll':
       // Scroll doesn't need value, but may have selector
       break;
+
+    case 'upload': {
+      // For upload, value is the file URL or storage path
+      command.value = step.value || '';
+      const uploadOpts = step.options?.upload;
+      command.upload = {
+        fileUrl: step.value || '',
+        sourceType: uploadOpts?.sourceType || 'url',
+        filename: uploadOpts?.filename,
+        envVar: uploadOpts?.envVar,
+        maxSizeBytes: uploadOpts?.maxSizeBytes,
+      };
+      break;
+    }
 
     default:
       // For click, hover, check, uncheck, toggle, open, close

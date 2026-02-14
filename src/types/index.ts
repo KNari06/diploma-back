@@ -989,6 +989,19 @@ export interface PlaywrightCommand {
     mode?: 'html' | 'text' | 'auto'; // Extraction mode for AI
     instructions?: string;  // Additional instructions for AI
   };
+  /** Configuration for upload action (V6: file upload to input[type="file"]) */
+  upload?: {
+    /** File source: URL to download, or storage path to a pre-uploaded file */
+    fileUrl: string;
+    /** Source type: 'url' (download from public URL) or 'storage' (pre-uploaded to platform storage) */
+    sourceType: 'url' | 'storage';
+    /** Optional filename override (e.g., 'invoice.pdf'). If omitted, derived from URL */
+    filename?: string;
+    /** Store the local file path in an environment variable */
+    envVar?: string;
+    /** Maximum file size in bytes (default: 50MB = 52428800) */
+    maxSizeBytes?: number;
+  };
   /** URL matcher for waitFor action (V5: SPA-safe URL waiting) */
   urlMatcher?: PlaywrightUrlMatcher;
 }

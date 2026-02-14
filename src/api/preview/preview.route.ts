@@ -5,6 +5,8 @@
 
 import { requireAuth } from '@/middleware/auth.middleware';
 import { Router } from 'express';
+import multer from 'multer';
+import { uploadTestFile } from './upload.controller';
 import {
   batchRunIntentTestCases,
   createIntentTestCase,
@@ -844,5 +846,45 @@ router.delete('/intent-test-cases/:id', requireAuth, deleteIntentTestCase);
 router.post('/intent-test-cases/batch-run', requireAuth, batchRunIntentTestCases);
 
 router.post('/intent-test-cases/:id/run', requireAuth, runIntentTestCase);
+
+// ============================================================================
+// FILE UPLOAD FOR UPLOAD STEPS (V6)
+// ============================================================================
+
+const uploadStorage = multer.memoryStorage();
+const uploadFile = multer({
+  storage: uploadStorage,
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB
+  },
+});
+
+/**
+ * @swagger
+ * /api/v1/preview/upload-file:
+ *   post:
+ *     summary: Upload a file for use in upload steps
+ *     tags: [Preview]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: File uploaded successfully
+ *       400:
+ *         description: Missing file
+ *       401:
+ *         description: Unauthorized
+ */
+router.post('/upload-file', requireAuth, uploadFile.single('file'), uploadTestFile);
 
 export default router;

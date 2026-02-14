@@ -78,6 +78,8 @@ const ACTION_TO_ELEMENT_TYPES: Record<string, string[]> = {
   toggle: ['input', 'button', 'div', 'span'],
   open: ['button', 'div', 'select', 'summary'],
   close: ['button', 'div', 'summary'],
+  // V6: File upload
+  upload: ['input'],
 };
 
 // V2: Actions that require writable state

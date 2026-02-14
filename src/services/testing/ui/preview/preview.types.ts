@@ -145,7 +145,9 @@ export type IntentActionType =
   // V3: AI-powered assertion
   | 'ai_check'
   // V5: URL wait (Momentic-like matchers + auto-insert support)
-  | 'wait_for';
+  | 'wait_for'
+  // V6: File upload
+  | 'upload';
 
 /**
  * Binding hints for element resolution
@@ -369,6 +371,17 @@ export interface StepOptions {
    * Default: false (lookahead wait is enabled)
    */
   disableLookaheadWait?: boolean;
+  /** Upload configuration for upload step (V6) */
+  upload?: {
+    /** Source type: 'url' (download from public URL) or 'storage' (pre-uploaded file) */
+    sourceType: 'url' | 'storage';
+    /** Optional filename override */
+    filename?: string;
+    /** Store uploaded file path in environment variable */
+    envVar?: string;
+    /** Max file size in bytes (default: 50MB) */
+    maxSizeBytes?: number;
+  };
 }
 
 /**
@@ -619,6 +632,7 @@ export const COMPILED_TTL_MS: Record<string, number> = {
   check: 14 * 24 * 60 * 60 * 1000,    // 14 days
   uncheck: 14 * 24 * 60 * 60 * 1000,  // 14 days
   hover: 14 * 24 * 60 * 60 * 1000,    // 14 days
+  upload: 14 * 24 * 60 * 60 * 1000,  // 14 days
   default: 14 * 24 * 60 * 60 * 1000,  // 14 days
 };
 

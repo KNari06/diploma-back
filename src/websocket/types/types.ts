@@ -744,7 +744,7 @@ export interface PreviewInteractiveNode {
  */
 export interface PreviewIntentStep {
   id: string;
-  type: 'type' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check' | 'wait_for';
+  type: 'type' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check' | 'wait_for' | 'upload';
   description: string;
   value?: string;
   /**

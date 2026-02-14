@@ -48,7 +48,7 @@ const ACTION_TIMEOUT = 10000; // 10 seconds
 const POST_ACTION_SETTLE_TIMEOUT = 5000; // 5 seconds
 
 // V2: Action types that support state verification
-const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click']);
+const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
 /**
  * Generate a random integer in range [min, max] (inclusive).
@@ -310,6 +310,12 @@ async function verifyActionEffect(
         return true;
       }
 
+      case 'upload': {
+        // Verify the file input has files set
+        const files = await locator.evaluate((el: any) => el.files?.length ?? 0);
+        return files > 0;
+      }
+
       default:
         return true; // Non-verifiable actions assumed successful
     }
@@ -342,7 +348,12 @@ async function ensureStability(
   if (step.options?.disableStabilityChecks) {
     return;
   }
-  await locator.waitFor({ state: 'visible', timeout });
+  // File inputs are often hidden via CSS; check for attached instead of visible
+  if (step.type === 'upload') {
+    await locator.waitFor({ state: 'attached', timeout });
+  } else {
+    await locator.waitFor({ state: 'visible', timeout });
+  }
 }
 
 /**
@@ -538,6 +549,43 @@ async function executeAction(
         const isExpanded = await locator.getAttribute('aria-expanded');
         if (isExpanded === 'true') {
           await locator.click({ timeout });
+        }
+        break;
+      }
+
+      // V6: File upload
+      case 'upload': {
+        if (!locator) throw new Error('No selector for upload action');
+
+        const fileUrl = step.value;
+        if (!fileUrl) throw new Error('File URL/path is required for upload action');
+
+        const uploadOpts = step.options?.upload;
+        let localFilePath: string;
+        let needsCleanup = false;
+
+        // Both 'url' and 'storage' source types use public URLs — download to temp dir
+        {
+          const { downloadFileForUpload } = await import('@/agent/execution/file-download.service');
+          const result = await downloadFileForUpload(fileUrl, {
+            filename: uploadOpts?.filename,
+            maxSizeBytes: uploadOpts?.maxSizeBytes,
+          });
+          localFilePath = result.localPath;
+          needsCleanup = true;
+        }
+
+        try {
+          // File inputs are often hidden; use 'attached' not 'visible'
+          await locator.waitFor({ state: 'attached', timeout });
+          await locator.setInputFiles(localFilePath, { timeout });
+        } finally {
+          if (needsCleanup) {
+            const { cleanupUploadTempFile } = await import('@/agent/execution/file-download.service');
+            setTimeout(() => {
+              cleanupUploadTempFile(localFilePath).catch(() => {});
+            }, 10_000);
+          }
         }
         break;
       }
