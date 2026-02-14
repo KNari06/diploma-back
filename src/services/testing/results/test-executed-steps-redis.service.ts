@@ -129,6 +129,31 @@ export class TestExecutedStepsRedisService {
   private static lastProgressByKey = new Map<string, { fp: ProgressFingerprint; tsMs: number }>();
   private static finalizeInProgress = new Set<string>();
 
+  // Cleanup stale entries from lastProgressByKey every 5 minutes
+  private static readonly CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+  private static readonly STALE_ENTRY_AGE_MS = 30 * 60 * 1000; // 30 min
+  private static cleanupTimer: ReturnType<typeof setInterval> | null = (() => {
+    const timer = setInterval(() => {
+      const now = Date.now();
+      let cleaned = 0;
+      for (const [key, entry] of TestExecutedStepsRedisService.lastProgressByKey) {
+        if (now - entry.tsMs > TestExecutedStepsRedisService.STALE_ENTRY_AGE_MS) {
+          TestExecutedStepsRedisService.lastProgressByKey.delete(key);
+          cleaned++;
+        }
+      }
+      if (cleaned > 0) {
+        logger.debug('[EXECUTED_STEPS_REDIS] Cleaned stale progress entries', {
+          cleaned,
+          remaining: TestExecutedStepsRedisService.lastProgressByKey.size,
+        });
+      }
+    }, TestExecutedStepsRedisService.CLEANUP_INTERVAL_MS);
+    // Allow process to exit without waiting for this timer
+    if (timer.unref) timer.unref();
+    return timer;
+  })();
+
   private static key(testId: string): string {
     return `${this.KEY_PREFIX}${testId}`;
   }
@@ -303,6 +328,13 @@ export class TestExecutedStepsRedisService {
 
       await redisConnection.del(key);
       await redisConnection.del(lockKey);
+
+      // Clean up in-memory dedup entries for this test
+      for (const dedupKey of this.lastProgressByKey.keys()) {
+        if (dedupKey.startsWith(`${testId}:`)) {
+          this.lastProgressByKey.delete(dedupKey);
+        }
+      }
     } catch {
       // Best-effort only.
     } finally {

@@ -61,14 +61,12 @@ class RedisWebSocketBridge {
           // ✅ REMOVED: REDIS_BRIDGE logs
         });
 
-        // ✅ FIX: Handle ready event for connection tracking
         this.publisher.on('ready', () => {
-          // ✅ REMOVED: REDIS_BRIDGE logs
+          logger.info('[REDIS_BRIDGE] Publisher connected/reconnected');
         });
 
-        // ✅ FIX: Handle close event for graceful shutdown
         this.publisher.on('close', () => {
-          // ✅ REMOVED: REDIS_BRIDGE logs
+          logger.warn('[REDIS_BRIDGE] Publisher connection closed, ioredis will auto-reconnect');
         });
       } catch (error) {
         // ✅ REMOVED: REDIS_BRIDGE logs
@@ -188,7 +186,11 @@ class RedisWebSocketBridge {
           });
 
           this.subscriber.on('ready', () => {
-            // ✅ REMOVED: REDIS_BRIDGE logs
+            logger.info('[REDIS_BRIDGE] Subscriber connected/reconnected');
+          });
+
+          this.subscriber.on('close', () => {
+            logger.warn('[REDIS_BRIDGE] Subscriber connection closed, ioredis will auto-reconnect');
           });
         } catch (error) {
           // ✅ REMOVED: REDIS_BRIDGE logs

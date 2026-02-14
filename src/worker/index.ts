@@ -37,7 +37,7 @@ const workerOptions = {
   removeOnFail: { count: 50 },
   lockDuration: 301000, // ~5 minutes - must exceed Lite Engine timeout (5 min) to prevent stalled restart
   stalledInterval: 90000, // 1.5 minutes - stalled jobs check (increased to reduce false positives)
-  maxStalledCount: 1, // Max 1 stalled before permanent fail (reduced since we disabled BullMQ retry)
+  maxStalledCount: 2, // Allow 1 stall recovery before permanent fail
 };
 
 // Create workers for each queue
@@ -398,7 +398,7 @@ const gracefulShutdown = async (signal: string) => {
     // Log any failures but continue shutdown
     closeResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'testRunRegistry', 'videoStreams', 'browserPool'];
+        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'testRunRegistry', 'videoStreams', 'browserPool'];
         logger.warn(`[WORKER] Failed to close ${workerNames[index]}`, {
           error: result.reason instanceof Error ? result.reason.message : String(result.reason),
         });

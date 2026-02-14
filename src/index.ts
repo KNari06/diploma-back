@@ -1158,7 +1158,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
       ]),
       Promise.race([
         QueueManager.healthCheck(),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Queue check timeout')), 5000)),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Queue check timeout')), 10000)),
       ]),
     ]);
 
@@ -1389,7 +1389,7 @@ const startServer = async () => {
     try {
       const queueCheckPromise = QueueManager.healthCheck();
       const queueTimeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Queue connection timeout')), 5000)
+        setTimeout(() => reject(new Error('Queue connection timeout')), 10000)
       );
 
       const queueHealth = await Promise.race([queueCheckPromise, queueTimeoutPromise]);

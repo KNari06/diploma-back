@@ -31,8 +31,11 @@ async function acquireChatTestLock(chatSessionId: string): Promise<boolean> {
     const result = await redisConnection.set(lockKey, '1', 'EX', CHAT_TEST_LOCK_TTL_SECONDS, 'NX');
     return result === 'OK';
   } catch {
-    // If Redis is unavailable, fail-open (allow the request)
-    return true;
+    // If Redis is unavailable, fail-closed (reject the request to prevent concurrent execution)
+    logger.warn('[CHAT_LOCK] Redis unavailable, denying lock to prevent concurrent test execution', {
+      chatSessionId,
+    });
+    return false;
   }
 }
 
