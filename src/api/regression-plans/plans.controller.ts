@@ -232,6 +232,37 @@ export async function getScopeItems(req: AuthenticatedRequest, res: Response): P
   }
 }
 
+/**
+ * Get plan health report with trend history and flaky tests
+ * Also accessible via /api/v1/regression/plans/:planId/health
+ */
+export async function getPlanHealthReport(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const planId = req.params.id || req.params.planId;
+    const userId = getUserId(req);
+    const historyLimit = Math.min(Math.max(parseInt(req.query.historyLimit as string) || 10, 1), 50);
+
+    if (!planId) {
+      res.status(400).json({ success: false, error: 'planId is required' });
+      return;
+    }
+
+    // Verify ownership
+    const plan = await RegressionPlanService.getById(planId, userId);
+    if (!plan) {
+      res.status(404).json({ success: false, error: 'Plan not found' });
+      return;
+    }
+
+    const report = await RegressionPlanService.getPlanHealthReport(planId, historyLimit);
+
+    res.json({ success: true, data: report, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[PLANS_API] Failed to get plan health', { error });
+    handleError(res, error, 'Failed to get plan health');
+  }
+}
+
 function handleError(res: Response, error: unknown, defaultMessage: string): void {
   if (res.headersSent) return;
 

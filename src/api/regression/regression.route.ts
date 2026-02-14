@@ -1,6 +1,8 @@
 import { requireAuth } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import {
+  getPlanHealth,
+  getRunReport,
   getRunStats,
   getTestCaseCommands,
   listRuns,
@@ -357,5 +359,58 @@ router.get('/runs/:runId/stats', requireAuth, getRunStats);
  */
 // Get test case commands (for shared steps picker in frontend).
 router.get('/test-cases/:id/commands', requireAuth, getTestCaseCommands);
+
+/**
+ * @swagger
+ * /api/v1/regression/runs/{runId}/report:
+ *   get:
+ *     summary: Get full run report
+ *     description: Returns aggregated report with executions, bugs, artifacts, recommendations
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: runId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Full run report
+ *       404:
+ *         description: Run not found
+ */
+router.get('/runs/:runId/report', requireAuth, getRunReport);
+
+/**
+ * @swagger
+ * /api/v1/regression/plans/{planId}/health:
+ *   get:
+ *     summary: Get plan health report
+ *     description: Returns current health, run history trend, and flaky tests
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: planId
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: historyLimit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *           minimum: 1
+ *           maximum: 50
+ *     responses:
+ *       200:
+ *         description: Plan health report
+ *       404:
+ *         description: Plan not found
+ */
+router.get('/plans/:planId/health', requireAuth, getPlanHealth);
 
 export default router;

@@ -56,9 +56,10 @@ export class ManualTestService {
   static async getTestsByUser(
     userId: string,
     page: number = 1,
-    limit: number = 20
+    limit: number = 20,
+    runId?: string,
   ): Promise<PaginatedResponse<Test>> {
-    return getTestsByUser(userId, page, limit);
+    return getTestsByUser(userId, page, limit, runId);
   }
 
   /**

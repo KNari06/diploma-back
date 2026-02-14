@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { ExecutionService } from '@/services/testing/executions/execution.service';
 import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/testing/flows/saved-case-dependency-suggester.service';
+import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
 import { NotFoundError, ValidationError } from '@/types';
@@ -642,6 +643,67 @@ export async function getTestCaseCommands(req: AuthenticatedRequest, res: Respon
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to get test case commands', { error });
     handleControllerError(res, error, 'Failed to get test case commands');
+  }
+}
+
+/**
+ * Get full run report with executions, bugs, artifacts
+ *
+ * @route GET /api/v1/regression/runs/:runId/report
+ */
+export async function getRunReport(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { runId } = req.params;
+    const userId = getUserId(req);
+
+    if (!runId) {
+      res.status(400).json({ success: false, error: 'runId is required' });
+      return;
+    }
+
+    const report = await RegressionRunService.buildFullReport(runId, userId);
+
+    if (!report) {
+      res.status(404).json({ success: false, error: 'Run not found' });
+      return;
+    }
+
+    res.json({ success: true, data: report, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to get run report', { error });
+    handleControllerError(res, error, 'Failed to get run report');
+  }
+}
+
+/**
+ * Get plan health report with trend history and flaky tests
+ *
+ * @route GET /api/v1/regression/plans/:planId/health
+ */
+export async function getPlanHealth(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { planId } = req.params;
+    const userId = getUserId(req);
+    const historyLimit = Math.min(Math.max(parseInt(req.query.historyLimit as string) || 10, 1), 50);
+
+    if (!planId) {
+      res.status(400).json({ success: false, error: 'planId is required' });
+      return;
+    }
+
+    // Verify ownership
+    const plan = await RegressionPlanService.getById(planId, userId);
+    if (!plan) {
+      res.status(404).json({ success: false, error: 'Plan not found' });
+      return;
+    }
+
+    const report = await RegressionPlanService.getPlanHealthReport(planId, historyLimit);
+
+    res.json({ success: true, data: report, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to get plan health', { error });
+    handleControllerError(res, error, 'Failed to get plan health');
   }
 }
 

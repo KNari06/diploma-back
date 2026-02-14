@@ -8,7 +8,9 @@ import type {
     AddPlanItemParams,
     CreateRegressionPlanParams,
     ExpandedTestCase,
+    FlakyTest,
     PlanGitTriggersConfig,
+    PlanHealthReport,
     PlanScheduleConfig,
     RegressionPlan,
     RegressionPlanItem,
@@ -1302,5 +1304,124 @@ export class RegressionPlanService {
       flows: scopeFlows,
       testCases: scopeTestCases,
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // PLAN HEALTH REPORT
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Get plan health report with run history and flaky tests
+   */
+  static async getPlanHealthReport(
+    planId: string,
+    historyLimit: number = 10,
+  ): Promise<PlanHealthReport> {
+    // Clamp historyLimit
+    const limit = Math.min(Math.max(historyLimit, 1), 50);
+
+    // Get recent runs for this plan
+    const { data: runs, error } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, status, started_at, completed_at, summary')
+      .eq('plan_id', planId)
+      .order('started_at', { ascending: false })
+      .limit(limit);
+
+    if (error || !runs || runs.length === 0) {
+      return {
+        currentHealth: 'unknown',
+        passRate: 0,
+        history: [],
+        flakyTests: [],
+      };
+    }
+
+    const runIds = runs.map((r: any) => r.id);
+    const healthMap = await this.batchGetRunHealths(runIds);
+
+    // Build history — frontend expects `id` not `runId`
+    const history = runs.map((run: any) => {
+      const health = healthMap.get(run.id);
+      return {
+        id: run.id,
+        status: run.status,
+        passRate: health?.passRate || 0,
+        startedAt: run.started_at,
+        bugsFound: run.summary?.bugs_count ?? run.summary?.bugsFound ?? 0,
+      };
+    });
+
+    // Current health = most recent run's state as string
+    const latestHealth = healthMap.get(runIds[0]);
+    const currentHealth: PlanHealthReport['currentHealth'] = latestHealth?.state || 'unknown';
+    const passRate = latestHealth?.passRate || 0;
+
+    // Detect flaky tests across all these runs
+    const flakyTests = await this.detectFlakyTests(runIds);
+
+    return { currentHealth, passRate, history, flakyTests };
+  }
+
+  /**
+   * Detect flaky tests across multiple runs
+   * Flaky = fail rate between 10% and 90%
+   */
+  private static async detectFlakyTests(runIds: string[]): Promise<FlakyTest[]> {
+    if (!runIds.length) return [];
+
+    const { data: executions } = await supabaseAdmin
+      .from('test_executions')
+      .select('test_case_id, status')
+      .in('run_id', runIds)
+      .in('status', ['passed', 'failed']);
+
+    if (!executions || executions.length === 0) return [];
+
+    // Group by test_case_id
+    const groups = new Map<string, { total: number; failures: number }>();
+    for (const exec of executions) {
+      if (!exec.test_case_id) continue;
+      const g = groups.get(exec.test_case_id) || { total: 0, failures: 0 };
+      g.total++;
+      if (exec.status === 'failed') g.failures++;
+      groups.set(exec.test_case_id, g);
+    }
+
+    // Filter flaky (fail rate 10%-90%) and require at least 2 runs
+    const flakyIds: string[] = [];
+    const flakyData = new Map<string, { total: number; failures: number; failRate: number }>();
+    for (const [id, g] of groups) {
+      if (g.total < 2) continue;
+      const failRate = Math.round((g.failures / g.total) * 100);
+      if (failRate >= 10 && failRate <= 90) {
+        flakyIds.push(id);
+        flakyData.set(id, { ...g, failRate });
+      }
+    }
+
+    if (!flakyIds.length) return [];
+
+    // Get names
+    const { data: names } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, name')
+      .in('id', flakyIds);
+
+    const nameMap = new Map<string, string>();
+    for (const n of names || []) {
+      nameMap.set(n.id, n.name);
+    }
+
+    return flakyIds.map((id) => {
+      const d = flakyData.get(id)!;
+      return {
+        testCaseId: id,
+        testCaseName: nameMap.get(id) || 'Unknown',
+        failRate: d.failRate,
+        totalRuns: d.total,
+        failures: d.failures,
+      };
+    });
   }
 }

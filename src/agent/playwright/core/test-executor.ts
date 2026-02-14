@@ -110,6 +110,32 @@ function shouldFailOnCriticalNetworkErrors(params: {
 }
 
 /**
+ * Capture a screenshot when a bug is detected during test execution.
+ * Non-fatal: returns undefined on any failure.
+ */
+async function captureBugScreenshot(
+  page: Page,
+  testData: TestJobData,
+  stepIndex: number,
+  reason: string,
+): Promise<string | undefined> {
+  try {
+    const buf = await page.screenshot({ type: 'png', fullPage: false });
+    const path = `bug-screenshots/${testData.testId}/${testData.browser}/step-${stepIndex}-${reason}.png`;
+    const { data } = await supabaseAdmin.storage
+      .from('test-artifacts')
+      .upload(path, buf, { contentType: 'image/png', upsert: true });
+    if (data?.path) {
+      const { data: urlData } = supabaseAdmin.storage.from('test-artifacts').getPublicUrl(data.path);
+      return urlData?.publicUrl;
+    }
+  } catch {
+    // Non-fatal — continue without screenshot
+  }
+  return undefined;
+}
+
+/**
  * Execute Playwright test
  */
 export async function executePlaywrightTest(testData: TestJobData): Promise<{
@@ -382,6 +408,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               allSuccess = false;
               finalError = `Silent backend failure: ${firstFatal.method} ${firstFatal.url} → ${firstFatal.error}`;
 
+              // Capture bug screenshot before emitting failure
+              const bugScreenshotUrl = await captureBugScreenshot(page, testData, currentStepIndex, 'backend-failure');
+
               // Enrich runtimeMeta with network evidence
               const enrichedMeta: NonNullable<TestStepCompletedPayload['runtimeMeta']> = {
                 stepId: intentMeta?.stepId,
@@ -397,6 +426,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                   network: updatedStepErrors.networkErrors.length,
                   ui: updatedStepErrors.uiErrors.length,
                 },
+                bugScreenshotUrl,
               };
 
               webSocketService.emitTestStepCompleted(testData.testId, {
@@ -437,6 +467,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             // Collect UI errors after successful step execution
             try {
               await errorCollector.collectUIErrors();
+              // Capture screenshot if UI errors were detected during this step
+              const uiErrorsSinceStep = errorCollector.getErrorsSince(stepStartedAt).uiErrors;
+              if (uiErrorsSinceStep.length > 0) {
+                await captureBugScreenshot(page, testData, currentStepIndex, 'ui-error');
+              }
             } catch (uiErrorCollectionError) {
               // Non-fatal - log and continue
               logger.debug('[PLAYWRIGHT] Failed to collect UI errors', {
@@ -547,6 +582,10 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               network: stepErrors.networkErrors.length,
               ui: stepErrors.uiErrors.length,
             };
+
+            // Capture bug screenshot at moment of failure
+            const bugScreenshotUrl = await captureBugScreenshot(page, testData, currentStepIndex, 'step-failure');
+            finalMeta.bugScreenshotUrl = bugScreenshotUrl;
 
             logger.error('[PLAYWRIGHT] Replay mode step failed', {
               testId: testData.testId,

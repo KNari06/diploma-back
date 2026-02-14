@@ -11,6 +11,7 @@ import {
     deletePlan,
     expandPlan,
     getPlan,
+    getPlanHealthReport,
     getScopeItems,
     listPlans,
     removeItem,
@@ -136,6 +137,36 @@ router.post('/', requireAuth, createPlan);
  *         description: Scope items with counts
  */
 router.get('/scope-items', requireAuth, getScopeItems);
+
+/**
+ * @swagger
+ * /api/v1/regression-plans/{id}/health:
+ *   get:
+ *     summary: Get plan health report
+ *     description: Returns current health, run history trend, and flaky tests
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: historyLimit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *           minimum: 1
+ *           maximum: 50
+ *     responses:
+ *       200:
+ *         description: Plan health report
+ *       404:
+ *         description: Plan not found
+ */
+router.get('/:id/health', requireAuth, getPlanHealthReport);
 
 /**
  * @swagger

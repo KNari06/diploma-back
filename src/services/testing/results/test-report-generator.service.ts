@@ -449,4 +449,31 @@ export class TestReportGeneratorService {
       return null;
     }
   }
+
+  /**
+   * Batch fetch test reports by multiple test IDs
+   */
+  static async batchGetReportsByTestIds(testIds: string[]): Promise<FinalTestReport[]> {
+    if (!testIds.length) return [];
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('test_reports')
+        .select('*')
+        .in('test_id', testIds);
+      if (error || !data) return [];
+      return data.map((row: any) => ({
+        testId: row.test_id,
+        testUrl: row.test_url,
+        status: row.status,
+        executedAt: row.executed_at,
+        duration: row.duration,
+        generatedCode: row.generated_code,
+        artifacts: row.artifacts,
+        analysis: row.analysis,
+        summary: row.summary,
+      }));
+    } catch {
+      return [];
+    }
+  }
 }

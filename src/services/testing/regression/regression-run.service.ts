@@ -1,11 +1,21 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { NotFoundError, ValidationError } from '@/types';
-import type { Priority, RunResult } from '@/types/testing.types';
+import type {
+  Priority,
+  RunResult,
+  RunReport,
+  RunReportExecution,
+  RunReportStep,
+  RunReportSummary,
+  RunReportArtifactsSummary,
+  EnrichedBug,
+} from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { ExecutionService } from '../executions/execution.service';
 import { RegressionPlanService } from '../plans/regression-plan.service';
 import { ManualTestService } from '../ui/manualTest.service';
+import { TestReportGeneratorService } from '../results/test-report-generator.service';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -345,7 +355,7 @@ export class RegressionRunService {
 
     const { data: runs, error } = await supabaseAdmin
       .from('regression_runs')
-      .select('*')
+      .select('*, regression_plans(name)')
       .eq('project_id', projectId)
       .order('started_at', { ascending: false })
       .limit(safeLimit);
@@ -354,7 +364,60 @@ export class RegressionRunService {
       throw new Error(`Failed to list runs: ${error.message}`);
     }
 
-    return runs || [];
+    if (!runs || runs.length === 0) return [];
+
+    // Batch fetch stats for all runs
+    const runIds = runs.map((r: any) => r.id);
+    const { data: allExecs } = await supabaseAdmin
+      .from('test_executions')
+      .select('run_id, status, duration_ms')
+      .in('run_id', runIds);
+
+    // Group by run_id and compute stats
+    const statsMap = new Map<string, any>();
+    const grouped = new Map<string, any[]>();
+    for (const exec of allExecs || []) {
+      const arr = grouped.get(exec.run_id) || [];
+      arr.push(exec);
+      grouped.set(exec.run_id, arr);
+    }
+    for (const [rid, execs] of grouped) {
+      const total = execs.length;
+      const passed = execs.filter((e: any) => e.status === 'passed').length;
+      const failed = execs.filter((e: any) => e.status === 'failed').length;
+      const skipped = execs.filter((e: any) => e.status === 'skipped').length;
+      const pending = execs.filter((e: any) => e.status === 'pending').length;
+      const running = execs.filter((e: any) => e.status === 'running').length;
+      const cancelled = execs.filter((e: any) => e.status === 'cancelled').length;
+      const completed = passed + failed;
+      statsMap.set(rid, {
+        total, passed, failed, skipped, pending, running, cancelled,
+        passRate: completed > 0 ? Math.round((passed / completed) * 100) : 0,
+      });
+    }
+
+    return runs.map((run: any) => {
+      const runStats = statsMap.get(run.id) || { total: 0, passed: 0, failed: 0, skipped: 0, pending: 0, running: 0, cancelled: 0, passRate: 0 };
+      const durationMs = run.started_at && run.completed_at
+        ? Math.max(new Date(run.completed_at).getTime() - new Date(run.started_at).getTime(), 0)
+        : null;
+      const bugsFound = run.summary?.bugs_count ?? run.summary?.bugsFound ?? 0;
+
+      return {
+        id: run.id,
+        planId: run.plan_id || null,
+        planName: (run.regression_plans as any)?.name || null,
+        projectId: run.project_id,
+        status: run.status,
+        trigger: run.trigger,
+        startedAt: run.started_at,
+        completedAt: run.completed_at || null,
+        durationMs,
+        passRate: runStats.passRate,
+        stats: runStats,
+        bugsFound,
+      };
+    });
   }
 
   /**
@@ -1214,5 +1277,331 @@ export class RegressionRunService {
     }
 
     return (configs || []).map((c: any) => ({ id: c.id, flow_id: c.flow_id || undefined }));
+  }
+
+  // =========================================================================
+  // RUN REPORT METHODS
+  // =========================================================================
+
+  /**
+   * Get a run with ownership check, including plan name
+   */
+  static async getRunWithOwnership(
+    runId: string,
+    userId: string,
+  ): Promise<any | null> {
+    const { data, error } = await supabaseAdmin
+      .from('regression_runs')
+      .select('*, regression_plans(name)')
+      .eq('id', runId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) {
+      logger.error('[REGRESSION_RUN] Failed to get run', { error, runId });
+      return null;
+    }
+    return data;
+  }
+
+  /**
+   * Batch fetch test case names by IDs
+   */
+  static async batchGetTestCaseNames(
+    testCaseIds: string[],
+  ): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    if (!testCaseIds.length) return map;
+
+    const { data } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, name')
+      .in('id', testCaseIds);
+
+    for (const row of data || []) {
+      map.set(row.id, row.name);
+    }
+    return map;
+  }
+
+  /**
+   * Batch fetch test results (artifacts + ai_summary) by test IDs.
+   * When a test has multiple results (one per browser), picks the first one
+   * with ai_summary, or falls back to the first result.
+   */
+  static async batchGetTestResults(
+    testIds: string[],
+  ): Promise<Map<string, any>> {
+    const map = new Map<string, any>();
+    if (!testIds.length) return map;
+
+    const { data } = await supabaseAdmin
+      .from('test_results')
+      .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary')
+      .in('test_id', testIds)
+      .order('created_at', { ascending: false });
+
+    for (const row of data || []) {
+      // Prefer the result that has ai_summary
+      const existing = map.get(row.test_id);
+      if (!existing || (!existing.ai_summary && row.ai_summary)) {
+        map.set(row.test_id, row);
+      }
+    }
+    return map;
+  }
+
+  /**
+   * Batch fetch executed steps from tests table
+   */
+  static async batchGetExecutedSteps(
+    testIds: string[],
+  ): Promise<Map<string, any[]>> {
+    const map = new Map<string, any[]>();
+    if (!testIds.length) return map;
+
+    const { data } = await supabaseAdmin
+      .from('tests')
+      .select('id, executed_steps')
+      .in('id', testIds);
+
+    for (const row of data || []) {
+      map.set(row.id, row.executed_steps || []);
+    }
+    return map;
+  }
+
+  /**
+   * Build a full aggregated run report
+   */
+  static async buildFullReport(
+    runId: string,
+    userId: string,
+  ): Promise<RunReport | null> {
+    // Phase 1: Fetch run ownership first
+    const run = await this.getRunWithOwnership(runId, userId);
+    if (!run) return null;
+
+    // Phase 1b: Parallel fetch stats + executions (safe — run exists)
+    const [stats, executions] = await Promise.all([
+      ExecutionService.getStats(runId),
+      ExecutionService.getByRunId(runId),
+    ]);
+
+    const planName = (run.regression_plans as any)?.name || null;
+
+    // Get test case names
+    const testCaseIds = [...new Set(executions.map((e) => e.testCaseId))];
+    const namesMap = await this.batchGetTestCaseNames(testCaseIds);
+
+    // Extract testIds from UI executions (stored in execution.result.testId)
+    const testIdToExecId = new Map<string, string>();
+    const testIds: string[] = [];
+    for (const exec of executions) {
+      const testId = exec.result?.testId;
+      if (testId && exec.testType === 'ui') {
+        testIds.push(testId);
+        testIdToExecId.set(testId, exec.id);
+      }
+    }
+
+    // Phase 2: Parallel enrichment fetch
+    const [testResultsMap, testReports, executedStepsMap] = await Promise.all([
+      this.batchGetTestResults(testIds),
+      TestReportGeneratorService.batchGetReportsByTestIds(testIds),
+      this.batchGetExecutedSteps(testIds),
+    ]);
+
+    // Index reports by testId
+    const reportsMap = new Map<string, any>();
+    for (const report of testReports) {
+      reportsMap.set(report.testId, report);
+    }
+
+    // Build executions, bugs, aggregated artifacts
+    const reportExecutions: RunReportExecution[] = [];
+    const allBugs: EnrichedBug[] = [];
+    const allRecommendations = new Set<string>();
+    let totalConfidence = 0;
+    let confidenceCount = 0;
+
+    // Aggregated artifacts across all executions (actual data for artifactsSummary)
+    const aggArtifacts: RunReportArtifactsSummary = {
+      screenshots: [],
+      consoleLogs: [],
+      networkLogs: [],
+    };
+
+    const validSeverities = new Set(['critical', 'high', 'medium', 'low']);
+    const validCategories = new Set(['functional', 'performance', 'accessibility', 'visual', 'security']);
+
+    for (const exec of executions) {
+      const testCaseName = namesMap.get(exec.testCaseId) || 'Unknown';
+      const testId = exec.result?.testId;
+
+      // Build steps from executed_steps
+      const steps: RunReportStep[] = [];
+      let execArtifacts = {
+        videoUrl: undefined as string | undefined,
+        traceUrl: undefined as string | undefined,
+        screenshots: [] as string[],
+        consoleLogs: [] as string[],
+        networkLogs: [] as Array<{ method: string; url: string; status?: number; durationMs?: number }>,
+      };
+      let bugsCount = 0;
+
+      if (testId && exec.testType === 'ui') {
+        // Build steps
+        const rawSteps = executedStepsMap.get(testId) || [];
+        const completedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        for (let i = 0; i < completedSteps.length; i++) {
+          const step = completedSteps[i];
+          const meta = step.data?.runtimeMeta;
+          const success = step.data?.success !== false;
+          steps.push({
+            index: i + 1,
+            description: step.data?.stepDescription || step.data?.step || `Step ${i + 1}`,
+            status: success ? 'passed' : 'failed',
+            durationMs: meta?.executionMs,
+            error: !success ? {
+              message: meta?.failureExplanation || meta?.failedReason || 'Step failed',
+              failedReason: meta?.failedReason,
+              screenshot: meta?.bugScreenshotUrl,
+            } : undefined,
+          });
+        }
+
+        // Build artifacts from test_results
+        const testResult = testResultsMap.get(testId);
+        if (testResult) {
+          execArtifacts.videoUrl = testResult.video_url || undefined;
+          execArtifacts.traceUrl = testResult.trace_url || undefined;
+          if (testResult.screenshot) {
+            const screenshots = Array.isArray(testResult.screenshot)
+              ? testResult.screenshot
+              : [testResult.screenshot];
+            // Filter out base64 data — only include URLs
+            execArtifacts.screenshots = screenshots.filter(
+              (s: string) => typeof s === 'string' && !s.startsWith('data:'),
+            );
+          }
+          if (testResult.logs) {
+            execArtifacts.consoleLogs = Array.isArray(testResult.logs) ? testResult.logs : [];
+          }
+          if (testResult.network_logs && Array.isArray(testResult.network_logs)) {
+            execArtifacts.networkLogs = testResult.network_logs.map((nl: any) => ({
+              method: nl.method || '',
+              url: nl.url || '',
+              status: nl.status ?? undefined,
+              durationMs: nl.responseTime || nl.durationMs,
+            }));
+          }
+
+          // Aggregate into run-level artifacts
+          if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
+          if (execArtifacts.traceUrl && !aggArtifacts.traceUrl) aggArtifacts.traceUrl = execArtifacts.traceUrl;
+          aggArtifacts.screenshots.push(...execArtifacts.screenshots);
+          aggArtifacts.consoleLogs.push(...execArtifacts.consoleLogs);
+          aggArtifacts.networkLogs.push(...execArtifacts.networkLogs);
+        }
+
+        // Extract bugs: prefer test_reports > ai_summary
+        const report = reportsMap.get(testId);
+        const testResultData = testResultsMap.get(testId);
+        const rawBugs: any[] =
+          report?.analysis?.bugs ||
+          testResultData?.ai_summary?.bugs ||
+          [];
+
+        for (let i = 0; i < rawBugs.length; i++) {
+          const bug = rawBugs[i];
+          allBugs.push({
+            id: bug.id || `${exec.id}-bug-${i}`,
+            title: bug.title || '',
+            severity: validSeverities.has(bug.severity) ? bug.severity : 'medium',
+            category: validCategories.has(bug.category) ? bug.category : 'functional',
+            testCaseId: exec.testCaseId,
+            testCaseName,
+            executionId: exec.id,
+            steps: bug.steps || bug.stepsToReproduce || [],
+            expected: bug.expectedResult || bug.expected || '',
+            actual: bug.actualResult || bug.actual || '',
+            selector: bug.domSelector || bug.selector,
+            recommendation: bug.recommendation || '',
+          });
+        }
+        bugsCount = rawBugs.length;
+
+        // Collect recommendations
+        const recs: string[] =
+          report?.analysis?.recommendations ||
+          testResultData?.ai_summary?.recommendations ||
+          [];
+        for (const r of recs) {
+          allRecommendations.add(r);
+        }
+
+        // Collect confidence
+        const conf = report?.analysis?.confidence ?? testResultData?.ai_summary?.confidence;
+        if (typeof conf === 'number') {
+          totalConfidence += conf;
+          confidenceCount++;
+        }
+      }
+
+      reportExecutions.push({
+        id: exec.id,
+        testCaseId: exec.testCaseId,
+        testCaseName,
+        status: exec.status,
+        durationMs: exec.durationMs || 0,
+        browser: exec.browser || 'chrome',
+        bugsCount,
+        steps,
+        artifacts: execArtifacts,
+      });
+    }
+
+    // Build merged summary (stats + bugs breakdown)
+    const bySeverity: Record<string, number> = {};
+    const byCategory: Record<string, number> = {};
+    for (const bug of allBugs) {
+      bySeverity[bug.severity] = (bySeverity[bug.severity] || 0) + 1;
+      byCategory[bug.category] = (byCategory[bug.category] || 0) + 1;
+    }
+    const summary: RunReportSummary = {
+      total: stats.total,
+      passed: stats.passed,
+      failed: stats.failed,
+      skipped: stats.skipped,
+      flaky: 0,
+      totalBugs: allBugs.length,
+      bySeverity,
+      byCategory,
+    };
+
+    // Compute duration (guard against negative if clocks are skewed)
+    let durationMs: number | null = null;
+    if (run.started_at && run.completed_at) {
+      const diff = new Date(run.completed_at).getTime() - new Date(run.started_at).getTime();
+      durationMs = diff > 0 ? diff : 0;
+    }
+
+    return {
+      id: run.id,
+      planId: run.plan_id || null,
+      planName,
+      status: run.status,
+      trigger: run.trigger,
+      startedAt: run.started_at,
+      completedAt: run.completed_at || null,
+      durationMs,
+      aiConfidence: confidenceCount > 0 ? Math.round(totalConfidence / confidenceCount) : 0,
+      summary,
+      executions: reportExecutions,
+      bugs: allBugs,
+      recommendations: [...allRecommendations],
+      artifactsSummary: aggArtifacts,
+    };
   }
 }

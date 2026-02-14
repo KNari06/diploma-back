@@ -56,6 +56,7 @@ const testResultSchema = z.object({
 const paginationSchema = z.object({
   page: z.string().transform(Number).refine(n => n > 0, 'Page must be positive').optional().default('1'),
   limit: z.string().transform(Number).refine(n => n > 0 && n <= 100, 'Limit must be between 1 and 100').optional().default('20'),
+  runId: z.string().uuid().optional(),
 });
 
 /**
@@ -423,7 +424,8 @@ router.get('/', requireAuth, asyncHandler(async (req: Request, res: Response) =>
   const result = await ManualTestService.getTestsByUser(
     userId,
     pagination.page,
-    pagination.limit
+    pagination.limit,
+    pagination.runId,
   );
 
   res.status(200).json(result);

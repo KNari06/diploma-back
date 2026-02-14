@@ -630,6 +630,151 @@ export interface ExecutionStats {
 }
 
 // ============================================================================
+// RUN REPORT TYPES
+// ============================================================================
+
+/**
+ * Step in a run report execution
+ */
+export interface RunReportStep {
+  index: number;
+  description: string;
+  status: 'passed' | 'failed' | 'skipped';
+  durationMs?: number;
+  error?: {
+    message: string;
+    failedReason?: string;
+    screenshot?: string;
+  };
+}
+
+/**
+ * Artifacts for a single execution in a run report
+ */
+export interface RunReportExecArtifacts {
+  videoUrl?: string;
+  traceUrl?: string;
+  screenshots: string[];
+  consoleLogs: string[];
+  networkLogs: Array<{
+    method: string;
+    url: string;
+    status?: number;
+    durationMs?: number;
+  }>;
+}
+
+/**
+ * Single execution entry in a run report
+ */
+export interface RunReportExecution {
+  id: string;
+  testCaseId: string;
+  testCaseName: string;
+  status: string;
+  durationMs: number;
+  browser: string;
+  bugsCount: number;
+  steps: RunReportStep[];
+  artifacts: RunReportExecArtifacts;
+}
+
+/**
+ * Enriched bug with test case context
+ */
+export interface EnrichedBug {
+  id: string;
+  title: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  category: 'functional' | 'performance' | 'accessibility' | 'visual' | 'security';
+  testCaseId: string;
+  testCaseName: string;
+  executionId: string;
+  steps: string[];
+  expected: string;
+  actual: string;
+  selector?: string;
+  recommendation: string;
+}
+
+/**
+ * Merged summary: execution stats + bugs breakdown
+ */
+export interface RunReportSummary {
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  flaky: number;
+  totalBugs: number;
+  bySeverity: Record<string, number>;
+  byCategory: Record<string, number>;
+}
+
+/**
+ * Aggregated artifacts across all executions (actual data, not counts)
+ */
+export interface RunReportArtifactsSummary {
+  videoUrl?: string;
+  traceUrl?: string;
+  screenshots: string[];
+  consoleLogs: string[];
+  networkLogs: Array<{
+    method: string;
+    url: string;
+    status?: number;
+    durationMs?: number;
+  }>;
+}
+
+/**
+ * Full run report — aggregated data for a regression run
+ */
+export interface RunReport {
+  id: string;
+  planId: string | null;
+  planName: string | null;
+  status: string;
+  trigger: string;
+  startedAt: string;
+  completedAt: string | null;
+  durationMs: number | null;
+  aiConfidence: number;
+  summary: RunReportSummary;
+  executions: RunReportExecution[];
+  bugs: EnrichedBug[];
+  recommendations: string[];
+  artifactsSummary: RunReportArtifactsSummary;
+}
+
+/**
+ * Flaky test detected across multiple runs
+ */
+export interface FlakyTest {
+  testCaseId: string;
+  testCaseName: string;
+  failRate: number;
+  totalRuns: number;
+  failures: number;
+}
+
+/**
+ * Plan health report with trend history
+ */
+export interface PlanHealthReport {
+  currentHealth: 'passing' | 'warning' | 'failing' | 'unknown';
+  passRate: number;
+  history: Array<{
+    id: string;
+    status: string;
+    passRate: number;
+    startedAt: string;
+    bugsFound: number;
+  }>;
+  flakyTests: FlakyTest[];
+}
+
+// ============================================================================
 // EXPANDED TEST CASE (for plan execution)
 // ============================================================================
 

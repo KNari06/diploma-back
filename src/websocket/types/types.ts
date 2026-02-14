@@ -284,6 +284,9 @@ export interface TestStepCompletedPayload {
       network: number;
       ui: number;
     };
+
+    /** Screenshot URL captured at the moment a bug was detected */
+    bugScreenshotUrl?: string;
   };
 }
 

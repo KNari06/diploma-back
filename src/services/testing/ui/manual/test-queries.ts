@@ -74,28 +74,67 @@ export async function getTestResults(testId: string, userId?: string): Promise<A
 export async function getTestsByUser(
   userId: string,
   page: number = 1,
-  limit: number = 20
+  limit: number = 20,
+  runId?: string,
 ): Promise<PaginatedResponse<Test>> {
   try {
     const offset = (page - 1) * limit;
 
-    // Get tests for user
-    const { data: tests, error: testsError } = await dbService.supabaseAdmin
+    // If runId is provided, filter tests to only those in the regression run
+    let testIdFilter: string[] | undefined;
+    let runInfo: { runId: string; planName: string | null } | undefined;
+    if (runId) {
+      const { data: run } = await dbService.supabaseAdmin
+        .from('regression_runs')
+        .select('id, test_id, test_ids, regression_plans(name)')
+        .eq('id', runId)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (run) {
+        // Handle both array (plan runs) and single (legacy runs)
+        const ids: string[] = [];
+        if (run.test_ids && Array.isArray(run.test_ids)) {
+          ids.push(...run.test_ids);
+        } else if (run.test_id) {
+          ids.push(run.test_id);
+        }
+
+        if (ids.length > 0) {
+          testIdFilter = ids;
+          runInfo = {
+            runId: run.id,
+            planName: (run.regression_plans as any)?.name || null,
+          };
+        }
+      }
+    }
+
+    // Build query
+    let query = dbService.supabaseAdmin
       .from('tests')
       .select('*')
       .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
+      .order('created_at', { ascending: false });
+
+    let countQuery = dbService.supabaseAdmin
+      .from('tests')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId);
+
+    if (testIdFilter) {
+      query = query.in('id', testIdFilter);
+      countQuery = countQuery.in('id', testIdFilter);
+    }
+
+    const { data: tests, error: testsError } = await query.range(offset, offset + limit - 1);
 
     if (testsError) {
       throw new Error(`Failed to get tests: ${testsError.message}`);
     }
 
     // Get total count for pagination
-    const { count, error: countError } = await dbService.supabaseAdmin
-      .from('tests')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', userId);
+    const { count, error: countError } = await countQuery;
 
     if (countError) {
       throw new Error(`Failed to get test count: ${countError.message}`);
@@ -103,16 +142,27 @@ export async function getTestsByUser(
 
     const totalPages = Math.ceil((count || 0) / limit);
 
+    // Enrich with regression run info if filtering by runId
+    let enrichedTests = tests || [];
+    if (runInfo) {
+      enrichedTests = enrichedTests.map((t: any) => ({
+        ...t,
+        regressionRunId: runInfo!.runId,
+        regressionPlanName: runInfo!.planName,
+      }));
+    }
+
     logTestEvent('user_tests_retrieved', userId, {
       userId,
       page,
       limit,
       total: count,
+      runId,
     });
 
     return {
       success: true,
-      data: tests || [],
+      data: enrichedTests,
       pagination: {
         page,
         limit,
