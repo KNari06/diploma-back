@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import * as kbService from '@/services/kb/kb.service';
 import { getLocalKBStats, rebuildGlobalKB } from '@/services/kb/localKB.service';
+import { WorkspaceService } from '@/services/core/workspace.service';
 import { errorResponse, successResponse } from '@/utils/core/error-handler';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -374,6 +375,25 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
       projectStats = await kbService.getKBStats(projectId);
     }
 
+    // Get skills count from workspace memory
+    let skillsTotal = 0;
+    try {
+      const workspaceId = await WorkspaceService.getActiveWorkspaceForUser(userId);
+      if (workspaceId) {
+        const { count, error: countError } = await supabaseAdmin
+          .from('workspace_memory')
+          .select('id', { count: 'exact', head: true })
+          .eq('workspace_id', workspaceId);
+        if (!countError && count !== null) {
+          skillsTotal = count;
+        }
+      }
+    } catch (err) {
+      logger.warn('[KB_STATS] Failed to get skills count (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     successResponse(res, {
       global: {
         type: 'local',
@@ -384,6 +404,7 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
         lastGenerated: localStats.lastGenerated,
       },
       project: projectStats,
+      skills: { total: skillsTotal },
     });
   } catch (error: any) {
     logger.error('Get KB stats failed', { error });

@@ -382,11 +382,11 @@ export class WorkspaceMemoryService {
         return '';
       }
 
-      // Combine and deduplicate
+      // Combine, deduplicate, and filter out disabled memories
       const allMemories = [...(topAccessed || []), ...(recent || [])];
-      const uniqueMemories = Array.from(
+      const uniqueMemories = (Array.from(
         new Map(allMemories.map(m => [m.id, m])).values()
-      ) as WorkspaceMemory[];
+      ) as WorkspaceMemory[]).filter(m => m.metadata?.enabled !== false);
 
       // Sort by relevance (access_count + recency)
       uniqueMemories.sort((a, b) => {
@@ -426,6 +426,126 @@ export class WorkspaceMemoryService {
         workspaceId,
       });
       return ''; // Return empty string on error (non-fatal)
+    }
+  }
+
+  /**
+   * Read a memory by its UUID
+   */
+  static async readMemoryById(id: string): Promise<WorkspaceMemory | null> {
+    try {
+      logger.debug('[WORKSPACE_MEMORY] Reading memory by id', { id });
+
+      const { data, error } = await supabaseAdmin
+        .from('workspace_memory')
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+
+      if (error) {
+        logger.error('[WORKSPACE_MEMORY] Failed to read memory by id', {
+          error: error.message,
+          id,
+        });
+        throw error;
+      }
+
+      return data as WorkspaceMemory | null;
+    } catch (error) {
+      logger.error('[WORKSPACE_MEMORY] Read memory by id error', {
+        error: error instanceof Error ? error.message : String(error),
+        id,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Update a memory by its UUID (partial update)
+   * Regenerates embedding if content changes
+   */
+  static async updateMemoryById(
+    id: string,
+    updates: Partial<{
+      key: string;
+      content: string;
+      category: MemoryCategory;
+      metadata: Record<string, any>;
+      confidence: number;
+    }>
+  ): Promise<WorkspaceMemory> {
+    try {
+      logger.info('[WORKSPACE_MEMORY] Updating memory by id', {
+        id,
+        fields: Object.keys(updates),
+      });
+
+      const updatePayload: Record<string, any> = {
+        ...updates,
+        updated_at: new Date().toISOString(),
+      };
+
+      // Regenerate embedding if content changed
+      if (updates.content) {
+        updatePayload.embedding = await generateEmbedding(updates.content);
+      }
+
+      const { data, error } = await supabaseAdmin
+        .from('workspace_memory')
+        .update(updatePayload)
+        .eq('id', id)
+        .select()
+        .single();
+
+      if (error) {
+        logger.error('[WORKSPACE_MEMORY] Failed to update memory by id', {
+          error: error.message,
+          id,
+        });
+        throw error;
+      }
+
+      logger.info('[WORKSPACE_MEMORY] Memory updated successfully', { id });
+
+      return data as WorkspaceMemory;
+    } catch (error) {
+      logger.error('[WORKSPACE_MEMORY] Update memory by id error', {
+        error: error instanceof Error ? error.message : String(error),
+        id,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Delete a memory by its UUID
+   */
+  static async deleteMemoryById(id: string): Promise<boolean> {
+    try {
+      logger.info('[WORKSPACE_MEMORY] Deleting memory by id', { id });
+
+      const { error } = await supabaseAdmin
+        .from('workspace_memory')
+        .delete()
+        .eq('id', id);
+
+      if (error) {
+        logger.error('[WORKSPACE_MEMORY] Failed to delete memory by id', {
+          error: error.message,
+          id,
+        });
+        throw error;
+      }
+
+      logger.info('[WORKSPACE_MEMORY] Memory deleted by id successfully', { id });
+
+      return true;
+    } catch (error) {
+      logger.error('[WORKSPACE_MEMORY] Delete memory by id error', {
+        error: error instanceof Error ? error.message : String(error),
+        id,
+      });
+      throw error;
     }
   }
 

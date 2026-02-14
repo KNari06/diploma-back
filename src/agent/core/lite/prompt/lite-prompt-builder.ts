@@ -98,6 +98,8 @@ export class LitePromptBuilder {
     failedActions?: BlacklistedAction[];
     /** Audited state drift result (replaces raw stateDriftAnalysis when available) */
     auditedDrift?: StateDriftAuditResult;
+    /** Workspace skills/knowledge from KB */
+    skillsContext?: string;
   }): string {
     // ✅ NEW: Sanitize snapshot to prevent prompt injection attacks
     const sanitizationResult = PromptSanitizer.sanitizeSnapshot(
@@ -308,12 +310,20 @@ ${params.formFocusHint}
       ? `${coreRules}\n${conditionalRules.join('\n')}`
       : coreRules;
 
+    // Build skills section from KB
+    const skillsSection = params.skillsContext
+      ? `
+AGENT KNOWLEDGE (from Knowledge Base):
+${params.skillsContext}
+`
+      : '';
+
     // Build complete prompt with JSON-only response format
     return `You are a browser automation agent testing a web application.
 Your job is to REACH THE TARGET STATE through intermediate steps. Navigation is expected.
 
 GOAL: ${params.goal}
-
+${skillsSection}
 CURRENT PAGE:
 ${snapshot}
 ${taskPlanSection}${goalOrientedSummarySection}${formFocusSection}${auditedDriftSection || stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${visionHintsSection}${modalDismissSection}${validationErrorSection}${failedActionsSection}

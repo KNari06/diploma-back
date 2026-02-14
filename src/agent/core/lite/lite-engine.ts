@@ -45,6 +45,8 @@ import type { AICommand, AIDecision, ActionOutcome, BlacklistedAction, Collected
 import { LitePromptBuilder, type TaskPlanContext, type ValidationErrorContext } from './prompt/lite-prompt-builder';
 import { PromptSanitizer } from './security/prompt-sanitizer';
 import { LiteTraceWriter } from './trace/lite-trace-writer';
+import { WorkspaceMemoryService } from '@/services/ai/memory/workspace-memory.service';
+import { WorkspaceService } from '@/services/core/workspace.service';
 
 export class LiteEngine {
   private page: Page;
@@ -110,6 +112,7 @@ export class LiteEngine {
   private transientWaitStartTime: number | null = null;
   private readonly MAX_TRANSIENT_WAIT_MS = 15000; // 15 seconds max wait for loaders
   private lastGoalOrientedSummary: string | null = null; // ✅ NEW: Goal-Oriented Summary from last iteration (Hybrid Semantic Weight)
+  private skillsContext = ''; // Workspace skills from KB (loaded once at start)
 
   // ═══════════════════════════════════════════════════════════════════════════
   // L2-L4-L5 MANUS ALIGNMENT PROPERTIES
@@ -888,6 +891,26 @@ export class LiteEngine {
     const timeoutPromise = new Promise<LiteTestResult>((_, reject) => {
       setTimeout(() => reject(new Error('TIMEOUT')), timeoutMs);
     });
+
+    // Load workspace skills for AI context (non-blocking, best-effort)
+    if (this.config.userId) {
+      try {
+        const workspaceId = await WorkspaceService.getActiveWorkspaceForUser(this.config.userId);
+        if (workspaceId) {
+          this.skillsContext = await WorkspaceMemoryService.getMemoryForContext(workspaceId, 1500);
+          if (this.skillsContext) {
+            logger.info('[LITE_ENGINE] Skills loaded for AI context', {
+              testId: this.config.testId,
+              skillsLength: this.skillsContext.length,
+            });
+          }
+        }
+      } catch (err) {
+        logger.warn('[LITE_ENGINE] Failed to load skills (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     try {
       return await Promise.race([this.runLoop(), timeoutPromise]);
@@ -2031,6 +2054,7 @@ export class LiteEngine {
           formFocusHint, // ✅ TASK 9: Goal form identification
           failedActions, // Negative Reinforcement: blacklisted actions
           auditedDrift, // State Drift Auditor: enriched drift analysis
+          skillsContext: this.skillsContext || undefined, // KB skills for smarter decisions
         });
 
         // ═══════════════════════════════════════════════════════════════════════

@@ -1128,7 +1128,7 @@ export class IntelligentTestOrchestrator {
       this.state,
       this.page,
       this.costManager,
-      hints  // Pass hints for AI guidance during action generation
+      hints,  // Pass hints for AI guidance during action generation
     );
 
       const timeoutPromise = new Promise<never>((_, reject) => {

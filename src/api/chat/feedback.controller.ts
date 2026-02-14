@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { FeedbackAnalyticsService } from '@/services/feedback/feedback-analytics.service';
 import { FeedbackService } from '@/services/feedback/feedback.service';
+import { SkillSuggestionService } from '@/services/kb/skill-suggestion.service';
 import { CreateFeedbackRequest } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -81,6 +82,16 @@ export const createFeedback = async (req: Request, res: Response): Promise<void>
       intent_type,
       context,
     });
+
+    // After saving like feedback, trigger skill suggestion analysis (fire-and-forget)
+    if (feedback_type === 'like' && sessionId) {
+      SkillSuggestionService.analyzeMessageForSkill(message_id, userId, sessionId).catch(err => {
+        logger.warn('[FEEDBACK_API] Skill suggestion trigger failed (non-fatal)', {
+          messageId: message_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
 
     res.status(200).json({
       success: true,
