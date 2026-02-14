@@ -1,6 +1,6 @@
 import { promises as fs } from 'fs';
 import mammoth from 'mammoth';
-import * as pdfParse from 'pdf-parse';
+import { PDFParse } from 'pdf-parse';
 import { logger } from '../core/logger';
 
 export interface ParsedFile {
@@ -61,27 +61,27 @@ async function parsePdfFile(filePath: string): Promise<ParsedFile> {
     throw new Error(`Failed to read PDF file: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  // pdf-parse expects default export
-  const pdf = (pdfParse as any).default || pdfParse;
-
-  let data: any;
   try {
-    data = await pdf(dataBuffer);
+    const parser = new PDFParse({ data: new Uint8Array(dataBuffer) });
+
+    // pdf-parse v2: getText() loads the doc internally and returns TextResult
+    const result = await parser.getText();
+
+    // TextResult has .text (concatenated string) and .total (page count)
+    const text = result.text || '';
+    const numPages = result.total || undefined;
+
+    return {
+      content: text,
+      metadata: {
+        fileType: 'pdf',
+        pageCount: numPages,
+        wordCount: text ? text.split(/\s+/).filter(word => word.length > 0).length : 0,
+      },
+    };
   } catch (error) {
     throw new Error(`Failed to parse PDF: ${error instanceof Error ? error.message : String(error)}`);
   }
-
-  const text = data && data.text ? String(data.text) : '';
-  const numpages = data && typeof data.numpages === 'number' ? data.numpages : undefined;
-
-  return {
-    content: text,
-    metadata: {
-      fileType: 'pdf',
-      pageCount: numpages,
-      wordCount: text ? text.split(/\s+/).filter(word => word.length > 0).length : 0,
-    },
-  };
 }
 
 /**
@@ -235,8 +235,9 @@ export async function parseFile(filePath: string, originalName: string): Promise
         return await parseTextFile(filePath);
     }
   } catch (error) {
-    logger.error('File parsing failed', { error, filePath });
-    throw new Error(`Failed to parse file: ${originalName}`);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger.error('File parsing failed', { error: errorMessage, filePath, originalName });
+    throw new Error(`Failed to parse file "${originalName}": ${errorMessage}`);
   }
 }
 

@@ -1,4 +1,4 @@
-import { supabase } from '@/db/supabase';
+import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { chunkMarkdown, chunkText } from '@/utils/text-processing/chunking';
 import { getFileSizeMB, isValidFileType, parseFile } from '@/utils/parsing/fileParser';
@@ -112,7 +112,7 @@ export async function uploadGlobalKB(
       };
     });
 
-    const { error } = await supabase.from('global_kb_chunks').insert(records);
+    const { error } = await supabaseAdmin.from('global_kb_chunks').insert(records);
 
     if (error) {
       logger.error('[KB_SERVICE] Failed to insert global KB chunks', {
@@ -247,7 +247,7 @@ export async function uploadProjectKB(
       };
     });
 
-    const { error } = await supabase.from('project_kb_chunks').insert(records);
+    const { error } = await supabaseAdmin.from('project_kb_chunks').insert(records);
 
     if (error) {
       logger.error('[KB_SERVICE] Failed to insert project KB chunks', {
@@ -482,7 +482,7 @@ export async function searchKB(
     let projectChunks: KBChunk[] = [];
     if (projectId) {
       try {
-        const { data: projectResults, error: projectError } = await supabase.rpc('search_project_kb', {
+        const { data: projectResults, error: projectError } = await supabaseAdmin.rpc('search_project_kb', {
           p_project_id: projectId,
           query_embedding: JSON.stringify(queryEmbedding),
           match_threshold: matchThreshold,
@@ -587,7 +587,7 @@ export async function getProjectFiles(projectId: string): Promise<Array<{
   }
 
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('project_kb_chunks')
       .select('file_name, uploaded_by, created_at, metadata')
       .eq('project_id', projectId)
@@ -661,7 +661,7 @@ export async function deleteProjectFile(projectId: string, fileName: string): Pr
   }
 
   try {
-    const { error, count } = await supabase
+    const { error, count } = await supabaseAdmin
       .from('project_kb_chunks')
       .delete()
       .eq('project_id', projectId)
@@ -705,7 +705,7 @@ export async function getKBStats(projectId?: string): Promise<any> {
   }
 
   try {
-    const { data, error } = await supabase.rpc('get_kb_stats', {
+    const { data, error } = await supabaseAdmin.rpc('get_kb_stats', {
       p_project_id: projectId || null,
     });
 
