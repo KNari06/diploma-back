@@ -1195,10 +1195,13 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
 
     // 9. Collect all network logs
     const networkLogs = results
-      .filter(r => r.networkLogs && Array.isArray(r.networkLogs) && r.networkLogs.length > 0)
-      .map(r => ({
+      .filter((r: any) => {
+        const nl = r.network_logs ?? r.networkLogs;
+        return nl && Array.isArray(nl) && nl.length > 0;
+      })
+      .map((r: any) => ({
         browser: r.browser,
-        network_logs: r.networkLogs || [],
+        network_logs: r.network_logs ?? r.networkLogs ?? [],
         status: r.status,
       }));
 
@@ -1212,7 +1215,7 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
       }));
 
     // 10.5 Live executed steps fallback (Redis) for running tests
-    const rawExecutedSteps = (test as any).executedSteps ?? (test as any).executed_steps ?? null;
+    const rawExecutedSteps = (test as any).executed_steps ?? (test as any).executedSteps ?? null;
     const isRunning = test.status === 'running' || test.status === 'pending';
     const executedSteps = (isRunning && (!rawExecutedSteps || (Array.isArray(rawExecutedSteps) && rawExecutedSteps.length === 0)))
       ? await TestExecutedStepsRedisService.getLive(id)
@@ -1224,37 +1227,37 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
       test: {
         id: test.id,
         url: test.url,
-        project_id: test.projectId,
-        user_id: test.userId,
+        project_id: (test as any).project_id ?? (test as any).projectId,
+        user_id: (test as any).user_id ?? (test as any).userId,
         status: test.status,
         browsers: test.browsers,
         options: test.options,
-        created_at: test.createdAt,
-        updated_at: test.updatedAt,
-        started_at: test.startedAt,
-        completed_at: test.completedAt,
-        intelligent_mode: test.intelligentMode,
-        test_goal: test.testGoal,
+        created_at: (test as any).created_at ?? (test as any).createdAt,
+        updated_at: (test as any).updated_at ?? (test as any).updatedAt,
+        started_at: (test as any).started_at ?? (test as any).startedAt,
+        completed_at: (test as any).completed_at ?? (test as any).completedAt,
+        intelligent_mode: (test as any).intelligent_mode ?? (test as any).intelligentMode,
+        test_goal: (test as any).test_goal ?? (test as any).testGoal,
         executed_steps: executedSteps,
       },
       // ✅ OPTIMIZED: Use pre-converted URLs (no duplicate conversion)
       // ✅ FIX: Use video_url/trace_url from DB (snake_case) - Supabase returns snake_case
       results: (results as any[]).map(r => ({
         id: r.id,
-        test_id: r.test_id || r.testId,
+        test_id: r.test_id ?? r.testId,
         browser: r.browser,
         status: r.status,
         screenshot: screenshotUrlMap.get(r.id) || null,
         dom: r.dom,
-        video_url: r.video_url || r.videoUrl, // Support both formats for compatibility
-        trace_url: r.trace_url || r.traceUrl, // Support both formats for compatibility
+        video_url: r.video_url ?? r.videoUrl,
+        trace_url: r.trace_url ?? r.traceUrl,
         performance: r.performance,
-        ai_summary: r.aiSummary,
+        ai_summary: r.ai_summary ?? r.aiSummary ?? null,
         logs: r.logs || [],
-        network_logs: r.networkLogs || [],
+        network_logs: r.network_logs ?? r.networkLogs ?? [],
         errors: r.errors || [],
-        created_at: r.createdAt ?? r.created_at,
-        completed_at: r.completedAt ?? r.completed_at,
+        created_at: r.created_at ?? r.createdAt,
+        completed_at: r.completed_at ?? r.completedAt,
       })),
       report: report ? {
         generatedCode: report.generatedCode,
