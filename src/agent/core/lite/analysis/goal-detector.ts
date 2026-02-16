@@ -1498,7 +1498,9 @@ PAGE CONTENT SUMMARY (key elements):
 ${context.snapshotSummary.slice(0, 40).join('\n') || 'No elements'}
 
 LAST ACTION: ${lastAction || context.lastOutcome || 'Unknown'}
-
+${context.authSignals ? `
+AUTH SIGNALS:
+${context.authSignals.credentialsFilled ? '- Credentials were auto-filled and submitted (username + password + click submit)\n' : ''}${context.authSignals.successfulResponses?.length ? `- Successful network responses after submit:\n${context.authSignals.successfulResponses.map(r => `  ${r.method} ${r.url} → ${r.status}`).join('\n')}\n` : ''}${context.authSignals.failedResponses?.length ? `- Failed network responses after submit:\n${context.authSignals.failedResponses.map(r => `  ${r.method} ${r.url} → ${r.status} (${r.error})`).join('\n')}\n` : ''}${context.authSignals.titleBefore && context.authSignals.titleAfter && context.authSignals.titleBefore !== context.authSignals.titleAfter ? `- Page title changed: "${context.authSignals.titleBefore}" → "${context.authSignals.titleAfter}"\n` : ''}` : ''}
 TASK: Based on the page state, determine if:
 1. The goal has been FULLY achieved (isDone)
 2. The test is BLOCKED by something requiring user help (captcha, 2FA, verification code)

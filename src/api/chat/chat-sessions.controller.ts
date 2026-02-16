@@ -99,11 +99,12 @@ async function getWorkspaceChatInternal(
     return;
   }
 
-  // Get message count
+  // Get message count (exclude system welcome message)
   const { count: messageCount } = await supabaseAdmin
     .from('chat_messages')
     .select('id', { count: 'exact', head: true })
-    .eq('session_id', session.id);
+    .eq('session_id', session.id)
+    .not('metadata->>type', 'eq', 'welcome');
 
   logger.info('[CHAT_SESSIONS] Workspace chat retrieved', {
     userId,
@@ -415,6 +416,11 @@ export const clearWorkspaceChat = async (req: Request, res: Response): Promise<v
           logger.warn('[CHAT_SESSIONS] Failed to delete summaries during clear (table may not exist yet)', { error: error.message });
         }
       });
+
+    // Re-insert welcome message after clearing
+    if (session.workspace_id) {
+      await ChatService.insertWelcomeMessage(sessionId, session.workspace_id);
+    }
 
     logger.info('[CHAT_SESSIONS] Workspace chat cleared', { userId, sessionId });
 

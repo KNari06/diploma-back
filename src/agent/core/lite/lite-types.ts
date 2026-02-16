@@ -604,6 +604,19 @@ export interface GoalContext {
 
   /** ✅ NEW: Current flow state for multi-step processes */
   flowState?: FlowState;
+
+  /** Auth-specific signals for login/register goal validation */
+  authSignals?: {
+    /** Credential auto-fill completed (fill username → fill password → click submit) */
+    credentialsFilled?: boolean;
+    /** Successful network responses after submit (e.g. POST /auth → 200) */
+    successfulResponses?: Array<{ url: string; method: string; status: number }>;
+    /** Network errors after submit (e.g. POST /auth → 401) */
+    failedResponses?: Array<{ url: string; method: string; status: number; error: string }>;
+    /** Page title changed (e.g. "Login" → "Dashboard") */
+    titleBefore?: string;
+    titleAfter?: string;
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

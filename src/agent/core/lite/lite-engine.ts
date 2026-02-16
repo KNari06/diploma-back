@@ -1289,16 +1289,57 @@ export class LiteEngine {
             } else {
               this.autoFillIterationCount++;
 
+              const autoFillStateName = this.credentialFillState;
               logger.info('[LITE_ENGINE] Auto-fill active, executing command (skipping AI)', {
                 testId: this.config.testId,
-                state: this.credentialFillState,
+                state: autoFillStateName,
                 action: autoCommand.action,
                 iteration: i,
                 attemptCount: this.autoFillIterationCount,
               });
 
+              // Build safe (redacted) command for trace/graph
+              const safeAutoCommand = this.buildSafeCommandForTrace(autoCommand, snapshotBefore) || autoCommand;
+
+              // Trace action execute start (same as normal iterations)
+              const autoActionSpanId = this.traceWriter.generateSpanId();
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'action_execution',
+                eventType: 'action_execute_start',
+                spanId: autoActionSpanId,
+                parentSpanId: iterationSpanId,
+                payload: {
+                  command: safeAutoCommand,
+                  thought: `Auto-fill credentials (${autoFillStateName})`,
+                  isAutoFill: true,
+                },
+              });
+
               // Execute auto-command directly
               const execResult = await this.executor.execute(autoCommand, snapshotBefore, {});
+
+              // Trace action execute end
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'action_execution',
+                eventType: 'action_execute_end',
+                spanId: this.traceWriter.generateSpanId(),
+                parentSpanId: autoActionSpanId,
+                payload: {
+                  success: execResult.success,
+                  error: execResult.error,
+                  duration: execResult.duration,
+                  isAutoFill: true,
+                },
+              });
+
+              // Build synthetic decision for progress/graph emission
+              const autoDecision: AIDecision = {
+                thought: `Auto-fill credentials (${autoFillStateName})`,
+                command: safeAutoCommand,
+                done: false,
+              };
 
               // Record iteration with auto-fill
               const syntheticDiff: StateDiff = {
@@ -1309,10 +1350,10 @@ export class LiteEngine {
                 removedRefs: [],
                 changedElements: [],
                 hasVisualChange: false,
-                meaningfulChange: false,
+                meaningfulChange: execResult.success,
                 significantChange: false,
                 semanticWeight: 0,
-                progressSentiment: 'No Effect',
+                progressSentiment: execResult.success ? 'Minor Change' : 'No Effect',
                 newPageErrors: [],
                 newConsoleErrors: [],
               };
@@ -1320,7 +1361,7 @@ export class LiteEngine {
               this.state.recordIteration({
                 iteration: i,
                 decision: {
-                  thought: `Auto-fill: ${this.credentialFillState}`,
+                  thought: `Auto-fill: ${autoFillStateName}`,
                   command: autoCommand,
                   done: false,
                 },
@@ -1328,7 +1369,7 @@ export class LiteEngine {
                   stateDiff: syntheticDiff,
                   outcome: execResult.success ? 'state_changed' : 'execution_error',
                   success: execResult.success,
-                  duration: 0,
+                  duration: execResult.duration || 0,
                 },
                 stateBefore: {
                   url: snapshotBefore.url,
@@ -1340,6 +1381,23 @@ export class LiteEngine {
                   elementCount: snapshotBefore.elements.length,
                   pageErrors: [],
                 },
+              });
+
+              // Emit progress via WebSocket (so frontend shows auto-fill steps)
+              const autoOutcome = execResult.success ? 'state_changed' as const : 'execution_error' as const;
+              this.emitIterationProgress(i, autoDecision, autoOutcome, syntheticDiff);
+
+              // Add action node to graph (so flowmap shows auto-fill steps)
+              await this.addGraphActionNode(i, autoDecision, execResult, snapshotBefore, snapshotBefore, syntheticDiff);
+
+              // Close iteration with proper trace event
+              closeIteration({
+                iteration: i,
+                outcome: autoOutcome,
+                urlAfter: snapshotBefore.url,
+                stateChanged: execResult.success,
+                isAutoFill: true,
+                autoFillState: autoFillStateName,
               });
 
               // Skip rest of this iteration (continue to next)
@@ -1636,6 +1694,143 @@ export class LiteEngine {
 
         // ✅ NEW: Goal-first check BEFORE asking AI (using heuristic)
         const goalCheck = this.goalDetector.detectHeuristic(goalContext);
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // POST-CREDENTIAL-FILL GOAL CHECK
+        // When auto-fill completed (state='done') and URL redirected away from auth page,
+        // the heuristic often fails because URL/form signals no longer match.
+        // In this case, proactively call auditor (gpt-4o) to verify login success.
+        // ═══════════════════════════════════════════════════════════════════════
+        if (
+          this.credentialFillState === 'done' &&
+          !goalCheck.goalReached &&
+          this.config.url &&
+          snapshotBefore.url !== this.config.url
+        ) {
+          // URL changed after credential fill — likely a redirect post-login
+          const isAuthGoal = /login|sign.?in|auth|авторизац|войти/i.test(this.config.goal);
+          if (isAuthGoal) {
+            logger.info('[LITE_ENGINE] Post-credential-fill: URL redirected, checking if login succeeded', {
+              testId: this.config.testId,
+              originalUrl: this.config.url,
+              currentUrl: snapshotBefore.url,
+              iteration: i,
+            });
+
+            try {
+              // Collect network signals from recent activity (auth API calls)
+              const recentResponses = this.networkTracker.getSuccessfulResponsesSince(
+                Date.now() - 10000 // last 10 seconds covers auto-fill + redirect
+              );
+              const recentErrors = this.networkTracker.getErrorsSince(
+                Date.now() - 10000
+              );
+
+              // Build enriched goal context with credential-fill + auth signals
+              const credGoalContext: GoalContext = {
+                ...goalContext,
+                urlBefore: this.config.url,
+                urlAfter: snapshotBefore.url,
+                urlChanged: true,
+                lastOutcome: 'Credentials filled and submitted via auto-fill, page redirected',
+                authSignals: {
+                  credentialsFilled: true,
+                  successfulResponses: recentResponses.slice(-5).map(r => ({
+                    url: r.url,
+                    method: r.method,
+                    status: r.status,
+                  })),
+                  failedResponses: recentErrors.slice(-3).map(r => ({
+                    url: r.url,
+                    method: r.method,
+                    status: r.status || 0,
+                    error: r.error,
+                  })),
+                  titleAfter: snapshotBefore.title,
+                },
+              };
+
+              const auditorPromptSpanId = this.traceWriter.generateSpanId();
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'goal_validation',
+                eventType: 'ai_auditor_prompt',
+                spanId: auditorPromptSpanId,
+                parentSpanId: iterationSpanId,
+                payload: {
+                  trigger: 'post_credential_fill',
+                  goalContext: credGoalContext,
+                  model: 'gpt-4o',
+                },
+              });
+
+              const credAuditResult = await withCancellation(
+                this.config.testId,
+                this.goalDetector.auditDone(
+                  credGoalContext,
+                  'Credentials filled and submitted via auto-fill, page redirected to ' + snapshotBefore.url
+                ),
+                'goalDetector.auditDone (post-credential-fill)'
+              );
+
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'goal_validation',
+                eventType: 'ai_auditor_response',
+                spanId: this.traceWriter.generateSpanId(),
+                parentSpanId: auditorPromptSpanId,
+                payload: {
+                  auditResult: credAuditResult,
+                  isDone: credAuditResult.isDone,
+                  confidence: credAuditResult.confidence,
+                  reason: credAuditResult.reason,
+                  trigger: 'post_credential_fill',
+                },
+              });
+
+              if (credAuditResult.isDone && credAuditResult.confidence >= 0.5) {
+                logger.info('[LITE_ENGINE] Post-credential-fill: Login SUCCESS confirmed by auditor', {
+                  testId: this.config.testId,
+                  confidence: credAuditResult.confidence.toFixed(2),
+                  reason: credAuditResult.reason,
+                  iterations: i + 1,
+                });
+                this.emitCompletion(true, credAuditResult.reason || 'Login successful');
+                await this.flushPendingGraphScreenshotUploads();
+                closeIteration({
+                  iteration: i,
+                  outcome: 'goal_reached',
+                  trigger: 'post_credential_fill',
+                });
+                return await this.buildResult(true, credAuditResult.reason || 'Login successful');
+              } else if (credAuditResult.isBlocked) {
+                logger.info('[LITE_ENGINE] Post-credential-fill: Blocked (2FA/captcha)', {
+                  testId: this.config.testId,
+                  blockedReason: credAuditResult.blockedReason,
+                });
+                // Don't stop — let AI try to handle the blocker
+              } else {
+                logger.info('[LITE_ENGINE] Post-credential-fill: Auditor says NOT done yet', {
+                  testId: this.config.testId,
+                  reason: credAuditResult.reason,
+                  nextStep: credAuditResult.nextStepIfMissing,
+                });
+              }
+
+              // Reset credentialFillState to prevent re-checking every iteration
+              this.credentialFillState = 'idle';
+            } catch (credAuditError) {
+              if (credAuditError instanceof Error && credAuditError.message.includes('cancelled')) {
+                throw credAuditError;
+              }
+              logger.warn('[LITE_ENGINE] Post-credential-fill auditor failed', {
+                testId: this.config.testId,
+                error: credAuditError instanceof Error ? credAuditError.message : String(credAuditError),
+              });
+              // Continue without completing (conservative)
+            }
+          }
+        }
 
         // ✅ FIX P0: Decrement audit cooldown ONLY if heuristic doesn't claim done
         // This prevents wasting iterations when heuristic says "done" but cooldown is active
