@@ -5,6 +5,7 @@
  */
 
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
+import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
 import type { Page } from 'playwright';
 import type { LiteElement, LiteSnapshot } from '../lite-types';
@@ -902,6 +903,97 @@ export class SnapshotCollector {
           }
         }
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // PAGE STRUCTURE DETECTION: Tables, Lists, Pagination
+        // ═══════════════════════════════════════════════════════════════════════
+        const pageStructure = (() => {
+          const tables: Array<{
+            ref: string; headers: string[]; rowCount: number; columnCount: number;
+            isSortable: boolean; hasPagination: boolean; hasCheckboxes: boolean; hasInlineEditing: boolean;
+          }> = [];
+
+          // @ts-expect-error - document available in browser context
+          document.querySelectorAll('table, [role="grid"], [role="treegrid"]').forEach((table: Element, tIdx: number) => {
+            const tEl = table as HTMLElement;
+            const rect = tEl.getBoundingClientRect();
+            if (rect.width < 50 || rect.height < 50) return;
+            const style = window.getComputedStyle(tEl);
+            if (style.display === 'none' || style.visibility === 'hidden') return;
+
+            const headerCells = table.querySelectorAll('thead th, thead td, [role="columnheader"]');
+            const headers = Array.from(headerCells).map(h => (h as HTMLElement).textContent?.trim() || '').filter(Boolean).slice(0, 20);
+            const rows = table.querySelectorAll('tbody tr, [role="row"]');
+            const rowCount = rows.length;
+            const columnCount = headers.length || (rows[0]?.querySelectorAll('td, [role="gridcell"]').length || 0);
+            const isSortable = Array.from(headerCells).some(h => h.querySelector('button, a, [role="button"]') !== null);
+            const hasCheckboxes = table.querySelector('input[type="checkbox"], [role="checkbox"]') !== null;
+            const hasInlineEditing = Array.from(table.querySelectorAll('td, [role="gridcell"]')).some(cell => cell.querySelector('input, textarea, select, [contenteditable="true"]') !== null);
+            const parent = tEl.parentElement || tEl;
+            const hasPagination = parent.querySelector('[aria-label*="pagination" i], [aria-label*="page" i], .pagination, [class*="paginat"]') !== null;
+            const ref = tEl.getAttribute('data-agent-ref') || `t${tIdx}`;
+
+            tables.push({ ref, headers, rowCount, columnCount, isSortable, hasPagination, hasCheckboxes, hasInlineEditing });
+          });
+
+          const lists: Array<{ ref: string; itemCount: number; isVirtualized: boolean; hasLoadMore: boolean }> = [];
+
+          // @ts-expect-error - document available in browser context
+          document.querySelectorAll('ul, ol, [role="list"], [role="listbox"]').forEach((list: Element, lIdx: number) => {
+            const lEl = list as HTMLElement;
+            const items = list.querySelectorAll(':scope > li, :scope > [role="listitem"], :scope > [role="option"]');
+            if (items.length < 3) return;
+            const rect = lEl.getBoundingClientRect();
+            if (rect.width < 50) return;
+            const style = window.getComputedStyle(lEl);
+            const isVirtualized = style.overflow === 'auto' || style.overflowY === 'auto' ||
+              style.overflowY === 'scroll' || lEl.classList.contains('virtual-list') ||
+              lEl.hasAttribute('data-virtualized');
+            const ref = lEl.getAttribute('data-agent-ref') || `l${lIdx}`;
+            lists.push({ ref, itemCount: items.length, isVirtualized, hasLoadMore: false });
+          });
+
+          // Pagination controls
+          let pagination: { currentPage?: number; totalPages?: number; nextRef?: string; prevRef?: string } | null = null;
+          // @ts-expect-error - document available in browser context
+          const pagNav = document.querySelector('[aria-label*="pagination" i], [aria-label*="page" i], .pagination, [class*="paginat"], nav[aria-label*="Page"]');
+          if (pagNav) {
+            const current = pagNav.querySelector('[aria-current="page"], .active, [class*="active"]');
+            const currentPage = current ? parseInt(current.textContent?.trim() || '', 10) : undefined;
+            const allPageNums = Array.from(pagNav.querySelectorAll('a, button'))
+              .map((e: Element) => parseInt((e as HTMLElement).textContent?.trim() || '', 10))
+              .filter((n: number) => !isNaN(n));
+            const totalPages = allPageNums.length > 0 ? Math.max(...allPageNums) : undefined;
+            const nextBtn = pagNav.querySelector('[aria-label*="next" i], [aria-label*="Next"]') as HTMLElement | null;
+            const prevBtn = pagNav.querySelector('[aria-label*="prev" i], [aria-label*="Prev"]') as HTMLElement | null;
+            pagination = {
+              currentPage: (currentPage && !isNaN(currentPage)) ? currentPage : undefined,
+              totalPages,
+              nextRef: nextBtn?.getAttribute('data-agent-ref') || undefined,
+              prevRef: prevBtn?.getAttribute('data-agent-ref') || undefined,
+            };
+          }
+
+          // Load More buttons — tag nearest list
+          const loadMoreRe = /load\s*more|show\s*more|see\s*more|view\s*all|ещё|показать\s*ещ|көбірек|загрузить\s*ещ/i;
+          // @ts-expect-error - document available in browser context
+          document.querySelectorAll('button, a, [role="button"]').forEach((el: Element) => {
+            const text = (el as HTMLElement).textContent?.trim() || '';
+            if (loadMoreRe.test(text) && text.length < 50) {
+              // Tag nearest parent list
+              for (const l of lists) {
+                // @ts-expect-error - document available in browser context
+                const listEl = document.querySelector(`[data-agent-ref="${l.ref}"]`);
+                if (listEl && (listEl.contains(el) || listEl.parentElement?.contains(el))) {
+                  l.hasLoadMore = true;
+                  break;
+                }
+              }
+            }
+          });
+
+          return { tables, lists, pagination };
+        })();
+
         return {
           // @ts-expect-error - window and document available in browser context
           url: window.location.href,
@@ -913,6 +1005,7 @@ export class SnapshotCollector {
           transientState, // Include transient state info (loading indicators)
           pageTextForExtraction, // For credential extraction only
           metadata, // P0: Visual content metadata for proactive vision detection
+          pageStructure, // Manus: Tables, lists, pagination detection
         };
       });
 
@@ -923,6 +1016,67 @@ export class SnapshotCollector {
       //   isTransient: snapshot.transientState?.isTransient || false,
       //   transientType: snapshot.transientState?.type,
       // });
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // IFRAME ELEMENT COLLECTION (same-origin only)
+      // ═══════════════════════════════════════════════════════════════════════
+      try {
+        const frames = page.frames().filter(f => f !== page.mainFrame() && !f.isDetached());
+        for (const frame of frames) {
+          try {
+            let frameName: string;
+            try {
+              frameName = frame.name() || new URL(frame.url()).pathname.slice(-30);
+            } catch {
+              frameName = frame.name() || 'iframe';
+            }
+
+            const iframeElements = await frame.evaluate((fName: string) => {
+              const selectors = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [onclick], [tabindex]:not([tabindex="-1"])';
+              const els: any[] = [];
+              let idx = 0;
+              const MAX_IFRAME_ELEMENTS = 50;
+
+              document.querySelectorAll(selectors).forEach((el) => {
+                if (idx >= MAX_IFRAME_ELEMENTS) return;
+                const htmlEl = el as HTMLElement;
+                const rect = htmlEl.getBoundingClientRect();
+                const style = window.getComputedStyle(htmlEl);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+                if (rect.width < 5 || rect.height < 5) return;
+
+                const tag = htmlEl.tagName.toLowerCase();
+                const role = htmlEl.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'input' || tag === 'select' || tag === 'textarea' ? 'input' : 'button');
+                const name = htmlEl.getAttribute('aria-label') || htmlEl.title || htmlEl.textContent?.trim().slice(0, 80) || htmlEl.getAttribute('placeholder') || '';
+
+                els.push({
+                  ref: `f${idx}`,
+                  role,
+                  name,
+                  tag,
+                  type: htmlEl.getAttribute('type') || undefined,
+                  placeholder: htmlEl.getAttribute('placeholder') || undefined,
+                  checked: (htmlEl as HTMLInputElement).checked || undefined,
+                  disabled: htmlEl.hasAttribute('disabled') || htmlEl.getAttribute('aria-disabled') === 'true' || undefined,
+                  visible: true,
+                  context: `iframe: ${fName}`,
+                  iframeSource: fName,
+                });
+                idx++;
+              });
+              return els;
+            }, frameName);
+
+            if (iframeElements.length > 0) {
+              (snapshot as any).elements.push(...iframeElements);
+            }
+          } catch {
+            // Cross-origin or detached iframe — skip silently
+          }
+        }
+      } catch {
+        // Frame enumeration failed — non-fatal
+      }
 
       return snapshot as LiteSnapshot;
     } catch (error) {
@@ -952,10 +1106,25 @@ export class SnapshotCollector {
       return 'No interactive elements found on page.';
     }
 
+    // Cap elements to prevent token explosion on heavy pages
+    const maxElements = LITE_ENGINE_FLAGS.snapshotMaxElements;
+    let elements = snapshot.elements;
+    if (maxElements > 0 && snapshot.elements.length > maxElements) {
+      const priorityScore = (el: LiteElement): number => {
+        if (el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select') return 4;
+        if (el.tag === 'button' || el.role === 'button') return 3;
+        if (el.tag === 'a' || el.role === 'link') return 2;
+        return 1;
+      };
+      elements = [...snapshot.elements]
+        .sort((a, b) => priorityScore(b) - priorityScore(a))
+        .slice(0, maxElements);
+    }
+
     // Group elements by role
     const groups: Record<string, LiteElement[]> = {};
 
-    snapshot.elements.forEach((el) => {
+    elements.forEach((el) => {
       const role = el.role.toUpperCase();
       if (!groups[role]) groups[role] = [];
       groups[role].push(el);
@@ -968,6 +1137,25 @@ export class SnapshotCollector {
     // Add active modal indicator if present
     if (snapshot.activeModalRef) {
       lines.push(`ACTIVE_MODAL: ${snapshot.activeModalRef} (Focus on elements inside this modal)`);
+    }
+
+    // Loading state indicator
+    if (snapshot.transientState?.isTransient) {
+      lines.push(`LOADING_STATE: ${snapshot.transientState.type}${snapshot.transientState.ref ? ` at ${snapshot.transientState.ref}` : ''}${snapshot.transientState.text ? ` ("${snapshot.transientState.text}")` : ''}`);
+    }
+
+    // Page structure metadata (tables, lists, pagination)
+    if (snapshot.pageStructure) {
+      const ps = snapshot.pageStructure;
+      for (const t of ps.tables) {
+        lines.push(`TABLE: ref=${t.ref} rows=${t.rowCount} cols=${t.columnCount}${t.isSortable ? ' [SORTABLE]' : ''}${t.hasPagination ? ' [PAGINATED]' : ''}${t.hasCheckboxes ? ' [SELECTABLE]' : ''} headers=[${t.headers.join(', ')}]`);
+      }
+      for (const l of ps.lists) {
+        lines.push(`LIST: ref=${l.ref} items=${l.itemCount}${l.isVirtualized ? ' [VIRTUAL]' : ''}${l.hasLoadMore ? ' [HAS_LOAD_MORE]' : ''}`);
+      }
+      if (ps.pagination) {
+        lines.push(`PAGINATION: page=${ps.pagination.currentPage || '?'}/${ps.pagination.totalPages || '?'} nextRef=${ps.pagination.nextRef || 'none'} prevRef=${ps.pagination.prevRef || 'none'}`);
+      }
     }
 
     lines.push('');
@@ -988,6 +1176,18 @@ export class SnapshotCollector {
         if (el.placeholder) line += ` placeholder="${el.placeholder}"`;
         if (el.disabled) line += ' [DISABLED]';
         if (el.checked) line += ' [CHECKED]';
+        // Manus parity: expose collected-but-hidden element metadata
+        if (el.isTopMostAtCenter === false) line += ' [COVERED]';
+        if (el.required) line += ' [REQUIRED]';
+        if (el.hasValue) line += ' [HAS_VALUE]';
+        if (el.readOnly) line += ' [READONLY]';
+        if (el.invalid) line += ' [INVALID]';
+        if (el.isInsideShadowDOM) line += ' [SHADOW]';
+        if (el.ariaExpanded === true) line += ' [EXPANDED]';
+        if (el.ariaExpanded === false) line += ' [COLLAPSED]';
+        if (el.ariaPressed) line += ' [PRESSED]';
+        if (el.ariaSelected) line += ' [SELECTED]';
+        if (el.iframeSource) line += ' [IFRAME]';
         // SECURITY: Do not include raw input values in logs/prompts/traces.
         // This avoids leaking emails, passwords, OTPs, or other sensitive data.
         // If needed later, we can add a safe, type-aware mask (e.g., last 2 chars) behind a debug flag.

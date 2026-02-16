@@ -20,6 +20,7 @@ import { buildAllHintsWithMetadata } from '../setup/hints-builder';
 import { buildIntelligentTestConfig } from '../setup/test-config-builder';
 import { checkTestCancelled } from '../utils/test-cancellation-checker';
 import { createRunKey, TestRunRegistry } from './test-run-registry';
+import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { waitForStepReadiness, shouldSkipLookaheadAfter } from '@/services/testing/ui/preview/step-readiness.service';
 import type { IntentStep, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 
@@ -926,7 +927,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         success: liteResult.success,
         goal: goal,
         startUrl: testData.url,
-        pagesVisited: 1,
+        pagesVisited: liteResult.uniquePagesVisited || 1,
         actionsTaken: liteResult.iterations,
         duration: liteResult.duration || 0,
         cost: liteResult.iterations * 0.001, // Approximate cost
@@ -938,8 +939,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         // Summary
         summary: liteResult.reason,
 
-        // Page visits (minimal for Lite)
-        pageVisits: [],
+        // Page visits (constructed from iteration records)
+        pageVisits: liteResult.pageVisits || [],
 
         // Screenshots: Pro format, derived from graphData (already URLs)
         screenshots,
@@ -950,6 +951,24 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         // Internal flags
         _liteMode: true, // Flag to skip uploadIntelligentTestScreenshots
       };
+
+      // Push executed steps to Redis for DB persistence via finalizeToDb
+      if (liteResult.executedSteps && liteResult.executedSteps.length > 0) {
+        for (const step of liteResult.executedSteps) {
+          await TestExecutedStepsRedisService.appendStepCompleted(testData.testId, {
+            testId: testData.testId,
+            browser: testData.browser || 'chrome',
+            step: step.data.step,
+            stepDescription: step.data.description,
+            success: step.data.success,
+            timestamp: step.ts,
+          });
+        }
+        logger.info('[PLAYWRIGHT] Lite mode: pushed executed steps to Redis', {
+          testId: testData.testId,
+          stepCount: liteResult.executedSteps.length,
+        });
+      }
     } else {
       // Use Pro Mode (existing IntelligentTestOrchestrator)
       logger.info('[PLAYWRIGHT] Starting Pro Mode execution', {

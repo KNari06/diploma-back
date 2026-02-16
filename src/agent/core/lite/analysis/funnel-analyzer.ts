@@ -39,6 +39,10 @@ export type ElementCategory =
   | 'checkout-button'
   | 'form'
   | 'search'
+  | 'pagination-button'
+  | 'load-more-button'
+  | 'sort-control'
+  | 'filter-control'
   | 'default';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -119,6 +123,10 @@ export class FunnelAnalyzer {
           'category-link': 0.1,
           'product-link': 0.1,
           'search': 0.1,
+          'pagination-button': 0.1,
+          'load-more-button': 0.1,
+          'sort-control': 0.0,
+          'filter-control': 0.1,
           'default': 0.5,
         };
 
@@ -135,6 +143,10 @@ export class FunnelAnalyzer {
           'category-link': 0.3,
           'product-link': 0.5,
           'search': 0.3,
+          'pagination-button': 0.5,
+          'load-more-button': 0.5,
+          'sort-control': 0.3,
+          'filter-control': 0.5,
           'default': 1.0,
         };
 
@@ -151,6 +163,10 @@ export class FunnelAnalyzer {
           'category-link': 1.0,
           'product-link': 1.5,
           'search': 1.0,
+          'pagination-button': 1.5,
+          'load-more-button': 2.0,
+          'sort-control': 1.5,
+          'filter-control': 1.5,
           'default': 1.0,
         };
 
@@ -168,6 +184,10 @@ export class FunnelAnalyzer {
           'input-field': 1.0,
           'form': 1.0,
           'footer-link': 0.3,
+          'pagination-button': 2.0,
+          'load-more-button': 2.5,
+          'sort-control': 1.0,
+          'filter-control': 1.5,
           'default': 1.0,
         };
     }
@@ -229,6 +249,18 @@ export class FunnelAnalyzer {
     if (tag === 'input' || tag === 'textarea' || tag === 'select') {
       return 'input-field';
     }
+
+    // Pagination / load-more / sort / filter detection (before generic button/link)
+    if (tag === 'button' || tag === 'a' || element.role === 'button') {
+      if (/\b(next|prev|previous|»|«|›|‹)\b/i.test(nameLower) || element.context?.toLowerCase().includes('pagination'))
+        return 'pagination-button';
+      if (this.matchesAnyPattern(nameLower, FUNNEL_ELEMENT_PATTERNS.load_more))
+        return 'load-more-button';
+    }
+    if ((tag === 'button' || element.role === 'button') && element.context?.toLowerCase().includes('header') && /\b(sort|↑|↓)\b/i.test(nameLower))
+      return 'sort-control';
+    if ((tag === 'input' || tag === 'select') && (/\b(filter|search)\b/i.test(nameLower) || element.context?.toLowerCase().includes('filter')))
+      return 'filter-control';
 
     // Button categorization
     if (tag === 'button' || element.role === 'button') {

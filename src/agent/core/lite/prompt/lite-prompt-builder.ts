@@ -169,6 +169,8 @@ User has provided login credentials. The system will automatically fill them.
 - Use any placeholder value in your fill commands - the system will override with real credentials
 - When filling credential fields, set "isSensitive": true in your command
 - Focus on finding and clicking the correct form fields, not on what to type
+- ⚠️ DO NOT click "Forgot Password" / "Reset Password" links — use the provided credentials instead
+- ⚠️ PRIORITY: Fill email/username field FIRST, then password field, then click submit/login button
 `
       : '';
 

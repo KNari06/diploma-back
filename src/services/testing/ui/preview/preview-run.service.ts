@@ -5,6 +5,7 @@
  * Features: cancel support, per-step progress tracking, stop-on-fail, best-effort persistence
  */
 
+import { LiteTraceWriter } from '@/agent/core/lite/trace/lite-trace-writer';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { IntentTestCaseService } from './intent-test-case.service';
@@ -72,6 +73,15 @@ export class PreviewRunService {
     let failedSteps = 0;
     let skippedSteps = 0;
 
+    // Initialize trace writer for JSONL logging
+    const traceWriter = new LiteTraceWriter({
+      testId: `preview_run_${previewSessionId}`,
+      logsDir: undefined, // Use default test_logs/
+      maxFileSizeBytes: 50 * 1024 * 1024, // 50MB for preview runs
+      maxPayloadChars: 10_000,
+    });
+    const rootSpanId = traceWriter.getRootSpanId();
+
     try {
       // 4. Load saved steps from DB
       const testCase = await IntentTestCaseService.getById(intentTestCaseId, userId);
@@ -102,6 +112,22 @@ export class PreviewRunService {
         userId,
         totalSteps: savedSteps.length,
         startUrl,
+      });
+
+      // Trace run_start
+      traceWriter.write({
+        stage: 'initialization',
+        eventType: 'run_start',
+        spanId: rootSpanId,
+        payload: {
+          previewSessionId,
+          intentTestCaseId,
+          userId,
+          totalSteps: savedSteps.length,
+          startUrl,
+          mode: 'preview_run',
+          startTime: new Date(runState.startTime).toISOString(),
+        },
       });
 
       // 7. Emit started event
@@ -194,6 +220,24 @@ export class PreviewRunService {
           description: step.description?.slice(0, 80),
         });
 
+        // Trace step_start
+        const stepSpanId = traceWriter.generateSpanId();
+        traceWriter.write({
+          iteration: i,
+          stage: 'step_execution',
+          eventType: 'step_start',
+          spanId: stepSpanId,
+          parentSpanId: rootSpanId,
+          payload: {
+            stepIndex: i,
+            stepId: step.id,
+            stepType: step.type,
+            description: step.description,
+            hasCompiled: !!step.compiled,
+            hasEvidence: !!step.evidence?.lastSuccessRef,
+          },
+        });
+
         // Emit step running
         webSocketService.emitToUser(userId, 'preview:run:step', {
           previewSessionId,
@@ -270,6 +314,24 @@ export class PreviewRunService {
               previewSessionId,
               stepIndex: i,
               stepId: step.id,
+            });
+
+            // Trace step_result (pass)
+            traceWriter.write({
+              iteration: i,
+              stage: 'step_execution',
+              eventType: 'step_result',
+              spanId: traceWriter.generateSpanId(),
+              parentSpanId: stepSpanId,
+              payload: {
+                stepIndex: i,
+                stepId: step.id,
+                status: 'pass',
+                urlChanged: result.urlChanged,
+                url: result.url,
+                attempts: result.attempts,
+                verified: result.verified,
+              },
             });
 
             // Emit pass
@@ -381,6 +443,22 @@ export class PreviewRunService {
               error: result.error,
             });
 
+            // Trace step_result (fail)
+            traceWriter.write({
+              iteration: i,
+              stage: 'step_execution',
+              eventType: 'step_result',
+              spanId: traceWriter.generateSpanId(),
+              parentSpanId: stepSpanId,
+              payload: {
+                stepIndex: i,
+                stepId: step.id,
+                status: 'fail',
+                error: result.error,
+                attempts: result.attempts,
+              },
+            });
+
             // Emit fail
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
@@ -422,6 +500,21 @@ export class PreviewRunService {
             stepIndex: i,
             stepId: step.id,
             error: stepError instanceof Error ? stepError.message : String(stepError),
+          });
+
+          // Trace step_result (exception)
+          traceWriter.write({
+            iteration: i,
+            stage: 'step_execution',
+            eventType: 'step_result',
+            spanId: traceWriter.generateSpanId(),
+            parentSpanId: stepSpanId,
+            payload: {
+              stepIndex: i,
+              stepId: step.id,
+              status: 'exception',
+              error: stepError instanceof Error ? stepError.message : String(stepError),
+            },
           });
 
           // Emit fail
@@ -471,6 +564,25 @@ export class PreviewRunService {
           duration,
         });
 
+        // Trace run_end
+        traceWriter.write({
+          stage: 'completion',
+          eventType: 'run_end',
+          spanId: traceWriter.generateSpanId(),
+          parentSpanId: rootSpanId,
+          payload: {
+            success: failedSteps === 0 && !cancelled,
+            totalSteps: savedSteps.length,
+            passedSteps,
+            failedSteps,
+            skippedSteps,
+            cancelled,
+            duration,
+            durationSeconds: Math.round(duration / 1000),
+            endTime: new Date().toISOString(),
+          },
+        });
+
         webSocketService.emitToUser(userId, 'preview:run:completed', {
           previewSessionId,
           success: failedSteps === 0 && !cancelled,
@@ -484,7 +596,17 @@ export class PreviewRunService {
         });
       }
 
-      // 9. Cleanup run state
+      // 9. Close trace writer (flushes pending writes)
+      try {
+        await traceWriter.close();
+      } catch (closeError) {
+        logger.warn('[PreviewRun] Failed to close trace writer', {
+          previewSessionId,
+          error: closeError instanceof Error ? closeError.message : String(closeError),
+        });
+      }
+
+      // 10. Cleanup run state
       activeRuns.delete(previewSessionId);
     }
   }

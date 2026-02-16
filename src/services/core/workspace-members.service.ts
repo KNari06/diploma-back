@@ -415,7 +415,7 @@ export class WorkspaceMembersService {
       // Send email notification
       let emailSent = false;
       const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-      const redirectTo = `${frontendUrl}/invite/accept?inviteId=${invite.id}&workspaceId=${workspaceId}`;
+      const redirectTo = `${frontendUrl}/invite/accept?token=${invite.id}&workspaceId=${workspaceId}`;
 
       try {
         logger.info('[WORKSPACE_MEMBERS] Sending invite email', {
@@ -703,7 +703,7 @@ export class WorkspaceMembersService {
       let emailResent = false;
       try {
         const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-        const redirectTo = `${frontendUrl}/invite/accept?inviteId=${invite.id}&workspaceId=${invite.workspace_id}`;
+        const redirectTo = `${frontendUrl}/invite/accept?token=${invite.id}&workspaceId=${invite.workspace_id}`;
 
         logger.info('[WORKSPACE_MEMBERS] Resending invite email', {
           email: invite.email,

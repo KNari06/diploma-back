@@ -141,7 +141,9 @@ export class TestCaseExecutor {
         chatSessionId: this.config.chatSessionId,
         credentials: this.config.credentials?.password ? {
           password: this.config.credentials.password,
-          username: this.config.credentials.username,
+          ...(this.config.credentials.username && { username: this.config.credentials.username }),
+          ...(this.config.credentials.email && { email: this.config.credentials.email }),
+          ...(this.config.credentials.phone && { phone: this.config.credentials.phone }),
         } : undefined,
       });
 

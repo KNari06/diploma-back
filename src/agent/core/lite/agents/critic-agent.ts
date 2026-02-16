@@ -106,7 +106,7 @@ export class CriticAgent {
     const aiResult = await LitePromptBuilder.askJson<AICriticResponse>(prompt, {
       model: LITE_ENGINE_FLAGS.coreBrainModel as 'gpt-4o' | 'gpt-4o-mini',
       temperature: 0.0,
-      maxTokens: 250,
+      maxTokens: LITE_ENGINE_FLAGS.criticMaxTokens,
       timeoutMs: LITE_ENGINE_FLAGS.multiAgentCriticTimeoutMs,
     });
 
@@ -134,7 +134,10 @@ export class CriticAgent {
     if (verdict.verdict === 'approve') {
       const warningCount = policyViolations.filter(v => v.severity === 'warn').length;
       if (warningCount > 0 || reasoningInconsistencies.length > 0) {
-        verdict.confidence = Math.max(0.3, verdict.confidence - 0.2 * warningCount - 0.15 * reasoningInconsistencies.length);
+        const warnPenalty = LITE_ENGINE_FLAGS.criticWarningPenalty;
+        const inconsistencyPenalty = LITE_ENGINE_FLAGS.criticInconsistencyPenalty;
+        const minConfidence = LITE_ENGINE_FLAGS.criticMinConfidence;
+        verdict.confidence = Math.max(minConfidence, verdict.confidence - warnPenalty * warningCount - inconsistencyPenalty * reasoningInconsistencies.length);
         verdict.riskAssessment += ` (${warningCount} warnings, ${reasoningInconsistencies.length} inconsistencies)`;
       }
     }
@@ -266,6 +269,40 @@ export class CriticAgent {
       }
     }
 
+    // Policy 5: Clicking "Forgot Password" / "Reset Password" when credentials are provided
+    if (input.hasCredentials && input.proposedCommand.action === 'click' && input.proposedCommand.ref) {
+      // Check if the target element text matches forgot/reset password patterns
+      const refEscaped = input.proposedCommand.ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const refPattern = new RegExp(`\\b${refEscaped}\\b[^\\n]*`, 'i');
+      const elementLine = input.availableElements.match(refPattern)?.[0] || '';
+      const isForgotPassword = /forgot|reset|recover|құпия сөзді ұмыт|парольді қалпына|восстанов|сбросить/i.test(elementLine);
+      if (isForgotPassword) {
+        violations.push({
+          type: 'unsafe_action',
+          description: 'Clicking password reset/forgot link when credentials are provided. Should fill login form instead.',
+          severity: 'block',
+        });
+      }
+    }
+
+    // Policy 6: Clicking during loading state
+    if (input.isPageLoading && input.proposedCommand.action === 'click') {
+      violations.push({
+        type: 'unsafe_action',
+        description: 'Clicking while page is loading (skeleton/spinner). Wait for load to complete.',
+        severity: 'warn',
+      });
+    }
+
+    // Policy 7: Clicking covered element
+    if (input.proposedCommand.ref && input.coveredElements?.includes(input.proposedCommand.ref)) {
+      violations.push({
+        type: 'unsafe_action',
+        description: `Element ${input.proposedCommand.ref} is covered by overlay. Dismiss overlay first.`,
+        severity: 'block',
+      });
+    }
+
     return violations;
   }
 
@@ -358,13 +395,13 @@ export class CriticAgent {
       if (conflict.issue === 'covered' || conflict.issue === 'hidden') {
         violations.push({
           type: 'unsafe_action',
-          description: `Target element ${targetRef} ("${conflict.domName || conflict.visionText}") is ${conflict.issue} by another element. ${conflict.note}`,
+          description: `Target element ${targetRef} ("${conflict.domName || conflict.visionText}") is ${conflict.issue} by another element.${conflict.note ? ' ' + conflict.note : ''}`,
           severity: 'block',
         });
       } else if (conflict.issue === 'disabled') {
         violations.push({
           type: 'unsafe_action',
-          description: `Target element ${targetRef} ("${conflict.domName || conflict.visionText}") is disabled. ${conflict.note}`,
+          description: `Target element ${targetRef} ("${conflict.domName || conflict.visionText}") is disabled.${conflict.note ? ' ' + conflict.note : ''}`,
           severity: 'warn',
         });
       }
@@ -397,6 +434,14 @@ export class CriticAgent {
       ? `⚠️ Errors: ${input.observation.errorState}`
       : '';
 
+    // Compact element list for override accuracy — Critic needs real refs to suggest alternatives
+    const maxLines = LITE_ENGINE_FLAGS.criticElementListMaxLines;
+    const allElementLines = input.availableElements ? input.availableElements.split('\n').filter(l => l.trim()) : [];
+    const elementLines = allElementLines.slice(0, maxLines);
+    const elementsSection = elementLines.length > 0
+      ? `\n═══ PAGE ELEMENTS (real refs — use ONLY these for override) ═══\n${elementLines.join('\n')}${allElementLines.length > maxLines ? '\n... (truncated)' : ''}\n`
+      : '';
+
     return `You are a RED TEAM Critic. Your job is to DISPROVE the proposed action.
 Find at least ONE reason it could FAIL or be WRONG.
 
@@ -407,7 +452,7 @@ Available actions: ${input.observation.availableActions.join(', ') || 'none'}
 ${obstacles}
 ${formInfo}
 ${errorInfo}
-
+${elementsSection}
 ═══ PROPOSED ACTION (challenge this) ═══
 Action: ${input.proposedCommand.action}${input.proposedCommand.ref ? `(${input.proposedCommand.ref})` : ''}${input.proposedCommand.value ? ` value="${input.proposedCommand.value}"` : ''}${input.proposedCommand.key ? ` key="${input.proposedCommand.key}"` : ''}${input.proposedCommand.url ? ` url="${input.proposedCommand.url}"` : ''}
 Actor reasoning: "${input.actorReasoning}"
@@ -431,7 +476,7 @@ Verdict options:
 - "reject": Action is wrong or too risky. Try alternative strategy.
 - "override": Action is wrong. Use "suggestedAction" instead.
 
-If overriding:
+If overriding, use ONLY refs from PAGE ELEMENTS above:
 {
   "verdict": "override",
   "riskAssessment": "Wrong element selected. The correct submit button is e12, not e5.",
@@ -446,6 +491,7 @@ Rules:
 - Check goal alignment: does this action ACTUALLY help reach the goal?
 - Check element correctness: is this the RIGHT element?
 - "approve" should still include a failureRisk (what COULD go wrong)
+- Override refs MUST exist in PAGE ELEMENTS above — never invent refs
 - Return ONLY valid JSON`;
   }
 }

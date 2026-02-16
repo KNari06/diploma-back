@@ -248,8 +248,22 @@ export class LiteTraceWriter {
 
     this.isClosed = true;
 
-    // Wait for all pending writes
-    await this.writeQueue;
+    // Wait for all pending writes with timeout to prevent infinite hangs
+    const CLOSE_TIMEOUT_MS = 10_000;
+    try {
+      await Promise.race([
+        this.writeQueue,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error('Trace writer close timed out')), CLOSE_TIMEOUT_MS)
+        ),
+      ]);
+    } catch (error) {
+      logger.warn('[LITE_TRACE] Writer close timeout or error, some events may be lost', {
+        testId: this.testId,
+        runId: this.runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     logger.info('[LITE_TRACE] Writer closed', {
       testId: this.testId,
@@ -404,11 +418,11 @@ export class LiteTraceWriter {
     let out = input;
 
     // 1) Authorization headers / Bearer tokens
-    out = out.replace(/Bearer\\s+[A-Za-z0-9\\-_.=]+/g, 'Bearer [REDACTED]');
-    out = out.replace(/Basic\\s+[A-Za-z0-9\\/=+]+/g, 'Basic [REDACTED]');
+    out = out.replace(/Bearer\s+[A-Za-z0-9\-_.=]+/g, 'Bearer [REDACTED]');
+    out = out.replace(/Basic\s+[A-Za-z0-9\/=+]+/g, 'Basic [REDACTED]');
 
     // 2) JWT-like token strings (best-effort)
-    out = out.replace(/eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/g, '[JWT_REDACTED]');
+    out = out.replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[JWT_REDACTED]');
 
     // 3) Mask sensitive query params in URLs (only if parseable)
     if (out.startsWith('http://') || out.startsWith('https://')) {
@@ -439,7 +453,7 @@ export class LiteTraceWriter {
 
     // 4) Mask common key=value secrets in any text
     out = out.replace(
-      /\\b(token|access_token|refresh_token|api[_-]?key|apikey|key|secret|password)=([^&\\s]+)/gi,
+      /\b(token|access_token|refresh_token|api[_-]?key|apikey|key|secret|password)=([^&\s]+)/gi,
       (_m, k) => `${String(k)}=[REDACTED]`
     );
 

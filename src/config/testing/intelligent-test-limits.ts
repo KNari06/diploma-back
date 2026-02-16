@@ -188,6 +188,16 @@ export const LITE_ENGINE_FLAGS = {
   multiAgentCriticTimeoutMs: 2000,
   /** Max reasoning history entries for consistency check */
   criticReasoningHistorySize: 10,
+  /** Maximum tokens for Critic AI response (must fit override JSON) */
+  criticMaxTokens: 350,
+  /** Confidence penalty per policy warning (subtracted from AI confidence) */
+  criticWarningPenalty: 0.2,
+  /** Confidence penalty per reasoning inconsistency */
+  criticInconsistencyPenalty: 0.15,
+  /** Minimum confidence floor after penalties */
+  criticMinConfidence: 0.3,
+  /** Max element lines to include in Critic prompt for override accuracy */
+  criticElementListMaxLines: 30,
 
   // ═══════════════════════════════════════════════════════════════════════════
   // COGNITIVE ENHANCEMENTS (Working Memory, Structured Strategy, Adaptive)
@@ -222,6 +232,8 @@ export const LITE_ENGINE_FLAGS = {
   enableReStrategizeOnReject: true,
   /** Check vision conflicts (covered/hidden/disabled elements) in Critic Phase 1 (zero AI cost) */
   enableCriticVisualCheck: true,
+  /** Maximum elements in formatted snapshot (0 = unlimited). Prevents token explosion on heavy pages */
+  snapshotMaxElements: 80,
 } as const;
 
 /**

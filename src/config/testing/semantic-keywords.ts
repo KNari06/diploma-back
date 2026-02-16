@@ -213,6 +213,20 @@ export const FUNNEL_ELEMENT_PATTERNS = {
     // KZ
     'жіберу', 'растау', 'төлеу', 'аяқтау',
   ],
+  /** Pagination buttons */
+  pagination: [
+    'next', 'prev', 'previous', 'page', '»', '«', '›', '‹',
+    'следующая', 'предыдущая', 'страница',
+    // KZ
+    'келесі', 'алдыңғы', 'бет',
+  ],
+  /** Load more / show more buttons */
+  load_more: [
+    'load more', 'show more', 'see more', 'view all', 'see all', 'show all',
+    'ещё', 'показать ещё', 'загрузить ещё', 'показать все', 'смотреть все',
+    // KZ
+    'көбірек', 'тағы', 'барлығын көрсету',
+  ],
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════

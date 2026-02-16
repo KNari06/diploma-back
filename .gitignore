@@ -201,6 +201,9 @@ build/
 test-results/
 coverage/
 
+# Trace logs (JSONL debug logs from lite mode / AI editor runs)
+test_logs/
+
 
 # Database
 *.db

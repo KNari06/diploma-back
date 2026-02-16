@@ -160,6 +160,11 @@ export class StrategistAgent {
       parts.push(`\n🛡️ CRITIC REJECTIONS (avoid these patterns):\n${rejections.join('\n')}`);
     }
 
+    // Expectation mismatch tracking (prediction failures)
+    if (memory.consecutiveExpectationMisses && memory.consecutiveExpectationMisses >= 2) {
+      parts.push(`\n⚠️ PREDICTION FAILURES: ${memory.consecutiveExpectationMisses} consecutive wrong predictions${memory.lastExpectationMismatch ? ` (last: "${memory.lastExpectationMismatch}")` : ''}. Your expectedOutcome keeps being wrong — reassess page state.`);
+    }
+
     return parts.length > 0 ? parts.join('\n') : 'No accumulated memory yet';
   }
 
@@ -184,6 +189,10 @@ export class StrategistAgent {
 
     const stuckSection = input.isStuck
       ? '\n⚠️ AGENT IS STUCK. You MUST choose a fundamentally different approach. Do NOT repeat any previous strategy.\n'
+      : '';
+
+    const confidenceTrendSection = input.confidenceTrend === 'declining'
+      ? '\n⚠️ LOW CONFIDENCE TREND: Your confidence has been below 0.4 for 2+ iterations. Consider a fundamentally different approach — current strategy path may be wrong.\n'
       : '';
 
     const criticFeedbackSection = input.criticFeedback
@@ -254,18 +263,52 @@ export class StrategistAgent {
       ? `\nForm field refs: ${input.observation.formAnalysis.fields.map(f => `${f.ref}="${f.label}"(${f.type}${f.hasValue ? ',filled' : ''})`).join(', ')}${input.observation.formAnalysis.submitButtonRef ? ` | Submit: ${input.observation.formAnalysis.submitButtonRef}="${input.observation.formAnalysis.submitButtonText}"` : ''}`
       : '';
 
+    // Credential-aware sections
+    const credentialSection = input.hasCredentials
+      ? `\n🔐 CREDENTIALS: PROVIDED (system auto-fills values — just pick correct fields)\n`
+      : '';
+
+    const credentialNegativeConstraints = input.hasCredentials
+      ? `- DO NOT click "Forgot Password", "Reset Password", or password recovery links — user provided credentials for direct login
+- DO NOT navigate away from the login/auth form — fill credential fields first (email/username → password → submit)
+`
+      : '';
+
+    // URL context
+    const urlLine = input.currentUrl ? `- Current URL: ${input.currentUrl}\n` : '';
+
+    // Manus parity: Table context from Observer
+    const tableSection = input.tableContext
+      ? `\nTABLE: ${input.tableContext.rowCount} rows [${input.tableContext.headers.join(', ')}]${input.tableContext.hasPagination ? ' — use pagination to see more' : ''}${input.tableContext.hasBulkActions ? ' — has row checkboxes for bulk actions' : ''}${input.tableContext.isSortable ? ' — click headers to sort' : ''}\n`
+      : '';
+
+    // Manus parity: List context from Observer
+    const listSection = input.listContext
+      ? `\nLIST: ~${input.listContext.estimatedItems} items${input.listContext.hasLoadMore ? ' — "Load More" available' : ''}${input.listContext.isVirtualized ? ' — virtualized, scroll to discover more' : ''}\n`
+      : '';
+
+    // Manus parity: Loading state from Observer
+    const loadingContextSection = input.loadingContext?.isLoading
+      ? `\nLOADING: ${input.loadingContext.type} in "${input.loadingContext.affectedArea}". WAIT before acting on elements there.\n`
+      : '';
+
+    // Manus parity: Overlap context from Observer
+    const overlapSection = input.overlapContext?.length
+      ? `\nBLOCKED: ${input.overlapContext.map(o => `${o.coveredRef} covered by ${o.coveredBy}`).join('; ')}. Dismiss overlay FIRST.\n`
+      : '';
+
     return `You are a Strategy Agent (Manus architecture). Decide the next action based on structured observation.
 
 GOAL: ${input.goal}
-
+${credentialSection}
 ═══ PAGE STATE ═══
 - Page type: ${input.observation.pageType}
-- Available actions: ${input.observation.availableActions.join(', ') || 'none identified'}
+${urlLine}- Available actions: ${input.observation.availableActions.join(', ') || 'none identified'}
 - Obstacles: ${input.observation.obstacles.join(', ') || 'none'}
 - Form: ${input.observation.formAnalysis ? `${input.observation.formAnalysis.fields.length} fields, submit="${input.observation.formAnalysis.submitButtonText || 'unknown'}"` : 'none'}
 - Error state: ${input.observation.errorState || 'none'}
 - Modal: ${input.observation.modalInfo || 'none'}${formRefsHint}
-${impactSection}${spatialSection}${networkStateSection}${expectationSection}${workingMemorySection}
+${impactSection}${spatialSection}${networkStateSection}${expectationSection}${tableSection}${listSection}${loadingContextSection}${overlapSection}${workingMemorySection}
 ═══ TOOL COST & RISK MATRIX ═══
 Before choosing an action, consider its cost and risk:
 | Action   | Cost   | Risk   | When to use                              |
@@ -279,7 +322,7 @@ Before choosing an action, consider its cost and risk:
 | press    | MEDIUM | MEDIUM | Keyboard shortcut. May trigger submit.   |
 | goto     | HIGH   | HIGH   | Navigate to new URL. Loses current page. |
 Prefer LOW-cost actions when multiple paths exist. Use HIGH-risk actions only when necessary.
-${planSection}${guidanceSection}${stuckSection}${criticFeedbackSection}${failedActionsSection}${auditSection}
+${planSection}${guidanceSection}${stuckSection}${confidenceTrendSection}${criticFeedbackSection}${failedActionsSection}${auditSection}
 ═══ PROGRESS ═══
 Progress: ${Math.round(input.progressScore * 100)}% | Iteration: ${input.iteration}
 Last outcome: ${input.lastOutcome || 'none'}
@@ -294,6 +337,12 @@ ${rollingHistory}
 - Do NOT use goto when a link/button on the page achieves the same navigation
 - Do NOT repeat a strategy that already failed (check HISTORY and BLACKLIST)
 - Do NOT ignore obstacles — dismiss modals/popups before proceeding
+- Do NOT click elements marked [COVERED] — dismiss the overlay first
+- Do NOT interact with loading areas (skeleton/spinner) — wait for load to complete
+- If data is not visible, try pagination (Next button) or Load More before blind scrolling
+- Prefer fill/scroll (LOW cost) over click (MEDIUM cost) when both achieve the same goal
+- Prefer deterministic form filling (fill email → fill password → click submit) over exploratory clicks
+${credentialNegativeConstraints}
 
 ═══ OUTPUT FORMAT ═══
 Respond with JSON:
@@ -302,16 +351,18 @@ Respond with JSON:
   "thought": "Login form visible with 2 empty fields. Must fill before submit.",
   "expectedOutcome": "Both fields filled, form ready to submit",
   "verificationCriteria": "email field has value AND password field has value",
-  "alternatives": ["Click 'Sign in with Google' button", "Click 'Forgot password' link"],
+  "alternatives": [${input.hasCredentials ? '"Fill password field", "Click submit button"' : '"Click \'Sign in with Google\' button", "Click \'Forgot password\' link"'}],
   "confidence": 0.85,
   "riskLevel": "low",
   "done": false,
-  "blockedInfo": null${structuredStrategyFormat}
+  "blockedInfo": null,
+  "subGoal": "Fill login credentials"${structuredStrategyFormat}
 }
 
 Rules:
 - "strategy": Clear single-step instruction for the Actor (what to do RIGHT NOW)
-- "alternatives": 1-2 backup strategies if primary fails. Pre-computed — Actor will try these automatically
+- "subGoal": What you're currently focused on (e.g., "Fill login form", "Navigate to products", "Dismiss cookie banner"). Helps track progress across iterations
+- "alternatives": 1-2 backup strategies if primary fails. Pre-computed — Actor will try these automatically. Alternatives MUST provide semantic diversity: target a DIFFERENT element AND preferably use a DIFFERENT action type (e.g., if primary is click, alternative should be fill, scroll, or press)
 - "expectedOutcome": What you predict will happen after this action
 - "verificationCriteria": Concrete check using DOM/URL (e.g., "URL contains /dashboard OR element with text 'Welcome' visible"). NOT vague descriptions
 - "riskLevel": "low" (scroll/hover/wait/fill), "medium" (click/select/press), "high" (goto/submit with side effects)

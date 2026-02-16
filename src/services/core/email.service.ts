@@ -37,7 +37,7 @@ export class EmailService {
    */
   static async sendWorkspaceInvite(data: WorkspaceInviteEmailData): Promise<{ success: boolean; error?: string }> {
     try {
-      const inviteUrl = `${data.frontendUrl}/invite/accept?inviteId=${data.inviteId}&workspaceId=${data.workspaceId}`;
+      const inviteUrl = `${data.frontendUrl}/invite/accept?token=${data.inviteId}&workspaceId=${data.workspaceId}`;
 
       const roleText = data.role === 'full_access' ? 'Full Access' : 'View Only';
       const workspaceName = data.workspaceName || 'a workspace';

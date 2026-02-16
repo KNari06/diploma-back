@@ -1096,9 +1096,43 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
 
     const test = testResponse.data;
 
+    // DEBUG: Log raw test data from Supabase
+    logger.info('[MANUAL_TEST_FULL] Raw test data keys', {
+      testId: id,
+      keys: Object.keys(test as any),
+      status: test.status,
+      has_executed_steps: !!(test as any).executed_steps,
+      has_executedSteps: !!(test as any).executedSteps,
+      has_started_at: !!(test as any).started_at,
+      has_completed_at: !!(test as any).completed_at,
+      has_test_goal: !!(test as any).test_goal,
+      has_intelligent_mode: !!(test as any).intelligent_mode,
+    });
+
     // 2. Get test results with all details
     const resultsResponse = await ManualTestService.getTestResults(id, userId);
     const results = resultsResponse.data || [];
+
+    // DEBUG: Log raw results from Supabase
+    logger.info('[MANUAL_TEST_FULL] Raw results data', {
+      testId: id,
+      resultsCount: results.length,
+      firstResultKeys: results.length > 0 ? Object.keys(results[0] as any) : [],
+      firstResult: results.length > 0 ? {
+        id: (results[0] as any).id,
+        status: (results[0] as any).status,
+        has_video_url: !!(results[0] as any).video_url,
+        has_videoUrl: !!(results[0] as any).videoUrl,
+        has_trace_url: !!(results[0] as any).trace_url,
+        has_screenshot: !!(results[0] as any).screenshot,
+        has_ai_summary: !!(results[0] as any).ai_summary,
+        has_aiSummary: !!(results[0] as any).aiSummary,
+        has_network_logs: !!(results[0] as any).network_logs,
+        has_networkLogs: !!(results[0] as any).networkLogs,
+        logs: (results[0] as any).logs,
+        errors_count: ((results[0] as any).errors || []).length,
+      } : null,
+    });
 
     // 3. Get test report (includes generated code)
     let report = null;
@@ -1120,8 +1154,22 @@ router.get('/:id/full', requireAuth, asyncHandler(async (req: Request, res: Resp
         .eq('test_id', id)
         .limit(1);
 
+      logger.info('[MANUAL_TEST_FULL] Intelligent session query result', {
+        testId: id,
+        sessionError: sessionError?.message,
+        sessionsCount: sessions?.length || 0,
+        sessionIds: sessions?.map((s: any) => s.id) || [],
+      });
+
       if (!sessionError && sessions && sessions.length > 0) {
         intelligentSession = await IntelligentTestStorageService.getTestSession(sessions[0].id);
+        logger.info('[MANUAL_TEST_FULL] Intelligent session loaded', {
+          testId: id,
+          hasSession: !!intelligentSession?.session,
+          pagesCount: intelligentSession?.pages?.length || 0,
+          findingsCount: intelligentSession?.findings?.length || 0,
+          hasGraphData: !!(intelligentSession?.session as any)?.graph_data,
+        });
       }
     } catch (error) {
       logger.warn('[MANUAL_TEST] Error getting intelligent session', {

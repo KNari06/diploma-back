@@ -97,6 +97,38 @@ export interface ObserverOutput {
   networkActivity?: NetworkActivity;
   /** Expectation validation */
   expectationDiff?: ExpectationDiff;
+
+  // Manus parity: structural analysis
+  /** Table structure analysis (when tables detected) */
+  tableAnalysis?: {
+    ref: string;
+    headers: string[];
+    rowCount: number;
+    isSortable: boolean;
+    hasPagination: boolean;
+    hasBulkActions: boolean;
+    hasInlineEditing: boolean;
+  } | null;
+  /** List/feed analysis (when significant lists detected) */
+  listAnalysis?: {
+    ref: string;
+    estimatedItems: number;
+    hasLoadMore: boolean;
+    isVirtualized: boolean;
+    scrollDirection: 'vertical' | 'horizontal';
+  } | null;
+  /** Loading state interpretation */
+  loadingState?: {
+    isLoading: boolean;
+    type: string;
+    affectedArea: string;
+    ref?: string;
+  } | null;
+  /** Elements covered by overlays */
+  overlapInfo?: Array<{
+    coveredRef: string;
+    coveredBy: string;
+  }> | null;
 }
 
 export interface ObserverInput {
@@ -110,6 +142,10 @@ export interface ObserverInput {
   url: string;
   /** Page title */
   title: string;
+  /** Whether user provided login credentials */
+  hasCredentials?: boolean;
+  /** Test goal for context-aware observation */
+  goal?: string;
 
   // Manus-style enhancements
   /** Previous snapshot for visual diff (bounding boxes) */
@@ -120,6 +156,12 @@ export interface ObserverInput {
   lastExpectation?: string;
   /** Last action performed */
   lastAction?: string;
+  /** Transient loading state (skeleton, spinner, progressbar) */
+  transientState?: { isTransient: boolean; type?: string; ref?: string; text?: string };
+  /** Page metadata (DOM weakness, vision recommendation) */
+  pageMetadata?: { isDOMWeak: boolean; recommendVision: boolean; interactiveElementCount: number };
+  /** Structured page data: tables, lists, pagination detected */
+  pageStructure?: import('../lite-types').PageStructureMetadata;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -185,6 +227,10 @@ export interface WorkingMemory {
   lastFormAnalysis?: FormAnalysis;
   /** Critic rejection history: captures rejection reasons for cross-ref pattern avoidance (bounded) */
   criticRejections?: CriticRejectionRecord[];
+  /** Consecutive expectation mismatches count (predictions that were wrong) */
+  consecutiveExpectationMisses?: number;
+  /** Last expectation mismatch description */
+  lastExpectationMismatch?: string;
 }
 
 /** Accumulated context for monolithic fallback — don't lose knowledge */
@@ -226,6 +272,8 @@ export interface StrategistOutput {
   done?: boolean;
   /** Whether the agent is blocked */
   blockedInfo?: { reason: string; canUserHelp: boolean };
+  /** Current sub-goal the agent is focused on (persists in working memory) */
+  subGoal?: string;
 }
 
 export interface StrategistInput {
@@ -255,6 +303,22 @@ export interface StrategistInput {
   workingMemory?: WorkingMemory;
   /** Critic feedback from a rejected action — re-strategize with this as negative constraint */
   criticFeedback?: string;
+  /** Whether user provided login credentials */
+  hasCredentials?: boolean;
+  /** Current page URL for URL-aware decisions */
+  currentUrl?: string;
+
+  // Manus parity: structured context from Observer
+  /** Table context from Observer (for table navigation strategies) */
+  tableContext?: ObserverOutput['tableAnalysis'];
+  /** List context from Observer (for scroll/load-more strategies) */
+  listContext?: ObserverOutput['listAnalysis'];
+  /** Loading state from Observer (wait vs act decision) */
+  loadingContext?: ObserverOutput['loadingState'];
+  /** Covered elements from Observer (dismiss overlay first) */
+  overlapContext?: ObserverOutput['overlapInfo'];
+  /** Recent confidence trend — 'declining' if last 2 iterations had confidence < 0.4 */
+  confidenceTrend?: 'stable' | 'declining';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -266,6 +330,8 @@ export interface ActorOutput {
   command: AICommand;
   /** Brief reasoning for element choice */
   reasoning: string;
+  /** Whether this action was resolved deterministically (no AI call) */
+  deterministic?: boolean;
 }
 
 export interface ActorInput {
@@ -355,6 +421,10 @@ export interface CriticInput {
   strategistThought: string;
   /** Vision-detected conflicts for the target element (covered/hidden/disabled) */
   visionConflicts?: VisionHints['conflicts'];
+  /** Whether page is in loading state (skeleton/spinner active) */
+  isPageLoading?: boolean;
+  /** Refs of elements currently covered by overlays */
+  coveredElements?: string[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -408,6 +478,14 @@ export interface MultiAgentInput {
   lastAction?: string;
   /** What was expected from last action */
   lastExpectation?: string;
+
+  // Manus parity: snapshot-level context
+  /** Transient state (loading indicators) from snapshot */
+  transientState?: { isTransient: boolean; type?: string; ref?: string; text?: string };
+  /** Page metadata from snapshot */
+  pageMetadata?: { isDOMWeak: boolean; recommendVision: boolean; interactiveElementCount: number };
+  /** Page structure (tables, lists, pagination) from snapshot */
+  pageStructure?: import('../lite-types').PageStructureMetadata;
 }
 
 /** Run-level metrics accumulated across all iterations for A/B comparison */

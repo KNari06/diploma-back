@@ -25,6 +25,7 @@ export class ActorAgent {
     if (input.structuredStrategy) {
       const structured = ActorAgent.tryStructuredPath(input.structuredStrategy, input);
       if (structured) {
+        structured.deterministic = true;
         logger.debug('[ACTOR] Structured strategy resolved', {
           action: structured.command.action,
           ref: structured.command.ref,
@@ -36,6 +37,7 @@ export class ActorAgent {
     // Deterministic path: try to resolve without AI
     const deterministic = ActorAgent.tryDeterministicPath(input);
     if (deterministic) {
+      deterministic.deterministic = true;
       logger.debug('[ACTOR] Deterministic path resolved', {
         action: deterministic.command.action,
         ref: deterministic.command.ref,

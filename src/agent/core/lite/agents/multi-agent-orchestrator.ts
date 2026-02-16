@@ -44,6 +44,12 @@ export class MultiAgentOrchestrator {
   private lastVerificationCriteria: string | undefined;
   /** Manus-style: Rolling reasoning history for consistency checks (bounded) */
   private reasoningHistory: string[] = [];
+  /** Sliding window of last 3 strategy confidence scores */
+  private confidenceHistory: number[] = [];
+  /** Consecutive critic rejection counter (resets on approve) */
+  private consecutiveCriticRejections = 0;
+  /** Consecutive expectation mismatch counter */
+  private consecutiveExpectationMisses = 0;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // Cognitive: Working Memory
@@ -117,6 +123,11 @@ export class MultiAgentOrchestrator {
     };
   }
 
+  /** Get consecutive critic rejection count for stuck detection */
+  getConsecutiveCriticRejections(): number {
+    return this.consecutiveCriticRejections;
+  }
+
   /**
    * Execute the full Observer → Strategist → Actor → Critic pipeline
    * Cognitive: Circuit breaker, working memory, structured strategy, validated alternatives
@@ -173,11 +184,17 @@ export class MultiAgentOrchestrator {
           visionHints: input.visionHints,
           url: input.url,
           title: input.title,
+          hasCredentials: input.hasCredentials,
+          goal: input.goal,
           // Manus-style enhancements
           previousSnapshot: input.previousSnapshot,
           networkActivity: input.networkActivity,
           lastExpectation: input.lastExpectation,
           lastAction: input.lastAction,
+          // Manus parity: transient state, metadata, page structure
+          transientState: input.transientState,
+          pageMetadata: input.pageMetadata,
+          pageStructure: input.pageStructure,
         });
 
         if (!observation) {
@@ -201,6 +218,22 @@ export class MultiAgentOrchestrator {
         this.updateWorkingMemoryFromObserver(observation, input.url, input.iteration);
       }
 
+      // Track expectation mismatches (predictions that were wrong)
+      if (observation.expectationDiff && !observation.expectationDiff.met) {
+        this.consecutiveExpectationMisses++;
+        if (LITE_ENGINE_FLAGS.enableWorkingMemory) {
+          this.workingMemory.consecutiveExpectationMisses = this.consecutiveExpectationMisses;
+          this.workingMemory.lastExpectationMismatch = observation.expectationDiff.mismatch || observation.expectationDiff.actual;
+        }
+      } else if (!observation.expectationDiff || observation.expectationDiff.met) {
+        // Reset on met expectation OR when no expectation was tracked (normal iterations)
+        this.consecutiveExpectationMisses = 0;
+        if (LITE_ENGINE_FLAGS.enableWorkingMemory) {
+          this.workingMemory.consecutiveExpectationMisses = 0;
+          this.workingMemory.lastExpectationMismatch = undefined;
+        }
+      }
+
       // ═══════════════════════════════════════════════════════════════════════
       // Phase 2: Strategist — "What should I do?"
       // ═══════════════════════════════════════════════════════════════════════
@@ -218,6 +251,16 @@ export class MultiAgentOrchestrator {
         isStuck: input.isStuck,
         lastOutcome: input.lastOutcome,
         workingMemory: LITE_ENGINE_FLAGS.enableWorkingMemory ? this.workingMemory : undefined,
+        hasCredentials: input.hasCredentials,
+        currentUrl: input.url,
+        // Manus parity: Observer analysis results
+        tableContext: observation.tableAnalysis,
+        listContext: observation.listAnalysis,
+        loadingContext: observation.loadingState,
+        overlapContext: observation.overlapInfo,
+        // Manus gaps: confidence trend for declining-strategy warning
+        confidenceTrend: this.confidenceHistory.length >= 2 &&
+          this.confidenceHistory.slice(-2).every(c => c < 0.4) ? 'declining' : 'stable',
       });
 
       if (!strategy) {
@@ -231,6 +274,17 @@ export class MultiAgentOrchestrator {
       // Store expectedOutcome for next iteration's expectation validation
       this.lastExpectedOutcome = strategy.expectedOutcome;
       this.lastVerificationCriteria = strategy.verificationCriteria;
+
+      // Track confidence trend (sliding window of last 3)
+      this.confidenceHistory.push(strategy.confidence);
+      if (this.confidenceHistory.length > 3) {
+        this.confidenceHistory = this.confidenceHistory.slice(-3);
+      }
+
+      // Store subGoal in working memory
+      if (LITE_ENGINE_FLAGS.enableWorkingMemory && strategy.subGoal) {
+        this.workingMemory.currentSubGoal = strategy.subGoal;
+      }
 
       // Track reasoning history for consistency checks (bounded ring buffer)
       this.reasoningHistory.push(strategy.thought);
@@ -323,15 +377,26 @@ export class MultiAgentOrchestrator {
       const structuredAlts = strategy.structuredAlternatives;
       const structuredAltByIndex = new Map<number, { action: StrategyAction; confidence: number }>();
       if (LITE_ENGINE_FLAGS.enableValidatedAlternatives && structuredAlts && strategy.structuredStrategy) {
+        const primaryStrategy = strategy.structuredStrategy; // Local ref for safe access inside loop
         for (let i = 0; i < structuredAlts.length; i++) {
           const alt = structuredAlts[i];
           // Alternative must NOT target same ref as primary (semantic diversity)
-          if (alt.action.targetRef && alt.action.targetRef === strategy.structuredStrategy!.targetRef) {
+          if (alt.action.targetRef && alt.action.targetRef === primaryStrategy.targetRef) {
             continue;
           }
-          // Alternative ref must exist in page elements (if specified)
-          if (alt.action.targetRef && !input.snapshotElements.includes(alt.action.targetRef)) {
-            continue;
+          // Alternative ref must exist in page elements (if specified) — word-boundary match to avoid e5 matching e50
+          if (alt.action.targetRef) {
+            const altRefPattern = new RegExp(`\\b${alt.action.targetRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+            if (!altRefPattern.test(input.snapshotElements)) {
+              continue;
+            }
+          }
+          // Action-type diversity: skip duplicate actionType if we already have a diverse alternative
+          if (structuredAlts.length > 1 && alt.action.actionType === primaryStrategy.actionType) {
+            const hasDiverseAlt = [...structuredAltByIndex.values()].some(
+              existing => existing.action.actionType !== primaryStrategy.actionType
+            );
+            if (hasDiverseAlt) continue;
           }
           structuredAltByIndex.set(i, alt);
         }
@@ -408,8 +473,8 @@ export class MultiAgentOrchestrator {
       }
       actorMs = Date.now() - actorStart;
 
-      // Check if actor used deterministic path (very fast = likely deterministic)
-      actorDeterministic = actorMs < 50;
+      // Check if actor used deterministic path (explicit flag from Actor, not timing heuristic)
+      actorDeterministic = action.deterministic === true;
 
       // ═══════════════════════════════════════════════════════════════════════
       // Phase 4: Critic — "Should we really do this?" (Manus Red Teaming)
@@ -439,6 +504,9 @@ export class MultiAgentOrchestrator {
           iteration: input.iteration,
           strategistThought: strategy.thought,
           visionConflicts: input.visionHints?.conflicts,
+          // Manus parity: loading and overlap context
+          isPageLoading: observation.loadingState?.isLoading,
+          coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
         });
 
         criticMs = Date.now() - criticStart;
@@ -448,11 +516,13 @@ export class MultiAgentOrchestrator {
           policyViolationCount = verdict.policyViolations.length;
 
           if (verdict.verdict === 'reject') {
+            this.consecutiveCriticRejections++;
             logger.warn('[MULTI_AGENT] Critic rejected action', {
               risk: verdict.riskAssessment.slice(0, 80),
               failureRisk: verdict.failureRisk.slice(0, 80),
               policyViolations: policyViolationCount,
               inconsistencies: verdict.reasoningInconsistencies.length,
+              consecutiveRejections: this.consecutiveCriticRejections,
             });
 
             // Cognitive: Record critic rejection in working memory for cross-ref pattern avoidance
@@ -501,6 +571,8 @@ export class MultiAgentOrchestrator {
                   iteration: input.iteration,
                   strategistThought: strategy.thought,
                   visionConflicts: input.visionHints?.conflicts,
+                  isPageLoading: observation.loadingState?.isLoading,
+                  coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
                 });
                 if (fallbackSafe) {
                   usedHypothesisIndex = h;
@@ -541,6 +613,16 @@ export class MultiAgentOrchestrator {
                   lastOutcome: input.lastOutcome,
                   workingMemory: LITE_ENGINE_FLAGS.enableWorkingMemory ? this.workingMemory : undefined,
                   criticFeedback: `${verdict.riskAssessment}. ${verdict.failureRisk}`,
+                  hasCredentials: input.hasCredentials,
+                  currentUrl: input.url,
+                  // Manus parity: Observer analysis results
+                  tableContext: observation.tableAnalysis,
+                  listContext: observation.listAnalysis,
+                  loadingContext: observation.loadingState,
+                  overlapContext: observation.overlapInfo,
+                  // Manus gaps: confidence trend
+                  confidenceTrend: this.confidenceHistory.length >= 2 &&
+                    this.confidenceHistory.slice(-2).every(c => c < 0.4) ? 'declining' : 'stable',
                 });
                 strategistMs += Date.now() - reStrategistStart;
 
@@ -573,6 +655,8 @@ export class MultiAgentOrchestrator {
                       iteration: input.iteration,
                       strategistThought: reStrategy.thought,
                       visionConflicts: input.visionHints?.conflicts,
+                      isPageLoading: observation.loadingState?.isLoading,
+                      coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
                     });
 
                     if (reSafe) {
@@ -586,6 +670,12 @@ export class MultiAgentOrchestrator {
                       this.reasoningHistory.push(reStrategy.thought);
                       if (this.reasoningHistory.length > LITE_ENGINE_FLAGS.criticReasoningHistorySize) {
                         this.reasoningHistory = this.reasoningHistory.slice(-LITE_ENGINE_FLAGS.criticReasoningHistorySize);
+                      }
+
+                      // Track re-strategy confidence in trend history
+                      this.confidenceHistory.push(reStrategy.confidence);
+                      if (this.confidenceHistory.length > 3) {
+                        this.confidenceHistory = this.confidenceHistory.slice(-3);
                       }
 
                       logger.info('[MULTI_AGENT] Re-strategize succeeded', {
@@ -644,6 +734,7 @@ export class MultiAgentOrchestrator {
                     reasoning: `Critic override: ${verdict.suggestedAction || 'alternative element selected'}`,
                   };
                   criticOverrideApplied = true;
+                  actorDeterministic = false; // Override came from AI critic, not deterministic
                   this.metrics.criticOverrideAppliedCount++;
                   logger.info('[MULTI_AGENT] Critic override applied', {
                     ref: overrideRef,
@@ -677,10 +768,16 @@ export class MultiAgentOrchestrator {
         criticSkippedLowRisk = true;
         this.metrics.criticLowRiskSkipCount++;
         this.metrics.criticSkippedCount++;
+        this.consecutiveCriticRejections = 0;
         logger.debug('[MULTI_AGENT] Critic skipped: low-risk deterministic action', {
           confidence: strategy.confidence,
           riskLevel: strategy.riskLevel,
         });
+      }
+
+      // Reset consecutive critic rejections on successful pipeline completion
+      if (criticVerdict === 'approve' || criticVerdict === 'override' || criticVerdict === 'skipped') {
+        this.consecutiveCriticRejections = 0;
       }
 
       const totalMs = Date.now() - totalStart;
@@ -690,7 +787,7 @@ export class MultiAgentOrchestrator {
       // Cognitive: Update Working Memory from successful action
       // ═══════════════════════════════════════════════════════════════════════
       if (LITE_ENGINE_FLAGS.enableWorkingMemory) {
-        this.updateWorkingMemoryFromAction(action.command, finalStrategy, input.iteration);
+        this.updateWorkingMemoryFromAction(action.command, finalStrategy, input.iteration, action.reasoning);
       }
 
       // Record circuit breaker result
@@ -817,6 +914,7 @@ export class MultiAgentOrchestrator {
     command: { action: string; ref?: string; value?: string },
     strategyDescription: string,
     iteration: number,
+    actorReasoning?: string,
   ): void {
     // Record successful action (bounded to last 20)
     if (command.ref) {
@@ -831,8 +929,8 @@ export class MultiAgentOrchestrator {
       }
     }
 
-    // Track accomplishment
-    const accomplishment = this.describeAccomplishment(command, strategyDescription);
+    // Track accomplishment — use Actor reasoning for element context (e.g., "Clicked Submit button")
+    const accomplishment = this.describeAccomplishment(command, strategyDescription, actorReasoning);
     if (accomplishment) {
       this.workingMemory.accomplishments.push(accomplishment);
       if (this.workingMemory.accomplishments.length > 10) {
@@ -845,21 +943,52 @@ export class MultiAgentOrchestrator {
   private describeAccomplishment(
     command: { action: string; ref?: string; value?: string },
     strategy: string,
+    actorReasoning?: string,
   ): string | undefined {
+    // Extract element label from actor reasoning (e.g., 'submit button "Login"', 'field "Email"')
+    const elementLabel = actorReasoning ? this.extractElementLabel(actorReasoning) : undefined;
+    const refLabel = command.ref
+      ? (elementLabel ? `${command.ref} (${elementLabel})` : command.ref)
+      : (elementLabel || 'element');
+
     switch (command.action) {
-      case 'fill': return `Filled ${command.ref}`;
-      case 'click': return `Clicked ${command.ref}`;
+      case 'fill': return `Filled ${refLabel}`;
+      case 'click': return `Clicked ${refLabel}`;
       case 'goto': return `Navigated to new page`;
-      case 'select': return `Selected option in ${command.ref}`;
+      case 'select': return `Selected option in ${refLabel}`;
       default: return strategy.length > 60 ? strategy.slice(0, 57) + '...' : strategy;
     }
   }
 
-  /** Normalize URL for working memory (strip query params for grouping) */
+  /** Extract element label from Actor reasoning (e.g., '"Email" field', 'Submit button') */
+  private extractElementLabel(reasoning: string): string | undefined {
+    // Match quoted text like "Login", "Email", "Submit" from reasoning
+    const quotedMatch = reasoning.match(/"([^"]{1,30})"/);
+    if (quotedMatch) return quotedMatch[1];
+    // Match "button/field/input/link <name>" patterns
+    const labelMatch = reasoning.match(/(?:button|field|input|link|form)\s+["']?([A-Za-z0-9 ]{1,25})["']?/i);
+    if (labelMatch) return labelMatch[1].trim();
+    return undefined;
+  }
+
+  /** Normalize URL for working memory (preserve significant query params) */
   private normalizeUrl(url: string): string {
     try {
       const parsed = new URL(url);
-      return `${parsed.origin}${parsed.pathname}`;
+      // Preserve significant query params that change page content (search, filter, page, id)
+      // Strip tracking/session params — exact match only to avoid stripping ref_id, sidebar, etc.
+      const TRACKING_PARAMS = new Set([
+        'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+        'fbclid', '_ga', 'gclid', 'ref', 'source', 'token', 'session', 'sid', 'nonce',
+      ]);
+      const significantParams = new URLSearchParams();
+      for (const [key, value] of parsed.searchParams.entries()) {
+        if (!TRACKING_PARAMS.has(key.toLowerCase()) && !key.startsWith('utm_')) {
+          significantParams.set(key, value);
+        }
+      }
+      const queryStr = significantParams.toString();
+      return `${parsed.origin}${parsed.pathname}${queryStr ? '?' + queryStr : ''}${parsed.hash}`;
     } catch {
       return url;
     }

@@ -40,6 +40,8 @@ export interface LiteElement {
   slotName?: string;
   /** Shadow DOM nesting depth (0 = light DOM, 1 = first level shadow, etc.) */
   shadowDepth?: number;
+  /** Source iframe name/url (only for elements collected from iframes) */
+  iframeSource?: string;
   // Semantic attributes for field classification (Level 1 signals)
   autocomplete?: string;  // e.g., "current-password", "email", "tel", "username"
   inputmode?: string;     // e.g., "tel", "email", "numeric"
@@ -187,6 +189,8 @@ export interface LiteSnapshot {
   pageTextForExtraction?: string;
   /** Visual content metadata for proactive vision detection - NEW: P0 Feature */
   metadata?: SnapshotMetadata;
+  /** Page structure metadata (tables, lists, pagination) */
+  pageStructure?: PageStructureMetadata;
 }
 
 /**
@@ -438,6 +442,51 @@ export interface LiteTestResult {
   };
   /** Multi-agent pipeline metrics (present when enableMultiAgentBrain=true) */
   multiAgentMetrics?: import('./agents/types').MultiAgentRunMetrics;
+  /** Page visits constructed from iteration records (for DB storage) */
+  pageVisits?: import('@/agent/types/intelligent-testing.types').PageVisit[];
+  /** Actual count of unique pages visited */
+  uniquePagesVisited?: number;
+  /** Structured executed steps for /full endpoint */
+  executedSteps?: Array<{ ts: string; type: 'step_completed'; data: { step: number; action: string; description: string; success: boolean; url: string } }>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PAGE STRUCTURE METADATA (Tables, Lists, Pagination)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Table structure detected in page */
+export interface TableMetadata {
+  ref: string;
+  headers: string[];
+  rowCount: number;
+  columnCount: number;
+  isSortable: boolean;
+  hasPagination: boolean;
+  hasCheckboxes: boolean;
+  hasInlineEditing: boolean;
+}
+
+/** List structure detected in page */
+export interface ListMetadata {
+  ref: string;
+  itemCount: number;
+  isVirtualized: boolean;
+  hasLoadMore: boolean;
+}
+
+/** Pagination controls detected on page */
+export interface PaginationMetadata {
+  currentPage?: number;
+  totalPages?: number;
+  nextRef?: string;
+  prevRef?: string;
+}
+
+/** Composite page structure metadata */
+export interface PageStructureMetadata {
+  tables: TableMetadata[];
+  lists: ListMetadata[];
+  pagination: PaginationMetadata | null;
 }
 
 /**

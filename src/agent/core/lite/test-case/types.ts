@@ -198,7 +198,9 @@ export interface TestExecutorConfig {
   userId?: string;
   chatSessionId?: string;
   credentials?: {
+    email?: string;
     username?: string;
+    phone?: string;
     password?: string;
   };
 }

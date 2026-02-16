@@ -41,7 +41,8 @@ import { MultiAgentOrchestrator } from './agents/multi-agent-orchestrator';
 import type { MultiAgentInput } from './agents/types';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
-import type { AICommand, AIDecision, ActionOutcome, BlacklistedAction, CollectedError, ExecutionResult, FlowState, FunnelPhaseType, GoalContext, GoalGuidance, LiteElement, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, RecoveryPoint, StateDiff, StateDriftAuditResult, VisionHints } from './lite-types';
+import type { AICommand, AIDecision, ActionOutcome, BlacklistedAction, CollectedError, ExecutionResult, FlowState, FunnelPhaseType, GoalContext, GoalGuidance, IterationRecord, LiteElement, LiteEngineConfig, LiteSnapshot, LiteTestResult, ModalDismissInfo, RecoveryPoint, StateDiff, StateDriftAuditResult, VisionHints } from './lite-types';
+import type { PageVisit, ActionResult, DynamicAction, PageType } from '@/agent/types/intelligent-testing.types';
 import { LitePromptBuilder, type TaskPlanContext, type ValidationErrorContext } from './prompt/lite-prompt-builder';
 import { PromptSanitizer } from './security/prompt-sanitizer';
 import { LiteTraceWriter } from './trace/lite-trace-writer';
@@ -1195,6 +1196,13 @@ export class LiteEngine {
         // 1. Check if stuck
         const stuckCheck = this.state.isStuck();
 
+        // Critic rejection stuck signal — 3+ consecutive rejections = effectively stuck
+        const criticRejectionCount = this.multiAgentOrchestrator?.getConsecutiveCriticRejections() ?? 0;
+        if (criticRejectionCount >= 3 && !stuckCheck.stuck) {
+          stuckCheck.stuck = true;
+          stuckCheck.suggestion = 'Critic rejected 3+ consecutive actions. Agent strategy is fundamentally misaligned with page state.';
+        }
+
         // 2. Collect snapshot BEFORE (with visual stability)
         let snapshotBefore = await SnapshotCollector.collect(this.page);
         const pageErrorsBefore = await ErrorCollector.collectFromPage(this.page);
@@ -1228,6 +1236,31 @@ export class LiteEngine {
             formattedSnapshot, // Full formatted snapshot for AI context
           },
         });
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // PHASE 0.3 PRE: Activate auto-fill when user provided credentials and login form is visible
+        // This bridges the gap: extractPageCredentials only runs when NO creds provided,
+        // but when user provides creds, we still need to activate the auto-fill state machine
+        // ═══════════════════════════════════════════════════════════════════════
+        if (this.config.credentials && this.credentialFillState === 'idle') {
+          const hasUsernameField = snapshotBefore.elements.some(el => {
+            if (el.tag !== 'input' || !el.visible || el.disabled) return false;
+            const c = classifyField(el);
+            return (c.kind === 'email' || c.kind === 'username') && !el.hasValue;
+          });
+          const hasPasswordField = snapshotBefore.elements.some(el => {
+            if (el.tag !== 'input' || !el.visible || el.disabled) return false;
+            const c = classifyField(el);
+            return c.kind === 'password' && !el.hasValue;
+          });
+          if (hasUsernameField && hasPasswordField) {
+            this.credentialFillState = 'filling_username';
+            logger.info('[LITE_ENGINE] Login form detected with user credentials, starting auto-fill', {
+              testId: this.config.testId,
+              iteration: i,
+            });
+          }
+        }
 
         // ═══════════════════════════════════════════════════════════════════════
         // PHASE 0.3 FIX: Check credential auto-fill state FIRST (before all other logic)
@@ -2122,6 +2155,10 @@ export class LiteEngine {
             networkActivity: this.networkTracker.getNetworkActivityState(),
             lastAction: i > 0 ? this.state.getAllIterations()[i - 1]?.decision.command.action : undefined,
             lastExpectation: this.lastExpectedOutcome, // Manus-style: Feed Strategist's expectedOutcome to Observer
+            // Manus parity: transient state, metadata, page structure
+            transientState: snapshotBefore.transientState,
+            pageMetadata: snapshotBefore.metadata,
+            pageStructure: snapshotBefore.pageStructure,
           } : undefined;
           decision = await this.getAIDecision(prompt, i, iterationSpanId, snapshotBefore, multiAgentCtx);
 
@@ -3632,8 +3669,15 @@ export class LiteEngine {
     // ✅ FIX: Finalization flag should already be set by emitCompletion, but ensure it here
     this.isFinalizing = true;
 
+    // Count unique pages visited from iteration records
+    const iterationUrls = new Set(this.state.getAllIterations().map(it => it.stateBefore.url));
+    this.state.getAllIterations().forEach(it => {
+      if (it.result.stateDiff.urlChanged) iterationUrls.add(it.result.stateDiff.urlAfter);
+    });
+    const pagesVisitedCount = Math.max(iterationUrls.size, 1);
+
     const endUpdate = this.graphBuilder.addEndNode(success, reason, {
-      pagesVisited: 1, // Lite typically stays on one page
+      pagesVisited: pagesVisitedCount,
       actionsTaken: iterations,
       successRate: `${iterations > 0 ? Math.round((this.graphBuilder.getMetadata().completedSteps / iterations) * 100) : 0}%`,
       duration: `${Math.round(duration / 1000)}s`,
@@ -3727,147 +3771,146 @@ export class LiteEngine {
       },
     });
 
-    // ✅ NEW: Close trace writer and upload to Supabase Storage
-    try {
-      await this.traceWriter.close();
+    // ✅ Close trace writer (flush pending writes) before uploading
+    await this.traceWriter.close();
 
-      const traceFilePath = this.traceWriter.getFilePath();
-      const runId = this.traceWriter.getRunId();
-      const userId = this.config.userId;
-      const testId = this.config.testId;
+    // ✅ Upload trace log to Supabase Storage (production only)
+    // In development, keep logs locally in test_logs/ for easy debugging
+    const isProduction = process.env.NODE_ENV === 'production';
 
-      // Validate UUIDs (trace_files requires UUID, not 'anonymous')
-      const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      const isValidUserId = userId && UUID_REGEX.test(userId);
-      const isValidTestId = testId && UUID_REGEX.test(testId);
+    if (isProduction) {
+      try {
+        const traceFilePath = this.traceWriter.getFilePath();
+        const runId = this.traceWriter.getRunId();
+        const userId = this.config.userId;
+        const testId = this.config.testId;
 
-      if (isValidUserId && isValidTestId) {
-        // Check if file exists and has content
-        const fs = await import('fs/promises');
-        const path = await import('path');
+        // Validate UUIDs (trace_files requires UUID, not 'anonymous')
+        const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const isValidUserId = userId && UUID_REGEX.test(userId);
+        const isValidTestId = testId && UUID_REGEX.test(testId);
 
-        try {
-          await fs.access(traceFilePath);
-          const stats = await fs.stat(traceFilePath);
+        if (isValidUserId && isValidTestId) {
+          const fs = await import('fs/promises');
+          const path = await import('path');
 
-          if (stats.size > 0) {
-            logger.info('[LITE_ENGINE] Uploading trace log to Storage', {
-              testId,
-              filePath: traceFilePath,
-              fileSize: `${Math.round(stats.size / 1024)}KB`,
-              runId,
-            });
+          try {
+            await fs.access(traceFilePath);
+            const stats = await fs.stat(traceFilePath);
 
-            const { uploadLiteTraceLogToStorage, insertTraceFileRecord, deleteLiteTraceLogFromStorage } = await import(
-              '@/services/storage/test-artifacts-storage.service'
-            );
-
-            const fileName = path.basename(traceFilePath);
-            const { storagePath, fileSize } = await uploadLiteTraceLogToStorage(
-              traceFilePath,
-              userId,
-              fileName
-            );
-
-            let traceFileId: string | undefined;
-            try {
-              const { id } = await insertTraceFileRecord({
-                userId,
+            if (stats.size > 0) {
+              logger.info('[LITE_ENGINE] Uploading trace log to Storage', {
                 testId,
-                fileName,
+                filePath: traceFilePath,
+                fileSize: `${Math.round(stats.size / 1024)}KB`,
+                runId,
+              });
+
+              const { uploadLiteTraceLogToStorage, insertTraceFileRecord, deleteLiteTraceLogFromStorage } = await import(
+                '@/services/storage/test-artifacts-storage.service'
+              );
+
+              const fileName = path.basename(traceFilePath);
+              const { storagePath, fileSize } = await uploadLiteTraceLogToStorage(
+                traceFilePath,
+                userId,
+                fileName
+              );
+
+              let traceFileId: string | undefined;
+              try {
+                const { id } = await insertTraceFileRecord({
+                  userId,
+                  testId,
+                  fileName,
+                  storagePath,
+                  fileSize,
+                  browser: 'lite-trace-log',
+                  status: 'uploaded',
+                });
+                traceFileId = id;
+              } catch (insertError) {
+                await deleteLiteTraceLogFromStorage(storagePath);
+                throw insertError;
+              }
+
+              logger.info('[LITE_ENGINE] Trace log uploaded successfully', {
+                testId,
+                traceFileId,
                 storagePath,
-                fileSize,
-                browser: 'lite-trace-log',
-                status: 'uploaded',
+                runId,
               });
-              traceFileId = id;
-            } catch (insertError) {
-              // Prevent orphan files in Storage if DB insert fails (best-effort cleanup)
-              await deleteLiteTraceLogFromStorage(storagePath);
-              throw insertError;
-            }
 
-            logger.info('[LITE_ENGINE] Trace log uploaded successfully', {
-              testId,
-              traceFileId,
-              storagePath,
-              runId,
-            });
-
-            // Clean up local file (best-effort)
-            try {
-              await fs.unlink(traceFilePath);
-              logger.debug('[LITE_ENGINE] Local trace log deleted', { traceFilePath });
-            } catch (cleanupError) {
-              logger.warn('[LITE_ENGINE] Failed to delete local trace log', {
-                traceFilePath,
-                error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-              });
+              // Clean up local file after successful upload (production only)
+              try {
+                await fs.unlink(traceFilePath);
+                logger.debug('[LITE_ENGINE] Local trace log deleted', { traceFilePath });
+              } catch (cleanupError) {
+                logger.warn('[LITE_ENGINE] Failed to delete local trace log', {
+                  traceFilePath,
+                  error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+                });
+              }
             }
-          } else {
-            logger.warn('[LITE_ENGINE] Trace log file is empty, skipping upload', {
+          } catch (fileError) {
+            logger.warn('[LITE_ENGINE] Trace log file not found or inaccessible, skipping upload', {
               testId,
               traceFilePath,
+              error: fileError instanceof Error ? fileError.message : String(fileError),
             });
           }
-        } catch (fileError) {
-          logger.warn('[LITE_ENGINE] Trace log file not found or inaccessible, skipping upload', {
-            testId,
-            traceFilePath,
-            error: fileError instanceof Error ? fileError.message : String(fileError),
-          });
-        }
-      } else {
-        // Non-UUID / anonymous runs: upload to Storage without trace_files record
-        const fs = await import('fs/promises');
-        const path = await import('path');
+        } else {
+          // Non-UUID / anonymous runs
+          const fs = await import('fs/promises');
+          const path = await import('path');
 
-        try {
-          await fs.access(traceFilePath);
-          const stats = await fs.stat(traceFilePath);
+          try {
+            await fs.access(traceFilePath);
+            const stats = await fs.stat(traceFilePath);
 
-          if (stats.size > 0) {
-            const { uploadLiteTraceLogToStorageAnonymous } = await import(
-              '@/services/storage/test-artifacts-storage.service'
-            );
+            if (stats.size > 0) {
+              const { uploadLiteTraceLogToStorageAnonymous } = await import(
+                '@/services/storage/test-artifacts-storage.service'
+              );
 
-            const fileName = path.basename(traceFilePath);
-            const { storagePath } = await uploadLiteTraceLogToStorageAnonymous(traceFilePath, fileName);
+              const fileName = path.basename(traceFilePath);
+              const { storagePath } = await uploadLiteTraceLogToStorageAnonymous(traceFilePath, fileName);
 
-            logger.info('[LITE_ENGINE] Trace log uploaded for non-UUID run (no DB record)', {
-              testId,
-              userId: userId?.substring(0, 20) || 'undefined',
-              storagePath,
-              runId,
-            });
-
-            // Clean up local file only if upload succeeded
-            try {
-              await fs.unlink(traceFilePath);
-              logger.debug('[LITE_ENGINE] Local trace log deleted (non-UUID run)', { traceFilePath });
-            } catch (cleanupError) {
-              logger.warn('[LITE_ENGINE] Failed to delete local trace log (non-UUID run)', {
-                traceFilePath,
-                error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+              logger.info('[LITE_ENGINE] Trace log uploaded for non-UUID run (no DB record)', {
+                testId,
+                userId: userId?.substring(0, 20) || 'undefined',
+                storagePath,
+                runId,
               });
+
+              // Clean up local file after successful upload (production only)
+              try {
+                await fs.unlink(traceFilePath);
+                logger.debug('[LITE_ENGINE] Local trace log deleted (non-UUID run)', { traceFilePath });
+              } catch (cleanupError) {
+                logger.warn('[LITE_ENGINE] Failed to delete local trace log (non-UUID run)', {
+                  traceFilePath,
+                  error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+                });
+              }
             }
-          } else {
-            logger.warn('[LITE_ENGINE] Trace log file is empty, skipping upload (non-UUID run)', {
+          } catch (fileError) {
+            logger.warn('[LITE_ENGINE] Trace log file not found or inaccessible (non-UUID run)', {
               traceFilePath,
+              error: fileError instanceof Error ? fileError.message : String(fileError),
             });
           }
-        } catch (fileError) {
-          logger.warn('[LITE_ENGINE] Trace log file not found or inaccessible (non-UUID run)', {
-            traceFilePath,
-            error: fileError instanceof Error ? fileError.message : String(fileError),
-          });
         }
+      } catch (traceUploadError) {
+        logger.error('[LITE_ENGINE] Failed to upload trace log', {
+          testId: this.config.testId,
+          error: traceUploadError instanceof Error ? traceUploadError.message : String(traceUploadError),
+        });
       }
-    } catch (traceUploadError) {
-      // Don't fail the test if trace upload fails
-      logger.error('[LITE_ENGINE] Failed to upload trace log', {
+    } else {
+      logger.info('[LITE_ENGINE] Keeping trace log locally (non-production)', {
         testId: this.config.testId,
-        error: traceUploadError instanceof Error ? traceUploadError.message : String(traceUploadError),
+        filePath: this.traceWriter.getFilePath(),
       });
     }
 
@@ -3886,6 +3929,9 @@ export class LiteEngine {
     // Multi-agent metrics (when enabled)
     const multiAgentMetrics = this.multiAgentOrchestrator?.getRunMetrics();
 
+    // Build page visits and executed steps from iteration records
+    const { pageVisits, uniquePagesVisited, executedSteps } = this.buildPageVisitsFromIterations();
+
     return {
       success,
       reason,
@@ -3896,6 +3942,9 @@ export class LiteEngine {
       errors: this.collectedErrors, // ✅ Pro-grade error collection
       graphData, // ✅ Full graph like Pro
       ...(multiAgentMetrics && { multiAgentMetrics }),
+      pageVisits,
+      uniquePagesVisited,
+      executedSteps,
     };
   }
 
@@ -4804,11 +4853,13 @@ export class LiteEngine {
    * Returns command if target element found, null otherwise
    */
   private buildAutoCredentialCommand(snapshot: LiteSnapshot): AICommand | null {
-    const { username, password } = this.config.credentials || {};
+    const { username, email, phone, password } = this.config.credentials || {};
+    // Fallback chain: username → email → phone (matches overrideCommandWithCredentials logic)
+    const usernameValue = username || email || phone;
 
     switch (this.credentialFillState) {
       case 'filling_username': {
-        // Find username field
+        // Find username/email field
         const usernameField = snapshot.elements.find(el => {
           if (el.tag !== 'input' || !el.visible || el.disabled) return false;
 
@@ -4819,9 +4870,9 @@ export class LiteEngine {
           ) && !el.hasValue; // Don't fill if already filled
         });
 
-        if (usernameField && username) {
+        if (usernameField && usernameValue) {
           this.credentialFillState = 'filling_password';
-          return { action: 'fill', ref: usernameField.ref, value: username };
+          return { action: 'fill', ref: usernameField.ref, value: usernameValue };
         }
 
         // Skip to password if username field not found or no username
@@ -4855,7 +4906,7 @@ export class LiteEngine {
           const isButton = el.role === 'button' || el.tag === 'button' ||
             (el.tag === 'input' && el.type === 'submit');
 
-          const hasSubmitText = /submit|login|sign.?in|log.?in|continue|enter|next/i.test(el.name);
+          const hasSubmitText = /submit|login|sign.?in|log.?in|continue|enter|next|войти|вход|кіру|увійти|giriş|вхід|жіберу|отправить/i.test(el.name);
 
           return isButton && hasSubmitText;
         });
@@ -4871,6 +4922,152 @@ export class LiteEngine {
     }
 
     return null;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PAGE VISITS & EXECUTED STEPS CONVERSION
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Detect page type from URL path using simple heuristics
+   */
+  private detectPageTypeFromUrl(url: string): PageType {
+    try {
+      const path = new URL(url).pathname.toLowerCase();
+      if (/\/(login|auth|signin|sign-in|authorization)/.test(path)) return 'login';
+      if (/\/(register|signup|sign-up)/.test(path)) return 'register';
+      if (/\/dashboard/.test(path)) return 'dashboard';
+      if (/\/cart/.test(path)) return 'cart';
+      if (/\/(checkout|payment)/.test(path)) return 'checkout';
+      if (/\/search/.test(path)) return 'search_results';
+      if (/\/(profile|account)/.test(path)) return 'profile';
+      if (/\/settings/.test(path)) return 'settings';
+      if (/\/(category|catalog)/.test(path)) return 'category';
+      if (/\/(product|item)/.test(path)) return 'product';
+      if (path === '/' || path === '') return 'home';
+      return 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  /**
+   * Map AICommand action to DynamicAction action type
+   */
+  private mapCommandToDynamicAction(cmd: AICommand, thought: string): DynamicAction {
+    const actionMap: Record<string, DynamicAction['action']> = {
+      click: 'click',
+      fill: 'fill',
+      press: 'press',
+      goto: 'goto',
+      scroll: 'scroll',
+      select: 'select',
+      hover: 'hover',
+      wait: 'wait',
+    };
+
+    return {
+      action: actionMap[cmd.action] || 'click',
+      selector: cmd.ref,
+      value: cmd.value,
+      url: cmd.url,
+      description: thought,
+    };
+  }
+
+  /**
+   * Build PageVisit[] and executedSteps[] from iteration records.
+   * Groups iterations by URL and creates structured data for DB storage.
+   */
+  private buildPageVisitsFromIterations(): {
+    pageVisits: PageVisit[];
+    uniquePagesVisited: number;
+    executedSteps: LiteTestResult['executedSteps'];
+  } {
+    const iterations = this.state.getAllIterations();
+    if (iterations.length === 0) {
+      return { pageVisits: [], uniquePagesVisited: 1, executedSteps: [] };
+    }
+
+    const pageVisits: PageVisit[] = [];
+    const executedSteps: NonNullable<LiteTestResult['executedSteps']> = [];
+    const uniqueUrls = new Set<string>();
+    let currentPageVisit: PageVisit | null = null;
+    let cumulativeDuration = 0;
+
+    for (let i = 0; i < iterations.length; i++) {
+      const iter = iterations[i];
+      const url = iter.stateBefore.url;
+      uniqueUrls.add(url);
+
+      // Check if we need to start a new PageVisit (URL changed from previous)
+      if (!currentPageVisit || currentPageVisit.url !== url) {
+        // Finalize previous page visit
+        if (currentPageVisit) {
+          currentPageVisit.success = (currentPageVisit.actionResults || []).some(r => r.success);
+        }
+        // Start new page visit
+        currentPageVisit = {
+          url,
+          pageType: this.detectPageTypeFromUrl(url),
+          timestamp: this.startTime + cumulativeDuration,
+          actions: [],
+          actionResults: [],
+          success: false,
+        };
+        pageVisits.push(currentPageVisit);
+      }
+
+      // Build DynamicAction from AICommand
+      const cmd = iter.decision.command;
+      const thought = iter.decision.thought;
+      const dynamicAction = this.mapCommandToDynamicAction(cmd, thought);
+      currentPageVisit.actions.push(dynamicAction);
+
+      // Build ActionResult
+      const actionResult: ActionResult = {
+        action: dynamicAction,
+        success: iter.result.success,
+        error: iter.result.error,
+        urlChanged: iter.result.stateDiff.urlChanged,
+        urlBefore: iter.result.stateDiff.urlBefore,
+        urlAfter: iter.result.stateDiff.urlAfter,
+        timestamp: this.startTime + cumulativeDuration,
+        durationMs: iter.result.duration,
+      };
+      currentPageVisit.actionResults!.push(actionResult);
+
+      // Track URL after action
+      if (iter.result.stateDiff.urlChanged) {
+        uniqueUrls.add(iter.result.stateDiff.urlAfter);
+      }
+
+      // Build executed step event
+      executedSteps.push({
+        ts: new Date(this.startTime + cumulativeDuration).toISOString(),
+        type: 'step_completed',
+        data: {
+          step: i + 1,
+          action: cmd.action,
+          description: thought,
+          success: iter.result.success,
+          url,
+        },
+      });
+
+      cumulativeDuration += iter.result.duration;
+    }
+
+    // Finalize last page visit
+    if (currentPageVisit) {
+      currentPageVisit.success = (currentPageVisit.actionResults || []).some(r => r.success);
+    }
+
+    return {
+      pageVisits,
+      uniquePagesVisited: uniqueUrls.size,
+      executedSteps,
+    };
   }
 
 }
