@@ -321,6 +321,64 @@ export async function executeUiTestFlow(
     // ✅ FIX #1: Deduct credits AFTER successful queue job creation
     // ✅ FIX (duplicate start): If we reused an existing active test, DO NOT deduct credits again.
     const reusedExistingTest = testCreated?.message === 'ACTIVE_TEST_REUSED';
+
+    // Create analytics records (regression_run + test_execution)
+    // Without these, analytics endpoints show 0 for chat-launched tests.
+    // Skip if we reused an existing test — analytics records already exist for it.
+    if (!reusedExistingTest && actualTestId) {
+      try {
+        const { data: analyticsRun, error: runInsertError } = await supabaseAdmin
+          .from('regression_runs')
+          .insert({
+            project_id: project_id,
+            user_id: userId,
+            trigger: 'chat',
+            status: 'running',
+            test_id: actualTestId,
+          })
+          .select('id')
+          .single();
+
+        if (runInsertError || !analyticsRun) {
+          logger.warn('[UI_TEST] Failed to create analytics regression_run', {
+            error: runInsertError?.message,
+            testId: actualTestId,
+          });
+        } else {
+          const { error: execInsertError } = await supabaseAdmin
+            .from('test_executions')
+            .insert({
+              run_id: analyticsRun.id,
+              test_type: 'ui',
+              test_case_id: null,
+              status: 'running',
+              started_at: new Date().toISOString(),
+              browser: 'chrome',
+              result: { testId: actualTestId, type: 'ui', trigger: 'chat' },
+            });
+
+          if (execInsertError) {
+            logger.warn('[UI_TEST] Failed to create analytics test_execution', {
+              error: execInsertError.message,
+              runId: analyticsRun.id,
+              testId: actualTestId,
+            });
+          } else {
+            logger.info('[UI_TEST] Analytics records created for Pro test', {
+              runId: analyticsRun.id,
+              testId: actualTestId,
+            });
+          }
+        }
+      } catch (analyticsError) {
+        // Analytics tracking is non-critical — never block test execution
+        logger.warn('[UI_TEST] Analytics tracking failed (non-critical)', {
+          error: analyticsError instanceof Error ? analyticsError.message : String(analyticsError),
+          testId: actualTestId,
+        });
+      }
+    }
+
     if (!reusedExistingTest) {
       // This ensures we only charge if test actually started
       emitProcessingStep(chatSessionId, 'executing_test', '💳 Deducting credits...', 90);

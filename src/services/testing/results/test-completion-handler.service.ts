@@ -311,7 +311,7 @@ export class TestCompletionHandlerService {
       // Either directly (test_id) or in a batch (test_ids array)
       const { data: runs, error: runsError } = await supabaseAdmin
         .from('regression_runs')
-        .select('id, saved_test_case_id, test_id, test_ids, status, user_id, trigger, plan_id')
+        .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
         .or(`test_id.eq.${testId},test_ids.cs.["${testId}"]`)
         .in('status', ['running']); // Only update runs that are still in progress
 
