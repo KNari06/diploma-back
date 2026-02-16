@@ -4,6 +4,9 @@ import { ApiResponse, NotFoundError, Test, ValidationError } from '@/types';
 import { logger, logTestEvent } from '@/utils/core/logger';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 
+/** Maximum age for a test to be considered "alive" (30 minutes) */
+const STALE_TEST_THRESHOLD_MS = 30 * 60 * 1000;
+
 /**
  * Get all running tests for a user
  */
@@ -21,7 +24,39 @@ export async function getRunningTestsForUser(userId: string): Promise<Test[]> {
       return [];
     }
 
-    return (tests || []) as Test[];
+    if (!tests || tests.length === 0) {
+      return [];
+    }
+
+    // Stale test detection: auto-fail zombie tests (same as chat session version)
+    const now = Date.now();
+    const aliveTests: Test[] = [];
+    for (const test of tests) {
+      const createdAt = new Date((test as any).created_at).getTime();
+      const age = now - createdAt;
+      if (age > STALE_TEST_THRESHOLD_MS) {
+        logger.warn('[STALE_TEST] Auto-failing zombie test', {
+          testId: test.id,
+          status: test.status,
+          ageMinutes: Math.round(age / 60000),
+          userId,
+        });
+        Promise.resolve(
+          dbService.supabaseAdmin
+            .from('tests')
+            .update({ status: 'failed', completed_at: new Date().toISOString() })
+            .eq('id', test.id)
+        ).then(() => {
+          logger.info('[STALE_TEST] Zombie test marked as failed', { testId: test.id });
+        }).catch((err: any) => {
+          logger.error('[STALE_TEST] Failed to update zombie test', { testId: test.id, error: err?.message });
+        });
+      } else {
+        aliveTests.push(test as Test);
+      }
+    }
+
+    return aliveTests;
   } catch (error) {
     logger.error(`[CANCEL_TEST] Error getting running tests for user: ${userId}`, error);
     return [];
@@ -52,7 +87,41 @@ export async function getRunningTestsForChatSession(chatSessionId: string): Prom
       return [];
     }
 
-    return (tests || []) as Test[];
+    if (!tests || tests.length === 0) {
+      return [];
+    }
+
+    // Stale test detection: auto-fail tests that have been "running" too long
+    // This handles zombie tests left after server crashes/restarts
+    const now = Date.now();
+    const aliveTests: Test[] = [];
+    for (const test of tests) {
+      const createdAt = new Date((test as any).created_at).getTime();
+      const age = now - createdAt;
+      if (age > STALE_TEST_THRESHOLD_MS) {
+        // Mark stale test as failed in DB (fire-and-forget)
+        logger.warn('[STALE_TEST] Auto-failing zombie test', {
+          testId: test.id,
+          status: test.status,
+          ageMinutes: Math.round(age / 60000),
+          chatSessionId,
+        });
+        Promise.resolve(
+          dbService.supabaseAdmin
+            .from('tests')
+            .update({ status: 'failed', completed_at: new Date().toISOString() })
+            .eq('id', test.id)
+        ).then(() => {
+          logger.info('[STALE_TEST] Zombie test marked as failed', { testId: test.id });
+        }).catch((err: any) => {
+          logger.error('[STALE_TEST] Failed to update zombie test', { testId: test.id, error: err?.message });
+        });
+      } else {
+        aliveTests.push(test as Test);
+      }
+    }
+
+    return aliveTests;
   } catch (error) {
     logger.error(`[CANCEL_TEST] Error getting running tests for chat session: ${chatSessionId}`, error);
     return [];

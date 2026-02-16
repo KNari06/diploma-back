@@ -26,6 +26,7 @@ import { CriticAgent } from './critic-agent';
 import { ObserverCache } from './observer-cache';
 import { ObserverAgent } from './observer-agent';
 import { StrategistAgent } from './strategist-agent';
+import { SupervisorAgent } from './supervisor-agent';
 import type {
   AccumulatedContext,
   MultiAgentInput,
@@ -33,6 +34,7 @@ import type {
   MultiAgentRunMetrics,
   ObserverOutput,
   StrategyAction,
+  SupervisorBlackboard,
   WorkingMemory,
 } from './types';
 
@@ -50,6 +52,8 @@ export class MultiAgentOrchestrator {
   private consecutiveCriticRejections = 0;
   /** Consecutive expectation mismatch counter */
   private consecutiveExpectationMisses = 0;
+  /** Supervisor agent — Manus Tiered Escalation watchdog */
+  private supervisor = new SupervisorAgent();
 
   // ═══════════════════════════════════════════════════════════════════════════
   // Cognitive: Working Memory
@@ -90,6 +94,9 @@ export class MultiAgentOrchestrator {
     criticLowRiskSkipCount: 0,
     criticOverrideAppliedCount: 0,
     reStrategizeCount: 0,
+    supervisorRecoveryModeCount: 0,
+    supervisorHardBacktrackCount: 0,
+    supervisorTier2Count: 0,
   };
 
   constructor() {
@@ -162,6 +169,125 @@ export class MultiAgentOrchestrator {
     let criticOverrideApplied = false;
     let reStrategized = false;
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Supervisor Layer — Manus Tiered Escalation
+    // Tier 1: Deterministic blackboard (<5ms, 0 tokens)
+    // Tier 2: AI diagnosis (gpt-4o-mini) only when stuck 5+ iterations
+    // ═══════════════════════════════════════════════════════════════════════
+    let blackboard: SupervisorBlackboard | undefined;
+
+    if (LITE_ENGINE_FLAGS.enableSupervisorLayer) {
+      // Record previous action's outcome for Tier 2 context (available from engine)
+      if (input.lastOutcome) {
+        this.supervisor.recordActionOutcome(input.lastOutcome);
+      }
+
+      blackboard = this.supervisor.computeBlackboard(input);
+
+      // Hard Backtrack: skip entire pipeline, force navigation to known-good URL
+      const backtrackUrl = blackboard.knownGoodUrls[0];
+      if (blackboard.hardBacktrack && backtrackUrl) {
+        this.metrics.supervisorHardBacktrackCount++;
+        return {
+          success: true,
+          decision: {
+            thought: `[SUPERVISOR] Hard backtrack: wrong page for ${blackboard.wrongPageCount} iterations → navigating to ${backtrackUrl}`,
+            command: { action: 'goto', url: backtrackUrl },
+          },
+          debug: {
+            observerCacheHit: false,
+            actorDeterministic: true,
+            observerMs: 0,
+            strategistMs: 0,
+            actorMs: 0,
+            criticMs: 0,
+            totalMs: Date.now() - totalStart,
+            supervisorHardBacktrack: true,
+            supervisorTier: 1,
+            supervisorRecoveryMode: true,
+          },
+        };
+      }
+
+      // Tier 2 Nuclear: AI diagnosis when Tier 1 exhausted
+      // Cooldown: only invoke every 3 interventions after threshold to avoid cost/latency spam
+      const tier2Eligible = blackboard.recoveryMode
+        && blackboard.interventionCount >= LITE_ENGINE_FLAGS.supervisorMaxInterventions
+        && LITE_ENGINE_FLAGS.enableSupervisorTier2
+        && ((blackboard.interventionCount - LITE_ENGINE_FLAGS.supervisorMaxInterventions) % 3 === 0);
+
+      if (tier2Eligible) {
+        const diagnosis = await this.supervisor.diagnoseBlocker(input, blackboard);
+        if (diagnosis) {
+          blackboard.aiDiagnosis = diagnosis.suggestedRecovery;
+          blackboard.recoveryTier = 2;
+          this.metrics.supervisorTier2Count++;
+
+          // Mandatory Action Override: Tier 2 AI is confident about the exact next step
+          // Validate: action type valid + ref exists on page + NOT in forbidden list
+          if (diagnosis.mandatoryAction) {
+            const ma = diagnosis.mandatoryAction;
+            const VALID_ACTIONS = new Set(['click', 'fill', 'press', 'goto', 'scroll', 'select', 'hover', 'wait']);
+            const refValid = !ma.ref || new RegExp(`\\b${ma.ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(input.snapshotElements);
+
+            // Check against forbidden actions — mandatory actions must NOT repeat failed actions
+            const isForbidden = blackboard.forbiddenActions.some(fa =>
+              (fa.action === ma.action && fa.ref && fa.ref === ma.ref) ||
+              (fa.action === 'goto' && ma.action === 'goto' && fa.url && fa.url === ma.url),
+            );
+
+            if (VALID_ACTIONS.has(ma.action) && refValid && !isForbidden) {
+              blackboard.mandatoryAction = ma;
+              logger.info('[SUPERVISOR] Tier 2: Mandatory action override set', {
+                action: ma.action,
+                ref: ma.ref,
+              });
+            } else {
+              logger.warn('[SUPERVISOR] Tier 2: Mandatory action rejected', {
+                action: ma.action,
+                ref: ma.ref,
+                refValid,
+                isForbidden,
+              });
+            }
+          }
+        }
+      }
+
+      if (blackboard.recoveryMode) {
+        this.metrics.supervisorRecoveryModeCount++;
+      }
+
+      // Mandatory Action Override: skip entire pipeline, execute Tier 2's prescribed action
+      if (blackboard.mandatoryAction) {
+        const ma = blackboard.mandatoryAction;
+        this.supervisor.recordAction(ma);
+        return {
+          success: true,
+          decision: {
+            thought: `[SUPERVISOR] Tier 2 mandatory override: ${ma.action}${ma.ref ? `(${ma.ref})` : ''}${ma.url ? ` → ${ma.url}` : ''}`,
+            command: {
+              action: ma.action as any,
+              ref: ma.ref,
+              value: ma.value,
+              url: ma.url,
+            },
+          },
+          debug: {
+            observerCacheHit: false,
+            actorDeterministic: true,
+            observerMs: 0,
+            strategistMs: 0,
+            actorMs: 0,
+            criticMs: 0,
+            totalMs: Date.now() - totalStart,
+            supervisorRecoveryMode: true,
+            supervisorTier: 2,
+          },
+        };
+      }
+    }
+
     try {
       // ═══════════════════════════════════════════════════════════════════════
       // Phase 1: Observer — "What do I see?"
@@ -195,6 +321,8 @@ export class MultiAgentOrchestrator {
           transientState: input.transientState,
           pageMetadata: input.pageMetadata,
           pageStructure: input.pageStructure,
+          // Supervisor: shared recovery context
+          blackboard,
         });
 
         if (!observation) {
@@ -261,6 +389,9 @@ export class MultiAgentOrchestrator {
         // Manus gaps: confidence trend for declining-strategy warning
         confidenceTrend: this.confidenceHistory.length >= 2 &&
           this.confidenceHistory.slice(-2).every(c => c < 0.4) ? 'declining' : 'stable',
+        goalUrl: input.goalUrl,
+        // Supervisor: shared recovery context
+        blackboard,
       });
 
       if (!strategy) {
@@ -449,13 +580,39 @@ export class MultiAgentOrchestrator {
         });
 
         if (action) {
-          usedHypothesisIndex = h;
+          // Safety check for alternatives (h > 0): verify policy compliance before accepting
           if (h > 0) {
+            const isSafe = CriticAgent.quickSafetyCheck({
+              proposedCommand: action.command,
+              actorReasoning: action.reasoning,
+              goal: input.goal,
+              availableElements: input.snapshotElements,
+              observation,
+              currentUrl: input.url,
+              hasCredentials: input.hasCredentials,
+              formAnalysis: observation.formAnalysis,
+              iteration: input.iteration,
+              strategistThought: hypothesis,
+              visionConflicts: input.visionHints?.conflicts,
+              isPageLoading: observation.loadingState?.isLoading,
+              coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
+              blackboard,
+            });
+            if (!isSafe) {
+              logger.info('[MULTI_AGENT] Alternative blocked by safety check', {
+                alternativeIndex: h,
+                action: action.command.action,
+                ref: action.command.ref,
+              });
+              action = null;
+              continue; // Try next hypothesis
+            }
             logger.info('[MULTI_AGENT] Primary strategy failed Actor, used alternative', {
               alternativeIndex: h,
               strategy: hypothesis.slice(0, 60),
             });
           }
+          usedHypothesisIndex = h;
           break;
         }
 
@@ -507,6 +664,8 @@ export class MultiAgentOrchestrator {
           // Manus parity: loading and overlap context
           isPageLoading: observation.loadingState?.isLoading,
           coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
+          // Supervisor: shared recovery context
+          blackboard,
         });
 
         criticMs = Date.now() - criticStart;
@@ -573,6 +732,7 @@ export class MultiAgentOrchestrator {
                   visionConflicts: input.visionHints?.conflicts,
                   isPageLoading: observation.loadingState?.isLoading,
                   coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
+                  blackboard,
                 });
                 if (fallbackSafe) {
                   usedHypothesisIndex = h;
@@ -623,6 +783,9 @@ export class MultiAgentOrchestrator {
                   // Manus gaps: confidence trend
                   confidenceTrend: this.confidenceHistory.length >= 2 &&
                     this.confidenceHistory.slice(-2).every(c => c < 0.4) ? 'declining' : 'stable',
+                  goalUrl: input.goalUrl,
+                  // Supervisor: shared recovery context
+                  blackboard,
                 });
                 strategistMs += Date.now() - reStrategistStart;
 
@@ -657,6 +820,7 @@ export class MultiAgentOrchestrator {
                       visionConflicts: input.visionHints?.conflicts,
                       isPageLoading: observation.loadingState?.isLoading,
                       coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
+                      blackboard,
                     });
 
                     if (reSafe) {
@@ -688,8 +852,35 @@ export class MultiAgentOrchestrator {
                 }
               }
 
-              // If re-strategize was not attempted or did not produce a safe action, fall back
+              // If re-strategize was not attempted or did not produce a safe action, check Supervisor backtrack
               if (criticVerdict !== 'approve') {
+                // Supervisor: In recovery mode with critic rejection, backtrack to known-good URL
+                const criticBacktrackUrl = blackboard?.knownGoodUrls?.[0];
+                if (LITE_ENGINE_FLAGS.enableSupervisorLayer && blackboard?.recoveryMode && criticBacktrackUrl) {
+                  this.metrics.supervisorHardBacktrackCount++;
+                  logger.info('[SUPERVISOR] Critic rejected in recovery — backtracking', {
+                    url: criticBacktrackUrl,
+                  });
+                  return {
+                    success: true,
+                    decision: {
+                      thought: `[SUPERVISOR] Critic rejected in recovery — backtracking to ${criticBacktrackUrl}`,
+                      command: { action: 'goto', url: criticBacktrackUrl },
+                    },
+                    debug: {
+                      observerCacheHit,
+                      actorDeterministic: true,
+                      observerMs,
+                      strategistMs,
+                      actorMs,
+                      criticMs,
+                      totalMs: Date.now() - totalStart,
+                      supervisorHardBacktrack: true,
+                      supervisorRecoveryMode: true,
+                    },
+                  };
+                }
+
                 logger.warn('[MULTI_AGENT] Critic rejected and no safe alternatives (including re-strategize), falling back to monolithic');
                 // Record failed action in working memory
                 if (LITE_ENGINE_FLAGS.enableWorkingMemory && action?.command?.ref && action.command.action === 'fill') {
@@ -814,6 +1005,21 @@ export class MultiAgentOrchestrator {
         case 'skipped': this.metrics.criticSkippedCount++; break;
       }
 
+      // ═══════════════════════════════════════════════════════════════════════
+      // Supervisor: Record action and observer output for Tier 2 context
+      // ═══════════════════════════════════════════════════════════════════════
+      if (LITE_ENGINE_FLAGS.enableSupervisorLayer) {
+        this.supervisor.recordAction(action.command);
+        if (observation) {
+          this.supervisor.recordObserverOutput(
+            `pageType=${observation.pageType} obstacles=[${observation.obstacles.join(',')}] error=${observation.errorState || 'none'}`,
+          );
+        }
+        if (!blackboard?.recoveryMode && input.progressScore > 0.1) {
+          this.supervisor.resetOnProgress(input.progressScore);
+        }
+      }
+
       logger.info('[MULTI_AGENT] Pipeline complete', {
         observerCacheHit,
         actorDeterministic,
@@ -831,6 +1037,7 @@ export class MultiAgentOrchestrator {
         usedAlternative: usedHypothesisIndex > 0,
         reStrategized,
         circuitState: this.circuitState,
+        supervisorRecoveryMode: blackboard?.recoveryMode,
       });
 
       return {
@@ -861,6 +1068,8 @@ export class MultiAgentOrchestrator {
           criticSkippedLowRisk: criticSkippedLowRisk || undefined,
           criticOverrideApplied: criticOverrideApplied || undefined,
           reStrategized: reStrategized || undefined,
+          supervisorRecoveryMode: blackboard?.recoveryMode || undefined,
+          supervisorTier: blackboard?.recoveryTier,
         },
       };
     } catch (error) {

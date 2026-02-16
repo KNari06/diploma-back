@@ -116,11 +116,24 @@ CONTEXT: User has provided login credentials. When analyzing available actions:
       return parts.length > 0 ? '\n' + parts.join('\n') + '\n' : '';
     })();
 
+    // Supervisor: Recovery mode prompt injection
+    const recoverySection = input.blackboard?.recoveryMode
+      ? `
+⚠️ RECOVERY MODE (Tier ${input.blackboard.recoveryTier}): Agent is STUCK. Focus on OBSTACLES first:
+- Disabled buttons, invisible overlays, error messages, session warnings
+- Navigation links to go BACK to a working page
+- Form validation errors, hidden required fields
+${input.blackboard.currentBlocker ? `Known blocker: ${input.blackboard.currentBlocker}` : ''}
+${input.blackboard.aiDiagnosis ? `AI Diagnosis: ${input.blackboard.aiDiagnosis}` : ''}
+Report obstacles as FIRST priority in your response.
+`
+      : '';
+
     return `You are a Page Observer (Manus-style). Analyze the page and score changes by IMPACT.
 
 URL: ${input.url}
 Title: ${input.title}
-${goalContext}${credentialContext}
+${goalContext}${credentialContext}${recoverySection}
 CURRENT PAGE SNAPSHOT:
 ${input.snapshot}
 ${visualDiffSection}${driftSection}${networkSection}${visionSection}${expectationSection}${loadingSection}${metadataSection}${structureSection}

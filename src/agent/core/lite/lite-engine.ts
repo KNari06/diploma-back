@@ -134,6 +134,10 @@ export class LiteEngine {
   private multiAgentOrchestrator: MultiAgentOrchestrator | null = null;
   // Manus-style: Store previous snapshot for spatial diff
   private previousFormattedSnapshot: string | null = null;
+  /** Last iteration's console/network errors for Supervisor blocker detection */
+  private lastConsoleErrors: string[] = [];
+  private lastNetworkErrors: import('./collectors/network-tracker').NetworkError[] = [];
+  private lastValidationErrors: import('./lite-types').NetworkValidationError[] = [];
   // Store previous snapshot for state drift auditor (lost-field detection needs real elements)
   private lastSnapshotForAuditor: LiteSnapshot | null = null;
   // Manus-style: Store last expectedOutcome for expectation validation loop
@@ -2159,6 +2163,17 @@ export class LiteEngine {
             transientState: snapshotBefore.transientState,
             pageMetadata: snapshotBefore.metadata,
             pageStructure: snapshotBefore.pageStructure,
+            // Goal URL for wrong-page detection and recovery
+            goalUrl: this.config.url,
+            // Consecutive critic rejections for stuck detection in orchestrator
+            consecutiveCriticRejections: this.multiAgentOrchestrator?.getConsecutiveCriticRejections() ?? 0,
+            // Supervisor: loop signals from state-drift-auditor
+            loopDetected: auditedDrift?.repetition?.loopDetected || false,
+            loopDescription: auditedDrift?.repetition?.loopDescription,
+            // Supervisor: console/network errors from last action for blocker detection
+            recentConsoleErrors: this.lastConsoleErrors.length > 0 ? this.lastConsoleErrors.slice(-5) : undefined,
+            recentNetworkErrors: this.lastNetworkErrors.length > 0 ? this.lastNetworkErrors.slice(-3) : undefined,
+            recentValidationErrors: this.lastValidationErrors.length > 0 ? this.lastValidationErrors.slice(-3) : undefined,
           } : undefined;
           decision = await this.getAIDecision(prompt, i, iterationSpanId, snapshotBefore, multiAgentCtx);
 
@@ -2826,6 +2841,11 @@ export class LiteEngine {
         const successfulResponses = this.networkTracker.getSuccessfulResponsesSince(execResult.startTime);
         const validationErrors = this.networkTracker.getValidationErrorsSince(execResult.startTime);
 
+        // Store for Supervisor blocker detection (available next iteration)
+        this.lastConsoleErrors = consoleErrors;
+        this.lastNetworkErrors = networkErrors;
+        this.lastValidationErrors = validationErrors;
+
         // 9a. Collect UI errors (Pro-grade)
         const uiErrors = await ErrorCollector.collectUIErrors(this.page, i);
 
@@ -3021,7 +3041,8 @@ export class LiteEngine {
           diff,
           execResult.error,
           snapshotBefore.elements.length,
-          snapshotAfter.elements.length
+          snapshotAfter.elements.length,
+          decision.command.action
         );
 
         // ═══════════════════════════════════════════════════════════════════════

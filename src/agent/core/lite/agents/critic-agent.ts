@@ -64,6 +64,11 @@ export class CriticAgent {
       policyViolations.push(...visualConflictViolations);
     }
 
+    // 1e. Supervisor forbidden action check (recovery mode only)
+    if (LITE_ENGINE_FLAGS.enableSupervisorLayer) {
+      policyViolations.push(...CriticAgent.checkForbiddenActions(input));
+    }
+
     // If critical policy violation found, reject immediately (no AI call needed)
     const blockingViolations = policyViolations.filter(v => v.severity === 'block');
     if (blockingViolations.length > 0) {
@@ -172,7 +177,53 @@ export class CriticAgent {
       const visualViolations = CriticAgent.checkVisualConflicts(input);
       if (visualViolations.some(v => v.severity === 'block')) return false;
     }
+    // Supervisor forbidden action check
+    if (LITE_ENGINE_FLAGS.enableSupervisorLayer) {
+      if (CriticAgent.checkForbiddenActions(input).some(v => v.severity === 'block')) return false;
+    }
     return true;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Supervisor: Forbidden Action Enforcement
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Check if proposed action is forbidden by Supervisor during recovery mode.
+   * Returns blocking violations for actions that were tried in recent iterations.
+   * Zero AI cost, <1ms.
+   */
+  static checkForbiddenActions(input: CriticInput): PolicyViolation[] {
+    if (!input.blackboard?.recoveryMode || !input.blackboard.forbiddenActions.length) return [];
+    const violations: PolicyViolation[] = [];
+    const proposed = input.proposedCommand;
+
+    for (const forbidden of input.blackboard.forbiddenActions) {
+      // Exact match: same action + same ref
+      if (forbidden.action === proposed.action && forbidden.ref && forbidden.ref === proposed.ref) {
+        violations.push({
+          type: 'unsafe_action',
+          description: `SUPERVISOR: ${proposed.action}(${proposed.ref}) forbidden — attempted in recent iterations`,
+          severity: 'block',
+        });
+        break;
+      }
+      // Goto URL match (normalize proposed URL to match supervisor's normalization)
+      if (forbidden.action === 'goto' && proposed.action === 'goto' &&
+          forbidden.url && proposed.url) {
+        let normalizedProposed = proposed.url;
+        try { const u = new URL(proposed.url); normalizedProposed = u.origin + u.pathname; } catch { /* keep raw */ }
+        if (forbidden.url === normalizedProposed) {
+          violations.push({
+            type: 'unsafe_action',
+            description: `SUPERVISOR: goto("${proposed.url}") forbidden — already attempted`,
+            severity: 'block',
+          });
+          break;
+        }
+      }
+    }
+    return violations;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -203,13 +254,15 @@ export class CriticAgent {
     if (input.proposedCommand.action === 'fill' && input.proposedCommand.isSensitive && input.formAnalysis) {
       const targetField = input.formAnalysis.fields.find(f => f.ref === input.proposedCommand.ref);
       if (targetField && targetField.type === 'text') {
-        // Check if it's labeled as password — sometimes type="text" is used with visibility toggle
-        const isLikelyPasswordField = /password|passwd|secret/i.test(targetField.label);
+        // Many modern forms use type="text" with JS visibility toggles ("show/hide password")
+        // Check label, name, placeholder, and nearby context for password-related hints
+        const fieldContext = `${targetField.label} ${(targetField as any).name || ''} ${(targetField as any).placeholder || ''}`.toLowerCase();
+        const isLikelyPasswordField = /password|passwd|secret|пароль|парол|құпия/i.test(fieldContext);
         if (!isLikelyPasswordField) {
           violations.push({
             type: 'password_exposure',
             description: `Filling sensitive data into type="text" field "${targetField.label}" (ref: ${targetField.ref}). Expected type="password"`,
-            severity: 'block',
+            severity: 'warn',
           });
         }
       }
@@ -270,8 +323,9 @@ export class CriticAgent {
     }
 
     // Policy 5: Clicking "Forgot Password" / "Reset Password" when credentials are provided
+    // Warn only — not block. Agent may need forgot password for legitimate test scenarios
+    // (e.g., testing password reset flow, credentials failed, etc.)
     if (input.hasCredentials && input.proposedCommand.action === 'click' && input.proposedCommand.ref) {
-      // Check if the target element text matches forgot/reset password patterns
       const refEscaped = input.proposedCommand.ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const refPattern = new RegExp(`\\b${refEscaped}\\b[^\\n]*`, 'i');
       const elementLine = input.availableElements.match(refPattern)?.[0] || '';
@@ -279,8 +333,8 @@ export class CriticAgent {
       if (isForgotPassword) {
         violations.push({
           type: 'unsafe_action',
-          description: 'Clicking password reset/forgot link when credentials are provided. Should fill login form instead.',
-          severity: 'block',
+          description: 'Clicking password reset/forgot link when credentials are provided. Consider filling login form first.',
+          severity: 'warn',
         });
       }
     }

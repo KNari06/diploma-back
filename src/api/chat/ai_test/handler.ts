@@ -204,6 +204,39 @@ function extractCredentialsFromMessage(message: string): { email?: string; usern
     };
   }
 
+  // Pattern 5: Unquoted key: value pairs (login: user@mail.com, password: 123)
+  // Handles: (login: kasper_admin@juz40.kz, password: 123qwe123)
+  // Handles: email: test@mail.com password: secret
+  // Runs LAST — quoted patterns (1-4) have priority to avoid false positives
+  const unquotedEmailPattern = /(?:email|login|username)\s*[:=]\s*([^\s,)"']+)/i;
+  const unquotedPhonePattern = /(?:phone|tel|mobile|телефон|номер)\s*[:=]\s*([^\s,)"']+)/i;
+  const unquotedPasswordPattern = /(?:password|pass|пароль)\s*[:=]\s*([^\s,)"']+)/i;
+
+  const uqEmailMatch = message.match(unquotedEmailPattern);
+  const uqPhoneMatch = message.match(unquotedPhonePattern);
+  const uqPasswordMatch = message.match(unquotedPasswordPattern);
+
+  if (uqPasswordMatch && (uqEmailMatch || uqPhoneMatch)) {
+    // Strip trailing punctuation that isn't part of credentials (e.g., period at end of sentence)
+    const stripTrailing = (v: string) => v.replace(/[.!?;:]+$/, '');
+    const passwordValue = stripTrailing(uqPasswordMatch[1]);
+    const result: { email?: string; username?: string; phone?: string; password: string } = { password: passwordValue };
+
+    if (uqPhoneMatch) {
+      result.phone = stripTrailing(uqPhoneMatch[1]);
+    }
+
+    if (uqEmailMatch) {
+      const loginValue = stripTrailing(uqEmailMatch[1]);
+      const type = classifyLoginValue(loginValue);
+      if (type === 'email') result.email = loginValue;
+      else if (type === 'phone' && !result.phone) result.phone = loginValue;
+      else result.username = loginValue;
+    }
+
+    return result;
+  }
+
   return null;
 }
 

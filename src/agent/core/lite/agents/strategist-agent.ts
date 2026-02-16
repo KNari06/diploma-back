@@ -187,13 +187,44 @@ export class StrategistAgent {
       ? `\nDRIFT AUDIT: confidence=${Math.round(input.auditedDrift.confidence.score * 100)}%, ${input.auditedDrift.attribution.summary}${input.auditedDrift.repetition.loopDetected ? ' | ⚠️ LOOP: ' + input.auditedDrift.repetition.loopDescription : ''}\n`
       : '';
 
-    const stuckSection = input.isStuck
-      ? '\n⚠️ AGENT IS STUCK. You MUST choose a fundamentally different approach. Do NOT repeat any previous strategy.\n'
-      : '';
+    // Wrong-page detection: if current URL diverged from goal URL and we're stuck or looping
+    let isOnWrongPage = false;
+    try {
+      isOnWrongPage = !!(input.goalUrl && input.currentUrl &&
+        new URL(input.currentUrl).pathname !== new URL(input.goalUrl).pathname);
+    } catch { /* invalid URL — treat as not on wrong page */ }
+    const loopDetected = input.auditedDrift?.repetition?.loopDetected;
+
+    let stuckSection = '';
+    if (input.isStuck && isOnWrongPage) {
+      stuckSection = `\n⚠️ AGENT IS STUCK on WRONG PAGE. Current: ${input.currentUrl} | Goal page: ${input.goalUrl}\nYou navigated away from the goal page. Use goto to return: { "action": "goto", "url": "${input.goalUrl}" } or click "Back" if available.\n`;
+    } else if (loopDetected && isOnWrongPage) {
+      stuckSection = `\n⚠️ NAVIGATION LOOP detected on wrong page. You keep revisiting the same pages without progress.\nReturn to goal page: ${input.goalUrl} using goto or a "Back" button.\n`;
+    } else if (input.isStuck) {
+      stuckSection = '\n⚠️ AGENT IS STUCK. You MUST choose a fundamentally different approach. Do NOT repeat any previous strategy.\n';
+    }
 
     const confidenceTrendSection = input.confidenceTrend === 'declining'
       ? '\n⚠️ LOW CONFIDENCE TREND: Your confidence has been below 0.4 for 2+ iterations. Consider a fundamentally different approach — current strategy path may be wrong.\n'
       : '';
+
+    // Supervisor: Recovery mode section with forbidden actions + blocker + AI diagnosis
+    let supervisorSection = '';
+    if (input.blackboard?.recoveryMode) {
+      const forbiddenList = input.blackboard.forbiddenActions
+        .map(fa => `- ${fa.action}${fa.ref ? `(${fa.ref})` : ''}${fa.url ? ` url="${fa.url}"` : ''}`)
+        .join('\n');
+
+      supervisorSection = `
+⚠️ SUPERVISOR RECOVERY MODE (Tier ${input.blackboard.recoveryTier}, intervention #${input.blackboard.interventionCount}):
+FORBIDDEN ACTIONS (Critic will BLOCK these — do NOT choose them):
+${forbiddenList || '(none yet)'}
+${input.blackboard.currentBlocker ? `BLOCKER DETECTED: ${input.blackboard.currentBlocker}` : ''}
+${input.blackboard.aiDiagnosis ? `AI DIAGNOSIS: ${input.blackboard.aiDiagnosis}` : ''}
+${input.blackboard.knownGoodUrls?.length ? `SAFE RETURN URL: ${input.blackboard.knownGoodUrls[0]}` : ''}
+You MUST choose a fundamentally different element/action. Forbidden actions will be REJECTED by the Critic.
+`;
+    }
 
     const criticFeedbackSection = input.criticFeedback
       ? `\n⚠️ CRITIC FEEDBACK: ${input.criticFeedback}\nYour previous strategy was REJECTED by the safety critic. You MUST propose a DIFFERENT approach that avoids this risk.\n`
@@ -269,8 +300,8 @@ export class StrategistAgent {
       : '';
 
     const credentialNegativeConstraints = input.hasCredentials
-      ? `- DO NOT click "Forgot Password", "Reset Password", or password recovery links — user provided credentials for direct login
-- DO NOT navigate away from the login/auth form — fill credential fields first (email/username → password → submit)
+      ? `- Prefer filling login form directly (email/username → password → submit) since credentials are provided
+- Avoid "Forgot Password" / "Reset Password" links unless login fails after filling all fields
 `
       : '';
 
@@ -322,7 +353,7 @@ Before choosing an action, consider its cost and risk:
 | press    | MEDIUM | MEDIUM | Keyboard shortcut. May trigger submit.   |
 | goto     | HIGH   | HIGH   | Navigate to new URL. Loses current page. |
 Prefer LOW-cost actions when multiple paths exist. Use HIGH-risk actions only when necessary.
-${planSection}${guidanceSection}${stuckSection}${confidenceTrendSection}${criticFeedbackSection}${failedActionsSection}${auditSection}
+${planSection}${guidanceSection}${stuckSection}${confidenceTrendSection}${supervisorSection}${criticFeedbackSection}${failedActionsSection}${auditSection}
 ═══ PROGRESS ═══
 Progress: ${Math.round(input.progressScore * 100)}% | Iteration: ${input.iteration}
 Last outcome: ${input.lastOutcome || 'none'}
@@ -331,7 +362,7 @@ Last outcome: ${input.lastOutcome || 'none'}
 ${rollingHistory}
 
 ═══ NEGATIVE CONSTRAINTS (NEVER violate these) ═══
-- Do NOT click external links that navigate away from the test domain
+- Avoid external links that leave the test domain unless required by the goal (e.g., OAuth login, federated auth)
 - Do NOT fill fields with random/garbage data — use realistic test values
 - Do NOT submit forms with empty required fields
 - Do NOT use goto when a link/button on the page achieves the same navigation

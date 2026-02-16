@@ -234,6 +234,26 @@ export const LITE_ENGINE_FLAGS = {
   enableCriticVisualCheck: true,
   /** Maximum elements in formatted snapshot (0 = unlimited). Prevents token explosion on heavy pages */
   snapshotMaxElements: 80,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SUPERVISOR LAYER (Manus Tiered Escalation)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable Supervisor layer */
+  enableSupervisorLayer: true,
+  /** State hash repeats to trigger Tier 1 recovery */
+  supervisorStateHashRepeatThreshold: 3,
+  /** Wrong-page iterations for hard backtrack */
+  supervisorWrongPageThreshold: 2,
+  /** Max Tier 1 interventions before escalation to Tier 2 */
+  supervisorMaxInterventions: 5,
+  /** Recent iterations for forbidden action window */
+  supervisorForbiddenActionWindow: 3,
+  /** Max element signatures in state hash */
+  supervisorStateHashElementCount: 20,
+  /** Enable Tier 2 AI diagnosis (gpt-4o-mini) when Tier 1 exhausted */
+  enableSupervisorTier2: true,
+  /** Timeout for Tier 2 AI call (ms) */
+  supervisorTier2TimeoutMs: 3000,
 } as const;
 
 /**

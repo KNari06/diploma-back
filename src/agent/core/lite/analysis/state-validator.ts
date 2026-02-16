@@ -22,7 +22,8 @@ export class StateValidator {
     diff: StateDiff,
     executionError?: string,
     elementCountBefore?: number,
-    elementCountAfter?: number
+    elementCountAfter?: number,
+    actionType?: string
   ): ActionOutcome {
     try {
       // 1. Execution error - action failed to execute
@@ -61,24 +62,47 @@ export class StateValidator {
         return 'critical_error';
       }
 
-      // 3. Validation error - new errors appeared after action
+      // 3. State changed - action was successful
+      // Checked BEFORE validation_error: if DOM changed, the action worked even if
+      // the page has background JS errors (unrelated console errors, analytics failures, etc.)
+      if (diff.hasVisualChange) {
+        if (diff.newPageErrors.length > 0 || diff.newConsoleErrors.length > 0) {
+          logger.debug('[STATE_VALIDATOR] State changed WITH errors (errors likely unrelated)', {
+            urlChanged: diff.urlChanged,
+            addedElements: diff.addedElements.length,
+            pageErrors: diff.newPageErrors.length,
+            consoleErrors: diff.newConsoleErrors.length,
+          });
+        } else {
+          logger.debug('[STATE_VALIDATOR] State changed - action successful', {
+            urlChanged: diff.urlChanged,
+            addedElements: diff.addedElements.length,
+            removedRefs: diff.removedRefs.length,
+            changedElements: diff.changedElements.length,
+          });
+        }
+        return 'state_changed';
+      }
+
+      // 3b. Fill/select actions always change state (input value) even when diff doesn't detect it
+      // The diff engine tracks DOM structure changes but not input value mutations.
+      // If fill/select executed without error, the field was filled — treat as state_changed.
+      if ((actionType === 'fill' || actionType === 'select') && !executionError) {
+        logger.debug('[STATE_VALIDATOR] Fill/select completed without error — treating as state_changed', {
+          actionType,
+          hasPageErrors: diff.newPageErrors.length > 0,
+        });
+        return 'state_changed';
+      }
+
+      // 4. Validation error - new errors appeared BUT no state change
+      // This means the action didn't work AND errors appeared (form validation failure, etc.)
       if (diff.newPageErrors.length > 0 || diff.newConsoleErrors.length > 0) {
-        logger.debug('[STATE_VALIDATOR] Validation errors detected', {
+        logger.debug('[STATE_VALIDATOR] Validation errors detected (no state change)', {
           pageErrors: diff.newPageErrors.length,
           consoleErrors: diff.newConsoleErrors.length,
         });
         return 'validation_error';
-      }
-
-      // 4. State changed - action was successful
-      if (diff.hasVisualChange) {
-        logger.debug('[STATE_VALIDATOR] State changed - action successful', {
-          urlChanged: diff.urlChanged,
-          addedElements: diff.addedElements.length,
-          removedRefs: diff.removedRefs.length,
-          changedElements: diff.changedElements.length,
-        });
-        return 'state_changed';
       }
 
       // 5. No effect - action executed but no visible state change

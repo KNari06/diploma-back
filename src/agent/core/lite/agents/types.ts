@@ -3,7 +3,8 @@
  * Shared interfaces for Observer, Strategist, and Actor agents
  */
 
-import type { AICommand, BlacklistedAction, StateDriftAuditResult, VisionHints } from '../lite-types';
+import type { AICommand, BlacklistedAction, NetworkValidationError, StateDriftAuditResult, VisionHints } from '../lite-types';
+import type { NetworkError } from '../collectors/network-tracker';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Observer Agent Types
@@ -162,6 +163,8 @@ export interface ObserverInput {
   pageMetadata?: { isDOMWeak: boolean; recommendVision: boolean; interactiveElementCount: number };
   /** Structured page data: tables, lists, pagination detected */
   pageStructure?: import('../lite-types').PageStructureMetadata;
+  /** Supervisor Blackboard — shared recovery context */
+  blackboard?: SupervisorBlackboard;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -231,6 +234,42 @@ export interface WorkingMemory {
   consecutiveExpectationMisses?: number;
   /** Last expectation mismatch description */
   lastExpectationMismatch?: string;
+}
+
+/** Supervisor Blackboard — shared reactive state visible to ALL agents.
+ *  Tier 1: computed deterministically (<5ms, zero AI).
+ *  Tier 2: AI diagnosis appended only when stuck 5+ iterations. */
+export interface SupervisorBlackboard {
+  /** All agents adjust behavior when true */
+  recoveryMode: boolean;
+  /** Tier of recovery: 1 = deterministic, 2 = AI-diagnosed */
+  recoveryTier: 0 | 1 | 2;
+  /** Detected blocker (Tier 1: regex pattern, Tier 2: AI-diagnosed semantic blocker) */
+  currentBlocker?: string;
+  /** Actions from last N iterations — BLOCKED by Critic in recovery mode */
+  forbiddenActions: Array<{ action: string; ref?: string; url?: string }>;
+  /** Stack of last 3 URLs where meaningful progress was made (most recent first) */
+  knownGoodUrls: string[];
+  /** Backtrack failures on current knownGoodUrl (pop to next after 2 failures) */
+  backtrackFailures: number;
+  /** Consecutive Supervisor interventions (resets on progress) */
+  interventionCount: number;
+  /** State hash for loop detection */
+  stateHash: string;
+  /** Consecutive state hash repeats */
+  stateHashRepeatCount: number;
+  /** Force goto(knownGoodUrl), skip entire pipeline */
+  hardBacktrack: boolean;
+  /** Consecutive iterations on wrong page */
+  wrongPageCount: number;
+  /** Tier 2 AI diagnosis: suggested recovery strategy (only when tier=2) */
+  aiDiagnosis?: string;
+  /** Tier 2 mandatory action override — Orchestrator skips Strategist+Actor and executes this directly */
+  mandatoryAction?: { action: string; ref?: string; value?: string; url?: string };
+  /** Jaccard similarity between current and previous element signature sets (0–1) */
+  jaccardSimilarity: number;
+  /** Consecutive iterations with high Jaccard similarity (soft loop indicator) */
+  softLoopCount: number;
 }
 
 /** Accumulated context for monolithic fallback — don't lose knowledge */
@@ -319,6 +358,10 @@ export interface StrategistInput {
   overlapContext?: ObserverOutput['overlapInfo'];
   /** Recent confidence trend — 'declining' if last 2 iterations had confidence < 0.4 */
   confidenceTrend?: 'stable' | 'declining';
+  /** Original goal URL — for wrong-page detection and recovery */
+  goalUrl?: string;
+  /** Supervisor Blackboard — shared recovery context */
+  blackboard?: SupervisorBlackboard;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -425,6 +468,8 @@ export interface CriticInput {
   isPageLoading?: boolean;
   /** Refs of elements currently covered by overlays */
   coveredElements?: string[];
+  /** Supervisor Blackboard — shared recovery context */
+  blackboard?: SupervisorBlackboard;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -486,6 +531,20 @@ export interface MultiAgentInput {
   pageMetadata?: { isDOMWeak: boolean; recommendVision: boolean; interactiveElementCount: number };
   /** Page structure (tables, lists, pagination) from snapshot */
   pageStructure?: import('../lite-types').PageStructureMetadata;
+  /** Original goal URL — for wrong-page detection and recovery */
+  goalUrl?: string;
+  /** Number of consecutive critic rejections (from orchestrator) */
+  consecutiveCriticRejections?: number;
+  /** Loop detected by state-drift-auditor */
+  loopDetected?: boolean;
+  /** Loop description */
+  loopDescription?: string;
+  /** Recent console errors (last action) — for Supervisor blocker detection */
+  recentConsoleErrors?: string[];
+  /** Recent network errors (last action) — for Supervisor blocker detection */
+  recentNetworkErrors?: NetworkError[];
+  /** Recent API validation errors (last action) — for Supervisor blocker detection */
+  recentValidationErrors?: NetworkValidationError[];
 }
 
 /** Run-level metrics accumulated across all iterations for A/B comparison */
@@ -526,6 +585,14 @@ export interface MultiAgentRunMetrics {
   criticOverrideAppliedCount: number;
   /** Times re-strategize was attempted after critic rejection */
   reStrategizeCount: number;
+
+  // Supervisor
+  /** Times Supervisor triggered recovery mode */
+  supervisorRecoveryModeCount: number;
+  /** Times Supervisor forced hard backtrack */
+  supervisorHardBacktrackCount: number;
+  /** Times Supervisor Tier 2 AI diagnosis was invoked */
+  supervisorTier2Count: number;
 
   // Computed (for convenience)
   avgPipelineMs: number;
@@ -578,6 +645,12 @@ export interface MultiAgentResult {
     criticOverrideApplied?: boolean;
     /** Whether re-strategize was attempted after critic rejection */
     reStrategized?: boolean;
+    /** Whether Supervisor triggered recovery mode */
+    supervisorRecoveryMode?: boolean;
+    /** Whether Supervisor forced hard backtrack */
+    supervisorHardBacktrack?: boolean;
+    /** Supervisor recovery tier (0=none, 1=deterministic, 2=AI) */
+    supervisorTier?: 0 | 1 | 2;
   };
   /** Action rejected by Critic (for blacklist recording by caller) */
   rejectedAction?: {
