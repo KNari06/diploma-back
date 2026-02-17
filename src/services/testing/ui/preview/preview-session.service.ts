@@ -778,9 +778,10 @@ export class PreviewSessionService {
         return { success: false, error: 'Invalid wheel delta' };
       }
 
-      // Prevent extreme values (accidental or abuse)
-      const safeDeltaX = Math.max(-2000, Math.min(2000, deltaX));
-      const safeDeltaY = Math.max(-2000, Math.min(2000, deltaY));
+      // Apply scroll sensitivity multiplier and prevent extreme values
+      const SCROLL_SENSITIVITY = 1.8;
+      const safeDeltaX = Math.max(-2000, Math.min(2000, deltaX * SCROLL_SENSITIVITY));
+      const safeDeltaY = Math.max(-2000, Math.min(2000, deltaY * SCROLL_SENSITIVITY));
 
       await session.page.mouse.wheel(safeDeltaX, safeDeltaY);
       return { success: true };

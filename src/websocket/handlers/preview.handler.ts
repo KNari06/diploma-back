@@ -122,9 +122,9 @@ const RATE_LIMITS = {
   apply: { max: 10, windowMs: 10000 },    // 10 apply requests per 10s
   subscribe: { max: 5, windowMs: 10000 }, // 5 subscribes per 10s
   mouse: { max: 100, windowMs: 10000 },   // 100 mouse events per 10s
-  // Typing can be bursty (frontend may send frequent keyboard:type updates),
+  // Typing can be bursty (frontend sends per-keystroke type/press events),
   // so keep this high enough to avoid UX throttling while still preventing abuse.
-  keyboard: { max: 300, windowMs: 10000 }, // 300 keyboard events per 10s
+  keyboard: { max: 600, windowMs: 10000 }, // 600 keyboard events per 10s
   pageAction: { max: 5, windowMs: 10000 }, // 5 refresh/reset per 10s
 };
 
