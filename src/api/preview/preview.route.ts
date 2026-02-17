@@ -13,6 +13,7 @@ import {
   deleteIntentTestCase,
   getIntentTestCase,
   listIntentTestCases,
+  runFromJiraViaChat,
   runIntentTestCase,
   startPreview,
   stopPreview,
@@ -592,6 +593,12 @@ router.post('/stop', requireAuth, stopPreview);
  *         description: Test case created
  */
 router.post('/intent-test-cases', requireAuth, createIntentTestCase);
+
+/**
+ * Run Jira ticket via the same chat handler flow.
+ * message = ticket.summary + ticket.description
+ */
+router.post('/intent-test-cases/from-jira', requireAuth, runFromJiraViaChat);
 
 /**
  * @swagger
