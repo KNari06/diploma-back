@@ -69,7 +69,7 @@ const AMBIGUOUS_SIMILARITY_DELTA = 0.05;
 const ACTION_TO_TAGS: Record<string, string[]> = {
   type: ['input', 'textarea'],
   click: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'summary', 'nav', 'header', 'footer', 'section', 'article'],
-  select: ['select', 'div', 'span', 'button', 'ul', 'input'],
+  select: ['select'],
   check: ['input'],
   uncheck: ['input'],
   toggle: ['input', 'button', 'div', 'span'],
@@ -109,6 +109,21 @@ const SELECT_ALLOWED_ROLES = new Set([
   'option',
   'menu',
   'menuitem',
+]);
+
+/**
+ * Tags that can serve as custom dropdown triggers (soft-allowed for select action).
+ * Many modern frameworks render dropdowns as <button>, <div>, <span>, or <input>
+ * without any ARIA roles. These are allowed as soft candidates so the embeddings
+ * model can decide via semantic matching.
+ */
+const SELECT_SOFT_TAGS = new Set([
+  'button',
+  'div',
+  'span',
+  'input',
+  'a',
+  'li',
 ]);
 
 /** Actions that require writable state (not readonly) */
@@ -452,12 +467,21 @@ export async function buildAllowedSets(
 
         // P1 FIX: Role-based allowlist for click actions
         // Elements with interactive ARIA roles should be allowed regardless of tag
+        // For select: also allow elements with aria-expanded (dropdown triggers without explicit ARIA role)
+        const isDropdownLike = actionType === 'select' && node.ariaExpanded !== undefined;
         const roleMatches =
           (actionType === 'click' && node.role && CLICK_ALLOWED_ROLES.has(node.role)) ||
-          (actionType === 'select' && node.role && SELECT_ALLOWED_ROLES.has(node.role));
+          (actionType === 'select' && (
+            (node.role && SELECT_ALLOWED_ROLES.has(node.role)) || isDropdownLike
+          ));
+
+        // For select action: soft-allow common interactive tags as potential custom dropdown triggers.
+        // Many modern frameworks render dropdowns as <button>/<div>/<span> without ARIA roles.
+        const isSelectSoftTag = actionType === 'select' && !tagMatches && !roleMatches
+          && SELECT_SOFT_TAGS.has(node.tag.toLowerCase());
 
         // Exception: allow non-standard textbox components for type as SoftAllowed.
-        if (!tagMatches && !isNonStandardTextbox && !roleMatches) {
+        if (!tagMatches && !isNonStandardTextbox && !roleMatches && !isSelectSoftTag) {
           excluded = true;
           nodeRules.push({
             ruleId: 'tag.incompatible',
@@ -484,14 +508,25 @@ export async function buildAllowedSets(
             evidence: `tag=${node.tag} allowed via role=${node.role} for click`,
             affectedRefs: [node.ref],
           });
-        } else if (roleMatches && !tagMatches && actionType === 'select') {
-          // Custom dropdown via ARIA role: soft-allow (prefer native <select>)
+        } else if ((roleMatches || isDropdownLike) && !tagMatches && actionType === 'select') {
+          // Custom dropdown via ARIA role or aria-expanded: soft-allow (prefer native <select>)
           isSoft = true;
           nodeRules.push({
             ruleId: 'structure.custom_dropdown',
             version: 'v1',
             action: 'penalize',
-            evidence: `tag=${node.tag}, role=${node.role} allowed as soft candidate for select via ARIA role`,
+            evidence: `tag=${node.tag}, role=${node.role || 'none'}, ariaExpanded=${node.ariaExpanded} allowed as soft candidate for select`,
+            affectedRefs: [node.ref],
+          });
+        } else if (isSelectSoftTag) {
+          // Custom dropdown trigger without ARIA: soft-allow with heavier penalty
+          // Embeddings model will decide via semantic matching
+          isSoft = true;
+          nodeRules.push({
+            ruleId: 'structure.custom_dropdown_trigger',
+            version: 'v1',
+            action: 'penalize',
+            evidence: `tag=${node.tag} soft-allowed as potential custom dropdown trigger for select (no ARIA role)`,
             affectedRefs: [node.ref],
           });
         }

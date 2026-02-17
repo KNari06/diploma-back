@@ -76,7 +76,7 @@ function getProviderForTask(task: AITask, override?: AIProvider): AIProvider {
  */
 function getDefaultModel(provider: AIProvider, task: AITask): string {
   if (provider === 'gemini') {
-    return task === 'fast' ? 'gemini-1.5-flash' : 'gemini-1.5-pro';
+    return task === 'fast' ? 'gemini-1.5-flash-latest' : 'gemini-1.5-pro';
   } else {
     return task === 'fast' ? 'gpt-4o-mini' : (env.OPENAI_MODEL || 'gpt-4o');
   }

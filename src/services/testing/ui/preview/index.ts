@@ -31,3 +31,4 @@ export {
   fetchHtml,
   fetchAccessibility,
 } from './preview-devtools-collector.service';
+export { RecordingCaptureService } from './recording-capture.service';

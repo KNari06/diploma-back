@@ -357,6 +357,88 @@ async function ensureStability(
 }
 
 /**
+ * Custom dropdown select: click trigger → find visible option → click option.
+ *
+ * Strategy chain (most precise → broadest):
+ * 1. Scoped: find ARIA listbox/menu container, search option inside it
+ *    — Prevents clicking same-text elements elsewhere on the page
+ * 2. Page-level getByRole('option'/'menuitem') — ARIA-compliant; auto-filters hidden
+ *    — Handles portaled menus (React Portal, MUI Popper) rendered outside DOM tree
+ * 3. Page-level getByText + :visible — universal fallback for non-ARIA dropdowns
+ */
+async function selectFromCustomDropdown(
+  page: Page,
+  triggerLocator: Locator,
+  value: string,
+  timeout: number
+): Promise<void> {
+  // Click the trigger to open the dropdown
+  await triggerLocator.click({ timeout });
+  await page.waitForTimeout(300);
+
+  // Phase 1: Try scoped search inside a visible ARIA container (listbox/menu)
+  // This is the safest approach — avoids clicking same-text elements elsewhere
+  const containers = [
+    page.locator('[role="listbox"]:visible'),
+    page.locator('[role="menu"]:visible'),
+  ];
+
+  for (const container of containers) {
+    try {
+      const isVisible = await container.first().isVisible().catch(() => false);
+      if (!isVisible) continue;
+
+      // Search for option inside this container
+      const scopedOpt = container.first().getByText(value, { exact: true }).first();
+      await scopedOpt.waitFor({ state: 'visible', timeout: 2000 });
+      await scopedOpt.click({ timeout: 2000 });
+      return;
+    } catch {
+      // Container exists but option not found inside — try next
+    }
+  }
+
+  // Phase 2: Page-level ARIA role search (handles portals where container is outside DOM tree)
+  const roleStrategies = [
+    page.getByRole('option', { name: value, exact: true }),
+    page.getByRole('menuitem', { name: value, exact: true }),
+    page.getByRole('option', { name: value, exact: false }),
+    page.getByRole('menuitem', { name: value, exact: false }),
+  ];
+
+  for (const strategy of roleStrategies) {
+    try {
+      const opt = strategy.first();
+      await opt.waitFor({ state: 'visible', timeout: 2000 });
+      await opt.click({ timeout: 2000 });
+      return;
+    } catch {
+      // Try next
+    }
+  }
+
+  // Phase 3: Universal text fallback (non-ARIA dropdowns)
+  // getByText matches hidden elements too, so we filter with :visible
+  const textStrategies = [
+    page.getByText(value, { exact: true }).and(page.locator(':visible')),
+    page.getByText(value, { exact: false }).and(page.locator(':visible')),
+  ];
+
+  for (const strategy of textStrategies) {
+    try {
+      const opt = strategy.first();
+      await opt.waitFor({ state: 'visible', timeout: 2000 });
+      await opt.click({ timeout: 2000 });
+      return;
+    } catch {
+      // Try next
+    }
+  }
+
+  throw new Error(`Could not find option "${value}" in dropdown`);
+}
+
+/**
  * Execute an action on the page
  * V7: Optionally accepts a pre-resolved locator (from compiled plan)
  */
@@ -472,30 +554,7 @@ async function executeAction(
           // Native <select>: use Playwright's selectOption
           await locator.selectOption(selectValue, { timeout });
         } else {
-          // Custom dropdown: click to open, find option by text, click option
-          await locator.click({ timeout });
-
-          // Search for the option across common custom dropdown patterns
-          // Uses page-level search to handle portal-rendered menus (MUI, Ant Design, etc.)
-          const optionLocator = page.locator(
-            [
-              // WAI-ARIA standard patterns
-              `[role="option"]:has-text("${selectValue}")`,
-              `[role="menuitem"]:has-text("${selectValue}")`,
-              `[role="listbox"] >> text="${selectValue}"`,
-              `[role="menu"] >> text="${selectValue}"`,
-              // Framework-specific patterns (MUI, Ant Design, React Select)
-              `.MuiMenuItem-root:has-text("${selectValue}")`,
-              `.ant-select-item-option:has-text("${selectValue}")`,
-              `[class*="option"]:has-text("${selectValue}")`,
-              // Bootstrap + generic HTML patterns
-              `.dropdown-item:has-text("${selectValue}")`,
-              `li:has-text("${selectValue}")`,
-            ].join(', ')
-          ).first();
-
-          await optionLocator.waitFor({ state: 'visible', timeout });
-          await optionLocator.click({ timeout });
+          await selectFromCustomDropdown(page, locator, selectValue, timeout);
         }
         break;
       }

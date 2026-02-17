@@ -37,6 +37,10 @@ export interface ClientToServerEvents {
   'preview:keyboard:type': (data: PreviewKeyboardTypeRequest) => void;
   'preview:keyboard:press': (data: PreviewKeyboardPressRequest) => void;
 
+  // Preview recording
+  'preview:recording:start': (data: PreviewRecordingRequest) => void;
+  'preview:recording:stop': (data: PreviewRecordingRequest) => void;
+
   // Preview page actions (refresh, reset)
   'preview:page:refresh': (data: { previewSessionId: string }) => void;
   'preview:page:reset': (data: { previewSessionId: string }) => void;
@@ -126,6 +130,10 @@ export interface ServerToClientEvents {
   'preview:html:update': (data: PreviewHtmlUpdatePayload) => void;
   'preview:accessibility:update': (data: PreviewAccessibilityUpdatePayload) => void;
   'preview:context:update': (data: PreviewContextUpdatePayload) => void;
+
+  // Preview recording events
+  'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
+  'preview:recording:state': (data: PreviewRecordingStatePayload) => void;
 
   // Preview interactive control responses
   'preview:viewport': (data: PreviewViewportPayload) => void;
@@ -1013,6 +1021,39 @@ export interface PreviewRunCompletedPayload {
   skippedSteps: number;
   cancelled?: boolean;
   duration: number; // ms
+  timestamp: string;
+}
+
+// ============================================================================
+// PREVIEW RECORDING PAYLOADS
+// ============================================================================
+
+/**
+ * Recording start/stop request (client -> server)
+ */
+export interface PreviewRecordingRequest {
+  previewSessionId: string;
+}
+
+/**
+ * Recording step payload (server -> client)
+ * Emitted each time a user interaction is captured as an IntentStep
+ */
+export interface PreviewRecordingStepPayload {
+  previewSessionId: string;
+  step: PreviewIntentStep;
+  /** Bounding box for transient highlight on the recorded element */
+  highlight?: PreviewBoundingBox;
+  timestamp: string;
+}
+
+/**
+ * Recording state payload (server -> client)
+ * Emitted on recording start/stop to confirm state
+ */
+export interface PreviewRecordingStatePayload {
+  previewSessionId: string;
+  recording: boolean;
   timestamp: string;
 }
 

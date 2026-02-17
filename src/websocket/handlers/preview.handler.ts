@@ -34,6 +34,18 @@ type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, So
 const previewSubscriptions = new Map<string, Set<string>>();
 
 // ═══════════════════════════════════════════════════════════════════════════
+// RECORDING: Module-level state
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Per-session typing debounce timers */
+const recordingTypingTimers = new Map<string, NodeJS.Timeout>();
+const RECORDING_TYPING_DEBOUNCE_MS = 1500;
+
+/** Per-session scroll debounce timers */
+const recordingScrollTimers = new Map<string, { deltaY: number; timer: NodeJS.Timeout }>();
+const RECORDING_SCROLL_DEBOUNCE_MS = 500;
+
+// ═══════════════════════════════════════════════════════════════════════════
 // V7: Video + DevTools streaming registry
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -933,6 +945,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             const { getPreviewSessionService, getPreviewVideoStreamRegistry } =
               await import('@/services/testing/ui/preview');
             const sessionService = getPreviewSessionService();
+
+            // V9: Update recording URL baseline after step:apply (prevents false nav steps)
+            if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+              const page = sessionService.getPage(previewSessionId, ensuredUserId);
+              if (page) {
+                sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
+              }
+            }
+
             const snapshot = await sessionService.getSnapshot(previewSessionId, ensuredUserId, {
               force: true,
               includeDomNodes: true, // Always include after action
@@ -1065,6 +1086,23 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
+      // V9: Pre-click probe for recording (state-aware: need element state BEFORE click)
+      let preClickElement: Awaited<ReturnType<typeof import('@/services/testing/ui/preview/recording-capture.service').RecordingCaptureService.probeForRecording>> = null;
+      const isRecording = sessionService.isRecording(previewSessionId, ensuredUserId);
+      if (isRecording) {
+        try {
+          const { RecordingCaptureService } = await import(
+            '@/services/testing/ui/preview/recording-capture.service'
+          );
+          const page = sessionService.getPage(previewSessionId, ensuredUserId);
+          if (page) {
+            preClickElement = await RecordingCaptureService.probeForRecording(page, x, y);
+          }
+        } catch {
+          // Non-critical — recording probe failure doesn't block click
+        }
+      }
+
       const result = await sessionService.executeMouseAction({
         sessionId: previewSessionId,
         userId: ensuredUserId,
@@ -1080,6 +1118,74 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         if (result.needsSnapshot) {
           // Always emit snapshot after click so user always sees visual feedback
           setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        }
+
+        // V9: Recording hook (non-blocking)
+        if (isRecording && preClickElement) {
+          setImmediate(async () => {
+            try {
+              const { RecordingCaptureService } = await import(
+                '@/services/testing/ui/preview/recording-capture.service'
+              );
+              const room = createRoomName('preview', previewSessionId);
+
+              // Flush pending typing buffer (user clicked elsewhere)
+              const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+              if (buffer) {
+                const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
+                if (typingStep) {
+                  socket.nsp.to(room).emit('preview:recording:step', {
+                    previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
+                  });
+                }
+                sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
+                const timer = recordingTypingTimers.get(previewSessionId);
+                if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
+              }
+
+              // Build step from pre-click element state
+              const actionType = RecordingCaptureService.inferClickActionType(preClickElement!);
+              const description = RecordingCaptureService.buildDescription(actionType, preClickElement!);
+              const bindingHints = RecordingCaptureService.buildBindingHints(preClickElement!);
+
+              const step: PreviewIntentStep = {
+                id: `rec_${Date.now().toString(36)}`,
+                type: actionType,
+                description,
+                bindingHints: Object.keys(bindingHints).length > 0 ? bindingHints : undefined,
+              };
+
+              socket.nsp.to(room).emit('preview:recording:step', {
+                previewSessionId,
+                step,
+                highlight: preClickElement?.boundingBox,
+                timestamp: new Date().toISOString(),
+              });
+
+              // Check for navigation (wait a bit for page to settle)
+              const page = sessionService.getPage(previewSessionId, ensuredUserId);
+              if (page) {
+                await page.waitForLoadState('domcontentloaded', { timeout: 500 }).catch(() => {});
+                const currentUrl = page.url();
+                const prevUrl = sessionService.getRecordingLastUrl(previewSessionId, ensuredUserId);
+                if (prevUrl && currentUrl !== prevUrl) {
+                  const navStep = RecordingCaptureService.captureNavigation(currentUrl, prevUrl);
+                  if (navStep) {
+                    socket.nsp.to(room).emit('preview:recording:step', {
+                      previewSessionId,
+                      step: navStep,
+                      timestamp: new Date().toISOString(),
+                    });
+                  }
+                  sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, currentUrl);
+                }
+              }
+            } catch (e) {
+              logger.debug('[RECORDING] Click capture failed', {
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          });
         }
       } else {
         emitInputError(socket, previewSessionId, 'click', result.error || 'Click failed');
@@ -1229,6 +1335,38 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         emitInputSuccess(socket, previewSessionId, 'wheel');
         // Scroll may reveal lazy-loaded content – always emit for visual feedback
         setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+
+        // V9: Recording hook — debounced scroll step
+        if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+          const existing = recordingScrollTimers.get(previewSessionId);
+          const accumulatedDeltaY = (existing?.deltaY ?? 0) + (data.deltaY ?? 0);
+          if (existing) clearTimeout(existing.timer);
+
+          recordingScrollTimers.set(previewSessionId, {
+            deltaY: accumulatedDeltaY,
+            timer: setTimeout(() => {
+              try {
+                const finalDeltaY = recordingScrollTimers.get(previewSessionId)?.deltaY ?? accumulatedDeltaY;
+                recordingScrollTimers.delete(previewSessionId);
+                if (finalDeltaY === 0) return;
+
+                const scrollStep: PreviewIntentStep = {
+                  id: `rec_${Date.now().toString(36)}`,
+                  type: 'scroll',
+                  description: finalDeltaY > 0 ? 'Scroll down' : 'Scroll up',
+                };
+                const room = createRoomName('preview', previewSessionId);
+                socket.nsp.to(room).emit('preview:recording:step', {
+                  previewSessionId, step: scrollStep, timestamp: new Date().toISOString(),
+                });
+              } catch (e) {
+                logger.debug('[RECORDING] Scroll capture failed', {
+                  error: e instanceof Error ? e.message : String(e),
+                });
+              }
+            }, RECORDING_SCROLL_DEBOUNCE_MS),
+          });
+        }
       } else {
         emitInputError(socket, previewSessionId, 'wheel', result.error || 'Wheel failed');
       }
@@ -1275,6 +1413,66 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (result.success) {
         emitInputSuccess(socket, previewSessionId, 'type');
         setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+
+        // V9: Recording hook — accumulate typing into buffer
+        if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+          setImmediate(async () => {
+            try {
+              const { RecordingCaptureService } = await import(
+                '@/services/testing/ui/preview/recording-capture.service'
+              );
+
+              let buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+
+              if (!buffer) {
+                // First character — probe focused element for label
+                const page = sessionService.getPage(previewSessionId, ensuredUserId);
+                const focusedEl = page ? await RecordingCaptureService.probeFocusedElement(page) : null;
+                buffer = {
+                  text: data.text,
+                  elementRef: focusedEl?.ref,
+                  elementLabel: RecordingCaptureService.getElementLabel(focusedEl),
+                  lastCharAt: Date.now(),
+                  bindingHints: focusedEl ? RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, string> : undefined,
+                };
+              } else {
+                buffer.text += data.text;
+                buffer.lastCharAt = Date.now();
+              }
+
+              sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, buffer);
+
+              // Reset debounce timer
+              const existingTimer = recordingTypingTimers.get(previewSessionId);
+              if (existingTimer) clearTimeout(existingTimer);
+
+              recordingTypingTimers.set(previewSessionId, setTimeout(async () => {
+                try {
+                  const currentBuffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+                  if (currentBuffer) {
+                    const step = RecordingCaptureService.flushTypingBuffer(currentBuffer);
+                    if (step) {
+                      const room = createRoomName('preview', previewSessionId);
+                      socket.nsp.to(room).emit('preview:recording:step', {
+                        previewSessionId, step, timestamp: new Date().toISOString(),
+                      });
+                    }
+                    sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
+                  }
+                } catch (e) {
+                  logger.debug('[RECORDING] Typing flush failed', {
+                    error: e instanceof Error ? e.message : String(e),
+                  });
+                }
+                recordingTypingTimers.delete(previewSessionId);
+              }, RECORDING_TYPING_DEBOUNCE_MS));
+            } catch (e) {
+              logger.debug('[RECORDING] Type capture failed', {
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          });
+        }
       } else {
         emitInputError(socket, previewSessionId, 'type', result.error || 'Type failed');
       }
@@ -1322,6 +1520,46 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (result.success) {
         emitInputSuccess(socket, previewSessionId, 'press');
         setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
+
+        // V9: Recording hook — flush typing buffer + emit press step
+        if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+          setImmediate(async () => {
+            try {
+              const { RecordingCaptureService } = await import(
+                '@/services/testing/ui/preview/recording-capture.service'
+              );
+              const room = createRoomName('preview', previewSessionId);
+
+              // Flush typing buffer if Enter/Tab triggers it
+              if (RecordingCaptureService.shouldFlushOnKey(data.key)) {
+                const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+                if (buffer) {
+                  const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
+                  if (typingStep) {
+                    socket.nsp.to(room).emit('preview:recording:step', {
+                      previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
+                    });
+                  }
+                  sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
+                  const timer = recordingTypingTimers.get(previewSessionId);
+                  if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
+                }
+              }
+
+              // Emit press step for meaningful keys
+              const pressStep = RecordingCaptureService.capturePress(data.key, data.modifiers);
+              if (pressStep) {
+                socket.nsp.to(room).emit('preview:recording:step', {
+                  previewSessionId, step: pressStep, timestamp: new Date().toISOString(),
+                });
+              }
+            } catch (e) {
+              logger.debug('[RECORDING] Press capture failed', {
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          });
+        }
       } else {
         emitInputError(socket, previewSessionId, 'press', result.error || 'Press failed');
       }
@@ -1359,6 +1597,42 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'refresh', true);
         setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+
+        // V9: Recording hook — flush buffers and update URL baseline after refresh
+        if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+          setImmediate(async () => {
+            try {
+              const { RecordingCaptureService } = await import(
+                '@/services/testing/ui/preview/recording-capture.service'
+              );
+              const room = createRoomName('preview', previewSessionId);
+
+              // Flush pending typing buffer
+              const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+              if (buffer) {
+                const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
+                if (typingStep) {
+                  socket.nsp.to(room).emit('preview:recording:step', {
+                    previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
+                  });
+                }
+                sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
+                const timer = recordingTypingTimers.get(previewSessionId);
+                if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
+              }
+
+              // Update URL baseline (URL may change after redirect)
+              const page = sessionService.getPage(previewSessionId, ensuredUserId);
+              if (page) {
+                sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
+              }
+            } catch (e) {
+              logger.debug('[RECORDING] Refresh hook failed', {
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          });
+        }
       } else {
         emitPageActionResult(socket, previewSessionId, 'refresh', false, 'Refresh failed or session not found');
       }
@@ -1393,6 +1667,25 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
+      // V9: Capture recording state BEFORE reset (reset clears it)
+      const wasRecording = sessionService.isRecording(previewSessionId, ensuredUserId);
+      if (wasRecording) {
+        // Flush typing buffer before reset destroys the session state
+        const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+        if (buffer) {
+          const { RecordingCaptureService } = await import(
+            '@/services/testing/ui/preview/recording-capture.service'
+          );
+          const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
+          if (typingStep) {
+            const room = createRoomName('preview', previewSessionId);
+            socket.nsp.to(room).emit('preview:recording:step', {
+              previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      }
+
       // Reset session (clears cookies/storage/context)
       const result = await sessionService.resetSession({
         sessionId: previewSessionId,
@@ -1402,6 +1695,28 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'reset', true);
         setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+
+        // V9: Recording — reset destroys old page+context, so recording must stop
+        // (resetSession already sets recording=false and clears buffer)
+        // But we need to flush pending buffers, clean up timers, and notify client
+        if (wasRecording) {
+          const room = createRoomName('preview', previewSessionId);
+
+          // Clean up timers
+          const typingTimer = recordingTypingTimers.get(previewSessionId);
+          if (typingTimer) { clearTimeout(typingTimer); recordingTypingTimers.delete(previewSessionId); }
+          const scrollState = recordingScrollTimers.get(previewSessionId);
+          if (scrollState) { clearTimeout(scrollState.timer); recordingScrollTimers.delete(previewSessionId); }
+
+          // Notify client that recording has stopped
+          socket.nsp.to(room).emit('preview:recording:state', {
+            previewSessionId,
+            recording: false,
+            timestamp: new Date().toISOString(),
+          });
+
+          logger.info('[RECORDING] Stopped due to page reset', { previewSessionId, userId: ensuredUserId });
+        }
       } else {
         emitPageActionResult(socket, previewSessionId, 'reset', false, 'Reset failed or session not found');
       }
@@ -1720,6 +2035,57 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
+      // V9: Stop recording if active (run replays existing steps, would create duplicates)
+      if (sessionService.isRecording(previewSessionId, userId)) {
+        // Flush pending typing buffer
+        const buffer = sessionService.getRecordingBuffer(previewSessionId, userId);
+        if (buffer) {
+          const { RecordingCaptureService } = await import(
+            '@/services/testing/ui/preview/recording-capture.service'
+          );
+          const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
+          if (typingStep) {
+            const room = createRoomName('preview', previewSessionId);
+            socket.nsp.to(room).emit('preview:recording:step', {
+              previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
+            });
+          }
+          sessionService.setRecordingBuffer(previewSessionId, userId, null);
+        }
+
+        // Clean up timers
+        const typingTimer = recordingTypingTimers.get(previewSessionId);
+        if (typingTimer) { clearTimeout(typingTimer); recordingTypingTimers.delete(previewSessionId); }
+        const scrollState = recordingScrollTimers.get(previewSessionId);
+        if (scrollState) { clearTimeout(scrollState.timer); recordingScrollTimers.delete(previewSessionId); }
+
+        // Remove select listener
+        const page = sessionService.getPage(previewSessionId, userId);
+        if (page) {
+          try {
+            const { RecordingCaptureService } = await import(
+              '@/services/testing/ui/preview/recording-capture.service'
+            );
+            await RecordingCaptureService.removeSelectChangeListener(page);
+            const loadHandler = (page as any).__qai_recording_load_handler;
+            if (loadHandler) {
+              page.off('load', loadHandler);
+              delete (page as any).__qai_recording_load_handler;
+            }
+          } catch { /* page may be closing */ }
+        }
+
+        sessionService.setRecording(previewSessionId, userId, false);
+
+        const room = createRoomName('preview', previewSessionId);
+        socket.nsp.to(room).emit('preview:recording:state', {
+          previewSessionId,
+          recording: false,
+          timestamp: new Date().toISOString(),
+        });
+        logger.info('[RECORDING] Stopped due to run:start', { previewSessionId, userId });
+      }
+
       logger.info('[WebSocket] Starting preview run', {
         previewSessionId,
         intentTestCaseId,
@@ -1794,6 +2160,207 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V9: Recording handlers
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  socket.on('preview:recording:start', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId } = data;
+      if (!previewSessionId) return;
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        socket.emit('error', {
+          code: 'FORBIDDEN',
+          message: 'Session not found or not owned by user',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Already recording? Ignore silently
+      if (sessionService.isRecording(previewSessionId, ensuredUserId)) return;
+
+      sessionService.setRecording(previewSessionId, ensuredUserId, true);
+
+      // Set the current URL as baseline for navigation detection
+      const page = sessionService.getPage(previewSessionId, ensuredUserId);
+      if (page) {
+        sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
+
+        // Inject <select> change listener
+        try {
+          const { RecordingCaptureService } = await import(
+            '@/services/testing/ui/preview/recording-capture.service'
+          );
+
+          const SELECT_CB_NAME = '__qai_select_change';
+
+          // Expose callback function (ignore if already exposed)
+          await page.exposeFunction(SELECT_CB_NAME, (changeData: { label: string; text: string; value: string }) => {
+            try {
+              // Guard: only emit if still recording
+              if (!sessionService.isRecording(previewSessionId, ensuredUserId)) return;
+
+              const step = RecordingCaptureService.captureSelectChange({
+                label: changeData.label,
+                selectedText: changeData.text,
+                selectedValue: changeData.value,
+              });
+              const room = createRoomName('preview', previewSessionId);
+              socket.nsp.to(room).emit('preview:recording:step', {
+                previewSessionId,
+                step,
+                timestamp: new Date().toISOString(),
+              });
+            } catch (e) {
+              logger.debug('[RECORDING] Select change callback error', {
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          }).catch(() => {
+            // exposeFunction may fail if already exposed (e.g., page reload) — that's OK
+          });
+
+          await RecordingCaptureService.injectSelectChangeListener(page, SELECT_CB_NAME);
+
+          // Re-inject on navigation (page.evaluate scripts are lost on load)
+          const reInjectHandler = async () => {
+            try {
+              if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+                await RecordingCaptureService.injectSelectChangeListener(page, SELECT_CB_NAME);
+              }
+            } catch {
+              // Page may be closing during navigation
+            }
+          };
+          page.on('load', reInjectHandler);
+          // Store cleanup reference (removed on recording:stop)
+          (page as any).__qai_recording_load_handler = reInjectHandler;
+        } catch (e) {
+          logger.debug('[RECORDING] Select listener injection failed (non-critical)', {
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+
+      // Emit state to all subscribers
+      const room = createRoomName('preview', previewSessionId);
+      socket.nsp.to(room).emit('preview:recording:state', {
+        previewSessionId,
+        recording: true,
+        timestamp: new Date().toISOString(),
+      });
+
+      logger.info('[RECORDING] Started', { previewSessionId, userId: ensuredUserId });
+    } catch (error) {
+      logger.error('[RECORDING] Start failed', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  socket.on('preview:recording:stop', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId } = data;
+      if (!previewSessionId) return;
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) return;
+      if (!sessionService.isRecording(previewSessionId, ensuredUserId)) return;
+
+      const room = createRoomName('preview', previewSessionId);
+
+      // Flush pending typing buffer
+      const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+      if (buffer) {
+        const { RecordingCaptureService } = await import(
+          '@/services/testing/ui/preview/recording-capture.service'
+        );
+        const step = RecordingCaptureService.flushTypingBuffer(buffer);
+        if (step) {
+          socket.nsp.to(room).emit('preview:recording:step', {
+            previewSessionId,
+            step,
+            timestamp: new Date().toISOString(),
+          });
+        }
+        sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
+      }
+
+      // Clear typing timer
+      const typingTimer = recordingTypingTimers.get(previewSessionId);
+      if (typingTimer) {
+        clearTimeout(typingTimer);
+        recordingTypingTimers.delete(previewSessionId);
+      }
+
+      // Clear scroll timer and flush
+      const scrollState = recordingScrollTimers.get(previewSessionId);
+      if (scrollState) {
+        clearTimeout(scrollState.timer);
+        recordingScrollTimers.delete(previewSessionId);
+        // Emit final scroll step
+        const scrollStep: PreviewIntentStep = {
+          id: `rec_${Date.now().toString(36)}`,
+          type: 'scroll',
+          description: scrollState.deltaY > 0 ? 'Scroll down' : 'Scroll up',
+        };
+        socket.nsp.to(room).emit('preview:recording:step', {
+          previewSessionId,
+          step: scrollStep,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      // Remove <select> listener and load handler
+      const page = sessionService.getPage(previewSessionId, ensuredUserId);
+      if (page) {
+        try {
+          const { RecordingCaptureService } = await import(
+            '@/services/testing/ui/preview/recording-capture.service'
+          );
+          await RecordingCaptureService.removeSelectChangeListener(page);
+          // Remove navigation re-injection handler
+          const loadHandler = (page as any).__qai_recording_load_handler;
+          if (loadHandler) {
+            page.off('load', loadHandler);
+            delete (page as any).__qai_recording_load_handler;
+          }
+        } catch {
+          // Page may be closed
+        }
+      }
+
+      sessionService.setRecording(previewSessionId, ensuredUserId, false);
+
+      socket.nsp.to(room).emit('preview:recording:state', {
+        previewSessionId,
+        recording: false,
+        timestamp: new Date().toISOString(),
+      });
+
+      logger.info('[RECORDING] Stopped', { previewSessionId, userId: ensuredUserId });
+    } catch (error) {
+      logger.error('[RECORDING] Stop failed', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // Cleanup on disconnect
   socket.on('disconnect', () => {
     // V7: Cleanup all streams for all rooms the socket was subscribed to
@@ -1809,6 +2376,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           const previewSessionId = room.replace('preview:', '');
           stopPreviewStreams(previewSessionId).catch(() => {});
           previewRoomRefCount.delete(room);
+
+          // Cleanup recording timers
+          const typingTimer = recordingTypingTimers.get(previewSessionId);
+          if (typingTimer) { clearTimeout(typingTimer); recordingTypingTimers.delete(previewSessionId); }
+          const scrollState = recordingScrollTimers.get(previewSessionId);
+          if (scrollState) { clearTimeout(scrollState.timer); recordingScrollTimers.delete(previewSessionId); }
 
           logger.debug('[WebSocket] Stopped streams on disconnect', {
             socketId: socket.id,

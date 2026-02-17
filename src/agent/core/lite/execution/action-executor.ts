@@ -461,26 +461,7 @@ export class ActionExecutor {
         if (isNativeSelect) {
           await locator.selectOption(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
         } else {
-          // Custom dropdown: click to open, find option by text, click option
-          await locator.click({ timeout: this.DEFAULT_TIMEOUT });
-          const optionLocator = this.page.locator(
-            [
-              // WAI-ARIA standard patterns
-              `[role="option"]:has-text("${cmd.value}")`,
-              `[role="menuitem"]:has-text("${cmd.value}")`,
-              `[role="listbox"] >> text="${cmd.value}"`,
-              `[role="menu"] >> text="${cmd.value}"`,
-              // Framework-specific patterns (MUI, Ant Design, React Select)
-              `.MuiMenuItem-root:has-text("${cmd.value}")`,
-              `.ant-select-item-option:has-text("${cmd.value}")`,
-              `[class*="option"]:has-text("${cmd.value}")`,
-              // Bootstrap + generic HTML patterns
-              `.dropdown-item:has-text("${cmd.value}")`,
-              `li:has-text("${cmd.value}")`,
-            ].join(', ')
-          ).first();
-          await optionLocator.waitFor({ state: 'visible', timeout: this.DEFAULT_TIMEOUT });
-          await optionLocator.click({ timeout: this.DEFAULT_TIMEOUT });
+          await this.selectFromCustomDropdown(locator, cmd.value || '', this.DEFAULT_TIMEOUT);
         }
         break;
 
@@ -861,26 +842,7 @@ export class ActionExecutor {
           if (isNativeFallback) {
             await locator.selectOption(cmd.value, { timeout: this.FALLBACK_TIMEOUT });
           } else {
-            // Custom dropdown fallback: click to open, find and click option
-            await locator.click({ timeout: this.FALLBACK_TIMEOUT });
-            const fallbackOption = this.page.locator(
-              [
-                // WAI-ARIA standard patterns
-                `[role="option"]:has-text("${cmd.value}")`,
-                `[role="menuitem"]:has-text("${cmd.value}")`,
-                `[role="listbox"] >> text="${cmd.value}"`,
-                `[role="menu"] >> text="${cmd.value}"`,
-                // Framework-specific patterns (MUI, Ant Design, React Select)
-                `.MuiMenuItem-root:has-text("${cmd.value}")`,
-                `.ant-select-item-option:has-text("${cmd.value}")`,
-                `[class*="option"]:has-text("${cmd.value}")`,
-                // Bootstrap + generic HTML patterns
-                `.dropdown-item:has-text("${cmd.value}")`,
-                `li:has-text("${cmd.value}")`,
-              ].join(', ')
-            ).first();
-            await fallbackOption.waitFor({ state: 'visible', timeout: this.FALLBACK_TIMEOUT });
-            await fallbackOption.click({ timeout: this.FALLBACK_TIMEOUT });
+            await this.selectFromCustomDropdown(locator, cmd.value, this.FALLBACK_TIMEOUT);
           }
         }
         break;
@@ -889,6 +851,77 @@ export class ActionExecutor {
     }
 
     return { usedForceClick };
+  }
+
+  /**
+   * Custom dropdown select: click trigger → find visible option → click option.
+   * 3-phase strategy: scoped ARIA container → page-level ARIA roles → text fallback.
+   */
+  private async selectFromCustomDropdown(
+    locator: Locator,
+    value: string,
+    timeout: number
+  ): Promise<void> {
+    await locator.click({ timeout });
+    await this.page.waitForTimeout(300);
+
+    // Phase 1: Scoped search inside visible ARIA container
+    const containers = [
+      this.page.locator('[role="listbox"]:visible'),
+      this.page.locator('[role="menu"]:visible'),
+    ];
+
+    for (const container of containers) {
+      try {
+        const isVisible = await container.first().isVisible().catch(() => false);
+        if (!isVisible) continue;
+
+        const scopedOpt = container.first().getByText(value, { exact: true }).first();
+        await scopedOpt.waitFor({ state: 'visible', timeout: 2000 });
+        await scopedOpt.click({ timeout: 2000 });
+        return;
+      } catch {
+        // Try next container
+      }
+    }
+
+    // Phase 2: Page-level ARIA role search (handles portals)
+    const roleStrategies = [
+      this.page.getByRole('option', { name: value, exact: true }),
+      this.page.getByRole('menuitem', { name: value, exact: true }),
+      this.page.getByRole('option', { name: value, exact: false }),
+      this.page.getByRole('menuitem', { name: value, exact: false }),
+    ];
+
+    for (const strategy of roleStrategies) {
+      try {
+        const opt = strategy.first();
+        await opt.waitFor({ state: 'visible', timeout: 2000 });
+        await opt.click({ timeout: 2000 });
+        return;
+      } catch {
+        // Try next
+      }
+    }
+
+    // Phase 3: Universal text fallback (non-ARIA dropdowns)
+    const textStrategies = [
+      this.page.getByText(value, { exact: true }).and(this.page.locator(':visible')),
+      this.page.getByText(value, { exact: false }).and(this.page.locator(':visible')),
+    ];
+
+    for (const strategy of textStrategies) {
+      try {
+        const opt = strategy.first();
+        await opt.waitFor({ state: 'visible', timeout: 2000 });
+        await opt.click({ timeout: 2000 });
+        return;
+      } catch {
+        // Try next
+      }
+    }
+
+    throw new Error(`Could not find option "${value}" in dropdown`);
   }
 
   /**

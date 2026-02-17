@@ -76,6 +76,17 @@ interface InternalSession extends PreviewSession {
   domVersion: number;             // Monotonically increasing DOM version
   contextVersion: number;         // Version for context updates
   contextData: Record<string, any>; // Context data (env + test variables)
+
+  // Recording mode state
+  recording: boolean;
+  recordingTypingBuffer: {
+    text: string;
+    elementRef?: string;
+    elementLabel: string;
+    lastCharAt: number;
+    bindingHints?: Record<string, string>;
+  } | null;
+  recordingLastUrl: string;
 }
 
 /**
@@ -313,6 +324,11 @@ export class PreviewSessionService {
           domVersion: 1,           // Start at version 1
           contextVersion: 0,
           contextData: {},
+
+          // Recording mode (off by default)
+          recording: false,
+          recordingTypingBuffer: null,
+          recordingLastUrl: safeStartUrl,
         };
 
         // Store session
@@ -423,6 +439,11 @@ export class PreviewSessionService {
       session.lastKeyboardTypeAt = 0;
       session.lastKeyboardPressAt = 0;
       session.domVersion = 1; // Reset to version 1 on session reset
+
+      // Reset recording state
+      session.recording = false;
+      session.recordingTypingBuffer = null;
+      session.recordingLastUrl = startUrl;
 
       // Close old resources after swap (do not break reset if close fails)
       await this.safeCloseBrowserResources(undefined, oldContext, oldPage);
@@ -1146,6 +1167,63 @@ export class PreviewSessionService {
       version: session.contextVersion,
       data: session.contextData,
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // RECORDING STATE
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Set recording state for a session
+   */
+  setRecording(sessionId: string, userId: string, recording: boolean): boolean {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return false;
+    session.recording = recording;
+    if (!recording) {
+      session.recordingTypingBuffer = null;
+    }
+    return true;
+  }
+
+  /**
+   * Check if recording is active for a session
+   */
+  isRecording(sessionId: string, userId?: string): boolean {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recording ?? false;
+  }
+
+  /**
+   * Get recording typing buffer
+   */
+  getRecordingBuffer(sessionId: string, userId?: string): InternalSession['recordingTypingBuffer'] {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingTypingBuffer ?? null;
+  }
+
+  /**
+   * Set recording typing buffer
+   */
+  setRecordingBuffer(sessionId: string, userId: string, buffer: InternalSession['recordingTypingBuffer']): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingTypingBuffer = buffer;
+  }
+
+  /**
+   * Get last recorded URL (for navigation detection)
+   */
+  getRecordingLastUrl(sessionId: string, userId?: string): string | undefined {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingLastUrl;
+  }
+
+  /**
+   * Set last recorded URL
+   */
+  setRecordingLastUrl(sessionId: string, userId: string, url: string): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingLastUrl = url;
   }
 
   /**

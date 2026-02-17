@@ -65,8 +65,8 @@ const CONFIDENCE = {
 const ACTION_TO_ELEMENT_TYPES: Record<string, string[]> = {
   type: ['input', 'textarea'],
   fill: ['input', 'textarea'],
-  click: ['button', 'a', 'input', 'div', 'span'],
-  select: ['select', 'div', 'span', 'button', 'ul', 'input'],
+  click: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'summary'],
+  select: ['select'],
   hover: ['button', 'a', 'div', 'span', 'img'],
   scroll: ['div', 'section', 'main', 'body'],
   press: ['input', 'textarea', 'button'],
@@ -1336,7 +1336,17 @@ export function isEvidenceShortcutNodeCompatible(
       if (role === 'combobox' || role === 'listbox') {
         return { ok: true };
       }
-      return { ok: false, reason: `select_action_requires_select_or_combobox_role (got ${tag}/${role})` };
+      // Elements with aria-expanded are dropdown-like triggers
+      if (node.ariaExpanded !== undefined) {
+        return { ok: true };
+      }
+      // Common interactive tags that may serve as custom dropdown triggers
+      // (many frameworks render dropdowns as <button>/<div>/<span> without ARIA)
+      const selectSoftTags = ['button', 'div', 'span', 'input', 'a', 'li'];
+      if (selectSoftTags.includes(tag)) {
+        return { ok: true };
+      }
+      return { ok: false, reason: `select_action_requires_dropdown_element (got ${tag}/${role})` };
     }
 
     case 'check':
