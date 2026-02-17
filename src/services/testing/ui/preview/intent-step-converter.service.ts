@@ -64,7 +64,7 @@ function mapActionType(intentAction: IntentActionType): string {
     case 'wait':
       return 'wait';
     case 'assert':
-      return 'assertVisible'; // Default assert type; refined in command
+      return 'assertText'; // "Check contains" - verify element contains expected text
     case 'navigate':
       return 'goto';
     case 'select':
@@ -226,11 +226,21 @@ export function convertIntentStepToCommand(
     }
 
     case 'assert':
-      // For assert, set up assertion config
-      command.assertion = {
-        type: 'visible',
-        expected: step.value || true,
-      };
+      // For assert ("Check contains"), set up assertion config
+      // If value is provided, check text content; otherwise fall back to visibility check
+      if (step.value && step.value.trim().length > 0) {
+        command.assertion = {
+          type: 'text',
+          expected: step.value,
+          operator: 'contains',
+        };
+      } else {
+        command.action = 'assertVisible';
+        command.assertion = {
+          type: 'visible',
+          expected: true,
+        };
+      }
       break;
 
     case 'ai_check':

@@ -452,7 +452,36 @@ export class ActionExecutor {
         // PHASE B: Pre-scroll to ensure element is visible before select
         // ═══════════════════════════════════════════════════════════════════
         await this.ensureElementVisible(locator);
-        await locator.selectOption(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
+
+        // Detect native <select> vs custom dropdown
+        const isNativeSelect = await locator.evaluate(
+          (el) => el.tagName.toLowerCase() === 'select'
+        ).catch(() => false);
+
+        if (isNativeSelect) {
+          await locator.selectOption(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
+        } else {
+          // Custom dropdown: click to open, find option by text, click option
+          await locator.click({ timeout: this.DEFAULT_TIMEOUT });
+          const optionLocator = this.page.locator(
+            [
+              // WAI-ARIA standard patterns
+              `[role="option"]:has-text("${cmd.value}")`,
+              `[role="menuitem"]:has-text("${cmd.value}")`,
+              `[role="listbox"] >> text="${cmd.value}"`,
+              `[role="menu"] >> text="${cmd.value}"`,
+              // Framework-specific patterns (MUI, Ant Design, React Select)
+              `.MuiMenuItem-root:has-text("${cmd.value}")`,
+              `.ant-select-item-option:has-text("${cmd.value}")`,
+              `[class*="option"]:has-text("${cmd.value}")`,
+              // Bootstrap + generic HTML patterns
+              `.dropdown-item:has-text("${cmd.value}")`,
+              `li:has-text("${cmd.value}")`,
+            ].join(', ')
+          ).first();
+          await optionLocator.waitFor({ state: 'visible', timeout: this.DEFAULT_TIMEOUT });
+          await optionLocator.click({ timeout: this.DEFAULT_TIMEOUT });
+        }
         break;
 
       case 'hover':
@@ -825,7 +854,34 @@ export class ActionExecutor {
         break;
       case 'select':
         if (cmd.value) {
-          await locator.selectOption(cmd.value, { timeout: this.FALLBACK_TIMEOUT });
+          const isNativeFallback = await locator.evaluate(
+            (el) => el.tagName.toLowerCase() === 'select'
+          ).catch(() => false);
+
+          if (isNativeFallback) {
+            await locator.selectOption(cmd.value, { timeout: this.FALLBACK_TIMEOUT });
+          } else {
+            // Custom dropdown fallback: click to open, find and click option
+            await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+            const fallbackOption = this.page.locator(
+              [
+                // WAI-ARIA standard patterns
+                `[role="option"]:has-text("${cmd.value}")`,
+                `[role="menuitem"]:has-text("${cmd.value}")`,
+                `[role="listbox"] >> text="${cmd.value}"`,
+                `[role="menu"] >> text="${cmd.value}"`,
+                // Framework-specific patterns (MUI, Ant Design, React Select)
+                `.MuiMenuItem-root:has-text("${cmd.value}")`,
+                `.ant-select-item-option:has-text("${cmd.value}")`,
+                `[class*="option"]:has-text("${cmd.value}")`,
+                // Bootstrap + generic HTML patterns
+                `.dropdown-item:has-text("${cmd.value}")`,
+                `li:has-text("${cmd.value}")`,
+              ].join(', ')
+            ).first();
+            await fallbackOption.waitFor({ state: 'visible', timeout: this.FALLBACK_TIMEOUT });
+            await fallbackOption.click({ timeout: this.FALLBACK_TIMEOUT });
+          }
         }
         break;
       default:

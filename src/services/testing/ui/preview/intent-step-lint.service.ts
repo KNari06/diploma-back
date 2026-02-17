@@ -63,9 +63,10 @@ const CONFIDENCE = {
 
 // Action type to element type mappings (V2: added check/uncheck/toggle/open/close)
 const ACTION_TO_ELEMENT_TYPES: Record<string, string[]> = {
+  type: ['input', 'textarea'],
   fill: ['input', 'textarea'],
   click: ['button', 'a', 'input', 'div', 'span'],
-  select: ['select'],
+  select: ['select', 'div', 'span', 'button', 'ul', 'input'],
   hover: ['button', 'a', 'div', 'span', 'img'],
   scroll: ['div', 'section', 'main', 'body'],
   press: ['input', 'textarea', 'button'],
@@ -427,8 +428,8 @@ export class IntentStepLintService {
 
       const domNodes = snapshot.domNodes ?? [];
 
-      // Non-targeting actions (navigate, wait, wait_for)
-      if (['navigate', 'wait', 'wait_for'].includes(stepDraft.type)) {
+      // Non-targeting actions (navigate, wait, wait_for, ai_check)
+      if (['navigate', 'wait', 'wait_for', 'ai_check'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -721,7 +722,7 @@ export class IntentStepLintService {
     });
 
     // Non-targeting actions don't need element resolution
-    if (['navigate', 'wait', 'wait_for'].includes(stepDraft.type)) {
+    if (['navigate', 'wait', 'wait_for', 'ai_check'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -1327,12 +1328,15 @@ export function isEvidenceShortcutNodeCompatible(
     }
 
     case 'select': {
-      // Preview executor uses `locator.selectOption(...)` which only works for native <select>.
-      if (tag !== 'select') {
-        return { ok: false, reason: `select_action_requires_native_select (got ${tag}/${role})` };
+      // Native <select> always allowed
+      if (tag === 'select') {
+        return { ok: true };
       }
-
-      return { ok: true };
+      // Custom dropdowns with ARIA roles are allowed (click-based execution)
+      if (role === 'combobox' || role === 'listbox') {
+        return { ok: true };
+      }
+      return { ok: false, reason: `select_action_requires_select_or_combobox_role (got ${tag}/${role})` };
     }
 
     case 'check':
@@ -1374,6 +1378,15 @@ export function isEvidenceShortcutNodeCompatible(
 
     case 'assert': {
       // Preview executor only waits for visibility.
+      return { ok: true };
+    }
+
+    case 'upload': {
+      // Upload requires input[type=file]
+      const isFileInput = tag === 'input' && inputType === 'file';
+      if (!isFileInput) {
+        return { ok: false, reason: `upload_action_requires_input_file (got ${tag}/${inputType || 'none'})` };
+      }
       return { ok: true };
     }
 

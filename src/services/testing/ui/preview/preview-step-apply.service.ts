@@ -461,7 +461,42 @@ async function executeAction(
 
       case 'select': {
         if (!locator) throw new Error('No selector for select action');
-        await locator.selectOption(step.value || '', { timeout });
+        const selectValue = step.value || '';
+
+        // Detect native <select> vs custom dropdown
+        const isNativeSelect = await locator.evaluate(
+          (el) => el.tagName.toLowerCase() === 'select'
+        ).catch(() => false);
+
+        if (isNativeSelect) {
+          // Native <select>: use Playwright's selectOption
+          await locator.selectOption(selectValue, { timeout });
+        } else {
+          // Custom dropdown: click to open, find option by text, click option
+          await locator.click({ timeout });
+
+          // Search for the option across common custom dropdown patterns
+          // Uses page-level search to handle portal-rendered menus (MUI, Ant Design, etc.)
+          const optionLocator = page.locator(
+            [
+              // WAI-ARIA standard patterns
+              `[role="option"]:has-text("${selectValue}")`,
+              `[role="menuitem"]:has-text("${selectValue}")`,
+              `[role="listbox"] >> text="${selectValue}"`,
+              `[role="menu"] >> text="${selectValue}"`,
+              // Framework-specific patterns (MUI, Ant Design, React Select)
+              `.MuiMenuItem-root:has-text("${selectValue}")`,
+              `.ant-select-item-option:has-text("${selectValue}")`,
+              `[class*="option"]:has-text("${selectValue}")`,
+              // Bootstrap + generic HTML patterns
+              `.dropdown-item:has-text("${selectValue}")`,
+              `li:has-text("${selectValue}")`,
+            ].join(', ')
+          ).first();
+
+          await optionLocator.waitFor({ state: 'visible', timeout });
+          await optionLocator.click({ timeout });
+        }
         break;
       }
 
@@ -506,7 +541,21 @@ async function executeAction(
 
       case 'assert': {
         if (!locator) throw new Error('No selector for assert action');
+        // Step 1: verify element is visible
         await locator.waitFor({ state: 'visible', timeout });
+        // Step 2: if value is provided, verify element contains the expected text
+        if (step.value && step.value.trim().length > 0) {
+          const elementText = await locator.textContent({ timeout });
+          const actualText = (elementText || '').trim();
+          const expectedText = step.value.trim();
+          if (!actualText.toLowerCase().includes(expectedText.toLowerCase())) {
+            throw new Error(
+              `Element does not contain expected text.\n` +
+              `Expected: "${expectedText}"\n` +
+              `Actual: "${actualText.substring(0, 200)}"`
+            );
+          }
+        }
         break;
       }
 

@@ -397,9 +397,18 @@ export class CommandExecutor {
             await selectSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
             // ✅ Wait for enabled: Ensure select is not disabled
             await this.waitForEnabled(selectSmartResult.locator, 5000);
-            // ✅ Wait for options: Ensure select has options available
-            await this.waitForSelectOptions(selectSmartResult.locator, 5000, 3);
-            await selectSmartResult.locator.selectOption(selectValue, { timeout: timeout || 30000 });
+
+            // Detect native <select> vs custom dropdown
+            const isNativeSelectCmd = await this.isNativeSelectLocator(selectSmartResult.locator);
+
+            if (isNativeSelectCmd) {
+              // ✅ Wait for options: Ensure select has options available
+              await this.waitForSelectOptions(selectSmartResult.locator, 5000, 3);
+              await selectSmartResult.locator.selectOption(selectValue, { timeout: timeout || 30000 });
+            } else {
+              // Custom dropdown: click-based selection
+              await this.selectFromCustomDropdown(selectSmartResult.locator, String(value), timeout || 30000);
+            }
           } catch (selectError) {
             // Smart locator failed, try self-healing
             logger.warn('[COMMAND_EXECUTOR] Smart locator select failed, trying self-healing', {
@@ -412,9 +421,14 @@ export class CommandExecutor {
                 const locator = getLocator(this.page, selector);
                 // ✅ Wait for enabled in self-healing path too
                 await this.waitForEnabled(locator, 5000);
-                // ✅ Wait for options in self-healing path too
-                await this.waitForSelectOptions(locator, 5000, 3);
-                await locator.selectOption(selectValue, { timeout: timeout || 30000 });
+
+                const isNativeSH = await this.isNativeSelectLocator(locator);
+                if (isNativeSH) {
+                  await this.waitForSelectOptions(locator, 5000, 3);
+                  await locator.selectOption(selectValue, { timeout: timeout || 30000 });
+                } else {
+                  await this.selectFromCustomDropdown(locator, String(value), timeout || 30000);
+                }
               },
               {
                 selector,
@@ -2231,14 +2245,22 @@ export class CommandExecutor {
         break;
 
       case 'select':
-      case 'selectOption':
+      case 'selectOption': {
         if (value === undefined) throw new Error('Value is required for select action');
         // ✅ Wait for enabled: Ensure select is not disabled
         await this.waitForEnabled(locator, 5000);
-        // ✅ Wait for options: Ensure select has options available
-        await this.waitForSelectOptions(locator, 5000, 3);
-        await locator.selectOption(String(value), { timeout: defaultTimeout });
+
+        const isNativeHeal = await this.isNativeSelectLocator(locator);
+        if (isNativeHeal) {
+          // ✅ Wait for options: Ensure select has options available
+          await this.waitForSelectOptions(locator, 5000, 3);
+          await locator.selectOption(String(value), { timeout: defaultTimeout });
+        } else {
+          // Custom dropdown: click-based selection
+          await this.selectFromCustomDropdown(locator, String(value), defaultTimeout);
+        }
         break;
+      }
 
       case 'check':
         // ✅ Wait for enabled: Ensure checkbox is not disabled
@@ -2748,6 +2770,51 @@ export class CommandExecutor {
    * @param maxRetries Maximum number of retries (default: 3)
    * @throws Error if options don't appear after timeout and retries
    */
+  private async isNativeSelectLocator(locator: Locator): Promise<boolean> {
+    try {
+      const tagName = await locator.evaluate((el) => el.tagName.toLowerCase());
+      return tagName === 'select';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Click-based select for custom (non-native) dropdowns.
+   * Strategy: click trigger to open → find option by text → click option.
+   * Uses page-level search to handle portal-rendered menus.
+   */
+  private async selectFromCustomDropdown(
+    locator: Locator,
+    value: string,
+    timeout: number
+  ): Promise<void> {
+    // Click the trigger to open the dropdown
+    await locator.click({ timeout });
+
+    // Search for the option across common custom dropdown patterns
+    // Uses page-level search to handle portal-rendered menus (MUI, Ant Design, etc.)
+    const optionLocator = this.page.locator(
+      [
+        // WAI-ARIA standard patterns
+        `[role="option"]:has-text("${value}")`,
+        `[role="menuitem"]:has-text("${value}")`,
+        `[role="listbox"] >> text="${value}"`,
+        `[role="menu"] >> text="${value}"`,
+        // Framework-specific patterns (MUI, Ant Design, React Select)
+        `.MuiMenuItem-root:has-text("${value}")`,
+        `.ant-select-item-option:has-text("${value}")`,
+        `[class*="option"]:has-text("${value}")`,
+        // Bootstrap + generic HTML patterns
+        `.dropdown-item:has-text("${value}")`,
+        `li:has-text("${value}")`,
+      ].join(', ')
+    ).first();
+
+    await optionLocator.waitFor({ state: 'visible', timeout });
+    await optionLocator.click({ timeout });
+  }
+
   private async waitForSelectOptions(locator: Locator, timeout: number = 5000, maxRetries: number = 3): Promise<void> {
     let attempt = 0;
     const backoffMs = 500; // Short backoff between retries

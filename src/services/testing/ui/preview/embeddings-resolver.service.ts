@@ -69,7 +69,7 @@ const AMBIGUOUS_SIMILARITY_DELTA = 0.05;
 const ACTION_TO_TAGS: Record<string, string[]> = {
   type: ['input', 'textarea'],
   click: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'summary', 'nav', 'header', 'footer', 'section', 'article'],
-  select: ['select'],
+  select: ['select', 'div', 'span', 'button', 'ul', 'input'],
   check: ['input'],
   uncheck: ['input'],
   toggle: ['input', 'button', 'div', 'span'],
@@ -97,6 +97,18 @@ const CLICK_ALLOWED_ROLES = new Set([
   'columnheader',
   'rowheader',
   'switch',
+]);
+
+/**
+ * Role-based allowlist for select actions
+ * Custom dropdowns with these ARIA roles are allowed for select regardless of tag
+ */
+const SELECT_ALLOWED_ROLES = new Set([
+  'combobox',
+  'listbox',
+  'option',
+  'menu',
+  'menuitem',
 ]);
 
 /** Actions that require writable state (not readonly) */
@@ -440,7 +452,9 @@ export async function buildAllowedSets(
 
         // P1 FIX: Role-based allowlist for click actions
         // Elements with interactive ARIA roles should be allowed regardless of tag
-        const roleMatches = actionType === 'click' && node.role && CLICK_ALLOWED_ROLES.has(node.role);
+        const roleMatches =
+          (actionType === 'click' && node.role && CLICK_ALLOWED_ROLES.has(node.role)) ||
+          (actionType === 'select' && node.role && SELECT_ALLOWED_ROLES.has(node.role));
 
         // Exception: allow non-standard textbox components for type as SoftAllowed.
         if (!tagMatches && !isNonStandardTextbox && !roleMatches) {
@@ -461,13 +475,23 @@ export async function buildAllowedSets(
             evidence: 'div with role=textbox allowed as soft candidate',
             affectedRefs: [node.ref],
           });
-        } else if (roleMatches && !tagMatches) {
-          // Role-based match: allow but log for visibility
+        } else if (roleMatches && !tagMatches && actionType === 'click') {
+          // Role-based match for click: allow but log for visibility
           nodeRules.push({
             ruleId: 'role.click_allowed',
             version: 'v1',
             action: 'boost',
             evidence: `tag=${node.tag} allowed via role=${node.role} for click`,
+            affectedRefs: [node.ref],
+          });
+        } else if (roleMatches && !tagMatches && actionType === 'select') {
+          // Custom dropdown via ARIA role: soft-allow (prefer native <select>)
+          isSoft = true;
+          nodeRules.push({
+            ruleId: 'structure.custom_dropdown',
+            version: 'v1',
+            action: 'penalize',
+            evidence: `tag=${node.tag}, role=${node.role} allowed as soft candidate for select via ARIA role`,
             affectedRefs: [node.ref],
           });
         }
@@ -835,7 +859,9 @@ export function sanitizeIntent(step: IntentStep): string {
   let intent = description;
 
   // Redact value if accidentally included in description
-  if (value.length > 0) {
+  // Exception: for 'select' actions, keep the value in the description
+  // because it's needed for semantic matching against dropdown trigger/options
+  if (value.length > 0 && step.type !== 'select') {
     intent = intent.replace(new RegExp(escapeRegex(value), 'gi'), '[VALUE]');
   }
 
@@ -1316,7 +1342,7 @@ export async function resolveWithEmbeddings(params: {
   });
 
   // Non-targeting actions don't need element resolution
-  if (['navigate', 'wait'].includes(stepDraft.type)) {
+  if (['navigate', 'wait', 'wait_for', 'ai_check'].includes(stepDraft.type)) {
     return {
       status: 'resolved',
       message: `Action "${stepDraft.type}" does not require element targeting`,
