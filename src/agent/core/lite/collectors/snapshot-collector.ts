@@ -66,10 +66,21 @@ export class SnapshotCollector {
           const ariaLabel = el.getAttribute('aria-label') || '';
           const placeholder = el.getAttribute('placeholder') || '';
           const text = (el.textContent || '').trim().slice(0, 30);
-          const parentTag = el.parentElement?.tagName.toLowerCase() || '';
-          const parentId = el.parentElement?.getAttribute('id') || '';
 
-          return `${tag}|${role}|${type}|${name}|${ariaLabel}|${placeholder}|${text}|${parentTag}|${parentId}`;
+          // Build a short DOM path (up to 4 ancestors) using tag + child-index at each level.
+          // This is scroll/resize-stable and distinguishes identical elements in different
+          // containers (e.g. "Забронировать" buttons inside separate tutor cards).
+          const pathParts: string[] = [];
+          let cur: Element | null = el;
+          for (let i = 0; i < 4 && cur && cur.parentElement; i++) {
+            const parent = cur.parentElement;
+            const idx = Array.prototype.indexOf.call(parent.children, cur);
+            pathParts.push(`${cur.tagName.toLowerCase()}[${idx}]`);
+            cur = parent;
+          }
+          const domPath = pathParts.join('/');
+
+          return `${tag}|${role}|${type}|${name}|${ariaLabel}|${placeholder}|${text}|${domPath}`;
         }
 
         /**
@@ -510,6 +521,8 @@ export class SnapshotCollector {
           return true;
         });
 
+        // activeModalElement is already computed above via detectActiveModal + activeModalRef.
+
         // Process each unique element (including shadow DOM elements)
         uniqueElements.forEach((el: Element) => {
           try {
@@ -522,9 +535,43 @@ export class SnapshotCollector {
             const rect = el.getBoundingClientRect();
             if (rect.width < 5 || rect.height < 5) return;
 
-            // Skip if outside viewport (way off screen)
+            // Skip elements that are fully outside the visible viewport
             // @ts-expect-error - window available in browser context
-            if (rect.bottom < -1000 || rect.top > window.innerHeight + 1000) return;
+            const vw = window.innerWidth;
+            // @ts-expect-error - window available in browser context
+            const vh = window.innerHeight;
+            if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) return;
+
+            // Universal visibility check via elementFromPoint.
+            // The browser tells us exactly what the user sees at the element's center pixel.
+            // If the topmost element there is unrelated (neither itself, nor a descendant,
+            // nor an ancestor), then this element is visually covered by something —
+            // overlay, popup, dropdown, sticky header, toast, etc. Skip it.
+            // We cache the result to avoid calling elementFromPoint twice per element
+            // (this same data is also used for `isTopMostAtCenter` below).
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            // @ts-expect-error - window available in browser context
+            const inVp = cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight;
+            let hitTestTopEl: Element | null = null;
+            let hitTestDone = false;
+            if (inVp) {
+              try {
+                hitTestTopEl = document.elementFromPoint(cx, cy);
+                hitTestDone = true;
+                if (hitTestTopEl && hitTestTopEl !== el && !el.contains(hitTestTopEl) && !hitTestTopEl.contains(el)) {
+                  // For shadow DOM elements, elementFromPoint returns the shadow host
+                  // which won't match ancestor/descendant checks above.
+                  // Check if the hit element is the shadow host that contains our element.
+                  const elRoot = el.getRootNode();
+                  if (!(elRoot instanceof ShadowRoot && elRoot.host === hitTestTopEl)) {
+                    return;
+                  }
+                }
+              } catch {
+                // elementFromPoint can fail in edge cases — don't skip
+              }
+            }
 
             // ✅ P1: Detect if element is inside shadow DOM for ref prefixing
             let isInsideShadowDOM = false;
@@ -591,24 +638,10 @@ export class SnapshotCollector {
             // Check if element is positioned (participates in stacking context)
             const isPositioned = style.position !== 'static';
 
-            // Check if element is topmost at its center point (coverage proxy)
-            // Only compute if element center is within viewport
-            let isTopMostAtCenter: boolean | undefined = undefined;
-            const centerX = rect.left + rect.width / 2;
-            const centerY = rect.top + rect.height / 2;
-            // @ts-expect-error - window available in browser context
-            const inViewport = centerX >= 0 && centerX <= window.innerWidth &&
-              centerY >= 0 && centerY <= window.innerHeight;
-
-            if (inViewport) {
-              try {
-                const topEl = document.elementFromPoint(centerX, centerY);
-                // Element is topmost if the found element is itself or its descendant
-                isTopMostAtCenter = topEl === el || el.contains(topEl);
-              } catch {
-                // elementFromPoint can fail in edge cases, leave undefined
-              }
-            }
+            // Reuse cached elementFromPoint result from visibility check above
+            const isTopMostAtCenter: boolean | undefined = hitTestDone
+              ? (hitTestTopEl === el || (hitTestTopEl !== null && el.contains(hitTestTopEl)))
+              : undefined;
 
             // SECURITY: Redact sensitive input values to prevent credential leakage
             // Password fields and credential-related inputs should never have values in snapshot
