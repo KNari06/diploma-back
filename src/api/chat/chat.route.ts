@@ -350,12 +350,13 @@ router.post('/cancel',
         return;
       }
     } else {
-      // ✅ FIX #2: Verify session belongs to user (security check)
+      // ✅ FIX #2: Verify user is a member of the session's workspace (security check)
       try {
         const { supabaseAdmin } = await import('@/db/supabase');
+        const { WorkspaceAccessService } = await import('@/services/core/workspace-access.service');
         const { data: session, error: sessionError } = await supabaseAdmin
           .from('chat_sessions')
-          .select('id, user_id')
+          .select('id, workspace_id')
           .eq('id', chatSessionId)
           .maybeSingle();
 
@@ -367,7 +368,7 @@ router.post('/cancel',
           return;
         }
 
-        if (session.user_id !== userId) {
+        if (!session.workspace_id || !(await WorkspaceAccessService.isMember(userId, session.workspace_id))) {
           res.status(403).json({
             success: false,
             error: 'Access denied to this chat session',
@@ -375,13 +376,13 @@ router.post('/cancel',
           return;
         }
       } catch (error) {
-        logger.error('[CHAT] Failed to verify session ownership', {
+        logger.error('[CHAT] Failed to verify session access', {
           error: error instanceof Error ? error.message : String(error),
           sessionId: chatSessionId,
         });
         res.status(500).json({
           success: false,
-          error: 'Failed to verify session ownership',
+          error: 'Failed to verify session access',
           message: error instanceof Error ? error.message : 'Unknown error',
         });
         return;

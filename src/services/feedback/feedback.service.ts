@@ -1,4 +1,5 @@
-import { supabase } from '@/db/supabase';
+import { supabase, supabaseAdmin } from '@/db/supabase';
+import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { logger } from '@/utils/core/logger';
 import {
   MessageFeedback,
@@ -39,16 +40,19 @@ export class FeedbackService {
         throw new Error('Message not found');
       }
 
-      // Verify session ownership
-      const { data: session, error: sessionError } = await supabase
+      // Verify workspace membership for the session
+      const { data: session, error: sessionError } = await supabaseAdmin
         .from('chat_sessions')
-        .select('id, user_id')
+        .select('id, workspace_id')
         .eq('id', message.session_id)
-        .eq('user_id', userId)
         .single();
 
       if (sessionError || !session) {
-        throw new Error('Unauthorized: Message does not belong to user');
+        throw new Error('Chat session not found');
+      }
+
+      if (!session.workspace_id || !(await WorkspaceAccessService.isMember(userId, session.workspace_id))) {
+        throw new Error('Unauthorized: User does not have access to this chat session');
       }
 
       // Check if feedback already exists (update instead of create)

@@ -1,5 +1,7 @@
 import { Request, Response } from 'express';
 import { supabaseAdmin } from '@/db/supabase';
+import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
+import { WorkspaceService } from '@/services/core/workspace.service';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -11,13 +13,24 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
 
     const limit = Math.min(Number(req.query.limit) || 50, 100);
     const offset = Number(req.query.offset) || 0;
+    const workspaceId = typeof req.query.workspaceId === 'string'
+      ? req.query.workspaceId
+      : await WorkspaceService.getActiveWorkspaceForUser(userId);
 
-    // Get user's session
+    if (!workspaceId) {
+      res.json({
+        success: true,
+        data: { session: null, messages: [], pagination: { limit, offset, total: 0, has_more: false } },
+      });
+      return;
+    }
+
+    // Get workspace chat session
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
       .select('id, title, created_at')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
+      .eq('workspace_id', workspaceId)
+      .order('created_at', { ascending: true })
       .limit(1)
       .maybeSingle();
 
@@ -88,6 +101,14 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
 
     const limit = Math.min(Number(req.query.limit) || 20, 100);
     const offset = Number(req.query.offset) || 0;
+    const workspaceId = typeof req.query.workspaceId === 'string'
+      ? req.query.workspaceId
+      : await WorkspaceService.getActiveWorkspaceForUser(userId);
+
+    if (!workspaceId) {
+      res.json({ success: true, data: { sessions: [], pagination: { limit, offset, total: 0 } } });
+      return;
+    }
 
     const { data: sessions } = await supabaseAdmin
       .from('chat_sessions')
@@ -102,7 +123,7 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
           created_at
         )
       `)
-      .eq('user_id', userId)
+      .eq('workspace_id', workspaceId)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
@@ -147,16 +168,20 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
     const limit = usePagination ? Math.min(Number(limitParam) || 50, 100) : undefined;
     const offset = usePagination ? Math.max(Number(offsetParam) || 0, 0) : undefined;
 
-    // Verify session belongs to user
+    // Verify user has access via workspace membership
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id, title, created_at')
+      .select('id, title, created_at, workspace_id')
       .eq('id', sessionId)
-      .eq('user_id', userId)
       .maybeSingle();
 
     if (!session) {
       res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    if (!session.workspace_id || !(await WorkspaceAccessService.isMember(userId, session.workspace_id))) {
+      res.status(403).json({ error: 'Access denied' });
       return;
     }
 
@@ -229,10 +254,16 @@ export const debugChatData = async (req: Request, res: Response): Promise<void> 
   try {
     const userId = req.user!.id;
 
-    const { data: sessions, error: sessionsError } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('*')
-      .eq('user_id', userId);
+    const workspaceId = typeof req.query.workspaceId === 'string'
+      ? req.query.workspaceId
+      : await WorkspaceService.getActiveWorkspaceForUser(userId);
+
+    const { data: sessions, error: sessionsError } = workspaceId
+      ? await supabaseAdmin
+          .from('chat_sessions')
+          .select('*')
+          .eq('workspace_id', workspaceId)
+      : { data: [], error: null };
 
     const sessionIds = sessions?.map(s => s.id) || [];
     const { data: messages, error: messagesError } = sessionIds.length > 0
@@ -246,6 +277,7 @@ export const debugChatData = async (req: Request, res: Response): Promise<void> 
       success: true,
       debug: {
         userId,
+        workspaceId,
         sessions: sessions || [],
         messages: messages || [],
         errors: {

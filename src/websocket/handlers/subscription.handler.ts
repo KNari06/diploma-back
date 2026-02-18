@@ -6,6 +6,7 @@
 
 import { connection } from '@/config/infrastructure/queues';
 import { supabaseAdmin } from '@/db/supabase';
+import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { logger } from '@/utils/core/logger';
 import Redis from 'ioredis';
 import { Socket } from 'socket.io';
@@ -492,17 +493,17 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         return;
       }
 
-      // ✅ SECURITY: Verify chat session ownership before allowing subscription (fail-closed)
-      // This prevents users from subscribing to other users' chat events.
+      // ✅ SECURITY: Verify workspace membership before allowing subscription (fail-closed)
+      // Chat sessions are shared within a workspace — any workspace member can subscribe.
       try {
         const { data: chatSession, error: sessionError } = await supabaseAdmin
           .from('chat_sessions')
-          .select('user_id')
+          .select('workspace_id')
           .eq('id', sessionId.trim())
           .maybeSingle();
 
         if (sessionError) {
-          logger.warn('[WebSocket] Failed to verify chat session ownership (denying subscription)', {
+          logger.warn('[WebSocket] Failed to verify chat session workspace (denying subscription)', {
             socketId: socket.id,
             userId,
             sessionId,
@@ -530,8 +531,8 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           return;
         }
 
-        if (!chatSession.user_id) {
-          logger.warn('[WebSocket] Chat session owner is missing (denying subscription)', {
+        if (!chatSession.workspace_id) {
+          logger.warn('[WebSocket] Chat session has no workspace (denying subscription)', {
             socketId: socket.id,
             userId,
             sessionId,
@@ -544,11 +545,12 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           return;
         }
 
-        if (chatSession.user_id !== userId) {
-          logger.warn('[WebSocket] Subscription denied: chat session belongs to different user', {
+        const isMember = await WorkspaceAccessService.isMember(userId, chatSession.workspace_id);
+        if (!isMember) {
+          logger.warn('[WebSocket] Subscription denied: user is not a workspace member', {
             socketId: socket.id,
-            requestingUserId: userId,
-            sessionOwnerId: chatSession.user_id.substring(0, 8) + '...',
+            userId,
+            workspaceId: chatSession.workspace_id,
             sessionId,
           });
           socket.emit('error', {
@@ -559,7 +561,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           return;
         }
       } catch (verifyError) {
-        logger.warn('[WebSocket] Exception verifying chat session ownership (denying subscription)', {
+        logger.warn('[WebSocket] Exception verifying chat session access (denying subscription)', {
           socketId: socket.id,
           userId,
           sessionId,

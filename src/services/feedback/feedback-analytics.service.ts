@@ -1,4 +1,4 @@
-import { supabase } from '@/db/supabase';
+import { supabase, supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import {
   FeedbackInsights,
@@ -230,15 +230,24 @@ export class FeedbackAnalyticsService {
       .gte('created_at', dateFrom.toISOString());
 
     if (userId) {
-      // Need to join with sessions to filter by user
-      const { data: sessions } = await supabase
-        .from('chat_sessions')
-        .select('id')
-        .eq('user_id', userId);
+      // Get sessions from workspaces the user is a member of
+      const { data: memberships } = await supabaseAdmin
+        .from('workspace_members')
+        .select('workspace_id')
+        .eq('user_id', userId)
+        .eq('status', 'active');
 
-      if (sessions) {
-        const sessionIds = sessions.map((s) => s.id);
-        query = query.in('session_id', sessionIds);
+      if (memberships && memberships.length > 0) {
+        const workspaceIds = memberships.map((m) => m.workspace_id);
+        const { data: sessions } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('id')
+          .in('workspace_id', workspaceIds);
+
+        if (sessions) {
+          const sessionIds = sessions.map((s) => s.id);
+          query = query.in('session_id', sessionIds);
+        }
       }
     }
 

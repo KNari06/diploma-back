@@ -20,71 +20,58 @@ export class WorkspaceService {
         return null;
       }
 
-      // 1) Latest chat session workspace
-      const { data: chatSession, error: chatSessionError } = await supabaseAdmin
-        .from('chat_sessions')
-        .select('workspace_id, updated_at, created_at')
+      // 1) Get workspaces user is a member of (workspace membership model)
+      const { data: memberships, error: membershipError } = await supabaseAdmin
+        .from('workspace_members')
+        .select('workspace_id')
         .eq('user_id', userId)
-        .not('workspace_id', 'is', null)
-        .order('updated_at', { ascending: false })
-        .order('created_at', { ascending: false })
-        .limit(1);
+        .eq('status', 'active');
 
-      if (chatSessionError) {
-        logger.warn('[WORKSPACE] Failed to resolve active workspace from chat_sessions', {
+      if (membershipError) {
+        logger.warn('[WORKSPACE] Failed to resolve workspaces from membership', {
           userId,
-          code: (chatSessionError as any)?.code,
-          message: (chatSessionError as any)?.message,
-          details: (chatSessionError as any)?.details,
-        });
-      } else if (Array.isArray(chatSession) && chatSession[0]?.workspace_id) {
-        return String(chatSession[0].workspace_id);
-      }
-
-      // 2) Latest project workspace
-      const { data: project, error: projectError } = await supabaseAdmin
-        .from('projects')
-        .select('workspace_id, updated_at, created_at')
-        .eq('user_id', userId)
-        .not('workspace_id', 'is', null)
-        .order('updated_at', { ascending: false })
-        .order('created_at', { ascending: false })
-        .limit(1);
-
-      if (projectError) {
-        logger.warn('[WORKSPACE] Failed to resolve active workspace from projects', {
-          userId,
-          code: (projectError as any)?.code,
-          message: (projectError as any)?.message,
-          details: (projectError as any)?.details,
-        });
-      } else if (Array.isArray(project) && project[0]?.workspace_id) {
-        return String(project[0].workspace_id);
-      }
-
-      // 3) Fallback to oldest workspace
-      const { data: workspace, error: workspaceError } = await supabaseAdmin
-        .from('workspaces')
-        .select('id, created_at')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: true })
-        .limit(1);
-
-      if (workspaceError) {
-        logger.warn('[WORKSPACE] Failed to resolve fallback workspace', {
-          userId,
-          code: (workspaceError as any)?.code,
-          message: (workspaceError as any)?.message,
-          details: (workspaceError as any)?.details,
+          code: (membershipError as any)?.code,
+          message: (membershipError as any)?.message,
         });
         return null;
       }
 
-      if (Array.isArray(workspace) && workspace[0]?.id) {
-        return String(workspace[0].id);
+      if (!memberships || memberships.length === 0) {
+        // Fallback: check if user owns a workspace directly (owner who may not have membership row)
+        const { data: ownedWorkspace } = await supabaseAdmin
+          .from('workspaces')
+          .select('id')
+          .eq('user_id', userId)
+          .order('created_at', { ascending: true })
+          .limit(1);
+
+        if (Array.isArray(ownedWorkspace) && ownedWorkspace[0]?.id) {
+          return String(ownedWorkspace[0].id);
+        }
+        return null;
       }
 
-      return null;
+      // If only one workspace, return it directly
+      if (memberships.length === 1) {
+        return String(memberships[0].workspace_id);
+      }
+
+      // Multiple workspaces — pick the one with most recent chat activity
+      const workspaceIds = memberships.map(m => m.workspace_id);
+      const { data: recentSession } = await supabaseAdmin
+        .from('chat_sessions')
+        .select('workspace_id, updated_at')
+        .in('workspace_id', workspaceIds)
+        .not('workspace_id', 'is', null)
+        .order('updated_at', { ascending: false })
+        .limit(1);
+
+      if (Array.isArray(recentSession) && recentSession[0]?.workspace_id) {
+        return String(recentSession[0].workspace_id);
+      }
+
+      // Fallback: return first workspace from membership
+      return String(memberships[0].workspace_id);
     } catch (error) {
       logger.error('[WORKSPACE] Exception resolving active workspace', { error, userId });
       return null;

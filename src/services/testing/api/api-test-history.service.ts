@@ -72,6 +72,35 @@ export interface ApiTestDetails extends ApiTestHistoryItem {
  */
 export class ApiTestHistoryService {
   /**
+   * Get chat session IDs accessible to a user via workspace membership.
+   * Used to scope chat_messages queries to sessions the user can access.
+   */
+  private static async getAccessibleSessionIds(userId: string, projectId?: string): Promise<string[]> {
+    // Get workspaces the user is a member of
+    const { data: memberships } = await supabaseAdmin
+      .from('workspace_members')
+      .select('workspace_id')
+      .eq('user_id', userId)
+      .eq('status', 'active');
+
+    if (!memberships || memberships.length === 0) return [];
+
+    const workspaceIds = memberships.map(m => m.workspace_id);
+
+    let query = supabaseAdmin
+      .from('chat_sessions')
+      .select('id')
+      .in('workspace_id', workspaceIds);
+
+    if (projectId) {
+      query = query.eq('project_id', projectId);
+    }
+
+    const { data: sessions } = await query;
+    return sessions?.map(s => s.id) || [];
+  }
+
+  /**
    * Get all API tests for a user (merged from api_test_executions + chat_messages)
    * NEW: Combines data from both tables for complete information
    */
@@ -116,20 +145,12 @@ export class ApiTestHistoryService {
       // ═══════════════════════════════════════════════════════════════════
       // STEP 2: Get data from chat_messages (fallback + additional info)
       // ═══════════════════════════════════════════════════════════════════
-      const { data: sessions, error: sessionsError } = await supabaseAdmin
-        .from('chat_sessions')
-        .select('id')
-        .eq('user_id', userId);
-
-      if (sessionsError) {
-        throw new Error(`Failed to get chat sessions: ${sessionsError.message}`);
-      }
+      const sessionIds = await this.getAccessibleSessionIds(userId);
 
       let messagesData: any[] = [];
       let messagesCount = 0;
 
-      if (sessions && sessions.length > 0) {
-        const sessionIds = sessions.map(s => s.id);
+      if (sessionIds.length > 0) {
 
         // Get count
         const { count, error: countError } = await supabaseAdmin
@@ -373,15 +394,10 @@ export class ApiTestHistoryService {
       // Extract session ID from testId if possible (format: api_planId_timestamp or api_sessionId_timestamp)
       const testIdParts = testId.split('_');
       if (testIdParts.length >= 3) {
-        // Try to find by chat_session_id (testId might contain session info)
-        const { data: sessions } = await supabaseAdmin
-          .from('chat_sessions')
-          .select('id')
-          .eq('user_id', userId);
+        // Try to find by chat_session_id via workspace membership
+        const sessionIds = await this.getAccessibleSessionIds(userId);
 
-        if (sessions && sessions.length > 0) {
-          const sessionIds = sessions.map(s => s.id);
-
+        if (sessionIds.length > 0) {
           // Search in executions by chat_session_id
           const { data: executions } = await supabaseAdmin
             .from('api_test_executions')
@@ -417,19 +433,12 @@ export class ApiTestHistoryService {
       // ═══════════════════════════════════════════════════════════════════
       // STEP 2: Get from chat_messages (fallback + additional info)
       // ═══════════════════════════════════════════════════════════════════
-      const { data: sessions, error: sessionsError } = await supabaseAdmin
-        .from('chat_sessions')
-        .select('id')
-        .eq('user_id', userId);
-
-      if (sessionsError) {
-        throw new Error(`Failed to get chat sessions: ${sessionsError.message}`);
-      }
+      const accessibleSessionIds = await this.getAccessibleSessionIds(userId);
 
       let message: any = null;
 
-      if (sessions && sessions.length > 0) {
-        const sessionIds = sessions.map(s => s.id);
+      if (accessibleSessionIds.length > 0) {
+        const sessionIds = accessibleSessionIds;
 
         // Search for API test message by testId in metadata
         const { data: msg, error: messageError } = await supabaseAdmin
@@ -632,18 +641,10 @@ export class ApiTestHistoryService {
 
       const offset = (page - 1) * limit;
 
-      // Get all chat sessions for user
-      const { data: sessions, error: sessionsError } = await supabaseAdmin
-        .from('chat_sessions')
-        .select('id, project_id')
-        .eq('user_id', userId)
-        .eq('project_id', projectId);
+      // Get accessible chat sessions for user via workspace membership, filtered by project
+      const sessionIds = await this.getAccessibleSessionIds(userId, projectId);
 
-      if (sessionsError) {
-        throw new Error(`Failed to get chat sessions: ${sessionsError.message}`);
-      }
-
-      if (!sessions || sessions.length === 0) {
+      if (sessionIds.length === 0) {
         return {
           success: true,
           data: [],
@@ -656,8 +657,6 @@ export class ApiTestHistoryService {
           timestamp: new Date(),
         };
       }
-
-      const sessionIds = sessions.map(s => s.id);
 
       // Get total count
       const { count, error: countError } = await supabaseAdmin

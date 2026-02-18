@@ -1,10 +1,31 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { logger } from '@/utils/core/logger';
 
 /**
  * Service for chat-related database operations
  */
 export class ChatService {
+  /**
+   * Verify that a user has access to a chat session via workspace membership.
+   * Returns the session's workspace_id if access is granted, null otherwise.
+   */
+  private static async verifySessionAccess(
+    sessionId: string,
+    userId: string
+  ): Promise<string | null> {
+    const { data: session } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('workspace_id')
+      .eq('id', sessionId)
+      .maybeSingle();
+
+    if (!session?.workspace_id) return null;
+
+    const isMember = await WorkspaceAccessService.isMember(userId, session.workspace_id);
+    return isMember ? session.workspace_id : null;
+  }
+
   /**
    * Save chat messages to database
    * @param sessionId - Chat session ID
@@ -112,17 +133,11 @@ export class ChatService {
     const validLimit = Math.max(1, Math.min(100, Math.floor(limit || 20)));
 
     try {
-      // SECURITY: Verify session belongs to user if userId provided
+      // SECURITY: Verify user is a workspace member if userId provided
       if (userId) {
-        const { data: session } = await supabaseAdmin
-          .from('chat_sessions')
-          .select('id')
-          .eq('id', sessionId)
-          .eq('user_id', userId)
-          .maybeSingle();
-
-        if (!session) {
-          logger.warn('[CHAT_SERVICE] Session access denied - not owned by user', {
+        const workspaceId = await ChatService.verifySessionAccess(sessionId, userId);
+        if (!workspaceId) {
+          logger.warn('[CHAT_SERVICE] Session access denied - not a workspace member', {
             sessionId,
             userId: userId.substring(0, 8) + '...',
           });
@@ -353,16 +368,10 @@ export class ChatService {
     }
 
     try {
-      // ✅ SECURITY: Verify session belongs to user if userId provided
+      // ✅ SECURITY: Verify user is a workspace member if userId provided
       if (userId) {
-        const { data: session } = await supabaseAdmin
-          .from('chat_sessions')
-          .select('id')
-          .eq('id', sessionId)
-          .eq('user_id', userId)
-          .maybeSingle();
-
-        if (!session) {
+        const workspaceId = await ChatService.verifySessionAccess(sessionId, userId);
+        if (!workspaceId) {
           logger.warn('[CHAT_SERVICE] Session access denied in updateSessionProject', {
             sessionId,
             userId: userId.substring(0, 8) + '...',
@@ -371,17 +380,10 @@ export class ChatService {
         }
       }
 
-      let query = supabaseAdmin
+      const { error } = await supabaseAdmin
         .from('chat_sessions')
         .update({ project_id: projectId })
         .eq('id', sessionId);
-
-      // Add user_id filter if provided for additional security
-      if (userId) {
-        query = query.eq('user_id', userId);
-      }
-
-      const { error } = await query;
 
       if (error) {
         logger.error('[CHAT_SERVICE] Failed to update session project', {
@@ -432,7 +434,16 @@ export class ChatService {
     }
 
     try {
-      let query = supabaseAdmin
+      // SECURITY: Verify workspace membership if userId provided
+      if (userId) {
+        const workspaceId = await ChatService.verifySessionAccess(sessionId, userId);
+        if (!workspaceId) {
+          logger.debug('[CHAT_SERVICE] Session access denied in getSessionWithProject', { sessionId });
+          return null;
+        }
+      }
+
+      const { data, error } = await supabaseAdmin
         .from('chat_sessions')
         .select(`
           id,
@@ -445,14 +456,8 @@ export class ChatService {
             settings
           )
         `)
-        .eq('id', sessionId);
-
-      // SECURITY: Filter by userId if provided
-      if (userId) {
-        query = query.eq('user_id', userId);
-      }
-
-      const { data, error } = await query.maybeSingle();
+        .eq('id', sessionId)
+        .maybeSingle();
 
       if (error) {
         logger.error('[CHAT_SERVICE] Failed to get session with project', {
@@ -596,11 +601,24 @@ export class ChatService {
     const validOffset = Math.max(0, Math.floor(offset || 0));
 
     try {
-      // Build query with optional workspace filter
+      // Build query — workspace-based model: filter by workspace membership
+      // If workspaceId is provided, use it directly; otherwise we still need a workspace context
+      if (!workspaceId) {
+        logger.warn('[CHAT_SERVICE] getUserChatSessions called without workspaceId', { userId });
+        return { sessions: [], total: 0 };
+      }
+
+      // Verify workspace membership
+      const isMember = await WorkspaceAccessService.isMember(userId, workspaceId);
+      if (!isMember) {
+        logger.warn('[CHAT_SERVICE] User is not a workspace member', { userId, workspaceId });
+        return { sessions: [], total: 0 };
+      }
+
       let countQuery = supabaseAdmin
         .from('chat_sessions')
         .select('id', { count: 'exact', head: true })
-        .eq('user_id', userId);
+        .eq('workspace_id', workspaceId);
 
       let sessionsQuery = supabaseAdmin
         .from('chat_sessions')
@@ -616,13 +634,7 @@ export class ChatService {
             created_at
           )
         `)
-        .eq('user_id', userId);
-
-      // Multi-workspace: filter by workspace_id if provided
-      if (workspaceId) {
-        countQuery = countQuery.eq('workspace_id', workspaceId);
-        sessionsQuery = sessionsQuery.eq('workspace_id', workspaceId);
-      }
+        .eq('workspace_id', workspaceId);
 
       // Get total count
       const { count } = await countQuery;
@@ -720,26 +732,10 @@ export class ChatService {
     }
 
     try {
-      // Verify session belongs to user
-      const { data: session, error: verifyError } = await supabaseAdmin
-        .from('chat_sessions')
-        .select('id')
-        .eq('id', sessionId)
-        .eq('user_id', userId)
-        .maybeSingle();
-
-      if (verifyError) {
-        logger.warn('[CHAT_SERVICE] Error verifying session ownership', {
-          sessionId,
-          userId,
-          error: verifyError instanceof Error ? verifyError.message : String(verifyError),
-          code: verifyError.code,
-        });
-        return { success: false, message: 'Chat session not found' };
-      }
-
-      if (!session || !session.id) {
-        logger.warn('[CHAT_SERVICE] Session not found or unauthorized', {
+      // Verify user is a workspace member
+      const workspaceId = await ChatService.verifySessionAccess(sessionId, userId);
+      if (!workspaceId) {
+        logger.warn('[CHAT_SERVICE] Session not found or access denied', {
           sessionId,
           userId,
         });
@@ -750,8 +746,7 @@ export class ChatService {
       const { error: deleteError } = await supabaseAdmin
         .from('chat_sessions')
         .delete()
-        .eq('id', sessionId)
-        .eq('user_id', userId);
+        .eq('id', sessionId);
 
       if (deleteError) {
         logger.error('[CHAT_SERVICE] Failed to delete chat session', {
@@ -805,13 +800,21 @@ export class ChatService {
     }
 
     try {
+      // Verify workspace membership
+      const workspaceId = await ChatService.verifySessionAccess(sessionId, userId);
+      if (!workspaceId) {
+        logger.warn('[CHAT_SERVICE] Session not found or access denied', {
+          sessionId,
+          userId,
+        });
+        return { success: false, message: 'Chat session not found' };
+      }
 
-      // Update title (with user verification)
+      // Update title
       const { data, error } = await supabaseAdmin
         .from('chat_sessions')
         .update({ title: title.trim() })
         .eq('id', sessionId)
-        .eq('user_id', userId)
         .select('id')
         .maybeSingle();
 
@@ -826,7 +829,7 @@ export class ChatService {
       }
 
       if (!data) {
-        logger.warn('[CHAT_SERVICE] Session not found or unauthorized', {
+        logger.warn('[CHAT_SERVICE] Session not found after access check', {
           sessionId,
           userId,
         });
