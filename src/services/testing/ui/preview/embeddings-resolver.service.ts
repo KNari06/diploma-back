@@ -1,22 +1,24 @@
 /**
- * Embeddings Resolver Service V3
+ * Embeddings Resolver Service V6
  * Language-agnostic element resolution using multilingual embeddings
- * 
- * Architecture (V3):
- * 1. Build HardAllowed/SoftAllowed sets via deterministic rules
- * 2. Apply contextual deterministic rules (label/aria/autocomplete)
- * 3. Embeddings only SORT allowed candidates (never decide status)
- * 4. Status decision based on allowed count:
- *    - 0 allowed → AI fallback
+ *
+ * Architecture (V6 — simplified):
+ * 1. Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync, fast)
+ * 2. Check for exact quoted text short-circuit ('Login', "Submit")
+ * 3. Rank allowed candidates by embedding cosine similarity
+ * 4. Apply count-based decision policy:
+ *    - 0 allowed → Gemini Flash rescue (last-resort AI)
  *    - 1 allowed → resolved
- *    - >1 allowed → needs_clarification (unless rule short-circuit)
+ *    - >1 allowed → LLM disambiguation or needs_clarification
+ *
+ * Philosophy: DOM-structural rules only (tag, type, visibility, state).
+ * All text-based matching (typos, spaces, multilingual) is handled by embeddings + AI.
+ * No hardcoded keyword lists, no fuzzy matching, no space-stripping heuristics.
  */
 
-import { generateEmbedding, generateEmbeddings } from '@/services/ai/core/embedding.service';
+import { generateEmbedding, generateEmbeddings, cosineSimilarity } from '@/services/ai/core/embedding.service';
 import { generateText } from '@/services/ai/core/ai-provider.service';
 import { logger } from '@/utils/core/logger';
-import { cosineSimilarity } from '@/utils/text-processing/vector';
-import { extractKeywordsWithAI } from '@/utils/text-processing/ai-keyword-extractor';
 import {
     disambiguateWithLLM,
     nodeToDisambiguationCandidate,
@@ -169,235 +171,56 @@ export interface AllowedSetResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// V3: DETERMINISTIC CONTEXT RULES
+// INTENT EMBEDDING CACHE
 // ═══════════════════════════════════════════════════════════════════════════
-
-// Anchor phrases for embedding-based intent classification.
-// These are English-only — multilingual embeddings map all languages into the same space,
-// so "пароль", "şifre", "contraseña" will all score high against "password field".
-const PASSWORD_ANCHOR = 'password field';
-const USERNAME_ANCHOR = 'username login email field';
-
-// Minimum cosine similarity to classify intent as password/username
-const INTENT_SIMILARITY_THRESHOLD = 0.60;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ANCHOR + INTENT EMBEDDING CACHE
-// ═══════════════════════════════════════════════════════════════════════════
-
-/** Cached anchor embeddings — computed once, reused forever (they never change). */
-let cachedPasswordAnchorEmb: number[] | null = null;
-let cachedUsernameAnchorEmb: number[] | null = null;
-let anchorEmbeddingsLoading: Promise<void> | null = null;
-
-/**
- * Ensure anchor embeddings are loaded. Safe to call multiple times —
- * concurrent callers will await the same promise (no duplicate API calls).
- */
-async function ensureAnchorEmbeddings(): Promise<{ passwordEmb: number[]; usernameEmb: number[] }> {
-  if (cachedPasswordAnchorEmb && cachedUsernameAnchorEmb) {
-    return { passwordEmb: cachedPasswordAnchorEmb, usernameEmb: cachedUsernameAnchorEmb };
-  }
-
-  if (!anchorEmbeddingsLoading) {
-    anchorEmbeddingsLoading = (async () => {
-      const [pEmb, uEmb] = await Promise.all([
-        generateEmbedding(PASSWORD_ANCHOR),
-        generateEmbedding(USERNAME_ANCHOR),
-      ]);
-      cachedPasswordAnchorEmb = pEmb;
-      cachedUsernameAnchorEmb = uEmb;
-    })();
-  }
-
-  await anchorEmbeddingsLoading;
-  return { passwordEmb: cachedPasswordAnchorEmb!, usernameEmb: cachedUsernameAnchorEmb! };
-}
 
 /**
  * Cache for intent embeddings — avoids duplicate API calls when the same
- * intent text is used in both classifyIntent() and rankCandidatesByEmbedding().
- * Key: normalized intent text, Value: embedding vector.
+ * intent text appears in multiple ranking calls.
+ * Key: normalized intent text (lowercased, trimmed, sliced to 200 chars).
  */
 const intentEmbeddingCache = new Map<string, number[]>();
 const INTENT_EMB_CACHE_MAX_SIZE = 200;
 
 /**
- * Get or compute intent embedding (with cache).
- * Reusable across classifyIntent and rankCandidatesByEmbedding.
+ * In-flight dedup: if two concurrent calls request the same intent embedding,
+ * they share one API call instead of making two.
+ */
+const intentEmbeddingInFlight = new Map<string, Promise<number[]>>();
+
+/**
+ * Get or compute intent embedding with caching and in-flight dedup.
+ * On error, the promise rejects and is NOT cached — next caller retries fresh.
  */
 async function getIntentEmbedding(intentText: string): Promise<number[]> {
   const cacheKey = intentText.toLowerCase().trim().slice(0, 200);
+
+  // 1. Cache hit
   const cached = intentEmbeddingCache.get(cacheKey);
   if (cached) return cached;
 
-  const embedding = await generateEmbedding(intentText);
+  // 2. In-flight dedup — share the existing promise
+  const inFlight = intentEmbeddingInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
 
-  if (intentEmbeddingCache.size >= INTENT_EMB_CACHE_MAX_SIZE) {
-    const firstKey = intentEmbeddingCache.keys().next().value;
-    if (firstKey !== undefined) intentEmbeddingCache.delete(firstKey);
-  }
-  intentEmbeddingCache.set(cacheKey, embedding);
-  return embedding;
-}
-
-// Cache for intent classification results (keyed by normalized intent text)
-const intentClassificationCache = new Map<string, { isPassword: boolean; isUsername: boolean; confidence: number }>();
-const INTENT_CACHE_MAX_SIZE = 500;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// FUZZY TEXT MATCHING UTILITIES
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Compute Levenshtein edit distance between two strings.
- * Inline implementation to avoid dependency on transitive `leven` package.
- */
-export function levenshteinDistance(a: string, b: string): number {
-  if (a === b) return 0;
-  if (a.length === 0) return b.length;
-  if (b.length === 0) return a.length;
-  if (a.length > b.length) { [a, b] = [b, a]; }
-
-  const aLen = a.length;
-  const bLen = b.length;
-  let prev = Array.from({ length: aLen + 1 }, (_, i) => i);
-  let curr = new Array(aLen + 1);
-
-  for (let j = 1; j <= bLen; j++) {
-    curr[0] = j;
-    for (let i = 1; i <= aLen; i++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      curr[i] = Math.min(prev[i] + 1, curr[i - 1] + 1, prev[i - 1] + cost);
-    }
-    [prev, curr] = [curr, prev];
-  }
-  return prev[aLen];
-}
-
-/**
- * Max allowed edit distance for fuzzy matching, scales with keyword length.
- * short words (<=4): 1 edit, medium (5-8): 2 edits, long (>8): 3 edits
- */
-function maxEditDistance(kwLen: number): number {
-  if (kwLen <= 4) return 1;
-  if (kwLen <= 8) return 2;
-  return 3;
-}
-
-/**
- * Fuzzy substring check: does `text` contain `keyword` (with typo tolerance)?
- * Returns confidence: 1.0 exact, 0.95 space-stripped, 0.5-0.9 fuzzy, 0 no match.
- */
-export function fuzzyContains(text: string, keyword: string): { matched: boolean; confidence: number } {
-  if (!text || !keyword) return { matched: false, confidence: 0 };
-
-  // Fast path: exact substring
-  if (text.includes(keyword)) return { matched: true, confidence: 1.0 };
-
-  // Space-stripped match ("log in" vs "login")
-  const textNoSpaces = text.replace(/\s+/g, '');
-  const kwNoSpaces = keyword.replace(/\s+/g, '');
-  if (kwNoSpaces.length > 0 && textNoSpaces.includes(kwNoSpaces)) {
-    return { matched: true, confidence: 0.95 };
-  }
-
-  // Levenshtein sliding window over space-stripped text
-  const kwLen = kwNoSpaces.length;
-  if (kwLen < 3) return { matched: false, confidence: 0 }; // too short for fuzzy
-  const maxDist = maxEditDistance(kwLen);
-
-  for (let windowSize = Math.max(1, kwLen - 1); windowSize <= kwLen + 1; windowSize++) {
-    for (let i = 0; i <= textNoSpaces.length - windowSize; i++) {
-      const window = textNoSpaces.substring(i, i + windowSize);
-      const dist = levenshteinDistance(window, kwNoSpaces);
-      if (dist <= maxDist) {
-        const confidence = Math.max(0.5, Math.min(0.9, 1.0 - dist / (kwLen * 0.5)));
-        return { matched: true, confidence };
+  // 3. Start new request
+  const promise = generateEmbedding(intentText)
+    .then(embedding => {
+      // Cache only on success (don't cache errors)
+      if (intentEmbeddingCache.size >= INTENT_EMB_CACHE_MAX_SIZE) {
+        const firstKey = intentEmbeddingCache.keys().next().value;
+        if (firstKey !== undefined) intentEmbeddingCache.delete(firstKey);
       }
-    }
-  }
-
-  return { matched: false, confidence: 0 };
-}
-
-/**
- * Classify intent text as password/username using embedding similarity.
- * Language-agnostic: multilingual embeddings map all languages to the same space.
- *
- * API calls:
- * - Anchor embeddings: computed ONCE and cached forever (2 calls on first use, 0 after)
- * - Intent embedding: cached via getIntentEmbedding() and reused by rankCandidatesByEmbedding()
- * - Total per new intent: 1 API call (just the intent text)
- *
- * Falls back to { isPassword: false, isUsername: false } if embeddings fail.
- */
-async function classifyIntent(intentText: string): Promise<{
-  isPassword: boolean;
-  isUsername: boolean;
-  confidence: number;
-}> {
-  const cacheKey = intentText.toLowerCase().trim().slice(0, 200);
-  const cached = intentClassificationCache.get(cacheKey);
-  if (cached) return cached;
-
-  try {
-    // Anchor embeddings are cached forever; intent embedding is cached per-text
-    const [intentEmb, anchors] = await Promise.all([
-      getIntentEmbedding(intentText),
-      ensureAnchorEmbeddings(),
-    ]);
-
-    const passwordSim = cosineSimilarity(intentEmb, anchors.passwordEmb);
-    const usernameSim = cosineSimilarity(intentEmb, anchors.usernameEmb);
-    const maxSim = Math.max(passwordSim, usernameSim);
-
-    const result = {
-      isPassword: passwordSim >= INTENT_SIMILARITY_THRESHOLD && passwordSim >= usernameSim,
-      isUsername: usernameSim >= INTENT_SIMILARITY_THRESHOLD && usernameSim > passwordSim,
-      confidence: maxSim,
-    };
-
-    if (intentClassificationCache.size >= INTENT_CACHE_MAX_SIZE) {
-      const firstKey = intentClassificationCache.keys().next().value;
-      if (firstKey !== undefined) intentClassificationCache.delete(firstKey);
-    }
-    intentClassificationCache.set(cacheKey, result);
-
-    logger.debug('[EMBEDDINGS_RESOLVER] Intent classified', {
-      intentPreview: intentText.slice(0, 50),
-      passwordSim: passwordSim.toFixed(3),
-      usernameSim: usernameSim.toFixed(3),
-      isPassword: result.isPassword,
-      isUsername: result.isUsername,
+      intentEmbeddingCache.set(cacheKey, embedding);
+      return embedding;
+    })
+    .finally(() => {
+      // Always clean up in-flight tracker (success or failure)
+      intentEmbeddingInFlight.delete(cacheKey);
     });
 
-    return result;
-  } catch (error) {
-    logger.warn('[EMBEDDINGS_RESOLVER] Intent classification failed, defaulting to no-classification', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return { isPassword: false, isUsername: false, confidence: 0 };
-  }
-}
-
-/**
- * Check if node is a password field — based purely on DOM attributes (no keyword lists).
- * type="password" and autocomplete values are 100% reliable signals.
- */
-function isPasswordField(node: InteractiveNode): boolean {
-  if (node.type === 'password' || node.inputType === 'password') return true;
-  if (node.autocomplete === 'current-password' || node.autocomplete === 'new-password') return true;
-  return false;
-}
-
-/**
- * Check if node is a username/email field — based purely on DOM attributes (no keyword lists).
- */
-function isUsernameField(node: InteractiveNode): boolean {
-  if (node.type === 'email' || node.inputType === 'email') return true;
-  if (node.autocomplete === 'username' || node.autocomplete === 'email') return true;
-  return false;
+  intentEmbeddingInFlight.set(cacheKey, promise);
+  return promise;
 }
 
 /**
@@ -437,23 +260,6 @@ function isFillCompatibleTextField(node: InteractiveNode): boolean {
 }
 
 /**
- * Extract a “searchable” text blob for deterministic lexical checks.
- */
-function getNodeSearchText(node: InteractiveNode): string {
-  return [
-    node.labelText,
-    node.ariaLabel,
-    node.placeholder,
-    node.text,
-    node.name,
-    node.autocomplete,
-  ]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
-}
-
-/**
  * Check if node label/aria/placeholder contains exact quoted text from intent
  * Supports: 'exact text' or "exact text" patterns
  */
@@ -478,27 +284,28 @@ function matchesExactQuotedText(node: InteractiveNode, intentText: string): bool
 }
 
 /**
- * Build HardAllowed and SoftAllowed sets based on deterministic rules
- * V3: Core function for element filtering before embeddings
- * V4: Uses AI-powered keyword extraction (multilingual)
+ * Build HardAllowed and SoftAllowed sets based on deterministic DOM-structural rules.
+ * V6: Synchronous — no AI calls. All text-based matching delegated to embeddings + AI.
+ *
+ * Rules applied (in order):
+ * 1. Visibility (isVisible=false → hard exclude)
+ * 2. Disabled (isDisabled=true → hard exclude)
+ * 3. Readonly for writable actions → hard exclude
+ * 3b. Tag/type compatibility for `type` action → hard exclude
+ * 4. State-aware action checks (check/uncheck/open/close) → hard exclude
+ * 5. Tag/role compatibility for action → hard exclude or soft penalize
+ * Soft: covered by overlay, dynamic ID
+ * Short-circuit: exact quoted text match ('Login', "Submit")
  */
-export async function buildAllowedSets(
+export function buildAllowedSets(
   nodes: InteractiveNode[],
   actionType: IntentActionType,
   intentText: string
-): Promise<AllowedSetResult> {
+): AllowedSetResult {
   const hardAllowed: InteractiveNode[] = [];
   const softAllowed: InteractiveNode[] = [];
   const ruleTrace: RuleTraceEntry[] = [];
   let shortCircuitRef: string | undefined;
-
-  // Classify intent and extract keywords in parallel
-  const [intentClass, intentKeywords] = await Promise.all([
-    classifyIntent(intentText),
-    extractKeywordsWithAI(intentText),
-  ]);
-  const intentIsPassword = intentClass.isPassword;
-  const passwordIntentConfidence = intentClass.confidence;
 
   // Track exact quote match candidates for potential short-circuit
   const exactMatchRefs: string[] = [];
@@ -729,55 +536,6 @@ export async function buildAllowedSets(
       }
     }
     
-    // Rule 6: Password isolation (if intent is NOT password, exclude password fields)
-    // V5: When confidence is 0 (no fuzzy match at all) → hard exclude
-    //     When confidence > 0 but uncertain (typo) → soft penalty, let embeddings decide
-    if (!excluded && actionType === 'type' && !intentIsPassword && isPasswordField(node)) {
-      if (passwordIntentConfidence === 0) {
-        excluded = true;
-        nodeRules.push({
-          ruleId: 'context.password_isolation',
-          version: 'v2',
-          action: 'exclude',
-          evidence: 'Intent does not mention password (confidence=0), node is password field',
-          affectedRefs: [node.ref],
-        });
-      } else {
-        isSoft = true;
-        nodeRules.push({
-          ruleId: 'context.password_isolation_soft',
-          version: 'v2',
-          action: 'penalize',
-          evidence: `Intent may mention password (fuzzy confidence=${passwordIntentConfidence.toFixed(2)}), soft penalty`,
-          affectedRefs: [node.ref],
-        });
-      }
-    }
-    
-    // Rule 7: Username isolation (if intent is password, exclude username fields)
-    // V5: Only hard exclude if password confidence is high (>= 0.9), else soft penalty
-    if (!excluded && actionType === 'type' && intentIsPassword && isUsernameField(node) && !isPasswordField(node)) {
-      if (passwordIntentConfidence >= 0.9) {
-        excluded = true;
-        nodeRules.push({
-          ruleId: 'context.username_isolation',
-          version: 'v2',
-          action: 'exclude',
-          evidence: `Intent mentions password (confidence=${passwordIntentConfidence.toFixed(2)}), node is username/email field`,
-          affectedRefs: [node.ref],
-        });
-      } else {
-        isSoft = true;
-        nodeRules.push({
-          ruleId: 'context.username_isolation_soft',
-          version: 'v2',
-          action: 'penalize',
-          evidence: `Intent may mention password (fuzzy confidence=${passwordIntentConfidence.toFixed(2)}), soft penalty`,
-          affectedRefs: [node.ref],
-        });
-      }
-    }
-    
     // ═══════════════════════════════════════════════════════════════════════
     // SOFT RULES: Penalize but don't exclude
     // ═══════════════════════════════════════════════════════════════════════
@@ -865,50 +623,12 @@ export async function buildAllowedSets(
     });
   }
 
-  // Deterministic lexical short-circuit (label/aria/placeholder/name/autocomplete)
-  // If exactly one allowed element has strong lexical overlap with intent keywords,
-  // we can safely auto-resolve without using embeddings.
-  if (!shortCircuitRef && intentKeywords.length > 0) {
-    const allowedAll = [...hardAllowed, ...softAllowed];
-    const matchedRefs: string[] = [];
-
-    for (const node of allowedAll) {
-      if (!node.ref) continue;
-      const txt = getNodeSearchText(node);
-      const txtNoSpaces = txt.replace(/\s+/g, '');
-      const matchCount = intentKeywords.filter((kw) => {
-        if (txt.includes(kw)) return true;
-        // Space-insensitive: "log in" matches "login"
-        const kwNoSpaces = kw.replace(/\s+/g, '');
-        return kwNoSpaces.length > 0 && txtNoSpaces.includes(kwNoSpaces);
-      }).length;
-      const ratio = matchCount / intentKeywords.length;
-
-      // “Strong enough” means at least one meaningful hit and decent ratio.
-      if (matchCount >= 1 && (ratio >= 0.6 || matchCount >= 2)) {
-        matchedRefs.push(node.ref);
-      }
-    }
-
-    if (matchedRefs.length === 1) {
-      shortCircuitRef = matchedRefs[0];
-      ruleTrace.push({
-        ruleId: 'decision.lexical_shortcircuit',
-        version: 'v1',
-        action: 'shortcircuit',
-        evidence: `Single strong lexical match for keywords=[${intentKeywords.join(', ')}]`,
-        affectedRefs: [shortCircuitRef],
-      });
-    }
-  }
-  
   // Log rule trace summary
   logger.debug('[EMBEDDINGS_RESOLVER] Built allowed sets', {
     hardAllowedCount: hardAllowed.length,
     softAllowedCount: softAllowed.length,
     rulesApplied: ruleTrace.length,
     shortCircuitRef,
-    intentKeywordCount: intentKeywords.length,
   });
   
   return { hardAllowed, softAllowed, ruleTrace, shortCircuitRef };
@@ -1279,7 +999,7 @@ async function rankCandidatesByEmbedding(params: {
     return { ranked: [], cacheHit: false, latencyMs: 0 };
   }
 
-  // Reuse cached intent embedding from classifyIntent() if available, else compute fresh
+  // Get (or compute) intent embedding — shared via in-flight dedup cache
   const intentEmbedding = await withTimeout(
     getIntentEmbedding(intentText),
     EMBEDDING_TIMEOUT_MS,
@@ -1557,9 +1277,12 @@ function applyDecisionPolicy(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * V5: Last-resort rescue when deterministic rules excluded ALL elements.
+ * V6: Last-resort rescue when deterministic rules excluded ALL elements.
  * Calls Gemini Flash (task:'fast') with a 3s timeout to pick the best match
  * from excluded-but-visible nodes. Only used when allowedCount === 0.
+ *
+ * Uses a high-quality prompt with action-type semantics and multilingual awareness,
+ * matching the quality bar of the LLM disambiguation service.
  */
 async function rescueWithGeminiFlash(params: {
   intentText: string;
@@ -1578,49 +1301,81 @@ async function rescueWithGeminiFlash(params: {
   const candidateList = rescueCandidates.map((n, i) => {
     const attrs: string[] = [];
     if (n.labelText) attrs.push(`label="${n.labelText}"`);
-    if (n.ariaLabel) attrs.push(`aria="${n.ariaLabel}"`);
+    if (n.ariaLabel) attrs.push(`aria-label="${n.ariaLabel}"`);
     if (n.placeholder) attrs.push(`placeholder="${n.placeholder}"`);
     if (n.text && n.text.length <= 50) attrs.push(`text="${n.text}"`);
     if (n.name) attrs.push(`name="${n.name}"`);
     if (n.autocomplete) attrs.push(`autocomplete="${n.autocomplete}"`);
     if (n.type || n.inputType) attrs.push(`type="${n.type || n.inputType}"`);
-    return `${i + 1}. ref="${n.ref}" <${n.tag}${n.role ? ` role=${n.role}` : ''}> ${attrs.join(' ')}`;
+    if (n.role) attrs.push(`role="${n.role}"`);
+    return `${i + 1}. ref="${n.ref}" <${n.tag}> ${attrs.join(' ')}`;
   }).join('\n');
 
-  const prompt = `Match a user's UI test step to a web element.
+  const systemPrompt = `You are an AI element selector for a browser testing tool.
 
-USER INTENT: "${intentText}"
+TASK: The user wants to perform a "${actionType}" action. Select the element that BEST matches their intent.
+
+ACTION-TYPE SEMANTICS:
+- type/fill: prefer <input>, <textarea>, or role=textbox. The element must be editable.
+- click: prefer <button>, <a>, or elements with role=button/link/tab/menuitem.
+- select: prefer <select>, role=combobox/listbox, or dropdown-trigger elements.
+- check/uncheck/toggle: prefer checkbox/radio/switch controls.
+- hover/press/scroll: prefer the closest matching interactive element.
+
+RULES:
+1. Match by semantic meaning of the intent to the element's label/aria-label/placeholder/text.
+2. Consider action type — e.g., for "type", only editable fields are valid.
+3. Use multilingual semantic understanding; do NOT translate literally.
+4. If multiple elements could match, pick the one whose label/text is semantically closest.
+5. Only use refs from the provided list — never invent refs.
+6. If no element is a confident match, return ref as null.
+7. Respond ONLY with valid JSON, no markdown or extra text.
+
+OUTPUT FORMAT:
+{"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
+If none match: {"ref":null,"confidence":0,"reason":"no match"}`;
+
+  const userPrompt = `USER INTENT: "${intentText}"
 ACTION: ${actionType}
 PAGE: ${pageUrl}
 
-ELEMENTS:
+CANDIDATE ELEMENTS:
 ${candidateList}
 
-Which element (ref) best matches? Only select if confident.
-Reply ONLY with JSON: {"ref":"eXX","confidence":0.0-1.0,"reason":"brief"}
-If none match: {"ref":null,"confidence":0,"reason":"no match"}`;
+Select the single best matching element. If unsure, return ref: null.`;
 
   try {
     const response = await generateText({
-      prompt,
+      prompt: `${systemPrompt}\n\n${userPrompt}`,
       task: 'fast',
       temperature: 0,
-      maxTokens: 80,
+      maxTokens: 100,
       timeout: 3000,
     });
 
-    const jsonMatch = response.content.match(/\{[\s\S]*\}/);
+    const jsonMatch = response.content.match(/\{[\s\S]*?\}/);
     if (!jsonMatch) return null;
 
     const parsed = JSON.parse(jsonMatch[0]);
+
+    // ref must be a non-empty string (null or absent = no match)
     if (!parsed.ref || typeof parsed.ref !== 'string') return null;
 
     const validRefs = new Set(rescueCandidates.map(n => n.ref));
-    if (!validRefs.has(parsed.ref)) return null;
+    if (!validRefs.has(parsed.ref)) {
+      logger.warn('[EMBEDDINGS_RESOLVER] Gemini Flash rescue: hallucinated ref rejected', {
+        ref: parsed.ref,
+      });
+      return null;
+    }
 
-    const confidence = typeof parsed.confidence === 'number'
-      ? Math.min(1, Math.max(0, parsed.confidence))
-      : 0;
+    // Handle confidence as number or numeric string (e.g., "0.85")
+    const rawConfidence = typeof parsed.confidence === 'number'
+      ? parsed.confidence
+      : typeof parsed.confidence === 'string'
+        ? parseFloat(parsed.confidence)
+        : 0;
+    const confidence = Number.isFinite(rawConfidence) ? Math.min(1, Math.max(0, rawConfidence)) : 0;
 
     if (confidence < 0.7) return null;
 
@@ -1710,8 +1465,8 @@ export async function resolveWithEmbeddings(params: {
   // Step 1: Prepare intent text
   const intentText = sanitizeIntent(stepDraft);
 
-  // Step 2: Build HardAllowed/SoftAllowed sets via deterministic rules (with AI keyword extraction)
-  const allowedResult = await buildAllowedSets(domNodes, stepDraft.type, intentText);
+  // Step 2: Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync)
+  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, intentText);
   const { hardAllowed, softAllowed, ruleTrace, shortCircuitRef } = allowedResult;
   
   // Combine allowed sets (hardAllowed first, then softAllowed)

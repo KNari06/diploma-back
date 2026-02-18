@@ -7,8 +7,6 @@ import {
     applyStructuralFilters,
     applySpatialTieBreakOrdering,
     buildCandidateText,
-    fuzzyContains,
-    levenshteinDistance,
     sanitizeIntent,
 } from '../embeddings-resolver.service';
 import type { IntentStep, InteractiveNode } from '../preview.types';
@@ -727,69 +725,6 @@ describe('EmbeddingsResolverService', () => {
     });
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // Fuzzy Matching Utilities (V5)
-  // ═══════════════════════════════════════════════════════════════════════════
-  describe('levenshteinDistance', () => {
-    it('should return 0 for identical strings', () => {
-      expect(levenshteinDistance('password', 'password')).toBe(0);
-    });
-
-    it('should handle single insertion', () => {
-      expect(levenshteinDistance('passwword', 'password')).toBe(1);
-    });
-
-    it('should handle single substitution', () => {
-      expect(levenshteinDistance('passvord', 'password')).toBe(1);
-    });
-
-    it('should handle transposition as 2 edits', () => {
-      expect(levenshteinDistance('lgoin', 'login')).toBe(2);
-    });
-
-    it('should handle empty strings', () => {
-      expect(levenshteinDistance('', 'abc')).toBe(3);
-      expect(levenshteinDistance('abc', '')).toBe(3);
-    });
-  });
-
-  describe('fuzzyContains', () => {
-    it('should return confidence 1.0 for exact substring match', () => {
-      const result = fuzzyContains('enter your password here', 'password');
-      expect(result.matched).toBe(true);
-      expect(result.confidence).toBe(1.0);
-    });
-
-    it('should return confidence 0.95 for space-stripped match (log in vs login)', () => {
-      const result = fuzzyContains('log in', 'login');
-      expect(result.matched).toBe(true);
-      expect(result.confidence).toBe(0.95);
-    });
-
-    it('should match typo with 1 extra char (passwword vs password)', () => {
-      const result = fuzzyContains('enter passwword', 'password');
-      expect(result.matched).toBe(true);
-      expect(result.confidence).toBeGreaterThanOrEqual(0.5);
-    });
-
-    it('should return no match for completely different text', () => {
-      const result = fuzzyContains('click submit button', 'password');
-      expect(result.matched).toBe(false);
-      expect(result.confidence).toBe(0);
-    });
-
-    it('should handle empty inputs gracefully', () => {
-      expect(fuzzyContains('', 'password')).toEqual({ matched: false, confidence: 0 });
-      expect(fuzzyContains('some text', '')).toEqual({ matched: false, confidence: 0 });
-    });
-
-    it('should not fuzzy match very short keywords (< 3 chars)', () => {
-      // "ab" is too short for fuzzy (only exact/space match)
-      const result = fuzzyContains('abcdef', 'xy');
-      expect(result.matched).toBe(false);
-    });
-
-  });
 
   // ═══════════════════════════════════════════════════════════════════════════
   // DOM-based field detection (no keyword lists)
