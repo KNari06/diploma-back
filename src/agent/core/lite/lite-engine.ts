@@ -1349,10 +1349,33 @@ export class LiteEngine {
               // After submit click, the page may navigate (e.g. login redirect).
               // Wait for navigation + stability so the NEXT iteration's snapshot
               // reflects the new page, not the stale login form.
+              //
+              // FIX: The old approach (waitForLoadState('domcontentloaded') + networkIdle)
+              // failed for SPAs because:
+              //   1. 'domcontentloaded' resolves instantly (already fired for current page)
+              //   2. networkIdle resolves instantly (auth request hasn't fired yet)
+              //   3. VisualStability passes (DOM hasn't changed yet)
+              // Result: next iteration gets a stale snapshot of the login form.
+              //
+              // New approach: wait for a concrete signal that the page reacted to
+              // the submit, THEN wait for everything to settle.
               if (autoFillStateName === 'submitting' && execResult.success) {
                 try {
-                  await this.page.waitForLoadState('domcontentloaded', { timeout: 10000 });
-                  await this.networkTracker.waitForNetworkIdle(5000);
+                  const currentUrl = this.page.url();
+
+                  // Phase 1: Wait for ANY signal that the submit had an effect.
+                  // Whichever fires first wins — we just need proof that the page reacted.
+                  // NOTE: Every promise gets its own .catch() to prevent unhandled rejection
+                  // warnings from the losers when the winner resolves first.
+                  await Promise.race([
+                    // Signal 1: A new fetch/xhr request starts (auth API call firing)
+                    this.waitForPendingRequest(2000).catch(() => {}),
+                    // Signal 2: URL changes (SPA client-side navigation or MPA full reload)
+                    this.page.waitForURL(url => url.href !== currentUrl, { timeout: 2000 }).catch(() => {}),
+                  ]);
+
+                  // Phase 2: Now that something happened, wait for it to finish.
+                  await this.networkTracker.waitForNetworkIdle(8000);
                   await VisualStability.waitForStable(this.page);
                 } catch {
                   // Timeout is OK — page might not navigate (e.g. validation error).
@@ -5112,6 +5135,23 @@ export class LiteEngine {
     });
 
     return decision;
+  }
+
+  /**
+   * Wait for at least one pending network request to appear.
+   * Used after form submit to detect the auth API call before checking networkIdle.
+   * Without this, networkIdle resolves instantly because the request hasn't fired yet.
+   */
+  private waitForPendingRequest(timeout: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const start = Date.now();
+      const check = () => {
+        if (this.networkTracker.getPendingCount() > 0) return resolve();
+        if (Date.now() - start > timeout) return reject(new Error('No pending request within timeout'));
+        setTimeout(check, 50);
+      };
+      check();
+    });
   }
 
   /**

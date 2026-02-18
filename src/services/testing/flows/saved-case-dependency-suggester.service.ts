@@ -1,14 +1,14 @@
 /**
  * Intent Case Dependency Suggester Service
  * Generates AI-powered dependency suggestions for intent_test_cases across a project.
- * Uses context-first approach: name matching, URL continuity, heuristics, and semantic similarity.
+ * Uses LLM classification (gpt-4o-mini) + URL continuity boost.
  *
  * NOTE: Service class name kept as SavedCaseDependencySuggester for API compatibility.
  * Now operates on intent_test_cases (unified table) instead of saved_test_cases.
  */
 
 import { supabaseAdmin } from '@/db/supabase';
-import { cosineSimilarity, generateEmbedding } from '@/services/ai/core/embedding.service';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 
 // ============================================================================
@@ -41,27 +41,73 @@ interface IntentCaseData {
   depends_on?: string[];
 }
 
+/** Shape of individual suggestion from LLM */
+interface LLMDependencySuggestion {
+  id: string;
+  confidence: number;
+  reason: string;
+}
+
+/** Shape of the full LLM JSON response */
+interface LLMClassificationResponse {
+  suggestions: LLMDependencySuggestion[];
+}
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
-/** Maximum number of suggestions to return */
+// --- Limits ---
 const MAX_SUGGESTIONS = 5;
 
-/** Maximum number of semantic comparisons (expensive embedding calls) */
-const MAX_SEMANTIC_COMPARISONS = 20;
-
-/** Minimum confidence threshold to include in suggestions */
+// --- Thresholds ---
 const MIN_CONFIDENCE_THRESHOLD = 0.25;
 
-/** Semantic similarity threshold */
-const SEMANTIC_SIMILARITY_THRESHOLD = 0.45;
+// --- URL Continuity Scoring (Strategy 2 — language-independent, kept as-is) ---
+const SCORE_URL_SAME_PAGE = 0.75;
+const SCORE_URL_AUTH_PATH = 0.7;
+const SCORE_URL_SAME_DOMAIN = 0.35;
 
-/** Keywords indicating a prerequisite test (login, auth, setup) */
-const PREREQ_KEYWORDS = ['login', 'auth', 'authenticate', 'sign in', 'signin', 'onboarding', 'setup', 'register', 'registration', 'create', 'add', 'new', 'init', 'open', 'navigate', 'go to'];
+/** Auth-related keywords for URL path matching */
+const AUTH_PATH_KEYWORDS = [
+  'login', 'auth', 'signin', 'sign-in',
+  'register', 'signup', 'sign-up', 'onboarding',
+];
 
-/** Keywords indicating dependent tests (dashboard, profile, settings, etc.) */
-const DEPENDENT_KEYWORDS = ['dashboard', 'profile', 'settings', 'account', 'home', 'main', 'checkout', 'payment', 'order', 'delete', 'remove', 'edit', 'update', 'modify', 'submit', 'confirm', 'verify', 'view', 'list'];
+// --- LLM Configuration ---
+const LLM_MODEL = 'gpt-4o-mini';
+const LLM_TEMPERATURE = 0.1;
+const LLM_MAX_TOKENS = 800;
+const MAX_LLM_CANDIDATES = 35;
+
+// --- Score Combination ---
+const URL_BOOST_WEIGHT = 0.15;
+const SAME_FLOW_BOOST = 0.03;
+
+// ============================================================================
+// LLM PROMPT
+// ============================================================================
+
+const DEPENDENCY_CLASSIFIER_SYSTEM_PROMPT = `You are a Senior QA test dependency analyzer. You determine which test cases must run BEFORE a target test case.
+
+A dependency means: the candidate test MUST succeed before the target test can run.
+Common patterns:
+- Login/auth tests are dependencies for tests that require authenticated state
+- Data creation tests (e.g. "Create product") are dependencies for tests that consume that data (e.g. "Edit product", "Delete product")
+- Registration is a dependency for login (user must exist)
+- Setup/config tests are dependencies for feature tests that need that configuration
+
+Rules:
+- Only suggest genuine execution-order dependencies, not just "related" tests
+- Understand directionality: "Login" depends on nothing; "Dashboard" depends on "Login"
+- Tests with the same goal but different scenarios (e.g. "Login valid" vs "Login invalid") are NOT dependencies of each other
+- Consider the test names, descriptions, URLs, and flow context
+- Work with ANY language (English, Russian, Kazakh, Turkish, Chinese, etc.) — understand semantics, not keywords
+- Return between 0 and 5 suggestions, sorted by confidence (highest first)
+- If no candidates are true dependencies, return an empty suggestions array
+
+Return JSON: {"suggestions": [{"id": "<candidate_id>", "confidence": <0.0-1.0>, "reason": "<concise explanation, 5-15 words>"}]}
+If no dependencies found: {"suggestions": []}`;
 
 // ============================================================================
 // SERVICE
@@ -69,22 +115,14 @@ const DEPENDENT_KEYWORDS = ['dashboard', 'profile', 'settings', 'account', 'home
 
 /**
  * Service for generating dependency suggestions for intent test cases.
- * Analyzes test cases across the entire project and suggests dependencies based on:
- * 1. Name/word matching (lightweight, high recall)
- * 2. URL continuity (strongest signal)
- * 3. Keyword heuristics (login -> dashboard patterns)
- * 4. Semantic similarity (embeddings-based, most expensive)
+ * Analyzes test cases across the entire project and suggests dependencies using:
+ * 1. LLM classification (understands semantics, directionality, any language)
+ * 2. URL continuity boost (same page/auth path/same domain — language-independent)
  */
 export class SavedCaseDependencySuggester {
   /**
    * Generate dependency suggestions for an intent test case.
    * Considers all candidates within the same project (cross-flow).
-   *
-   * @param caseId - ID of the intent test case (or null for draft)
-   * @param flowId - Flow ID of the target case
-   * @param userId - User ID for access control
-   * @param draftCase - Optional draft case data (when creating new case)
-   * @returns Array of suggested dependencies with confidence and reasons
    */
   static async suggestForCase(
     caseId: string | null,
@@ -94,125 +132,272 @@ export class SavedCaseDependencySuggester {
   ): Promise<DependencySuggestion[]> {
     try {
       logger.info('[DEPENDENCY_SUGGESTER] Generating suggestions', {
-        caseId,
-        flowId,
-        userId,
-        hasDraft: !!draftCase,
+        caseId, flowId, userId, hasDraft: !!draftCase,
       });
 
       // 1. Get target case data
-      let targetCase: IntentCaseData;
-      if (draftCase) {
-        targetCase = {
-          id: caseId || 'draft',
-          name: draftCase.name,
-          description: draftCase.description,
-          url: draftCase.url,
-          flow_id: flowId,
-        };
-      } else if (caseId) {
-        const fetched = await this.getIntentCase(caseId, userId);
-        if (!fetched) {
-          logger.warn('[DEPENDENCY_SUGGESTER] Target case not found', { caseId });
-          return [];
-        }
-        targetCase = fetched;
-      } else {
-        logger.warn('[DEPENDENCY_SUGGESTER] No caseId or draftCase provided');
-        return [];
-      }
+      const targetCase = await this.resolveTargetCase(caseId, flowId, userId, draftCase);
+      if (!targetCase) return [];
 
-      // 2. Get project_id from flow to scope candidates across entire project
+      // 2. Get project_id from flow
       const projectId = await this.getProjectIdFromFlow(flowId, userId);
       if (!projectId) {
         logger.warn('[DEPENDENCY_SUGGESTER] Could not resolve project for flow', { flowId });
         return [];
       }
 
-      // 3. Get candidate cases across entire project (excluding target and already-added deps)
+      // 3. Get candidates across entire project
       const candidates = await this.getCandidatesInProject(projectId, userId, caseId, targetCase.depends_on);
       if (candidates.length === 0) {
         logger.info('[DEPENDENCY_SUGGESTER] No candidates in project', { projectId });
         return [];
       }
 
-      // 4. Score each candidate
-      const scoredCandidates: Array<DependencySuggestion & { scores: number[] }> = [];
-      let semanticComparisons = 0;
-
-      for (const candidate of candidates) {
-        const scores: { score: number; reason: string }[] = [];
-
-        // 4a. Name/word matching (cheap, high recall)
-        const nameScore = this.checkNameSimilarity(candidate, targetCase);
-        if (nameScore.score > 0) {
-          scores.push(nameScore);
-        }
-
-        // 4b. URL continuity check
-        const urlScore = this.checkUrlContinuity(candidate, targetCase);
-        if (urlScore.score > 0) {
-          scores.push(urlScore);
-        }
-
-        // 4c. Keyword heuristics check
-        const heuristicScore = this.checkKeywordHeuristics(candidate, targetCase);
-        if (heuristicScore.score > 0) {
-          scores.push(heuristicScore);
-        }
-
-        // 4d. Semantic similarity (limited, expensive)
-        if (semanticComparisons < MAX_SEMANTIC_COMPARISONS) {
-          const semanticScore = await this.checkSemanticSimilarity(candidate, targetCase);
-          semanticComparisons++;
-          if (semanticScore.score > 0) {
-            scores.push(semanticScore);
-          }
-        }
-
-        // Calculate combined confidence (take best score)
-        if (scores.length > 0) {
-          scores.sort((a, b) => b.score - a.score);
-          const bestScore = scores[0];
-
-          // Boost same-flow candidates slightly
-          const flowBoost = candidate.flow_id === targetCase.flow_id ? 0.05 : 0;
-          const finalConfidence = Math.min(1.0, bestScore.score + flowBoost);
-
-          if (finalConfidence >= MIN_CONFIDENCE_THRESHOLD) {
-            scoredCandidates.push({
-              id: candidate.id,
-              name: candidate.name,
-              flowName: candidate.flow_name,
-              confidence: Math.round(finalConfidence * 100) / 100,
-              reason: bestScore.reason,
-              scores: scores.map(s => s.score),
-            });
-          }
-        }
-      }
-
-      // 5. Sort by confidence and limit
-      scoredCandidates.sort((a, b) => b.confidence - a.confidence);
-      const suggestions = scoredCandidates
-        .slice(0, MAX_SUGGESTIONS)
-        .map(({ id, name, flowName, confidence, reason }) => ({ id, name, flowName, confidence, reason }));
+      // 4. Score and rank candidates
+      const suggestions = await this.scoreAndRankCandidates(candidates, targetCase);
 
       logger.info('[DEPENDENCY_SUGGESTER] Generated suggestions', {
-        caseId,
-        flowId,
-        projectId,
+        caseId, flowId, projectId,
         candidatesCount: candidates.length,
         suggestionsCount: suggestions.length,
-        semanticComparisons,
       });
 
       return suggestions;
     } catch (error) {
       logger.error('[DEPENDENCY_SUGGESTER] Failed to generate suggestions', {
         error: error instanceof Error ? error.message : String(error),
-        caseId,
-        flowId,
+        caseId, flowId,
+      });
+      return [];
+    }
+  }
+
+  // ==========================================================================
+  // PRIVATE: Orchestration
+  // ==========================================================================
+
+  private static async resolveTargetCase(
+    caseId: string | null,
+    flowId: string,
+    userId: string,
+    draftCase?: { name: string; description?: string; url?: string }
+  ): Promise<IntentCaseData | null> {
+    if (draftCase) {
+      return {
+        id: caseId || 'draft',
+        name: draftCase.name,
+        description: draftCase.description,
+        url: draftCase.url,
+        flow_id: flowId,
+      };
+    }
+
+    if (caseId) {
+      const fetched = await this.getIntentCase(caseId, userId);
+      if (!fetched) {
+        logger.warn('[DEPENDENCY_SUGGESTER] Target case not found', { caseId });
+      }
+      return fetched;
+    }
+
+    logger.warn('[DEPENDENCY_SUGGESTER] No caseId or draftCase provided');
+    return null;
+  }
+
+  private static async scoreAndRankCandidates(
+    candidates: IntentCaseData[],
+    targetCase: IntentCaseData
+  ): Promise<DependencySuggestion[]> {
+    if (candidates.length === 0) return [];
+
+    // Stage 1: Pre-compute URL continuity scores (free, fast)
+    const urlScores = new Map<string, { score: number; reason: string }>();
+    for (const candidate of candidates) {
+      const urlResult = this.checkUrlContinuity(candidate, targetCase);
+      if (urlResult.score > 0) {
+        urlScores.set(candidate.id, urlResult);
+      }
+    }
+
+    // Stage 2: Select candidates for LLM (truncate if needed)
+    const llmCandidates = this.selectCandidatesForLLM(candidates, urlScores);
+
+    // Stage 3: Call LLM classifier
+    const llmSuggestions = await this.classifyWithLLM(targetCase, llmCandidates);
+
+    // Stage 4: Combine LLM confidence with URL boost
+    const validCandidateIds = new Set(candidates.map(c => c.id));
+    const candidateMap = new Map(candidates.map(c => [c.id, c]));
+    const results: DependencySuggestion[] = [];
+
+    for (const suggestion of llmSuggestions) {
+      // Guard: filter out hallucinated IDs
+      if (!validCandidateIds.has(suggestion.id)) {
+        logger.warn('[DEPENDENCY_SUGGESTER] LLM returned unknown candidate ID, skipping', {
+          hallucinatedId: suggestion.id,
+        });
+        continue;
+      }
+
+      let finalConfidence = suggestion.confidence;
+      const candidate = candidateMap.get(suggestion.id)!;
+
+      // Apply URL continuity boost
+      const urlScore = urlScores.get(suggestion.id);
+      if (urlScore) {
+        finalConfidence = Math.min(1.0, finalConfidence + urlScore.score * URL_BOOST_WEIGHT);
+      }
+
+      // Apply same-flow boost
+      if (candidate.flow_id === targetCase.flow_id) {
+        finalConfidence = Math.min(1.0, finalConfidence + SAME_FLOW_BOOST);
+      }
+
+      // Apply minimum threshold
+      if (finalConfidence < MIN_CONFIDENCE_THRESHOLD) continue;
+
+      results.push({
+        id: suggestion.id,
+        name: candidate.name,
+        flowName: candidate.flow_name,
+        confidence: Math.round(finalConfidence * 100) / 100,
+        reason: suggestion.reason,
+      });
+    }
+
+    // Sort by confidence descending, take top MAX_SUGGESTIONS
+    results.sort((a, b) => b.confidence - a.confidence);
+    return results.slice(0, MAX_SUGGESTIONS);
+  }
+
+  // ==========================================================================
+  // PRIVATE: LLM Classification
+  // ==========================================================================
+
+  /**
+   * Select candidates to send to LLM within token budget.
+   * Prioritizes candidates with URL continuity scores.
+   */
+  private static selectCandidatesForLLM(
+    candidates: IntentCaseData[],
+    urlScores: Map<string, { score: number; reason: string }>
+  ): IntentCaseData[] {
+    if (candidates.length <= MAX_LLM_CANDIDATES) return candidates;
+
+    const withUrl: IntentCaseData[] = [];
+    const withoutUrl: IntentCaseData[] = [];
+
+    for (const c of candidates) {
+      if (urlScores.has(c.id)) {
+        withUrl.push(c);
+      } else {
+        withoutUrl.push(c);
+      }
+    }
+
+    const remaining = MAX_LLM_CANDIDATES - withUrl.length;
+    const selected = [...withUrl, ...withoutUrl.slice(0, Math.max(0, remaining))];
+
+    logger.info('[DEPENDENCY_SUGGESTER] Truncated candidates for LLM', {
+      total: candidates.length,
+      selected: selected.length,
+      withUrlScore: withUrl.length,
+    });
+
+    return selected;
+  }
+
+  /**
+   * Build user prompt for LLM classification.
+   */
+  private static buildLLMUserPrompt(
+    targetCase: IntentCaseData,
+    candidates: IntentCaseData[]
+  ): string {
+    const targetBlock = [
+      `Name: ${targetCase.name || '(unnamed)'}`,
+      targetCase.description ? `Description: ${targetCase.description}` : null,
+      targetCase.url ? `URL: ${targetCase.url}` : null,
+    ].filter(Boolean).join('\n');
+
+    const candidateLines = candidates.map((c, i) => {
+      const parts = [
+        `  id: ${c.id}`,
+        `  name: ${c.name || '(unnamed)'}`,
+      ];
+      if (c.description) parts.push(`  description: ${c.description.substring(0, 100)}`);
+      if (c.url) parts.push(`  url: ${c.url}`);
+      if (c.flow_name) parts.push(`  flow: ${c.flow_name}`);
+      return `[${i + 1}]\n${parts.join('\n')}`;
+    }).join('\n\n');
+
+    return `TARGET TEST CASE (needs dependencies):\n${targetBlock}\n\nCANDIDATE TESTS (may or may not be dependencies):\n${candidateLines}\n\nWhich candidates must run before the target? Return JSON with suggestions array.`;
+  }
+
+  /**
+   * Call LLM to classify dependency relationships.
+   * Returns validated suggestions or empty array on failure.
+   */
+  private static async classifyWithLLM(
+    targetCase: IntentCaseData,
+    candidates: IntentCaseData[]
+  ): Promise<LLMDependencySuggestion[]> {
+    if (candidates.length === 0) return [];
+
+    try {
+      const userPrompt = this.buildLLMUserPrompt(targetCase, candidates);
+
+      const response = await getChatCompletionWithMessages(
+        [
+          { role: 'system', content: DEPENDENCY_CLASSIFIER_SYSTEM_PROMPT },
+          { role: 'user', content: userPrompt },
+        ],
+        {
+          model: LLM_MODEL,
+          temperature: LLM_TEMPERATURE,
+          max_tokens: LLM_MAX_TOKENS,
+          response_format: { type: 'json_object' },
+        }
+      );
+
+      // Parse JSON response
+      const parsed: LLMClassificationResponse = JSON.parse(response.content);
+
+      if (!parsed.suggestions || !Array.isArray(parsed.suggestions)) {
+        logger.warn('[DEPENDENCY_SUGGESTER] LLM returned invalid structure', {
+          content: response.content.substring(0, 200),
+        });
+        return [];
+      }
+
+      // Validate each suggestion
+      const validSuggestions: LLMDependencySuggestion[] = [];
+      for (const s of parsed.suggestions) {
+        if (
+          typeof s.id === 'string' && s.id.length > 0 &&
+          typeof s.confidence === 'number' && s.confidence >= 0 && s.confidence <= 1 &&
+          typeof s.reason === 'string'
+        ) {
+          validSuggestions.push({
+            id: s.id,
+            confidence: s.confidence,
+            reason: s.reason.substring(0, 200),
+          });
+        }
+      }
+
+      logger.info('[DEPENDENCY_SUGGESTER] LLM classification complete', {
+        candidatesAnalyzed: candidates.length,
+        suggestionsReturned: validSuggestions.length,
+        inputTokens: response.usage?.inputTokens,
+        outputTokens: response.usage?.outputTokens,
+      });
+
+      return validSuggestions;
+    } catch (error) {
+      logger.error('[DEPENDENCY_SUGGESTER] LLM classification failed, returning empty', {
+        error: error instanceof Error ? error.message : String(error),
+        candidatesCount: candidates.length,
       });
       return [];
     }
@@ -222,9 +407,6 @@ export class SavedCaseDependencySuggester {
   // PRIVATE: Data Fetching
   // ==========================================================================
 
-  /**
-   * Get an intent test case by ID
-   */
   private static async getIntentCase(
     caseId: string,
     userId: string
@@ -242,15 +424,9 @@ export class SavedCaseDependencySuggester {
     }
 
     const result = data as any;
-    return {
-      ...result,
-      url: result.url || result.start_url,
-    } as IntentCaseData;
+    return { ...result, url: result.url || result.start_url } as IntentCaseData;
   }
 
-  /**
-   * Get project_id from flow via test_modules
-   */
   private static async getProjectIdFromFlow(
     flowId: string,
     userId: string
@@ -266,9 +442,6 @@ export class SavedCaseDependencySuggester {
     return (data as any).test_modules?.project_id || null;
   }
 
-  /**
-   * Get all candidate cases across the entire project (excluding target and existing deps)
-   */
   private static async getCandidatesInProject(
     projectId: string,
     userId: string,
@@ -285,7 +458,6 @@ export class SavedCaseDependencySuggester {
       query = query.neq('id', excludeCaseId);
     }
 
-    // Exclude already-added dependencies
     if (existingDeps && existingDeps.length > 0) {
       query = query.not('id', 'in', `(${existingDeps.join(',')})`);
     }
@@ -304,53 +476,9 @@ export class SavedCaseDependencySuggester {
   }
 
   // ==========================================================================
-  // PRIVATE: Scoring Methods
+  // PRIVATE: URL Continuity (Strategy 2 — language-independent)
   // ==========================================================================
 
-  /**
-   * Check name similarity using word overlap.
-   * Simple but effective for catching related tests like "Login" and "Login and redirect".
-   *
-   * @returns Score (0.0 - 0.7) and reason
-   */
-  private static checkNameSimilarity(
-    candidate: IntentCaseData,
-    target: IntentCaseData
-  ): { score: number; reason: string } {
-    const candidateWords = this.extractWords(candidate.name);
-    const targetWords = this.extractWords(target.name);
-
-    if (candidateWords.length === 0 || targetWords.length === 0) {
-      return { score: 0, reason: '' };
-    }
-
-    // Count shared words
-    const shared = candidateWords.filter(w => targetWords.includes(w));
-    if (shared.length === 0) {
-      return { score: 0, reason: '' };
-    }
-
-    // Jaccard-like similarity: shared / union
-    const union = new Set([...candidateWords, ...targetWords]);
-    const similarity = shared.length / union.size;
-
-    if (similarity >= 0.2) {
-      const score = Math.min(0.7, 0.3 + similarity * 0.5);
-      return {
-        score,
-        reason: `Related test: "${candidate.name}"`,
-      };
-    }
-
-    return { score: 0, reason: '' };
-  }
-
-  /**
-   * Check URL continuity between candidate and target.
-   * If candidate's URL matches target's start URL or shares domain → potential prereq.
-   *
-   * @returns Score (0.0 - 0.9) and reason
-   */
   private static checkUrlContinuity(
     candidate: IntentCaseData,
     target: IntentCaseData
@@ -366,31 +494,28 @@ export class SavedCaseDependencySuggester {
       return { score: 0, reason: '' };
     }
 
-    // Exact match (candidate ends where target starts)
     if (candidateUrl === targetUrl) {
       return {
-        score: 0.75,
+        score: SCORE_URL_SAME_PAGE,
         reason: `Same URL: ${this.shortUrl(candidate.url)}`,
       };
     }
 
-    // Same domain
     const candidateDomain = this.extractDomain(candidate.url);
     const targetDomain = this.extractDomain(target.url);
 
     if (candidateDomain && targetDomain && candidateDomain === targetDomain) {
       const candidatePath = this.extractPath(candidate.url);
 
-      // If candidate is login/auth and target is something else
-      if (candidatePath && PREREQ_KEYWORDS.some(k => candidatePath.toLowerCase().includes(k))) {
+      if (candidatePath && AUTH_PATH_KEYWORDS.some(k => candidatePath.includes(k))) {
         return {
-          score: 0.7,
+          score: SCORE_URL_AUTH_PATH,
           reason: `Auth flow: ${this.shortUrl(candidate.url)} → ${this.shortUrl(target.url)}`,
         };
       }
 
       return {
-        score: 0.35,
+        score: SCORE_URL_SAME_DOMAIN,
         reason: `Same domain: ${candidateDomain}`,
       };
     }
@@ -398,101 +523,10 @@ export class SavedCaseDependencySuggester {
     return { score: 0, reason: '' };
   }
 
-  /**
-   * Check keyword heuristics (login/auth → dashboard/profile patterns).
-   *
-   * @returns Score (0.0 - 0.8) and reason
-   */
-  private static checkKeywordHeuristics(
-    candidate: IntentCaseData,
-    target: IntentCaseData
-  ): { score: number; reason: string } {
-    const candidateText = `${candidate.name} ${candidate.description || ''} ${candidate.url || ''}`.toLowerCase();
-    const targetText = `${target.name} ${target.description || ''} ${target.url || ''}`.toLowerCase();
-
-    // Check if candidate is a prereq type and target is a dependent type
-    const candidateIsPrereq = PREREQ_KEYWORDS.some(k => candidateText.includes(k));
-    const targetIsDependent = DEPENDENT_KEYWORDS.some(k => targetText.includes(k));
-
-    if (candidateIsPrereq && targetIsDependent) {
-      return {
-        score: 0.8,
-        reason: `"${candidate.name}" is typically required before "${target.name}"`,
-      };
-    }
-
-    // Check if candidate is explicitly a prereq based on name
-    if (candidateIsPrereq && !PREREQ_KEYWORDS.some(k => targetText.includes(k))) {
-      return {
-        score: 0.5,
-        reason: `"${candidate.name}" is a setup/auth test`,
-      };
-    }
-
-    return { score: 0, reason: '' };
-  }
-
-  /**
-   * Check semantic similarity using embeddings.
-   * Compares name + description text.
-   *
-   * @returns Score (0.0 - 0.9) and reason
-   */
-  private static async checkSemanticSimilarity(
-    candidate: IntentCaseData,
-    target: IntentCaseData
-  ): Promise<{ score: number; reason: string }> {
-    const candidateText = `${candidate.name} ${candidate.description || ''}`.trim();
-    const targetText = `${target.name} ${target.description || ''}`.trim();
-
-    // Skip if texts are too short
-    if (candidateText.length < 5 || targetText.length < 5) {
-      return { score: 0, reason: '' };
-    }
-
-    try {
-      const [candidateEmbedding, targetEmbedding] = await Promise.all([
-        generateEmbedding(candidateText),
-        generateEmbedding(targetText),
-      ]);
-
-      const similarity = cosineSimilarity(candidateEmbedding, targetEmbedding);
-
-      if (similarity >= SEMANTIC_SIMILARITY_THRESHOLD) {
-        return {
-          score: Math.min(0.9, similarity),
-          reason: `Similar context (${Math.round(similarity * 100)}% match)`,
-        };
-      }
-
-      return { score: 0, reason: '' };
-    } catch (error) {
-      logger.warn('[DEPENDENCY_SUGGESTER] Semantic similarity failed', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return { score: 0, reason: '' };
-    }
-  }
-
   // ==========================================================================
-  // PRIVATE: Utilities
+  // PRIVATE: URL Utilities
   // ==========================================================================
 
-  /**
-   * Extract meaningful words from a string (lowercase, min 2 chars, no stop words)
-   */
-  private static extractWords(text: string): string[] {
-    const stopWords = new Set(['the', 'a', 'an', 'is', 'in', 'on', 'to', 'for', 'of', 'and', 'or', 'with', 'test', 'case', 'that', 'this', 'it']);
-    return text
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, ' ')
-      .split(/\s+/)
-      .filter(w => w.length >= 2 && !stopWords.has(w));
-  }
-
-  /**
-   * Normalize URL for comparison (lowercase, remove trailing slash, etc.)
-   */
   private static normalizeUrl(url: string): string | null {
     try {
       const parsed = new URL(url);
@@ -502,33 +536,22 @@ export class SavedCaseDependencySuggester {
     }
   }
 
-  /**
-   * Extract domain from URL
-   */
   private static extractDomain(url: string): string | null {
     try {
-      const parsed = new URL(url);
-      return parsed.hostname.toLowerCase();
+      return new URL(url).hostname.toLowerCase();
     } catch {
       return null;
     }
   }
 
-  /**
-   * Extract path from URL
-   */
   private static extractPath(url: string): string | null {
     try {
-      const parsed = new URL(url);
-      return parsed.pathname.toLowerCase();
+      return new URL(url).pathname.toLowerCase();
     } catch {
       return null;
     }
   }
 
-  /**
-   * Get a short version of URL for display
-   */
   private static shortUrl(url: string): string {
     try {
       const parsed = new URL(url);
