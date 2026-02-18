@@ -606,10 +606,8 @@ async function validateDependencies(
       continue;
     }
 
-    // Flow check (if target has a flow, deps should be in the same flow or no flow)
-    if (flowId && depCase.flow_id && depCase.flow_id !== flowId) {
-      errors.push(`Dependency ${depId} is in a different flow`);
-    }
+    // Flow check: allow cross-flow dependencies within the same project.
+    // Common case: "Login" in Auth Flow is a prerequisite for "Payment" in Checkout Flow.
   }
 
   return errors;
@@ -627,18 +625,12 @@ async function detectCycle(
 ): Promise<boolean> {
   // Adding edge: targetId -> depId introduces a cycle if depId can already reach targetId.
 
-  let query = supabaseAdmin
+  // Fetch all cases in the project for full graph traversal (cross-flow deps allowed)
+  const { data: allCases, error } = await supabaseAdmin
     .from('intent_test_cases')
     .select('id, depends_on')
     .eq('user_id', userId)
     .eq('project_id', projectId);
-
-  if (flowId) {
-    // Same flow + allow unassigned nodes that might be used as prerequisites
-    query = query.or(`flow_id.eq.${flowId},flow_id.is.null`);
-  }
-
-  const { data: allCases, error } = await query;
   if (error) {
     logger.warn('[SAVED_TEST_CASES_API] Cycle detection query failed', {
       error: error.message,

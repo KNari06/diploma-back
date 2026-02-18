@@ -10,8 +10,11 @@ import type {
   RunReportSummary,
   RunReportArtifactsSummary,
   EnrichedBug,
+  ExecutableTestCase,
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { topologicalSort } from '@/utils/graph/topological-sort';
+import { executionCompletionEmitter } from '../executions/execution-completion-emitter';
 import { ExecutionService } from '../executions/execution.service';
 import { RegressionPlanService } from '../plans/regression-plan.service';
 import { ManualTestService } from '../ui/manualTest.service';
@@ -481,6 +484,27 @@ export class RegressionRunService {
         throw new ValidationError('Plan has no test cases');
       }
 
+      // 1b. Batch-fetch depends_on for UI test cases
+      const uiCaseIds = expandedCases.filter((tc) => tc.testType === 'ui').map((tc) => tc.testCaseId);
+      const depMap = new Map<string, string[]>();
+      if (uiCaseIds.length > 0) {
+        const { data: depRows } = await supabaseAdmin
+          .from('intent_test_cases')
+          .select('id, depends_on')
+          .in('id', uiCaseIds);
+        for (const row of depRows || []) {
+          depMap.set(row.id, row.depends_on || []);
+        }
+      }
+
+      const executableCases: ExecutableTestCase[] = expandedCases.map((tc) => ({
+        testCaseId: tc.testCaseId,
+        testType: tc.testType,
+        moduleId: tc.moduleId,
+        flowId: tc.flowId,
+        dependsOn: depMap.get(tc.testCaseId) || [],
+      }));
+
       // 2. Create regression run record with plan_id
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
@@ -501,7 +525,7 @@ export class RegressionRunService {
       // 3. Create execution records for all test cases
       const executions = await ExecutionService.createBatch(
         run.id,
-        expandedCases.map((tc) => ({
+        executableCases.map((tc) => ({
           testCaseId: tc.testCaseId,
           testType: tc.testType,
           moduleId: tc.moduleId,
@@ -515,7 +539,7 @@ export class RegressionRunService {
       // 5. Start executing tests (async, don't wait)
       this.executeTestCasesAsync(
         run.id,
-        expandedCases,
+        executableCases,
         userId,
         trigger,
         parameters,
@@ -531,14 +555,14 @@ export class RegressionRunService {
       logger.info('[REGRESSION_RUN] Plan execution started', {
         runId: run.id,
         planId,
-        totalCases: expandedCases.length,
+        totalCases: executableCases.length,
         browserOverride,
       });
 
       return {
         runId: run.id,
         executionIds: executions.map((e) => e.id),
-        totalTests: expandedCases.length,
+        totalTests: executableCases.length,
       };
     } catch (error) {
       logger.error('[REGRESSION_RUN] Failed to run plan', { error, planId });
@@ -627,12 +651,7 @@ export class RegressionRunService {
       // 7. Start async execution
       this.executeTestCasesAsync(
         run.id,
-        testCases.map((tc) => ({
-          testCaseId: tc.testCaseId,
-          testType: tc.testType,
-          moduleId: tc.moduleId,
-          flowId: tc.flowId,
-        })),
+        testCases,
         userId,
         trigger,
         parameters
@@ -718,12 +737,7 @@ export class RegressionRunService {
       // 5. Start async execution
       this.executeTestCasesAsync(
         run.id,
-        testCases.map((tc) => ({
-          testCaseId: tc.testCaseId,
-          testType: tc.testType,
-          moduleId: tc.moduleId,
-          flowId: tc.flowId,
-        })),
+        testCases,
         userId,
         trigger,
         parameters
@@ -768,23 +782,25 @@ export class RegressionRunService {
       // Get UI test cases with tag from intent_test_cases (unified table)
       const { data: uiCases } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('id, flow_id')
+        .select('id, flow_id, depends_on')
         .eq('project_id', projectId)
         .contains('tags', [tag]);
 
       // Get API test cases with tag (scoped to project via environments/endpoints)
       const apiCases = await this.getApiTestConfigsByProjectAndTag(projectId, userId, tag);
 
-      const testCases = [
+      const testCases: ExecutableTestCase[] = [
         ...(uiCases || []).map((tc: any) => ({
           testCaseId: tc.id,
           testType: 'ui' as const,
           flowId: tc.flow_id || undefined,
+          dependsOn: tc.depends_on || [],
         })),
         ...(apiCases || []).map((tc: any) => ({
           testCaseId: tc.id,
           testType: 'api' as const,
           flowId: tc.flow_id || undefined,
+          dependsOn: [] as string[],
         })),
       ];
 
@@ -814,11 +830,7 @@ export class RegressionRunService {
       // Start async execution
       this.executeTestCasesAsync(
         run.id,
-        testCases.map((tc) => ({
-          testCaseId: tc.testCaseId,
-          testType: tc.testType,
-          flowId: tc.flowId,
-        })),
+        testCases,
         userId,
         trigger,
         {}
@@ -863,23 +875,25 @@ export class RegressionRunService {
       // Get UI test cases with priority from intent_test_cases (unified table)
       const { data: uiCases } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('id, flow_id')
+        .select('id, flow_id, depends_on')
         .eq('project_id', projectId)
         .eq('priority', priority);
 
       // Get API test cases with priority (scoped to project via environments/endpoints)
       const apiCases = await this.getApiTestConfigsByProjectAndPriority(projectId, userId, priority);
 
-      const testCases = [
+      const testCases: ExecutableTestCase[] = [
         ...(uiCases || []).map((tc: any) => ({
           testCaseId: tc.id,
           testType: 'ui' as const,
           flowId: tc.flow_id || undefined,
+          dependsOn: tc.depends_on || [],
         })),
         ...(apiCases || []).map((tc: any) => ({
           testCaseId: tc.id,
           testType: 'api' as const,
           flowId: tc.flow_id || undefined,
+          dependsOn: [] as string[],
         })),
       ];
 
@@ -909,11 +923,7 @@ export class RegressionRunService {
       // Start async execution
       this.executeTestCasesAsync(
         run.id,
-        testCases.map((tc) => ({
-          testCaseId: tc.testCaseId,
-          testType: tc.testType,
-          flowId: tc.flowId,
-        })),
+        testCases,
         userId,
         trigger,
         {}
@@ -941,12 +951,7 @@ export class RegressionRunService {
    */
   private static async getTestCasesInFlows(
     flowIds: string[]
-  ): Promise<Array<{
-    testCaseId: string;
-    testType: 'ui' | 'api';
-    moduleId?: string;
-    flowId?: string;
-  }>> {
+  ): Promise<ExecutableTestCase[]> {
     if (flowIds.length === 0) {
       return [];
     }
@@ -968,17 +973,12 @@ export class RegressionRunService {
       }
     }
 
-    const testCases: Array<{
-      testCaseId: string;
-      testType: 'ui' | 'api';
-      moduleId?: string;
-      flowId?: string;
-    }> = [];
+    const testCases: ExecutableTestCase[] = [];
 
     // UI test cases from intent_test_cases (unified table)
     const { data: uiCases, error: uiError } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, flow_id')
+      .select('id, flow_id, depends_on')
       .in('flow_id', flowIds);
 
     if (uiError) {
@@ -993,10 +993,11 @@ export class RegressionRunService {
         testType: 'ui',
         moduleId,
         flowId,
+        dependsOn: tc.depends_on || [],
       });
     }
 
-    // API test configs
+    // API test configs (no depends_on support for API tests)
     const { data: apiCases, error: apiError } = await supabaseAdmin
       .from('api_test_configs')
       .select('id, flow_id')
@@ -1014,6 +1015,7 @@ export class RegressionRunService {
         testType: 'api',
         moduleId,
         flowId,
+        dependsOn: [],
       });
     }
 
@@ -1026,12 +1028,7 @@ export class RegressionRunService {
    */
   private static async executeTestCasesAsync(
     runId: string,
-    testCases: Array<{
-      testCaseId: string;
-      testType: 'ui' | 'api';
-      moduleId?: string;
-      flowId?: string;
-    }>,
+    testCases: ExecutableTestCase[],
     userId: string,
     trigger: 'manual' | 'chat' | 'scheduled' | 'webhook',
     parameters: Record<string, any>,
@@ -1055,87 +1052,169 @@ export class RegressionRunService {
       execByKey.set(`${e.test_type}:${e.test_case_id}`, e.id);
     }
 
-    const uiTestIds: string[] = [];
-    let apiPassed = 0;
-    let apiFailed = 0;
+    // Topological sort by depends_on
+    const { levels, hasCycle, cycleNodes } = topologicalSort(testCases);
 
-    for (const testCase of testCases) {
-      const execId = execByKey.get(`${testCase.testType}:${testCase.testCaseId}`);
-
-      try {
-        if (execId) {
-          await ExecutionService.updateStatus({ id: execId, status: 'running' });
-        }
-
-        if (testCase.testType === 'ui') {
-          // Run UI test without creating nested regression_runs
-          const savedCase = await this.getSavedTestCase(testCase.testCaseId, userId);
-          const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
-          const testResult = await ManualTestService.runTest(testRequest);
-
-          if (!testResult.success || !testResult.data?.id) {
-            throw new Error('Failed to start UI test execution');
-          }
-
-          const testId = testResult.data.id;
-          uiTestIds.push(testId);
-
+    if (hasCycle) {
+      logger.error('[REGRESSION_RUN] Dependency cycle detected in run', { runId, cycleNodes });
+      // Mark cycle nodes as failed
+      for (const nodeId of cycleNodes || []) {
+        const tc = testCases.find((t) => t.testCaseId === nodeId);
+        if (tc) {
+          const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
           if (execId) {
-            await ExecutionService.updateStatus({
-              id: execId,
-              status: 'running',
-              result: {
-                type: 'ui',
-                testId,
-                trigger,
-                startedAt,
-              },
-            });
-          }
-        } else {
-          // Run API test via existing configuration-based executor
-          const apiExecution = await ApiConfigService.executeWithConfig(userId, {
-            test_config_id: testCase.testCaseId,
-          } as any);
-
-          const passed = !!apiExecution?.success;
-          if (passed) apiPassed++;
-          else apiFailed++;
-
-          if (execId) {
-            await ExecutionService.updateStatus({
-              id: execId,
-              status: passed ? 'passed' : 'failed',
-              result: {
-                type: 'api',
-                apiExecutionId: apiExecution?.id,
-                statusCode: apiExecution?.status_code,
-                durationMs: apiExecution?.duration_ms,
-              },
-              errorMessage: passed ? undefined : apiExecution?.error_message || 'API test failed',
-            });
-          }
-        }
-      } catch (error) {
-        logger.error('[REGRESSION_RUN] Failed to execute test case', {
-          runId,
-          testCaseId: testCase.testCaseId,
-          testType: testCase.testType,
-          error,
-        });
-
-        if (execId) {
-          try {
             await ExecutionService.updateStatus({
               id: execId,
               status: 'failed',
-              errorMessage: error instanceof Error ? error.message : String(error),
+              errorMessage: 'Circular dependency detected. Cannot execute.',
             });
-          } catch (statusError) {
-            logger.error('[REGRESSION_RUN] Failed to update execution status', {
-              execId,
-              statusError: statusError instanceof Error ? statusError.message : String(statusError),
+          }
+        }
+      }
+    }
+
+    // Level-based execution with dependency tracking
+    const failedOrSkippedIds = new Set<string>();
+    const uiTestIds: string[] = [];
+    let apiPassed = 0;
+    let apiFailed = 0;
+    let skippedCount = 0;
+
+    for (let levelIdx = 0; levelIdx < levels.length; levelIdx++) {
+      const level = levels[levelIdx];
+      const uiWaiters: Array<{ testCaseId: string; execId: string; promise: Promise<string> }> = [];
+
+      for (const testCase of level) {
+        const execId = execByKey.get(`${testCase.testType}:${testCase.testCaseId}`);
+
+        // Check if any prerequisite failed or was skipped
+        const failedPrereqs = (testCase.dependsOn || []).filter((d) => failedOrSkippedIds.has(d));
+        if (failedPrereqs.length > 0) {
+          failedOrSkippedIds.add(testCase.testCaseId);
+          skippedCount++;
+          if (execId) {
+            await ExecutionService.updateStatus({
+              id: execId,
+              status: 'skipped',
+              errorMessage: `Skipped: prerequisite test(s) failed or were skipped [${failedPrereqs.join(', ')}]`,
             });
+          }
+          logger.info('[REGRESSION_RUN] Skipped test due to dependency failure', {
+            runId,
+            testCaseId: testCase.testCaseId,
+            failedPrereqs,
+          });
+          continue;
+        }
+
+        // Execute test (existing logic preserved)
+        try {
+          if (execId) {
+            await ExecutionService.updateStatus({ id: execId, status: 'running' });
+          }
+
+          if (testCase.testType === 'ui') {
+            // Run UI test without creating nested regression_runs
+            const savedCase = await this.getSavedTestCase(testCase.testCaseId, userId);
+            const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
+            const testResult = await ManualTestService.runTest(testRequest);
+
+            if (!testResult.success || !testResult.data?.id) {
+              throw new Error('Failed to start UI test execution');
+            }
+
+            const testId = testResult.data.id;
+            uiTestIds.push(testId);
+
+            if (execId) {
+              await ExecutionService.updateStatus({
+                id: execId,
+                status: 'running',
+                result: {
+                  type: 'ui',
+                  testId,
+                  trigger,
+                  startedAt,
+                },
+              });
+
+              // Register waiter for dependency-aware ordering
+              const waitPromise = executionCompletionEmitter.waitForCompletion(execId);
+              uiWaiters.push({ testCaseId: testCase.testCaseId, execId, promise: waitPromise });
+            }
+          } else {
+            // Run API test via existing configuration-based executor
+            const apiExecution = await ApiConfigService.executeWithConfig(userId, {
+              test_config_id: testCase.testCaseId,
+            } as any);
+
+            const passed = !!apiExecution?.success;
+            if (passed) {
+              apiPassed++;
+            } else {
+              apiFailed++;
+              failedOrSkippedIds.add(testCase.testCaseId);
+            }
+
+            if (execId) {
+              await ExecutionService.updateStatus({
+                id: execId,
+                status: passed ? 'passed' : 'failed',
+                result: {
+                  type: 'api',
+                  apiExecutionId: apiExecution?.id,
+                  statusCode: apiExecution?.status_code,
+                  durationMs: apiExecution?.duration_ms,
+                },
+                errorMessage: passed ? undefined : apiExecution?.error_message || 'API test failed',
+              });
+            }
+          }
+        } catch (error) {
+          logger.error('[REGRESSION_RUN] Failed to execute test case', {
+            runId,
+            testCaseId: testCase.testCaseId,
+            testType: testCase.testType,
+            error,
+          });
+
+          failedOrSkippedIds.add(testCase.testCaseId);
+
+          if (execId) {
+            try {
+              await ExecutionService.updateStatus({
+                id: execId,
+                status: 'failed',
+                errorMessage: error instanceof Error ? error.message : String(error),
+              });
+            } catch (statusError) {
+              logger.error('[REGRESSION_RUN] Failed to update execution status', {
+                execId,
+                statusError: statusError instanceof Error ? statusError.message : String(statusError),
+              });
+            }
+          }
+        }
+      }
+
+      // Wait for all UI tests in this level to complete before moving to next level
+      if (uiWaiters.length > 0) {
+        logger.info('[REGRESSION_RUN] Waiting for UI tests in level to complete', {
+          runId,
+          level: levelIdx,
+          uiTestCount: uiWaiters.length,
+        });
+
+        const results = await Promise.all(
+          uiWaiters.map(async (w) => {
+            const status = await w.promise;
+            return { testCaseId: w.testCaseId, status };
+          })
+        );
+
+        for (const result of results) {
+          if (result.status !== 'passed') {
+            failedOrSkippedIds.add(result.testCaseId);
           }
         }
       }
@@ -1152,6 +1231,7 @@ export class RegressionRunService {
             ui_started: uiTestIds.length,
             api_passed: apiPassed,
             api_failed: apiFailed,
+            skipped: skippedCount,
             started_at: startedAt,
           },
         })
@@ -1178,6 +1258,7 @@ export class RegressionRunService {
           total: testCases.length,
           api_passed: apiPassed,
           api_failed: apiFailed,
+          skipped: skippedCount,
           completed_at: new Date().toISOString(),
         },
         completed_at: new Date().toISOString(),

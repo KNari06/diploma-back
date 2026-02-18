@@ -1,7 +1,7 @@
 /**
  * Intent Case Dependency Suggester Service
- * Generates AI-powered dependency suggestions for intent_test_cases within a flow.
- * Uses context-first approach: URL continuity, heuristics, and semantic similarity.
+ * Generates AI-powered dependency suggestions for intent_test_cases across a project.
+ * Uses context-first approach: name matching, URL continuity, heuristics, and semantic similarity.
  *
  * NOTE: Service class name kept as SavedCaseDependencySuggester for API compatibility.
  * Now operates on intent_test_cases (unified table) instead of saved_test_cases.
@@ -20,6 +20,8 @@ import { logger } from '@/utils/core/logger';
  */
 export interface DependencySuggestion {
   id: string;           // intent_test_cases.id of the suggested dependency
+  name: string;         // test case name for display
+  flowName?: string;    // flow name (useful for cross-flow suggestions)
   confidence: number;   // 0.0 - 1.0
   reason: string;       // Human-readable explanation
 }
@@ -34,6 +36,8 @@ interface IntentCaseData {
   url?: string;
   start_url?: string;
   flow_id?: string;
+  flow_name?: string;
+  project_id?: string;
   depends_on?: string[];
 }
 
@@ -48,16 +52,16 @@ const MAX_SUGGESTIONS = 5;
 const MAX_SEMANTIC_COMPARISONS = 20;
 
 /** Minimum confidence threshold to include in suggestions */
-const MIN_CONFIDENCE_THRESHOLD = 0.4;
+const MIN_CONFIDENCE_THRESHOLD = 0.25;
 
-/** Semantic similarity threshold (higher = more strict) */
-const SEMANTIC_SIMILARITY_THRESHOLD = 0.65;
+/** Semantic similarity threshold */
+const SEMANTIC_SIMILARITY_THRESHOLD = 0.45;
 
 /** Keywords indicating a prerequisite test (login, auth, setup) */
-const PREREQ_KEYWORDS = ['login', 'auth', 'authenticate', 'sign in', 'signin', 'onboarding', 'setup', 'register', 'registration'];
+const PREREQ_KEYWORDS = ['login', 'auth', 'authenticate', 'sign in', 'signin', 'onboarding', 'setup', 'register', 'registration', 'create', 'add', 'new', 'init', 'open', 'navigate', 'go to'];
 
 /** Keywords indicating dependent tests (dashboard, profile, settings, etc.) */
-const DEPENDENT_KEYWORDS = ['dashboard', 'profile', 'settings', 'account', 'home', 'main', 'checkout', 'payment', 'order'];
+const DEPENDENT_KEYWORDS = ['dashboard', 'profile', 'settings', 'account', 'home', 'main', 'checkout', 'payment', 'order', 'delete', 'remove', 'edit', 'update', 'modify', 'submit', 'confirm', 'verify', 'view', 'list'];
 
 // ============================================================================
 // SERVICE
@@ -65,19 +69,19 @@ const DEPENDENT_KEYWORDS = ['dashboard', 'profile', 'settings', 'account', 'home
 
 /**
  * Service for generating dependency suggestions for intent test cases.
- * Now operates on intent_test_cases (unified table).
- * Analyzes test cases within the same flow and suggests dependencies based on:
- * 1. URL continuity (strongest signal)
- * 2. Keyword heuristics (login -> dashboard patterns)
- * 3. Semantic similarity (embeddings-based)
+ * Analyzes test cases across the entire project and suggests dependencies based on:
+ * 1. Name/word matching (lightweight, high recall)
+ * 2. URL continuity (strongest signal)
+ * 3. Keyword heuristics (login -> dashboard patterns)
+ * 4. Semantic similarity (embeddings-based, most expensive)
  */
 export class SavedCaseDependencySuggester {
   /**
    * Generate dependency suggestions for an intent test case.
-   * Only considers candidates within the same flow_id.
+   * Considers all candidates within the same project (cross-flow).
    *
    * @param caseId - ID of the intent test case (or null for draft)
-   * @param flowId - Flow ID to scope candidates
+   * @param flowId - Flow ID of the target case
    * @param userId - User ID for access control
    * @param draftCase - Optional draft case data (when creating new case)
    * @returns Array of suggested dependencies with confidence and reasons
@@ -118,38 +122,51 @@ export class SavedCaseDependencySuggester {
         return [];
       }
 
-      // 2. Get candidate cases in the same flow (excluding target)
-      const candidates = await this.getCandidatesInFlow(flowId, userId, caseId);
-      if (candidates.length === 0) {
-        logger.info('[DEPENDENCY_SUGGESTER] No candidates in flow', { flowId });
+      // 2. Get project_id from flow to scope candidates across entire project
+      const projectId = await this.getProjectIdFromFlow(flowId, userId);
+      if (!projectId) {
+        logger.warn('[DEPENDENCY_SUGGESTER] Could not resolve project for flow', { flowId });
         return [];
       }
 
-      // 3. Score each candidate
+      // 3. Get candidate cases across entire project (excluding target and already-added deps)
+      const candidates = await this.getCandidatesInProject(projectId, userId, caseId, targetCase.depends_on);
+      if (candidates.length === 0) {
+        logger.info('[DEPENDENCY_SUGGESTER] No candidates in project', { projectId });
+        return [];
+      }
+
+      // 4. Score each candidate
       const scoredCandidates: Array<DependencySuggestion & { scores: number[] }> = [];
       let semanticComparisons = 0;
 
       for (const candidate of candidates) {
         const scores: { score: number; reason: string }[] = [];
 
-        // 3a. URL continuity check
+        // 4a. Name/word matching (cheap, high recall)
+        const nameScore = this.checkNameSimilarity(candidate, targetCase);
+        if (nameScore.score > 0) {
+          scores.push(nameScore);
+        }
+
+        // 4b. URL continuity check
         const urlScore = this.checkUrlContinuity(candidate, targetCase);
         if (urlScore.score > 0) {
           scores.push(urlScore);
         }
 
-        // 3b. Keyword heuristics check
+        // 4c. Keyword heuristics check
         const heuristicScore = this.checkKeywordHeuristics(candidate, targetCase);
         if (heuristicScore.score > 0) {
           scores.push(heuristicScore);
         }
 
-        // 3c. Semantic similarity (limited)
+        // 4d. Semantic similarity (limited, expensive)
         if (semanticComparisons < MAX_SEMANTIC_COMPARISONS) {
           const semanticScore = await this.checkSemanticSimilarity(candidate, targetCase);
+          semanticComparisons++;
           if (semanticScore.score > 0) {
             scores.push(semanticScore);
-            semanticComparisons++;
           }
         }
 
@@ -158,10 +175,16 @@ export class SavedCaseDependencySuggester {
           scores.sort((a, b) => b.score - a.score);
           const bestScore = scores[0];
 
-          if (bestScore.score >= MIN_CONFIDENCE_THRESHOLD) {
+          // Boost same-flow candidates slightly
+          const flowBoost = candidate.flow_id === targetCase.flow_id ? 0.05 : 0;
+          const finalConfidence = Math.min(1.0, bestScore.score + flowBoost);
+
+          if (finalConfidence >= MIN_CONFIDENCE_THRESHOLD) {
             scoredCandidates.push({
               id: candidate.id,
-              confidence: bestScore.score,
+              name: candidate.name,
+              flowName: candidate.flow_name,
+              confidence: Math.round(finalConfidence * 100) / 100,
               reason: bestScore.reason,
               scores: scores.map(s => s.score),
             });
@@ -169,15 +192,16 @@ export class SavedCaseDependencySuggester {
         }
       }
 
-      // 4. Sort by confidence and limit
+      // 5. Sort by confidence and limit
       scoredCandidates.sort((a, b) => b.confidence - a.confidence);
       const suggestions = scoredCandidates
         .slice(0, MAX_SUGGESTIONS)
-        .map(({ id, confidence, reason }) => ({ id, confidence, reason }));
+        .map(({ id, name, flowName, confidence, reason }) => ({ id, name, flowName, confidence, reason }));
 
       logger.info('[DEPENDENCY_SUGGESTER] Generated suggestions', {
         caseId,
         flowId,
+        projectId,
         candidatesCount: candidates.length,
         suggestionsCount: suggestions.length,
         semanticComparisons,
@@ -200,7 +224,6 @@ export class SavedCaseDependencySuggester {
 
   /**
    * Get an intent test case by ID
-   * Now fetches from intent_test_cases (unified table).
    */
   private static async getIntentCase(
     caseId: string,
@@ -208,7 +231,7 @@ export class SavedCaseDependencySuggester {
   ): Promise<IntentCaseData | null> {
     const { data, error } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name, description, url, start_url, flow_id, depends_on')
+      .select('id, name, description, url, start_url, flow_id, project_id, depends_on')
       .eq('id', caseId)
       .eq('user_id', userId)
       .single();
@@ -218,7 +241,6 @@ export class SavedCaseDependencySuggester {
       throw new Error(`Failed to get intent case: ${error.message}`);
     }
 
-    // Normalize url: use url field, fallback to start_url
     const result = data as any;
     return {
       ...result,
@@ -227,22 +249,45 @@ export class SavedCaseDependencySuggester {
   }
 
   /**
-   * Get all candidate cases in the same flow (excluding target)
-   * Now fetches from intent_test_cases (unified table).
+   * Get project_id from flow via test_modules
    */
-  private static async getCandidatesInFlow(
+  private static async getProjectIdFromFlow(
     flowId: string,
+    userId: string
+  ): Promise<string | null> {
+    const { data, error } = await supabaseAdmin
+      .from('test_flows')
+      .select('id, module_id, test_modules!inner(project_id)')
+      .eq('id', flowId)
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !data) return null;
+    return (data as any).test_modules?.project_id || null;
+  }
+
+  /**
+   * Get all candidate cases across the entire project (excluding target and existing deps)
+   */
+  private static async getCandidatesInProject(
+    projectId: string,
     userId: string,
-    excludeCaseId?: string | null
+    excludeCaseId?: string | null,
+    existingDeps?: string[]
   ): Promise<IntentCaseData[]> {
     let query = supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name, description, url, start_url, flow_id, depends_on')
-      .eq('flow_id', flowId)
+      .select('id, name, description, url, start_url, flow_id, project_id, depends_on, test_flows(name)')
+      .eq('project_id', projectId)
       .eq('user_id', userId);
 
     if (excludeCaseId) {
       query = query.neq('id', excludeCaseId);
+    }
+
+    // Exclude already-added dependencies
+    if (existingDeps && existingDeps.length > 0) {
+      query = query.not('id', 'in', `(${existingDeps.join(',')})`);
     }
 
     const { data, error } = await query;
@@ -251,16 +296,54 @@ export class SavedCaseDependencySuggester {
       throw new Error(`Failed to get candidates: ${error.message}`);
     }
 
-    // Normalize url for each candidate
     return (data || []).map((row: any) => ({
       ...row,
       url: row.url || row.start_url,
+      flow_name: row.test_flows?.name,
     })) as IntentCaseData[];
   }
 
   // ==========================================================================
   // PRIVATE: Scoring Methods
   // ==========================================================================
+
+  /**
+   * Check name similarity using word overlap.
+   * Simple but effective for catching related tests like "Login" and "Login and redirect".
+   *
+   * @returns Score (0.0 - 0.7) and reason
+   */
+  private static checkNameSimilarity(
+    candidate: IntentCaseData,
+    target: IntentCaseData
+  ): { score: number; reason: string } {
+    const candidateWords = this.extractWords(candidate.name);
+    const targetWords = this.extractWords(target.name);
+
+    if (candidateWords.length === 0 || targetWords.length === 0) {
+      return { score: 0, reason: '' };
+    }
+
+    // Count shared words
+    const shared = candidateWords.filter(w => targetWords.includes(w));
+    if (shared.length === 0) {
+      return { score: 0, reason: '' };
+    }
+
+    // Jaccard-like similarity: shared / union
+    const union = new Set([...candidateWords, ...targetWords]);
+    const similarity = shared.length / union.size;
+
+    if (similarity >= 0.2) {
+      const score = Math.min(0.7, 0.3 + similarity * 0.5);
+      return {
+        score,
+        reason: `Related test: "${candidate.name}"`,
+      };
+    }
+
+    return { score: 0, reason: '' };
+  }
 
   /**
    * Check URL continuity between candidate and target.
@@ -296,9 +379,7 @@ export class SavedCaseDependencySuggester {
     const targetDomain = this.extractDomain(target.url);
 
     if (candidateDomain && targetDomain && candidateDomain === targetDomain) {
-      // Check path relationship
       const candidatePath = this.extractPath(candidate.url);
-      // const targetPath = this.extractPath(target.url);
 
       // If candidate is login/auth and target is something else
       if (candidatePath && PREREQ_KEYWORDS.some(k => candidatePath.toLowerCase().includes(k))) {
@@ -309,7 +390,7 @@ export class SavedCaseDependencySuggester {
       }
 
       return {
-        score: 0.4,
+        score: 0.35,
         reason: `Same domain: ${candidateDomain}`,
       };
     }
@@ -343,7 +424,7 @@ export class SavedCaseDependencySuggester {
     // Check if candidate is explicitly a prereq based on name
     if (candidateIsPrereq && !PREREQ_KEYWORDS.some(k => targetText.includes(k))) {
       return {
-        score: 0.6,
+        score: 0.5,
         reason: `"${candidate.name}" is a setup/auth test`,
       };
     }
@@ -365,7 +446,7 @@ export class SavedCaseDependencySuggester {
     const targetText = `${target.name} ${target.description || ''}`.trim();
 
     // Skip if texts are too short
-    if (candidateText.length < 10 || targetText.length < 10) {
+    if (candidateText.length < 5 || targetText.length < 5) {
       return { score: 0, reason: '' };
     }
 
@@ -394,8 +475,20 @@ export class SavedCaseDependencySuggester {
   }
 
   // ==========================================================================
-  // PRIVATE: URL Utilities
+  // PRIVATE: Utilities
   // ==========================================================================
+
+  /**
+   * Extract meaningful words from a string (lowercase, min 2 chars, no stop words)
+   */
+  private static extractWords(text: string): string[] {
+    const stopWords = new Set(['the', 'a', 'an', 'is', 'in', 'on', 'to', 'for', 'of', 'and', 'or', 'with', 'test', 'case', 'that', 'this', 'it']);
+    return text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length >= 2 && !stopWords.has(w));
+  }
 
   /**
    * Normalize URL for comparison (lowercase, remove trailing slash, etc.)

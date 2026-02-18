@@ -70,7 +70,7 @@ export class IntentTestCaseService {
   static async getById(id: string, userId: string): Promise<IntentTestCase | null> {
     const { data, error } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('*')
+      .select('*, test_flows(name)')
       .eq('id', id)
       .eq('user_id', userId)
       .single();
@@ -83,7 +83,22 @@ export class IntentTestCaseService {
       throw new Error(`Failed to get test case: ${error.message}`);
     }
 
-    return this.mapToIntentTestCase(data);
+    const item = this.mapToIntentTestCase(data);
+
+    // Resolve dependency names in a single query
+    if (item.dependsOn && item.dependsOn.length > 0) {
+      const { data: depRows } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, name')
+        .in('id', item.dependsOn);
+
+      item.resolvedDependencies = (item.dependsOn || []).map((depId) => {
+        const dep = depRows?.find((r: any) => r.id === depId);
+        return { id: depId, name: dep?.name || 'Unknown' };
+      });
+    }
+
+    return item;
   }
 
   /**
@@ -98,7 +113,7 @@ export class IntentTestCaseService {
   }): Promise<{ items: IntentTestCase[]; total: number }> {
     const { projectId, userId, flowId, limit = 50, offset = 0 } = params;
 
-    // Build base query
+    // Build base query — join test_flows to get flow name
     let countQuery = supabaseAdmin
       .from('intent_test_cases')
       .select('id', { count: 'exact', head: true })
@@ -107,7 +122,7 @@ export class IntentTestCaseService {
 
     let dataQuery = supabaseAdmin
       .from('intent_test_cases')
-      .select('*')
+      .select('*, test_flows(name)')
       .eq('project_id', projectId)
       .eq('user_id', userId);
 
@@ -135,10 +150,36 @@ export class IntentTestCaseService {
       throw new Error(`Failed to list test cases: ${error.message}`);
     }
 
-    return {
-      items: (data || []).map(this.mapToIntentTestCase),
-      total: count || 0,
-    };
+    const items = (data || []).map((row) => this.mapToIntentTestCase(row));
+
+    // Batch resolve dependency names
+    const allDepIds = new Set<string>();
+    for (const item of items) {
+      for (const depId of item.dependsOn || []) {
+        allDepIds.add(depId);
+      }
+    }
+
+    if (allDepIds.size > 0) {
+      const { data: depRows } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, name')
+        .in('id', [...allDepIds]);
+
+      const depNameMap = new Map<string, string>();
+      for (const row of depRows || []) {
+        depNameMap.set(row.id, row.name);
+      }
+
+      for (const item of items) {
+        if (item.dependsOn && item.dependsOn.length > 0) {
+          item.resolvedDependencies = item.dependsOn
+            .map((depId) => ({ id: depId, name: depNameMap.get(depId) || 'Unknown' }));
+        }
+      }
+    }
+
+    return { items, total: count || 0 };
   }
 
   /**
@@ -291,6 +332,7 @@ export class IntentTestCaseService {
 
       // Organization
       flowId: row.flow_id || undefined,
+      flowName: row.test_flows?.name || undefined,
       dependsOn: row.depends_on || undefined,
 
       // Metadata

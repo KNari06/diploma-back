@@ -790,6 +790,32 @@ export interface ExpandedTestCase {
   parameters?: Record<string, any>;
 }
 
+/**
+ * Test case enriched with dependency info for execution ordering.
+ * Used by executeTestCasesAsync() to resolve topological order.
+ */
+export interface ExecutableTestCase {
+  testCaseId: string;
+  testType: TestType;
+  moduleId?: string;
+  flowId?: string;
+  dependsOn: string[];
+}
+
+/**
+ * Result of topological sort over ExecutableTestCase[].
+ */
+export interface TopologicalSortResult {
+  /** All test cases in topological order */
+  sorted: ExecutableTestCase[];
+  /** Test cases grouped by execution level (level 0 = no deps) */
+  levels: ExecutableTestCase[][];
+  /** True if the dependency graph contains a cycle */
+  hasCycle: boolean;
+  /** IDs of nodes involved in a cycle (only present when hasCycle=true) */
+  cycleNodes?: string[];
+}
+
 // ============================================================================
 // RUN PARAMS
 // ============================================================================

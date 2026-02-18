@@ -153,6 +153,7 @@ export class LiteEngine {
   // ✅ FIX P0: Auto-fill timeout tracking to prevent infinite loops
   private autoFillIterationCount = 0;
   private readonly MAX_AUTO_FILL_ITERATIONS = 3; // Max consecutive auto-fill attempts
+  private staleSnapshotGuardDone = false; // Run stale-snapshot re-wait only once after submit
 
   // ═══════════════════════════════════════════════════════════════════════════
   // L7: ADDITIONAL CLARIFICATION GATES
@@ -1223,6 +1224,32 @@ export class LiteEngine {
           snapshotBefore = await SnapshotCollector.collect(this.page);
         }
 
+        // 2b. Guard: stale snapshot after credential fill.
+        // Runs only ONCE (flag prevents re-triggering on 2FA pages that also have password fields).
+        // If auto-fill just completed (state='done') but snapshot still shows a login
+        // form (password field visible), the page navigation hasn't settled yet.
+        // Re-wait and re-collect so the AI doesn't see the old page.
+        if (this.credentialFillState === 'done' && !this.staleSnapshotGuardDone) {
+          this.staleSnapshotGuardDone = true;
+          const hasPasswordField = snapshotBefore.elements.some(
+            el => el.tag === 'input' && el.type === 'password' && el.visible
+          );
+          if (hasPasswordField) {
+            logger.info('[LITE_ENGINE] Stale snapshot after auto-fill: login form still visible, re-waiting', {
+              testId: this.config.testId,
+              url: snapshotBefore.url,
+              iteration: i,
+            });
+            try {
+              await this.page.waitForLoadState('networkidle', { timeout: 8000 });
+              await VisualStability.waitForStable(this.page);
+            } catch {
+              // Timeout OK — maybe it's a real login failure
+            }
+            snapshotBefore = await SnapshotCollector.collect(this.page);
+          }
+        }
+
         // ✅ NEW: Trace snapshot
         const formattedSnapshot = SnapshotCollector.format(snapshotBefore);
         this.traceWriter.write({
@@ -1319,6 +1346,20 @@ export class LiteEngine {
               // Execute auto-command directly
               const execResult = await this.executor.execute(autoCommand, snapshotBefore, {});
 
+              // After submit click, the page may navigate (e.g. login redirect).
+              // Wait for navigation + stability so the NEXT iteration's snapshot
+              // reflects the new page, not the stale login form.
+              if (autoFillStateName === 'submitting' && execResult.success) {
+                try {
+                  await this.page.waitForLoadState('domcontentloaded', { timeout: 10000 });
+                  await this.networkTracker.waitForNetworkIdle(5000);
+                  await VisualStability.waitForStable(this.page);
+                } catch {
+                  // Timeout is OK — page might not navigate (e.g. validation error).
+                  // The next iteration will handle it either way.
+                }
+              }
+
               // Trace action execute end
               this.traceWriter.write({
                 iteration: i,
@@ -1341,18 +1382,21 @@ export class LiteEngine {
                 done: false,
               };
 
+              // Capture actual URL after action (may have changed due to redirect)
+              const urlAfterAutoFill = this.page.url();
+
               // Record iteration with auto-fill
               const syntheticDiff: StateDiff = {
-                urlChanged: false,
+                urlChanged: urlAfterAutoFill !== snapshotBefore.url,
                 urlBefore: snapshotBefore.url,
-                urlAfter: snapshotBefore.url,
+                urlAfter: urlAfterAutoFill,
                 addedElements: [],
                 removedRefs: [],
                 changedElements: [],
-                hasVisualChange: false,
+                hasVisualChange: urlAfterAutoFill !== snapshotBefore.url,
                 meaningfulChange: execResult.success,
-                significantChange: false,
-                semanticWeight: 0,
+                significantChange: urlAfterAutoFill !== snapshotBefore.url,
+                semanticWeight: urlAfterAutoFill !== snapshotBefore.url ? 3 : 0,
                 progressSentiment: execResult.success ? 'Minor Change' : 'No Effect',
                 newPageErrors: [],
                 newConsoleErrors: [],
@@ -1377,8 +1421,8 @@ export class LiteEngine {
                   pageErrors: [],
                 },
                 stateAfter: {
-                  url: snapshotBefore.url,
-                  elementCount: snapshotBefore.elements.length,
+                  url: urlAfterAutoFill,
+                  elementCount: snapshotBefore.elements.length, // snapshot not re-collected here; next iteration gets fresh
                   pageErrors: [],
                 },
               });
@@ -1394,7 +1438,7 @@ export class LiteEngine {
               closeIteration({
                 iteration: i,
                 outcome: autoOutcome,
-                urlAfter: snapshotBefore.url,
+                urlAfter: urlAfterAutoFill,
                 stateChanged: execResult.success,
                 isAutoFill: true,
                 autoFillState: autoFillStateName,
@@ -4267,8 +4311,14 @@ export class LiteEngine {
 
         try {
           await this.executor.execute(commandWithCreds, newSnapshot);
+          // Wait for potential navigation after retry
+          try {
+            await this.networkTracker.waitForNetworkIdle(5000);
+            await VisualStability.waitForStable(this.page);
+          } catch { /* timeout OK */ }
+          const postRetrySnapshot = await SnapshotCollector.collect(this.page);
           logger.info('[RECOVERY] Reload + retry successful', { testId: this.config.testId });
-          return { recovered: true, method: 'reload', newSnapshot, shouldEscalate: false };
+          return { recovered: true, method: 'reload', newSnapshot: postRetrySnapshot, shouldEscalate: false };
         } catch (retryError) {
           logger.debug('[RECOVERY] Retry failed after reload', {
             error: retryError instanceof Error ? retryError.message : String(retryError),

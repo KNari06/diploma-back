@@ -770,7 +770,9 @@ export interface IntentTestCase {
 
   // Organization
   flowId?: string;
+  flowName?: string;
   dependsOn?: string[];
+  resolvedDependencies?: Array<{ id: string; name: string }>;
 
   // Metadata
   tags?: string[];

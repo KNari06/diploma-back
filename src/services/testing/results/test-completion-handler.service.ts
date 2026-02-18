@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { executionCompletionEmitter } from '@/services/testing/executions/execution-completion-emitter';
 import { TestResultsFormatterService } from '@/services/testing/results/test-results-formatter.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 import { ChatService } from '@/services/utils/chat.service';
@@ -285,6 +286,11 @@ export class TestCompletionHandlerService {
           updatedCount: data.length,
           mappedStatus,
         });
+
+        // Signal dependency-aware execution orchestrator so dependents can proceed
+        for (const row of data) {
+          executionCompletionEmitter.signalCompletion(row.id, mappedStatus);
+        }
       }
     } catch (error) {
       logger.warn('[TEST_COMPLETION] Error updating test_executions for UI test', {
