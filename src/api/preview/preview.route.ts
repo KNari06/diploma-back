@@ -7,13 +7,13 @@ import { requireAuth } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import multer from 'multer';
 import { uploadTestFile } from './upload.controller';
+import { runFromJiraViaChat } from '../jira/jira.controller';
 import {
   batchRunIntentTestCases,
   createIntentTestCase,
   deleteIntentTestCase,
   getIntentTestCase,
   listIntentTestCases,
-  runFromJiraViaChat,
   runIntentTestCase,
   startPreview,
   stopPreview,

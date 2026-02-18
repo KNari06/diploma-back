@@ -9,11 +9,8 @@ import { IntentStepConverterService } from '@/services/testing/ui/preview/intent
 import { injectAutoWaitForSteps } from '@/services/testing/ui/preview/auto-wait-for.utils';
 import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-session.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
-import { handleChat } from '@/api/chat/chat.controller';
-import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
-import { randomUUID } from 'crypto';
 import { Request, Response } from 'express';
 
 // ============================================================================
@@ -145,136 +142,6 @@ export async function stopPreview(req: Request, res: Response): Promise<void> {
     const message = error instanceof Error ? error.message : 'Failed to stop preview';
     const statusCode = message.toLowerCase().includes('forbidden') ? 403 : 500;
     res.status(statusCode).json({ error: message });
-  }
-}
-
-async function detectJiraTicketTypeByPrompt(params: {
-  summary: string;
-  description: string;
-}): Promise<'api' | 'web_ui'> {
-  const { summary, description } = params;
-
-  const systemPrompt =
-    'You are a strict classifier for QA tickets. ' +
-    'Return JSON only with this exact shape: {"ticketType":"web_ui"|"api","confidence":0..1,"reason":"short"}. ' +
-    'Classify as "api" only if the ticket is primarily about backend endpoints, HTTP methods, request/response, API contracts, or integrations via API. ' +
-    'Otherwise classify as "web_ui".';
-
-  const userPrompt = `Classify this Jira ticket.\nTitle: ${summary}\nDescription: ${description || '(empty)'}`;
-
-  const completion = await getChatCompletionWithMessages(
-    [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ],
-    {
-      temperature: 0,
-      max_tokens: 200,
-      response_format: { type: 'json_object' },
-    }
-  );
-
-  const raw = completion.content || '{}';
-  let parsed: any = {};
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    parsed = {};
-  }
-
-  const type = typeof parsed?.ticketType === 'string' ? parsed.ticketType.trim().toLowerCase() : '';
-  if (type === 'api') return 'api';
-  if (type === 'web_ui') return 'web_ui';
-
-  throw new Error(`AI returned invalid ticketType: ${String(parsed?.ticketType ?? 'undefined')}`);
-}
-
-/**
- * Run Jira ticket through the same flow as POST /api/v1/chat.
- * POST /api/v1/preview/intent-test-cases/from-jira
- */
-export async function runFromJiraViaChat(req: Request, res: Response): Promise<void> {
-  try {
-    const userId = (req as any).user?.id;
-    if (!userId) {
-      res.status(401).json({ error: 'Unauthorized' });
-      return;
-    }
-
-    const { projectId, sessionId, conversationId, mode, context, ticket, apiTest, issueKey } = req.body || {};
-
-    const summaryRaw = ticket?.summary ?? req.body?.summary;
-    const descriptionRaw = ticket?.description ?? req.body?.description;
-
-    const summary = typeof summaryRaw === 'string' ? summaryRaw.trim() : '';
-    const description = typeof descriptionRaw === 'string' ? descriptionRaw.trim() : '';
-
-    if (!summary) {
-      res.status(400).json({ error: 'Missing required ticket.summary (or title)' });
-      return;
-    }
-
-    const mergedMessage = [summary, description].filter(Boolean).join('\n\n');
-    const resolvedSessionId = typeof sessionId === 'string' && sessionId.trim().length > 0
-      ? sessionId
-      : randomUUID();
-
-    let ticketType: 'api' | 'web_ui' = 'web_ui';
-    try {
-      ticketType = await detectJiraTicketTypeByPrompt({ summary, description });
-    } catch (classifyError) {
-      logger.warn('[PREVIEW_CONTROLLER] Jira ticket type classification failed, fallback to web_ui', {
-        error: classifyError instanceof Error ? classifyError.message : String(classifyError),
-      });
-    }
-
-    const nextContext: Record<string, any> = {
-      ...(typeof context === 'object' && context !== null && !Array.isArray(context) ? context : {}),
-      projectId: projectId || context?.projectId,
-      source: 'jira_from_ticket',
-      jira: {
-        issueKey,
-        testType: ticketType,
-      },
-    };
-
-    if (ticketType === 'api') {
-      // Force API flow so the run is stored via API test path.
-      nextContext.action = 'run_api_test';
-      if (apiTest && typeof apiTest === 'object' && !Array.isArray(apiTest)) {
-        nextContext.apiTest = apiTest;
-      }
-    }
-
-    req.body = {
-      message: mergedMessage,
-      context: nextContext,
-      sessionId: resolvedSessionId,
-      conversationId,
-      mode: mode || 'lite',
-    };
-
-    logger.info('[PREVIEW_CONTROLLER] Jira from-ticket delegated to /chat handler', {
-      userId,
-      projectId,
-      issueKey: issueKey || null,
-      testType: ticketType || 'auto',
-      sessionId: resolvedSessionId,
-      messageLength: mergedMessage.length,
-      hasDescription: !!description,
-    });
-
-    await handleChat(req, res);
-  } catch (error) {
-    logger.error('[PREVIEW_CONTROLLER] Failed to run Jira from-ticket flow', {
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-    });
-    res.status(500).json({
-      success: false,
-      error: 'Failed to run Jira ticket through chat flow',
-      message: error instanceof Error ? error.message : String(error),
-    });
   }
 }
 
