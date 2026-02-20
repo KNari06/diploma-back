@@ -1142,6 +1142,91 @@ export class LiteEngine {
       });
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PHASE 0.5: PREFILLED STEPS FAST REPLAY
+    // Execute known steps directly (no AI), then switch to full AI loop.
+    // Same pattern as credential auto-fill (executor.execute + continue).
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (this.config.prefilledSteps?.length) {
+      logger.info('[LITE_ENGINE] Phase 0.5: Starting fast replay of prefilled steps', {
+        testId: this.config.testId,
+        stepCount: this.config.prefilledSteps.length,
+      });
+
+      for (let si = 0; si < this.config.prefilledSteps.length; si++) {
+        const step = this.config.prefilledSteps[si];
+
+        // Check cancellation between steps
+        try {
+          await checkTestCancelled(this.config.testId);
+        } catch (cancelError) {
+          if (cancelError instanceof Error && cancelError.message.includes('cancelled')) {
+            logger.info('[LITE_ENGINE] Phase 0.5: Test cancelled during fast replay', {
+              testId: this.config.testId,
+              stepIndex: si,
+            });
+            this.emitCompletion(false, 'Test cancelled by user');
+            return await this.buildResult(false, 'Test cancelled by user');
+          }
+        }
+
+        try {
+          const snapshot = await SnapshotCollector.collect(this.page);
+          let command = step.command;
+
+          // Override credentials in fill commands (security: never send to LLM)
+          if (command.action === 'fill' && this.config.credentials) {
+            command = this.overrideCredentialFillValue(command, snapshot);
+          }
+
+          const execResult = await this.executor.execute(command, snapshot, {});
+
+          if (execResult.success) {
+            // Wait for page stability after each action
+            try {
+              await this.networkTracker.waitForNetworkIdle(3000);
+              await VisualStability.waitForStable(this.page);
+            } catch {
+              // Non-critical: continue even if stability wait fails
+            }
+
+            logger.debug('[LITE_ENGINE] Phase 0.5: Step replayed successfully', {
+              testId: this.config.testId,
+              stepIndex: si,
+              action: command.action,
+              source: step.sourceTestCaseName,
+            });
+          } else if (!step.softReplay) {
+            // Hard failure: stop replay, let AI take over
+            logger.info('[LITE_ENGINE] Phase 0.5: Hard failure, switching to AI', {
+              testId: this.config.testId,
+              stepIndex: si,
+              action: command.action,
+            });
+            break;
+          } else {
+            // Soft failure: skip step, continue replay
+            logger.debug('[LITE_ENGINE] Phase 0.5: Soft failure, continuing replay', {
+              testId: this.config.testId,
+              stepIndex: si,
+              action: command.action,
+            });
+          }
+        } catch (stepError) {
+          logger.warn('[LITE_ENGINE] Phase 0.5: Step execution threw, continuing', {
+            testId: this.config.testId,
+            stepIndex: si,
+            error: stepError instanceof Error ? stepError.message : String(stepError),
+          });
+          if (!step.softReplay) break;
+        }
+      }
+
+      logger.info('[LITE_ENGINE] Phase 0.5: Fast replay complete, starting AI loop', {
+        testId: this.config.testId,
+      });
+    }
+
     try {
       for (let i = 0; i < this.MAX_ITERATIONS; i++) {
         logger.debug('[LITE_ENGINE] Starting iteration', { iteration: i });

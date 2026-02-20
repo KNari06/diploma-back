@@ -514,6 +514,8 @@ export interface LiteEngineConfig {
   credentials?: LiteCredentials;
   /** Chat session ID for WebSocket routing isolation */
   chatSessionId?: string;
+  /** Prefilled steps from Smart Test Case Resolver for fast replay before AI loop */
+  prefilledSteps?: import('@/services/testing/resolver/resolver.types').PrefilledStep[];
 }
 
 /**

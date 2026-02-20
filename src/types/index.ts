@@ -33,6 +33,8 @@ export interface TestRunRequest {
   intent?: string; // Original user intent for context
   mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
   chatSessionId?: string; // Chat session ID for WebSocket routing isolation
+  /** Prefilled steps from Smart Test Case Resolver for fast replay */
+  prefilledSteps?: import('@/services/testing/resolver/resolver.types').PrefilledStep[];
   /** V2: Additional metadata for linking and reporting */
   metadata?: {
     /** Intent test case ID if run from intent test case */
@@ -339,6 +341,7 @@ export interface TestJobData {
   testGoal?: string; // NEW: Testing goal for intelligent mode
   mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
   chatSessionId?: string; // Chat session ID for WebSocket routing isolation
+  prefilledSteps?: import('@/services/testing/resolver/resolver.types').PrefilledStep[]; // Smart Resolver prefilled steps
 }
 
 export interface AgentResponse {
@@ -865,6 +868,13 @@ export interface IntentResult {
   sourceTestId?: string | null;        // For save_test: ID of test to save
   suggestedName?: string | null;       // For save_test: suggested name
   savedTestCaseId?: string | null;     // For run_regression: ID of saved test case
+
+  // Smart Test Case Resolver context (for platform_test with matched existing cases)
+  resolvedContext?: {
+    prefilledSteps: import('@/services/testing/resolver/resolver.types').PrefilledStep[];
+    sourceTestCases?: Array<{ id: string; name: string; matchScore: number }>;
+    resolverStrategy: 'embedding' | 'hybrid' | 'name_only';
+  };
 }
 
 // Playwright Command types

@@ -813,6 +813,7 @@ export async function handlePlatformTest(
         : `Test ${finalScope} functionality on ${extractedUrl}`;
 
       // Step L2: Create test request
+      const resolvedContext = parsedIntent?.resolvedContext;
       const testRequest = {
         url: extractedUrl.trim(),
         browsers: ['chrome' as const],
@@ -825,6 +826,7 @@ export async function handlePlatformTest(
         testGoal,
         mode: 'lite' as const,
         chatSessionId, // Pass chat session ID for WebSocket routing isolation
+        prefilledSteps: resolvedContext?.prefilledSteps, // Smart Resolver: prefilled steps for fast replay
       };
 
       emitProcessingStepWithLogging(chatSessionId, 'executing_test', '⚙️ Launching browser...', 60);

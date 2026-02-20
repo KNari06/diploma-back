@@ -854,6 +854,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               // Pass credentials for secure fill (never sent to LLM)
               credentials: testData.options?.credentials,
               chatSessionId: testData.chatSessionId, // Chat session for routing isolation
+              prefilledSteps: testData.prefilledSteps, // Smart Resolver: prefilled steps for fast replay
             });
 
             return engine.execute();

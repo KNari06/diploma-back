@@ -197,6 +197,53 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     checkRequestAbortedWithLogging(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
+    // STEP 5.5: SMART TEST CASE RESOLVER
+    // Only for platform_test intent — check if existing test cases match
+    // ═══════════════════════════════════════════════════════════════════════
+    if (parsedIntent?.intent === 'platform_test') {
+      try {
+        const { TestCaseResolverService } = await import(
+          '@/services/testing/resolver/test-case-resolver.service'
+        );
+        const resolverResult = await TestCaseResolverService.resolve({
+          message,
+          userId,
+          workspaceId: workspace_id,
+        });
+
+        if (resolverResult.matchType === 'exact' && resolverResult.bestMatch) {
+          // Redirect to regression (fast, background)
+          parsedIntent.intent = 'run_regression';
+          parsedIntent.savedTestCaseId = resolverResult.bestMatch.id;
+          logger.info('[CHAT] Smart Resolver: exact match → run_regression', {
+            testCaseId: resolverResult.bestMatch.id,
+            testCaseName: resolverResult.bestMatch.name,
+            score: resolverResult.bestMatch.score,
+          });
+        } else if (resolverResult.matchType === 'partial' && resolverResult.prefilledSteps?.length) {
+          // Enrich with prefilled steps for LiteEngine
+          parsedIntent.resolvedContext = {
+            prefilledSteps: resolverResult.prefilledSteps,
+            sourceTestCases: resolverResult.relatedCases?.map(c => ({
+              id: c.id, name: c.name, matchScore: c.score,
+            })),
+            resolverStrategy: resolverResult.resolverMeta.strategy,
+          };
+          logger.info('[CHAT] Smart Resolver: partial match → prefilled steps', {
+            prefilledStepsCount: resolverResult.prefilledSteps.length,
+            sourceTestCases: resolverResult.relatedCases?.map(c => c.name),
+          });
+        }
+        // 'none' → no changes, full LiteEngine
+      } catch (error) {
+        // Graceful degradation: if resolver fails, continue unchanged
+        logger.warn('[CHAT] Smart Resolver failed, continuing with original intent', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // STEP 6: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
     // ═══════════════════════════════════════════════════════════════════════
     const routeToHandlerWithLogging = withFunctionLogging(routeToHandler, 'routeToHandler', functionLogger);
