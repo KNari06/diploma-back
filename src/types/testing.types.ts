@@ -130,6 +130,44 @@ export interface TestRecommendation {
 }
 
 // ============================================================================
+// COVERAGE ANALYSIS TYPES
+// ============================================================================
+
+/**
+ * Type of coverage gap identified
+ */
+export type CoverageGapType =
+  | 'untested_url'
+  | 'stale_test'
+  | 'unstable_area'
+  | 'no_test_case';
+
+/**
+ * A single coverage gap with priority and context
+ */
+export interface CoverageGap {
+  type: CoverageGapType;
+  title: string;
+  description: string;
+  url?: string;
+  testCaseId?: string;
+  priority: 'high' | 'medium' | 'low';
+}
+
+/**
+ * Full coverage analysis report for a project
+ */
+export interface CoverageReport {
+  score: number;                    // 0-100
+  totalUrls: number;
+  coveredUrls: number;
+  totalTestCases: number;
+  staleTestCases: number;
+  gaps: CoverageGap[];
+  summary: string;                  // LLM-generated
+}
+
+// ============================================================================
 // TEST PLATFORM
 // ============================================================================
 

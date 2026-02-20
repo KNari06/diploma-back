@@ -33,6 +33,20 @@ interface LocalizedMessages {
     success: (formattedList: string) => string;
     error: string;
   };
+  coverageAnalysis: {
+    noProject: string;
+    success: (
+      scoreBadge: string,
+      score: number,
+      coveredUrls: number,
+      totalUrls: number,
+      totalTestCases: number,
+      staleTestCases: number,
+      gapList: string,
+      summary: string,
+    ) => string;
+    error: string;
+  };
 }
 
 const messages: Record<Language, LocalizedMessages> = {
@@ -61,6 +75,15 @@ const messages: Record<Language, LocalizedMessages> = {
         `📋 **Test Recommendations**\n\nHere\'s what I recommend testing next:\n\n${formattedList}`,
       error: 'Failed to generate test recommendations. Please try again.',
     },
+    coverageAnalysis: {
+      noProject: 'No project context found. Please run a test first so I can analyze coverage.',
+      success: (scoreBadge, score, coveredUrls, totalUrls, totalTestCases, staleTestCases, gapList, summary) =>
+        `${scoreBadge} **Coverage Score: ${score}/100**\n\n` +
+        `**URLs:** ${coveredUrls}/${totalUrls} covered | **Test Cases:** ${totalTestCases} total, ${staleTestCases} stale\n\n` +
+        `---\n\n${summary}\n\n` +
+        `---\n\n**Gaps:**\n\n${gapList}`,
+      error: 'Failed to analyze coverage. Please try again.',
+    },
   },
   ru: {
     saveTest: {
@@ -87,6 +110,15 @@ const messages: Record<Language, LocalizedMessages> = {
         `📋 **Рекомендации по тестированию**\n\nВот что я рекомендую протестировать:\n\n${formattedList}`,
       error: 'Не удалось сгенерировать рекомендации. Пожалуйста, попробуйте снова.',
     },
+    coverageAnalysis: {
+      noProject: 'Не найден контекст проекта. Запустите тест, чтобы я мог проанализировать покрытие.',
+      success: (scoreBadge, score, coveredUrls, totalUrls, totalTestCases, staleTestCases, gapList, summary) =>
+        `${scoreBadge} **Покрытие: ${score}/100**\n\n` +
+        `**URL:** ${coveredUrls}/${totalUrls} покрыто | **Тест-кейсы:** ${totalTestCases} всего, ${staleTestCases} устаревших\n\n` +
+        `---\n\n${summary}\n\n` +
+        `---\n\n**Пробелы в покрытии:**\n\n${gapList}`,
+      error: 'Не удалось проанализировать покрытие. Пожалуйста, попробуйте снова.',
+    },
   },
   neutral: {
     saveTest: {
@@ -112,6 +144,15 @@ const messages: Record<Language, LocalizedMessages> = {
       success: (formattedList) =>
         `📋 **Test Recommendations**\n\nHere\'s what I recommend testing next:\n\n${formattedList}`,
       error: 'Failed to generate test recommendations. Please try again.',
+    },
+    coverageAnalysis: {
+      noProject: 'No project context found. Please run a test first so I can analyze coverage.',
+      success: (scoreBadge, score, coveredUrls, totalUrls, totalTestCases, staleTestCases, gapList, summary) =>
+        `${scoreBadge} **Coverage Score: ${score}/100**\n\n` +
+        `**URLs:** ${coveredUrls}/${totalUrls} covered | **Test Cases:** ${totalTestCases} total, ${staleTestCases} stale\n\n` +
+        `---\n\n${summary}\n\n` +
+        `---\n\n**Gaps:**\n\n${gapList}`,
+      error: 'Failed to analyze coverage. Please try again.',
     },
   },
 };

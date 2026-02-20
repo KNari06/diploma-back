@@ -4,6 +4,7 @@ import { handleApiTest as handleApiTestOriginal } from '../api_test/handler';
 import { handleGeneralChat as handleGeneralChatOriginal } from '../general/handler';
 import { handleAddToPlanIntent } from '../regression/add-to-plan.handler';
 import { handleAnalyzeFailureIntent } from '../regression/analyze-failure.handler';
+import { handleCoverageAnalysisIntent } from '../regression/coverage-analysis.handler';
 import { handleCreatePlanIntent } from '../regression/create-plan.handler';
 import { handleRunByTagIntent } from '../regression/run-by-tag.handler';
 import { handleRunModuleIntent } from '../regression/run-module.handler';
@@ -148,6 +149,7 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
   // AI intelligence intents
   analyze_failure: handleAnalyzeFailureIntent,
   test_recommendations: handleTestRecommendationsIntent,
+  coverage_analysis: handleCoverageAnalysisIntent,
 };
 
 /**
@@ -204,5 +206,6 @@ export function getIntentDescriptions(): Record<string, string> {
     run_by_tag: 'User wants to run tests by tag (e.g., "run critical tests")',
     analyze_failure: 'User wants to understand why a test failed (root-cause analysis)',
     test_recommendations: 'User wants suggestions on what to test next',
+    coverage_analysis: 'User wants to see test coverage gaps and what\'s not tested',
   };
 }

@@ -235,6 +235,11 @@ export class RegressionRunService {
       testGoal: intentCase.description || intentCase.name,
       commands, // Pre-generated commands
       options: sourceTest?.options || {},
+      metadata: {
+        intentTestCaseId: intentCase.id,
+        intentTestCaseName: intentCase.name,
+        source: 'intent_test_case',
+      },
     };
   }
 

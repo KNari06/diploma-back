@@ -356,7 +356,7 @@ export async function handleGeneralChat(
       const { MEMORY_TOOLS } = await import('@/services/ai/memory/memory-tools');
 
       // Get available skill tools
-      const skillContext = { userId, workspaceId, chatSessionId };
+      const skillContext = { userId, workspaceId, chatSessionId, projectId };
       const skillTools = await SkillRegistry.getAvailableTools(skillContext);
       skillDescriptions = await SkillRegistry.getSkillDescriptions(skillContext);
 
@@ -378,7 +378,7 @@ export async function handleGeneralChat(
   const buildChatSystemPromptWithLogging = functionLogger
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
     : buildChatSystemPrompt;
-  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions);
+  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId);
 
   // Append editor-specific instructions if in editor mode
   if (mode === 'editor') {
@@ -532,9 +532,30 @@ If the user asks to test something on the current page, prefer platform_test int
       } as any);
 
       // Execute each tool call
+      const TOOL_TIMEOUT_MS = 15000; // 15 seconds per tool
+
       for (const toolCall of toolCalls) {
         const toolName = toolCall.function.name;
-        const toolArgs = JSON.parse(toolCall.function.arguments);
+
+        // A1: Safely parse tool arguments — malformed JSON from LLM should not crash the loop
+        let toolArgs: Record<string, any>;
+        try {
+          toolArgs = JSON.parse(toolCall.function.arguments);
+        } catch (parseError) {
+          logger.warn('[GENERAL_CHAT] Failed to parse tool arguments', {
+            toolName,
+            raw: toolCall.function.arguments?.substring(0, 200),
+          });
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({
+              success: false,
+              message: 'Invalid arguments: failed to parse JSON',
+            }),
+          } as any);
+          continue; // Skip this tool, continue with others
+        }
 
         logger.info('[GENERAL_CHAT] Executing tool', {
           toolName,
@@ -544,16 +565,30 @@ If the user asks to test something on the current page, prefer platform_test int
         try {
           let toolResult: any;
 
+          // A3: Wrap tool execution with timeout to prevent stalling
+          const withToolTimeout = <T>(promise: Promise<T>): Promise<T> => {
+            return Promise.race([
+              promise,
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error(`Tool '${toolName}' timed out after ${TOOL_TIMEOUT_MS}ms`)), TOOL_TIMEOUT_MS)
+              ),
+            ]);
+          };
+
           // Route to appropriate executor
           if (['remember_fact', 'search_memory', 'forget_fact'].includes(toolName)) {
-            // Memory tools
-            const { executeMemoryTool } = await import('@/services/ai/memory/memory-tools');
-            toolResult = await executeMemoryTool(toolName, toolArgs, workspaceId!, userId);
+            // Memory tools — guard against missing workspaceId
+            if (!workspaceId) {
+              toolResult = { success: false, message: 'Workspace context required for memory tools' };
+            } else {
+              const { executeMemoryTool } = await import('@/services/ai/memory/memory-tools');
+              toolResult = await withToolTimeout(executeMemoryTool(toolName, toolArgs, workspaceId, userId));
+            }
           } else {
             // Skill tools
             const { SkillRegistry } = await import('@/services/skills');
-            const skillContext = { userId, workspaceId: workspaceId!, chatSessionId };
-            toolResult = await SkillRegistry.executeTool(toolName, toolArgs, skillContext);
+            const skillContext = { userId, workspaceId: workspaceId!, chatSessionId, projectId };
+            toolResult = await withToolTimeout(SkillRegistry.executeTool(toolName, toolArgs, skillContext));
           }
 
           // Add tool result to messages
@@ -589,8 +624,11 @@ If the user asks to test something on the current page, prefer platform_test int
     }
 
     if (!finalResponse) {
-      // Max rounds reached without final response
-      finalResponse = "I've completed the requested actions. Is there anything else you'd like me to help with?";
+      // Max rounds reached without final response — provide partial context if available
+      const lastAssistantMsg = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
+      finalResponse = lastAssistantMsg?.content
+        ? `${lastAssistantMsg.content}\n\n(Note: I reached the maximum number of analysis steps. The above may be incomplete — feel free to ask a follow-up question for more detail.)`
+        : "I ran out of analysis steps before completing my response. Could you try asking a more specific question so I can answer within fewer steps?";
       logger.warn('[GENERAL_CHAT] Max tool rounds reached', { rounds: MAX_TOOL_ROUNDS });
     }
 

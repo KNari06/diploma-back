@@ -21,7 +21,8 @@ export type IntegrationProvider =
   | 'notion'
   | 'trello'
   | 'slack'
-  | 'telegram';
+  | 'telegram'
+  | 'qa';
 
 /**
  * Context provided to skills during execution
@@ -30,6 +31,7 @@ export interface SkillContext {
   userId: string;
   workspaceId: string;
   chatSessionId?: string;
+  projectId?: string;
 }
 
 /**

@@ -119,6 +119,7 @@ export function buildIntentPrompt(
     'run_regression',
     'analyze_failure',
     'test_recommendations',
+    'coverage_analysis',
   ];
 
   // Build regression context if available
@@ -160,10 +161,12 @@ AVAILABLE INTENTS: ${intents.join(', ')}
    - Relative paths ("/test", "/api/v1/users"): set apiUrl to the path, isRelativePath=true
    - Keywords: "API", "endpoint", "HTTP", GET/POST/PUT/DELETE
 
-3. "general_chat" - User wants to TALK, ASK, or DISCUSS
+3. "general_chat" - User wants to TALK, ASK, DISCUSS, or ANALYZE QA data
    - User is asking a QUESTION (not giving a command): "Did you...?", "What were...?", "How...?"
    - Wants info about PAST tests, results, or explanations
    - Having a CONVERSATION, not requesting action
+   - **Analytical QA questions** — coverage gaps, test counts, pass rates, failure trends, stale tests, what to test next, run comparisons
+   - Examples: "how many test cases?", "what's the pass rate?", "which tests are stale?", "show recent failures", "what URLs aren't covered?"
 
 4. "needs_clarification" - UNCERTAIN about user's intent
    USE ONLY when critical info is truly missing AND cannot be inferred.
@@ -193,6 +196,9 @@ AVAILABLE INTENTS: ${intents.join(', ')}
 8. "test_recommendations" - Know WHAT to test next
    - "what should I test?", "suggest tests", "что протестировать", "рекомендации"
 
+9. "coverage_analysis" - See test COVERAGE gaps (no test execution, DB analysis only)
+   - "what's not covered?", "coverage analysis", "покажи покрытие", "gap analysis", "что не покрыто", "what's not tested?"
+
 ${regressionContextStr}
 
 --- DECISION TREE ---
@@ -212,6 +218,17 @@ ${regressionContextStr}
 
 5. Test suggestions ("what should I test", "что протестировать") → test_recommendations
 
+5b. Coverage questions ("what's not covered", "покажи покрытие", "gap analysis") → coverage_analysis
+
+5c. Analytical QA data questions → general_chat (agent has QA tools to query DB)
+   - Test case counts/listing: "how many test cases?", "list my tests", "сколько тестов?"
+   - Pass rate / analytics: "what's the pass rate?", "show analytics", "покажи статистику"
+   - Failure trends / recent failures: "show recent failures", "which tests keep failing?"
+   - Coverage comparisons: "compare /login vs /checkout coverage", "which URLs aren't tested?"
+   - Stale test detection: "which tests are stale?", "какие тесты устарели?"
+   - Run reports: "show last run results", "результаты последнего запуска"
+   - Plan listing: "how many regression plans?", "list plans"
+
 6. Questions about past/status, explanations, discussions → general_chat
 
 7. Missing critical info after checking all above → needs_clarification
@@ -225,7 +242,7 @@ CRITICAL anti-hallucination rule:
 
 REQUIRED FIELDS (always include):
 {
-  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations",
+  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis",
   "intent_confidence": 0.0-1.0,
   "rawText": string
 }
@@ -310,7 +327,25 @@ Ex15: "what should I test?"
 → {"intent": "test_recommendations", "intent_confidence": 0.90, "rawText": "..."}
 
 Ex16: "что мне протестировать?"
-→ {"intent": "test_recommendations", "intent_confidence": 0.90, "rawText": "..."}`;
+→ {"intent": "test_recommendations", "intent_confidence": 0.90, "rawText": "..."}
+
+Ex17: "what's not covered?"
+→ {"intent": "coverage_analysis", "intent_confidence": 0.92, "rawText": "..."}
+
+Ex18: "покажи покрытие"
+→ {"intent": "coverage_analysis", "intent_confidence": 0.92, "rawText": "..."}
+
+Ex19: "how many test cases do I have?"
+→ {"intent": "general_chat", "intent_confidence": 0.90, "rawText": "..."}
+
+Ex20: "show me recent failed tests"
+→ {"intent": "general_chat", "intent_confidence": 0.88, "rawText": "..."}
+
+Ex21: "what's the pass rate this month?"
+→ {"intent": "general_chat", "intent_confidence": 0.90, "rawText": "..."}
+
+Ex22: "сколько регрессионных планов?"
+→ {"intent": "general_chat", "intent_confidence": 0.88, "rawText": "..."}`;
 
   // Add context if available
   if (context) {
@@ -342,7 +377,7 @@ Ex16: "что мне протестировать?"
  * Used for general conversations with users
  * @param skillDescriptions - Optional skill descriptions for integration tools
  */
-export function buildChatSystemPrompt(skillDescriptions?: string): string {
+export function buildChatSystemPrompt(skillDescriptions?: string, projectId?: string): string {
   let prompt = `You are QAIT - an AI QA automation assistant. Have natural conversations about testing like ChatGPT.
 
 MINDSET: Understand CONTEXT, not just keywords.
@@ -393,11 +428,19 @@ CRITICAL MISTAKES TO AVOID:
   // Add skill/integration descriptions if provided
   if (skillDescriptions) {
     prompt += skillDescriptions;
-    prompt += `\n\n--- USING INTEGRATIONS ---
+    prompt += `\n\n--- USING INTEGRATIONS & QA TOOLS ---
 
 Integrations (Jira, GitHub, Notion, etc.):
 • **READ** (search, get, view): Execute immediately, no confirmation needed
-• **WRITE** (create, update, delete): Describe plan → ask confirmation → execute only after "yes"`;
+• **WRITE** (create, update, delete): Describe plan → ask confirmation → execute only after "yes"
+
+QA Tools (13 tools for reading project QA data):
+• Test data: qa_list_test_cases, qa_get_test_case, qa_list_test_executions, qa_get_run_report, qa_get_test_results
+• Organization: qa_list_test_modules, qa_list_test_flows, qa_list_regression_plans
+• Analytics: qa_get_analytics_summary, qa_detect_flaky_tests, qa_list_page_visits
+• Operations: qa_list_schedules, qa_list_test_findings
+• Compose multiple tools to derive insights (e.g., list test cases + list page visits → coverage gaps)
+• For test artifacts (video, screenshot, logs), first get the test_id from executions, then call qa_get_test_results${projectId ? `\n• **Current project_id: ${projectId}** — ALWAYS use this value for the project_id parameter in QA tools. NEVER ask the user for their project ID.` : ''}`;
   }
 
   // Add memory instructions
