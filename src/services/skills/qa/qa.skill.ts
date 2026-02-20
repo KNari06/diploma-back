@@ -28,6 +28,19 @@ import {
   handleListJiraIssues,
   handleListElementInteractions,
   handleUpdateTestCaseSteps,
+  // Write tools — Tier 1
+  handleUpdateTestCase,
+  handleRunTest,
+  handleCreateTestCase,
+  // Write tools — Tier 2
+  handleManageRegressionPlan,
+  handleManageSchedule,
+  handleDeleteTestCase,
+  // Write tools — Tier 3
+  handleManageFixture,
+  handleManageModule,
+  handleManageFlow,
+  handleBulkTag,
 } from './qa-tool-handlers';
 import { logger } from '@/utils/core/logger';
 
@@ -658,6 +671,513 @@ const QA_TOOLS: ChatCompletionTool[] = [
       },
     },
   },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Tier 1 — HIGH priority write tools (28–30)
+  // ═══════════════════════════════════════════════════════════════
+
+  {
+    type: 'function',
+    function: {
+      name: 'qa_update_test_case',
+      description:
+        '⚠️ WRITE operation — Update test case metadata (name, status, priority, tags, description). NOT for steps — use qa_update_test_case_steps for that. Describe changes → get approval → call with confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          test_case_id: {
+            type: 'string',
+            description: 'The test case ID to update',
+          },
+          name: {
+            type: 'string',
+            description: 'New name for the test case',
+          },
+          status: {
+            type: 'string',
+            enum: ['draft', 'published', 'archived'],
+            description: 'New status',
+          },
+          priority: {
+            type: 'string',
+            enum: ['critical', 'high', 'medium', 'low'],
+            description: 'New priority',
+          },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'New tags array (replaces existing tags)',
+          },
+          description: {
+            type: 'string',
+            description: 'New description',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing changes to user AND receiving explicit approval.',
+          },
+        },
+        required: ['test_case_id', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_run_test',
+      description:
+        '⚠️ WRITE operation — Run a test case, plan, module, flow, or filter by tag/priority. Describe what will run → get approval → call with confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          run_type: {
+            type: 'string',
+            enum: ['test_case', 'plan', 'module', 'flow', 'tag', 'priority'],
+            description: 'What to run',
+          },
+          target_id: {
+            type: 'string',
+            description: 'ID of the test_case/plan/module/flow to run (required for those run types)',
+          },
+          tag: {
+            type: 'string',
+            description: 'Tag to filter by (required when run_type=tag)',
+          },
+          priority_filter: {
+            type: 'string',
+            enum: ['critical', 'high', 'medium', 'low'],
+            description: 'Priority to filter by (required when run_type=priority)',
+          },
+          project_id: {
+            type: 'string',
+            description: 'Project ID (required for tag/priority run types)',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing what will run to user AND receiving explicit approval.',
+          },
+        },
+        required: ['run_type', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_create_test_case',
+      description:
+        '⚠️ WRITE operation — Create a new test case with steps. Describe the test case → get approval → call with confirm=true. Each step needs: id (UUID), type, description.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to create the test case in',
+          },
+          name: {
+            type: 'string',
+            description: 'Name of the test case',
+          },
+          steps: {
+            type: 'array',
+            description: 'Array of steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string}',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Unique step ID (UUID)' },
+                type: {
+                  type: 'string',
+                  enum: ['type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover', 'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close', 'ai_check', 'wait_for', 'upload'],
+                  description: 'Action type for this step',
+                },
+                description: { type: 'string', description: 'What this step does' },
+                value: { type: 'string', description: 'Value for type/press actions' },
+                assertionText: { type: 'string', description: 'Assertion text for ai_check steps' },
+              },
+              required: ['id', 'type', 'description'],
+            },
+          },
+          description: {
+            type: 'string',
+            description: 'Description of the test case',
+          },
+          start_url: {
+            type: 'string',
+            description: 'Starting URL for the test',
+          },
+          status: {
+            type: 'string',
+            enum: ['draft', 'published'],
+            description: 'Initial status (default: draft)',
+          },
+          priority: {
+            type: 'string',
+            enum: ['critical', 'high', 'medium', 'low'],
+            description: 'Priority level',
+          },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Tags for the test case',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing the test case to user AND receiving explicit approval.',
+          },
+        },
+        required: ['project_id', 'name', 'steps', 'confirm'],
+      },
+    },
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Tier 2 — MEDIUM priority write tools (31–33)
+  // ═══════════════════════════════════════════════════════════════
+
+  {
+    type: 'function',
+    function: {
+      name: 'qa_manage_regression_plan',
+      description:
+        '⚠️ WRITE operation — Create/update regression plan or add/remove items. Actions: create (need project_id, name), update (need plan_id), add_item (need plan_id, item_type, item_id), remove_item (need item_id). Describe changes → get approval → confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['create', 'update', 'add_item', 'remove_item'],
+            description: 'Operation to perform',
+          },
+          project_id: {
+            type: 'string',
+            description: 'Project ID (required for create)',
+          },
+          plan_id: {
+            type: 'string',
+            description: 'Plan ID (required for update, add_item)',
+          },
+          name: {
+            type: 'string',
+            description: 'Plan name (required for create, optional for update)',
+          },
+          description: {
+            type: 'string',
+            description: 'Plan description',
+          },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Plan tags',
+          },
+          is_default: {
+            type: 'boolean',
+            description: 'Whether this is the default plan',
+          },
+          item_type: {
+            type: 'string',
+            enum: ['module', 'flow', 'test_case'],
+            description: 'Type of item to add (required for add_item)',
+          },
+          item_id: {
+            type: 'string',
+            description: 'ID of the item to add/remove',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing changes to user AND receiving explicit approval.',
+          },
+        },
+        required: ['action', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_manage_schedule',
+      description:
+        '⚠️ WRITE operation — Create/update/activate/deactivate/delete test schedule. Create needs: project_id, name, cron_expression, and exactly one of plan_id or module_id. Describe changes → get approval → confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['create', 'update', 'activate', 'deactivate', 'delete'],
+            description: 'Operation to perform',
+          },
+          project_id: {
+            type: 'string',
+            description: 'Project ID (required for create)',
+          },
+          schedule_id: {
+            type: 'string',
+            description: 'Schedule ID (required for update/activate/deactivate/delete)',
+          },
+          name: {
+            type: 'string',
+            description: 'Schedule name (required for create, optional for update)',
+          },
+          cron_expression: {
+            type: 'string',
+            description: 'Cron expression (e.g. "0 9 * * *" for daily at 9am). Required for create.',
+          },
+          timezone: {
+            type: 'string',
+            description: 'Timezone (e.g. "Asia/Almaty"). Optional.',
+          },
+          plan_id: {
+            type: 'string',
+            description: 'Plan to run on schedule (exactly one of plan_id or module_id for create)',
+          },
+          module_id: {
+            type: 'string',
+            description: 'Module to run on schedule (exactly one of plan_id or module_id for create)',
+          },
+          is_active: {
+            type: 'boolean',
+            description: 'Active state (for update)',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing changes to user AND receiving explicit approval.',
+          },
+        },
+        required: ['action', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_delete_test_case',
+      description:
+        '🔴 DESTRUCTIVE WRITE operation — Permanently delete a test case. CANNOT BE UNDONE. You MUST warn the user about permanent deletion, wait for explicit approval, then call with confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          test_case_id: {
+            type: 'string',
+            description: 'The test case ID to permanently delete',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after warning user about permanent deletion AND receiving explicit approval.',
+          },
+        },
+        required: ['test_case_id', 'confirm'],
+      },
+    },
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Tier 3 — LOW priority write tools (34–37)
+  // ═══════════════════════════════════════════════════════════════
+
+  {
+    type: 'function',
+    function: {
+      name: 'qa_manage_fixture',
+      description:
+        '⚠️ WRITE operation — Create/update/delete test fixtures (reusable test data). Create needs: project_id, name, data. Describe changes → get approval → confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['create', 'update', 'delete'],
+            description: 'Operation to perform',
+          },
+          project_id: {
+            type: 'string',
+            description: 'Project ID (required for create)',
+          },
+          fixture_id: {
+            type: 'string',
+            description: 'Fixture ID (required for update/delete)',
+          },
+          name: {
+            type: 'string',
+            description: 'Fixture name',
+          },
+          data: {
+            description: 'Fixture data (object or string). Required for create.',
+          },
+          description: {
+            type: 'string',
+            description: 'Fixture description',
+          },
+          scope: {
+            type: 'string',
+            enum: ['global', 'project', 'module', 'flow'],
+            description: 'Fixture scope',
+          },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Fixture tags',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing changes to user AND receiving explicit approval.',
+          },
+        },
+        required: ['action', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_manage_module',
+      description:
+        '⚠️ WRITE operation — Create or update test modules. Create needs: project_id, name, platform_key (web_ui or api). Describe changes → get approval → confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['create', 'update'],
+            description: 'Operation to perform',
+          },
+          project_id: {
+            type: 'string',
+            description: 'Project ID (required for create)',
+          },
+          module_id: {
+            type: 'string',
+            description: 'Module ID (required for update)',
+          },
+          name: {
+            type: 'string',
+            description: 'Module name',
+          },
+          platform_key: {
+            type: 'string',
+            enum: ['web_ui', 'api'],
+            description: 'Platform type (required for create)',
+          },
+          description: {
+            type: 'string',
+            description: 'Module description',
+          },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Module tags',
+          },
+          priority: {
+            type: 'string',
+            enum: ['critical', 'high', 'medium', 'low'],
+            description: 'Module priority',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing changes to user AND receiving explicit approval.',
+          },
+        },
+        required: ['action', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_manage_flow',
+      description:
+        '⚠️ WRITE operation — Create, update, or reorder test flows. Create needs: module_id, name. Reorder needs: module_id, flow_ids[]. Describe changes → get approval → confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['create', 'update', 'reorder'],
+            description: 'Operation to perform',
+          },
+          module_id: {
+            type: 'string',
+            description: 'Module ID (required for create and reorder)',
+          },
+          flow_id: {
+            type: 'string',
+            description: 'Flow ID (required for update)',
+          },
+          name: {
+            type: 'string',
+            description: 'Flow name',
+          },
+          description: {
+            type: 'string',
+            description: 'Flow description',
+          },
+          flow_type: {
+            type: 'string',
+            enum: ['ui', 'api', 'mixed'],
+            description: 'Flow type',
+          },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Flow tags',
+          },
+          priority: {
+            type: 'string',
+            enum: ['critical', 'high', 'medium', 'low'],
+            description: 'Flow priority',
+          },
+          preconditions: {
+            type: 'string',
+            description: 'Preconditions for the flow',
+          },
+          expected_result: {
+            type: 'string',
+            description: 'Expected result of the flow',
+          },
+          flow_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'New order of flow IDs (required for reorder)',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing changes to user AND receiving explicit approval.',
+          },
+        },
+        required: ['action', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_bulk_tag',
+      description:
+        '⚠️ WRITE operation — Add or remove a tag from multiple test cases at once (max 50). Describe changes → get approval → confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['add', 'remove'],
+            description: 'Whether to add or remove the tag',
+          },
+          tag: {
+            type: 'string',
+            description: 'The tag to add or remove',
+          },
+          test_case_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Array of test case IDs to update (max 50)',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing changes to user AND receiving explicit approval.',
+          },
+        },
+        required: ['action', 'tag', 'test_case_ids', 'confirm'],
+      },
+    },
+  },
 ];
 
 /**
@@ -668,7 +1188,7 @@ export const QASkill: SkillDefinition = {
   name: 'QA Tools',
   provider: 'qa',
   description:
-    'Query and manage test cases, executions, regression plans, analytics, API test configs/history, coverage reports, failure analysis, recommendations, fixtures, deployments, Jira issues, element interactions, AI usage, and more. 26 read-only tools + 1 write tool for comprehensive QA data access.',
+    'Query and manage test cases, executions, regression plans, analytics, API test configs/history, coverage reports, failure analysis, recommendations, fixtures, deployments, Jira issues, element interactions, AI usage, and more. 26 read-only tools + 11 write tools (create/update/delete test cases, run tests, manage plans/schedules/modules/flows/fixtures, bulk tagging) for comprehensive QA data access and management.',
   tools: QA_TOOLS,
 
   /**
@@ -778,6 +1298,39 @@ export const QASkill: SkillDefinition = {
         // Write tools
         case 'qa_update_test_case_steps':
           return await handleUpdateTestCaseSteps(args, context);
+
+        // Write tools — Tier 1
+        case 'qa_update_test_case':
+          return await handleUpdateTestCase(args, context);
+
+        case 'qa_run_test':
+          return await handleRunTest(args, context);
+
+        case 'qa_create_test_case':
+          return await handleCreateTestCase(args, context);
+
+        // Write tools — Tier 2
+        case 'qa_manage_regression_plan':
+          return await handleManageRegressionPlan(args, context);
+
+        case 'qa_manage_schedule':
+          return await handleManageSchedule(args, context);
+
+        case 'qa_delete_test_case':
+          return await handleDeleteTestCase(args, context);
+
+        // Write tools — Tier 3
+        case 'qa_manage_fixture':
+          return await handleManageFixture(args, context);
+
+        case 'qa_manage_module':
+          return await handleManageModule(args, context);
+
+        case 'qa_manage_flow':
+          return await handleManageFlow(args, context);
+
+        case 'qa_bulk_tag':
+          return await handleBulkTag(args, context);
 
         default:
           return {

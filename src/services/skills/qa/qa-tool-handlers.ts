@@ -8,6 +8,11 @@ import { AIUsageQueryService } from '@/services/ai/tracking/ai-usage-query.servi
 import { FixtureService } from '@/services/testing/fixtures/fixture.service';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
+import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
+import { ScheduleService } from '@/services/testing/schedules/schedule.service';
+import { ModuleService } from '@/services/testing/modules/module.service';
+import { FlowService } from '@/services/testing/flows/flow.service';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import type { SkillContext, SkillResult } from '../types';
 import { logger } from '@/utils/core/logger';
@@ -2022,6 +2027,1345 @@ export async function handleUpdateTestCaseSteps(
     return {
       success: false,
       message: `Failed to update test case steps: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TIER 1 — HIGH PRIORITY WRITE TOOLS (Tools 28–30)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * qa_update_test_case — Update test case metadata (NOT steps)
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ * - Ownership enforced (user_id check)
+ * - At least one field besides confirm must be provided
+ */
+export async function handleUpdateTestCase(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const testCaseId = args.test_case_id as string | undefined;
+  const confirm = args.confirm === true;
+
+  if (!testCaseId) {
+    return { success: false, message: 'Missing required field: test_case_id', displayToUser: false };
+  }
+
+  // Gate: confirm required
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  // Validate at least one updatable field is provided
+  const updatableFields = ['name', 'status', 'priority', 'tags', 'description'];
+  const providedFields = updatableFields.filter((f) => args[f] !== undefined);
+
+  if (providedFields.length === 0) {
+    return {
+      success: false,
+      message: 'At least one field to update must be provided: name, status, priority, tags, description',
+      displayToUser: false,
+    };
+  }
+
+  // Validate enum values
+  if (args.status !== undefined && !['draft', 'published', 'archived'].includes(args.status)) {
+    return { success: false, message: `Invalid status: ${args.status}. Must be draft, published, or archived.`, displayToUser: false };
+  }
+  if (args.priority !== undefined && !['critical', 'high', 'medium', 'low'].includes(args.priority)) {
+    return { success: false, message: `Invalid priority: ${args.priority}. Must be critical, high, medium, or low.`, displayToUser: false };
+  }
+
+  try {
+    const projectId = resolveProjectId(args, context);
+
+    // Ownership check
+    let verifyQuery = supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, name, user_id')
+      .eq('id', testCaseId);
+
+    if (projectId) {
+      verifyQuery = verifyQuery.eq('project_id', projectId);
+    }
+
+    const { data: existing, error: fetchError } = await verifyQuery.single();
+
+    if (fetchError) {
+      if (fetchError.code === 'PGRST116') {
+        return { success: false, message: `Test case not found: ${testCaseId}`, displayToUser: false };
+      }
+      return { success: false, message: `Database error: ${fetchError.message}`, displayToUser: false };
+    }
+
+    if (existing.user_id !== context.userId) {
+      return {
+        success: false,
+        message: 'You can only update test cases you created. This test case belongs to another user.',
+        displayToUser: false,
+      };
+    }
+
+    // Build update params
+    const updateParams: {
+      id: string;
+      userId: string;
+      name?: string;
+      status?: 'draft' | 'published' | 'archived';
+      priority?: 'critical' | 'high' | 'medium' | 'low';
+      tags?: string[];
+      description?: string;
+    } = {
+      id: testCaseId,
+      userId: context.userId,
+    };
+
+    if (args.name !== undefined) updateParams.name = args.name;
+    if (args.status !== undefined) updateParams.status = args.status;
+    if (args.priority !== undefined) updateParams.priority = args.priority;
+    if (args.tags !== undefined) updateParams.tags = args.tags;
+    if (args.description !== undefined) updateParams.description = args.description;
+
+    const updated = await IntentTestCaseService.update(updateParams);
+
+    logger.info('[QA_TOOL] Test case metadata updated', {
+      testCaseId,
+      userId: context.userId,
+      updatedFields: providedFields,
+    });
+
+    return {
+      success: true,
+      data: {
+        testCaseId: updated.id,
+        name: updated.name,
+        status: updated.status,
+        priority: updated.priority,
+        tags: updated.tags || [],
+        updatedFields: providedFields,
+      },
+      message: `Updated test case "${updated.name}": ${providedFields.join(', ')}`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleUpdateTestCase error', {
+      error: error instanceof Error ? error.message : String(error),
+      testCaseId,
+    });
+    return {
+      success: false,
+      message: `Failed to update test case: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_run_test — Run a test case, plan, module, flow, or filter by tag/priority
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ * - Always uses trigger: 'chat'
+ */
+export async function handleRunTest(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const runType = args.run_type as string | undefined;
+  const confirm = args.confirm === true;
+
+  if (!runType) {
+    return { success: false, message: 'Missing required field: run_type', displayToUser: false };
+  }
+
+  const validRunTypes = ['test_case', 'plan', 'module', 'flow', 'tag', 'priority'];
+  if (!validRunTypes.includes(runType)) {
+    return { success: false, message: `Invalid run_type: ${runType}. Must be one of: ${validRunTypes.join(', ')}`, displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe what will be run to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    const targetId = args.target_id as string | undefined;
+    const tag = args.tag as string | undefined;
+    const priorityFilter = args.priority_filter as string | undefined;
+    const projectId = resolveProjectId(args, context);
+
+    switch (runType) {
+      case 'test_case': {
+        if (!targetId) {
+          return { success: false, message: 'Missing required field: target_id (test case ID)', displayToUser: false };
+        }
+        const result = await RegressionRunService.runSavedTestCase({
+          savedTestCaseId: targetId,
+          userId: context.userId,
+          trigger: 'chat',
+        });
+        return {
+          success: true,
+          data: { runId: result.runId, testId: result.testId, runType },
+          message: `Started test case run: ${result.runId}`,
+          displayToUser: true,
+        };
+      }
+
+      case 'plan': {
+        if (!targetId) {
+          return { success: false, message: 'Missing required field: target_id (plan ID)', displayToUser: false };
+        }
+        const result = await RegressionRunService.runPlan({
+          planId: targetId,
+          userId: context.userId,
+          trigger: 'chat',
+        });
+        return {
+          success: true,
+          data: { runId: result.runId, totalTests: result.totalTests, runType },
+          message: `Started plan run: ${result.runId} (${result.totalTests} tests)`,
+          displayToUser: true,
+        };
+      }
+
+      case 'module': {
+        if (!targetId) {
+          return { success: false, message: 'Missing required field: target_id (module ID)', displayToUser: false };
+        }
+        const result = await RegressionRunService.runModule({
+          moduleId: targetId,
+          userId: context.userId,
+          trigger: 'chat',
+        });
+        return {
+          success: true,
+          data: { runId: result.runId, totalTests: result.totalTests, runType },
+          message: `Started module run: ${result.runId} (${result.totalTests} tests)`,
+          displayToUser: true,
+        };
+      }
+
+      case 'flow': {
+        if (!targetId) {
+          return { success: false, message: 'Missing required field: target_id (flow ID)', displayToUser: false };
+        }
+        const result = await RegressionRunService.runFlow({
+          flowId: targetId,
+          userId: context.userId,
+          trigger: 'chat',
+        });
+        return {
+          success: true,
+          data: { runId: result.runId, totalTests: result.totalTests, runType },
+          message: `Started flow run: ${result.runId} (${result.totalTests} tests)`,
+          displayToUser: true,
+        };
+      }
+
+      case 'tag': {
+        if (!tag) {
+          return { success: false, message: 'Missing required field: tag', displayToUser: false };
+        }
+        if (!projectId) {
+          return { success: false, message: 'Missing required field: project_id (required for tag-based runs)', displayToUser: false };
+        }
+        const result = await RegressionRunService.runByTag({
+          projectId,
+          tag,
+          userId: context.userId,
+          trigger: 'chat',
+        });
+        return {
+          success: true,
+          data: { runId: result.runId, totalTests: result.totalTests, runType, tag },
+          message: `Started tag run "${tag}": ${result.runId} (${result.totalTests} tests)`,
+          displayToUser: true,
+        };
+      }
+
+      case 'priority': {
+        if (!priorityFilter || !['critical', 'high', 'medium', 'low'].includes(priorityFilter)) {
+          return { success: false, message: 'Missing or invalid priority_filter. Must be critical, high, medium, or low.', displayToUser: false };
+        }
+        if (!projectId) {
+          return { success: false, message: 'Missing required field: project_id (required for priority-based runs)', displayToUser: false };
+        }
+        const result = await RegressionRunService.runByPriority({
+          projectId,
+          priority: priorityFilter as 'critical' | 'high' | 'medium' | 'low',
+          userId: context.userId,
+          trigger: 'chat',
+        });
+        return {
+          success: true,
+          data: { runId: result.runId, totalTests: result.totalTests, runType, priority: priorityFilter },
+          message: `Started priority run "${priorityFilter}": ${result.runId} (${result.totalTests} tests)`,
+          displayToUser: true,
+        };
+      }
+
+      default:
+        return { success: false, message: `Unknown run_type: ${runType}`, displayToUser: false };
+    }
+  } catch (error) {
+    logger.error('[QA_TOOL] handleRunTest error', {
+      error: error instanceof Error ? error.message : String(error),
+      runType,
+    });
+    return {
+      success: false,
+      message: `Failed to run test: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_create_test_case — Create a new test case with steps
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ * - Steps validated against VALID_STEP_TYPES
+ */
+export async function handleCreateTestCase(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const name = args.name as string | undefined;
+  const steps = args.steps as IntentStep[] | undefined;
+  const confirm = args.confirm === true;
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+  if (!name) {
+    return { success: false, message: 'Missing required field: name', displayToUser: false };
+  }
+  if (!steps || !Array.isArray(steps) || steps.length === 0) {
+    return { success: false, message: 'Missing or empty required field: steps (array of step objects)', displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the test case you will create to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  // Validate step structure
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (!step.id || typeof step.id !== 'string') {
+      return { success: false, message: `Step ${i}: missing or invalid "id" (must be a string UUID)`, displayToUser: false };
+    }
+    if (!step.type || !VALID_STEP_TYPES.has(step.type)) {
+      return {
+        success: false,
+        message: `Step ${i}: invalid "type" "${step.type}". Allowed: ${[...VALID_STEP_TYPES].join(', ')}`,
+        displayToUser: false,
+      };
+    }
+    if (!step.description || typeof step.description !== 'string') {
+      return { success: false, message: `Step ${i}: missing or invalid "description" (must be a non-empty string)`, displayToUser: false };
+    }
+  }
+
+  try {
+    const created = await IntentTestCaseService.create({
+      projectId,
+      userId: context.userId,
+      name,
+      description: args.description || undefined,
+      startUrl: args.start_url || undefined,
+      steps,
+      status: args.status || 'draft',
+    });
+
+    // Apply tags and priority via update if provided
+    if (args.tags || args.priority) {
+      await IntentTestCaseService.update({
+        id: created.id,
+        userId: context.userId,
+        ...(args.tags ? { tags: args.tags } : {}),
+        ...(args.priority ? { priority: args.priority } : {}),
+      });
+    }
+
+    logger.info('[QA_TOOL] Test case created', {
+      testCaseId: created.id,
+      userId: context.userId,
+      stepCount: steps.length,
+    });
+
+    return {
+      success: true,
+      data: {
+        testCaseId: created.id,
+        name: created.name,
+        status: created.status,
+        stepCount: steps.length,
+      },
+      message: `Created test case "${created.name}" with ${steps.length} steps`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleCreateTestCase error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to create test case: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TIER 2 — MEDIUM PRIORITY WRITE TOOLS (Tools 31–33)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * qa_manage_regression_plan — Create/update plan + add/remove items
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ * - Compound tool: action determines behavior
+ */
+export async function handleManageRegressionPlan(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const action = args.action as string | undefined;
+  const confirm = args.confirm === true;
+
+  if (!action) {
+    return { success: false, message: 'Missing required field: action', displayToUser: false };
+  }
+
+  const validActions = ['create', 'update', 'add_item', 'remove_item'];
+  if (!validActions.includes(action)) {
+    return { success: false, message: `Invalid action: ${action}. Must be one of: ${validActions.join(', ')}`, displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    switch (action) {
+      case 'create': {
+        const projectId = resolveProjectId(args, context);
+        const name = args.name as string | undefined;
+
+        if (!projectId) {
+          return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+        }
+        if (!name) {
+          return { success: false, message: 'Missing required field: name', displayToUser: false };
+        }
+
+        const plan = await RegressionPlanService.create({
+          projectId,
+          userId: context.userId,
+          name,
+          description: args.description || undefined,
+          tags: args.tags || undefined,
+          isDefault: args.is_default || false,
+        });
+
+        logger.info('[QA_TOOL] Regression plan created', { planId: plan.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: { planId: plan.id, name: plan.name, isDefault: plan.isDefault },
+          message: `Created regression plan "${plan.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'update': {
+        const planId = args.plan_id as string | undefined;
+        if (!planId) {
+          return { success: false, message: 'Missing required field: plan_id', displayToUser: false };
+        }
+
+        const plan = await RegressionPlanService.update({
+          id: planId,
+          userId: context.userId,
+          ...(args.name !== undefined ? { name: args.name } : {}),
+          ...(args.description !== undefined ? { description: args.description } : {}),
+          ...(args.tags !== undefined ? { tags: args.tags } : {}),
+          ...(args.is_default !== undefined ? { isDefault: args.is_default } : {}),
+        });
+
+        logger.info('[QA_TOOL] Regression plan updated', { planId: plan.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: { planId: plan.id, name: plan.name, isDefault: plan.isDefault },
+          message: `Updated regression plan "${plan.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'add_item': {
+        const planId = args.plan_id as string | undefined;
+        const itemType = args.item_type as string | undefined;
+        const itemId = args.item_id as string | undefined;
+
+        if (!planId) {
+          return { success: false, message: 'Missing required field: plan_id', displayToUser: false };
+        }
+        if (!itemType || !['module', 'flow', 'test_case'].includes(itemType)) {
+          return { success: false, message: 'Missing or invalid item_type. Must be module, flow, or test_case.', displayToUser: false };
+        }
+        if (!itemId) {
+          return { success: false, message: 'Missing required field: item_id', displayToUser: false };
+        }
+
+        const item = await RegressionPlanService.addItem({
+          planId,
+          itemType: itemType as 'module' | 'flow' | 'test_case',
+          ...(itemType === 'module' ? { moduleId: itemId } : {}),
+          ...(itemType === 'flow' ? { flowId: itemId } : {}),
+          ...(itemType === 'test_case' ? { testCaseId: itemId } : {}),
+        });
+
+        logger.info('[QA_TOOL] Plan item added', { planId, itemType, itemId, userId: context.userId });
+
+        return {
+          success: true,
+          data: { planItemId: item.id, planId, itemType, itemId },
+          message: `Added ${itemType} to plan`,
+          displayToUser: true,
+        };
+      }
+
+      case 'remove_item': {
+        const itemId = args.item_id as string | undefined;
+        if (!itemId) {
+          return { success: false, message: 'Missing required field: item_id (the plan item ID to remove)', displayToUser: false };
+        }
+
+        await RegressionPlanService.removeItem(itemId, context.userId);
+
+        logger.info('[QA_TOOL] Plan item removed', { itemId, userId: context.userId });
+
+        return {
+          success: true,
+          data: { removedItemId: itemId },
+          message: `Removed item from plan`,
+          displayToUser: true,
+        };
+      }
+
+      default:
+        return { success: false, message: `Unknown action: ${action}`, displayToUser: false };
+    }
+  } catch (error) {
+    logger.error('[QA_TOOL] handleManageRegressionPlan error', {
+      error: error instanceof Error ? error.message : String(error),
+      action,
+    });
+    return {
+      success: false,
+      message: `Failed to ${action} regression plan: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_manage_schedule — Create/update/toggle/delete schedule
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ * - Create validates exactly one of plan_id/module_id
+ */
+export async function handleManageSchedule(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const action = args.action as string | undefined;
+  const confirm = args.confirm === true;
+
+  if (!action) {
+    return { success: false, message: 'Missing required field: action', displayToUser: false };
+  }
+
+  const validActions = ['create', 'update', 'activate', 'deactivate', 'delete'];
+  if (!validActions.includes(action)) {
+    return { success: false, message: `Invalid action: ${action}. Must be one of: ${validActions.join(', ')}`, displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    switch (action) {
+      case 'create': {
+        const projectId = resolveProjectId(args, context);
+        const name = args.name as string | undefined;
+        const cronExpression = args.cron_expression as string | undefined;
+
+        if (!projectId) {
+          return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+        }
+        if (!name) {
+          return { success: false, message: 'Missing required field: name', displayToUser: false };
+        }
+        if (!cronExpression) {
+          return { success: false, message: 'Missing required field: cron_expression', displayToUser: false };
+        }
+
+        // Validate exactly one of plan_id/module_id
+        const hasPlanId = !!args.plan_id;
+        const hasModuleId = !!args.module_id;
+        if (!hasPlanId && !hasModuleId) {
+          return { success: false, message: 'Must provide exactly one of plan_id or module_id', displayToUser: false };
+        }
+        if (hasPlanId && hasModuleId) {
+          return { success: false, message: 'Must provide exactly one of plan_id or module_id, not both', displayToUser: false };
+        }
+
+        const schedule = await ScheduleService.create({
+          projectId,
+          userId: context.userId,
+          name,
+          cronExpression,
+          timezone: args.timezone || undefined,
+          planId: args.plan_id || undefined,
+          moduleId: args.module_id || undefined,
+        });
+
+        logger.info('[QA_TOOL] Schedule created', { scheduleId: schedule.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: {
+            scheduleId: schedule.id,
+            name: schedule.name,
+            cronExpression: schedule.cronExpression,
+            isActive: schedule.isActive,
+            nextRunAt: schedule.nextRunAt,
+          },
+          message: `Created schedule "${schedule.name}" (${schedule.cronExpression})`,
+          displayToUser: true,
+        };
+      }
+
+      case 'update': {
+        const scheduleId = args.schedule_id as string | undefined;
+        if (!scheduleId) {
+          return { success: false, message: 'Missing required field: schedule_id', displayToUser: false };
+        }
+
+        const schedule = await ScheduleService.update({
+          id: scheduleId,
+          userId: context.userId,
+          ...(args.name !== undefined ? { name: args.name } : {}),
+          ...(args.cron_expression !== undefined ? { cronExpression: args.cron_expression } : {}),
+          ...(args.timezone !== undefined ? { timezone: args.timezone } : {}),
+          ...(args.is_active !== undefined ? { isActive: args.is_active } : {}),
+        });
+
+        logger.info('[QA_TOOL] Schedule updated', { scheduleId: schedule.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: {
+            scheduleId: schedule.id,
+            name: schedule.name,
+            cronExpression: schedule.cronExpression,
+            isActive: schedule.isActive,
+            nextRunAt: schedule.nextRunAt,
+          },
+          message: `Updated schedule "${schedule.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'activate': {
+        const scheduleId = args.schedule_id as string | undefined;
+        if (!scheduleId) {
+          return { success: false, message: 'Missing required field: schedule_id', displayToUser: false };
+        }
+
+        const schedule = await ScheduleService.activate(scheduleId, context.userId);
+
+        logger.info('[QA_TOOL] Schedule activated', { scheduleId, userId: context.userId });
+
+        return {
+          success: true,
+          data: {
+            scheduleId: schedule.id,
+            name: schedule.name,
+            isActive: true,
+            nextRunAt: schedule.nextRunAt,
+          },
+          message: `Activated schedule "${schedule.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'deactivate': {
+        const scheduleId = args.schedule_id as string | undefined;
+        if (!scheduleId) {
+          return { success: false, message: 'Missing required field: schedule_id', displayToUser: false };
+        }
+
+        const schedule = await ScheduleService.deactivate(scheduleId, context.userId);
+
+        logger.info('[QA_TOOL] Schedule deactivated', { scheduleId, userId: context.userId });
+
+        return {
+          success: true,
+          data: {
+            scheduleId: schedule.id,
+            name: schedule.name,
+            isActive: false,
+          },
+          message: `Deactivated schedule "${schedule.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'delete': {
+        const scheduleId = args.schedule_id as string | undefined;
+        if (!scheduleId) {
+          return { success: false, message: 'Missing required field: schedule_id', displayToUser: false };
+        }
+
+        await ScheduleService.delete(scheduleId, context.userId);
+
+        logger.info('[QA_TOOL] Schedule deleted', { scheduleId, userId: context.userId });
+
+        return {
+          success: true,
+          data: { deleted: true, scheduleId },
+          message: `Deleted schedule`,
+          displayToUser: true,
+        };
+      }
+
+      default:
+        return { success: false, message: `Unknown action: ${action}`, displayToUser: false };
+    }
+  } catch (error) {
+    logger.error('[QA_TOOL] handleManageSchedule error', {
+      error: error instanceof Error ? error.message : String(error),
+      action,
+    });
+    return {
+      success: false,
+      message: `Failed to ${action} schedule: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_delete_test_case — Delete test case permanently (separate tool for extra safety)
+ *
+ * Safety:
+ * - Requires `confirm: true` with extra-stern warning
+ * - Ownership check before delete
+ * - Fetches name for response before deleting
+ */
+export async function handleDeleteTestCase(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const testCaseId = args.test_case_id as string | undefined;
+  const confirm = args.confirm === true;
+
+  if (!testCaseId) {
+    return { success: false, message: 'Missing required field: test_case_id', displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'DESTRUCTIVE operation: permanently deletes test case. Cannot be undone. You MUST first warn the user about permanent deletion, wait for their explicit approval ("yes", "delete it", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    const projectId = resolveProjectId(args, context);
+
+    // Fetch name and verify ownership before deleting
+    let verifyQuery = supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, name, user_id')
+      .eq('id', testCaseId);
+
+    if (projectId) {
+      verifyQuery = verifyQuery.eq('project_id', projectId);
+    }
+
+    const { data: existing, error: fetchError } = await verifyQuery.single();
+
+    if (fetchError) {
+      if (fetchError.code === 'PGRST116') {
+        return { success: false, message: `Test case not found: ${testCaseId}`, displayToUser: false };
+      }
+      return { success: false, message: `Database error: ${fetchError.message}`, displayToUser: false };
+    }
+
+    if (existing.user_id !== context.userId) {
+      return {
+        success: false,
+        message: 'You can only delete test cases you created. This test case belongs to another user.',
+        displayToUser: false,
+      };
+    }
+
+    const testCaseName = existing.name;
+
+    await IntentTestCaseService.delete(testCaseId, context.userId);
+
+    logger.info('[QA_TOOL] Test case deleted', { testCaseId, testCaseName, userId: context.userId });
+
+    return {
+      success: true,
+      data: { deleted: true, testCaseId, testCaseName },
+      message: `Permanently deleted test case "${testCaseName}"`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleDeleteTestCase error', {
+      error: error instanceof Error ? error.message : String(error),
+      testCaseId,
+    });
+    return {
+      success: false,
+      message: `Failed to delete test case: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TIER 3 — LOW PRIORITY WRITE TOOLS (Tools 34–37)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * qa_manage_fixture — Create/update/delete test fixtures
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ */
+export async function handleManageFixture(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const action = args.action as string | undefined;
+  const confirm = args.confirm === true;
+
+  if (!action) {
+    return { success: false, message: 'Missing required field: action', displayToUser: false };
+  }
+
+  const validActions = ['create', 'update', 'delete'];
+  if (!validActions.includes(action)) {
+    return { success: false, message: `Invalid action: ${action}. Must be one of: ${validActions.join(', ')}`, displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    switch (action) {
+      case 'create': {
+        const projectId = resolveProjectId(args, context);
+        const name = args.name as string | undefined;
+        const data = args.data;
+
+        if (!projectId) {
+          return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+        }
+        if (!name) {
+          return { success: false, message: 'Missing required field: name', displayToUser: false };
+        }
+        if (data === undefined || data === null) {
+          return { success: false, message: 'Missing required field: data', displayToUser: false };
+        }
+
+        const fixture = await FixtureService.create({
+          projectId,
+          userId: context.userId,
+          name,
+          data,
+          description: args.description || undefined,
+          scope: args.scope || undefined,
+          tags: args.tags || undefined,
+        });
+
+        logger.info('[QA_TOOL] Fixture created', { fixtureId: fixture.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: { fixtureId: fixture.id, name: fixture.name, scope: fixture.scope },
+          message: `Created fixture "${fixture.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'update': {
+        const fixtureId = args.fixture_id as string | undefined;
+        if (!fixtureId) {
+          return { success: false, message: 'Missing required field: fixture_id', displayToUser: false };
+        }
+
+        const fixture = await FixtureService.update({
+          id: fixtureId,
+          userId: context.userId,
+          ...(args.name !== undefined ? { name: args.name } : {}),
+          ...(args.data !== undefined ? { data: args.data } : {}),
+          ...(args.description !== undefined ? { description: args.description } : {}),
+          ...(args.scope !== undefined ? { scope: args.scope } : {}),
+          ...(args.tags !== undefined ? { tags: args.tags } : {}),
+        });
+
+        logger.info('[QA_TOOL] Fixture updated', { fixtureId: fixture.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: { fixtureId: fixture.id, name: fixture.name, scope: fixture.scope },
+          message: `Updated fixture "${fixture.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'delete': {
+        const fixtureId = args.fixture_id as string | undefined;
+        if (!fixtureId) {
+          return { success: false, message: 'Missing required field: fixture_id', displayToUser: false };
+        }
+
+        await FixtureService.delete(fixtureId, context.userId);
+
+        logger.info('[QA_TOOL] Fixture deleted', { fixtureId, userId: context.userId });
+
+        return {
+          success: true,
+          data: { deleted: true, fixtureId },
+          message: `Deleted fixture`,
+          displayToUser: true,
+        };
+      }
+
+      default:
+        return { success: false, message: `Unknown action: ${action}`, displayToUser: false };
+    }
+  } catch (error) {
+    logger.error('[QA_TOOL] handleManageFixture error', {
+      error: error instanceof Error ? error.message : String(error),
+      action,
+    });
+    return {
+      success: false,
+      message: `Failed to ${action} fixture: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_manage_module — Create or update test modules
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ * - For create: resolves platform_key → platform_id via DB
+ * - No delete — cascading delete is too dangerous for chat
+ */
+export async function handleManageModule(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const action = args.action as string | undefined;
+  const confirm = args.confirm === true;
+
+  if (!action) {
+    return { success: false, message: 'Missing required field: action', displayToUser: false };
+  }
+
+  const validActions = ['create', 'update'];
+  if (!validActions.includes(action)) {
+    return { success: false, message: `Invalid action: ${action}. Must be one of: ${validActions.join(', ')}`, displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    switch (action) {
+      case 'create': {
+        const projectId = resolveProjectId(args, context);
+        const name = args.name as string | undefined;
+        const platformKey = args.platform_key as string | undefined;
+
+        if (!projectId) {
+          return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+        }
+        if (!name) {
+          return { success: false, message: 'Missing required field: name', displayToUser: false };
+        }
+        if (!platformKey || !['web_ui', 'api'].includes(platformKey)) {
+          return { success: false, message: 'Missing or invalid platform_key. Must be web_ui or api.', displayToUser: false };
+        }
+
+        // Resolve platform_key → platform_id
+        const { data: platform, error: platformError } = await supabaseAdmin
+          .from('test_platforms')
+          .select('id')
+          .eq('platform_key', platformKey)
+          .single();
+
+        if (platformError || !platform) {
+          return { success: false, message: `Could not resolve platform: ${platformKey}`, displayToUser: false };
+        }
+
+        const mod = await ModuleService.create({
+          projectId,
+          userId: context.userId,
+          platformId: platform.id,
+          name,
+          description: args.description || undefined,
+          tags: args.tags || undefined,
+          priority: args.priority || undefined,
+        });
+
+        logger.info('[QA_TOOL] Module created', { moduleId: mod.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: { moduleId: mod.id, name: mod.name, platformKey },
+          message: `Created module "${mod.name}" (${platformKey})`,
+          displayToUser: true,
+        };
+      }
+
+      case 'update': {
+        const moduleId = args.module_id as string | undefined;
+        if (!moduleId) {
+          return { success: false, message: 'Missing required field: module_id', displayToUser: false };
+        }
+
+        const mod = await ModuleService.update({
+          id: moduleId,
+          userId: context.userId,
+          ...(args.name !== undefined ? { name: args.name } : {}),
+          ...(args.description !== undefined ? { description: args.description } : {}),
+          ...(args.tags !== undefined ? { tags: args.tags } : {}),
+          ...(args.priority !== undefined ? { priority: args.priority } : {}),
+        });
+
+        logger.info('[QA_TOOL] Module updated', { moduleId: mod.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: { moduleId: mod.id, name: mod.name },
+          message: `Updated module "${mod.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      default:
+        return { success: false, message: `Unknown action: ${action}`, displayToUser: false };
+    }
+  } catch (error) {
+    logger.error('[QA_TOOL] handleManageModule error', {
+      error: error instanceof Error ? error.message : String(error),
+      action,
+    });
+    return {
+      success: false,
+      message: `Failed to ${action} module: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_manage_flow — Create, update, or reorder test flows
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ */
+export async function handleManageFlow(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const action = args.action as string | undefined;
+  const confirm = args.confirm === true;
+
+  if (!action) {
+    return { success: false, message: 'Missing required field: action', displayToUser: false };
+  }
+
+  const validActions = ['create', 'update', 'reorder'];
+  if (!validActions.includes(action)) {
+    return { success: false, message: `Invalid action: ${action}. Must be one of: ${validActions.join(', ')}`, displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    switch (action) {
+      case 'create': {
+        const moduleId = args.module_id as string | undefined;
+        const name = args.name as string | undefined;
+
+        if (!moduleId) {
+          return { success: false, message: 'Missing required field: module_id', displayToUser: false };
+        }
+        if (!name) {
+          return { success: false, message: 'Missing required field: name', displayToUser: false };
+        }
+
+        const flow = await FlowService.create({
+          moduleId,
+          userId: context.userId,
+          name,
+          description: args.description || undefined,
+          flowType: args.flow_type || undefined,
+          tags: args.tags || undefined,
+          priority: args.priority || undefined,
+          preconditions: args.preconditions || undefined,
+          expectedResult: args.expected_result || undefined,
+        });
+
+        logger.info('[QA_TOOL] Flow created', { flowId: flow.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: { flowId: flow.id, name: flow.name, flowType: flow.flowType },
+          message: `Created flow "${flow.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'update': {
+        const flowId = args.flow_id as string | undefined;
+        if (!flowId) {
+          return { success: false, message: 'Missing required field: flow_id', displayToUser: false };
+        }
+
+        const flow = await FlowService.update({
+          id: flowId,
+          userId: context.userId,
+          ...(args.name !== undefined ? { name: args.name } : {}),
+          ...(args.description !== undefined ? { description: args.description } : {}),
+          ...(args.flow_type !== undefined ? { flowType: args.flow_type } : {}),
+          ...(args.tags !== undefined ? { tags: args.tags } : {}),
+          ...(args.priority !== undefined ? { priority: args.priority } : {}),
+        });
+
+        logger.info('[QA_TOOL] Flow updated', { flowId: flow.id, userId: context.userId });
+
+        return {
+          success: true,
+          data: { flowId: flow.id, name: flow.name, flowType: flow.flowType },
+          message: `Updated flow "${flow.name}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'reorder': {
+        const moduleId = args.module_id as string | undefined;
+        const flowIds = args.flow_ids as string[] | undefined;
+
+        if (!moduleId) {
+          return { success: false, message: 'Missing required field: module_id', displayToUser: false };
+        }
+        if (!flowIds || !Array.isArray(flowIds) || flowIds.length === 0) {
+          return { success: false, message: 'Missing or empty required field: flow_ids (array of flow IDs in new order)', displayToUser: false };
+        }
+
+        await FlowService.reorder(moduleId, flowIds, context.userId);
+
+        logger.info('[QA_TOOL] Flows reordered', { moduleId, flowCount: flowIds.length, userId: context.userId });
+
+        return {
+          success: true,
+          data: { moduleId, reorderedCount: flowIds.length },
+          message: `Reordered ${flowIds.length} flows in module`,
+          displayToUser: true,
+        };
+      }
+
+      default:
+        return { success: false, message: `Unknown action: ${action}`, displayToUser: false };
+    }
+  } catch (error) {
+    logger.error('[QA_TOOL] handleManageFlow error', {
+      error: error instanceof Error ? error.message : String(error),
+      action,
+    });
+    return {
+      success: false,
+      message: `Failed to ${action} flow: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_bulk_tag — Add or remove a tag from multiple test cases
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ * - Capped at 50 IDs to prevent abuse
+ * - Ownership enforced per-case by service
+ */
+export async function handleBulkTag(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const action = args.action as string | undefined;
+  const tag = args.tag as string | undefined;
+  const testCaseIds = args.test_case_ids as string[] | undefined;
+  const confirm = args.confirm === true;
+
+  if (!action || !['add', 'remove'].includes(action)) {
+    return { success: false, message: 'Missing or invalid action. Must be add or remove.', displayToUser: false };
+  }
+  if (!tag || typeof tag !== 'string') {
+    return { success: false, message: 'Missing required field: tag', displayToUser: false };
+  }
+  if (!testCaseIds || !Array.isArray(testCaseIds) || testCaseIds.length === 0) {
+    return { success: false, message: 'Missing or empty required field: test_case_ids', displayToUser: false };
+  }
+  if (testCaseIds.length > 50) {
+    return { success: false, message: 'Too many test case IDs. Maximum is 50.', displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    let updatedCount = 0;
+    let failedCount = 0;
+    const errors: string[] = [];
+
+    for (const tcId of testCaseIds) {
+      try {
+        // Fetch current tags
+        const { data: tc, error: fetchError } = await supabaseAdmin
+          .from('intent_test_cases')
+          .select('id, tags')
+          .eq('id', tcId)
+          .single();
+
+        if (fetchError || !tc) {
+          failedCount++;
+          errors.push(`${tcId}: not found`);
+          continue;
+        }
+
+        const currentTags: string[] = tc.tags || [];
+        let newTags: string[];
+
+        if (action === 'add') {
+          if (currentTags.includes(tag)) {
+            updatedCount++; // Already has the tag, count as success
+            continue;
+          }
+          newTags = [...currentTags, tag];
+        } else {
+          if (!currentTags.includes(tag)) {
+            updatedCount++; // Doesn't have the tag, count as success
+            continue;
+          }
+          newTags = currentTags.filter((t) => t !== tag);
+        }
+
+        await IntentTestCaseService.update({
+          id: tcId,
+          userId: context.userId,
+          tags: newTags,
+        });
+
+        updatedCount++;
+      } catch (err) {
+        failedCount++;
+        errors.push(`${tcId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    logger.info('[QA_TOOL] Bulk tag operation completed', {
+      action,
+      tag,
+      updatedCount,
+      failedCount,
+      userId: context.userId,
+    });
+
+    return {
+      success: true,
+      data: {
+        tag,
+        action,
+        updatedCount,
+        failedCount,
+        ...(errors.length > 0 ? { errors } : {}),
+      },
+      message: `Bulk ${action} tag "${tag}": ${updatedCount} updated, ${failedCount} failed`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleBulkTag error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to bulk ${action} tag: ${error instanceof Error ? error.message : String(error)}`,
       displayToUser: false,
     };
   }

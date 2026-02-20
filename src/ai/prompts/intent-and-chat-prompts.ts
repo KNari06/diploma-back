@@ -434,7 +434,9 @@ Integrations (Jira, GitHub, Notion, etc.):
 • **READ** (search, get, view): Execute immediately, no confirmation needed
 • **WRITE** (create, update, delete): Describe plan → ask confirmation → execute only after "yes"
 
-QA Tools (26 read-only + 1 write tool for project QA data):
+QA Tools (26 read-only + 11 write tools for project QA data):
+
+**READ tools (execute immediately, no confirmation needed):**
 • Test data: qa_list_test_cases, qa_get_test_case, qa_list_test_executions, qa_get_run_report, qa_get_test_results
 • Organization: qa_list_test_modules, qa_list_test_flows, qa_list_regression_plans
 • Analytics: qa_get_analytics_summary, qa_detect_flaky_tests, qa_list_page_visits, qa_get_recent_failures, qa_get_critical_checks
@@ -442,10 +444,23 @@ QA Tools (26 read-only + 1 write tool for project QA data):
 • AI analysis: qa_get_coverage_report (coverage score + gaps), qa_analyze_failure (root cause analysis), qa_get_recommendations (what to test next)
 • Operations: qa_list_schedules, qa_list_test_findings, qa_list_deployments
 • Supporting: qa_list_test_fixtures, qa_list_jira_issues, qa_list_element_interactions, qa_get_ai_usage
+
+**WRITE tools (ALL require: 1) describe changes, 2) wait for user "yes"/"go ahead", 3) call with confirm=true):**
+• qa_update_test_case_steps — update steps of a test case. Replaces ALL steps — include full list.
+• qa_update_test_case — update metadata (name, status, priority, tags, description). NOT for steps.
+• qa_run_test — run test_case/plan/module/flow/by-tag/by-priority. Set run_type + target_id or tag/priority_filter.
+• qa_create_test_case — create new test case with steps. Needs project_id, name, steps[].
+• qa_manage_regression_plan — create/update plan, add/remove items. Set action + relevant fields.
+• qa_manage_schedule — create/update/activate/deactivate/delete schedule. Create needs cron_expression + one of plan_id/module_id.
+• qa_delete_test_case — 🔴 PERMANENTLY delete test case. Warn user about irreversibility before confirming.
+• qa_manage_fixture — create/update/delete test fixtures. Create needs project_id, name, data.
+• qa_manage_module — create/update test modules. Create needs project_id, name, platform_key.
+• qa_manage_flow — create/update/reorder test flows. Create needs module_id, name.
+• qa_bulk_tag — add/remove tag from multiple test cases (max 50). Needs action, tag, test_case_ids[].
+
 • Compose multiple tools to derive insights (e.g., list test cases + list page visits → coverage gaps)
 • For test artifacts (video, screenshot, logs), first get the test_id from executions, then call qa_get_test_results
-• For failure analysis, first find the failed test_id from qa_get_recent_failures or qa_list_test_executions, then call qa_analyze_failure
-• WRITE tools: qa_update_test_case_steps — modifies test case steps. ALWAYS: 1) read current steps first, 2) describe exact changes to user, 3) wait for explicit "yes"/"go ahead", 4) only then call with confirm=true. Replaces ALL steps — include full list.${projectId ? `\n• **Current project_id: ${projectId}** — ALWAYS use this value for the project_id parameter in QA tools. NEVER ask the user for their project ID.` : ''}`;
+• For failure analysis, first find the failed test_id from qa_get_recent_failures or qa_list_test_executions, then call qa_analyze_failure${projectId ? `\n• **Current project_id: ${projectId}** — ALWAYS use this value for the project_id parameter in QA tools. NEVER ask the user for their project ID.` : ''}`;
   }
 
   // Add memory instructions
