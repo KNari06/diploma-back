@@ -3,6 +3,7 @@ import { JiraSkill } from './integrations/jira.skill';
 import { GitHubSkill } from './integrations/github.skill';
 import { NotionSkill } from './integrations/notion.skill';
 import { TelegramSkill } from './integrations/telegram.skill';
+import { SlackSkill } from './integrations/slack.skill';
 import { QASkill } from './qa/qa.skill';
 import { logger } from '@/utils/core/logger';
 
@@ -30,6 +31,7 @@ export function registerAllSkills(): void {
     SkillRegistry.register(GitHubSkill);
     SkillRegistry.register(NotionSkill);
     SkillRegistry.register(TelegramSkill);
+    SkillRegistry.register(SlackSkill);
 
     // Register QA tools skill (read-only project analytics)
     SkillRegistry.register(QASkill);

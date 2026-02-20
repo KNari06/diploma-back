@@ -427,6 +427,83 @@ function decodeState(state: string): { userId: string; workspaceId?: string } {
 }
 
 /**
+ * Setup Slack Incoming Webhook integration
+ * POST /api/v1/integrations/slack/setup
+ */
+export async function setupSlack(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = req.user!.id;
+    const workspaceId = (req.query.workspace_id as string) || undefined;
+    const { webhook_url, channel, description } = req.body;
+
+    if (!webhook_url || typeof webhook_url !== 'string') {
+      res.status(400).json({
+        success: false,
+        error: 'webhook_url is required and must be a string',
+      });
+      return;
+    }
+
+    // Validate format and connectivity
+    const { validateWebhookUrl } = await import('@/services/api/slack.service');
+    try {
+      await validateWebhookUrl(webhook_url);
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        error: error instanceof Error ? error.message : 'Invalid webhook URL',
+      });
+      return;
+    }
+
+    const channelDisplay = channel ? String(channel) : null;
+
+    const savedToken = await IntegrationTokenService.saveToken(
+      userId,
+      workspaceId,
+      'slack',
+      {
+        access_token: webhook_url,
+        token_type: 'IncomingWebhook',
+        external_id: channelDisplay || 'default',
+        external_url: undefined,
+        metadata: {
+          channel: channelDisplay,
+          description: description || undefined,
+        },
+      }
+    );
+
+    logger.info('[INTEGRATIONS] Slack webhook configured', {
+      userId,
+      channel: channelDisplay,
+      workspaceId,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        id: savedToken.id,
+        provider: 'slack',
+        channel: channelDisplay,
+        enabled: savedToken.enabled,
+        created_at: savedToken.created_at,
+        updated_at: savedToken.updated_at,
+      },
+      message: 'Slack webhook configured successfully',
+    });
+  } catch (error) {
+    logger.error('[INTEGRATIONS] Slack setup error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to setup Slack integration',
+    });
+  }
+}
+
+/**
  * Setup Telegram bot integration
  * POST /api/v1/integrations/telegram/setup
  */

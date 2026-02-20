@@ -75,10 +75,14 @@ QAIT is a full-featured QA automation platform with 37 tools (26 read + 11 write
 - AI token usage and cost tracking per workspace
 
 **Integrations (when connected):**
-- Jira: create issues, search with JQL, add comments, change status
-- GitHub: repository operations
-- Notion: database and page operations
-- Telegram: notifications and messages
+
+- Jira (8 tools): check connection status, connect via OAuth, disconnect, create issues (Bug/Task/Story/Epic with priority), search issues with JQL queries, get issue details, add comments to issues, change issue status (transitions like To Do → In Progress → Done)
+- Slack (6 tools): check connection status, connect via Incoming Webhook URL, disconnect, send plain text messages with mrkdwn formatting, send formatted notifications (info/success/warning/error levels), send rich Block Kit messages for structured content (tables, test summaries, reports)
+- Telegram (7 tools): check connection status, connect via Bot Token from @BotFather, disconnect, send text messages (HTML/Markdown/MarkdownV2 formatting), get chat/group/channel info, send documents/files via URL, send formatted notifications with severity levels
+- GitHub (4 tools): create issues with labels, list pull requests (open/closed/all), add comments to issues and PRs, get repository information (description, stars, forks, language)
+- Notion (7 tools): check connection status, connect via OAuth, disconnect, create pages, search pages by query, update page properties, add entries to databases
+
+All integrations support connect/disconnect/status through the chat. User can set up any integration by simply asking in conversation.
 
 **Persistent Memory:**
 - Remembers user preferences, test patterns, bug patterns across conversations

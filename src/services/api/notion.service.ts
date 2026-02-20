@@ -242,6 +242,111 @@ export async function updatePage(
 }
 
 /**
+ * Get a single Notion page by ID
+ */
+export async function getPage(
+  accessToken: string,
+  pageId: string
+): Promise<NotionPage> {
+  try {
+    logger.info('[NOTION_SERVICE] Getting page', { pageId });
+
+    const response = await fetch(`${NOTION_API_URL}/pages/${encodeURIComponent(pageId)}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Notion-Version': NOTION_VERSION,
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error('[NOTION_SERVICE] Failed to get page', {
+        status: response.status,
+        error: errorText,
+      });
+      throw new Error(`Notion API error: ${response.status} ${errorText}`);
+    }
+
+    const page = (await response.json()) as NotionPage;
+    logger.info('[NOTION_SERVICE] Page retrieved', { pageId: page.id });
+
+    return page;
+  } catch (error) {
+    logger.error('[NOTION_SERVICE] Get page error', {
+      error: error instanceof Error ? error.message : String(error),
+      pageId,
+    });
+    throw error;
+  }
+}
+
+export interface NotionDatabase {
+  id: string;
+  url: string;
+  title: string;
+  created_time: string;
+  last_edited_time: string;
+}
+
+/**
+ * List Notion databases accessible to the integration
+ */
+export async function listDatabases(
+  accessToken: string,
+  pageSize: number = 20
+): Promise<NotionDatabase[]> {
+  try {
+    logger.info('[NOTION_SERVICE] Listing databases');
+
+    const response = await fetch(`${NOTION_API_URL}/search`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'Notion-Version': NOTION_VERSION,
+      },
+      body: JSON.stringify({
+        filter: { property: 'object', value: 'database' },
+        page_size: pageSize,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error('[NOTION_SERVICE] Failed to list databases', {
+        status: response.status,
+        error: errorText,
+      });
+      throw new Error(`Notion API error: ${response.status} ${errorText}`);
+    }
+
+    const data = (await response.json()) as {
+      results: Array<{
+        id: string;
+        url: string;
+        title?: Array<{ plain_text?: string }>;
+        created_time: string;
+        last_edited_time: string;
+      }>;
+    };
+
+    return data.results.map((db) => ({
+      id: db.id,
+      url: db.url,
+      title: db.title?.[0]?.plain_text || 'Untitled',
+      created_time: db.created_time,
+      last_edited_time: db.last_edited_time,
+    }));
+  } catch (error) {
+    logger.error('[NOTION_SERVICE] List databases error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+/**
  * Add page to database
  */
 export async function addToDatabase(

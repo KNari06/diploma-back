@@ -5,6 +5,7 @@ import {
   startAuthorization,
   handleCallback,
   disconnectIntegration,
+  setupSlack,
   setupTelegram,
 } from './integrations.controller';
 
@@ -196,6 +197,7 @@ router.delete('/:provider', authenticateUser, disconnectIntegration);
  *       401:
  *         description: Unauthorized
  */
+router.post('/slack/setup', authenticateUser, setupSlack);
 router.post('/telegram/setup', authenticateUser, setupTelegram);
 
 export default router;

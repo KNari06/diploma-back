@@ -2,11 +2,15 @@ import type { ChatCompletionTool } from 'openai/resources/chat/completions';
 import type { SkillDefinition, SkillContext, SkillResult } from '../types';
 import {
   getNotionToken,
+  getPage,
+  listDatabases,
   createPage,
   searchPages,
   updatePage,
   addToDatabase,
 } from '@/services/api/notion.service';
+import { IntegrationTokenService } from '@/services/api/integration-token.service';
+import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -24,6 +28,52 @@ import { logger } from '@/utils/core/logger';
  * Notion skill tools
  */
 const NOTION_TOOLS: ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'notion_status',
+      description:
+        'Check if Notion is connected for the user. Returns connection status and workspace info. Always available.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_connect',
+      description:
+        'Start Notion OAuth connection. Use when user asks to connect/setup/integrate Notion. ' +
+        'Returns an authorization URL the user must open in their browser. Always available.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_disconnect',
+      description:
+        'Disconnect the Notion integration for the user. Requires confirmation. Always available.',
+      parameters: {
+        type: 'object',
+        properties: {
+          confirm: {
+            type: 'boolean',
+            description:
+              'Must be true. Set ONLY after warning user that Notion will be disconnected AND receiving explicit approval.',
+          },
+        },
+        required: ['confirm'],
+      },
+    },
+  },
   {
     type: 'function',
     function: {
@@ -108,6 +158,35 @@ const NOTION_TOOLS: ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_get_page',
+      description: 'Get full details of a specific Notion page by ID, including all properties. Use when user wants to read page content.',
+      parameters: {
+        type: 'object',
+        properties: {
+          page_id: {
+            type: 'string',
+            description: 'The Notion page ID to retrieve',
+          },
+        },
+        required: ['page_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notion_list_databases',
+      description: 'List all Notion databases accessible to this integration. Use when user asks which databases exist or what database_id to use.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
 ];
 
 /**
@@ -121,19 +200,11 @@ export const NotionSkill: SkillDefinition = {
   tools: NOTION_TOOLS,
 
   /**
-   * Check if user has connected Notion
+   * Always available — notion_status/connect/disconnect work without a token.
+   * Other tools fail gracefully if not connected.
    */
-  async isAvailable(context: SkillContext): Promise<boolean> {
-    try {
-      const token = await getNotionToken(context.userId);
-      return token !== null;
-    } catch (error) {
-      logger.error('[NOTION_SKILL] Error checking availability', {
-        error: error instanceof Error ? error.message : String(error),
-        userId: context.userId,
-      });
-      return false;
-    }
+  async isAvailable(_context: SkillContext): Promise<boolean> {
+    return true;
   },
 
   /**
@@ -151,12 +222,26 @@ export const NotionSkill: SkillDefinition = {
     });
 
     try {
-      // Get Notion token
+      // Tools that do not require an existing token
+      if (toolName === 'notion_status') {
+        return await handleStatus(context);
+      }
+
+      if (toolName === 'notion_connect') {
+        return await handleConnect();
+      }
+
+      if (toolName === 'notion_disconnect') {
+        return await handleDisconnect(args, context);
+      }
+
+      // All other tools require an existing token
       const tokenData = await getNotionToken(context.userId);
       if (!tokenData) {
         return {
           success: false,
-          message: 'Notion integration not connected. Please connect your Notion workspace first.',
+          message:
+            'Notion is not connected. Use notion_connect to get the authorization URL and guide the user through the OAuth flow.',
           displayToUser: true,
         };
       }
@@ -176,6 +261,12 @@ export const NotionSkill: SkillDefinition = {
 
         case 'notion_add_to_database':
           return await handleAddToDatabase(accessToken, args);
+
+        case 'notion_get_page':
+          return await handleGetPage(accessToken, args);
+
+        case 'notion_list_databases':
+          return await handleListDatabases(accessToken);
 
         default:
           return {
@@ -198,6 +289,121 @@ export const NotionSkill: SkillDefinition = {
     }
   },
 };
+
+/**
+ * Status handler
+ */
+async function handleStatus(context: SkillContext): Promise<SkillResult> {
+  const tokenData = await getNotionToken(context.userId);
+
+  if (!tokenData) {
+    return {
+      success: true,
+      data: { connected: false },
+      message: 'Notion is not connected. Use notion_connect to start the OAuth flow.',
+      displayToUser: true,
+    };
+  }
+
+  const meta = tokenData.metadata || {};
+  return {
+    success: true,
+    data: {
+      connected: true,
+      workspaceName: meta.workspace_name || null,
+      workspaceId: tokenData.external_id || null,
+      connectedAt: tokenData.created_at,
+    },
+    message: `Notion connected${meta.workspace_name ? `: workspace "${meta.workspace_name}"` : ''}.`,
+    displayToUser: true,
+  };
+}
+
+/**
+ * Connect handler — returns Notion OAuth URL
+ */
+async function handleConnect(): Promise<SkillResult> {
+  const clientId = env.NOTION_CLIENT_ID;
+
+  if (!clientId) {
+    return {
+      success: false,
+      message:
+        'Notion OAuth is not configured on the server. Contact your admin to set NOTION_CLIENT_ID.',
+      displayToUser: true,
+    };
+  }
+
+  const backendUrl = env.BACKEND_URL || `http://localhost:${env.PORT}`;
+  const callbackUrl = `${backendUrl}/api/${env.API_VERSION}/integrations/notion/callback`;
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: callbackUrl,
+    response_type: 'code',
+    owner: 'user',
+  });
+
+  const authUrl = `https://api.notion.com/v1/oauth/authorize?${params.toString()}`;
+
+  return {
+    success: true,
+    data: { authUrl },
+    message:
+      `To connect Notion, open this URL in your browser:\n\n${authUrl}\n\n` +
+      `Select your workspace and grant access. After completing the flow you will be redirected back and Notion will be connected.`,
+    displayToUser: true,
+  };
+}
+
+/**
+ * Disconnect handler
+ */
+async function handleDisconnect(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  if (!args.confirm) {
+    return {
+      success: false,
+      message:
+        'Disconnecting Notion requires confirmation. Warn the user that the integration will be removed. Set confirm=true after explicit approval.',
+      displayToUser: true,
+    };
+  }
+
+  const tokenData = await getNotionToken(context.userId);
+  if (!tokenData) {
+    return {
+      success: false,
+      message: 'Notion is not connected — nothing to disconnect.',
+      displayToUser: true,
+    };
+  }
+
+  try {
+    await IntegrationTokenService.deleteToken(context.userId, 'notion');
+  } catch (error) {
+    logger.error('[NOTION_SKILL] Failed to disconnect', {
+      error: error instanceof Error ? error.message : String(error),
+      userId: context.userId,
+    });
+    return {
+      success: false,
+      message: 'Failed to disconnect Notion. Please try again.',
+      displayToUser: true,
+    };
+  }
+
+  logger.info('[NOTION_SKILL] Notion disconnected via chat', { userId: context.userId });
+
+  return {
+    success: true,
+    data: { disconnected: true },
+    message: 'Notion disconnected successfully. You can reconnect anytime using notion_connect.',
+    displayToUser: true,
+  };
+}
 
 /**
  * Create page handler
@@ -368,6 +574,82 @@ async function handleAddToDatabase(
     return {
       success: false,
       message: `Failed to add to database: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: true,
+    };
+  }
+}
+
+/**
+ * Get page handler
+ */
+async function handleGetPage(
+  accessToken: string,
+  args: Record<string, any>
+): Promise<SkillResult> {
+  const { page_id } = args;
+
+  if (!page_id) {
+    return {
+      success: false,
+      message: 'Missing required field: page_id',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    const page = await getPage(accessToken, page_id);
+
+    logger.info('[NOTION_SKILL] Page retrieved', { pageId: page.id });
+
+    return {
+      success: true,
+      data: {
+        id: page.id,
+        url: page.url,
+        properties: page.properties,
+        created_time: page.created_time,
+        last_edited_time: page.last_edited_time,
+      },
+      message: `Retrieved Notion page: ${page.url}`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[NOTION_SKILL] Failed to get page', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get page: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: true,
+    };
+  }
+}
+
+/**
+ * List databases handler
+ */
+async function handleListDatabases(accessToken: string): Promise<SkillResult> {
+  try {
+    const databases = await listDatabases(accessToken);
+
+    logger.info('[NOTION_SKILL] Databases listed', { count: databases.length });
+
+    return {
+      success: true,
+      data: { databases, total: databases.length },
+      message:
+        databases.length > 0
+          ? `Found ${databases.length} Notion database${databases.length !== 1 ? 's' : ''}: ${databases.map((d) => `"${d.title}" (${d.id})`).join(', ')}`
+          : 'No databases found. Make sure the Notion integration has access to your databases.',
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[NOTION_SKILL] Failed to list databases', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to list databases: ${error instanceof Error ? error.message : String(error)}`,
       displayToUser: true,
     };
   }
