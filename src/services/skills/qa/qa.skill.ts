@@ -14,6 +14,20 @@ import {
   handleListTestFlows,
   handleListSchedules,
   handleDetectFlakyTests,
+  handleListApiTestConfigs,
+  handleListApiTestHistory,
+  handleGetCoverageReport,
+  handleAnalyzeFailure,
+  handleGetRecommendations,
+  handleGetRecentFailures,
+  handleGetCriticalChecks,
+  handleListTestFixtures,
+  handleListApiEnvironments,
+  handleGetAiUsage,
+  handleListDeployments,
+  handleListJiraIssues,
+  handleListElementInteractions,
+  handleUpdateTestCaseSteps,
 } from './qa-tool-handlers';
 import { logger } from '@/utils/core/logger';
 
@@ -22,7 +36,8 @@ import { logger } from '@/utils/core/logger';
  * QA SKILL
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * QA data tools — read-only access to test cases, executions, plans, and analytics.
+ * QA data tools — read access to test cases, executions, plans, analytics,
+ * and write access to modify test case steps (with user confirmation).
  * The agent composes these primitives to answer analytical questions
  * (coverage gaps, failure analysis, recommendations) without dedicated intents.
  *
@@ -324,6 +339,325 @@ const QA_TOOLS: ChatCompletionTool[] = [
       },
     },
   },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Phase 4c — HIGH priority tools (14–20)
+  // ═══════════════════════════════════════════════════════════════
+
+  {
+    type: 'function',
+    function: {
+      name: 'qa_list_api_test_configs',
+      description:
+        'List saved API test configs + endpoints for a project. Returns environments (name, baseUrl, authType, endpointCount) and endpoints (method, path, name, category, tags).',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to query API configs for',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_list_api_test_history',
+      description:
+        'List recent API test execution results. Returns id, method, url, statusCode, durationMs, success, fuzzingScore, executedAt.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to query API test history for',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default 20, max 50)',
+          },
+          success: {
+            type: 'boolean',
+            description: 'Filter by success status (true/false)',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_coverage_report',
+      description:
+        'Get full coverage analysis: score, gaps, and AI-generated summary. Returns score (0-100), totalUrls, coveredUrls, totalTestCases, staleTestCases, gaps array, and summary text.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to analyze coverage for',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_analyze_failure',
+      description:
+        'AI-powered root cause analysis for a failed test execution. Returns rootCause, category, severity, suggestions, affectedStep, errorDetails.',
+      parameters: {
+        type: 'object',
+        properties: {
+          test_id: {
+            type: 'string',
+            description: 'The test execution ID to analyze (from test_executions)',
+          },
+        },
+        required: ['test_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_recommendations',
+      description:
+        'AI-powered test suggestions: what to test next based on coverage, failures, and patterns. Returns array of {type, title, reason, url, relatedTestCaseId, priority}.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to get recommendations for',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_recent_failures',
+      description:
+        'Recent test failures with severity and error context. Returns testCaseName, testCaseId, runId, errorMessage, severity, failedAt, timeAgo.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to query failures for',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default 10, max 20)',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_critical_checks',
+      description:
+        'Status of all critical-priority test cases: ok, failed, or unknown. Returns id, name, status, lastRunAt, lastRunId.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to query critical checks for',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Phase 4c — MEDIUM priority tools (21–26)
+  // ═══════════════════════════════════════════════════════════════
+
+  {
+    type: 'function',
+    function: {
+      name: 'qa_list_test_fixtures',
+      description:
+        'List reusable test data (fixtures) for a project. Returns id, name, description, scope, tags, data (truncated to 1000 chars), createdAt.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to query fixtures for',
+          },
+          scope: {
+            type: 'string',
+            enum: ['global', 'project', 'module', 'flow'],
+            description: 'Filter by fixture scope',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_list_api_environments',
+      description:
+        'List configured API environments (base URLs, auth types). Returns id, name, baseUrl, authType, isDefault, variableKeys. Auth secrets are stripped for security.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to query environments for',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_ai_usage',
+      description:
+        'AI token usage and cost summary for the workspace. Returns totalTokens, totalCostUSD, totalCalls, and breakdown by operation type.',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: {
+            type: 'number',
+            description: 'Look back N days (default 30, max 90)',
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_list_deployments',
+      description:
+        'Recent deployments/webhook events and their test run results. Returns id, version, eventType, provider, status, branch, deliveredAt, runId.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to query deployments for',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default 5, max 20)',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_list_jira_issues',
+      description:
+        'Jira issues linked to test results. Returns testId, jiraIssueKey, jiraIssueUrl, createdAt.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to query Jira issues for',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default 20, max 50)',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_list_element_interactions',
+      description:
+        'Element interaction patterns — which selectors are used, success rates, and reliability. Use to find unreliable selectors.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to analyze element patterns for',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default 20, max 50)',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // WRITE tools (require confirm=true after user approval)
+  // ═══════════════════════════════════════════════════════════════
+
+  {
+    type: 'function',
+    function: {
+      name: 'qa_update_test_case_steps',
+      description:
+        '⚠️ WRITE operation — Update the steps of a test case. BEFORE calling this tool: 1) Read the current test case with qa_get_test_case to see existing steps, 2) Describe the EXACT changes you will make to the user, 3) Wait for the user to explicitly approve. Only then call with confirm=true. Each step needs: id (UUID), type (click/type/navigate/etc.), description (what the step does). WARNING: This replaces ALL steps — always include the full step list, not just changed ones.',
+      parameters: {
+        type: 'object',
+        properties: {
+          test_case_id: {
+            type: 'string',
+            description: 'The test case ID to update',
+          },
+          steps: {
+            type: 'array',
+            description: 'Full array of steps to replace existing steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string}',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Unique step ID (UUID). Keep existing IDs for unchanged steps, generate new UUIDs for new steps.' },
+                type: {
+                  type: 'string',
+                  enum: ['type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover', 'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close', 'ai_check', 'wait_for', 'upload'],
+                  description: 'Action type for this step',
+                },
+                description: { type: 'string', description: 'Human-readable description of what this step does' },
+                value: { type: 'string', description: 'Value for type/press actions (e.g., text to type)' },
+                assertionText: { type: 'string', description: 'Assertion text for ai_check steps' },
+              },
+              required: ['id', 'type', 'description'],
+            },
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing changes to user AND receiving explicit approval.',
+          },
+        },
+        required: ['test_case_id', 'steps', 'confirm'],
+      },
+    },
+  },
 ];
 
 /**
@@ -334,7 +668,7 @@ export const QASkill: SkillDefinition = {
   name: 'QA Tools',
   provider: 'qa',
   description:
-    'Query test cases, execution results, regression plans, page visits, analytics, test artifacts (videos/screenshots/logs), bug findings, test modules/flows, schedules, and flaky test detection. Use these tools to answer any analytical QA question.',
+    'Query and manage test cases, executions, regression plans, analytics, API test configs/history, coverage reports, failure analysis, recommendations, fixtures, deployments, Jira issues, element interactions, AI usage, and more. 26 read-only tools + 1 write tool for comprehensive QA data access.',
   tools: QA_TOOLS,
 
   /**
@@ -399,6 +733,51 @@ export const QASkill: SkillDefinition = {
 
         case 'qa_detect_flaky_tests':
           return await handleDetectFlakyTests(args, context);
+
+        // Phase 4c — HIGH priority tools
+        case 'qa_list_api_test_configs':
+          return await handleListApiTestConfigs(args, context);
+
+        case 'qa_list_api_test_history':
+          return await handleListApiTestHistory(args, context);
+
+        case 'qa_get_coverage_report':
+          return await handleGetCoverageReport(args, context);
+
+        case 'qa_analyze_failure':
+          return await handleAnalyzeFailure(args, context);
+
+        case 'qa_get_recommendations':
+          return await handleGetRecommendations(args, context);
+
+        case 'qa_get_recent_failures':
+          return await handleGetRecentFailures(args, context);
+
+        case 'qa_get_critical_checks':
+          return await handleGetCriticalChecks(args, context);
+
+        // Phase 4c — MEDIUM priority tools
+        case 'qa_list_test_fixtures':
+          return await handleListTestFixtures(args, context);
+
+        case 'qa_list_api_environments':
+          return await handleListApiEnvironments(args, context);
+
+        case 'qa_get_ai_usage':
+          return await handleGetAiUsage(args, context);
+
+        case 'qa_list_deployments':
+          return await handleListDeployments(args, context);
+
+        case 'qa_list_jira_issues':
+          return await handleListJiraIssues(args, context);
+
+        case 'qa_list_element_interactions':
+          return await handleListElementInteractions(args, context);
+
+        // Write tools
+        case 'qa_update_test_case_steps':
+          return await handleUpdateTestCaseSteps(args, context);
 
         default:
           return {

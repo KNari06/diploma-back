@@ -1,5 +1,14 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { PatternsQueryService } from '@/services/kb/patterns-query.service';
+import { CoverageAnalysisService } from '@/services/testing/analysis/coverage-analysis.service';
+import { FailureAnalysisService } from '@/services/testing/analysis/failure-analysis.service';
+import { TestRecommendationService } from '@/services/testing/analysis/test-recommendation.service';
+import { AnalyticsQueryService } from '@/services/analytics/analytics-query.service';
+import { AIUsageQueryService } from '@/services/ai/tracking/ai-usage-query.service';
+import { FixtureService } from '@/services/testing/fixtures/fixture.service';
+import { ApiConfigService } from '@/services/api/api-config.service';
+import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import type { SkillContext, SkillResult } from '../types';
 import { logger } from '@/utils/core/logger';
 
@@ -1211,6 +1220,808 @@ export async function handleDetectFlakyTests(
     return {
       success: false,
       message: `Failed to detect flaky tests: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 4c — NEW TOOL HANDLERS (Tools 14–26)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * qa_list_api_test_configs — List saved API test configs + endpoints for a project
+ */
+export async function handleListApiTestConfigs(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const environments = await ApiConfigService.getEnvironments(context.userId, projectId);
+
+    // For each environment, get endpoint count and list endpoints
+    const envSummaries: any[] = [];
+    const allEndpoints: any[] = [];
+
+    for (const env of environments) {
+      const endpoints = await ApiConfigService.getEndpoints(env.id, context.userId);
+
+      envSummaries.push({
+        name: env.name,
+        baseUrl: env.base_url,
+        authType: env.auth_type,
+        endpointCount: endpoints.length,
+      });
+
+      for (const ep of endpoints) {
+        allEndpoints.push({
+          method: ep.method,
+          path: ep.path,
+          name: ep.name,
+          category: ep.category || null,
+          tags: ep.tags || [],
+        });
+      }
+    }
+
+    return {
+      success: true,
+      data: { environments: envSummaries, endpoints: allEndpoints },
+      message: `Found ${envSummaries.length} environments with ${allEndpoints.length} total endpoints`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleListApiTestConfigs error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to list API test configs: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_list_api_test_history — List recent API test execution results
+ */
+export async function handleListApiTestHistory(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const limit = Math.min(args.limit || 20, 50);
+  const successFilter = args.success as boolean | undefined;
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    // Get chat sessions for this project to scope API test executions
+    const { data: sessions, error: sessionsError } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('id')
+      .eq('project_id', projectId);
+
+    if (sessionsError) {
+      logger.error('[QA_TOOL] Failed to get sessions for API history', { error: sessionsError.message });
+      return { success: false, message: `Database error: ${sessionsError.message}`, displayToUser: false };
+    }
+
+    const sessionIds = (sessions || []).map((s) => s.id);
+
+    if (sessionIds.length === 0) {
+      return {
+        success: true,
+        data: { executions: [], total: 0 },
+        message: 'No API test history found for this project',
+        displayToUser: false,
+      };
+    }
+
+    // Query api_test_executions scoped by sessions (batched)
+    const batchSize = 100;
+    let allRows: any[] = [];
+
+    for (let i = 0; i < sessionIds.length; i += batchSize) {
+      const batch = sessionIds.slice(i, i + batchSize);
+      let query = supabaseAdmin
+        .from('api_test_executions')
+        .select('id, method, url, status_code, duration_ms, success, fuzzing_score, executed_at')
+        .in('session_id', batch)
+        .order('executed_at', { ascending: false });
+
+      if (successFilter !== undefined) {
+        query = query.eq('success', successFilter);
+      }
+
+      const { data: batchData, error: batchError } = await query;
+
+      if (batchError) {
+        logger.error('[QA_TOOL] Failed to get API test history batch', { error: batchError.message });
+        return { success: false, message: `Database error: ${batchError.message}`, displayToUser: false };
+      }
+
+      if (batchData) {
+        allRows.push(...batchData);
+      }
+    }
+
+    // Sort and limit
+    allRows.sort((a, b) => new Date(b.executed_at).getTime() - new Date(a.executed_at).getTime());
+    const executions = allRows.slice(0, limit).map((e) => ({
+      id: e.id,
+      method: e.method,
+      url: e.url,
+      statusCode: e.status_code,
+      durationMs: e.duration_ms,
+      success: e.success,
+      fuzzingScore: e.fuzzing_score || null,
+      executedAt: e.executed_at,
+    }));
+
+    return {
+      success: true,
+      data: { executions, total: executions.length },
+      message: `Found ${executions.length} API test executions`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleListApiTestHistory error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to list API test history: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_coverage_report — Get full coverage analysis with score, gaps, and summary
+ */
+export async function handleGetCoverageReport(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const report = await CoverageAnalysisService.analyze(projectId, context.userId, context.workspaceId);
+
+    return {
+      success: true,
+      data: {
+        score: report.score,
+        totalUrls: report.totalUrls,
+        coveredUrls: report.coveredUrls,
+        totalTestCases: report.totalTestCases,
+        staleTestCases: report.staleTestCases,
+        gaps: report.gaps,
+        summary: report.summary,
+      },
+      message: `Coverage score: ${report.score}% (${report.coveredUrls}/${report.totalUrls} URLs covered, ${report.gaps.length} gaps found)`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetCoverageReport error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get coverage report: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_analyze_failure — AI-powered root cause analysis for a failed test
+ */
+export async function handleAnalyzeFailure(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const testId = args.test_id;
+
+  if (!testId) {
+    return { success: false, message: 'Missing required field: test_id', displayToUser: false };
+  }
+
+  try {
+    const result = await FailureAnalysisService.analyze(testId, context.userId);
+
+    return {
+      success: true,
+      data: {
+        rootCause: result.rootCause,
+        category: result.category,
+        severity: result.severity,
+        suggestions: result.suggestions,
+        affectedStep: result.affectedStep || null,
+        errorDetails: result.errorDetails,
+      },
+      message: `Failure analysis: ${result.category} (${result.severity}) — ${result.rootCause.substring(0, 100)}`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleAnalyzeFailure error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to analyze failure: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_recommendations — AI-powered test suggestions
+ */
+export async function handleGetRecommendations(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const recommendations = await TestRecommendationService.getRecommendations(
+      projectId,
+      context.userId,
+      context.workspaceId
+    );
+
+    const results = recommendations.map((r) => ({
+      type: r.type,
+      title: r.title,
+      reason: r.reason,
+      url: r.url || null,
+      relatedTestCaseId: r.relatedTestCaseId || null,
+      priority: r.priority,
+    }));
+
+    return {
+      success: true,
+      data: { recommendations: results, total: results.length },
+      message: `Generated ${results.length} test recommendations`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetRecommendations error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get recommendations: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_recent_failures — Recent test failures with severity and error context
+ */
+export async function handleGetRecentFailures(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const limit = Math.min(args.limit || 10, 20);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const result = await AnalyticsQueryService.getRecentFailures(context.workspaceId, projectId, limit);
+
+    return {
+      success: true,
+      data: { failures: result.failures, total: result.failures.length },
+      message: `Found ${result.failures.length} recent failures`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetRecentFailures error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get recent failures: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_critical_checks — Status of all critical-priority test cases
+ */
+export async function handleGetCriticalChecks(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const result = await AnalyticsQueryService.getCriticalChecks(context.workspaceId, projectId);
+
+    return {
+      success: true,
+      data: { checks: result.checks, total: result.checks.length },
+      message: `Found ${result.checks.length} critical checks`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetCriticalChecks error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get critical checks: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_list_test_fixtures — List reusable test data (fixtures) for a project
+ */
+export async function handleListTestFixtures(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const scope = args.scope as 'global' | 'project' | 'module' | 'flow' | undefined;
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const fixtures = await FixtureService.listByProject(projectId, context.userId, scope);
+
+    // Truncate data field to prevent context blowup
+    const results = fixtures.map((f) => {
+      const dataStr = f.data ? (typeof f.data === 'string' ? f.data : JSON.stringify(f.data)) : '';
+      return {
+        id: f.id,
+        name: f.name,
+        description: f.description || null,
+        scope: f.scope,
+        tags: f.tags || [],
+        data: dataStr.length > 1000 ? dataStr.substring(0, 1000) + '... [truncated]' : dataStr,
+        createdAt: f.createdAt,
+      };
+    });
+
+    return {
+      success: true,
+      data: { fixtures: results, total: results.length },
+      message: `Found ${results.length} test fixtures${scope ? ` (scope: ${scope})` : ''}`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleListTestFixtures error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to list fixtures: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_list_api_environments — List configured API environments (strip secrets)
+ */
+export async function handleListApiEnvironments(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const environments = await ApiConfigService.getEnvironments(context.userId, projectId);
+
+    // SECURITY: Strip auth_config (contains tokens/secrets). Only return authType + variable keys.
+    const results = environments.map((env) => ({
+      id: env.id,
+      name: env.name,
+      baseUrl: env.base_url,
+      authType: env.auth_type,
+      isDefault: env.is_default,
+      variableKeys: env.variables ? Object.keys(env.variables) : [],
+    }));
+
+    return {
+      success: true,
+      data: { environments: results, total: results.length },
+      message: `Found ${results.length} API environments`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleListApiEnvironments error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to list API environments: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_ai_usage — AI token usage and cost summary for workspace
+ */
+export async function handleGetAiUsage(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const days = Math.min(args.days || 30, 90);
+
+  try {
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+
+    const [usageStats, operationBreakdown] = await Promise.all([
+      AIUsageQueryService.getWorkspaceUsageStats(context.workspaceId, startDate),
+      AIUsageQueryService.getUsageByOperationType(context.workspaceId, startDate),
+    ]);
+
+    return {
+      success: true,
+      data: {
+        totalTokens: usageStats.totalTokens,
+        totalCostUSD: usageStats.totalCostUSD,
+        totalCalls: usageStats.totalCalls,
+        breakdown: operationBreakdown.map((op) => ({
+          operationType: op.operationType,
+          tokens: op.totalTokens,
+          cost: op.totalCost,
+          count: op.count,
+        })),
+        periodDays: days,
+      },
+      message: `AI usage over ${days} days: ${usageStats.totalTokens} tokens, $${usageStats.totalCostUSD.toFixed(4)} cost, ${usageStats.totalCalls} calls`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetAiUsage error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get AI usage: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_list_deployments — Recent deployments/webhook events and their test run results
+ */
+export async function handleListDeployments(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const limit = Math.min(args.limit || 5, 20);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const result = await AnalyticsQueryService.getRecentDeployments(context.workspaceId, projectId, limit);
+
+    return {
+      success: true,
+      data: { deployments: result.deployments, total: result.deployments.length },
+      message: `Found ${result.deployments.length} recent deployments`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleListDeployments error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to list deployments: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_list_jira_issues — Jira issues linked to test results
+ */
+export async function handleListJiraIssues(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const limit = Math.min(args.limit || 20, 50);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    // Raw query: test_jira_issues → test_executions → regression_runs for project scoping
+    const { data, error } = await supabaseAdmin
+      .from('test_jira_issues')
+      .select(`
+        id,
+        test_id,
+        jira_issue_key,
+        jira_issue_url,
+        created_at,
+        test_executions!inner(
+          id,
+          run_id,
+          regression_runs!inner(
+            project_id
+          )
+        )
+      `)
+      .eq('test_executions.regression_runs.project_id', projectId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      logger.error('[QA_TOOL] Failed to list Jira issues', { error: error.message, projectId });
+      return { success: false, message: `Database error: ${error.message}`, displayToUser: false };
+    }
+
+    const issues = (data || []).map((j: any) => ({
+      testId: j.test_id,
+      jiraIssueKey: j.jira_issue_key,
+      jiraIssueUrl: j.jira_issue_url,
+      createdAt: j.created_at,
+    }));
+
+    return {
+      success: true,
+      data: { issues, total: issues.length },
+      message: `Found ${issues.length} Jira issues linked to tests`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleListJiraIssues error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to list Jira issues: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_list_element_interactions — Element interaction patterns (unreliable selectors)
+ */
+export async function handleListElementInteractions(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const limit = Math.min(args.limit || 20, 50);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const patterns = await PatternsQueryService.getElementPatterns(projectId, limit);
+
+    return {
+      success: true,
+      data: { elements: patterns, total: patterns.length },
+      message: `Found ${patterns.length} element interaction patterns`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleListElementInteractions error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to list element interactions: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WRITE TOOLS (require confirm=true from agent after user approval)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Allowed IntentStep action types — reject anything else */
+const VALID_STEP_TYPES = new Set([
+  'type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover',
+  'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close',
+  'ai_check', 'wait_for', 'upload',
+]);
+
+/**
+ * qa_update_test_case_steps — Update steps of a test case (WRITE operation)
+ *
+ * Safety:
+ * - Requires `confirm: true` — agent MUST describe changes and get user approval first
+ * - Ownership enforced by IntentTestCaseService (user_id check)
+ * - Project scoping via resolveProjectId
+ * - Returns previous step count so agent can inform user what changed
+ */
+export async function handleUpdateTestCaseSteps(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const testCaseId = args.test_case_id;
+  const steps = args.steps as IntentStep[] | undefined;
+  const confirm = args.confirm === true;
+
+  if (!testCaseId) {
+    return { success: false, message: 'Missing required field: test_case_id', displayToUser: false };
+  }
+
+  if (!steps || !Array.isArray(steps) || steps.length === 0) {
+    return { success: false, message: 'Missing or empty required field: steps (array of step objects)', displayToUser: false };
+  }
+
+  // Gate: agent must explicitly set confirm=true after user approval
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the exact changes to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  // Validate step structure
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (!step.id || typeof step.id !== 'string') {
+      return { success: false, message: `Step ${i}: missing or invalid "id" (must be a string UUID)`, displayToUser: false };
+    }
+    if (!step.type || !VALID_STEP_TYPES.has(step.type)) {
+      return {
+        success: false,
+        message: `Step ${i}: invalid "type" "${step.type}". Allowed: ${[...VALID_STEP_TYPES].join(', ')}`,
+        displayToUser: false,
+      };
+    }
+    if (!step.description || typeof step.description !== 'string') {
+      return { success: false, message: `Step ${i}: missing or invalid "description" (must be a non-empty string)`, displayToUser: false };
+    }
+  }
+
+  try {
+    const projectId = resolveProjectId(args, context);
+
+    // Fetch current test case to verify it exists, check ownership, and get previous state
+    let verifyQuery = supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, name, steps_json, project_id, user_id')
+      .eq('id', testCaseId);
+
+    if (projectId) {
+      verifyQuery = verifyQuery.eq('project_id', projectId);
+    }
+
+    const { data: existing, error: fetchError } = await verifyQuery.single();
+
+    if (fetchError) {
+      if (fetchError.code === 'PGRST116') {
+        return { success: false, message: `Test case not found: ${testCaseId}`, displayToUser: false };
+      }
+      return { success: false, message: `Database error: ${fetchError.message}`, displayToUser: false };
+    }
+
+    // Check ownership before attempting update
+    if (existing.user_id !== context.userId) {
+      return {
+        success: false,
+        message: 'You can only update test cases you created. This test case belongs to another user.',
+        displayToUser: false,
+      };
+    }
+
+    const previousSteps: IntentStep[] = Array.isArray(existing.steps_json) ? existing.steps_json : [];
+    const previousStepCount = previousSteps.length;
+
+    // Merge LLM-provided steps with existing step data to preserve compiled/evidence/bindingHints.
+    // For steps whose id matches an existing step, carry over fields the LLM cannot provide.
+    const existingStepMap = new Map<string, IntentStep>();
+    for (const s of previousSteps) {
+      if (s.id) existingStepMap.set(s.id, s);
+    }
+
+    const mergedSteps: IntentStep[] = steps.map((incoming) => {
+      const prev = existingStepMap.get(incoming.id);
+      if (!prev) {
+        // New step — use as-is
+        return incoming;
+      }
+
+      // If the action type or description changed, the old compiled/evidence are stale — discard them
+      const typeChanged = incoming.type !== prev.type;
+      const descChanged = incoming.description !== prev.description;
+      const stepModified = typeChanged || descChanged;
+
+      // Existing step — carry over compiled/evidence/bindingHints/options,
+      // but let LLM-provided fields (type, description, value, assertionText) take precedence
+      return {
+        ...prev,
+        ...incoming,
+        // Preserve complex fields only if step wasn't modified and LLM didn't provide them
+        bindingHints: incoming.bindingHints || prev.bindingHints,
+        evidence: stepModified ? undefined : (incoming.evidence || prev.evidence),
+        compiled: stepModified ? undefined : (incoming.compiled || prev.compiled),
+        options: incoming.options || prev.options,
+      };
+    });
+
+    // Perform the update via IntentTestCaseService (also enforces user_id ownership)
+    const updated = await IntentTestCaseService.update({
+      id: testCaseId,
+      userId: context.userId,
+      steps: mergedSteps,
+    });
+
+    logger.info('[QA_TOOL] Test case steps updated', {
+      testCaseId,
+      userId: context.userId,
+      previousStepCount,
+      newStepCount: steps.length,
+    });
+
+    return {
+      success: true,
+      data: {
+        testCaseId: updated.id,
+        testCaseName: updated.name,
+        previousStepCount,
+        newStepCount: updated.stepsJson.length,
+      },
+      message: `Updated test case "${updated.name}": ${previousStepCount} → ${updated.stepsJson.length} steps`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleUpdateTestCaseSteps error', {
+      error: error instanceof Error ? error.message : String(error),
+      testCaseId,
+    });
+    return {
+      success: false,
+      message: `Failed to update test case steps: ${error instanceof Error ? error.message : String(error)}`,
       displayToUser: false,
     };
   }
