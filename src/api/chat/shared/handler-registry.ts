@@ -3,12 +3,14 @@ import { handlePlatformTest as handlePlatformTestOriginal } from '../ai_test/han
 import { handleApiTest as handleApiTestOriginal } from '../api_test/handler';
 import { handleGeneralChat as handleGeneralChatOriginal } from '../general/handler';
 import { handleAddToPlanIntent } from '../regression/add-to-plan.handler';
+import { handleAnalyzeFailureIntent } from '../regression/analyze-failure.handler';
 import { handleCreatePlanIntent } from '../regression/create-plan.handler';
 import { handleRunByTagIntent } from '../regression/run-by-tag.handler';
 import { handleRunModuleIntent } from '../regression/run-module.handler';
 import { handleRunPlanIntent } from '../regression/run-plan.handler';
 import { handleRunRegressionIntent } from '../regression/run-regression.handler';
 import { handleSaveTestIntent } from '../regression/save-test.handler';
+import { handleTestRecommendationsIntent } from '../regression/test-recommendations.handler';
 import { handleClarificationRequest as handleClarificationOriginal } from './clarification';
 
 /**
@@ -142,6 +144,10 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
   add_to_plan: handleAddToPlanIntent,
   run_module: handleRunModuleIntent,
   run_by_tag: handleRunByTagIntent,
+
+  // AI intelligence intents
+  analyze_failure: handleAnalyzeFailureIntent,
+  test_recommendations: handleTestRecommendationsIntent,
 };
 
 /**
@@ -196,5 +202,7 @@ export function getIntentDescriptions(): Record<string, string> {
     add_to_plan: 'User wants to add module/flow to a regression plan',
     run_module: 'User wants to run all tests in a module',
     run_by_tag: 'User wants to run tests by tag (e.g., "run critical tests")',
+    analyze_failure: 'User wants to understand why a test failed (root-cause analysis)',
+    test_recommendations: 'User wants suggestions on what to test next',
   };
 }

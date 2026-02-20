@@ -36,10 +36,11 @@ export async function buildRegressionContext(params: {
 
   try {
     // Run all DB queries in parallel for ~4x speedup
-    const [lastTest, savedCasesCount, recentTestIds] = await Promise.all([
+    const [lastTest, savedCasesCount, recentTestIds, lastFailedTestId] = await Promise.all([
       chatSessionId ? getLastTestFromSession(chatSessionId, userId, projectId) : null,
       projectId ? getSavedCasesCount(projectId, userId) : 0,
       chatSessionId ? getRecentTestIds(chatSessionId) : [],
+      chatSessionId ? getLastFailedTestId(chatSessionId, userId) : null,
     ]);
 
     return {
@@ -47,6 +48,7 @@ export async function buildRegressionContext(params: {
       lastTestGoal: lastTest?.goal,
       savedCasesCount,
       recentTestIds,
+      lastFailedTestId: lastFailedTestId || undefined,
     };
   } catch (error) {
     logger.error('[REGRESSION_CONTEXT] Error building context', { error });
@@ -203,5 +205,51 @@ async function getRecentTestIds(
   } catch (error) {
     logger.warn('[REGRESSION_CONTEXT] Error getting recent test IDs', { error });
     return [];
+  }
+}
+
+/**
+ * Get the last failed test ID from chat session messages
+ * Searches metadata for test results with failed status
+ *
+ * @param chatSessionId - Chat session ID to search
+ * @param userId - User ID for ownership verification
+ * @returns Test ID of last failed test, or null
+ */
+async function getLastFailedTestId(
+  chatSessionId: string,
+  userId: string,
+): Promise<string | null> {
+  try {
+    const { data: messages, error } = await supabaseAdmin
+      .from('chat_messages')
+      .select('metadata')
+      .eq('session_id', chatSessionId)
+      .order('created_at', { ascending: false })
+      .limit(30);
+
+    if (error) throw error;
+    if (!messages) return null;
+
+    for (const msg of messages) {
+      const meta = msg.metadata;
+      if (!meta) continue;
+
+      // Check for failed test result in metadata
+      const isFailed =
+        meta.testResult?.status === 'failed' ||
+        meta.testStatus === 'failed' ||
+        meta.status === 'failed';
+
+      if (isFailed) {
+        const testId = meta.testId || meta.test_id || meta.testResult?.testId;
+        if (testId) return testId;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    logger.warn('[REGRESSION_CONTEXT] Error getting last failed test ID', { error });
+    return null;
   }
 }

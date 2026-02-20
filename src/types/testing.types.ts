@@ -77,6 +77,59 @@ export type PlanItemType = 'module' | 'flow' | 'test_case';
 export type PlatformKey = 'web_ui' | 'api';
 
 // ============================================================================
+// FAILURE ANALYSIS TYPES
+// ============================================================================
+
+/**
+ * Category of failure root cause
+ */
+export type FailureCategory =
+  | 'network'
+  | 'ui_element'
+  | 'validation'
+  | 'timeout'
+  | 'auth'
+  | 'server'
+  | 'unknown';
+
+/**
+ * Structured failure root-cause analysis result
+ */
+export interface FailureAnalysisResult {
+  rootCause: string;
+  category: FailureCategory;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  suggestions: string[];
+  affectedStep?: number;
+  errorDetails: string;
+}
+
+// ============================================================================
+// TEST RECOMMENDATION TYPES
+// ============================================================================
+
+/**
+ * Type of test recommendation
+ */
+export type TestRecommendationType =
+  | 'retest_failure'
+  | 'untested_area'
+  | 'stale_test'
+  | 'regression_risk';
+
+/**
+ * AI-generated test recommendation
+ */
+export interface TestRecommendation {
+  type: TestRecommendationType;
+  title: string;
+  reason: string;
+  url?: string;
+  relatedTestCaseId?: string;
+  priority: 'high' | 'medium' | 'low';
+}
+
+// ============================================================================
 // TEST PLATFORM
 // ============================================================================
 

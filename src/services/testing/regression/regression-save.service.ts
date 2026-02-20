@@ -86,7 +86,10 @@ export class RegressionSaveService {
         );
       }
 
-      // 6. Create intent test case (unified table) with status='published'
+      // 6. Build human-readable steps from execution data
+      const stepsJson = this.buildStepsJson(session, test);
+
+      // 7. Create intent test case (unified table) with status='published'
       // Saving from a completed test means it's ready for regression runs.
       const { data: savedCase, error } = await supabaseAdmin
         .from('intent_test_cases')
@@ -108,8 +111,8 @@ export class RegressionSaveService {
           // URL fields
           url: test.url || null,
           start_url: test.url || null,
-          // Empty steps_json (commands are the source of truth for replay)
-          steps_json: [],
+          // Human-readable steps (commands remain source of truth for replay)
+          steps_json: stepsJson,
         })
         .select('id')
         .single();
@@ -365,6 +368,71 @@ export class RegressionSaveService {
     }
 
     return { steps, parametersSchema };
+  }
+
+  /**
+   * Build human-readable steps_json from execution data
+   * Extracts from intelligent session result (executedSteps / pageVisits)
+   * Falls back to empty array if no execution data available
+   */
+  private static buildStepsJson(session: any, test: any): any[] {
+    try {
+      // Try executedSteps from session result first
+      const executedSteps = session?.result?.executedSteps;
+      if (Array.isArray(executedSteps) && executedSteps.length > 0) {
+        return executedSteps.map((step: any, index: number) => ({
+          step: index + 1,
+          action: step.action || 'unknown',
+          description: step.description || step.thought || '',
+          target: step.selector || step.target || undefined,
+          value: this.maskSensitiveStepValue(step.value, step),
+          url: step.url || test.url || '',
+        }));
+      }
+
+      // Try pageVisits from session result
+      const pageVisits = session?.result?.pageVisits;
+      if (Array.isArray(pageVisits) && pageVisits.length > 0) {
+        return pageVisits.map((visit: any, index: number) => ({
+          step: index + 1,
+          action: 'goto',
+          description: visit.title || `Navigate to ${visit.url}`,
+          url: visit.url || '',
+        }));
+      }
+
+      // Try commands from test as last resort (convert to step format)
+      if (Array.isArray(test.commands) && test.commands.length > 0) {
+        return test.commands.map((cmd: any, index: number) => ({
+          step: index + 1,
+          action: cmd.action || 'unknown',
+          description: cmd.description || cmd.label || '',
+          target: cmd.selector || undefined,
+          value: cmd.value?.startsWith?.('{{') ? cmd.value : this.maskSensitiveStepValue(cmd.value, cmd),
+          url: cmd.url || test.url || '',
+        }));
+      }
+
+      return [];
+    } catch (error) {
+      logger.warn('[REGRESSION_SAVE] Failed to build steps_json, falling back to empty', { error });
+      return [];
+    }
+  }
+
+  /**
+   * Mask sensitive values in step data (reuses same patterns as sanitizeCommands)
+   */
+  private static maskSensitiveStepValue(value: any, step: any): string | undefined {
+    if (!value || typeof value !== 'string') return undefined;
+
+    const sensitivePatterns = [
+      /password/i, /token/i, /secret/i, /api[_-]?key/i, /auth/i, /credential/i, /\bkey\b/i,
+    ];
+    const contextText = `${step.selector || ''} ${step.description || ''} ${step.label || ''}`;
+    const isSensitive = sensitivePatterns.some(pattern => pattern.test(contextText));
+
+    return isSensitive ? '***' : value;
   }
 
   /**

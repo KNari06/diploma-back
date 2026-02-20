@@ -23,6 +23,16 @@ interface LocalizedMessages {
     testStarted: (runId: string, testId: string) => string;
     error: string;
   };
+  analyzeFailure: {
+    noTestId: string;
+    success: (rootCause: string, category: string, severity: string, suggestions: string) => string;
+    error: string;
+  };
+  testRecommendations: {
+    noProject: string;
+    success: (formattedList: string) => string;
+    error: string;
+  };
 }
 
 const messages: Record<Language, LocalizedMessages> = {
@@ -39,6 +49,18 @@ const messages: Record<Language, LocalizedMessages> = {
         `✅ Saved test started!\n\n**Run ID:** ${runId}\n**Test ID:** ${testId}\n\nThe test is running in the background. You will receive results when it completes.`,
       error: 'Failed to run regression test. Please try again.',
     },
+    analyzeFailure: {
+      noTestId: 'No recent failed test found. Please run a test first or specify a test ID.',
+      success: (rootCause, category, severity, suggestions) =>
+        `🔍 **Failure Analysis**\n\n**Root Cause:** ${rootCause}\n**Category:** ${category}\n**Severity:** ${severity}\n\n**Suggestions:**\n${suggestions}`,
+      error: 'Failed to analyze test failure. Please try again.',
+    },
+    testRecommendations: {
+      noProject: 'No project context found. Please run a test first so I can understand your project.',
+      success: (formattedList) =>
+        `📋 **Test Recommendations**\n\nHere\'s what I recommend testing next:\n\n${formattedList}`,
+      error: 'Failed to generate test recommendations. Please try again.',
+    },
   },
   ru: {
     saveTest: {
@@ -53,6 +75,18 @@ const messages: Record<Language, LocalizedMessages> = {
         `✅ Запущен сохраненный тест!\n\n**Run ID:** ${runId}\n**Test ID:** ${testId}\n\nТест выполняется в фоне. Вы получите результаты когда он завершится.`,
       error: 'Не удалось запустить regression тест. Пожалуйста, попробуйте снова.',
     },
+    analyzeFailure: {
+      noTestId: 'Не найден недавний проваленный тест. Пожалуйста, запустите тест или укажите ID теста.',
+      success: (rootCause, category, severity, suggestions) =>
+        `🔍 **Анализ ошибки**\n\n**Причина:** ${rootCause}\n**Категория:** ${category}\n**Серьезность:** ${severity}\n\n**Рекомендации:**\n${suggestions}`,
+      error: 'Не удалось проанализировать ошибку теста. Пожалуйста, попробуйте снова.',
+    },
+    testRecommendations: {
+      noProject: 'Не найден контекст проекта. Запустите тест, чтобы я мог понять ваш проект.',
+      success: (formattedList) =>
+        `📋 **Рекомендации по тестированию**\n\nВот что я рекомендую протестировать:\n\n${formattedList}`,
+      error: 'Не удалось сгенерировать рекомендации. Пожалуйста, попробуйте снова.',
+    },
   },
   neutral: {
     saveTest: {
@@ -66,6 +100,18 @@ const messages: Record<Language, LocalizedMessages> = {
       testStarted: (runId, testId) =>
         `✅ Saved test started!\n\n**Run ID:** ${runId}\n**Test ID:** ${testId}\n\nThe test is running in the background. You will receive results when it completes.`,
       error: 'Failed to run regression test. Please try again.',
+    },
+    analyzeFailure: {
+      noTestId: 'No recent failed test found. Please run a test first or specify a test ID.',
+      success: (rootCause, category, severity, suggestions) =>
+        `🔍 **Failure Analysis**\n\n**Root Cause:** ${rootCause}\n**Category:** ${category}\n**Severity:** ${severity}\n\n**Suggestions:**\n${suggestions}`,
+      error: 'Failed to analyze test failure. Please try again.',
+    },
+    testRecommendations: {
+      noProject: 'No project context found. Please run a test first so I can understand your project.',
+      success: (formattedList) =>
+        `📋 **Test Recommendations**\n\nHere\'s what I recommend testing next:\n\n${formattedList}`,
+      error: 'Failed to generate test recommendations. Please try again.',
     },
   },
 };
