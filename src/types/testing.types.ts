@@ -39,6 +39,29 @@ export type ExecutionStatus =
 export type RunTrigger = 'manual' | 'chat' | 'scheduled' | 'webhook';
 
 /**
+ * How the Smart Resolver matched an existing test case
+ */
+export type ResolverMatchType = 'none' | 'partial';
+
+/**
+ * Metadata stored in test_chat_mappings for the Smart Resolver feedback loop
+ */
+export interface TestChatMappingMeta {
+  resolverMatchType?: ResolverMatchType;
+  trigger?: RunTrigger;
+}
+
+/**
+ * Save-as-test-case suggestion attached to completion messages
+ */
+export interface SaveSuggestionMeta {
+  available: true;
+  testId: string;
+  buttonLabel: string;
+  buttonAction: { intent: 'save_test'; sourceTestId: string };
+}
+
+/**
  * Fixture scope levels
  */
 export type FixtureScope = 'global' | 'project' | 'module' | 'flow';

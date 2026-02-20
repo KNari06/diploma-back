@@ -3,6 +3,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
+import { ResolverMatchType } from '@/types/testing.types';
 import { NavigationRequiresClarificationError } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
 import { requestMissingInformation, runAutonomousExploration } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
@@ -979,10 +980,12 @@ export async function handlePlatformTest(
       if (chatSessionId && actualTestId) {
         let mappingSaved = false;
         try {
+          const resolverMatchType: ResolverMatchType = parsedIntent?.resolvedContext ? 'partial' : 'none';
           await TestChatMappingService.saveTestChatMapping({
             testId: actualTestId,
             chatSessionId,
             userId,
+            metadata: { resolverMatchType, trigger: 'chat' },
           });
           mappingSaved = true;
           logger.debug('[PLATFORM_TEST] Test-chat mapping saved', {

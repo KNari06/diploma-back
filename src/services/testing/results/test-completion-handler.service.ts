@@ -2,6 +2,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { executionCompletionEmitter } from '@/services/testing/executions/execution-completion-emitter';
 import { TestResultsFormatterService } from '@/services/testing/results/test-results-formatter.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
+import { SaveSuggestionMeta } from '@/types/testing.types';
 import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
 import { NotificationService } from '@/services/notifications/notification.service';
@@ -88,13 +89,13 @@ export class TestCompletionHandlerService {
       // Send to linked chat sessions (if any)
       if (chatSessions && chatSessions.length > 0) {
         // Format results as chat message
-        const formattedMessage = TestResultsFormatterService.formatTestResults(
+        let formattedMessage = TestResultsFormatterService.formatTestResults(
           test,
           results || []
         );
 
         // ✅ FIX: Include test results in metadata so AI can see them
-        const testResultMetadata = {
+        const testResultMetadata: Record<string, any> = {
           testId: testId,
           testType: 'ui',
           testResult: {
@@ -110,6 +111,26 @@ export class TestCompletionHandlerService {
             })),
           },
         };
+
+        // Check if should suggest saving as test case
+        try {
+          if (await this.shouldSuggestSave(testId, test.status)) {
+            formattedMessage +=
+              '\n\n---\n💾 **Want to save this test as a reusable test case?**\n' +
+              'It can be rerun later without re-analysis.';
+            const saveSuggestion: SaveSuggestionMeta = {
+              available: true,
+              testId,
+              buttonLabel: 'Save as Test Case',
+              buttonAction: { intent: 'save_test', sourceTestId: testId },
+            };
+            testResultMetadata.saveSuggestion = saveSuggestion;
+          }
+        } catch (err) {
+          logger.warn('[TEST_COMPLETION] Save suggestion check failed', {
+            error: err instanceof Error ? err.message : String(err), testId,
+          });
+        }
 
         // Send to all linked chat sessions
         for (const chatSessionId of chatSessions) {
@@ -147,6 +168,26 @@ export class TestCompletionHandlerService {
     } catch (error) {
       logger.error('[TEST_COMPLETION] Unexpected error', { error, testId });
     }
+  }
+
+  /**
+   * Check if we should suggest saving this test as a reusable test case.
+   * Only suggests for successful, chat-triggered tests that haven't been saved yet.
+   */
+  private static async shouldSuggestSave(testId: string, testStatus: string): Promise<boolean> {
+    if (testStatus !== 'completed') return false;
+
+    const mapping = await TestChatMappingService.getMappingWithMetadata(testId);
+    if (!mapping?.metadata?.trigger || mapping.metadata.trigger !== 'chat') return false;
+
+    const { data: existing } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id')
+      .eq('source_test_id', testId)
+      .limit(1)
+      .maybeSingle();
+
+    return !existing;
   }
 
   /**

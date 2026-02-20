@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { TestChatMappingMeta } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -13,6 +14,7 @@ export class TestChatMappingService {
     testId: string;
     chatSessionId: string;
     userId: string;
+    metadata?: TestChatMappingMeta;
   }): Promise<{ success: boolean; error?: string }> {
     try {
       const { testId, chatSessionId, userId } = params;
@@ -25,6 +27,7 @@ export class TestChatMappingService {
           test_id: testId,
           chat_session_id: chatSessionId,
           user_id: userId,
+          metadata: params.metadata || {},
           updated_at: new Date().toISOString(), // Update timestamp on conflict
         }, {
           onConflict: 'test_id,chat_session_id', // Specify conflict columns
@@ -99,6 +102,41 @@ export class TestChatMappingService {
     } catch (error) {
       logger.error('[TEST_CHAT_MAPPING] Unexpected error getting test IDs', { error, chatSessionId });
       return [];
+    }
+  }
+
+  /**
+   * Get mapping with metadata for a test
+   * Used by completion handler to check trigger context
+   */
+  static async getMappingWithMetadata(testId: string): Promise<{
+    chatSessionId: string;
+    userId: string;
+    metadata: TestChatMappingMeta;
+  } | null> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('test_chat_mappings')
+        .select('chat_session_id, user_id, metadata')
+        .eq('test_id', testId)
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        logger.error('[TEST_CHAT_MAPPING] Failed to get mapping with metadata', { error, testId });
+        return null;
+      }
+
+      if (!data) return null;
+
+      return {
+        chatSessionId: data.chat_session_id,
+        userId: data.user_id,
+        metadata: data.metadata || {},
+      };
+    } catch (error) {
+      logger.error('[TEST_CHAT_MAPPING] Unexpected error getting mapping with metadata', { error, testId });
+      return null;
     }
   }
 
