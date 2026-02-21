@@ -466,10 +466,22 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               break;
             }
 
-            logger.info('[PLAYWRIGHT] Replay mode step passed', {
+            const stepDurationMs = Date.now() - stepStartedAt;
+            const meta = stepResult.runtimeMeta;
+            logger.info('[PLAYWRIGHT] Replay step completed', {
               testId: testData.testId,
-              stepIndex: currentStepIndex,
-              stepErrors: {
+              step: `${currentStepIndex}/${totalSteps}`,
+              action,
+              description: intentMeta?.elementDescription,
+              durationMs: stepDurationMs,
+              source: meta?.source,
+              resolutionPath: meta?.resolutionPath,
+              confidence: meta?.confidenceTier,
+              healed: meta?.source === 'self_heal',
+              healConfidence: meta?.healConfidence,
+              usedStrategy: meta?.usedLocatorStrategy,
+              autoWait: meta?.autoWaitApplied ? `${meta.autoWaitMs}ms` : undefined,
+              errors: {
                 console: stepErrors.consoleErrors.length,
                 network: stepErrors.networkErrors.length,
                 ui: stepErrors.uiErrors.length,
@@ -613,14 +625,25 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             const bugScreenshotUrl = await captureBugScreenshot(page, testData, currentStepIndex, 'step-failure');
             finalMeta.bugScreenshotUrl = bugScreenshotUrl;
 
-            logger.error('[PLAYWRIGHT] Replay mode step failed', {
+            const failDurationMs = Date.now() - stepStartedAt;
+            logger.error('[PLAYWRIGHT] Replay step failed', {
               testId: testData.testId,
-              stepIndex: currentStepIndex,
-              command: action,
+              step: `${currentStepIndex}/${totalSteps}`,
+              action,
+              description: intentMeta?.elementDescription,
+              durationMs: failDurationMs,
               error: finalError,
               rootCause: finalMeta.rootCause,
               failedReason: finalMeta.failedReason,
-              networkErrors: stepErrors.networkErrors.length,
+              source: baseMeta.source,
+              resolutionPath: baseMeta.resolutionPath,
+              healed: baseMeta.source === 'self_heal',
+              healConfidence: baseMeta.healConfidence,
+              errors: {
+                console: stepErrors.consoleErrors.length,
+                network: stepErrors.networkErrors.length,
+                ui: stepErrors.uiErrors.length,
+              },
             });
 
             // Emit test:step:completed with failure
