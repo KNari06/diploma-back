@@ -209,7 +209,7 @@ export async function updatePage(
   try {
     logger.info('[NOTION_SERVICE] Updating page', { pageId });
 
-    const response = await fetch(`${NOTION_API_URL}/pages/${pageId}`, {
+    const response = await fetch(`${NOTION_API_URL}/pages/${encodeURIComponent(pageId)}`, {
       method: 'PATCH',
       headers: {
         Authorization: `Bearer ${accessToken}`,

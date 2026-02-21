@@ -828,7 +828,11 @@ async function handleUpdateIssue(
     };
   }
 
-  if (summary === undefined && description === undefined && priority === undefined) {
+  const hasSummary = summary !== undefined && summary !== '';
+  const hasDescription = description !== undefined && description !== '';
+  const hasPriority = priority !== undefined && priority !== '';
+
+  if (!hasSummary && !hasDescription && !hasPriority) {
     return {
       success: false,
       message: 'At least one field to update is required: summary, description, or priority.',
@@ -841,17 +845,17 @@ async function handleUpdateIssue(
       accessToken,
       cloudId,
       issueKey: issue_key,
-      ...(summary !== undefined ? { summary } : {}),
-      ...(description !== undefined ? { description } : {}),
-      ...(priority !== undefined ? { priority } : {}),
+      ...(hasSummary ? { summary } : {}),
+      ...(hasDescription ? { description } : {}),
+      ...(hasPriority ? { priority } : {}),
     });
 
     logger.info('[JIRA_SKILL] Issue updated', { issue_key });
 
     const updatedFields = [
-      summary !== undefined ? 'summary' : null,
-      description !== undefined ? 'description' : null,
-      priority !== undefined ? 'priority' : null,
+      hasSummary ? 'summary' : null,
+      hasDescription ? 'description' : null,
+      hasPriority ? 'priority' : null,
     ].filter(Boolean);
 
     return {

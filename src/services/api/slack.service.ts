@@ -122,9 +122,9 @@ export async function sendSlackMessage(
     throw new Error(`Slack webhook error: ${response.status} ${errorText}`);
   }
 
-  // Slack webhooks return plain "ok" text on success
+  // Slack webhooks return plain "ok" text on success (trim in case of trailing newline)
   const body = await response.text();
-  if (body !== 'ok') {
+  if (body.trim() !== 'ok') {
     throw new Error(`Slack webhook returned unexpected response: ${body}`);
   }
 
@@ -158,7 +158,7 @@ export async function validateWebhookUrl(webhookUrl: string): Promise<void> {
   }
 
   const body = await response.text();
-  if (body !== 'ok') {
+  if (body.trim() !== 'ok') {
     throw new Error(`Slack webhook verification failed: ${body}`);
   }
 }
