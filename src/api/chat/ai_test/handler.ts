@@ -1,7 +1,6 @@
 import { redisConnection } from '@/config/infrastructure/queues';
 import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
-import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 import { ResolverMatchType } from '@/types/testing.types';
 import { NavigationRequiresClarificationError } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
@@ -351,33 +350,24 @@ export async function handlePlatformTest(
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 0: EARLY CREDIT CHECK (before any processing)
     // ═══════════════════════════════════════════════════════════════════════
-    // Check credits immediately to prevent unnecessary processing
+    // Soft credit check — verify user has at least 1 credit to start
+    // Actual credits are deducted per-step during execution
     const effectiveMode = mode || 'lite';
-    const liteRequiredCredits = 15;
-    const proRequiredCredits = TokenCalculatorService.getTestCreditCost('intelligent'); // 20
-    const requiredCreditsForMode = effectiveMode === 'lite' ? liteRequiredCredits : proRequiredCredits;
-
     const baseCreditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
-    const hasEnoughCreditsForMode = baseCreditCheck.available >= requiredCreditsForMode;
-    const shortageForMode = hasEnoughCreditsForMode ? 0 : requiredCreditsForMode - baseCreditCheck.available;
 
-    if (!hasEnoughCreditsForMode) {
-      logger.warn('[PLATFORM_TEST] Insufficient credits (early check)', {
+    if (baseCreditCheck.available < 1) {
+      logger.warn('[PLATFORM_TEST] Insufficient credits (soft check)', {
         userId,
-        mode: effectiveMode,
         available: baseCreditCheck.available,
-        required: requiredCreditsForMode,
-        shortage: shortageForMode,
       });
 
-      // Return error directly without saving to chat history
       res.status(402).json({
         success: false,
         error: 'Insufficient credits',
-        message: `❌ Insufficient credits. You need ${requiredCreditsForMode} credits, but you only have ${baseCreditCheck.available}. Please purchase more credits to continue testing.`,
-        creditsRequired: requiredCreditsForMode,
+        message: `❌ Insufficient credits. You need at least 1 credit to start a test, but you have ${baseCreditCheck.available}. Credits are deducted per step during execution.`,
+        creditsRequired: 1,
         creditsAvailable: baseCreditCheck.available,
-        shortage: shortageForMode,
+        shortage: 1 - baseCreditCheck.available,
         timestamp: new Date().toISOString(),
         sessionId: chatSessionId,
       });
@@ -927,48 +917,9 @@ export async function handlePlatformTest(
           });
         }
       }
-      if (!reusedExistingTest) {
-        emitProcessingStepWithLogging(chatSessionId, 'executing_test', '💳 Deducting credits...', 80);
-      }
-
-      // Check cancellation before credit deduction
-      if (abortSignal) {
-        const checkRequestAbortedWithLogging = functionLogger
-          ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
-          : checkRequestAborted;
-        checkRequestAbortedWithLogging(abortSignal);
-      }
-
-      if (!reusedExistingTest) {
-        const testTypeForDeduction = 'intelligent';
-        const creditsRequired = 15; // Lite mode cost
-
-        try {
-          await CreditCostTrackerService.deductCreditsForTest({
-            userId,
-            testType: testTypeForDeduction,
-            credits: creditsRequired,
-            costUSD: 0.08, // Intelligent test cost
-            testId: actualTestId!,
-            description: `Lite UI test: ${extractedUrl}`,
-          });
-        } catch (creditError) {
-          // If credit deduction fails, cancel the test
-          logger.error('[PLATFORM_TEST] Lite mode: credit deduction failed, cancelling test', {
-            error: creditError instanceof Error ? creditError.message : String(creditError),
-            testId: actualTestId,
-          });
-
-          try {
-            await ManualTestService.cancelTest(actualTestId!, userId);
-          } catch {
-            // Ignore cancel errors
-          }
-
-          throw new Error('Failed to deduct credits - test cancelled');
-        }
-      } else {
-        logger.info('[PLATFORM_TEST] Reused existing active test, skipping credit deduction', {
+      // Credits are now deducted per-step during execution — no upfront deduction needed
+      if (reusedExistingTest) {
+        logger.info('[PLATFORM_TEST] Reused existing active test', {
           testId: actualTestId,
           url: extractedUrl,
           userId,

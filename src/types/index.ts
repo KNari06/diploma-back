@@ -914,6 +914,9 @@ export type PlaywrightActionType =
   | 'selectOption'      // Select option from dropdown/select element
   | 'check'             // Check checkbox
   | 'uncheck'           // Uncheck checkbox
+  | 'toggle'            // Toggle checkbox/switch (state-aware click)
+  | 'open'              // Semantic click to open (with enabled guard)
+  | 'close'             // Semantic click to close (with enabled guard)
   | 'hover'             // Hover over element
   | 'press'             // Press keyboard key
   | 'focus'             // Focus element
@@ -944,6 +947,9 @@ export type PlaywrightActionType =
   | 'assertValue'       // Assert input has value
   | 'assertUrl'         // Assert current URL matches
   | 'assertCount'       // Assert number of elements
+  | 'assert'            // Generic assert dispatcher (visible/text/value/count/url/etc.)
+  // AI-powered
+  | 'aiCheck'           // AI-based assertion using LLM
   // Data extraction & evaluation
   | 'extract'           // Extract data from element
   | 'evaluate'          // Execute JS in browser context
@@ -988,7 +994,7 @@ export interface PlaywrightCommand {
   assertion?: {             // For assert actions
     type: 'visible' | 'hidden' | 'text' | 'value' | 'count' | 'url' | 'enabled' | 'disabled';
     expected: string | number | boolean;
-    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'contains' | 'startsWith' | 'endsWith' | 'matches' | 'regex';
+    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'contains' | 'startsWith' | 'endsWith' | 'matches' | 'regex' | 'glob';
   };
   extract?: {               // For extract action
     name: string;           // Variable name to store extracted value

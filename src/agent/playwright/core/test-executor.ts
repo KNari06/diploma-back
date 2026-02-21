@@ -1,3 +1,4 @@
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestJobData } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -327,6 +328,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           const action = (command as any).action ?? (command as any).type ?? 'action';
           const intentMeta = (command as any).intentMeta as undefined | { elementDescription?: string; stepId?: string };
 
+          // Capture URL before step — used by lookahead to detect SPA navigation
+          const urlBeforeStep = page.url();
+
           // Check cancellation
           await checkTestCancelled(testData.testId);
 
@@ -350,6 +354,24 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             commandType: action,
             description: intentMeta?.elementDescription,
           });
+
+          // Deduct 1 credit for step execution
+          if (testData.userId) {
+            const stepCreditResult = await CreditCostTrackerService.deductStepCredit(
+              testData.userId,
+              testData.testId,
+              `Step ${currentStepIndex}/${totalSteps}: ${action}`
+            );
+            if (!stepCreditResult.success) {
+              allSuccess = false;
+              finalError = 'Insufficient credits to continue test execution';
+              logger.warn('[PLAYWRIGHT] Stopping replay: insufficient credits', {
+                testId: testData.testId,
+                stepIndex: currentStepIndex,
+              });
+              break;
+            }
+          }
 
           // Capture step start time for error correlation
           const stepStartedAt = Date.now();
@@ -487,7 +509,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             if (nextCommand) {
               const prevActionType = (command as any).intentMeta?.actionType;
               const nextIntentMeta = (nextCommand as any).intentMeta;
-              
+
               if (prevActionType && nextIntentMeta && !shouldSkipLookaheadAfter(prevActionType)) {
                 try {
                   const nextStepForLookahead: IntentStep = {
@@ -505,6 +527,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                     maxWaitMs: 10000,
                     settleMs: 3000,
                     autoWaitThresholdMs: 2000,
+                    // Pass context for SPA navigation detection + dynamic DOM stability threshold
+                    prevActionType,
+                    prevUrl: urlBeforeStep,
                   });
 
                   if (lookahead.autoWaitApplied) {

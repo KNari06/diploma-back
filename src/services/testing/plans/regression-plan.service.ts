@@ -4,6 +4,7 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
+import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import type {
     AddPlanItemParams,
     CreateRegressionPlanParams,
@@ -924,7 +925,8 @@ export class RegressionPlanService {
             scheduleId: existingScheduleId,
           });
         }
-        return existingScheduleId || null;
+        // Return null — schedule is inactive, plan should not reference it as "active"
+        return null;
       }
 
       const cronExpression = scheduleConfig.customCron || this.buildCronExpression(scheduleConfig);
@@ -995,31 +997,11 @@ export class RegressionPlanService {
   }
 
   /**
-   * Simple next-run calculation for schedule sync
+   * Delegate to ScheduleService.calculateNextRun — single source of truth
+   * for cron → next-run-at conversion (handles day-of-week + timezone).
    */
-  private static calculateNextRunFromSchedule(cronExpression: string, _timezone: string): string {
-    void _timezone;
-
-    const now = new Date();
-    const parts = cronExpression.split(' ');
-    if (parts.length !== 5) {
-      return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
-    }
-
-    const [minuteStr, hourStr] = parts;
-    const minute = parseInt(minuteStr, 10);
-    const hour = parseInt(hourStr, 10);
-
-    if (!isNaN(minute) && !isNaN(hour)) {
-      const nextRun = new Date(now);
-      nextRun.setHours(hour, minute, 0, 0);
-      if (nextRun <= now) {
-        nextRun.setDate(nextRun.getDate() + 1);
-      }
-      return nextRun.toISOString();
-    }
-
-    return new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+  private static calculateNextRunFromSchedule(cronExpression: string, timezone: string): string {
+    return ScheduleService.calculateNextRun(cronExpression, timezone);
   }
 
   /**

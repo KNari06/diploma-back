@@ -1,7 +1,6 @@
 import { redisConnection } from '@/config/infrastructure/queues';
 import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
-import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 import { confirmTestPlan } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
@@ -168,17 +167,25 @@ export async function executeUiTestFlow(
       }
     }
 
-    // ✅ CREDITS ALREADY CHECKED in test-execution.ts via CreditCostTrackerService.checkCreditsForTest()
-    // No need to duplicate check here - it was already validated before calling executeUiTestFlow
-    // Credits will be deducted AFTER successful queue job creation to prevent charging without running
-    const uiTestType = 'intelligent';
-    // testId variable removed - was not used
-    const creditsRequired = TokenCalculatorService.getTestCreditCost(uiTestType);
+    // Soft credit check — verify user has at least 1 credit to start
+    // Actual credits are deducted per-step during execution
+    const softCreditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
+    if (softCreditCheck.available < 1) {
+      logger.warn('[UI_TEST] Insufficient credits (soft check)', { userId, available: softCreditCheck.available });
+      if (!res.headersSent) {
+        res.status(402).json({
+          success: false,
+          error: 'Insufficient credits',
+          message: 'You need at least 1 credit to start a test.',
+        });
+      }
+      return;
+    }
 
-    logger.info('[UI_TEST] Credit check already passed in test-execution.ts', {
+    logger.info('[UI_TEST] Soft credit check passed', {
       userId,
-      required: creditsRequired,
-      note: 'Credits were validated before entering this flow',
+      available: softCreditCheck.available,
+      note: 'Credits will be deducted per-step during execution',
     });
 
     emitProcessingStep(chatSessionId, 'executing_test', '🔍 Finding project context...', 20);
@@ -380,43 +387,9 @@ export async function executeUiTestFlow(
       }
     }
 
-    if (!reusedExistingTest) {
-      // This ensures we only charge if test actually started
-      emitProcessingStep(chatSessionId, 'executing_test', '💳 Deducting credits...', 90);
-      try {
-        await CreditCostTrackerService.deductCreditsForTest({
-          userId,
-          testType: uiTestType,
-          credits: creditsRequired,
-          costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001,
-          testId: actualTestId,
-          description: `${uiTestType} UI test: ${plan.url}`,
-        });
-        logger.info('[UI_TEST] Credits deducted successfully', {
-          testId: actualTestId,
-          credits: creditsRequired,
-        });
-      } catch (creditError) {
-        // If credit deduction fails AFTER test creation, we need to cancel the test
-        logger.error('[UI_TEST] Failed to deduct credits after test creation - cancelling test', {
-          error: creditError instanceof Error ? creditError.message : String(creditError),
-          testId: actualTestId,
-        });
-
-        // Cancel the test to prevent running without payment
-        try {
-          await ManualTestService.cancelTest(actualTestId, userId);
-        } catch (cancelError) {
-          logger.error('[UI_TEST] Failed to cancel test after credit deduction failure', {
-            error: cancelError instanceof Error ? cancelError.message : String(cancelError),
-            testId: actualTestId,
-          });
-        }
-
-        throw new Error('Failed to deduct credits - test cancelled');
-      }
-    } else {
-      logger.info('[UI_TEST] Reused existing active test, skipping credit deduction', {
+    // Credits are now deducted per-step during execution — no upfront deduction needed
+    if (reusedExistingTest) {
+      logger.info('[UI_TEST] Reused existing active test', {
         testId: actualTestId,
         url: plan.url,
         userId,

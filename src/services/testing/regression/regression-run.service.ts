@@ -1,5 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { ApiConfigService } from '@/services/api/api-config.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type {
   Priority,
@@ -79,6 +81,13 @@ export class RegressionRunService {
       // 1. Get intent test case
       const intentCase = await this.getSavedTestCase(intentTestCaseId, userId);
 
+      // 1b. Credit check + deduction for single test case
+      await this.checkCreditBalance(
+        userId,
+        [{ testCaseId: intentTestCaseId, testType: 'ui', dependsOn: [] }],
+        'regression_single'
+      );
+
       // 2. Create regression run record (now uses intent_test_case_id)
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
@@ -139,6 +148,76 @@ export class RegressionRunService {
       });
       throw error;
     }
+  }
+
+  /**
+   * Soft balance check before starting a regression run.
+   * Verifies user can afford estimated steps but does NOT deduct credits.
+   * Actual credits are deducted per-step during execution.
+   *
+   * Pricing: 1 credit per step for UI tests, API tests × API credit cost.
+   * Fetches actual step counts from intent_test_cases so the estimate is
+   * proportional to test complexity (20-step test = 20 estimated credits).
+   *
+   * Throws ValidationError with "Insufficient credits" so the scheduler
+   * can detect and notify the user.
+   */
+  private static async checkCreditBalance(
+    userId: string,
+    testCases: ExecutableTestCase[],
+    source: string
+  ): Promise<void> {
+    const uiCases = testCases.filter((tc) => tc.testType === 'ui');
+    const apiCount = testCases.filter((tc) => tc.testType === 'api').length;
+    const apiCreditCost = TokenCalculatorService.getTestCreditCost('api');
+
+    // Fetch step counts for UI test cases (1 credit per step)
+    let uiStepCredits = 0;
+    if (uiCases.length > 0) {
+      const uiIds = uiCases.map((tc) => tc.testCaseId);
+      const { data: rows } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, commands, graph_ref, replay_strategy')
+        .in('id', uiIds);
+
+      for (const row of rows || []) {
+        let stepCount = 0;
+        if (row.replay_strategy === 'commands' && Array.isArray(row.commands)) {
+          stepCount = row.commands.length;
+        } else if (row.replay_strategy === 'graph_extract' && row.graph_ref?.steps) {
+          stepCount = Array.isArray(row.graph_ref.steps) ? row.graph_ref.steps.length : 0;
+        }
+        // Minimum 1 credit per test case even if steps can't be counted
+        uiStepCredits += Math.max(stepCount, 1);
+      }
+
+      // If some test case IDs weren't found in DB, charge 1 credit each as minimum
+      const foundIds = new Set((rows || []).map((r: any) => r.id));
+      const missingCount = uiIds.filter((id) => !foundIds.has(id)).length;
+      uiStepCredits += missingCount;
+    }
+
+    const totalRequired = uiStepCredits + apiCount * apiCreditCost;
+
+    if (totalRequired <= 0) return;
+
+    // Soft balance check — verify user can afford estimated steps, but don't deduct
+    const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
+    if (creditCheck.available < totalRequired) {
+      throw new ValidationError(
+        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost}), Available: ${creditCheck.available}`
+      );
+    }
+
+    logger.info('[REGRESSION_RUN] Credit balance check passed (no deduction)', {
+      userId,
+      source,
+      uiTestCount: uiCases.length,
+      uiStepCredits,
+      apiCount,
+      totalEstimated: totalRequired,
+      available: creditCheck.available,
+    });
   }
 
   /**
@@ -510,6 +589,9 @@ export class RegressionRunService {
         dependsOn: depMap.get(tc.testCaseId) || [],
       }));
 
+      // 1c. Credit check — verify user has enough credits for all test cases
+      await this.checkCreditBalance(userId, executableCases, 'regression_plan');
+
       // 2. Create regression run record with plan_id
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
@@ -633,6 +715,9 @@ export class RegressionRunService {
         throw new ValidationError('Module has no test cases');
       }
 
+      // 4. Credit check + deduction
+      await this.checkCreditBalance(userId, testCases, 'regression_module');
+
       // 5. Create regression run record
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
@@ -717,6 +802,9 @@ export class RegressionRunService {
       if (testCases.length === 0) {
         throw new ValidationError('Flow has no test cases');
       }
+
+      // 2b. Credit check + deduction
+      await this.checkCreditBalance(userId, testCases, 'regression_flow');
 
       // 3. Create regression run record
       const { data: run, error: runError } = await supabaseAdmin
@@ -813,6 +901,9 @@ export class RegressionRunService {
         throw new ValidationError(`No test cases found with tag: ${tag}`);
       }
 
+      // Credit check + deduction
+      await this.checkCreditBalance(userId, testCases, 'regression_tag');
+
       // Create regression run
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
@@ -905,6 +996,9 @@ export class RegressionRunService {
       if (testCases.length === 0) {
         throw new ValidationError(`No test cases found with priority: ${priority}`);
       }
+
+      // Credit check + deduction
+      await this.checkCreditBalance(userId, testCases, 'regression_priority');
 
       // Create regression run
       const { data: run, error: runError } = await supabaseAdmin

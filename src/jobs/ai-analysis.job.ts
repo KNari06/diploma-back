@@ -1,6 +1,7 @@
 import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { aiService } from '@/services/ai/analysis/test-results.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { JiraReportService } from '@/services/integrations/jira-report.service';
 import { handleAIError } from '@/utils/core/error-handler';
@@ -14,6 +15,9 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { Job } from 'bullmq';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
+
+/** Credits charged for generating a bug report when bugs are found */
+const BUG_REPORT_CREDITS = 5;
 
 // Types for better type safety
 interface BugSeverity {
@@ -89,6 +93,34 @@ export class AIAnalysisJobHandler {
             timestamp: new Date().toISOString(),
           };
           webSocketService.emitAIBugFound(testId, bugFoundPayload);
+        }
+
+        // Charge for bug report generation (5 credits)
+        const bugReportUserId = testResult?.tests?.user_id;
+        if (bugReportUserId) {
+          try {
+            await CreditCostTrackerService.deductCreditsForTest({
+              userId: bugReportUserId,
+              testType: 'intelligent',
+              credits: BUG_REPORT_CREDITS,
+              costUSD: 0,
+              testId: testResultId,
+              description: `Bug report: ${processedBugs.length} bug(s) found in test ${testId}`,
+            });
+            logger.info('[AI-ANALYSIS] Bug report credits deducted', {
+              userId: bugReportUserId,
+              credits: BUG_REPORT_CREDITS,
+              bugsCount: processedBugs.length,
+              testResultId,
+            });
+          } catch (creditError) {
+            // Non-fatal — report is already generated, don't fail the analysis
+            logger.warn('[AI-ANALYSIS] Failed to deduct bug report credits', {
+              userId: bugReportUserId,
+              error: creditError instanceof Error ? creditError.message : String(creditError),
+              testResultId,
+            });
+          }
         }
       }
 
