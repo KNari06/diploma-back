@@ -1242,6 +1242,21 @@ export class RegressionRunService {
               uiWaiters.push({ testCaseId: testCase.testCaseId, execId, promise: waitPromise });
             }
           } else {
+            // Deduct API test credits upfront (flat cost per API test)
+            const apiCreditCost = TokenCalculatorService.getTestCreditCost('api');
+            const apiDeduction = await CreditCostTrackerService.deductCreditsForTest({
+              userId,
+              testType: 'api',
+              credits: apiCreditCost,
+              costUSD: 0,
+              testId: `api_${testCase.testCaseId}_${Date.now()}`,
+              description: `API test: ${testCase.testCaseId}`,
+            });
+
+            if (!apiDeduction.success) {
+              throw new Error('Insufficient credits for API test');
+            }
+
             // Run API test via existing configuration-based executor
             const apiExecution = await ApiConfigService.executeWithConfig(userId, {
               test_config_id: testCase.testCaseId,
