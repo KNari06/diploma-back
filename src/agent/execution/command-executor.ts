@@ -796,6 +796,255 @@ export class CommandExecutor {
           return { success: true, extractedValue };
         }
 
+        case 'fill': {
+          // Alias for type — fill without keyboard events (faster)
+          if (value === undefined) throw new Error('Value is required for fill action');
+
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentFillLocator } = await this.getLocatorForIntentCommand(
+              intentCommand,
+              'type',
+              timeout || 30000
+            );
+            await intentFillLocator.fill(String(value), { timeout: timeout || 30000 });
+            break;
+          }
+
+          if (!selector) throw new Error('Selector is required for fill action');
+
+          const fillSmartResult = await getSmartLocator(this.page, selector, 'type', description);
+          try {
+            await fillSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await fillSmartResult.locator.fill(String(value), { timeout: timeout || 30000 });
+          } catch (fillError) {
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector!);
+                await locator.fill(String(value), { timeout: timeout || 30000 });
+              },
+              { selector, intent: description || `fill with ${value}`, action: 'fill', timeout, value }
+            );
+          }
+          break;
+        }
+
+        // Alias: selectOption → select
+        case 'selectOption': {
+          if (!selector) throw new Error('Selector is required for selectOption action');
+          if (value === undefined) throw new Error('Value is required for selectOption action');
+
+          const soSmartResult = await getSmartLocator(this.page, selector, 'select', description);
+          const soValue = this.parseSelectValue(value);
+          try {
+            await soSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await this.waitForEnabled(soSmartResult.locator, 5000);
+            const isNativeSO = await this.isNativeSelectLocator(soSmartResult.locator);
+            if (isNativeSO) {
+              await this.waitForSelectOptions(soSmartResult.locator, 5000, 3);
+              await soSmartResult.locator.selectOption(soValue, { timeout: timeout || 30000 });
+            } else {
+              await this.selectFromCustomDropdown(soSmartResult.locator, String(value), timeout || 30000);
+            }
+          } catch (soError) {
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector!);
+                await this.waitForEnabled(locator, 5000);
+                const isNative = await this.isNativeSelectLocator(locator);
+                if (isNative) {
+                  await this.waitForSelectOptions(locator, 5000, 3);
+                  await locator.selectOption(soValue, { timeout: timeout || 30000 });
+                } else {
+                  await this.selectFromCustomDropdown(locator, String(value), timeout || 30000);
+                }
+              },
+              { selector, intent: description || `select ${value}`, action: 'select', timeout, value }
+            );
+          }
+          break;
+        }
+
+        // toggle: click only if current state doesn't match desired state
+        case 'toggle': {
+          if (!selector) throw new Error('Selector is required for toggle action');
+
+          const toggleLocator = this.getLocatorInternal(selector);
+          await toggleLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+          await this.waitForEnabled(toggleLocator, 5000);
+
+          // Check current checked state — only click if needed
+          const isChecked = await toggleLocator.isChecked().catch(() => null);
+          if (isChecked === null) {
+            // Not a checkbox — plain click
+            await this.forceScrollIntoView(toggleLocator);
+            await toggleLocator.click({ timeout: timeout || 30000 });
+          } else {
+            // Checkbox/radio — click only if not already in desired state
+            // value='true' means we want checked, value='false' means unchecked
+            const wantChecked = value !== undefined ? String(value).toLowerCase() !== 'false' : !isChecked;
+            if (isChecked !== wantChecked) {
+              await this.forceScrollIntoView(toggleLocator);
+              await toggleLocator.click({ timeout: timeout || 30000 });
+            } else {
+              logger.debug('[COMMAND_EXECUTOR] Toggle skipped: element already in desired state', {
+                selector, isChecked, wantChecked,
+              });
+            }
+          }
+          break;
+        }
+
+        // open / close: semantic click aliases
+        case 'open':
+        case 'close': {
+          if (!selector) throw new Error(`Selector is required for ${action} action`);
+          const ocLocator = this.getLocatorInternal(selector);
+          await ocLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+          await this.forceScrollIntoView(ocLocator);
+          await this.waitForEnabled(ocLocator, 5000);
+          await ocLocator.click({ timeout: timeout || 30000 });
+          break;
+        }
+
+        // assert: maps to assertVisible (check that element is present/visible)
+        case 'assert': {
+          if (!selector) throw new Error('Selector is required for assert action');
+          const assertLocator = this.getLocatorInternal(selector);
+
+          // If assertion.type is specified, delegate to specific handlers
+          if (command.assertion?.type) {
+            switch (command.assertion.type) {
+              case 'visible': {
+                const vis = await assertLocator.isVisible({ timeout: timeout || 5000 });
+                if (!vis) throw new Error(`Assertion failed: element not visible: ${selector}`);
+                break;
+              }
+              case 'hidden': {
+                const hid = await assertLocator.isHidden({ timeout: timeout || 5000 });
+                if (!hid) throw new Error(`Assertion failed: element not hidden: ${selector}`);
+                break;
+              }
+              case 'text': {
+                await assertLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+                const txt = await assertLocator.textContent();
+                const exp = String(command.assertion.expected || '');
+                const op = command.assertion.operator || 'contains';
+                if (!this.compareValues(txt || '', exp, op)) {
+                  throw new Error(`Text assertion failed: expected "${exp}", got "${txt}"`);
+                }
+                break;
+              }
+              case 'value': {
+                await assertLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+                const val = await assertLocator.inputValue();
+                const expVal = String(command.assertion.expected || '');
+                const opVal = command.assertion.operator || '=';
+                if (!this.compareValues(val, expVal, opVal)) {
+                  throw new Error(`Value assertion failed: expected "${expVal}", got "${val}"`);
+                }
+                break;
+              }
+              case 'enabled': {
+                const enabled = await assertLocator.isEnabled({ timeout: timeout || 5000 });
+                if (!enabled) throw new Error(`Assertion failed: element not enabled: ${selector}`);
+                break;
+              }
+              case 'disabled': {
+                const disabled = await assertLocator.isDisabled({ timeout: timeout || 5000 });
+                if (!disabled) throw new Error(`Assertion failed: element not disabled: ${selector}`);
+                break;
+              }
+              default: {
+                // Fallback: just check visibility
+                const vis2 = await assertLocator.isVisible({ timeout: timeout || 5000 });
+                if (!vis2) throw new Error(`Assertion failed: element not visible: ${selector}`);
+              }
+            }
+          } else {
+            // No assertion type — default to visible check
+            const vis3 = await assertLocator.isVisible({ timeout: timeout || 5000 });
+            if (!vis3) throw new Error(`Assertion failed: element not visible: ${selector}`);
+          }
+          logger.info('[COMMAND_EXECUTOR] Assertion passed', { action: 'assert', selector });
+          break;
+        }
+
+        case 'assertHidden': {
+          if (!selector) throw new Error('Selector is required for assertHidden action');
+          const assertHiddenLocator = this.getLocatorInternal(selector);
+          const isHidden = await assertHiddenLocator.isHidden({ timeout: timeout || 5000 });
+          if (!isHidden) {
+            throw new Error(`Element is visible but expected to be hidden: ${selector}`);
+          }
+          logger.info('Assertion passed: Element is hidden', { selector });
+          break;
+        }
+
+        case 'assertEnabled': {
+          if (!selector) throw new Error('Selector is required for assertEnabled action');
+          const assertEnabledLocator = this.getLocatorInternal(selector);
+          // Use 'attached' not 'visible' — disabled elements can be in DOM but hidden
+          await assertEnabledLocator.waitFor({ state: 'attached', timeout: timeout || 5000 });
+          const isEnabled = await assertEnabledLocator.isEnabled({ timeout: timeout || 5000 });
+          if (!isEnabled) {
+            throw new Error(`Element is disabled but expected to be enabled: ${selector}`);
+          }
+          logger.info('Assertion passed: Element is enabled', { selector });
+          break;
+        }
+
+        case 'assertDisabled': {
+          if (!selector) throw new Error('Selector is required for assertDisabled action');
+          const assertDisabledLocator = this.getLocatorInternal(selector);
+          // Use 'attached' not 'visible' — disabled elements can be in DOM but hidden
+          await assertDisabledLocator.waitFor({ state: 'attached', timeout: timeout || 5000 });
+          const isDisabled = await assertDisabledLocator.isDisabled({ timeout: timeout || 5000 });
+          if (!isDisabled) {
+            throw new Error(`Element is enabled but expected to be disabled: ${selector}`);
+          }
+          logger.info('Assertion passed: Element is disabled', { selector });
+          break;
+        }
+
+        // waitForTimeout: alias for wait
+        case 'waitForTimeout':
+          await this.page.waitForTimeout(timeout || (value !== undefined ? Number(value) : 1000));
+          break;
+
+        // waitForLoadState: wait for specific load state
+        case 'waitForLoadState': {
+          const loadState = (value as 'load' | 'domcontentloaded' | 'networkidle') || 'networkidle';
+          await this.page.waitForLoadState(loadState, { timeout: timeout || 30000 });
+          break;
+        }
+
+        // script: alias for evaluate
+        case 'script': {
+          if (!value) throw new Error('Script is required for script action');
+          const scriptAlias = String(value);
+          logger.debug('[COMMAND_EXECUTOR] Executing script (alias for evaluate)', {
+            scriptPreview: scriptAlias.substring(0, 100) + (scriptAlias.length > 100 ? '...' : ''),
+          });
+          await this.page.evaluate(scriptAlias);
+          break;
+        }
+
+        // download: read-only, just trigger the download event
+        case 'download': {
+          if (!selector) throw new Error('Selector is required for download action');
+          const downloadLocator = this.getLocatorInternal(selector);
+          await downloadLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+          // Start download — we don't save the file, just trigger and log
+          const [download] = await Promise.all([
+            this.page.waitForEvent('download', { timeout: timeout || 30000 }),
+            downloadLocator.click({ timeout: timeout || 30000 }),
+          ]);
+          logger.info('[COMMAND_EXECUTOR] Download triggered', {
+            suggestedFilename: download.suggestedFilename(),
+          });
+          break;
+        }
+
         case 'evaluate':
           // ✅ FIX 6: Log script (truncated) for security audit
           if (!value) throw new Error('Script is required for evaluate action');
@@ -1359,12 +1608,23 @@ export class CommandExecutor {
         return Number(actual) > Number(expected);
       case '<':
         return Number(actual) < Number(expected);
+      case '>=':
+        return Number(actual) >= Number(expected);
+      case '<=':
+        return Number(actual) <= Number(expected);
       case 'contains':
         return String(actual).includes(String(expected));
       case 'startsWith':
         return String(actual).startsWith(String(expected));
       case 'endsWith':
         return String(actual).endsWith(String(expected));
+      case 'matches':
+      case 'regex':
+        try {
+          return new RegExp(String(expected)).test(String(actual));
+        } catch {
+          return false;
+        }
       default:
         return actual === expected;
     }

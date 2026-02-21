@@ -4,21 +4,68 @@ import { logger } from '@/utils/core/logger';
 import { TestHint } from '../../types/intelligent-testing.types';
 
 /**
- * Convert commands to hints for AI guidance
+ * Convert commands to hints for AI guidance.
+ * Preserves all meaningful fields from PlaywrightCommand including intentMeta,
+ * assertions, navigation flags — so AI has full context per step.
  */
 export function buildHintsFromCommands(commands?: any[]): TestHint[] {
   if (!commands || commands.length === 0) {
     return [];
   }
 
-  return commands.map((cmd, i) => ({
-    id: `cmd_${i}`,
-    description: cmd.description || `${cmd.action} on ${cmd.selector || 'page'}`,
-    action: cmd.action,
-    target: cmd.selector,
-    value: cmd.value !== undefined ? String(cmd.value) : undefined,
-    priority: 'medium' as const,
-  }));
+  return commands.map((cmd, i) => {
+    const intentMeta = cmd.intentMeta ?? {};
+
+    const hint: TestHint = {
+      id: intentMeta.stepId ?? `cmd_${i}`,
+      description:
+        intentMeta.elementDescription ||
+        cmd.description ||
+        `${cmd.action ?? cmd.type} on ${cmd.selector || 'page'}`,
+      action: cmd.action ?? cmd.type,
+      target: cmd.selector,
+      value: cmd.value !== undefined ? String(cmd.value) : undefined,
+      priority: 'medium' as const,
+    };
+
+    // Expected outcome from assertion or explicit expectedResult
+    if (cmd.assertion) {
+      hint.assertion = {
+        type: cmd.assertion.type,
+        expected: cmd.assertion.expected,
+        operator: cmd.assertion.operator,
+      };
+      hint.expectedOutcome = `Assert ${cmd.assertion.type} ${cmd.assertion.operator ?? '='} "${cmd.assertion.expected}"`;
+    }
+
+    // Navigation expectation
+    if (cmd.awaitNavigation) {
+      hint.awaitNavigation = true;
+      hint.expectedOutcome = hint.expectedOutcome ?? 'Page navigates after this action';
+    }
+
+    // Non-blocking step
+    if (cmd.continueOnError) {
+      hint.continueOnError = true;
+      hint.optional = true;
+    }
+
+    // Evidence and compiled plan from recording
+    if (intentMeta.evidence) {
+      hint.evidence = intentMeta.evidence;
+    }
+    if (intentMeta.compiled) {
+      hint.compiled = intentMeta.compiled;
+    }
+    if (intentMeta.stepId) {
+      hint.stepId = intentMeta.stepId;
+    }
+    if (intentMeta.elementDescription) {
+      hint.elementDescription = intentMeta.elementDescription;
+    }
+
+    return hint;
+  });
 }
 
 /**

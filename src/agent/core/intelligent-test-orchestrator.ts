@@ -1109,14 +1109,8 @@ export class IntelligentTestOrchestrator {
       });
     }
 
-    // Convert TestHint[] to simpler format for ContextualActionGenerator
-    const hints = this.config.hints?.map(h => ({
-      description: h.description,
-      action: h.action,
-      target: h.target,
-      value: h.value,
-      priority: h.priority,
-    }));
+    // Pass TestHint[] directly to ContextualActionGenerator (full context preserved)
+    const hints = this.config.hints;
 
     // ✅ FIX: Add timeout and error handling to action generation
     let result: { actions: DynamicAction[]; reasoning: string; confidence: number };

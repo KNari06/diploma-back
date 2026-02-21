@@ -11,7 +11,7 @@
  * - Vision analysis
  */
 
-import { PageType } from '@/agent/types/intelligent-testing.types';
+import { PageType, TestHint } from '@/agent/types/intelligent-testing.types';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PAGE ANALYSIS PROMPTS
@@ -298,19 +298,40 @@ export function buildActionGenerationPrompt(params: {
   history: string; // What has been done so far
   domSummary: string; // DOM analysis summary
   actualHTML?: string; // NEW: Actual HTML from page (limited)
-  hints?: Array<{ description: string; action?: string; target?: string; value?: string; priority?: string }>; // NEW: Test hints from plan
+  hints?: TestHint[];
 }): string {
   // Build hints section if provided
   const hintsSection = params.hints && params.hints.length > 0
     ? `
---- TEST HINTS (User's requested steps) ---
-The user wants to test the following steps. Use these as GUIDANCE but ADAPT to actual page elements:
-${params.hints.map((h, i) => `${i + 1}. ${h.description}${h.action ? ` (suggested action: ${h.action})` : ''}${h.target ? ` (target: ${h.target})` : ''}${h.value ? ` (value: ${h.value})` : ''}${h.priority === 'high' ? ' [HIGH PRIORITY]' : ''}`).join('\n')}
+--- TEST STEPS (Recorded by user — execute IN ORDER) ---
+The user recorded the following steps. Execute them strictly in order, one per iteration.
+Adapt selectors to actual page elements but DO NOT skip or reorder steps.
 
-IMPORTANT: These hints describe WHAT the user wants to test, not exact commands.
-- Find the ACTUAL elements on the page that match these hints
-- Use REAL selectors from "Available Elements" section
-- If a hint cannot be matched to any element, skip it and continue with others
+${params.hints.map((h, i) => {
+  const parts: string[] = [`${i + 1}. [${(h.action ?? 'action').toUpperCase()}] ${h.description}`];
+  if (h.target) parts.push(`   → Target: ${h.target}`);
+  if (h.value) parts.push(`   → Value: "${h.value}"`);
+  if (h.elementDescription && h.elementDescription !== h.description) {
+    parts.push(`   → Element: ${h.elementDescription}`);
+  }
+  if (h.expectedOutcome) parts.push(`   → Expected: ${h.expectedOutcome}`);
+  if (h.assertion) {
+    parts.push(`   → Assert: ${h.assertion.type} ${h.assertion.operator ?? '='} "${h.assertion.expected}"`);
+  }
+  if (h.awaitNavigation) parts.push(`   → ⚡ Expects page navigation after this action`);
+  if (h.optional || h.continueOnError) parts.push(`   → (non-blocking: continue even if fails)`);
+  if (h.priority === 'high') parts.push(`   → [HIGH PRIORITY]`);
+  return parts.join('\n');
+}).join('\n\n')}
+
+RULES FOR EXECUTING RECORDED STEPS:
+- Execute steps IN ORDER — do not skip, reorder, or combine steps
+- Use the TARGET selector as guidance; if not found, use self-healing to find the real element
+- If EXPECTED OUTCOME is specified, validate it after execution — report failure if not met
+- If ASSERTION is specified, it MUST pass; treat failure as a test bug
+- If step has awaitNavigation=true, wait for page to fully load before continuing
+- If step is non-blocking (optional/continueOnError), continue to next step even on failure
+- Only generate actions for the NEXT unexecuted step in sequence
 `
     : '';
 
