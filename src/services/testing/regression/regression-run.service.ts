@@ -310,7 +310,7 @@ export class RegressionRunService {
       projectId: intentCase.project_id,
       userId,
       browsers: browserOverride ? [browserOverride] : (sourceTest?.browsers || ['chrome']),
-      intelligentMode: true, // Use intelligent mode for regression cases
+      intelligentMode: false, // Background Replay: deterministic step-by-step execution with self-healing
       testGoal: intentCase.description || intentCase.name,
       commands, // Pre-generated commands
       options: sourceTest?.options || {},
