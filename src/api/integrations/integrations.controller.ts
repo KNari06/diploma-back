@@ -18,6 +18,87 @@ import { env } from '@/config/environment/env';
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+const ALL_PROVIDERS: IntegrationProvider[] = [
+  'jira',
+  'github',
+  'gitlab',
+  'notion',
+  'trello',
+  'slack',
+  'telegram',
+];
+
+/**
+ * Get connection status for all providers
+ * GET /api/v1/integrations/status?workspace_id=xxx
+ */
+export async function getIntegrationStatus(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = (req as any).user?.id;
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'User ID not found',
+      });
+      return;
+    }
+
+    const workspaceId = req.query.workspace_id as string | undefined;
+
+    logger.info('[INTEGRATIONS] Getting integration status', { userId, workspaceId });
+
+    const connected = await IntegrationTokenService.listConnectedIntegrations(userId, workspaceId);
+
+    // Index by provider for O(1) lookup
+    const connectedMap = new Map<string, typeof connected[0]>();
+    for (const token of connected) {
+      // Keep the most recently created token per provider
+      if (!connectedMap.has(token.provider)) {
+        connectedMap.set(token.provider, token);
+      }
+    }
+
+    const status = Object.fromEntries(
+      ALL_PROVIDERS.map((provider) => {
+        const token = connectedMap.get(provider);
+        if (!token) {
+          return [provider, { connected: false }];
+        }
+        return [
+          provider,
+          {
+            connected: true,
+            id: token.id,
+            external_id: token.external_id ?? null,
+            external_url: token.external_url ?? null,
+            metadata: token.metadata ?? null,
+            connected_at: token.created_at,
+            updated_at: token.updated_at,
+          },
+        ];
+      })
+    );
+
+    res.json({
+      success: true,
+      status,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[INTEGRATIONS] Get status error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to get integration status',
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
 /**
  * List all connected integrations for user
  */

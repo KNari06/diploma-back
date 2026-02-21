@@ -2,6 +2,7 @@ import express from 'express';
 import { requireAuth as authenticateUser } from '@/middleware/auth.middleware';
 import {
   listIntegrations,
+  getIntegrationStatus,
   startAuthorization,
   handleCallback,
   disconnectIntegration,
@@ -32,6 +33,28 @@ const router = express.Router();
  *         description: Unauthorized
  */
 router.get('/', authenticateUser, listIntegrations);
+
+/**
+ * @swagger
+ * /integrations/status:
+ *   get:
+ *     summary: Get connection status for all integration providers
+ *     tags: [Integrations]
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: workspace_id
+ *         schema:
+ *           type: string
+ *         description: Filter by workspace ID
+ *     responses:
+ *       200:
+ *         description: Per-provider connection status
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/status', authenticateUser, getIntegrationStatus);
 
 /**
  * @swagger
