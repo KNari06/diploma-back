@@ -106,6 +106,9 @@ export interface ServerToClientEvents {
   'chat:processing:step': (data: ChatProcessingStepPayload) => void;
   'api:agent:step': (data: ApiAgentStepPayload) => void;
 
+  // Regression run events
+  'regression:run:progress': (data: RegressionRunProgressPayload) => void;
+
   // System events
   'system:error': (data: SystemErrorPayload) => void;
   'system:maintenance': (data: SystemMaintenancePayload) => void;
@@ -716,6 +719,28 @@ export interface SystemErrorPayload {
 export interface SystemMaintenancePayload {
   message: string;
   estimatedDuration?: number; // seconds
+  timestamp: string;
+}
+
+// Regression Run Events
+export interface RegressionRunProgressPayload {
+  runId: string;
+  userId: string;
+  status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed';
+  progress: number; // 0-100
+  message: string;
+  /** Machine-readable error code for specific failure reasons (e.g. 'INSUFFICIENT_CREDITS') */
+  errorCode?: string;
+  details?: {
+    totalTests: number;
+    completedTests: number;
+    currentLevel?: number;
+    totalLevels?: number;
+    currentTestName?: string;
+    passed?: number;
+    failed?: number;
+    skipped?: number;
+  };
   timestamp: string;
 }
 

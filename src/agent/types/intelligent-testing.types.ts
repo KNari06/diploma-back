@@ -417,9 +417,22 @@ export interface TestHint {
   action?: string; // Suggested action type (click, fill, etc.)
   target?: string; // What to interact with (e.g., "login button", "email field")
   value?: string; // Value to use (for fill actions)
-  expectedOutcome?: string;
+  expectedOutcome?: string; // What should happen after this step
   priority?: 'high' | 'medium' | 'low';
   optional?: boolean; // If true, skip if element not found
+  // Enriched from PlaywrightCommand
+  assertion?: {
+    type: string; // 'visible' | 'text' | 'value' | 'url' | 'enabled' | etc.
+    expected: string | number | boolean;
+    operator?: string; // '=' | 'contains' | 'startsWith' | etc.
+  };
+  awaitNavigation?: boolean; // Step expects page navigation after action
+  continueOnError?: boolean; // Step is non-blocking even if it fails
+  // Enriched from intentMeta
+  stepId?: string; // Original step ID from recording
+  elementDescription?: string; // Human-readable element description from recording
+  evidence?: any; // Screenshot/DOM snapshot from recording moment
+  compiled?: any; // Compiled step plan from step editor
 }
 
 /**

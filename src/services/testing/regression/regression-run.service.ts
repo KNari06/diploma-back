@@ -1,5 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { ApiConfigService } from '@/services/api/api-config.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type {
   Priority,
@@ -14,6 +16,7 @@ import type {
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { topologicalSort } from '@/utils/graph/topological-sort';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { executionCompletionEmitter } from '../executions/execution-completion-emitter';
 import { ExecutionService } from '../executions/execution.service';
 import { RegressionPlanService } from '../plans/regression-plan.service';
@@ -47,6 +50,40 @@ const MAX_LIST_LIMIT = 500;
  */
 export class RegressionRunService {
   /**
+   * Clean up zombie runs that got stuck in 'running' or 'pending' status.
+   * Should be called on server startup to recover from crashes.
+   * Marks stale runs (older than 30 minutes) as 'failed'.
+   */
+  static async cleanupZombieRuns(): Promise<void> {
+    try {
+      const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+      const { data: zombieRuns, error } = await supabaseAdmin
+        .from('regression_runs')
+        .update({
+          status: 'failed',
+          completed_at: new Date().toISOString(),
+        })
+        .in('status', ['running', 'pending'])
+        .lt('started_at', thirtyMinutesAgo)
+        .select('id');
+
+      if (error) {
+        logger.error('[REGRESSION_RUN] Failed to cleanup zombie runs', { error });
+        return;
+      }
+
+      if (zombieRuns && zombieRuns.length > 0) {
+        logger.warn('[REGRESSION_RUN] Cleaned up zombie runs', {
+          count: zombieRuns.length,
+          runIds: zombieRuns.map((r: any) => r.id),
+        });
+      }
+    } catch (error) {
+      logger.error('[REGRESSION_RUN] Error in zombie run cleanup', { error });
+    }
+  }
+
+  /**
    * Run an intent test case (unified table for UI test cases)
    * Method name kept as runSavedTestCase for API compatibility.
    *
@@ -78,6 +115,13 @@ export class RegressionRunService {
 
       // 1. Get intent test case
       const intentCase = await this.getSavedTestCase(intentTestCaseId, userId);
+
+      // 1b. Credit check + deduction for single test case
+      await this.checkCreditBalance(
+        userId,
+        [{ testCaseId: intentTestCaseId, testType: 'ui', dependsOn: [] }],
+        'regression_single'
+      );
 
       // 2. Create regression run record (now uses intent_test_case_id)
       const { data: run, error: runError } = await supabaseAdmin
@@ -142,6 +186,79 @@ export class RegressionRunService {
   }
 
   /**
+   * Soft balance check before starting a regression run.
+   * Verifies user can afford estimated steps but does NOT deduct credits.
+   * Actual credits are deducted per-step during execution.
+   *
+   * Pricing: 1 credit per step for UI tests, API tests × API credit cost.
+   * Fetches actual step counts from intent_test_cases so the estimate is
+   * proportional to test complexity (20-step test = 20 estimated credits).
+   *
+   * Throws ValidationError with "Insufficient credits" so the scheduler
+   * can detect and notify the user.
+   */
+  private static async checkCreditBalance(
+    userId: string,
+    testCases: ExecutableTestCase[],
+    source: string
+  ): Promise<void> {
+    const uiCases = testCases.filter((tc) => tc.testType === 'ui');
+    const apiCount = testCases.filter((tc) => tc.testType === 'api').length;
+    const apiCreditCost = TokenCalculatorService.getTestCreditCost('api');
+
+    // Fetch step counts for UI test cases (1 credit per step)
+    let uiStepCredits = 0;
+    if (uiCases.length > 0) {
+      const uiIds = uiCases.map((tc) => tc.testCaseId);
+      const { data: rows } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, commands, graph_ref, steps_json, replay_strategy')
+        .in('id', uiIds);
+
+      for (const row of rows || []) {
+        let stepCount = 0;
+        if (row.replay_strategy === 'commands' && Array.isArray(row.commands)) {
+          stepCount = row.commands.length;
+        } else if (row.replay_strategy === 'graph_extract' && row.graph_ref?.steps) {
+          stepCount = Array.isArray(row.graph_ref.steps) ? row.graph_ref.steps.length : 0;
+        } else if (Array.isArray(row.steps_json)) {
+          // Step editor test cases: count steps_json (+ 1 for initial goto)
+          stepCount = row.steps_json.length + 1;
+        }
+        // Minimum 1 credit per test case even if steps can't be counted
+        uiStepCredits += Math.max(stepCount, 1);
+      }
+
+      // If some test case IDs weren't found in DB, charge 1 credit each as minimum
+      const foundIds = new Set((rows || []).map((r: any) => r.id));
+      const missingCount = uiIds.filter((id) => !foundIds.has(id)).length;
+      uiStepCredits += missingCount;
+    }
+
+    const totalRequired = uiStepCredits + apiCount * apiCreditCost;
+
+    if (totalRequired <= 0) return;
+
+    // Soft balance check — verify user can afford estimated steps, but don't deduct
+    const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
+    if (creditCheck.available < totalRequired) {
+      throw new ValidationError(
+        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost}), Available: ${creditCheck.available}`
+      );
+    }
+
+    logger.info('[REGRESSION_RUN] Credit balance check passed (no deduction)', {
+      userId,
+      source,
+      uiTestCount: uiCases.length,
+      uiStepCredits,
+      apiCount,
+      totalEstimated: totalRequired,
+      available: creditCheck.available,
+    });
+  }
+
+  /**
    * Get intent test case and verify access
    * Now fetches from intent_test_cases (unified table).
    *
@@ -184,22 +301,58 @@ export class RegressionRunService {
     parameters: Record<string, any>,
     browserOverride?: string
   ): Promise<any> {
+    // Validate URL exists first (with fallback to start_url)
+    const targetUrl = intentCase.url || intentCase.start_url;
+    if (!targetUrl) {
+      throw new ValidationError(
+        `Intent test case "${intentCase.name}" (${intentCase.id}) has no URL. ` +
+        'Please set a URL on the test case before running.'
+      );
+    }
+
     // Get source test for base configuration (optional - only for browsers/options)
-    const { data: sourceTest } = await supabaseAdmin
-      .from('tests')
-      .select('browsers, options')
-      .eq('id', intentCase.source_test_id)
-      .maybeSingle();
+    // Step editor test cases have no source_test_id — query returns null, defaults apply
+    const { data: sourceTest } = intentCase.source_test_id
+      ? await supabaseAdmin
+          .from('tests')
+          .select('browsers, options')
+          .eq('id', intentCase.source_test_id)
+          .maybeSingle()
+      : { data: null };
 
     let commands: any[] = [];
 
-    // Extract commands based on strategy
-    if (intentCase.replay_strategy === 'commands' && intentCase.commands) {
+    // Extract commands based on strategy (3 paths):
+    // 1. Pre-compiled commands (saved from completed test via /regression/save)
+    // 2. Graph extract steps (saved from intelligent session)
+    // 3. steps_json conversion (step editor test cases — converted at runtime)
+    if (intentCase.replay_strategy === 'commands' && Array.isArray(intentCase.commands) && intentCase.commands.length > 0) {
       commands = intentCase.commands;
-    } else if (intentCase.replay_strategy === 'graph_extract' && intentCase.graph_ref?.steps) {
+    } else if (intentCase.replay_strategy === 'graph_extract' && Array.isArray(intentCase.graph_ref?.steps) && intentCase.graph_ref.steps.length > 0) {
       commands = intentCase.graph_ref.steps;
+    } else if (Array.isArray(intentCase.steps_json) && intentCase.steps_json.length > 0) {
+      // Convert intent steps to executable Playwright commands (same path as preview runner)
+      const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
+      commands = IntentStepConverterService.convertToCommands(intentCase.steps_json, targetUrl, intentCase.id);
+      logger.info('[REGRESSION_RUN] Converted steps_json to commands', {
+        intentTestCaseId: intentCase.id,
+        stepsCount: intentCase.steps_json.length,
+        commandsCount: commands.length,
+        stepsWithCompiled: intentCase.steps_json.filter((s: any) => !!s.compiled).length,
+      });
     } else {
-      throw new ValidationError('Intent test case has no replayable data');
+      throw new ValidationError(
+        `Intent test case "${intentCase.name}" (${intentCase.id}) has no replayable data. ` +
+        `replay_strategy=${intentCase.replay_strategy}, commands=${intentCase.commands === null ? 'null' : typeof intentCase.commands}, ` +
+        `steps_json=${intentCase.steps_json === null ? 'null' : (Array.isArray(intentCase.steps_json) ? `array(${intentCase.steps_json.length})` : typeof intentCase.steps_json)}, ` +
+        `status=${intentCase.status}.`
+      );
+    }
+
+    if (commands.length === 0) {
+      throw new ValidationError(
+        `Intent test case "${intentCase.name}" (${intentCase.id}) produced no executable commands.`
+      );
     }
 
     // Resolve shared_steps references BEFORE applying parameters
@@ -217,21 +370,13 @@ export class RegressionRunService {
     // Apply parameters AFTER resolution (so parent parameters apply to all expanded commands)
     commands = this.applyParameters(resolvedCommands, parameters);
 
-    // Validate URL exists (with fallback to start_url)
-    const targetUrl = intentCase.url || intentCase.start_url;
-    if (!targetUrl) {
-      throw new ValidationError(
-        'Intent test case has no URL. Please update the test case with a valid URL.'
-      );
-    }
-
     // Build request
     return {
-      url: targetUrl, // Use url with fallback to start_url
+      url: targetUrl,
       projectId: intentCase.project_id,
       userId,
       browsers: browserOverride ? [browserOverride] : (sourceTest?.browsers || ['chrome']),
-      intelligentMode: true, // Use intelligent mode for regression cases
+      intelligentMode: false, // Background Replay: deterministic step-by-step execution with self-healing
       testGoal: intentCase.description || intentCase.name,
       commands, // Pre-generated commands
       options: sourceTest?.options || {},
@@ -486,7 +631,20 @@ export class RegressionRunService {
 
       const expandedCases = await RegressionPlanService.expandPlan(planId);
       if (expandedCases.length === 0) {
-        throw new ValidationError('Plan has no test cases');
+        const items = await RegressionPlanService.getItems(planId);
+        const flowItems = items.filter((i) => i.itemType === 'flow');
+        const moduleItems = items.filter((i) => i.itemType === 'module');
+        logger.error('[REGRESSION_RUN] Plan expanded to 0 test cases', {
+          planId,
+          totalItems: items.length,
+          flowItems: flowItems.map((i) => i.flowId),
+          moduleItems: moduleItems.map((i) => i.moduleId),
+        });
+        throw new ValidationError(
+          items.length === 0
+            ? 'Plan has no items. Add modules, flows, or test cases to the plan before running.'
+            : `Plan has ${items.length} item(s) but none contain test cases. The referenced flows/modules may be empty.`
+        );
       }
 
       // 1b. Batch-fetch depends_on for UI test cases
@@ -502,15 +660,32 @@ export class RegressionRunService {
         }
       }
 
-      const executableCases: ExecutableTestCase[] = expandedCases.map((tc) => ({
-        testCaseId: tc.testCaseId,
-        testType: tc.testType,
-        moduleId: tc.moduleId,
-        flowId: tc.flowId,
-        dependsOn: depMap.get(tc.testCaseId) || [],
-      }));
+      // Filter depends_on to only include test cases that are part of this run
+      const runTestCaseIds = new Set(expandedCases.map((tc) => tc.testCaseId));
 
-      // 2. Create regression run record with plan_id
+      const executableCases: ExecutableTestCase[] = expandedCases.map((tc) => {
+        const rawDeps = depMap.get(tc.testCaseId) || [];
+        const validDeps = rawDeps.filter((depId) => runTestCaseIds.has(depId));
+        if (validDeps.length !== rawDeps.length) {
+          logger.warn('[REGRESSION_RUN] Filtered out-of-run dependencies', {
+            testCaseId: tc.testCaseId,
+            originalDeps: rawDeps,
+            filteredDeps: validDeps,
+          });
+        }
+        return {
+          testCaseId: tc.testCaseId,
+          testType: tc.testType,
+          moduleId: tc.moduleId,
+          flowId: tc.flowId,
+          dependsOn: validDeps,
+        };
+      });
+
+      // 1c. Credit check — verify user has enough credits for all test cases
+      await this.checkCreditBalance(userId, executableCases, 'regression_plan');
+
+      // 2. Create regression run record with plan_id (initially 'pending' until executions are created)
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
         .insert({
@@ -518,7 +693,7 @@ export class RegressionRunService {
           project_id: plan.projectId,
           user_id: userId,
           trigger,
-          status: 'running',
+          status: 'pending',
         })
         .select('id')
         .single();
@@ -528,15 +703,35 @@ export class RegressionRunService {
       }
 
       // 3. Create execution records for all test cases
-      const executions = await ExecutionService.createBatch(
-        run.id,
-        executableCases.map((tc) => ({
-          testCaseId: tc.testCaseId,
-          testType: tc.testType,
-          moduleId: tc.moduleId,
-          flowId: tc.flowId,
-        }))
-      );
+      let executions;
+      try {
+        executions = await ExecutionService.createBatch(
+          run.id,
+          executableCases.map((tc) => ({
+            testCaseId: tc.testCaseId,
+            testType: tc.testType,
+            moduleId: tc.moduleId,
+            flowId: tc.flowId,
+          }))
+        );
+      } catch (batchError) {
+        // Rollback: mark run as failed since executions couldn't be created
+        logger.error('[REGRESSION_RUN] Failed to create executions, marking run as failed', {
+          runId: run.id,
+          error: batchError,
+        });
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({ status: 'failed', completed_at: new Date().toISOString() })
+          .eq('id', run.id);
+        throw batchError;
+      }
+
+      // Transition from 'pending' to 'running' now that executions exist
+      await supabaseAdmin
+        .from('regression_runs')
+        .update({ status: 'running' })
+        .eq('id', run.id);
 
       // 4. Read runtime config from plan's automation_config
       const browserOverride = plan.automationConfig?.runtime?.browser;
@@ -633,6 +828,9 @@ export class RegressionRunService {
         throw new ValidationError('Module has no test cases');
       }
 
+      // 4. Credit check + deduction
+      await this.checkCreditBalance(userId, testCases, 'regression_module');
+
       // 5. Create regression run record
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
@@ -717,6 +915,9 @@ export class RegressionRunService {
       if (testCases.length === 0) {
         throw new ValidationError('Flow has no test cases');
       }
+
+      // 2b. Credit check + deduction
+      await this.checkCreditBalance(userId, testCases, 'regression_flow');
 
       // 3. Create regression run record
       const { data: run, error: runError } = await supabaseAdmin
@@ -813,6 +1014,9 @@ export class RegressionRunService {
         throw new ValidationError(`No test cases found with tag: ${tag}`);
       }
 
+      // Credit check + deduction
+      await this.checkCreditBalance(userId, testCases, 'regression_tag');
+
       // Create regression run
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
@@ -905,6 +1109,9 @@ export class RegressionRunService {
       if (testCases.length === 0) {
         throw new ValidationError(`No test cases found with priority: ${priority}`);
       }
+
+      // Credit check + deduction
+      await this.checkCreditBalance(userId, testCases, 'regression_priority');
 
       // Create regression run
       const { data: run, error: runError } = await supabaseAdmin
@@ -1084,10 +1291,51 @@ export class RegressionRunService {
     let apiPassed = 0;
     let apiFailed = 0;
     let skippedCount = 0;
+    let completedCount = 0;
+    const totalTests = testCases.length;
+    const totalLevels = levels.length;
 
-    for (let levelIdx = 0; levelIdx < levels.length; levelIdx++) {
+    // Helper to emit regression progress (non-fatal)
+    const emitProgress = (
+      status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed',
+      message: string,
+      extra?: { currentLevel?: number; currentTestName?: string; errorCode?: string }
+    ) => {
+      try {
+        const progress = totalTests > 0 ? Math.round((completedCount / totalTests) * 100) : 0;
+        webSocketService.emitRegressionRunProgress(userId, {
+          runId,
+          userId,
+          status,
+          progress,
+          message,
+          errorCode: extra?.errorCode,
+          details: {
+            totalTests,
+            completedTests: completedCount,
+            currentLevel: extra?.currentLevel,
+            totalLevels,
+            currentTestName: extra?.currentTestName,
+            passed: apiPassed,
+            failed: apiFailed,
+            skipped: skippedCount,
+          },
+          timestamp: new Date().toISOString(),
+        });
+      } catch { /* non-fatal */ }
+    };
+
+    emitProgress('started', `Regression run started: ${totalTests} tests in ${totalLevels} levels`);
+
+    let creditExhausted = false;
+
+    for (let levelIdx = 0; levelIdx < levels.length && !creditExhausted; levelIdx++) {
       const level = levels[levelIdx];
       const uiWaiters: Array<{ testCaseId: string; execId: string; promise: Promise<string> }> = [];
+
+      emitProgress('level_started', `Starting level ${levelIdx + 1}/${totalLevels} (${level.length} tests)`, {
+        currentLevel: levelIdx + 1,
+      });
 
       for (const testCase of level) {
         const execId = execByKey.get(`${testCase.testType}:${testCase.testCaseId}`);
@@ -1117,6 +1365,11 @@ export class RegressionRunService {
           if (execId) {
             await ExecutionService.updateStatus({ id: execId, status: 'running' });
           }
+
+          emitProgress('test_started', `Running ${testCase.testType.toUpperCase()} test (${completedCount + 1}/${totalTests})`, {
+            currentLevel: levelIdx + 1,
+            currentTestName: testCase.testCaseId,
+          });
 
           if (testCase.testType === 'ui') {
             // Run UI test without creating nested regression_runs
@@ -1148,6 +1401,21 @@ export class RegressionRunService {
               uiWaiters.push({ testCaseId: testCase.testCaseId, execId, promise: waitPromise });
             }
           } else {
+            // Deduct API test credits upfront (flat cost per API test)
+            const apiCreditCost = TokenCalculatorService.getTestCreditCost('api');
+            const apiDeduction = await CreditCostTrackerService.deductCreditsForTest({
+              userId,
+              testType: 'api',
+              credits: apiCreditCost,
+              costUSD: 0,
+              testId: `api_${testCase.testCaseId}_${Date.now()}`,
+              description: `API test: ${testCase.testCaseId}`,
+            });
+
+            if (!apiDeduction.success) {
+              throw new Error('Insufficient credits for API test');
+            }
+
             // Run API test via existing configuration-based executor
             const apiExecution = await ApiConfigService.executeWithConfig(userId, {
               test_config_id: testCase.testCaseId,
@@ -1174,12 +1442,23 @@ export class RegressionRunService {
                 errorMessage: passed ? undefined : apiExecution?.error_message || 'API test failed',
               });
             }
+
+            completedCount++;
+            emitProgress('test_completed', `API test ${passed ? 'passed' : 'failed'} (${completedCount}/${totalTests})`, {
+              currentLevel: levelIdx + 1,
+            });
           }
         } catch (error) {
+          const errMsg = error instanceof Error ? error.message : String(error);
+          const isCreditError = errMsg.toLowerCase().includes('insufficient credits');
+
           logger.error('[REGRESSION_RUN] Failed to execute test case', {
             runId,
             testCaseId: testCase.testCaseId,
             testType: testCase.testType,
+            errorMessage: errMsg,
+            errorCode: (error as any)?.code,
+            isCreditError,
             error,
           });
 
@@ -1190,7 +1469,7 @@ export class RegressionRunService {
               await ExecutionService.updateStatus({
                 id: execId,
                 status: 'failed',
-                errorMessage: error instanceof Error ? error.message : String(error),
+                errorMessage: errMsg,
               });
             } catch (statusError) {
               logger.error('[REGRESSION_RUN] Failed to update execution status', {
@@ -1198,6 +1477,16 @@ export class RegressionRunService {
                 statusError: statusError instanceof Error ? statusError.message : String(statusError),
               });
             }
+          }
+
+          // Emit credit-specific progress event so frontend can show top-up prompt
+          if (isCreditError) {
+            creditExhausted = true;
+            emitProgress('failed', 'Regression run stopped: insufficient credits. Please top up to continue.', {
+              currentLevel: levelIdx + 1,
+              errorCode: 'INSUFFICIENT_CREDITS',
+            });
+            break;
           }
         }
       }
@@ -1218,11 +1507,57 @@ export class RegressionRunService {
         );
 
         for (const result of results) {
+          completedCount++;
           if (result.status !== 'passed') {
             failedOrSkippedIds.add(result.testCaseId);
           }
+          emitProgress('test_completed', `UI test ${result.status} (${completedCount}/${totalTests})`, {
+            currentLevel: levelIdx + 1,
+          });
         }
       }
+
+      emitProgress('level_completed', `Level ${levelIdx + 1}/${totalLevels} completed`, {
+        currentLevel: levelIdx + 1,
+      });
+    }
+
+    // If credit exhaustion stopped the run, mark remaining tests as skipped and finalize
+    if (creditExhausted) {
+      // Mark all non-started executions as skipped
+      for (const tc of testCases) {
+        if (!failedOrSkippedIds.has(tc.testCaseId)) {
+          const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
+          if (execId) {
+            await ExecutionService.updateStatus({
+              id: execId,
+              status: 'skipped',
+              errorMessage: 'Skipped: regression run stopped due to insufficient credits',
+            }).catch(() => {});
+          }
+          skippedCount++;
+        }
+      }
+
+      await supabaseAdmin
+        .from('regression_runs')
+        .update({
+          status: 'failed',
+          test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
+          summary: {
+            total: testCases.length,
+            api_passed: apiPassed,
+            api_failed: apiFailed,
+            skipped: skippedCount,
+            creditExhausted: true,
+            started_at: startedAt,
+            completed_at: new Date().toISOString(),
+          },
+          completed_at: new Date().toISOString(),
+        })
+        .eq('id', runId);
+
+      return;
     }
 
     // Link UI test IDs to regression_runs so existing completion pipeline can update the run
@@ -1250,6 +1585,8 @@ export class RegressionRunService {
       }
 
       // Do not finalize run here — it will be recomputed on UI test completion
+      // Emit progress so frontend knows all tests have been dispatched (UI tests still running)
+      emitProgress('started', `All ${uiTestIds.length} UI tests dispatched, waiting for completion...`);
       return;
     }
 
@@ -1269,6 +1606,11 @@ export class RegressionRunService {
         completed_at: new Date().toISOString(),
       })
       .eq('id', runId);
+
+    emitProgress(
+      finalStatus === 'completed' ? 'completed' : 'failed',
+      `Regression run ${finalStatus}: ${apiPassed} passed, ${apiFailed} failed, ${skippedCount} skipped`
+    );
   }
 
   /**
@@ -1423,7 +1765,7 @@ export class RegressionRunService {
 
     const { data } = await supabaseAdmin
       .from('test_results')
-      .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary')
+      .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary, quality_checks')
       .in('test_id', testIds)
       .order('created_at', { ascending: false });
 
@@ -1514,6 +1856,7 @@ export class RegressionRunService {
     // Aggregated artifacts across all executions (actual data for artifactsSummary)
     const aggArtifacts: RunReportArtifactsSummary = {
       screenshots: [],
+      bugScreenshots: [],
       consoleLogs: [],
       networkLogs: [],
     };
@@ -1527,12 +1870,21 @@ export class RegressionRunService {
 
       // Build steps from executed_steps
       const steps: RunReportStep[] = [];
-      let execArtifacts = {
-        videoUrl: undefined as string | undefined,
-        traceUrl: undefined as string | undefined,
-        screenshots: [] as string[],
-        consoleLogs: [] as string[],
-        networkLogs: [] as Array<{ method: string; url: string; status?: number; durationMs?: number }>,
+      let execArtifacts: {
+        videoUrl?: string;
+        traceUrl?: string;
+        screenshots: string[];
+        bugScreenshots: string[];
+        consoleLogs: string[];
+        networkLogs: Array<{ method: string; url: string; status?: number; durationMs?: number }>;
+        qualityChecks?: any;
+      } = {
+        videoUrl: undefined,
+        traceUrl: undefined,
+        screenshots: [],
+        bugScreenshots: [],
+        consoleLogs: [],
+        networkLogs: [],
       };
       let bugsCount = 0;
 
@@ -1583,6 +1935,17 @@ export class RegressionRunService {
             }));
           }
 
+          // Extract quality checks from test_results
+          if (testResult.quality_checks && typeof testResult.quality_checks === 'object') {
+            const qc = testResult.quality_checks;
+            execArtifacts.qualityChecks = {
+              webVitals: qc.webVitals || undefined,
+              accessibility: qc.accessibility || undefined,
+              brokenResources: Array.isArray(qc.brokenResources) ? qc.brokenResources : undefined,
+              slowAPIs: Array.isArray(qc.slowAPIs) ? qc.slowAPIs : undefined,
+            };
+          }
+
           // Aggregate into run-level artifacts
           if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
           if (execArtifacts.traceUrl && !aggArtifacts.traceUrl) aggArtifacts.traceUrl = execArtifacts.traceUrl;
@@ -1591,25 +1954,64 @@ export class RegressionRunService {
           aggArtifacts.networkLogs.push(...execArtifacts.networkLogs);
         }
 
+        // Extract bug screenshots from executed steps (stored in runtimeMeta.bugScreenshotUrl)
+        for (const step of steps) {
+          if (step.error?.screenshot && typeof step.error.screenshot === 'string') {
+            execArtifacts.bugScreenshots.push(step.error.screenshot);
+          }
+        }
+        aggArtifacts.bugScreenshots.push(...execArtifacts.bugScreenshots);
+
+        // Aggregate quality checks at run level
+        if (execArtifacts.qualityChecks) {
+          if (!aggArtifacts.qualityChecks) {
+            aggArtifacts.qualityChecks = { brokenResources: [], slowAPIs: [] };
+          }
+          const agg = aggArtifacts.qualityChecks;
+          const ec = execArtifacts.qualityChecks;
+
+          // Web vitals: keep the latest non-empty one
+          if (ec.webVitals) agg.webVitals = ec.webVitals;
+
+          // Accessibility: merge warnings arrays, sum totals
+          if (ec.accessibility) {
+            if (!agg.accessibility) {
+              agg.accessibility = { warnings: [], totalWarnings: 0 };
+            }
+            agg.accessibility.warnings.push(...(ec.accessibility.warnings || []));
+            agg.accessibility.totalWarnings += ec.accessibility.totalWarnings || 0;
+          }
+
+          // Broken resources / slow APIs: concatenate
+          if (ec.brokenResources) {
+            agg.brokenResources = [...(agg.brokenResources || []), ...ec.brokenResources];
+          }
+          if (ec.slowAPIs) {
+            agg.slowAPIs = [...(agg.slowAPIs || []), ...ec.slowAPIs];
+          }
+        }
+
         // Extract bugs: prefer test_reports > ai_summary
         const report = reportsMap.get(testId);
         const testResultData = testResultsMap.get(testId);
-        const rawBugs: any[] =
+        const rawBugSource =
           report?.analysis?.bugs ||
           testResultData?.ai_summary?.bugs ||
           [];
+        const rawBugs: any[] = Array.isArray(rawBugSource) ? rawBugSource : [];
 
         for (let i = 0; i < rawBugs.length; i++) {
           const bug = rawBugs[i];
+          if (!bug || typeof bug !== 'object') continue;
           allBugs.push({
             id: bug.id || `${exec.id}-bug-${i}`,
-            title: bug.title || '',
+            title: bug.title || bug.message || bug.description || '',
             severity: validSeverities.has(bug.severity) ? bug.severity : 'medium',
             category: validCategories.has(bug.category) ? bug.category : 'functional',
             testCaseId: exec.testCaseId,
             testCaseName,
             executionId: exec.id,
-            steps: bug.steps || bug.stepsToReproduce || [],
+            steps: Array.isArray(bug.steps) ? bug.steps : (Array.isArray(bug.stepsToReproduce) ? bug.stepsToReproduce : []),
             expected: bug.expectedResult || bug.expected || '',
             actual: bug.actualResult || bug.actual || '',
             selector: bug.domSelector || bug.selector,
@@ -1619,12 +2021,15 @@ export class RegressionRunService {
         bugsCount = rawBugs.length;
 
         // Collect recommendations
-        const recs: string[] =
+        const recsSource =
           report?.analysis?.recommendations ||
           testResultData?.ai_summary?.recommendations ||
           [];
+        const recs: string[] = Array.isArray(recsSource) ? recsSource : [];
         for (const r of recs) {
-          allRecommendations.add(r);
+          if (typeof r === 'string' && r.trim()) {
+            allRecommendations.add(r);
+          }
         }
 
         // Collect confidence

@@ -73,7 +73,7 @@ export async function handleCreatePlanIntent(
       .eq('workspace_id', workspace_id)
       .eq('user_id', userId)
       .limit(1)
-      .single();
+      .maybeSingle();
 
     if (!project) {
       throw new NotFoundError('Project', workspace_id);
@@ -95,7 +95,7 @@ export async function handleCreatePlanIntent(
         .eq('project_id', project.id)
         .ilike('name', moduleName)
         .limit(1)
-        .single();
+        .maybeSingle();
 
       if (mod) {
         await RegressionPlanService.addItem({

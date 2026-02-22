@@ -7,7 +7,10 @@
  *
  * Key features:
  * - Fast precondition checks using compiled locatorPlan or evidence.lastSuccessRef
+ * - SPA navigation detection after click/open/close (URL-change race, no hardcoded delays)
+ * - Dynamic DOM stability threshold based on previous action risk profile
  * - Page settle fallback (network idle + DOM stable) when element not ready
+ * - Blind settle fallback when no locator available (instead of skipping entirely)
  * - Runtime metadata tracking (autoWaitApplied) when significant wait occurred
  * - Per-step disable flag for advanced use cases
  */
@@ -32,6 +35,8 @@ export interface LookaheadResult {
   autoWaitApplied: boolean;
   /** Reason if lookahead was skipped (non-targeting, no ref, disabled, etc.) */
   skipReason?: string;
+  /** True if SPA navigation was detected after previous step */
+  navigationDetected?: boolean;
 }
 
 /**
@@ -44,22 +49,44 @@ export interface LookaheadOptions {
   settleMs?: number;
   /** Threshold above which autoWaitApplied is flagged (default: 2000) */
   autoWaitThresholdMs?: number;
-  /** DOM stability threshold in milliseconds (default: 300) */
+  /** DOM stability threshold in milliseconds — overrides dynamic calculation when set */
   domStableThresholdMs?: number;
   /** Maximum number of settle retries (default: 3) */
   maxRetries?: number;
+  /**
+   * The action type of the PREVIOUS step.
+   * Used to detect SPA navigation risk and calibrate DOM stability threshold.
+   */
+  prevActionType?: IntentActionType;
+  /**
+   * URL of the page when the previous step started executing.
+   * If provided, used to detect SPA navigation (URL changed → nav occurred).
+   */
+  prevUrl?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Action types that don't target elements (skip lookahead) */
+/** Action types that don't target elements (skip lookahead entirely) */
 const NON_TARGETING_ACTIONS: Set<IntentActionType> = new Set([
   'navigate',
   'wait',
   'wait_for',
   'ai_check',
+]);
+
+/**
+ * Action types that commonly trigger SPA navigation or heavy async re-renders.
+ * After these, we do a URL-change race before attempting element checks.
+ */
+const NAVIGATION_TRIGGER_ACTIONS: Set<IntentActionType> = new Set([
+  'click',
+  'open',
+  'close',
+  'toggle',
+  'press',
 ]);
 
 /** Action types that require visible + enabled */
@@ -84,22 +111,101 @@ const NEEDS_ATTACHED_ONLY: Set<IntentActionType> = new Set([
   'press',
 ]);
 
+/**
+ * Dynamic DOM-stability thresholds per action risk profile (ms).
+ * Higher values after actions that likely cause significant re-renders.
+ */
+const DOM_STABLE_THRESHOLD_MS: Record<'navigation' | 'input' | 'assertion' | 'default', number> = {
+  navigation: 500, // after click/open/close/toggle that may trigger route change
+  input:      300, // after type/select — form re-renders are lighter
+  assertion:  150, // after assert/hover — almost no side effects
+  default:    300,
+};
+
+/** Blind settle duration when no locator is available (ms). Avoids complete skip. */
+const BLIND_SETTLE_MS = 800;
+
+/** Max time to wait for SPA URL change after a navigation-trigger action (ms) */
+const SPA_NAV_DETECT_MS = 1500;
+
 /** Default configuration values */
 const DEFAULTS = {
   maxWaitMs: 10000,
   settleMs: 3000,
   autoWaitThresholdMs: 2000,
-  domStableThresholdMs: 300,
   maxRetries: 3,
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DOM STABILITY THRESHOLD — DYNAMIC
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Compute DOM stability threshold based on the previous action's risk profile.
+ * Override with explicit domStableThresholdMs if provided.
+ */
+function getDomStableThresholdMs(
+  prevActionType: IntentActionType | undefined,
+  explicitOverride: number | undefined
+): number {
+  if (explicitOverride !== undefined) return explicitOverride;
+
+  if (!prevActionType) return DOM_STABLE_THRESHOLD_MS.default;
+
+  if (NAVIGATION_TRIGGER_ACTIONS.has(prevActionType)) return DOM_STABLE_THRESHOLD_MS.navigation;
+  if (prevActionType === 'type' || prevActionType === 'select') return DOM_STABLE_THRESHOLD_MS.input;
+  if (prevActionType === 'assert' || prevActionType === 'hover') return DOM_STABLE_THRESHOLD_MS.assertion;
+
+  return DOM_STABLE_THRESHOLD_MS.default;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SPA NAVIGATION DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Detect whether a SPA navigation occurred after a navigation-trigger action.
+ *
+ * Strategy: poll page.url() until it changes from prevUrl, or timeout.
+ * This is cheaper than waitForNavigation (which requires the nav to be in-flight)
+ * and works with hash-routing and pushState.
+ *
+ * Returns true if URL changed (navigation detected), false if timed out.
+ */
+async function detectSpaNavigation(
+  page: Page,
+  prevUrl: string,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const pollInterval = 50;
+
+  while (Date.now() < deadline) {
+    try {
+      const currentUrl = page.url();
+      if (currentUrl !== prevUrl) {
+        logger.debug('[STEP_READINESS] SPA navigation detected', {
+          from: prevUrl,
+          to: currentUrl,
+        });
+        return true;
+      }
+    } catch {
+      // Page may be in transition
+    }
+    await new Promise(r => setTimeout(r, pollInterval));
+  }
+
+  return false;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PAGE SETTLE HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Wait for network to be idle (no pending requests)
- * Uses Playwright's built-in networkidle with fallback
+ * Wait for network to be idle (no pending requests).
+ * Uses Playwright's built-in networkidle with fallback.
  */
 async function waitForNetworkIdle(page: Page, timeoutMs: number): Promise<void> {
   try {
@@ -111,7 +217,8 @@ async function waitForNetworkIdle(page: Page, timeoutMs: number): Promise<void> 
 }
 
 /**
- * Wait for DOM to stabilize (no mutations for threshold period)
+ * Wait for DOM to stabilize (no mutations for `stabilityThreshold` ms).
+ * Uses MutationObserver in the browser context.
  */
 async function waitForDOMStable(
   page: Page,
@@ -162,14 +269,13 @@ async function waitForDOMStable(
       { timeout: timeoutMs, threshold: stabilityThreshold }
     );
   } catch {
-    // DOM stability check failed, continue
     logger.debug('[STEP_READINESS] DOM stability check failed, continuing');
   }
 }
 
 /**
- * Apply page-level settle (network idle + DOM stable)
- * Used when element is not ready yet
+ * Apply page-level settle: networkIdle + DOM stable in parallel.
+ * The domStableThresholdMs is dynamically chosen based on prev action profile.
  */
 async function pageSettle(
   page: Page,
@@ -177,20 +283,31 @@ async function pageSettle(
   domStableThresholdMs: number
 ): Promise<void> {
   const startTime = Date.now();
-
   logger.debug('[STEP_READINESS] Applying page settle', { settleMs, domStableThresholdMs });
 
-  // Run network idle and DOM stable in parallel, with overall timeout
   await Promise.race([
     Promise.all([
       waitForNetworkIdle(page, settleMs),
       waitForDOMStable(page, settleMs, domStableThresholdMs),
     ]),
-    new Promise((resolve) => setTimeout(resolve, settleMs)),
+    new Promise(resolve => setTimeout(resolve, settleMs)),
   ]);
 
-  const elapsed = Date.now() - startTime;
-  logger.debug('[STEP_READINESS] Page settle complete', { elapsedMs: elapsed });
+  logger.debug('[STEP_READINESS] Page settle complete', { elapsedMs: Date.now() - startTime });
+}
+
+/**
+ * Blind settle: used when no locator is available to check preconditions.
+ * Instead of skipping lookahead entirely, waits a short fixed time for the page
+ * to settle (networkIdle + DOM stable). This covers the case where a new step
+ * has no compiled plan yet (first run after recording).
+ */
+async function blindSettle(page: Page, domStableThresholdMs: number): Promise<void> {
+  logger.debug('[STEP_READINESS] No locator available — applying blind settle', {
+    blindSettleMs: BLIND_SETTLE_MS,
+    domStableThresholdMs,
+  });
+  await pageSettle(page, BLIND_SETTLE_MS, domStableThresholdMs);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -198,8 +315,8 @@ async function pageSettle(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Build a fast locator from step's compiled plan or evidence
- * Returns null if no fast locator can be built (should skip lookahead)
+ * Build a fast locator from step's compiled plan or evidence.
+ * Returns null if no fast locator can be built.
  */
 function buildFastLocator(page: Page, step: IntentStep): Locator | null {
   // Priority 1: Use compiled locatorPlan if available
@@ -209,11 +326,9 @@ function buildFastLocator(page: Page, step: IntentStep): Locator | null {
     try {
       switch (primary.strategy) {
         case 'ref':
-          // CSS selector for data-agent-ref
           return page.locator(primary.value).first();
 
         case 'role':
-          // getByRole with accessible name
           return page
             .getByRole(primary.roleName as any, { name: primary.value })
             .first();
@@ -249,7 +364,6 @@ function buildFastLocator(page: Page, step: IntentStep): Locator | null {
   if (step.evidence?.lastSuccessRef) {
     try {
       const ref = step.evidence.lastSuccessRef;
-      // Escape special characters in ref for CSS selector
       const escapedRef = ref.replace(/"/g, '\\"');
       return page.locator(`[data-agent-ref="${escapedRef}"]`).first();
     } catch (error) {
@@ -260,7 +374,6 @@ function buildFastLocator(page: Page, step: IntentStep): Locator | null {
     }
   }
 
-  // No fast locator available
   return null;
 }
 
@@ -269,8 +382,8 @@ function buildFastLocator(page: Page, step: IntentStep): Locator | null {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Check if element meets preconditions for action type
- * Uses ONLY fast Playwright checks - no embeddings
+ * Check if element meets preconditions for action type.
+ * Uses ONLY fast Playwright checks — no embeddings or AI.
  */
 async function checkPreconditions(
   locator: Locator,
@@ -278,7 +391,6 @@ async function checkPreconditions(
 ): Promise<boolean> {
   try {
     if (NEEDS_VISIBLE_ENABLED.has(actionType)) {
-      // Must be visible AND enabled
       const [isVisible, isEnabled] = await Promise.all([
         locator.isVisible(),
         locator.isEnabled(),
@@ -287,20 +399,17 @@ async function checkPreconditions(
     }
 
     if (NEEDS_VISIBLE_ONLY.has(actionType)) {
-      // Must be visible
       return await locator.isVisible();
     }
 
     if (NEEDS_ATTACHED_ONLY.has(actionType)) {
-      // Must be attached (count > 0)
       const count = await locator.count();
       return count > 0;
     }
 
-    // Unknown action type - assume ready
+    // Unknown action type — assume ready
     return true;
   } catch (error) {
-    // Element not found or check failed
     logger.debug('[STEP_READINESS] Precondition check failed', {
       actionType,
       error: error instanceof Error ? error.message : String(error),
@@ -314,15 +423,21 @@ async function checkPreconditions(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Wait for next step to be ready before executing it
+ * Wait for next step to be ready before executing it.
  *
- * Uses fast Playwright checks only (no embeddings/AI).
- * If element not ready, applies page settle and retries.
+ * Algorithm:
+ * 1. Skip if next step is non-targeting (navigate/wait/ai_check)
+ * 2. If prev action is a navigation-trigger (click/open/close/toggle/press):
+ *    → race SPA navigation detection (URL changed?) for up to SPA_NAV_DETECT_MS
+ *    → if navigation detected → wait for networkIdle before element check
+ * 3. Build fast locator from compiled plan or evidence
+ *    → if no locator: blind settle (networkIdle + DOM stable) instead of skipping
+ * 4. Retry loop: checkPreconditions → pageSettle (with dynamic domStableThreshold) → repeat
+ * 5. Return LookaheadResult with waited time and navigationDetected flag
  *
  * @param page - Playwright Page instance
  * @param nextStep - The step that will be executed next
- * @param options - Configuration options
- * @returns LookaheadResult with readiness status and wait metrics
+ * @param options - Configuration options including prevActionType and prevUrl
  */
 export async function waitForStepReadiness(
   page: Page,
@@ -335,66 +450,97 @@ export async function waitForStepReadiness(
     maxWaitMs = DEFAULTS.maxWaitMs,
     settleMs = DEFAULTS.settleMs,
     autoWaitThresholdMs = DEFAULTS.autoWaitThresholdMs,
-    domStableThresholdMs = DEFAULTS.domStableThresholdMs,
+    domStableThresholdMs: domStableOverride,
     maxRetries = DEFAULTS.maxRetries,
+    prevActionType,
+    prevUrl,
   } = options;
+
+  // Dynamic DOM stability threshold based on prev action risk
+  const domStableThresholdMs = getDomStableThresholdMs(prevActionType, domStableOverride);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Skip conditions
   // ─────────────────────────────────────────────────────────────────────────
 
-  // Check per-step disable flag
   if (nextStep.options?.disableLookaheadWait) {
     logger.debug('[STEP_READINESS] Skipped: disableLookaheadWait flag set', {
       stepId: nextStep.id,
     });
-    return {
-      ready: true,
-      waited: 0,
-      autoWaitApplied: false,
-      skipReason: 'disableLookaheadWait flag set',
-    };
+    return { ready: true, waited: 0, autoWaitApplied: false, skipReason: 'disableLookaheadWait flag set' };
   }
 
-  // Check if action type targets an element
   if (NON_TARGETING_ACTIONS.has(nextStep.type)) {
     logger.debug('[STEP_READINESS] Skipped: non-targeting action', {
       stepId: nextStep.id,
       actionType: nextStep.type,
     });
-    return {
-      ready: true,
-      waited: 0,
-      autoWaitApplied: false,
-      skipReason: `Non-targeting action: ${nextStep.type}`,
-    };
+    return { ready: true, waited: 0, autoWaitApplied: false, skipReason: `Non-targeting action: ${nextStep.type}` };
   }
 
-  // Build fast locator
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 1: SPA navigation detection
+  // Runs only after actions that commonly trigger route changes.
+  // Does NOT block if no navigation — just races and moves on.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  let navigationDetected = false;
+
+  if (prevActionType && NAVIGATION_TRIGGER_ACTIONS.has(prevActionType) && prevUrl) {
+    const remainingMs = maxWaitMs - (Date.now() - startTime);
+    const spaWaitMs = Math.min(SPA_NAV_DETECT_MS, remainingMs);
+
+    if (spaWaitMs > 0) {
+      navigationDetected = await detectSpaNavigation(page, prevUrl, spaWaitMs);
+
+      if (navigationDetected) {
+        // Navigation happened → wait for networkIdle so the new page is ready
+        const postNavMs = Math.min(settleMs, maxWaitMs - (Date.now() - startTime));
+        if (postNavMs > 0) {
+          logger.debug('[STEP_READINESS] Post-navigation networkIdle wait', { postNavMs });
+          await waitForNetworkIdle(page, postNavMs);
+        }
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 2: Build fast locator
+  // If none available → blind settle instead of skipping
+  // ─────────────────────────────────────────────────────────────────────────
+
   const locator = buildFastLocator(page, nextStep);
+
   if (!locator) {
-    logger.debug('[STEP_READINESS] Skipped: no fast locator available', {
+    logger.debug('[STEP_READINESS] No fast locator — applying blind settle', {
       stepId: nextStep.id,
       hasCompiled: !!nextStep.compiled,
       hasEvidence: !!nextStep.evidence?.lastSuccessRef,
     });
+
+    await blindSettle(page, domStableThresholdMs);
+
+    const waited = Date.now() - startTime;
     return {
-      ready: true,
-      waited: 0,
-      autoWaitApplied: false,
-      skipReason: 'No fast locator available (no compiled plan or evidence)',
+      ready: true, // We don't know, but we waited — let executor try
+      waited,
+      autoWaitApplied: waited > autoWaitThresholdMs,
+      skipReason: 'No locator — blind settle applied',
+      navigationDetected,
     };
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Retry loop with settle
+  // Phase 3: Retry loop with dynamic settle
   // ─────────────────────────────────────────────────────────────────────────
 
   logger.debug('[STEP_READINESS] Starting lookahead wait', {
     stepId: nextStep.id,
     actionType: nextStep.type,
+    prevActionType,
+    domStableThresholdMs,
     maxWaitMs,
-    settleMs,
+    navigationDetected,
   });
 
   let attempt = 0;
@@ -403,7 +549,6 @@ export async function waitForStepReadiness(
   while (attempt <= maxRetries) {
     const elapsed = Date.now() - startTime;
 
-    // Check timeout
     if (elapsed >= maxWaitMs) {
       logger.debug('[STEP_READINESS] Max wait timeout reached', {
         stepId: nextStep.id,
@@ -414,7 +559,6 @@ export async function waitForStepReadiness(
       break;
     }
 
-    // Check preconditions
     ready = await checkPreconditions(locator, nextStep.type);
 
     if (ready) {
@@ -424,19 +568,20 @@ export async function waitForStepReadiness(
         waited,
         attempts: attempt,
       });
-
       return {
         ready: true,
         waited,
         autoWaitApplied: waited > autoWaitThresholdMs,
+        navigationDetected,
       };
     }
 
-    // Element not ready - apply page settle and retry
+    // Element not ready — apply page settle with dynamic threshold and retry
     logger.debug('[STEP_READINESS] Element not ready, applying settle', {
       stepId: nextStep.id,
       attempt,
       maxRetries,
+      domStableThresholdMs,
     });
 
     const remainingTime = maxWaitMs - (Date.now() - startTime);
@@ -450,7 +595,7 @@ export async function waitForStepReadiness(
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Final result
+  // Final result (element still not ready after all retries)
   // ─────────────────────────────────────────────────────────────────────────
 
   const waited = Date.now() - startTime;
@@ -461,23 +606,24 @@ export async function waitForStepReadiness(
     waited,
     attempts: attempt,
     autoWaitApplied: waited > autoWaitThresholdMs,
+    navigationDetected,
   });
 
   return {
     ready,
     waited,
     autoWaitApplied: waited > autoWaitThresholdMs,
+    navigationDetected,
   };
 }
 
 /**
- * Check if lookahead should be skipped based on previous step type
- * Call this before waitForStepReadiness if you have context about prev step
+ * Check if lookahead should be skipped based on previous step type.
+ * Only truly non-targeting actions (navigate/wait/wait_for/ai_check) skip lookahead.
+ * Navigation-trigger actions (click/open/close) now go through SPA detection instead.
  *
  * @param prevStepType - The type of the previous step
- * @returns true if lookahead should be skipped
  */
 export function shouldSkipLookaheadAfter(prevStepType: IntentActionType): boolean {
-  // These actions already handle waiting or don't trigger async changes
   return NON_TARGETING_ACTIONS.has(prevStepType);
 }

@@ -7,6 +7,7 @@ import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { getTelegramToken, sendMessage as sendTelegramMessage } from '@/services/api/telegram.service';
+import { webSocketService } from '@/websocket/core/websocket.service';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -143,6 +144,22 @@ export class TestCompletionHandlerService {
               },
             ]);
 
+            // Emit real-time WebSocket event so chat UI updates instantly
+            try {
+              webSocketService.emitChatMessage(chatSessionId, {
+                sessionId: chatSessionId,
+                messageId: `test-result-${testId}`,
+                role: 'assistant',
+                content: formattedMessage,
+                timestamp: new Date().toISOString(),
+              });
+            } catch (wsError) {
+              logger.warn('[TEST_COMPLETION] Failed to emit chat:message WebSocket event', {
+                testId, chatSessionId,
+                error: wsError instanceof Error ? wsError.message : String(wsError),
+              });
+            }
+
             logger.info('[TEST_COMPLETION] Results sent to chat', {
               testId,
               chatSessionId,
@@ -230,8 +247,22 @@ export class TestCompletionHandlerService {
           message = `Test completed successfully across ${results.length} browser(s)`;
         }
       } else if (status === 'failed') {
-        title = 'Background test failed';
-        message = `Test failed with ${errorsCount} error(s)`;
+        // Check if failure was due to credit exhaustion
+        const isCreditExhaustion = results.some((r) =>
+          r.errors?.some((e: any) =>
+            (typeof e === 'string' ? e : e?.message || '')
+              .toLowerCase()
+              .includes('insufficient credits')
+          )
+        );
+
+        if (isCreditExhaustion) {
+          title = 'Test stopped: insufficient credits';
+          message = 'Test execution was interrupted because your credit balance ran out. Top up credits to continue testing.';
+        } else {
+          title = 'Background test failed';
+          message = `Test failed with ${errorsCount} error(s)`;
+        }
       } else if (status === 'cancelled') {
         title = 'Background test cancelled';
         message = 'Test was cancelled before completion';
@@ -354,13 +385,34 @@ export class TestCompletionHandlerService {
     testId: string
   ): Promise<void> {
     try {
+      // Validate testId is a valid UUID to prevent injection in .or() filter
+      const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!UUID_REGEX.test(testId)) {
+        logger.error('[TEST_COMPLETION] Invalid testId format, skipping regression run update', { testId });
+        return;
+      }
+
       // Find regression runs that reference this test
-      // Either directly (test_id) or in a batch (test_ids array)
-      const { data: runs, error: runsError } = await supabaseAdmin
-        .from('regression_runs')
-        .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
-        .or(`test_id.eq.${testId},test_ids.cs.["${testId}"]`)
-        .in('status', ['running']); // Only update runs that are still in progress
+      // Query 1: direct test_id match; Query 2: batch test_ids contains
+      const [directResult, batchResult] = await Promise.all([
+        supabaseAdmin
+          .from('regression_runs')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
+          .eq('test_id', testId)
+          .in('status', ['running', 'pending']),
+        supabaseAdmin
+          .from('regression_runs')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
+          .contains('test_ids', [testId])
+          .in('status', ['running', 'pending']),
+      ]);
+
+      const runsError = directResult.error || batchResult.error;
+      // Deduplicate by run ID
+      const runMap = new Map<string, any>();
+      for (const r of directResult.data || []) runMap.set(r.id, r);
+      for (const r of batchResult.data || []) runMap.set(r.id, r);
+      const runs = [...runMap.values()];
 
       if (runsError) {
         logger.error('[TEST_COMPLETION] Failed to find regression runs', {
@@ -451,8 +503,13 @@ export class TestCompletionHandlerService {
           message = `All ${summary.total || 0} test(s) passed successfully`;
         }
       } else if (finalStatus === 'failed') {
-        title = `${triggerLabel} regression failed`;
-        message = `Regression run failed: ${summary.failed || 0} test(s) failed`;
+        if (summary.creditExhausted) {
+          title = `${triggerLabel} regression stopped: insufficient credits`;
+          message = 'Regression run was interrupted because your credit balance ran out. Top up credits to continue testing.';
+        } else {
+          title = `${triggerLabel} regression failed`;
+          message = `Regression run failed: ${summary.failed || 0} test(s) failed`;
+        }
       } else if (finalStatus === 'cancelled') {
         title = `${triggerLabel} regression cancelled`;
         message = 'Regression run was cancelled before completion';
@@ -545,7 +602,7 @@ export class TestCompletionHandlerService {
       // Prefer unified executions if present (covers UI + API and avoids relying only on tests table)
       const { data: unifiedExecutions, error: execError } = await supabaseAdmin
         .from('test_executions')
-        .select('status')
+        .select('status, error_message')
         .eq('run_id', run.id);
 
       if (execError) {
@@ -572,23 +629,33 @@ export class TestCompletionHandlerService {
           finalStatus = 'failed';
         }
 
+        const creditExhausted = unifiedExecutions.some((e: any) =>
+          e.error_message?.toLowerCase().includes('insufficient credits')
+        );
+
         const summary = {
           total: statuses.length,
           passed: statuses.filter((s: string) => s === 'passed').length,
           failed: statuses.filter((s: string) => s === 'failed').length,
           skipped: statuses.filter((s: string) => s === 'skipped').length,
           cancelled: statuses.filter((s: string) => s === 'cancelled').length,
+          creditExhausted,
           completed_at: new Date().toISOString(),
         };
 
-        const { error: updateError } = await supabaseAdmin
+        // Optimistic lock: only update if run is still in running/pending status
+        // Prevents race condition when multiple tests complete simultaneously
+        const { data: updatedRun, error: updateError } = await supabaseAdmin
           .from('regression_runs')
           .update({
             status: finalStatus,
             summary,
             completed_at: new Date().toISOString(),
           })
-          .eq('id', run.id);
+          .eq('id', run.id)
+          .in('status', ['running', 'pending'])
+          .select('id')
+          .maybeSingle();
 
         if (updateError) {
           logger.error('[TEST_COMPLETION] Failed to update regression run (unified)', {
@@ -596,13 +663,40 @@ export class TestCompletionHandlerService {
             runId: run.id,
             finalStatus,
           });
+        } else if (!updatedRun) {
+          // Another completion handler already finalized this run
+          logger.debug('[TEST_COMPLETION] Run already finalized by another handler', {
+            runId: run.id,
+          });
         } else {
           logger.info('[TEST_COMPLETION] Regression run updated (unified)', {
             runId: run.id,
             status: finalStatus,
             summary,
           });
-          
+
+          // Emit WebSocket completion event so frontend updates immediately (no polling delay)
+          try {
+            webSocketService.emitRegressionRunProgress(run.user_id, {
+              runId: run.id,
+              userId: run.user_id,
+              status: finalStatus === 'completed' ? 'completed' : 'failed',
+              progress: 100,
+              message: finalStatus === 'completed'
+                ? `Run completed: ${summary.passed} passed, ${summary.failed} failed`
+                : `Run failed: ${summary.passed} passed, ${summary.failed} failed`,
+              errorCode: summary.creditExhausted ? 'INSUFFICIENT_CREDITS' : undefined,
+              details: {
+                totalTests: summary.total,
+                completedTests: summary.total,
+                passed: summary.passed,
+                failed: summary.failed,
+                skipped: summary.skipped,
+              },
+              timestamp: new Date().toISOString(),
+            });
+          } catch { /* non-fatal */ }
+
           // Create notification for regression run
           await this.createRegressionRunNotification(run, finalStatus, summary);
         }
@@ -685,15 +779,18 @@ export class TestCompletionHandlerService {
         completed_at: new Date().toISOString(),
       };
 
-      // Update regression run
-      const { error: updateError } = await supabaseAdmin
+      // Update regression run (optimistic lock: only if still running/pending)
+      const { data: updatedRun, error: updateError } = await supabaseAdmin
         .from('regression_runs')
         .update({
           status: finalStatus,
           summary,
           completed_at: new Date().toISOString(),
         })
-        .eq('id', run.id);
+        .eq('id', run.id)
+        .in('status', ['running', 'pending'])
+        .select('id')
+        .maybeSingle();
 
       if (updateError) {
         logger.error('[TEST_COMPLETION] Failed to update regression run', {
@@ -701,13 +798,38 @@ export class TestCompletionHandlerService {
           runId: run.id,
           finalStatus,
         });
+      } else if (!updatedRun) {
+        logger.debug('[TEST_COMPLETION] Run already finalized by another handler', {
+          runId: run.id,
+        });
       } else {
         logger.info('[TEST_COMPLETION] Regression run updated', {
           runId: run.id,
           status: finalStatus,
           summary,
         });
-        
+
+        // Emit WebSocket completion event (fallback path)
+        try {
+          webSocketService.emitRegressionRunProgress(run.user_id, {
+            runId: run.id,
+            userId: run.user_id,
+            status: finalStatus === 'completed' ? 'completed' : 'failed',
+            progress: 100,
+            message: finalStatus === 'completed'
+              ? `Run completed: ${passed} passed, ${failed} failed`
+              : `Run failed: ${passed} passed, ${failed} failed`,
+            details: {
+              totalTests: tests.length,
+              completedTests: tests.length,
+              passed,
+              failed,
+              skipped: 0,
+            },
+            timestamp: new Date().toISOString(),
+          });
+        } catch { /* non-fatal */ }
+
         // Create notification for regression run
         await this.createRegressionRunNotification(run, finalStatus, summary);
       }

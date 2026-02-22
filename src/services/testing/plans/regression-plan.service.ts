@@ -5,6 +5,8 @@
 
 import { supabaseAdmin } from '@/db/supabase';
 import { GitIntegrationService } from '@/services/integrations/git-integration.service';
+import { ScheduleService } from '@/services/testing/schedules/schedule.service';
+import { ValidationError } from '@/types';
 import type {
     AddPlanItemParams,
     CreateRegressionPlanParams,
@@ -595,6 +597,90 @@ export class RegressionPlanService {
       itemType,
     });
 
+    // Validate plan exists
+    const { data: planExists } = await supabaseAdmin
+      .from('regression_plans')
+      .select('id')
+      .eq('id', planId)
+      .maybeSingle();
+
+    if (!planExists) {
+      throw new ValidationError(`Plan ${planId} not found`);
+    }
+
+    // Validate referenced entity exists
+    if (itemType === 'flow' && flowId) {
+      const { data: flowExists } = await supabaseAdmin
+        .from('test_flows')
+        .select('id')
+        .eq('id', flowId)
+        .maybeSingle();
+
+      if (!flowExists) {
+        throw new ValidationError(`Flow ${flowId} not found`);
+      }
+
+      const { count: tcCount } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id', { count: 'exact', head: true })
+        .eq('flow_id', flowId);
+
+      const { count: apiCount } = await supabaseAdmin
+        .from('api_test_configs')
+        .select('id', { count: 'exact', head: true })
+        .eq('flow_id', flowId);
+
+      if ((tcCount || 0) + (apiCount || 0) === 0) {
+        logger.warn('[REGRESSION_PLAN_SERVICE] Adding flow with no test cases', { planId, flowId });
+      }
+    }
+
+    if (itemType === 'module' && moduleId) {
+      const { data: moduleExists } = await supabaseAdmin
+        .from('test_modules')
+        .select('id')
+        .eq('id', moduleId)
+        .maybeSingle();
+
+      if (!moduleExists) {
+        throw new ValidationError(`Module ${moduleId} not found`);
+      }
+    }
+
+    if (itemType === 'test_case' && testCaseId) {
+      const table = testCaseType === 'api' ? 'api_test_configs' : 'intent_test_cases';
+      const { data: tcExists } = await supabaseAdmin
+        .from(table)
+        .select('id')
+        .eq('id', testCaseId)
+        .maybeSingle();
+
+      if (!tcExists) {
+        throw new ValidationError(`Test case ${testCaseId} not found in ${table}`);
+      }
+    }
+
+    // Prevent duplicate items in the same plan
+    const dupFilter: Record<string, any> = { plan_id: planId, item_type: itemType };
+    if (flowId) dupFilter.flow_id = flowId;
+    if (moduleId) dupFilter.module_id = moduleId;
+    if (testCaseId) dupFilter.test_case_id = testCaseId;
+
+    let dupQuery = supabaseAdmin
+      .from('regression_plan_items')
+      .select('id', { count: 'exact', head: true })
+      .eq('plan_id', planId)
+      .eq('item_type', itemType);
+
+    if (flowId) dupQuery = dupQuery.eq('flow_id', flowId);
+    if (moduleId) dupQuery = dupQuery.eq('module_id', moduleId);
+    if (testCaseId) dupQuery = dupQuery.eq('test_case_id', testCaseId);
+
+    const { count: dupCount } = await dupQuery;
+    if ((dupCount || 0) > 0) {
+      throw new ValidationError(`This ${itemType} is already in the plan`);
+    }
+
     // Get max order_index if not provided
     let finalOrderIndex = orderIndex;
     if (finalOrderIndex === undefined) {
@@ -604,7 +690,7 @@ export class RegressionPlanService {
         .eq('plan_id', planId)
         .order('order_index', { ascending: false })
         .limit(1)
-        .single();
+        .maybeSingle();
 
       finalOrderIndex = maxOrder ? maxOrder.order_index + 1 : 0;
     }
@@ -712,17 +798,25 @@ export class RegressionPlanService {
     const items = await this.getItems(planId);
     const expandedCases: ExpandedTestCase[] = [];
 
+    logger.info('[REGRESSION_PLAN_SERVICE] Expanding plan', {
+      planId,
+      itemCount: items.length,
+      items: items.map((i) => ({ itemType: i.itemType, moduleId: i.moduleId, flowId: i.flowId, testCaseId: i.testCaseId })),
+    });
+
     for (const item of items) {
       switch (item.itemType) {
         case 'module':
           if (item.moduleId) {
             const moduleCases = await this.expandModule(item.moduleId);
+            logger.info('[REGRESSION_PLAN_SERVICE] Expanded module', { moduleId: item.moduleId, testCaseCount: moduleCases.length });
             expandedCases.push(...moduleCases);
           }
           break;
         case 'flow':
           if (item.flowId) {
             const flowCases = await this.expandFlow(item.flowId);
+            logger.info('[REGRESSION_PLAN_SERVICE] Expanded flow', { flowId: item.flowId, testCaseCount: flowCases.length });
             expandedCases.push(...flowCases);
           }
           break;
@@ -785,15 +879,21 @@ export class RegressionPlanService {
       .from('test_flows')
       .select('module_id')
       .eq('id', flowId)
-      .single();
+      .maybeSingle();
 
     const moduleId = flow?.module_id;
 
     // Get UI test cases from intent_test_cases (unified table)
-    const { data: uiCases } = await supabaseAdmin
+    // Include cases that have replay data: commands, graph_ref, OR steps_json
+    const { data: uiCases, error: uiError } = await supabaseAdmin
       .from('intent_test_cases')
       .select('id, name')
-      .eq('flow_id', flowId);
+      .eq('flow_id', flowId)
+      .not('status', 'eq', 'archived');
+
+    if (uiError) {
+      logger.error('[REGRESSION_PLAN_SERVICE] Failed to query intent_test_cases for flow', { flowId, error: uiError });
+    }
 
     for (const tc of uiCases || []) {
       cases.push({
@@ -806,10 +906,14 @@ export class RegressionPlanService {
     }
 
     // Get API test cases
-    const { data: apiCases } = await supabaseAdmin
+    const { data: apiCases, error: apiError } = await supabaseAdmin
       .from('api_test_configs')
       .select('id, name')
       .eq('flow_id', flowId);
+
+    if (apiError) {
+      logger.error('[REGRESSION_PLAN_SERVICE] Failed to query api_test_configs for flow', { flowId, error: apiError });
+    }
 
     for (const tc of apiCases || []) {
       cases.push({
@@ -838,7 +942,7 @@ export class RegressionPlanService {
       .from(table)
       .select('id, name, flow_id')
       .eq('id', testCaseId)
-      .single();
+      .maybeSingle();
 
     if (!data) return null;
 
@@ -850,7 +954,7 @@ export class RegressionPlanService {
         .from('test_flows')
         .select('module_id')
         .eq('id', data.flow_id)
-        .single();
+        .maybeSingle();
 
       moduleId = flow?.module_id;
     }
@@ -925,7 +1029,8 @@ export class RegressionPlanService {
             scheduleId: existingScheduleId,
           });
         }
-        return existingScheduleId || null;
+        // Return null — schedule is inactive, plan should not reference it as "active"
+        return null;
       }
 
       const cronExpression = scheduleConfig.customCron || this.buildCronExpression(scheduleConfig);
@@ -996,31 +1101,11 @@ export class RegressionPlanService {
   }
 
   /**
-   * Simple next-run calculation for schedule sync
+   * Delegate to ScheduleService.calculateNextRun — single source of truth
+   * for cron → next-run-at conversion (handles day-of-week + timezone).
    */
-  private static calculateNextRunFromSchedule(cronExpression: string, _timezone: string): string {
-    void _timezone;
-
-    const now = new Date();
-    const parts = cronExpression.split(' ');
-    if (parts.length !== 5) {
-      return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
-    }
-
-    const [minuteStr, hourStr] = parts;
-    const minute = parseInt(minuteStr, 10);
-    const hour = parseInt(hourStr, 10);
-
-    if (!isNaN(minute) && !isNaN(hour)) {
-      const nextRun = new Date(now);
-      nextRun.setHours(hour, minute, 0, 0);
-      if (nextRun <= now) {
-        nextRun.setDate(nextRun.getDate() + 1);
-      }
-      return nextRun.toISOString();
-    }
-
-    return new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+  private static calculateNextRunFromSchedule(cronExpression: string, timezone: string): string {
+    return ScheduleService.calculateNextRun(cronExpression, timezone);
   }
 
   /**

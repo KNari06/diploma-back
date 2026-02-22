@@ -2,7 +2,6 @@ import { supabaseAdmin } from '@/db/supabase';
 import { requireAuth, requireCredits } from '@/middleware/auth.middleware';
 import { testRetryRateLimiter, testRunRateLimiter } from '@/middleware/rate-limiter.middleware';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
-import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { IntelligentTestStorageService } from '@/services/testing/results/intelligent-test-storage.service';
 import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
@@ -246,28 +245,14 @@ router.post('/run', requireAuth, testRunRateLimiter, asyncHandler(async (req: Re
       });
     }
 
-    // Deduct credits BEFORE running test
-    const uiTestType = validatedData.intelligentMode ? 'intelligent' : 'standard';
-    const testId = `ui_direct_${Date.now()}`;
-
-    try {
-      await CreditCostTrackerService.deductCreditsForTest({
-        userId,
-        testType: uiTestType,
-        credits: TokenCalculatorService.getTestCreditCost(uiTestType),
-        costUSD: uiTestType === 'intelligent' ? 0.08 : 0.001,
-        testId,
-        description: `${uiTestType} UI test: ${validatedData.url}`,
-      });
-    } catch (creditError) {
-      logger.error('[MANUAL_TEST_API] Failed to deduct credits', {
-        error: creditError instanceof Error ? creditError.message : String(creditError),
-        userId,
-      });
+    // Soft credit check — verify user has at least 1 credit to start
+    // Actual credits are deducted per-step during execution
+    const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
+    if (creditCheck.available < 1) {
       res.status(402).json({
         success: false,
         error: 'Insufficient credits',
-        message: creditError instanceof Error ? creditError.message : 'Payment error',
+        message: 'You need at least 1 credit to start a test. Credits are deducted per step during execution.',
       });
       return;
     }

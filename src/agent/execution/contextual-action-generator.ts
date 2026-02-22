@@ -19,6 +19,7 @@ import {
   DynamicAction,
   NextStepDecision,
   PageContext,
+  TestHint,
   TestState,
 } from '../types/intelligent-testing.types';
 
@@ -95,7 +96,7 @@ export class ContextualActionGenerator {
     state: TestState,
     page?: Page,
     costManager?: AICostManager,
-    hints?: Array<{ description: string; action?: string; target?: string; value?: string; priority?: string }>
+    hints?: TestHint[]
   ): Promise<{
     actions: DynamicAction[];
     reasoning: string;

@@ -2,6 +2,7 @@
 import { AIExtractService } from '@/services/ai-extract';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service';
 import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import type { IntentPlaywrightCommand } from '@/services/testing/ui/preview/intent-step-converter.service';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
@@ -13,6 +14,15 @@ import { shouldPressEnterAfterFill } from '../utils/ai/enter-detection-ai';
 import { getLocator, getSmartLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLocator } from '../utils/selectors/selector-utils';
 import { SelectorStabilityScore, SmartWaitService } from '../utils/selectors/smart-wait.service';
 import { buildRuntimeMeta, executeCompiledLocatorPlan } from './compiled-locator-executor';
+import {
+  buildGlobWaitPayload,
+  buildRegexWaitPayload,
+  matchDomain,
+  matchGlob,
+  matchRegex,
+  matchSubstring,
+  parseRegexString,
+} from './url-pattern-matcher';
 
 /**
  * Execute Playwright commands on a page
@@ -283,7 +293,9 @@ export class CommandExecutor {
           }
           break;
 
-        case 'type':
+        case 'type': {
+          // NOTE: Uses page.type() for keyboard-event simulation (keydown/keypress/keyup per char).
+          // This is important for sites that validate input via keyboard events (autocomplete, OTP, etc.)
           if (value === undefined) throw new Error('Value is required for type action');
 
           // ✅ V2: Use intent-based locator resolution for IntentPlaywrightCommand
@@ -293,7 +305,8 @@ export class CommandExecutor {
               'type',
               timeout || 30000
             );
-            await intentTypeLocator.fill(String(value), { timeout: timeout || 30000 });
+            // Use type() to simulate real keyboard events character by character
+            await intentTypeLocator.pressSequentially(String(value), { timeout: timeout || 30000 });
 
             // AI-powered Enter key detection
             const shouldPressIntent = await shouldPressEnterAfterFill(intentTypeLocator, this.page, description);
@@ -306,12 +319,11 @@ export class CommandExecutor {
           // Standard flow for non-intent commands
           if (!selector) throw new Error('Selector is required for type action');
 
-          // ✅ NEW: Use smart locator to select the right input element
           const typeSmartResult = await getSmartLocator(
             this.page,
             selector,
             'type',
-            description // Intent for AI context
+            description
           );
 
           if (typeSmartResult.wasSmartSelected) {
@@ -324,9 +336,9 @@ export class CommandExecutor {
 
           try {
             await typeSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            await typeSmartResult.locator.fill(String(value), { timeout: timeout || 30000 });
+            // Use pressSequentially to simulate real keyboard events
+            await typeSmartResult.locator.pressSequentially(String(value), { timeout: timeout || 30000 });
 
-            // ✅ AI-powered Enter key detection
             const shouldPress = await shouldPressEnterAfterFill(
               typeSmartResult.locator,
               this.page,
@@ -340,7 +352,6 @@ export class CommandExecutor {
               await typeSmartResult.locator.press('Enter', { timeout: timeout || 5000 });
             }
           } catch (typeError) {
-            // Smart locator failed, try self-healing
             logger.warn('[COMMAND_EXECUTOR] Smart locator type failed, trying self-healing', {
               selector: selector.substring(0, 50),
               error: typeError instanceof Error ? typeError.message : String(typeError),
@@ -349,11 +360,10 @@ export class CommandExecutor {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                await locator.fill(String(value), { timeout: timeout || 30000 });
+                await locator.pressSequentially(String(value), { timeout: timeout || 30000 });
 
-                // ✅ AI-powered Enter key detection (self-healing path)
-                const shouldPress = await shouldPressEnterAfterFill(locator, this.page, description);
-                if (shouldPress) {
+                const shouldPressHealed = await shouldPressEnterAfterFill(locator, this.page, description);
+                if (shouldPressHealed) {
                   logger.info('[COMMAND_EXECUTOR] AI decided to press Enter after type (self-healing)');
                   await locator.press('Enter', { timeout: timeout || 5000 });
                 }
@@ -367,12 +377,32 @@ export class CommandExecutor {
               }
             );
           }
-          // Note: Post-action analysis handled by PostActionAnalyzer
           break;
+        }
 
-        case 'select':
-          if (!selector) throw new Error('Selector is required for select action');
+        case 'select': {
           if (value === undefined) throw new Error('Value is required for select action');
+
+          // ✅ V2: Use intent-based locator resolution for IntentPlaywrightCommand
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentSelectLocator } = await this.getLocatorForIntentCommand(
+              intentCommand,
+              'select',
+              timeout || 30000
+            );
+            const intentSelectValue = this.parseSelectValue(value);
+            await this.waitForEnabled(intentSelectLocator, 5000);
+            const isNativeIntent = await this.isNativeSelectLocator(intentSelectLocator);
+            if (isNativeIntent) {
+              await this.waitForSelectOptions(intentSelectLocator, 5000, 3);
+              await intentSelectLocator.selectOption(intentSelectValue, { timeout: timeout || 30000 });
+            } else {
+              await this.selectFromCustomDropdown(intentSelectLocator, String(value), timeout || 30000);
+            }
+            break;
+          }
+
+          if (!selector) throw new Error('Selector is required for select action');
 
           // ✅ NEW: Use smart locator to select the right select element
           const selectSmartResult = await getSmartLocator(
@@ -440,17 +470,12 @@ export class CommandExecutor {
             );
           }
           break;
+        }
 
-        case 'check':
+        case 'check': {
           if (!selector) throw new Error('Selector is required for check action');
 
-          // ✅ NEW: Use smart locator for check action
-          const checkSmartResult = await getSmartLocator(
-            this.page,
-            selector,
-            'check', // Uses checkbox preferences
-            description
-          );
+          const checkSmartResult = await getSmartLocator(this.page, selector, 'check', description);
 
           if (checkSmartResult.wasSmartSelected) {
             logger.info('[COMMAND_EXECUTOR] Smart element selection used for check', {
@@ -462,9 +487,14 @@ export class CommandExecutor {
 
           try {
             await checkSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            // ✅ Wait for enabled: Ensure checkbox is not disabled
             await this.waitForEnabled(checkSmartResult.locator, 5000);
-            await checkSmartResult.locator.check({ timeout: timeout || 30000 });
+            // Guard: skip if already checked — Playwright throws if already in desired state
+            const alreadyChecked = await checkSmartResult.locator.isChecked().catch(() => false);
+            if (!alreadyChecked) {
+              await checkSmartResult.locator.check({ timeout: timeout || 30000 });
+            } else {
+              logger.debug('[COMMAND_EXECUTOR] check: element already checked, skipping');
+            }
           } catch (checkError) {
             logger.warn('[COMMAND_EXECUTOR] Smart locator check failed, trying self-healing', {
               selector: selector.substring(0, 50),
@@ -474,30 +504,22 @@ export class CommandExecutor {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                // ✅ Wait for enabled in self-healing path too
                 await this.waitForEnabled(locator, 5000);
-                await locator.check({ timeout: timeout || 30000 });
+                const alreadyCheckedSH = await locator.isChecked().catch(() => false);
+                if (!alreadyCheckedSH) {
+                  await locator.check({ timeout: timeout || 30000 });
+                }
               },
-              {
-                selector,
-                intent: description || 'check checkbox',
-                action: 'check',
-                timeout,
-              }
+              { selector, intent: description || 'check checkbox', action: 'check', timeout }
             );
           }
           break;
+        }
 
-        case 'uncheck':
+        case 'uncheck': {
           if (!selector) throw new Error('Selector is required for uncheck action');
 
-          // ✅ NEW: Use smart locator for uncheck action
-          const uncheckSmartResult = await getSmartLocator(
-            this.page,
-            selector,
-            'check', // Same preferences as check
-            description
-          );
+          const uncheckSmartResult = await getSmartLocator(this.page, selector, 'check', description);
 
           if (uncheckSmartResult.wasSmartSelected) {
             logger.info('[COMMAND_EXECUTOR] Smart element selection used for uncheck', {
@@ -509,9 +531,14 @@ export class CommandExecutor {
 
           try {
             await uncheckSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            // ✅ Wait for enabled: Ensure checkbox is not disabled
             await this.waitForEnabled(uncheckSmartResult.locator, 5000);
-            await uncheckSmartResult.locator.uncheck({ timeout: timeout || 30000 });
+            // Guard: skip if already unchecked — Playwright throws if already in desired state
+            const alreadyUnchecked = !(await uncheckSmartResult.locator.isChecked().catch(() => true));
+            if (!alreadyUnchecked) {
+              await uncheckSmartResult.locator.uncheck({ timeout: timeout || 30000 });
+            } else {
+              logger.debug('[COMMAND_EXECUTOR] uncheck: element already unchecked, skipping');
+            }
           } catch (uncheckError) {
             logger.warn('[COMMAND_EXECUTOR] Smart locator uncheck failed, trying self-healing', {
               selector: selector.substring(0, 50),
@@ -521,19 +548,17 @@ export class CommandExecutor {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                // ✅ Wait for enabled in self-healing path too
                 await this.waitForEnabled(locator, 5000);
-                await locator.uncheck({ timeout: timeout || 30000 });
+                const alreadyUncheckedSH = !(await locator.isChecked().catch(() => true));
+                if (!alreadyUncheckedSH) {
+                  await locator.uncheck({ timeout: timeout || 30000 });
+                }
               },
-              {
-                selector,
-                intent: description || 'uncheck checkbox',
-                action: 'uncheck',
-                timeout,
-              }
+              { selector, intent: description || 'uncheck checkbox', action: 'uncheck', timeout }
             );
           }
           break;
+        }
 
         case 'hover':
           if (!selector) throw new Error('Selector is required for hover action');
@@ -621,34 +646,67 @@ export class CommandExecutor {
           }
           break;
 
-        case 'focus':
+        case 'focus': {
           if (!selector) throw new Error('Selector is required for focus action');
           const focusLocator = this.getLocatorInternal(selector);
+          await focusLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
           await focusLocator.focus({ timeout: timeout || 30000 });
           break;
+        }
 
-        case 'blur':
+        case 'blur': {
           if (!selector) throw new Error('Selector is required for blur action');
           const blurLocator = this.getLocatorInternal(selector);
+          await blurLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
           await blurLocator.blur({ timeout: timeout || 30000 });
           break;
+        }
 
-        case 'press':
-          // ✅ FIX 4: If selector provided, use locator.press; otherwise page.keyboard.press
+        case 'press': {
           if (!value) throw new Error('Key is required for press action');
+
+          const performPress = async (locator: Locator) => {
+            await locator.waitFor({ state: 'attached', timeout: timeout || 10000 });
+            await this.ensureFocused(locator, 2000);
+            await locator.press(String(value), { timeout: timeout || 30000 });
+          };
+
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentPressLocator } = await this.getLocatorForIntentCommand(
+              intentCommand,
+              'press',
+              timeout || 30000
+            );
+            await performPress(intentPressLocator);
+            break;
+          }
+
           if (selector) {
-            const pressLocator = this.getLocatorInternal(selector);
-            // ✅ Ensure focus: Verify element is focused before pressing key
-            await this.ensureFocused(pressLocator, 2000);
-            await pressLocator.press(String(value), { timeout: timeout || 30000 });
+            const pressSmartResult = await getSmartLocator(this.page, selector, 'press' as any, description);
+            try {
+              await performPress(pressSmartResult.locator);
+            } catch (pressError) {
+              logger.warn('[COMMAND_EXECUTOR] Smart locator press failed, trying self-healing', {
+                selector: selector.substring(0, 50),
+                error: pressError instanceof Error ? pressError.message : String(pressError),
+              });
+              await this.executeWithSelfHealing(
+                async () => {
+                  const locator = getLocator(this.page, selector);
+                  await performPress(locator);
+                },
+                { selector, intent: description || `press ${value}`, action: 'press', timeout, value }
+              );
+            }
           } else {
-            // No selector - use page.keyboard.press (risky, log warning)
-            logger.warn('[COMMAND_EXECUTOR] Using page.keyboard.press without selector - risky behavior', {
+            // No selector — use page.keyboard.press (focus-dependent, warn)
+            logger.warn('[COMMAND_EXECUTOR] Using page.keyboard.press without selector — focus-dependent', {
               key: String(value),
             });
             await this.page.keyboard.press(String(value));
           }
           break;
+        }
 
         case 'dragAndDrop':
           if (!selector) throw new Error('Source selector is required for dragAndDrop action');
@@ -794,6 +852,321 @@ export class CommandExecutor {
           const extractedValue = await this.extractDataWithLocator(extractLocator, command.extract);
           this.extractedData.set(command.extract.name, extractedValue);
           return { success: true, extractedValue };
+        }
+
+        case 'fill': {
+          // Alias for type — fill without keyboard events (faster)
+          if (value === undefined) throw new Error('Value is required for fill action');
+
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentFillLocator } = await this.getLocatorForIntentCommand(
+              intentCommand,
+              'type',
+              timeout || 30000
+            );
+            await intentFillLocator.fill(String(value), { timeout: timeout || 30000 });
+            break;
+          }
+
+          if (!selector) throw new Error('Selector is required for fill action');
+
+          const fillSmartResult = await getSmartLocator(this.page, selector, 'type', description);
+          try {
+            await fillSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await fillSmartResult.locator.fill(String(value), { timeout: timeout || 30000 });
+          } catch (fillError) {
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector!);
+                await locator.fill(String(value), { timeout: timeout || 30000 });
+              },
+              { selector, intent: description || `fill with ${value}`, action: 'fill', timeout, value }
+            );
+          }
+          break;
+        }
+
+        // Alias: selectOption → select
+        case 'selectOption': {
+          if (!selector) throw new Error('Selector is required for selectOption action');
+          if (value === undefined) throw new Error('Value is required for selectOption action');
+
+          const soSmartResult = await getSmartLocator(this.page, selector, 'select', description);
+          const soValue = this.parseSelectValue(value);
+          try {
+            await soSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await this.waitForEnabled(soSmartResult.locator, 5000);
+            const isNativeSO = await this.isNativeSelectLocator(soSmartResult.locator);
+            if (isNativeSO) {
+              await this.waitForSelectOptions(soSmartResult.locator, 5000, 3);
+              await soSmartResult.locator.selectOption(soValue, { timeout: timeout || 30000 });
+            } else {
+              await this.selectFromCustomDropdown(soSmartResult.locator, String(value), timeout || 30000);
+            }
+          } catch (soError) {
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector!);
+                await this.waitForEnabled(locator, 5000);
+                const isNative = await this.isNativeSelectLocator(locator);
+                if (isNative) {
+                  await this.waitForSelectOptions(locator, 5000, 3);
+                  await locator.selectOption(soValue, { timeout: timeout || 30000 });
+                } else {
+                  await this.selectFromCustomDropdown(locator, String(value), timeout || 30000);
+                }
+              },
+              { selector, intent: description || `select ${value}`, action: 'select', timeout, value }
+            );
+          }
+          break;
+        }
+
+        // toggle: click only if current state doesn't match desired state
+        case 'toggle': {
+          if (!selector) throw new Error('Selector is required for toggle action');
+
+          // Use smart locator + self-healing like other interactive actions
+          const toggleSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+
+          const performToggle = async (toggleLocator: import('playwright').Locator) => {
+            await toggleLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await this.waitForEnabled(toggleLocator, 5000);
+
+            const isChecked = await toggleLocator.isChecked().catch(() => null);
+            if (isChecked === null) {
+              // Not a checkbox/radio — plain click
+              await this.forceScrollIntoView(toggleLocator);
+              await toggleLocator.click({ timeout: timeout || 30000 });
+            } else {
+              // value='true' → want checked, value='false' → want unchecked, undefined → flip
+              const wantChecked = value !== undefined ? String(value).toLowerCase() !== 'false' : !isChecked;
+              if (isChecked !== wantChecked) {
+                await this.forceScrollIntoView(toggleLocator);
+                await toggleLocator.click({ timeout: timeout || 30000 });
+              } else {
+                logger.debug('[COMMAND_EXECUTOR] Toggle skipped: already in desired state', {
+                  selector, isChecked, wantChecked,
+                });
+              }
+            }
+          };
+
+          try {
+            await performToggle(toggleSmartResult.locator);
+          } catch (toggleError) {
+            logger.warn('[COMMAND_EXECUTOR] Smart locator toggle failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: toggleError instanceof Error ? toggleError.message : String(toggleError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await performToggle(locator);
+              },
+              { selector, intent: description || 'toggle element', action: 'click', timeout }
+            );
+          }
+          break;
+        }
+
+        // open / close: semantic click aliases — same resilience as click
+        case 'open':
+        case 'close': {
+          if (!selector && !(isIntentCommand && intentCommand.intentMeta)) {
+            throw new Error(`Selector is required for ${action} action`);
+          }
+
+          const performOpenClose = async (locator: Locator) => {
+            await locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await this.forceScrollIntoView(locator);
+            await this.waitForEnabled(locator, 5000);
+            await locator.click({ timeout: timeout || 30000 });
+          };
+
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentOcLocator } = await this.getLocatorForIntentCommand(
+              intentCommand,
+              'click',
+              timeout || 30000
+            );
+            await performOpenClose(intentOcLocator);
+            break;
+          }
+
+          const ocSmartResult = await getSmartLocator(this.page, selector!, 'click', description);
+          try {
+            await performOpenClose(ocSmartResult.locator);
+          } catch (ocError) {
+            logger.warn(`[COMMAND_EXECUTOR] Smart locator ${action} failed, trying self-healing`, {
+              selector: selector!.substring(0, 50),
+              error: ocError instanceof Error ? ocError.message : String(ocError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector!);
+                await performOpenClose(locator);
+              },
+              { selector: selector!, intent: description || `${action} element`, action: 'click', timeout }
+            );
+          }
+          break;
+        }
+
+        // assert: maps to assertVisible (check that element is present/visible)
+        case 'assert': {
+          if (!selector) throw new Error('Selector is required for assert action');
+          const assertLocator = this.getLocatorInternal(selector);
+
+          // If assertion.type is specified, delegate to specific handlers
+          if (command.assertion?.type) {
+            switch (command.assertion.type) {
+              case 'visible': {
+                const vis = await assertLocator.isVisible({ timeout: timeout || 5000 });
+                if (!vis) throw new Error(`Assertion failed: element not visible: ${selector}`);
+                break;
+              }
+              case 'hidden': {
+                const hid = await assertLocator.isHidden({ timeout: timeout || 5000 });
+                if (!hid) throw new Error(`Assertion failed: element not hidden: ${selector}`);
+                break;
+              }
+              case 'text': {
+                await assertLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+                const txt = await assertLocator.textContent();
+                const exp = String(command.assertion.expected || '');
+                const op = command.assertion.operator || 'contains';
+                if (!this.compareValues(txt || '', exp, op)) {
+                  throw new Error(`Text assertion failed: expected "${exp}", got "${txt}"`);
+                }
+                break;
+              }
+              case 'value': {
+                await assertLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+                const val = await assertLocator.inputValue();
+                const expVal = String(command.assertion.expected || '');
+                const opVal = command.assertion.operator || '=';
+                if (!this.compareValues(val, expVal, opVal)) {
+                  throw new Error(`Value assertion failed: expected "${expVal}", got "${val}"`);
+                }
+                break;
+              }
+              case 'enabled': {
+                const enabled = await assertLocator.isEnabled({ timeout: timeout || 5000 });
+                if (!enabled) throw new Error(`Assertion failed: element not enabled: ${selector}`);
+                break;
+              }
+              case 'disabled': {
+                const disabled = await assertLocator.isDisabled({ timeout: timeout || 5000 });
+                if (!disabled) throw new Error(`Assertion failed: element not disabled: ${selector}`);
+                break;
+              }
+              case 'count': {
+                const cnt = await assertLocator.count();
+                const expCnt = Number(command.assertion.expected ?? 0);
+                const cntOp = command.assertion.operator || '=';
+                if (!this.compareValues(cnt, expCnt, cntOp)) {
+                  throw new Error(`Count assertion failed: expected ${expCnt} (${cntOp}), got ${cnt} for ${selector}`);
+                }
+                break;
+              }
+              case 'url': {
+                // Selector is not used for url assertions — assert on current page URL
+                await this.assertUrl(command.assertion);
+                break;
+              }
+              default: {
+                // Fallback: just check visibility
+                const vis2 = await assertLocator.isVisible({ timeout: timeout || 5000 });
+                if (!vis2) throw new Error(`Assertion failed: element not visible: ${selector}`);
+              }
+            }
+          } else {
+            // No assertion type — default to visible check
+            const vis3 = await assertLocator.isVisible({ timeout: timeout || 5000 });
+            if (!vis3) throw new Error(`Assertion failed: element not visible: ${selector}`);
+          }
+          logger.info('[COMMAND_EXECUTOR] Assertion passed', { action: 'assert', selector });
+          break;
+        }
+
+        case 'assertHidden': {
+          if (!selector) throw new Error('Selector is required for assertHidden action');
+          const assertHiddenLocator = this.getLocatorInternal(selector);
+          const isHidden = await assertHiddenLocator.isHidden({ timeout: timeout || 5000 });
+          if (!isHidden) {
+            throw new Error(`Element is visible but expected to be hidden: ${selector}`);
+          }
+          logger.info('Assertion passed: Element is hidden', { selector });
+          break;
+        }
+
+        case 'assertEnabled': {
+          if (!selector) throw new Error('Selector is required for assertEnabled action');
+          const assertEnabledLocator = this.getLocatorInternal(selector);
+          // Use 'attached' not 'visible' — disabled elements can be in DOM but hidden
+          await assertEnabledLocator.waitFor({ state: 'attached', timeout: timeout || 5000 });
+          const isEnabled = await assertEnabledLocator.isEnabled({ timeout: timeout || 5000 });
+          if (!isEnabled) {
+            throw new Error(`Element is disabled but expected to be enabled: ${selector}`);
+          }
+          logger.info('Assertion passed: Element is enabled', { selector });
+          break;
+        }
+
+        case 'assertDisabled': {
+          if (!selector) throw new Error('Selector is required for assertDisabled action');
+          const assertDisabledLocator = this.getLocatorInternal(selector);
+          // Use 'attached' not 'visible' — disabled elements can be in DOM but hidden
+          await assertDisabledLocator.waitFor({ state: 'attached', timeout: timeout || 5000 });
+          const isDisabled = await assertDisabledLocator.isDisabled({ timeout: timeout || 5000 });
+          if (!isDisabled) {
+            throw new Error(`Element is enabled but expected to be disabled: ${selector}`);
+          }
+          logger.info('Assertion passed: Element is disabled', { selector });
+          break;
+        }
+
+        // waitForTimeout: alias for wait
+        case 'waitForTimeout': {
+          const rawMs = timeout ?? (value !== undefined ? Number(Array.isArray(value) ? value[0] : value) : undefined);
+          const waitMs = Number.isFinite(rawMs) && (rawMs as number) > 0 ? Math.floor(rawMs as number) : 1000;
+          await this.page.waitForTimeout(waitMs);
+          break;
+        }
+
+        // waitForLoadState: wait for specific load state
+        case 'waitForLoadState': {
+          const loadState = (value as 'load' | 'domcontentloaded' | 'networkidle') || 'networkidle';
+          await this.page.waitForLoadState(loadState, { timeout: timeout || 30000 });
+          break;
+        }
+
+        // script: alias for evaluate
+        case 'script': {
+          if (!value) throw new Error('Script is required for script action');
+          const scriptAlias = String(value);
+          logger.debug('[COMMAND_EXECUTOR] Executing script (alias for evaluate)', {
+            scriptPreview: scriptAlias.substring(0, 100) + (scriptAlias.length > 100 ? '...' : ''),
+          });
+          await this.page.evaluate(scriptAlias);
+          break;
+        }
+
+        // download: read-only, just trigger the download event
+        case 'download': {
+          if (!selector) throw new Error('Selector is required for download action');
+          const downloadLocator = this.getLocatorInternal(selector);
+          await downloadLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+          // Start download — we don't save the file, just trigger and log
+          const [download] = await Promise.all([
+            this.page.waitForEvent('download', { timeout: timeout || 30000 }),
+            downloadLocator.click({ timeout: timeout || 30000 }),
+          ]);
+          logger.info('[COMMAND_EXECUTOR] Download triggered', {
+            suggestedFilename: download.suggestedFilename(),
+          });
+          break;
         }
 
         case 'evaluate':
@@ -1138,6 +1511,9 @@ export class CommandExecutor {
     for (let index = 0; index < commands.length; index++) {
       const command = commands[index];
 
+      // Capture URL before executing — used by lookahead to detect SPA navigation
+      const urlBeforeStep = this.page.url();
+
       try {
         const result = await this.executeCommand(command);
         results.push({ command, result });
@@ -1148,7 +1524,11 @@ export class CommandExecutor {
 
         // ─────────────────────────────────────────────────────────────────────
         // Lookahead wait: check next command's element readiness before executing
-        // Uses fast Playwright checks only (no AI/embeddings)
+        // Uses fast Playwright checks only (no AI/embeddings).
+        // Passes prevActionType + prevUrl so the service can:
+        //   1. Detect SPA navigation (URL changed after click/open/close/toggle)
+        //   2. Calibrate DOM stability threshold dynamically
+        //   3. Apply blind settle when no locator is available
         // ─────────────────────────────────────────────────────────────────────
         if (result.success && index < commands.length - 1) {
           const nextCommand = commands[index + 1];
@@ -1159,7 +1539,7 @@ export class CommandExecutor {
           if (intentCommand.intentMeta && nextIntentCommand.intentMeta) {
             const prevActionType = intentCommand.intentMeta.actionType as any;
 
-            // Skip lookahead if previous action already handled waiting
+            // Skip lookahead only for truly non-targeting prev actions (navigate/wait/ai_check)
             if (!shouldSkipLookaheadAfter(prevActionType)) {
               // Build IntentStep-like object for lookahead
               const nextStepForLookahead: IntentStep = {
@@ -1181,6 +1561,9 @@ export class CommandExecutor {
                     maxWaitMs: 10000,
                     settleMs: 3000,
                     autoWaitThresholdMs: 2000,
+                    // Pass context for dynamic behaviour — no hardcoded delays
+                    prevActionType,
+                    prevUrl: urlBeforeStep,
                   }
                 );
 
@@ -1192,7 +1575,6 @@ export class CommandExecutor {
                     runtimeStatus: existingMeta?.runtimeStatus || 'executed',
                     source: existingMeta?.source || 'resolver',
                     confidenceTier: existingMeta?.confidenceTier || 'medium',
-                    // V6: Add lookahead wait info
                     autoWaitApplied: true,
                     autoWaitMs: lookahead.waited,
                   } as StepRuntimeMeta & { autoWaitApplied?: boolean; autoWaitMs?: number });
@@ -1201,6 +1583,7 @@ export class CommandExecutor {
                     currentIndex: index,
                     nextStepId: nextIntentCommand.intentMeta.stepId,
                     waitedMs: lookahead.waited,
+                    navigationDetected: lookahead.navigationDetected,
                   });
                 } else if (lookahead.skipReason) {
                   logger.debug('[COMMAND_EXECUTOR] Lookahead skipped', {
@@ -1263,6 +1646,9 @@ export class CommandExecutor {
    */
   private async assertUrl(assertion: PlaywrightCommand['assertion']): Promise<void> {
     if (!assertion) throw new Error('Assertion config is required');
+    if (assertion.expected === undefined || assertion.expected === null) {
+      throw new Error('URL assertion requires an expected value');
+    }
 
     const actualUrl = this.page.url();
     const expectedUrl = String(assertion.expected);
@@ -1271,10 +1657,12 @@ export class CommandExecutor {
     const passed = this.compareValues(actualUrl, expectedUrl, operator);
 
     if (!passed) {
-      throw new Error(`URL assertion failed: expected "${expectedUrl}", got "${actualUrl}"`);
+      throw new Error(
+        `URL assertion failed (operator: "${operator}"): expected "${expectedUrl}", got "${actualUrl}"`
+      );
     }
 
-    logger.info(`Assertion passed: URL matches`, { expected: expectedUrl, actual: actualUrl });
+    logger.info(`Assertion passed: URL matches`, { operator, expected: expectedUrl, actual: actualUrl });
   }
 
   /**
@@ -1347,24 +1735,46 @@ export class CommandExecutor {
   }
 
   /**
-   * Compare values based on operator
+   * Compare values based on operator.
+   *
+   * For 'matches' / 'regex': supports /pattern/flags syntax.
+   *   "foo\d+"     → case-insensitive by default
+   *   "/foo\d+/i"  → explicit flags, wins over default
+   *   "/foo\d+/s"  → dotAll flag, matches newlines too
    */
   private compareValues(actual: any, expected: any, operator: string = '='): boolean {
     switch (operator) {
       case '=':
-        return actual === expected;
+        return String(actual) === String(expected);
       case '!=':
-        return actual !== expected;
+        return String(actual) !== String(expected);
       case '>':
         return Number(actual) > Number(expected);
       case '<':
         return Number(actual) < Number(expected);
+      case '>=':
+        return Number(actual) >= Number(expected);
+      case '<=':
+        return Number(actual) <= Number(expected);
       case 'contains':
-        return String(actual).includes(String(expected));
+        return String(actual).toLowerCase().includes(String(expected).toLowerCase());
       case 'startsWith':
-        return String(actual).startsWith(String(expected));
+        return String(actual).toLowerCase().startsWith(String(expected).toLowerCase());
       case 'endsWith':
-        return String(actual).endsWith(String(expected));
+        return String(actual).toLowerCase().endsWith(String(expected).toLowerCase());
+      case 'matches':
+      case 'regex': {
+        // Supports /pattern/flags syntax; default: case-insensitive
+        const { pattern, flags } = parseRegexString(String(expected), /* caseSensitive= */ false);
+        try {
+          return new RegExp(pattern, flags).test(String(actual));
+        } catch {
+          return false;
+        }
+      }
+      case 'glob':
+        // URL-aware glob: * [^/]*, ** .*, ? heuristic, no wildcards → substring
+        return matchGlob(String(actual), String(expected), { caseSensitive: false });
       default:
         return actual === expected;
     }
@@ -1391,8 +1801,14 @@ export class CommandExecutor {
     }
 
     // Check for comma-separated values (e.g., "option1,option2")
-    if (strValue.includes(',') && !strValue.includes('"')) {
-      return strValue.split(',').map(v => v.trim());
+    // Only split if there are no spaces adjacent to commas (avoids "First Last, Second Last" splitting incorrectly)
+    // and the value is not a quoted string
+    if (strValue.includes(',') && !strValue.includes('"') && !strValue.includes("'")) {
+      const parts = strValue.split(',').map(v => v.trim()).filter(Boolean);
+      // If every part looks like a simple token (no inner whitespace), treat as multi-select
+      if (parts.every(p => !/\s/.test(p))) {
+        return parts;
+      }
     }
 
     return strValue;
@@ -1827,6 +2243,15 @@ export class CommandExecutor {
     if (this.selfHealingEnabled && healAttempts < this.maxHealAttempts) {
       healAttempts++;
 
+      // Deduct 1 credit for self-heal retry
+      if (this.metadata.userId) {
+        await CreditCostTrackerService.deductStepCredit(
+          this.metadata.userId,
+          `heal_intent_${Date.now()}`,
+          `Intent self-heal: ${intentMeta?.intentDescription?.substring(0, 50)}`
+        );
+      }
+
       try {
         const healingResult = await SelfHealingService.healSelector({
           oldSelector: command.selector || '',
@@ -2112,17 +2537,27 @@ export class CommandExecutor {
       }
 
       // Healing successful - log and retry with new selector
+      const healConfidence = healingResult.diff?.confidence ?? 0;
       logger.info('[COMMAND_EXECUTOR] Self-healing successful', {
         oldSelector: context.selector,
         newSelector: healingResult.newSelector,
         autoApplied: healingResult.autoApplied,
-        confidence: healingResult.diff.confidence,
+        confidence: healConfidence,
       });
 
       // ✅ FIX 7: Use configurable confidence threshold
-      const meetsConfidenceThreshold = healingResult.diff.confidence >= this.selfHealingConfidenceThreshold;
+      const meetsConfidenceThreshold = healConfidence >= this.selfHealingConfidenceThreshold;
 
       if (healingResult.autoApplied && meetsConfidenceThreshold) {
+        // Deduct 1 credit for self-heal retry
+        if (this.metadata.userId) {
+          await CreditCostTrackerService.deductStepCredit(
+            this.metadata.userId,
+            `heal_${Date.now()}`,
+            `Self-heal retry: ${context.selector?.substring(0, 50)}`
+          );
+        }
+
         logger.info('[COMMAND_EXECUTOR] Auto-applying healed selector', {
           newSelector: healingResult.newSelector,
           whatChanged: healingResult.diff.what_changed,
@@ -2241,7 +2676,9 @@ export class CommandExecutor {
 
       case 'type':
         if (value === undefined) throw new Error('Value is required for type action');
-        await locator.fill(String(value), { timeout: defaultTimeout });
+        // Use pressSequentially (not fill) to match main handler — fires keydown/keypress/keyup per char
+        // Important for autocomplete, OTP, and sites that listen to keyboard events
+        await locator.pressSequentially(String(value), { timeout: defaultTimeout });
         break;
 
       case 'select':
@@ -2483,40 +2920,46 @@ export class CommandExecutor {
     }
 
     if (matcher.regex) {
-      const pattern = matcher.regex;
-      const flags = caseSensitive ? '' : 'i';
+      // Parse /pattern/flags syntax + validate in Node.js before sending to browser
+      const payload = buildRegexWaitPayload(matcher.regex, caseSensitive, negate);
       await this.page.waitForFunction(
         ({ pattern, flags, negate }: { pattern: string; flags: string; negate: boolean }) => {
-          const re = new RegExp(pattern, flags);
-          const href = String((globalThis as any).location?.href ?? '');
-          const matches = re.test(href);
-          return negate ? !matches : matches;
+          try {
+            const re = new RegExp(pattern, flags);
+            const href = String((globalThis as any).location?.href ?? '');
+            const matches = re.test(href);
+            return negate ? !matches : matches;
+          } catch {
+            return false;
+          }
         },
-        { pattern, flags, negate: negate },
+        payload,
         { timeout: timeoutMs }
       );
       return;
     }
 
     if (matcher.glob) {
-      // Convert glob to regex (simple conversion)
-      const globToRegex = (glob: string): string => {
-        return glob
-          .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape special chars
-          .replace(/\*\*/g, '.*') // ** → .*
-          .replace(/\*/g, '[^/]*') // * → [^/]*
-          .replace(/\?/g, '.'); // ? → .
-      };
-      const pattern = globToRegex(matcher.glob);
-      const flags = caseSensitive ? '' : 'i';
+      // Convert glob to regex using URL-aware semantics:
+      //   *   → [^/]*  (segment wildcard)
+      //   **  → .*     (path globstar)
+      //   ?   → [^/] or \? (query-string heuristic)
+      //   No wildcards → substring match (no anchors)
+      //   With protocol prefix → full anchor ^...$
+      //   Partial glob → suffix anchor only
+      const payload = buildGlobWaitPayload(matcher.glob, caseSensitive, negate);
       await this.page.waitForFunction(
         ({ pattern, flags, negate }: { pattern: string; flags: string; negate: boolean }) => {
-          const re = new RegExp(pattern, flags);
-          const href = String((globalThis as any).location?.href ?? '');
-          const matches = re.test(href);
-          return negate ? !matches : matches;
+          try {
+            const re = new RegExp(pattern, flags);
+            const href = String((globalThis as any).location?.href ?? '');
+            const matches = re.test(href);
+            return negate ? !matches : matches;
+          } catch {
+            return false;
+          }
         },
-        { pattern, flags, negate: negate },
+        payload,
         { timeout: timeoutMs }
       );
       return;
@@ -2593,9 +3036,9 @@ export class CommandExecutor {
           // @ts-ignore - browser context
           const rect = el.getBoundingClientRect();
           // @ts-ignore - browser context
-          const elementTop = rect.top + window.pageYOffset;
+          const elementTop = rect.top + window.scrollY;
           // @ts-ignore - browser context
-          const elementLeft = rect.left + window.pageXOffset;
+          const elementLeft = rect.left + window.scrollX;
 
           // Scroll to element with some offset from top
           const offset = 100; // Leave some space from top
@@ -2603,7 +3046,7 @@ export class CommandExecutor {
           window.scrollTo({
             top: elementTop - offset,
             left: elementLeft,
-            behavior: 'smooth'
+            behavior: 'instant', // 'instant' more reliable than 'smooth' in headless
           });
         });
 
@@ -2654,56 +3097,67 @@ export class CommandExecutor {
   private async ensureTopMostAtCenter(locator: Locator, timeout: number = 2000): Promise<void> {
     const startTime = Date.now();
     const pollInterval = 250;
+    // Use a temporary data attribute to identify the element inside browser context
+    // (ElementHandle cannot be compared by reference across evaluate boundary)
+    const marker = `data-agent-topmost-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-    while (Date.now() - startTime < timeout) {
-      try {
-        // Get the target element's bounding box
-        const box = await locator.boundingBox();
-        if (!box) {
-          throw new Error('Element has no bounding box (not visible or not in DOM)');
-        }
-
-        // Calculate center point
-        const centerX = box.x + box.width / 2;
-        const centerY = box.y + box.height / 2;
-
-        // Check if the element at center point is the target or its descendant
-        const isTopMost = await this.page.evaluate(
-          ({ x, y, targetElement }) => {
-            // @ts-ignore - browser context
-            const elementAtPoint = document.elementFromPoint(x, y);
-            if (!elementAtPoint) return false;
-
-            // Check if elementAtPoint is the target or a descendant of target
-            return targetElement === elementAtPoint || targetElement.contains(elementAtPoint);
-          },
-          { x: centerX, y: centerY, targetElement: await locator.elementHandle() }
-        );
-
-        if (isTopMost) {
-          logger.debug('[COMMAND_EXECUTOR] Element is topmost at center point');
-          return; // Success
-        }
-
-        // Element is not topmost, wait and retry
-        logger.debug('[COMMAND_EXECUTOR] Element not topmost, waiting...', {
-          elapsed: Date.now() - startTime,
-        });
-        await this.page.waitForTimeout(pollInterval);
-      } catch (error) {
-        // If we can't get bounding box or evaluate, element might be gone
-        logger.debug('[COMMAND_EXECUTOR] Error checking topmost status', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        await this.page.waitForTimeout(pollInterval);
-      }
+    try {
+      await locator.evaluate((el, attr) => el.setAttribute(attr, '1'), marker);
+    } catch {
+      // If we can't set attribute (e.g., SVG, iframe cross-origin) — skip overlay check silently
+      logger.debug('[COMMAND_EXECUTOR] Cannot set topmost marker, skipping overlay check');
+      return;
     }
 
-    // Timeout reached - element is still not topmost
-    throw new Error(
-      `Element is not clickable: it is covered by another element (overlay, modal, sticky header, etc.). ` +
-      `Waited ${timeout}ms but the element at the click point is still not the target element.`
-    );
+    try {
+      while (Date.now() - startTime < timeout) {
+        try {
+          const box = await locator.boundingBox();
+          if (!box) {
+            await this.page.waitForTimeout(pollInterval);
+            continue;
+          }
+
+          const centerX = box.x + box.width / 2;
+          const centerY = box.y + box.height / 2;
+
+          const isTopMost = await this.page.evaluate(
+            ({ x, y, attr }: { x: number; y: number; attr: string }) => {
+              // @ts-ignore - browser context
+              const elementAtPoint = document.elementFromPoint(x, y);
+              if (!elementAtPoint) return false;
+              // Walk up from hit element to see if our marked element is an ancestor or self
+              // @ts-ignore - browser context
+              return elementAtPoint.closest(`[${attr}]`) !== null;
+            },
+            { x: centerX, y: centerY, attr: marker }
+          );
+
+          if (isTopMost) {
+            logger.debug('[COMMAND_EXECUTOR] Element is topmost at center point');
+            return;
+          }
+
+          logger.debug('[COMMAND_EXECUTOR] Element not topmost, waiting...', {
+            elapsed: Date.now() - startTime,
+          });
+          await this.page.waitForTimeout(pollInterval);
+        } catch (error) {
+          logger.debug('[COMMAND_EXECUTOR] Error checking topmost status', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await this.page.waitForTimeout(pollInterval);
+        }
+      }
+
+      throw new Error(
+        `Element is not clickable: it is covered by another element (overlay, modal, sticky header, etc.). ` +
+        `Waited ${timeout}ms but the element at the click point is still not the target element.`
+      );
+    } finally {
+      // Always clean up the marker attribute
+      await locator.evaluate((el, attr) => el.removeAttribute(attr), marker).catch(() => {});
+    }
   }
 
   /**
@@ -2789,9 +3243,24 @@ export class CommandExecutor {
     value: string,
     timeout: number
   ): Promise<void> {
-    // Custom dropdown: click trigger → find visible option → click option
+    // Custom dropdown: click trigger → wait for dropdown to open → find visible option → click option
     await locator.click({ timeout });
-    await this.page.waitForTimeout(300);
+
+    // Wait for any ARIA dropdown container to appear (up to 3s), instead of hardcoded 300ms
+    // This is resilient to slow networks / animations
+    const dropdownOpenedAt = Date.now();
+    const dropdownWaitMs = Math.min(timeout, 3000);
+    const ariaContainerSelector = '[role="listbox"],[role="menu"],[role="dialog"],[role="combobox"] [role="option"]';
+    await this.page
+      .locator(ariaContainerSelector)
+      .first()
+      .waitFor({ state: 'visible', timeout: dropdownWaitMs })
+      .catch(() => {
+        // Dropdown may be non-ARIA — fall through to text-based strategies
+        logger.debug('[COMMAND_EXECUTOR] No ARIA dropdown container appeared after click', {
+          elapsedMs: Date.now() - dropdownOpenedAt,
+        });
+      });
 
     // Phase 1: Scoped search inside visible ARIA container (safest — avoids same-text elsewhere)
     const containers = [

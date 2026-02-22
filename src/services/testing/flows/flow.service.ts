@@ -193,6 +193,18 @@ export class FlowService {
   static async delete(id: string, userId: string): Promise<boolean> {
     logger.info('[FLOW_SERVICE] Deleting flow', { id });
 
+    // Clean up regression plan items referencing this flow
+    const { error: planCleanupError } = await supabaseAdmin
+      .from('regression_plan_items')
+      .delete()
+      .eq('flow_id', id);
+
+    if (planCleanupError) {
+      logger.warn('[FLOW_SERVICE] Failed to cleanup plan items for deleted flow', {
+        error: planCleanupError, id,
+      });
+    }
+
     const { error } = await supabaseAdmin
       .from('test_flows')
       .delete()

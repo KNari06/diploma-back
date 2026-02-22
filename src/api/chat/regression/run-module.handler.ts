@@ -60,7 +60,7 @@ export async function handleRunModuleIntent(
         .eq('workspace_id', workspace_id)
         .eq('user_id', userId)
         .limit(1)
-        .single();
+        .maybeSingle();
 
       if (project) {
         const { data: mod } = await supabaseAdmin
@@ -69,7 +69,7 @@ export async function handleRunModuleIntent(
           .eq('project_id', project.id)
           .ilike('name', moduleName)
           .limit(1)
-          .single();
+          .maybeSingle();
 
         if (mod) {
           targetModuleId = mod.id;

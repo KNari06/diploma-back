@@ -7,6 +7,7 @@
 import { dbAdminService } from '@/db/supabase';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service'; // Self-healing service for automatic selector recovery
 import { AICostManager, getCostManager, removeCostManager } from '@/services/ai/cost/ai-cost-manager.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { getActionEmoji, getActionIcon } from '@/websocket/types/types';
@@ -1109,14 +1110,8 @@ export class IntelligentTestOrchestrator {
       });
     }
 
-    // Convert TestHint[] to simpler format for ContextualActionGenerator
-    const hints = this.config.hints?.map(h => ({
-      description: h.description,
-      action: h.action,
-      target: h.target,
-      value: h.value,
-      priority: h.priority,
-    }));
+    // Pass TestHint[] directly to ContextualActionGenerator (full context preserved)
+    const hints = this.config.hints;
 
     // ✅ FIX: Add timeout and error handling to action generation
     let result: { actions: DynamicAction[]; reasoning: string; confidence: number };
@@ -1319,6 +1314,22 @@ export class IntelligentTestOrchestrator {
         });
 
       this.emitEvent('action_executing', { action: plannedAction.description });
+
+      // Deduct 1 credit for action execution
+      if (this.userId && this.testId) {
+        const creditResult = await CreditCostTrackerService.deductStepCredit(
+          this.userId,
+          this.testId,
+          `Action ${i + 1}/${actions.length}: ${plannedAction.description}`
+        );
+        if (!creditResult.success) {
+          logger.warn('[INTELLIGENT_ORCHESTRATOR] Stopping execution: insufficient credits', {
+            testId: this.testId,
+            actionIndex: i + 1,
+          });
+          break;
+        }
+      }
 
       const shouldSnapshotBefore = ['fill', 'type', 'click', 'select', 'check', 'uncheck'].includes(plannedAction.action);
       const snapshotBefore: DOMSnapshot = shouldSnapshotBefore

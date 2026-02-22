@@ -1419,13 +1419,20 @@ const startServer = async () => {
 
     // Start HTTP server
     try {
-      server = app.listen(env.PORT, () => {
+      server = app.listen(env.PORT, async () => {
         logger.info(`🚀 QAIT Backend API started on port ${env.PORT}`);
         logger.info(`📊 Environment: ${env.NODE_ENV}`);
         logger.info(`🏷️ Queue prefix: ${env.QUEUE_PREFIX}`);
         logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
         logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
 
+        // Cleanup zombie regression runs from previous server crashes
+        try {
+          const { RegressionRunService } = await import('@/services/testing/regression/regression-run.service');
+          await RegressionRunService.cleanupZombieRuns();
+        } catch (cleanupError) {
+          logger.error('[SERVER] Failed to cleanup zombie runs', { error: cleanupError });
+        }
       });
 
       /**

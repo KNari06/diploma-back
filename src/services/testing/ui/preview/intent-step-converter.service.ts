@@ -64,7 +64,7 @@ function mapActionType(intentAction: IntentActionType): string {
     case 'wait':
       return 'wait';
     case 'assert':
-      return 'assertText'; // "Check contains" - verify element contains expected text
+      return 'assert'; // Dispatcher in executor: delegates by assertion.type (visible/text/value/etc)
     case 'navigate':
       return 'goto';
     case 'select':
@@ -81,11 +81,11 @@ function mapActionType(intentAction: IntentActionType): string {
     case 'uncheck':
       return 'uncheck';
     case 'toggle':
-      return 'click'; // Toggle is click on checkable element
+      return 'toggle'; // State-aware: checks current state before clicking
     case 'open':
-      return 'click'; // Open is click on expandable element
+      return 'open'; // Semantic click with enabled guard
     case 'close':
-      return 'click'; // Close is click on closable element
+      return 'close'; // Semantic click with enabled guard
     // V3: AI check
     case 'ai_check':
       return 'aiCheck'; // New runtime action for AI-based assertions
@@ -226,8 +226,7 @@ export function convertIntentStepToCommand(
     }
 
     case 'assert':
-      // For assert ("Check contains"), set up assertion config
-      // If value is provided, check text content; otherwise fall back to visibility check
+      // For assert, set up assertion config — executor dispatches by assertion.type
       if (step.value && step.value.trim().length > 0) {
         command.assertion = {
           type: 'text',
@@ -235,7 +234,7 @@ export function convertIntentStepToCommand(
           operator: 'contains',
         };
       } else {
-        command.action = 'assertVisible';
+        // No value → visibility check (action stays 'assert', executor defaults to visible)
         command.assertion = {
           type: 'visible',
           expected: true,

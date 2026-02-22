@@ -43,8 +43,8 @@ export class TestSchedulerJobHandler {
         logger.error('[TEST_SCHEDULER] Scheduled run failed', { error });
       });
     }, intervalMs);
-    // Do not keep the process alive solely because of the scheduler timer
-    this.intervalId.unref?.();
+    // NOTE: Do NOT call .unref() — the scheduler process MUST stay alive.
+    // The interval is the sole reason the event loop keeps running.
   }
 
   /**

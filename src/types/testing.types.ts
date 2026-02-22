@@ -777,6 +777,7 @@ export interface RunReportExecArtifacts {
   videoUrl?: string;
   traceUrl?: string;
   screenshots: string[];
+  bugScreenshots: string[];
   consoleLogs: string[];
   networkLogs: Array<{
     method: string;
@@ -784,6 +785,20 @@ export interface RunReportExecArtifacts {
     status?: number;
     durationMs?: number;
   }>;
+  qualityChecks?: RunReportQualityChecks;
+}
+
+/**
+ * Quality checks collected during test execution
+ */
+export interface RunReportQualityChecks {
+  webVitals?: Record<string, any>;
+  accessibility?: {
+    warnings: any[];
+    totalWarnings: number;
+  };
+  brokenResources?: any[];
+  slowAPIs?: any[];
 }
 
 /**
@@ -840,6 +855,7 @@ export interface RunReportArtifactsSummary {
   videoUrl?: string;
   traceUrl?: string;
   screenshots: string[];
+  bugScreenshots: string[];
   consoleLogs: string[];
   networkLogs: Array<{
     method: string;
@@ -847,6 +863,7 @@ export interface RunReportArtifactsSummary {
     status?: number;
     durationMs?: number;
   }>;
+  qualityChecks?: RunReportQualityChecks;
 }
 
 /**

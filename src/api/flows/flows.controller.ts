@@ -115,11 +115,26 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
           .single();
 
         if (testCaseError) {
-          logger.error('[FLOWS_API] Failed to create initial test case', {
+          logger.error('[FLOWS_API] Failed to create initial test case, rolling back flow', {
             error: testCaseError,
             flowId: flow.id,
           });
-          // Don't fail the whole request, just log the error
+          // Rollback: delete the orphaned flow since it's unusable without a test case
+          try {
+            await FlowService.delete(flow.id, userId);
+            logger.info('[FLOWS_API] Rolled back orphaned flow', { flowId: flow.id });
+          } catch (rollbackError) {
+            logger.error('[FLOWS_API] Failed to rollback orphaned flow', {
+              flowId: flow.id,
+              error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+            });
+          }
+          res.status(500).json({
+            success: false,
+            error: 'Failed to create flow with initial test case',
+            details: testCaseError.message,
+          });
+          return;
         } else {
           createdTestCaseId = testCase.id;
           logger.info('[FLOWS_API] Created initial intent test case', {

@@ -43,7 +43,7 @@ export const MODEL_PRICING = {
  * Based on average token consumption
  */
 export const TEST_CREDITS = {
-  INTELLIGENT: 20, // ~10K tokens (multiple pages + vision analysis)
+  INTELLIGENT: 1, // Per-step billing: 1 credit deducted per step/action during execution
   STANDARD: 1, // No AI, just infrastructure
   API: 2, // ~1K tokens (lightweight AI analysis)
   CHAT: 1, // 1 credit per chat message

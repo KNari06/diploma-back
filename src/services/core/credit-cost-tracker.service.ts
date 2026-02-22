@@ -311,6 +311,35 @@ export class CreditCostTrackerService {
   }
 
   /**
+   * Deduct exactly 1 credit for a single step/action execution.
+   * Non-fatal: returns { success, newBalance } — callers decide whether to stop on failure.
+   */
+  static async deductStepCredit(
+    userId: string,
+    testId: string,
+    description: string
+  ): Promise<{ success: boolean; newBalance: number }> {
+    try {
+      const result = await this.deductCreditsForTest({
+        userId,
+        testType: 'intelligent',
+        credits: 1,
+        costUSD: 0,
+        testId,
+        description,
+      });
+      return { success: result.success, newBalance: result.newBalance };
+    } catch (error) {
+      logger.warn('[CREDIT_COST_TRACKER] deductStepCredit failed', {
+        userId,
+        testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, newBalance: 0 };
+    }
+  }
+
+  /**
    * Check if user has enough credits for a test
    * @param userId - User ID
    * @param testType - Type of test
