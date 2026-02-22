@@ -575,9 +575,19 @@ export async function getRunStats(req: AuthenticatedRequest, res: Response): Pro
 
     const stats = await ExecutionService.getStats(runId);
 
+    // Include run-level status so frontend can detect cancelled/failed runs
+    const { data: run } = await supabaseAdmin
+      .from('regression_runs')
+      .select('status')
+      .eq('id', runId)
+      .maybeSingle();
+
     res.json({
       success: true,
-      data: stats,
+      data: {
+        ...stats,
+        status: run?.status || null,
+      },
       timestamp: new Date(),
     });
   } catch (error) {
@@ -740,10 +750,36 @@ export async function getRunExecutions(req: AuthenticatedRequest, res: Response)
 
     const executions = await ExecutionService.getByRunId(runId);
 
-    // Map to frontend-friendly format with testId extracted from result
+    // Batch-fetch test case names for UI display
+    const uiTestCaseIds = [...new Set(
+      executions.filter((e) => e.testType === 'ui').map((e) => e.testCaseId)
+    )];
+    const apiTestCaseIds = [...new Set(
+      executions.filter((e) => e.testType === 'api').map((e) => e.testCaseId)
+    )];
+
+    const namesMap = new Map<string, string>();
+
+    if (uiTestCaseIds.length > 0) {
+      const { data: uiNames } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, name')
+        .in('id', uiTestCaseIds);
+      for (const row of uiNames || []) namesMap.set(row.id, row.name);
+    }
+    if (apiTestCaseIds.length > 0) {
+      const { data: apiNames } = await supabaseAdmin
+        .from('api_test_configs')
+        .select('id, name')
+        .in('id', apiTestCaseIds);
+      for (const row of apiNames || []) namesMap.set(row.id, row.name);
+    }
+
+    // Map to frontend-friendly format with testId and testCaseName
     const mapped = executions.map((exec) => ({
       id: exec.id,
       testCaseId: exec.testCaseId,
+      testCaseName: namesMap.get(exec.testCaseId) || null,
       testType: exec.testType,
       status: exec.status,
       browser: exec.browser,

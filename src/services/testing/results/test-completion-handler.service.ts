@@ -675,6 +675,28 @@ export class TestCompletionHandlerService {
             summary,
           });
 
+          // Emit WebSocket completion event so frontend updates immediately (no polling delay)
+          try {
+            webSocketService.emitRegressionRunProgress(run.user_id, {
+              runId: run.id,
+              userId: run.user_id,
+              status: finalStatus === 'completed' ? 'completed' : 'failed',
+              progress: 100,
+              message: finalStatus === 'completed'
+                ? `Run completed: ${summary.passed} passed, ${summary.failed} failed`
+                : `Run failed: ${summary.passed} passed, ${summary.failed} failed`,
+              errorCode: summary.creditExhausted ? 'INSUFFICIENT_CREDITS' : undefined,
+              details: {
+                totalTests: summary.total,
+                completedTests: summary.total,
+                passed: summary.passed,
+                failed: summary.failed,
+                skipped: summary.skipped,
+              },
+              timestamp: new Date().toISOString(),
+            });
+          } catch { /* non-fatal */ }
+
           // Create notification for regression run
           await this.createRegressionRunNotification(run, finalStatus, summary);
         }
@@ -786,6 +808,27 @@ export class TestCompletionHandlerService {
           status: finalStatus,
           summary,
         });
+
+        // Emit WebSocket completion event (fallback path)
+        try {
+          webSocketService.emitRegressionRunProgress(run.user_id, {
+            runId: run.id,
+            userId: run.user_id,
+            status: finalStatus === 'completed' ? 'completed' : 'failed',
+            progress: 100,
+            message: finalStatus === 'completed'
+              ? `Run completed: ${passed} passed, ${failed} failed`
+              : `Run failed: ${passed} passed, ${failed} failed`,
+            details: {
+              totalTests: tests.length,
+              completedTests: tests.length,
+              passed,
+              failed,
+              skipped: 0,
+            },
+            timestamp: new Date().toISOString(),
+          });
+        } catch { /* non-fatal */ }
 
         // Create notification for regression run
         await this.createRegressionRunNotification(run, finalStatus, summary);
