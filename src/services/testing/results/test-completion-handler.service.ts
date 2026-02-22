@@ -247,8 +247,22 @@ export class TestCompletionHandlerService {
           message = `Test completed successfully across ${results.length} browser(s)`;
         }
       } else if (status === 'failed') {
-        title = 'Background test failed';
-        message = `Test failed with ${errorsCount} error(s)`;
+        // Check if failure was due to credit exhaustion
+        const isCreditExhaustion = results.some((r) =>
+          r.errors?.some((e: any) =>
+            (typeof e === 'string' ? e : e?.message || '')
+              .toLowerCase()
+              .includes('insufficient credits')
+          )
+        );
+
+        if (isCreditExhaustion) {
+          title = 'Test stopped: insufficient credits';
+          message = 'Test execution was interrupted because your credit balance ran out. Top up credits to continue testing.';
+        } else {
+          title = 'Background test failed';
+          message = `Test failed with ${errorsCount} error(s)`;
+        }
       } else if (status === 'cancelled') {
         title = 'Background test cancelled';
         message = 'Test was cancelled before completion';
@@ -489,8 +503,13 @@ export class TestCompletionHandlerService {
           message = `All ${summary.total || 0} test(s) passed successfully`;
         }
       } else if (finalStatus === 'failed') {
-        title = `${triggerLabel} regression failed`;
-        message = `Regression run failed: ${summary.failed || 0} test(s) failed`;
+        if (summary.creditExhausted) {
+          title = `${triggerLabel} regression stopped: insufficient credits`;
+          message = 'Regression run was interrupted because your credit balance ran out. Top up credits to continue testing.';
+        } else {
+          title = `${triggerLabel} regression failed`;
+          message = `Regression run failed: ${summary.failed || 0} test(s) failed`;
+        }
       } else if (finalStatus === 'cancelled') {
         title = `${triggerLabel} regression cancelled`;
         message = 'Regression run was cancelled before completion';
@@ -583,7 +602,7 @@ export class TestCompletionHandlerService {
       // Prefer unified executions if present (covers UI + API and avoids relying only on tests table)
       const { data: unifiedExecutions, error: execError } = await supabaseAdmin
         .from('test_executions')
-        .select('status')
+        .select('status, error_message')
         .eq('run_id', run.id);
 
       if (execError) {
@@ -610,12 +629,17 @@ export class TestCompletionHandlerService {
           finalStatus = 'failed';
         }
 
+        const creditExhausted = unifiedExecutions.some((e: any) =>
+          e.error_message?.toLowerCase().includes('insufficient credits')
+        );
+
         const summary = {
           total: statuses.length,
           passed: statuses.filter((s: string) => s === 'passed').length,
           failed: statuses.filter((s: string) => s === 'failed').length,
           skipped: statuses.filter((s: string) => s === 'skipped').length,
           cancelled: statuses.filter((s: string) => s === 'cancelled').length,
+          creditExhausted,
           completed_at: new Date().toISOString(),
         };
 

@@ -729,6 +729,8 @@ export interface RegressionRunProgressPayload {
   status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed';
   progress: number; // 0-100
   message: string;
+  /** Machine-readable error code for specific failure reasons (e.g. 'INSUFFICIENT_CREDITS') */
+  errorCode?: string;
   details?: {
     totalTests: number;
     completedTests: number;
