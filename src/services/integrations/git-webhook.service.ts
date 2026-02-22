@@ -143,6 +143,11 @@ export class GitWebhookService {
     }
 
     if (!integration) {
+      logger.warn('[GIT_WEBHOOK] No git integration found for repo', {
+        provider,
+        repositoryUrl: repositoryUrlRaw,
+        deliveryId,
+      });
       await this.updateDeliveryStatus(provider, deliveryId, { status: 'ignored', error: 'integration_not_found' });
       return { queued: false, ignored: true, reason: 'integration_not_found' };
     }

@@ -97,6 +97,17 @@ const router = Router();
  *                           enum: [merge_to_main, pr_opened, release]
  *                       branch:
  *                         type: string
+ *                         description: Branch to trigger on (e.g. main, develop)
+ *                       integrationId:
+ *                         type: string
+ *                         format: uuid
+ *                         description: Git integration ID (from GET /git-integrations). Use when repo already added.
+ *                       repositoryUrl:
+ *                         type: string
+ *                         description: "Repo URL from GET /integrations/github/repos (e.g. https://github.com/owner/repo). Used when dropdown shows user's repos."
+ *                       webhookSecret:
+ *                         type: string
+ *                         description: Required when repositoryUrl is set and no git-integration exists for this project+repo
  *                   runtime:
  *                     type: object
  *                     properties:

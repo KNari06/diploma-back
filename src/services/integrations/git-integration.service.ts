@@ -210,6 +210,35 @@ export class GitIntegrationService {
     return (data || null) as GitIntegrationRow | null;
   }
 
+  /** Find git integration by project and repository URL (for plan automation: repo chosen from user's GitHub/GitLab list). */
+  static async findByProjectAndRepositoryUrl(
+    projectId: string,
+    repositoryUrl: string
+  ): Promise<GitIntegrationRow | null> {
+    const provider: GitProvider = repositoryUrl.includes('github.com') ? 'github' : 'gitlab';
+    const normalizedUrl = this.normalizeRepositoryUrl(repositoryUrl, provider);
+    this.validateRepositoryUrl(normalizedUrl, provider);
+
+    const { data, error } = await supabaseAdmin
+      .from('git_integrations')
+      .select('*')
+      .eq('project_id', projectId)
+      .eq('repository_url', normalizedUrl)
+      .eq('enabled', true)
+      .maybeSingle();
+
+    if (error) {
+      logger.error('[GIT_INTEGRATION] Failed to find integration by project+repo', {
+        projectId,
+        repositoryUrl: normalizedUrl,
+        error: error.message,
+      });
+      return null;
+    }
+
+    return (data || null) as GitIntegrationRow | null;
+  }
+
   private static normalizeRepositoryUrl(input: string, provider: GitProvider): string {
     const trimmed = (input || '').trim();
     if (!trimmed) {

@@ -4,6 +4,7 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
+import { GitIntegrationService } from '@/services/integrations/git-integration.service';
 import type {
     AddPlanItemParams,
     CreateRegressionPlanParams,
@@ -1023,30 +1024,83 @@ export class RegressionPlanService {
   }
 
   /**
-   * Link/unlink git_integrations.plan_id for this plan
+   * Link/unlink git_integrations.plan_id for this plan.
+   * Priority: integrationId > repositoryUrl (find or create) > first enabled integration (backward compatible).
    */
   private static async syncGitIntegration(
     plan: RegressionPlan,
     gitConfig?: PlanGitTriggersConfig
   ): Promise<void> {
     try {
+      // Unlink any integrations currently pointing to this plan
+      await supabaseAdmin
+        .from('git_integrations')
+        .update({ plan_id: null })
+        .eq('plan_id', plan.id);
+
       if (!gitConfig || !gitConfig.enabled) {
-        // Unlink any integrations pointing to this plan
-        await supabaseAdmin
-          .from('git_integrations')
-          .update({ plan_id: null })
-          .eq('plan_id', plan.id);
         return;
       }
 
-      // Find the project's git integration and link to this plan
-      const { data: integration } = await supabaseAdmin
-        .from('git_integrations')
-        .select('id')
-        .eq('project_id', plan.projectId)
-        .eq('enabled', true)
-        .limit(1)
-        .maybeSingle();
+      let integration: { id: string } | null = null;
+
+      if (gitConfig.integrationId) {
+        const { data } = await supabaseAdmin
+          .from('git_integrations')
+          .select('id')
+          .eq('id', gitConfig.integrationId)
+          .eq('project_id', plan.projectId)
+          .eq('enabled', true)
+          .maybeSingle();
+        integration = data;
+        if (!integration) {
+          logger.warn('[REGRESSION_PLAN_SERVICE] Chosen git integration not found or not allowed', {
+            planId: plan.id,
+            integrationId: gitConfig.integrationId,
+            projectId: plan.projectId,
+          });
+          return;
+        }
+      } else if (gitConfig.repositoryUrl?.trim()) {
+        const existing = await GitIntegrationService.findByProjectAndRepositoryUrl(
+          plan.projectId,
+          gitConfig.repositoryUrl.trim()
+        );
+        if (existing) {
+          integration = { id: existing.id };
+        } else if (gitConfig.webhookSecret?.trim()) {
+          const provider = gitConfig.repositoryUrl.includes('github.com') ? 'github' : 'gitlab';
+          const created = await GitIntegrationService.createIntegration({
+            projectId: plan.projectId,
+            userId: plan.userId,
+            provider,
+            repositoryUrl: gitConfig.repositoryUrl.trim(),
+            webhookSecret: gitConfig.webhookSecret.trim(),
+            events: ['pull_request', 'push', 'release'],
+          });
+          integration = { id: created.id };
+          logger.info('[REGRESSION_PLAN_SERVICE] Created git integration from repositoryUrl', {
+            planId: plan.id,
+            integrationId: created.id,
+            repositoryUrl: created.repository_url,
+          });
+        } else {
+          logger.warn('[REGRESSION_PLAN_SERVICE] repositoryUrl set but no matching integration and no webhookSecret', {
+            planId: plan.id,
+            projectId: plan.projectId,
+          });
+          return;
+        }
+      } else {
+        const { data } = await supabaseAdmin
+          .from('git_integrations')
+          .select('id')
+          .eq('project_id', plan.projectId)
+          .eq('enabled', true)
+          .limit(1)
+          .maybeSingle();
+        integration = data;
+      }
 
       if (!integration) {
         logger.warn('[REGRESSION_PLAN_SERVICE] No git integration found for project', {
@@ -1070,6 +1124,7 @@ export class RegressionPlanService {
         error: error instanceof Error ? error.message : String(error),
         planId: plan.id,
       });
+      throw error;
     }
   }
 

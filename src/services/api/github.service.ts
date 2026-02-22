@@ -77,6 +77,12 @@ export interface GitHubRepo {
   forks_count: number;
 }
 
+export interface GitHubBranch {
+  name: string;
+  commit: { sha: string; url: string };
+  protected?: boolean;
+}
+
 /**
  * Get GitHub token for user
  * Now uses centralized IntegrationTokenService
@@ -388,4 +394,42 @@ export async function listUserRepos(
     });
     throw error;
   }
+}
+
+/**
+ * List branches for a repository
+ * GET /repos/{owner}/{repo}/branches
+ */
+export async function listBranches(
+  accessToken: string,
+  owner: string,
+  repo: string
+): Promise<GitHubBranch[]> {
+  const ownerEnc = encodeURIComponent(owner);
+  const repoEnc = encodeURIComponent(repo);
+  const url = `${GITHUB_API_URL}/repos/${ownerEnc}/${repoEnc}/branches?per_page=100`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    logger.error('[GITHUB_SERVICE] Failed to list branches', {
+      owner,
+      repo,
+      status: response.status,
+      error: errorText,
+    });
+    throw new Error(`GitHub API error: ${response.status} ${errorText}`);
+  }
+
+  const branches = (await response.json()) as GitHubBranch[];
+  logger.info('[GITHUB_SERVICE] Branches listed', { owner, repo, count: branches.length });
+  return branches;
 }

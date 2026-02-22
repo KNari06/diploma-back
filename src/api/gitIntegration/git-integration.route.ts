@@ -13,6 +13,10 @@ const router = Router();
 
 // Webhook endpoint must be public (validated by signature/token)
 router.post('/webhook', handleWebhook);
+// GET so browser/health checks don't hit requireAuth and get 401
+router.get('/webhook', (req, res) =>
+  res.status(405).json({ success: true, message: 'Use POST to deliver webhook events' })
+);
 
 // All CRUD routes require authentication
 router.use(requireAuth);
