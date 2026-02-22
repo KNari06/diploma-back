@@ -16,6 +16,7 @@ import type {
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 import { topologicalSort } from '@/utils/graph/topological-sort';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { executionCompletionEmitter } from '../executions/execution-completion-emitter';
 import { ExecutionService } from '../executions/execution.service';
 import { RegressionPlanService } from '../plans/regression-plan.service';
@@ -1265,10 +1266,48 @@ export class RegressionRunService {
     let apiPassed = 0;
     let apiFailed = 0;
     let skippedCount = 0;
+    let completedCount = 0;
+    const totalTests = testCases.length;
+    const totalLevels = levels.length;
+
+    // Helper to emit regression progress (non-fatal)
+    const emitProgress = (
+      status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed',
+      message: string,
+      extra?: { currentLevel?: number; currentTestName?: string }
+    ) => {
+      try {
+        const progress = totalTests > 0 ? Math.round((completedCount / totalTests) * 100) : 0;
+        webSocketService.emitRegressionRunProgress(userId, {
+          runId,
+          userId,
+          status,
+          progress,
+          message,
+          details: {
+            totalTests,
+            completedTests: completedCount,
+            currentLevel: extra?.currentLevel,
+            totalLevels,
+            currentTestName: extra?.currentTestName,
+            passed: apiPassed,
+            failed: apiFailed,
+            skipped: skippedCount,
+          },
+          timestamp: new Date().toISOString(),
+        });
+      } catch { /* non-fatal */ }
+    };
+
+    emitProgress('started', `Regression run started: ${totalTests} tests in ${totalLevels} levels`);
 
     for (let levelIdx = 0; levelIdx < levels.length; levelIdx++) {
       const level = levels[levelIdx];
       const uiWaiters: Array<{ testCaseId: string; execId: string; promise: Promise<string> }> = [];
+
+      emitProgress('level_started', `Starting level ${levelIdx + 1}/${totalLevels} (${level.length} tests)`, {
+        currentLevel: levelIdx + 1,
+      });
 
       for (const testCase of level) {
         const execId = execByKey.get(`${testCase.testType}:${testCase.testCaseId}`);
@@ -1298,6 +1337,11 @@ export class RegressionRunService {
           if (execId) {
             await ExecutionService.updateStatus({ id: execId, status: 'running' });
           }
+
+          emitProgress('test_started', `Running ${testCase.testType.toUpperCase()} test (${completedCount + 1}/${totalTests})`, {
+            currentLevel: levelIdx + 1,
+            currentTestName: testCase.testCaseId,
+          });
 
           if (testCase.testType === 'ui') {
             // Run UI test without creating nested regression_runs
@@ -1370,6 +1414,11 @@ export class RegressionRunService {
                 errorMessage: passed ? undefined : apiExecution?.error_message || 'API test failed',
               });
             }
+
+            completedCount++;
+            emitProgress('test_completed', `API test ${passed ? 'passed' : 'failed'} (${completedCount}/${totalTests})`, {
+              currentLevel: levelIdx + 1,
+            });
           }
         } catch (error) {
           logger.error('[REGRESSION_RUN] Failed to execute test case', {
@@ -1414,11 +1463,19 @@ export class RegressionRunService {
         );
 
         for (const result of results) {
+          completedCount++;
           if (result.status !== 'passed') {
             failedOrSkippedIds.add(result.testCaseId);
           }
+          emitProgress('test_completed', `UI test ${result.status} (${completedCount}/${totalTests})`, {
+            currentLevel: levelIdx + 1,
+          });
         }
       }
+
+      emitProgress('level_completed', `Level ${levelIdx + 1}/${totalLevels} completed`, {
+        currentLevel: levelIdx + 1,
+      });
     }
 
     // Link UI test IDs to regression_runs so existing completion pipeline can update the run
@@ -1446,6 +1503,8 @@ export class RegressionRunService {
       }
 
       // Do not finalize run here — it will be recomputed on UI test completion
+      // Emit progress so frontend knows all tests have been dispatched (UI tests still running)
+      emitProgress('started', `All ${uiTestIds.length} UI tests dispatched, waiting for completion...`);
       return;
     }
 
@@ -1465,6 +1524,11 @@ export class RegressionRunService {
         completed_at: new Date().toISOString(),
       })
       .eq('id', runId);
+
+    emitProgress(
+      finalStatus === 'completed' ? 'completed' : 'failed',
+      `Regression run ${finalStatus}: ${apiPassed} passed, ${apiFailed} failed, ${skippedCount} skipped`
+    );
   }
 
   /**
@@ -1619,7 +1683,7 @@ export class RegressionRunService {
 
     const { data } = await supabaseAdmin
       .from('test_results')
-      .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary')
+      .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary, quality_checks')
       .in('test_id', testIds)
       .order('created_at', { ascending: false });
 
@@ -1710,6 +1774,7 @@ export class RegressionRunService {
     // Aggregated artifacts across all executions (actual data for artifactsSummary)
     const aggArtifacts: RunReportArtifactsSummary = {
       screenshots: [],
+      bugScreenshots: [],
       consoleLogs: [],
       networkLogs: [],
     };
@@ -1723,12 +1788,21 @@ export class RegressionRunService {
 
       // Build steps from executed_steps
       const steps: RunReportStep[] = [];
-      let execArtifacts = {
-        videoUrl: undefined as string | undefined,
-        traceUrl: undefined as string | undefined,
-        screenshots: [] as string[],
-        consoleLogs: [] as string[],
-        networkLogs: [] as Array<{ method: string; url: string; status?: number; durationMs?: number }>,
+      let execArtifacts: {
+        videoUrl?: string;
+        traceUrl?: string;
+        screenshots: string[];
+        bugScreenshots: string[];
+        consoleLogs: string[];
+        networkLogs: Array<{ method: string; url: string; status?: number; durationMs?: number }>;
+        qualityChecks?: any;
+      } = {
+        videoUrl: undefined,
+        traceUrl: undefined,
+        screenshots: [],
+        bugScreenshots: [],
+        consoleLogs: [],
+        networkLogs: [],
       };
       let bugsCount = 0;
 
@@ -1779,12 +1853,60 @@ export class RegressionRunService {
             }));
           }
 
+          // Extract quality checks from test_results
+          if (testResult.quality_checks && typeof testResult.quality_checks === 'object') {
+            const qc = testResult.quality_checks;
+            execArtifacts.qualityChecks = {
+              webVitals: qc.webVitals || undefined,
+              accessibility: qc.accessibility || undefined,
+              brokenResources: Array.isArray(qc.brokenResources) ? qc.brokenResources : undefined,
+              slowAPIs: Array.isArray(qc.slowAPIs) ? qc.slowAPIs : undefined,
+            };
+          }
+
           // Aggregate into run-level artifacts
           if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
           if (execArtifacts.traceUrl && !aggArtifacts.traceUrl) aggArtifacts.traceUrl = execArtifacts.traceUrl;
           aggArtifacts.screenshots.push(...execArtifacts.screenshots);
           aggArtifacts.consoleLogs.push(...execArtifacts.consoleLogs);
           aggArtifacts.networkLogs.push(...execArtifacts.networkLogs);
+        }
+
+        // Extract bug screenshots from executed steps (stored in runtimeMeta.bugScreenshotUrl)
+        for (const step of steps) {
+          if (step.error?.screenshot && typeof step.error.screenshot === 'string') {
+            execArtifacts.bugScreenshots.push(step.error.screenshot);
+          }
+        }
+        aggArtifacts.bugScreenshots.push(...execArtifacts.bugScreenshots);
+
+        // Aggregate quality checks at run level
+        if (execArtifacts.qualityChecks) {
+          if (!aggArtifacts.qualityChecks) {
+            aggArtifacts.qualityChecks = { brokenResources: [], slowAPIs: [] };
+          }
+          const agg = aggArtifacts.qualityChecks;
+          const ec = execArtifacts.qualityChecks;
+
+          // Web vitals: keep the latest non-empty one
+          if (ec.webVitals) agg.webVitals = ec.webVitals;
+
+          // Accessibility: merge warnings arrays, sum totals
+          if (ec.accessibility) {
+            if (!agg.accessibility) {
+              agg.accessibility = { warnings: [], totalWarnings: 0 };
+            }
+            agg.accessibility.warnings.push(...(ec.accessibility.warnings || []));
+            agg.accessibility.totalWarnings += ec.accessibility.totalWarnings || 0;
+          }
+
+          // Broken resources / slow APIs: concatenate
+          if (ec.brokenResources) {
+            agg.brokenResources = [...(agg.brokenResources || []), ...ec.brokenResources];
+          }
+          if (ec.slowAPIs) {
+            agg.slowAPIs = [...(agg.slowAPIs || []), ...ec.slowAPIs];
+          }
         }
 
         // Extract bugs: prefer test_reports > ai_summary

@@ -7,6 +7,7 @@ import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { getTelegramToken, sendMessage as sendTelegramMessage } from '@/services/api/telegram.service';
+import { webSocketService } from '@/websocket/core/websocket.service';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -142,6 +143,22 @@ export class TestCompletionHandlerService {
                 metadata: testResultMetadata,
               },
             ]);
+
+            // Emit real-time WebSocket event so chat UI updates instantly
+            try {
+              webSocketService.emitChatMessage(chatSessionId, {
+                sessionId: chatSessionId,
+                messageId: `test-result-${testId}`,
+                role: 'assistant',
+                content: formattedMessage,
+                timestamp: new Date().toISOString(),
+              });
+            } catch (wsError) {
+              logger.warn('[TEST_COMPLETION] Failed to emit chat:message WebSocket event', {
+                testId, chatSessionId,
+                error: wsError instanceof Error ? wsError.message : String(wsError),
+              });
+            }
 
             logger.info('[TEST_COMPLETION] Results sent to chat', {
               testId,

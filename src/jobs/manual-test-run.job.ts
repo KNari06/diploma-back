@@ -62,6 +62,7 @@ export class ManualTestRunJobHandler {
       intelligentMode,
       testGoal,
       mode,
+      chatSessionId,
     } = job.data;
 
     // Validate required parameters
@@ -104,6 +105,21 @@ export class ManualTestRunJobHandler {
     logQueueEvent('processing', job.id!, { testId, browser });
 
     try {
+      // Emit "queued → picked up" progress so frontend knows the job was dequeued
+      try {
+        webSocketService.emitTestProgress(testId, {
+          testId,
+          browser,
+          progress: 5,
+          phase: 'initializing',
+          currentStep: 'Preparing browser environment...',
+          status: 'running',
+          timestamp: new Date().toISOString(),
+          userId,
+          sessionId: chatSessionId,
+        });
+      } catch { /* non-fatal */ }
+
       // Update test status to running
       logger.info(`[TEST-RUN] Updating test status to running: ${testId}`);
       await this.updateTestStatus(testId, 'running', browser, new Date().toISOString());

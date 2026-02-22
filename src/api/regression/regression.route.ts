@@ -1,7 +1,9 @@
 import { requireAuth } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import {
+  cancelRun,
   getPlanHealth,
+  getRunExecutions,
   getRunReport,
   getRunStats,
   getTestCaseCommands,
@@ -382,6 +384,56 @@ router.get('/test-cases/:id/commands', requireAuth, getTestCaseCommands);
  *         description: Run not found
  */
 router.get('/runs/:runId/report', requireAuth, getRunReport);
+
+/**
+ * @swagger
+ * /api/v1/regression/runs/{runId}/executions:
+ *   get:
+ *     summary: Get executions for a run with testId mapping
+ *     description: Returns individual test executions with status and testId for WebSocket subscription
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: runId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: List of executions
+ *       404:
+ *         description: Run not found
+ */
+router.get('/runs/:runId/executions', requireAuth, getRunExecutions);
+
+/**
+ * @swagger
+ * /api/v1/regression/runs/{runId}/cancel:
+ *   post:
+ *     summary: Cancel a running regression run
+ *     description: Cancels all running/pending tests in the run and marks the run as cancelled
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: runId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Run cancelled
+ *       404:
+ *         description: Run not found
+ *       422:
+ *         description: Run is not in a cancellable state
+ */
+router.post('/runs/:runId/cancel', requireAuth, cancelRun);
 
 /**
  * @swagger
