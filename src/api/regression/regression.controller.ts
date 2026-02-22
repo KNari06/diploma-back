@@ -4,6 +4,7 @@ import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/t
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
+import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type { Priority } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
@@ -704,6 +705,153 @@ export async function getPlanHealth(req: AuthenticatedRequest, res: Response): P
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to get plan health', { error });
     handleControllerError(res, error, 'Failed to get plan health');
+  }
+}
+
+/**
+ * Get executions for a run (with testId mapping)
+ *
+ * @route GET /api/v1/regression/runs/:runId/executions
+ * @param {string} runId - Run ID
+ * @returns Array of executions with testCaseId, status, and result.testId
+ */
+export async function getRunExecutions(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { runId } = req.params;
+    const userId = getUserId(req);
+
+    if (!runId) {
+      res.status(400).json({ success: false, error: 'runId is required' });
+      return;
+    }
+
+    // Verify access: check that the run belongs to this user
+    const { data: run, error: runError } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, user_id')
+      .eq('id', runId)
+      .eq('user_id', userId)
+      .single();
+
+    if (runError || !run) {
+      res.status(404).json({ success: false, error: 'Run not found' });
+      return;
+    }
+
+    const executions = await ExecutionService.getByRunId(runId);
+
+    // Map to frontend-friendly format with testId extracted from result
+    const mapped = executions.map((exec) => ({
+      id: exec.id,
+      testCaseId: exec.testCaseId,
+      testType: exec.testType,
+      status: exec.status,
+      browser: exec.browser,
+      durationMs: exec.durationMs,
+      errorMessage: exec.errorMessage,
+      testId: exec.result?.testId || null,
+      startedAt: exec.startedAt,
+      completedAt: exec.completedAt,
+    }));
+
+    res.json({ success: true, data: mapped, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to get run executions', { error });
+    handleControllerError(res, error, 'Failed to get run executions');
+  }
+}
+
+/**
+ * Cancel a regression run
+ * Cancels all running/pending tests within the run and marks run as cancelled.
+ *
+ * @route POST /api/v1/regression/runs/:runId/cancel
+ * @param {string} runId - Run ID to cancel
+ */
+export async function cancelRun(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { runId } = req.params;
+    const userId = getUserId(req);
+
+    if (!runId) {
+      res.status(400).json({ success: false, error: 'runId is required' });
+      return;
+    }
+
+    // Verify access and get run data
+    const { data: run, error: runError } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, user_id, status, test_ids')
+      .eq('id', runId)
+      .eq('user_id', userId)
+      .single();
+
+    if (runError || !run) {
+      res.status(404).json({ success: false, error: 'Run not found' });
+      return;
+    }
+
+    if (run.status !== 'running' && run.status !== 'pending') {
+      res.status(422).json({
+        success: false,
+        error: `Cannot cancel run with status "${run.status}"`,
+      });
+      return;
+    }
+
+    // Cancel all running/pending underlying tests
+    const testIds: string[] = run.test_ids || [];
+    let cancelledTests = 0;
+
+    for (const testId of testIds) {
+      try {
+        const result = await ManualTestService.cancelTest(testId, userId);
+        if (result.success) cancelledTests++;
+      } catch {
+        // Some tests may already be completed — skip them
+      }
+    }
+
+    // Cancel all pending/running test_executions
+    await supabaseAdmin
+      .from('test_executions')
+      .update({
+        status: 'cancelled',
+        completed_at: new Date().toISOString(),
+        error_message: 'Cancelled by user',
+      })
+      .eq('run_id', runId)
+      .in('status', ['pending', 'running']);
+
+    // Mark the run as cancelled
+    await supabaseAdmin
+      .from('regression_runs')
+      .update({
+        status: 'cancelled',
+        completed_at: new Date().toISOString(),
+      })
+      .eq('id', runId)
+      .in('status', ['running', 'pending']);
+
+    logger.info('[REGRESSION_API] Run cancelled', {
+      runId,
+      cancelledTests,
+      totalTestIds: testIds.length,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        runId,
+        cancelledTests,
+        totalTests: testIds.length,
+        message: `Run cancelled. ${cancelledTests}/${testIds.length} tests stopped.`,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to cancel run', { error });
+    handleControllerError(res, error, 'Failed to cancel run');
   }
 }
 

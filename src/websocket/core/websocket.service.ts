@@ -35,6 +35,7 @@ import {
   TestProgressPayload,
   TestStartedPayload,
   TestStepCompletedPayload,
+  RegressionRunProgressPayload,
   // Video streaming payloads
   TestVideoFramePayload,
   TestVideoPausedPayload,
@@ -843,6 +844,21 @@ class WebSocketService {
       return;
     }
     this.emitToChat(sessionId, 'api:agent:step', payload);
+  }
+
+  // ============================================================================
+  // REGRESSION RUN EVENTS
+  // ============================================================================
+
+  public emitRegressionRunProgress(userId: string, payload: RegressionRunProgressPayload): void {
+    this.emitWithFallback(
+      'regression:run:progress',
+      payload,
+      () => {
+        this.emitToUser(userId, 'regression:run:progress', payload);
+      },
+      { userId }
+    );
   }
 
   // ============================================================================

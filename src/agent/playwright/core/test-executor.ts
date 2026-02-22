@@ -61,9 +61,13 @@ function safeParseUrl(raw: string): URL | null {
  * We intentionally bias toward safety (avoid false FAIL on 3rd-party / analytics errors).
  */
 function isSameOriginUrl(requestUrl: string, baseUrl: string): boolean {
-  const req = safeParseUrl(requestUrl);
   const base = safeParseUrl(baseUrl);
-  if (!req || !base) return false;
+  if (!base) return false;
+  // Handle relative URLs (e.g. "/api/save") by resolving against baseUrl
+  let req = safeParseUrl(requestUrl);
+  if (!req) {
+    try { req = new URL(requestUrl, baseUrl); } catch { return false; }
+  }
   return req.protocol === base.protocol && req.host === base.host;
 }
 
@@ -334,19 +338,26 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           // Check cancellation
           await checkTestCancelled(testData.testId);
 
-          // Emit test:progress
-          webSocketService.emitTestProgress(testData.testId, {
-            testId: testData.testId,
-            browser: testData.browser,
-            progress: Math.round((currentStepIndex / totalSteps) * 80) + 10, // 10-90%
-            phase: 'execution',
-            currentStep: `Step ${currentStepIndex}/${totalSteps}: ${action}`,
-            icon: getActionIcon(action, 'execution'),
-            status: 'running',
-            timestamp: new Date().toISOString(),
-            userId: testData.userId,
-            sessionId: testData.chatSessionId,
-          });
+          // Emit test:progress (non-fatal — WS failure must not kill replay)
+          try {
+            webSocketService.emitTestProgress(testData.testId, {
+              testId: testData.testId,
+              browser: testData.browser,
+              progress: Math.round((currentStepIndex / totalSteps) * 80) + 10, // 10-90%
+              phase: 'execution',
+              currentStep: `Step ${currentStepIndex}/${totalSteps}: ${action}`,
+              icon: getActionIcon(action, 'execution'),
+              status: 'running',
+              timestamp: new Date().toISOString(),
+              userId: testData.userId,
+              sessionId: testData.chatSessionId,
+            });
+          } catch (wsError) {
+            logger.warn('[PLAYWRIGHT] WebSocket emit failed (test:progress)', {
+              testId: testData.testId, step: currentStepIndex,
+              error: wsError instanceof Error ? wsError.message : String(wsError),
+            });
+          }
 
           logger.info('[PLAYWRIGHT] Replay mode executing step', {
             testId: testData.testId,
@@ -452,15 +463,22 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 bugScreenshotUrl,
               };
 
-              webSocketService.emitTestStepCompleted(testData.testId, {
-                testId: testData.testId,
-                browser: testData.browser,
-                step: currentStepIndex,
-                stepDescription,
-                success: false,
-                timestamp: new Date().toISOString(),
-                runtimeMeta: enrichedMeta,
-              });
+              try {
+                webSocketService.emitTestStepCompleted(testData.testId, {
+                  testId: testData.testId,
+                  browser: testData.browser,
+                  step: currentStepIndex,
+                  stepDescription,
+                  success: false,
+                  timestamp: new Date().toISOString(),
+                  runtimeMeta: enrichedMeta,
+                });
+              } catch (wsError) {
+                logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/network-fail)', {
+                  testId: testData.testId, step: currentStepIndex,
+                  error: wsError instanceof Error ? wsError.message : String(wsError),
+                });
+              }
 
               // Stop on first failure
               break;
@@ -488,16 +506,23 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               },
             });
 
-            // Emit test:step:completed with success
-            webSocketService.emitTestStepCompleted(testData.testId, {
-              testId: testData.testId,
-              browser: testData.browser,
-              step: currentStepIndex,
-              stepDescription,
-              success: true,
-              timestamp: new Date().toISOString(),
-              runtimeMeta: stepResult.runtimeMeta,
-            });
+            // Emit test:step:completed with success (non-fatal)
+            try {
+              webSocketService.emitTestStepCompleted(testData.testId, {
+                testId: testData.testId,
+                browser: testData.browser,
+                step: currentStepIndex,
+                stepDescription,
+                success: true,
+                timestamp: new Date().toISOString(),
+                runtimeMeta: stepResult.runtimeMeta,
+              });
+            } catch (wsError) {
+              logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/success)', {
+                testId: testData.testId, step: currentStepIndex,
+                error: wsError instanceof Error ? wsError.message : String(wsError),
+              });
+            }
 
             // Collect UI errors after successful step execution
             try {
@@ -646,16 +671,23 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               },
             });
 
-            // Emit test:step:completed with failure
-            webSocketService.emitTestStepCompleted(testData.testId, {
-              testId: testData.testId,
-              browser: testData.browser,
-              step: currentStepIndex,
-              stepDescription: intentMeta?.elementDescription || action,
-              success: false,
-              timestamp: new Date().toISOString(),
-              runtimeMeta: finalMeta,
-            });
+            // Emit test:step:completed with failure (non-fatal)
+            try {
+              webSocketService.emitTestStepCompleted(testData.testId, {
+                testId: testData.testId,
+                browser: testData.browser,
+                step: currentStepIndex,
+                stepDescription: intentMeta?.elementDescription || action,
+                success: false,
+                timestamp: new Date().toISOString(),
+                runtimeMeta: finalMeta,
+              });
+            } catch (wsError) {
+              logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/failure)', {
+                testId: testData.testId, step: currentStepIndex,
+                error: wsError instanceof Error ? wsError.message : String(wsError),
+              });
+            }
 
             // Stop on first failure
             break;
@@ -689,14 +721,62 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // These are non-fatal and enrich the test result for user visibility
       // ═══════════════════════════════════════════════════════════════════════
 
+      // Emit finalization progress so frontend doesn't hang at 90%
+      try {
+        webSocketService.emitTestProgress(testData.testId, {
+          testId: testData.testId,
+          browser: testData.browser,
+          progress: 92,
+          phase: 'quality_checks',
+          currentStep: 'Running quality checks: broken resources...',
+          icon: '🔍',
+          status: 'running',
+          timestamp: new Date().toISOString(),
+          userId: testData.userId,
+          sessionId: testData.chatSessionId,
+        });
+      } catch { /* non-fatal */ }
+
       // Run broken resource detection (adds findings to uiErrors)
       try {
         await errorCollector.collectBrokenResources();
       } catch { /* non-fatal */ }
 
+      // Emit accessibility check progress
+      try {
+        webSocketService.emitTestProgress(testData.testId, {
+          testId: testData.testId,
+          browser: testData.browser,
+          progress: 94,
+          phase: 'quality_checks',
+          currentStep: 'Running quality checks: accessibility scan...',
+          icon: '♿',
+          status: 'running',
+          timestamp: new Date().toISOString(),
+          userId: testData.userId,
+          sessionId: testData.chatSessionId,
+        });
+      } catch { /* non-fatal */ }
+
       // Run enhanced accessibility scan (11 WCAG checks, once at end)
       try {
         await errorCollector.collectAccessibilityWarnings();
+      } catch { /* non-fatal */ }
+
+      // Emit performance metrics progress
+      try {
+        webSocketService.emitTestProgress(testData.testId, {
+          testId: testData.testId,
+          browser: testData.browser,
+          progress: 96,
+          phase: 'quality_checks',
+          currentStep: 'Collecting performance metrics...',
+          icon: '📊',
+          status: 'running',
+          timestamp: new Date().toISOString(),
+          userId: testData.userId,
+          sessionId: testData.chatSessionId,
+        });
       } catch { /* non-fatal */ }
 
       // Collect Web Vitals performance metrics
@@ -797,6 +877,22 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         slowApiCalls: slowApiCalls.length,
         performanceLCP: performanceMetrics?.largestContentfulPaint || 0,
       });
+
+      // Emit final cleanup progress
+      try {
+        webSocketService.emitTestProgress(testData.testId, {
+          testId: testData.testId,
+          browser: testData.browser,
+          progress: 98,
+          phase: 'finalizing',
+          currentStep: 'Saving artifacts and cleaning up...',
+          icon: '💾',
+          status: 'running',
+          timestamp: new Date().toISOString(),
+          userId: testData.userId,
+          sessionId: testData.chatSessionId,
+        });
+      } catch { /* non-fatal */ }
 
       // Cleanup
       // Stop video streaming (best-effort) before closing context/page
