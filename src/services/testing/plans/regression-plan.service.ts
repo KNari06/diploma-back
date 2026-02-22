@@ -883,10 +883,12 @@ export class RegressionPlanService {
     const moduleId = flow?.module_id;
 
     // Get UI test cases from intent_test_cases (unified table)
+    // Include cases that have replay data: commands, graph_ref, OR steps_json
     const { data: uiCases, error: uiError } = await supabaseAdmin
       .from('intent_test_cases')
       .select('id, name')
-      .eq('flow_id', flowId);
+      .eq('flow_id', flowId)
+      .not('status', 'eq', 'archived');
 
     if (uiError) {
       logger.error('[REGRESSION_PLAN_SERVICE] Failed to query intent_test_cases for flow', { flowId, error: uiError });

@@ -212,7 +212,7 @@ export class RegressionRunService {
       const uiIds = uiCases.map((tc) => tc.testCaseId);
       const { data: rows } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('id, commands, graph_ref, replay_strategy')
+        .select('id, commands, graph_ref, steps_json, replay_strategy')
         .in('id', uiIds);
 
       for (const row of rows || []) {
@@ -221,6 +221,9 @@ export class RegressionRunService {
           stepCount = row.commands.length;
         } else if (row.replay_strategy === 'graph_extract' && row.graph_ref?.steps) {
           stepCount = Array.isArray(row.graph_ref.steps) ? row.graph_ref.steps.length : 0;
+        } else if (Array.isArray(row.steps_json)) {
+          // Step editor test cases: count steps_json (+ 1 for initial goto)
+          stepCount = row.steps_json.length + 1;
         }
         // Minimum 1 credit per test case even if steps can't be counted
         uiStepCredits += Math.max(stepCount, 1);
@@ -298,27 +301,57 @@ export class RegressionRunService {
     parameters: Record<string, any>,
     browserOverride?: string
   ): Promise<any> {
+    // Validate URL exists first (with fallback to start_url)
+    const targetUrl = intentCase.url || intentCase.start_url;
+    if (!targetUrl) {
+      throw new ValidationError(
+        `Intent test case "${intentCase.name}" (${intentCase.id}) has no URL. ` +
+        'Please set a URL on the test case before running.'
+      );
+    }
+
     // Get source test for base configuration (optional - only for browsers/options)
-    const { data: sourceTest } = await supabaseAdmin
-      .from('tests')
-      .select('browsers, options')
-      .eq('id', intentCase.source_test_id)
-      .maybeSingle();
+    // Step editor test cases have no source_test_id — query returns null, defaults apply
+    const { data: sourceTest } = intentCase.source_test_id
+      ? await supabaseAdmin
+          .from('tests')
+          .select('browsers, options')
+          .eq('id', intentCase.source_test_id)
+          .maybeSingle()
+      : { data: null };
 
     let commands: any[] = [];
 
-    // Extract commands based on strategy
-    if (intentCase.replay_strategy === 'commands' && Array.isArray(intentCase.commands)) {
+    // Extract commands based on strategy (3 paths):
+    // 1. Pre-compiled commands (saved from completed test via /regression/save)
+    // 2. Graph extract steps (saved from intelligent session)
+    // 3. steps_json conversion (step editor test cases — converted at runtime)
+    if (intentCase.replay_strategy === 'commands' && Array.isArray(intentCase.commands) && intentCase.commands.length > 0) {
       commands = intentCase.commands;
-    } else if (intentCase.replay_strategy === 'graph_extract' && Array.isArray(intentCase.graph_ref?.steps)) {
+    } else if (intentCase.replay_strategy === 'graph_extract' && Array.isArray(intentCase.graph_ref?.steps) && intentCase.graph_ref.steps.length > 0) {
       commands = intentCase.graph_ref.steps;
+    } else if (Array.isArray(intentCase.steps_json) && intentCase.steps_json.length > 0) {
+      // Convert intent steps to executable Playwright commands (same path as preview runner)
+      const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
+      commands = IntentStepConverterService.convertToCommands(intentCase.steps_json, targetUrl, intentCase.id);
+      logger.info('[REGRESSION_RUN] Converted steps_json to commands', {
+        intentTestCaseId: intentCase.id,
+        stepsCount: intentCase.steps_json.length,
+        commandsCount: commands.length,
+        stepsWithCompiled: intentCase.steps_json.filter((s: any) => !!s.compiled).length,
+      });
     } else {
-      throw new ValidationError('Intent test case has no replayable data');
+      throw new ValidationError(
+        `Intent test case "${intentCase.name}" (${intentCase.id}) has no replayable data. ` +
+        `replay_strategy=${intentCase.replay_strategy}, commands=${intentCase.commands === null ? 'null' : typeof intentCase.commands}, ` +
+        `steps_json=${intentCase.steps_json === null ? 'null' : (Array.isArray(intentCase.steps_json) ? `array(${intentCase.steps_json.length})` : typeof intentCase.steps_json)}, ` +
+        `status=${intentCase.status}.`
+      );
     }
 
     if (commands.length === 0) {
       throw new ValidationError(
-        'Intent test case has no saved commands. Record test steps in the preview editor before running in regression.'
+        `Intent test case "${intentCase.name}" (${intentCase.id}) produced no executable commands.`
       );
     }
 
@@ -337,17 +370,9 @@ export class RegressionRunService {
     // Apply parameters AFTER resolution (so parent parameters apply to all expanded commands)
     commands = this.applyParameters(resolvedCommands, parameters);
 
-    // Validate URL exists (with fallback to start_url)
-    const targetUrl = intentCase.url || intentCase.start_url;
-    if (!targetUrl) {
-      throw new ValidationError(
-        'Intent test case has no URL. Please update the test case with a valid URL.'
-      );
-    }
-
     // Build request
     return {
-      url: targetUrl, // Use url with fallback to start_url
+      url: targetUrl,
       projectId: intentCase.project_id,
       userId,
       browsers: browserOverride ? [browserOverride] : (sourceTest?.browsers || ['chrome']),
@@ -1274,7 +1299,7 @@ export class RegressionRunService {
     const emitProgress = (
       status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed',
       message: string,
-      extra?: { currentLevel?: number; currentTestName?: string }
+      extra?: { currentLevel?: number; currentTestName?: string; errorCode?: string }
     ) => {
       try {
         const progress = totalTests > 0 ? Math.round((completedCount / totalTests) * 100) : 0;
@@ -1284,6 +1309,7 @@ export class RegressionRunService {
           status,
           progress,
           message,
+          errorCode: extra?.errorCode,
           details: {
             totalTests,
             completedTests: completedCount,
@@ -1301,7 +1327,9 @@ export class RegressionRunService {
 
     emitProgress('started', `Regression run started: ${totalTests} tests in ${totalLevels} levels`);
 
-    for (let levelIdx = 0; levelIdx < levels.length; levelIdx++) {
+    let creditExhausted = false;
+
+    for (let levelIdx = 0; levelIdx < levels.length && !creditExhausted; levelIdx++) {
       const level = levels[levelIdx];
       const uiWaiters: Array<{ testCaseId: string; execId: string; promise: Promise<string> }> = [];
 
@@ -1421,10 +1449,16 @@ export class RegressionRunService {
             });
           }
         } catch (error) {
+          const errMsg = error instanceof Error ? error.message : String(error);
+          const isCreditError = errMsg.toLowerCase().includes('insufficient credits');
+
           logger.error('[REGRESSION_RUN] Failed to execute test case', {
             runId,
             testCaseId: testCase.testCaseId,
             testType: testCase.testType,
+            errorMessage: errMsg,
+            errorCode: (error as any)?.code,
+            isCreditError,
             error,
           });
 
@@ -1435,7 +1469,7 @@ export class RegressionRunService {
               await ExecutionService.updateStatus({
                 id: execId,
                 status: 'failed',
-                errorMessage: error instanceof Error ? error.message : String(error),
+                errorMessage: errMsg,
               });
             } catch (statusError) {
               logger.error('[REGRESSION_RUN] Failed to update execution status', {
@@ -1443,6 +1477,16 @@ export class RegressionRunService {
                 statusError: statusError instanceof Error ? statusError.message : String(statusError),
               });
             }
+          }
+
+          // Emit credit-specific progress event so frontend can show top-up prompt
+          if (isCreditError) {
+            creditExhausted = true;
+            emitProgress('failed', 'Regression run stopped: insufficient credits. Please top up to continue.', {
+              currentLevel: levelIdx + 1,
+              errorCode: 'INSUFFICIENT_CREDITS',
+            });
+            break;
           }
         }
       }
@@ -1476,6 +1520,44 @@ export class RegressionRunService {
       emitProgress('level_completed', `Level ${levelIdx + 1}/${totalLevels} completed`, {
         currentLevel: levelIdx + 1,
       });
+    }
+
+    // If credit exhaustion stopped the run, mark remaining tests as skipped and finalize
+    if (creditExhausted) {
+      // Mark all non-started executions as skipped
+      for (const tc of testCases) {
+        if (!failedOrSkippedIds.has(tc.testCaseId)) {
+          const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
+          if (execId) {
+            await ExecutionService.updateStatus({
+              id: execId,
+              status: 'skipped',
+              errorMessage: 'Skipped: regression run stopped due to insufficient credits',
+            }).catch(() => {});
+          }
+          skippedCount++;
+        }
+      }
+
+      await supabaseAdmin
+        .from('regression_runs')
+        .update({
+          status: 'failed',
+          test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
+          summary: {
+            total: testCases.length,
+            api_passed: apiPassed,
+            api_failed: apiFailed,
+            skipped: skippedCount,
+            creditExhausted: true,
+            started_at: startedAt,
+            completed_at: new Date().toISOString(),
+          },
+          completed_at: new Date().toISOString(),
+        })
+        .eq('id', runId);
+
+      return;
     }
 
     // Link UI test IDs to regression_runs so existing completion pipeline can update the run
