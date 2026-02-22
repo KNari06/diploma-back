@@ -62,13 +62,19 @@ export class AIAnalysisJobHandler {
         throw new Error(`Test result not found: ${testResultId}`);
       }
 
-      // Emit WebSocket: AI analysis started
-      const analysisStartedPayload: AIAnalysisStartedPayload = {
-        testId,
-        resultId: testResultId,
-        timestamp: new Date().toISOString(),
-      };
-      webSocketService.emitAIAnalysisStarted(testId, analysisStartedPayload);
+      // Emit WebSocket: AI analysis started (non-fatal — WS failure must not kill analysis)
+      try {
+        const analysisStartedPayload: AIAnalysisStartedPayload = {
+          testId,
+          resultId: testResultId,
+          timestamp: new Date().toISOString(),
+        };
+        webSocketService.emitAIAnalysisStarted(testId, analysisStartedPayload);
+      } catch (wsError) {
+        logger.warn('[AI-ANALYSIS] WebSocket emit failed (analysis started)', {
+          testId, error: wsError instanceof Error ? wsError.message : String(wsError),
+        });
+      }
 
       // Convert database result to TestResult type
       const testResultData = this.convertToTestResult(testResult);
@@ -81,18 +87,24 @@ export class AIAnalysisJobHandler {
         ai_summary: aiSummary,
       });
 
-      // Emit WebSocket: AI bugs found (one by one)
+      // Emit WebSocket: AI bugs found (one by one, non-fatal)
       if (aiSummary.bugs && aiSummary.bugs.length > 0) {
         const processedBugs = this.processBugsForWebSocket(aiSummary.bugs);
 
         for (const bug of processedBugs) {
-          const bugFoundPayload: AIBugFoundPayload = {
-            testId,
-            resultId: testResultId,
-            bug,
-            timestamp: new Date().toISOString(),
-          };
-          webSocketService.emitAIBugFound(testId, bugFoundPayload);
+          try {
+            const bugFoundPayload: AIBugFoundPayload = {
+              testId,
+              resultId: testResultId,
+              bug,
+              timestamp: new Date().toISOString(),
+            };
+            webSocketService.emitAIBugFound(testId, bugFoundPayload);
+          } catch (wsError) {
+            logger.warn('[AI-ANALYSIS] WebSocket emit failed (bug found)', {
+              testId, error: wsError instanceof Error ? wsError.message : String(wsError),
+            });
+          }
         }
 
         // Charge for bug report generation (5 credits)
@@ -124,20 +136,26 @@ export class AIAnalysisJobHandler {
         }
       }
 
-      // Emit WebSocket: AI analysis completed
-      const processedBugs = this.processBugsForWebSocket(aiSummary.bugs || []);
-      const analysisCompletedPayload: AIAnalysisCompletedPayload = {
-        testId,
-        resultId: testResultId,
-        summary: {
-          summary: aiSummary.summary,
-          bugs: processedBugs,
-          recommendations: aiSummary.recommendations || [],
-          confidence: aiSummary.confidence || 0,
-        },
-        timestamp: new Date().toISOString(),
-      };
-      webSocketService.emitAIAnalysisCompleted(testId, analysisCompletedPayload);
+      // Emit WebSocket: AI analysis completed (non-fatal)
+      try {
+        const processedBugs = this.processBugsForWebSocket(aiSummary.bugs || []);
+        const analysisCompletedPayload: AIAnalysisCompletedPayload = {
+          testId,
+          resultId: testResultId,
+          summary: {
+            summary: aiSummary.summary,
+            bugs: processedBugs,
+            recommendations: aiSummary.recommendations || [],
+            confidence: aiSummary.confidence || 0,
+          },
+          timestamp: new Date().toISOString(),
+        };
+        webSocketService.emitAIAnalysisCompleted(testId, analysisCompletedPayload);
+      } catch (wsError) {
+        logger.warn('[AI-ANALYSIS] WebSocket emit failed (analysis completed)', {
+          testId, error: wsError instanceof Error ? wsError.message : String(wsError),
+        });
+      }
 
       // Create in-app notifications for background tests
       await this.createBackgroundAINotifications(testId, testResultId, aiSummary, testResult);
@@ -163,7 +181,6 @@ export class AIAnalysisJobHandler {
           summary: 'AI analysis failed',
           bugs: [],
           recommendations: ['Manual review required'],
-          severity: 'medium',
           confidence: 0,
           generatedAt: new Date(),
         },

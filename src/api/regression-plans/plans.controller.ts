@@ -192,6 +192,14 @@ export async function removeItem(req: AuthenticatedRequest, res: Response): Prom
 export async function expandPlan(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
+    const userId = getUserId(req);
+
+    // Verify ownership before expanding
+    const plan = await RegressionPlanService.getById(id, userId);
+    if (!plan) {
+      res.status(404).json({ success: false, error: 'Plan not found' });
+      return;
+    }
 
     const testCases = await RegressionPlanService.expandPlan(id);
 

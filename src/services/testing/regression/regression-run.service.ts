@@ -49,6 +49,40 @@ const MAX_LIST_LIMIT = 500;
  */
 export class RegressionRunService {
   /**
+   * Clean up zombie runs that got stuck in 'running' or 'pending' status.
+   * Should be called on server startup to recover from crashes.
+   * Marks stale runs (older than 30 minutes) as 'failed'.
+   */
+  static async cleanupZombieRuns(): Promise<void> {
+    try {
+      const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+      const { data: zombieRuns, error } = await supabaseAdmin
+        .from('regression_runs')
+        .update({
+          status: 'failed',
+          completed_at: new Date().toISOString(),
+        })
+        .in('status', ['running', 'pending'])
+        .lt('started_at', thirtyMinutesAgo)
+        .select('id');
+
+      if (error) {
+        logger.error('[REGRESSION_RUN] Failed to cleanup zombie runs', { error });
+        return;
+      }
+
+      if (zombieRuns && zombieRuns.length > 0) {
+        logger.warn('[REGRESSION_RUN] Cleaned up zombie runs', {
+          count: zombieRuns.length,
+          runIds: zombieRuns.map((r: any) => r.id),
+        });
+      }
+    } catch (error) {
+      logger.error('[REGRESSION_RUN] Error in zombie run cleanup', { error });
+    }
+  }
+
+  /**
    * Run an intent test case (unified table for UI test cases)
    * Method name kept as runSavedTestCase for API compatibility.
    *
@@ -273,12 +307,18 @@ export class RegressionRunService {
     let commands: any[] = [];
 
     // Extract commands based on strategy
-    if (intentCase.replay_strategy === 'commands' && intentCase.commands) {
+    if (intentCase.replay_strategy === 'commands' && Array.isArray(intentCase.commands)) {
       commands = intentCase.commands;
-    } else if (intentCase.replay_strategy === 'graph_extract' && intentCase.graph_ref?.steps) {
+    } else if (intentCase.replay_strategy === 'graph_extract' && Array.isArray(intentCase.graph_ref?.steps)) {
       commands = intentCase.graph_ref.steps;
     } else {
       throw new ValidationError('Intent test case has no replayable data');
+    }
+
+    if (commands.length === 0) {
+      throw new ValidationError(
+        'Intent test case has no saved commands. Record test steps in the preview editor before running in regression.'
+      );
     }
 
     // Resolve shared_steps references BEFORE applying parameters
@@ -565,7 +605,20 @@ export class RegressionRunService {
 
       const expandedCases = await RegressionPlanService.expandPlan(planId);
       if (expandedCases.length === 0) {
-        throw new ValidationError('Plan has no test cases');
+        const items = await RegressionPlanService.getItems(planId);
+        const flowItems = items.filter((i) => i.itemType === 'flow');
+        const moduleItems = items.filter((i) => i.itemType === 'module');
+        logger.error('[REGRESSION_RUN] Plan expanded to 0 test cases', {
+          planId,
+          totalItems: items.length,
+          flowItems: flowItems.map((i) => i.flowId),
+          moduleItems: moduleItems.map((i) => i.moduleId),
+        });
+        throw new ValidationError(
+          items.length === 0
+            ? 'Plan has no items. Add modules, flows, or test cases to the plan before running.'
+            : `Plan has ${items.length} item(s) but none contain test cases. The referenced flows/modules may be empty.`
+        );
       }
 
       // 1b. Batch-fetch depends_on for UI test cases
@@ -581,18 +634,32 @@ export class RegressionRunService {
         }
       }
 
-      const executableCases: ExecutableTestCase[] = expandedCases.map((tc) => ({
-        testCaseId: tc.testCaseId,
-        testType: tc.testType,
-        moduleId: tc.moduleId,
-        flowId: tc.flowId,
-        dependsOn: depMap.get(tc.testCaseId) || [],
-      }));
+      // Filter depends_on to only include test cases that are part of this run
+      const runTestCaseIds = new Set(expandedCases.map((tc) => tc.testCaseId));
+
+      const executableCases: ExecutableTestCase[] = expandedCases.map((tc) => {
+        const rawDeps = depMap.get(tc.testCaseId) || [];
+        const validDeps = rawDeps.filter((depId) => runTestCaseIds.has(depId));
+        if (validDeps.length !== rawDeps.length) {
+          logger.warn('[REGRESSION_RUN] Filtered out-of-run dependencies', {
+            testCaseId: tc.testCaseId,
+            originalDeps: rawDeps,
+            filteredDeps: validDeps,
+          });
+        }
+        return {
+          testCaseId: tc.testCaseId,
+          testType: tc.testType,
+          moduleId: tc.moduleId,
+          flowId: tc.flowId,
+          dependsOn: validDeps,
+        };
+      });
 
       // 1c. Credit check — verify user has enough credits for all test cases
       await this.checkCreditBalance(userId, executableCases, 'regression_plan');
 
-      // 2. Create regression run record with plan_id
+      // 2. Create regression run record with plan_id (initially 'pending' until executions are created)
       const { data: run, error: runError } = await supabaseAdmin
         .from('regression_runs')
         .insert({
@@ -600,7 +667,7 @@ export class RegressionRunService {
           project_id: plan.projectId,
           user_id: userId,
           trigger,
-          status: 'running',
+          status: 'pending',
         })
         .select('id')
         .single();
@@ -610,15 +677,35 @@ export class RegressionRunService {
       }
 
       // 3. Create execution records for all test cases
-      const executions = await ExecutionService.createBatch(
-        run.id,
-        executableCases.map((tc) => ({
-          testCaseId: tc.testCaseId,
-          testType: tc.testType,
-          moduleId: tc.moduleId,
-          flowId: tc.flowId,
-        }))
-      );
+      let executions;
+      try {
+        executions = await ExecutionService.createBatch(
+          run.id,
+          executableCases.map((tc) => ({
+            testCaseId: tc.testCaseId,
+            testType: tc.testType,
+            moduleId: tc.moduleId,
+            flowId: tc.flowId,
+          }))
+        );
+      } catch (batchError) {
+        // Rollback: mark run as failed since executions couldn't be created
+        logger.error('[REGRESSION_RUN] Failed to create executions, marking run as failed', {
+          runId: run.id,
+          error: batchError,
+        });
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({ status: 'failed', completed_at: new Date().toISOString() })
+          .eq('id', run.id);
+        throw batchError;
+      }
+
+      // Transition from 'pending' to 'running' now that executions exist
+      await supabaseAdmin
+        .from('regression_runs')
+        .update({ status: 'running' })
+        .eq('id', run.id);
 
       // 4. Read runtime config from plan's automation_config
       const browserOverride = plan.automationConfig?.runtime?.browser;
@@ -1703,22 +1790,24 @@ export class RegressionRunService {
         // Extract bugs: prefer test_reports > ai_summary
         const report = reportsMap.get(testId);
         const testResultData = testResultsMap.get(testId);
-        const rawBugs: any[] =
+        const rawBugSource =
           report?.analysis?.bugs ||
           testResultData?.ai_summary?.bugs ||
           [];
+        const rawBugs: any[] = Array.isArray(rawBugSource) ? rawBugSource : [];
 
         for (let i = 0; i < rawBugs.length; i++) {
           const bug = rawBugs[i];
+          if (!bug || typeof bug !== 'object') continue;
           allBugs.push({
             id: bug.id || `${exec.id}-bug-${i}`,
-            title: bug.title || '',
+            title: bug.title || bug.message || bug.description || '',
             severity: validSeverities.has(bug.severity) ? bug.severity : 'medium',
             category: validCategories.has(bug.category) ? bug.category : 'functional',
             testCaseId: exec.testCaseId,
             testCaseName,
             executionId: exec.id,
-            steps: bug.steps || bug.stepsToReproduce || [],
+            steps: Array.isArray(bug.steps) ? bug.steps : (Array.isArray(bug.stepsToReproduce) ? bug.stepsToReproduce : []),
             expected: bug.expectedResult || bug.expected || '',
             actual: bug.actualResult || bug.actual || '',
             selector: bug.domSelector || bug.selector,
@@ -1728,12 +1817,15 @@ export class RegressionRunService {
         bugsCount = rawBugs.length;
 
         // Collect recommendations
-        const recs: string[] =
+        const recsSource =
           report?.analysis?.recommendations ||
           testResultData?.ai_summary?.recommendations ||
           [];
+        const recs: string[] = Array.isArray(recsSource) ? recsSource : [];
         for (const r of recs) {
-          allRecommendations.add(r);
+          if (typeof r === 'string' && r.trim()) {
+            allRecommendations.add(r);
+          }
         }
 
         // Collect confidence

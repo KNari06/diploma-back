@@ -72,7 +72,7 @@ export async function handleRunByTagIntent(
       .eq('workspace_id', workspace_id)
       .eq('user_id', userId)
       .limit(1)
-      .single();
+      .maybeSingle();
 
     if (!project) {
       throw new NotFoundError('Project', workspace_id);

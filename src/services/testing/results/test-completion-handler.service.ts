@@ -354,13 +354,34 @@ export class TestCompletionHandlerService {
     testId: string
   ): Promise<void> {
     try {
+      // Validate testId is a valid UUID to prevent injection in .or() filter
+      const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!UUID_REGEX.test(testId)) {
+        logger.error('[TEST_COMPLETION] Invalid testId format, skipping regression run update', { testId });
+        return;
+      }
+
       // Find regression runs that reference this test
-      // Either directly (test_id) or in a batch (test_ids array)
-      const { data: runs, error: runsError } = await supabaseAdmin
-        .from('regression_runs')
-        .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
-        .or(`test_id.eq.${testId},test_ids.cs.["${testId}"]`)
-        .in('status', ['running']); // Only update runs that are still in progress
+      // Query 1: direct test_id match; Query 2: batch test_ids contains
+      const [directResult, batchResult] = await Promise.all([
+        supabaseAdmin
+          .from('regression_runs')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
+          .eq('test_id', testId)
+          .in('status', ['running', 'pending']),
+        supabaseAdmin
+          .from('regression_runs')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
+          .contains('test_ids', [testId])
+          .in('status', ['running', 'pending']),
+      ]);
+
+      const runsError = directResult.error || batchResult.error;
+      // Deduplicate by run ID
+      const runMap = new Map<string, any>();
+      for (const r of directResult.data || []) runMap.set(r.id, r);
+      for (const r of batchResult.data || []) runMap.set(r.id, r);
+      const runs = [...runMap.values()];
 
       if (runsError) {
         logger.error('[TEST_COMPLETION] Failed to find regression runs', {
@@ -581,14 +602,19 @@ export class TestCompletionHandlerService {
           completed_at: new Date().toISOString(),
         };
 
-        const { error: updateError } = await supabaseAdmin
+        // Optimistic lock: only update if run is still in running/pending status
+        // Prevents race condition when multiple tests complete simultaneously
+        const { data: updatedRun, error: updateError } = await supabaseAdmin
           .from('regression_runs')
           .update({
             status: finalStatus,
             summary,
             completed_at: new Date().toISOString(),
           })
-          .eq('id', run.id);
+          .eq('id', run.id)
+          .in('status', ['running', 'pending'])
+          .select('id')
+          .maybeSingle();
 
         if (updateError) {
           logger.error('[TEST_COMPLETION] Failed to update regression run (unified)', {
@@ -596,13 +622,18 @@ export class TestCompletionHandlerService {
             runId: run.id,
             finalStatus,
           });
+        } else if (!updatedRun) {
+          // Another completion handler already finalized this run
+          logger.debug('[TEST_COMPLETION] Run already finalized by another handler', {
+            runId: run.id,
+          });
         } else {
           logger.info('[TEST_COMPLETION] Regression run updated (unified)', {
             runId: run.id,
             status: finalStatus,
             summary,
           });
-          
+
           // Create notification for regression run
           await this.createRegressionRunNotification(run, finalStatus, summary);
         }
@@ -685,15 +716,18 @@ export class TestCompletionHandlerService {
         completed_at: new Date().toISOString(),
       };
 
-      // Update regression run
-      const { error: updateError } = await supabaseAdmin
+      // Update regression run (optimistic lock: only if still running/pending)
+      const { data: updatedRun, error: updateError } = await supabaseAdmin
         .from('regression_runs')
         .update({
           status: finalStatus,
           summary,
           completed_at: new Date().toISOString(),
         })
-        .eq('id', run.id);
+        .eq('id', run.id)
+        .in('status', ['running', 'pending'])
+        .select('id')
+        .maybeSingle();
 
       if (updateError) {
         logger.error('[TEST_COMPLETION] Failed to update regression run', {
@@ -701,13 +735,17 @@ export class TestCompletionHandlerService {
           runId: run.id,
           finalStatus,
         });
+      } else if (!updatedRun) {
+        logger.debug('[TEST_COMPLETION] Run already finalized by another handler', {
+          runId: run.id,
+        });
       } else {
         logger.info('[TEST_COMPLETION] Regression run updated', {
           runId: run.id,
           status: finalStatus,
           summary,
         });
-        
+
         // Create notification for regression run
         await this.createRegressionRunNotification(run, finalStatus, summary);
       }

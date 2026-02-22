@@ -63,7 +63,7 @@ export async function handleRunPlanIntent(
         .eq('workspace_id', workspace_id)
         .eq('user_id', userId)
         .limit(1)
-        .single();
+        .maybeSingle();
 
       if (project) {
         const plans = await RegressionPlanService.listByProject(project.id, userId);

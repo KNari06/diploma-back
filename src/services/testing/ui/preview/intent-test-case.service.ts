@@ -269,6 +269,18 @@ export class IntentTestCaseService {
   static async delete(id: string, userId: string): Promise<boolean> {
     logger.info('[INTENT_TEST_CASE] Deleting test case', { id });
 
+    // Clean up regression plan items referencing this test case
+    const { error: planCleanupError } = await supabaseAdmin
+      .from('regression_plan_items')
+      .delete()
+      .eq('test_case_id', id);
+
+    if (planCleanupError) {
+      logger.warn('[INTENT_TEST_CASE] Failed to cleanup plan items for deleted test case', {
+        error: planCleanupError, id,
+      });
+    }
+
     const { error } = await supabaseAdmin
       .from('intent_test_cases')
       .delete()

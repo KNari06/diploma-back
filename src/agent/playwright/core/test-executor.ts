@@ -846,6 +846,16 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       };
     }
 
+    // Safety guard: if intelligentMode is false (regression/replay), commands MUST be present
+    // Prevents silent fallthrough to Lite Engine for regression tests
+    if (!testData.intelligentMode) {
+      logger.error('[PLAYWRIGHT] Regression test has no commands — cannot fall through to Lite Engine', {
+        testId: testData.testId,
+        commandsLength: testData.commands?.length ?? 0,
+      });
+      throw new Error('Regression test requires commands for replay. Record test steps before running.');
+    }
+
     // Continue with existing Lite/Pro mode selection...
     // Determine which mode to use (Lite vs Pro)
     const modeSelection = ModeRouter.selectMode({
