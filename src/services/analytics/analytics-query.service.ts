@@ -471,79 +471,78 @@ export class AnalyticsQueryService {
 
       const runIds = await this.getRunIdsForProjects(projectIds);
 
-      if (runIds.length === 0) {
-        return { failures: [] };
-      }
+      // Build regression failures list (only if we have run IDs)
+      let result: RecentFailure[] = [];
 
-      // Get recent failed executions
-      const { data: failures } = await supabaseAdmin
-        .from('test_executions')
-        .select('id, run_id, test_case_id, status, error_message, completed_at')
-        .in('run_id', runIds)
-        .eq('status', 'failed')
-        .not('completed_at', 'is', null)
-        .order('completed_at', { ascending: false })
-        .limit(limit);
-
-      if (!failures || failures.length === 0) {
-        return { failures: [] };
-      }
-
-      // Get test case names and priorities (separate query — no FK between tables)
-      const testCaseIds = [...new Set(failures.map((f) => f.test_case_id))];
-      const [testCasesResult, allExecutionsResult] = await Promise.all([
-        supabaseAdmin
-          .from('intent_test_cases')
-          .select('id, name, priority')
-          .in('id', testCaseIds),
-        // Check for recovery (later passed execution)
-        supabaseAdmin
+      if (runIds.length > 0) {
+        // Get recent failed executions
+        const { data: failures } = await supabaseAdmin
           .from('test_executions')
-          .select('test_case_id, status, completed_at')
-          .in('test_case_id', testCaseIds)
-          .in('status', ['passed', 'failed'])
-          .order('completed_at', { ascending: false }),
-      ]);
+          .select('id, run_id, test_case_id, status, error_message, completed_at')
+          .in('run_id', runIds)
+          .eq('status', 'failed')
+          .not('completed_at', 'is', null)
+          .order('completed_at', { ascending: false })
+          .limit(limit);
 
-      const testCaseMap = new Map<string, { name: string; priority: string | null }>();
-      for (const tc of testCasesResult.data || []) {
-        testCaseMap.set(tc.id, { name: tc.name, priority: tc.priority });
-      }
+        if (failures && failures.length > 0) {
+          // Get test case names and priorities (separate query — no FK between tables)
+          const testCaseIds = [...new Set(failures.map((f) => f.test_case_id))];
+          const [testCasesResult, allExecutionsResult] = await Promise.all([
+            supabaseAdmin
+              .from('intent_test_cases')
+              .select('id, name, priority')
+              .in('id', testCaseIds),
+            // Check for recovery (later passed execution)
+            supabaseAdmin
+              .from('test_executions')
+              .select('test_case_id, status, completed_at')
+              .in('test_case_id', testCaseIds)
+              .in('status', ['passed', 'failed'])
+              .order('completed_at', { ascending: false }),
+          ]);
 
-      const recoveryMap = new Map<string, boolean>();
-      for (const exec of allExecutionsResult.data || []) {
-        if (!recoveryMap.has(exec.test_case_id) && exec.status === 'passed') {
-          recoveryMap.set(exec.test_case_id, true);
+          const testCaseMap = new Map<string, { name: string; priority: string | null }>();
+          for (const tc of testCasesResult.data || []) {
+            testCaseMap.set(tc.id, { name: tc.name, priority: tc.priority });
+          }
+
+          const recoveryMap = new Map<string, boolean>();
+          for (const exec of allExecutionsResult.data || []) {
+            if (!recoveryMap.has(exec.test_case_id) && exec.status === 'passed') {
+              recoveryMap.set(exec.test_case_id, true);
+            }
+          }
+
+          result = failures.map((f: any) => {
+            const testCase = testCaseMap.get(f.test_case_id);
+            const isRecovered = recoveryMap.get(f.test_case_id) || false;
+            const priority = testCase?.priority || 'medium';
+
+            let severity: 'failure' | 'warn' | 'recovered';
+            if (isRecovered) {
+              severity = 'recovered';
+            } else if (priority === 'critical' || priority === 'high') {
+              severity = 'failure';
+            } else {
+              severity = 'warn';
+            }
+
+            return {
+              id: f.id,
+              testCaseName: testCase?.name || 'Unknown Test',
+              testCaseId: f.test_case_id,
+              runId: f.run_id,
+              status: 'failed' as const,
+              errorMessage: f.error_message,
+              severity,
+              failedAt: f.completed_at,
+              timeAgo: this.getTimeAgo(f.completed_at),
+              source: 'regression' as const,
+            };
+          });
         }
       }
-
-      const result: RecentFailure[] = failures.map((f: any) => {
-        const testCase = testCaseMap.get(f.test_case_id);
-        const isRecovered = recoveryMap.get(f.test_case_id) || false;
-        const priority = testCase?.priority || 'medium';
-
-        let severity: 'failure' | 'warn' | 'recovered';
-        if (isRecovered) {
-          severity = 'recovered';
-        } else if (priority === 'critical' || priority === 'high') {
-          severity = 'failure';
-        } else {
-          severity = 'warn';
-        }
-
-        return {
-          id: f.id,
-          testCaseName: testCase?.name || 'Unknown Test',
-          testCaseId: f.test_case_id,
-          runId: f.run_id,
-          status: 'failed' as const,
-          errorMessage: f.error_message,
-          severity,
-          failedAt: f.completed_at,
-          timeAgo: this.getTimeAgo(f.completed_at),
-          source: 'regression' as const,
-        };
-      });
 
       // Also get failed API test executions
       const apiFailures = await this.getApiTestFailures(projectIds, limit);
