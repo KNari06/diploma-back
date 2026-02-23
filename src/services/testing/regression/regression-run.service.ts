@@ -132,6 +132,7 @@ export class RegressionRunService {
           user_id: userId,
           trigger,
           status: 'running',
+          started_at: new Date().toISOString(),
         })
         .select('id')
         .single();
@@ -730,7 +731,7 @@ export class RegressionRunService {
       // Transition from 'pending' to 'running' now that executions exist
       await supabaseAdmin
         .from('regression_runs')
-        .update({ status: 'running' })
+        .update({ status: 'running', started_at: new Date().toISOString() })
         .eq('id', run.id);
 
       // 4. Read runtime config from plan's automation_config
@@ -840,6 +841,7 @@ export class RegressionRunService {
           user_id: userId,
           trigger,
           status: 'running',
+          started_at: new Date().toISOString(),
         })
         .select('id')
         .single();
@@ -929,6 +931,7 @@ export class RegressionRunService {
           user_id: userId,
           trigger,
           status: 'running',
+          started_at: new Date().toISOString(),
         })
         .select('id')
         .single();
@@ -1025,6 +1028,7 @@ export class RegressionRunService {
           user_id: userId,
           trigger,
           status: 'running',
+          started_at: new Date().toISOString(),
         })
         .select('id')
         .single();
@@ -1121,6 +1125,7 @@ export class RegressionRunService {
           user_id: userId,
           trigger,
           status: 'running',
+          started_at: new Date().toISOString(),
         })
         .select('id')
         .single();

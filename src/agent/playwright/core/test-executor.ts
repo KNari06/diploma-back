@@ -298,6 +298,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         intelligentMode: false,
       });
 
+      // Resolve workspaceId for AI usage tracking (self-healing may use AI)
+      const workspaceId = await resolveWorkspaceFromProject(testData.projectId);
+
       // Import CommandExecutor
       const { CommandExecutor } = await import('@/agent/execution/command-executor');
 
@@ -318,24 +321,49 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       const errorCollector = new ErrorCollectorService(page);
       errorCollector.startCollecting();
 
+      // Begin AI usage tracking session for background replay
+      // Self-healing may trigger AI calls (OpenAI/Gemini) that need to be tracked
+      // Use testId as sessionId so AIUsageTracker.record() can match via getAIContext().testId
+      const replaySessionId = testData.testId;
+      AIUsageTracker.beginSession(replaySessionId, {
+        workspaceId,
+        testId: testData.testId,
+        userId: testData.userId,
+        operationType: 'regression',
+      });
+
       logger.info('[PLAYWRIGHT] Started error collection for background replay', {
         testId: testData.testId,
       });
 
-      // Execute commands step-by-step
+      // Execute commands step-by-step (wrapped in AI context for self-healing token tracking)
+      // Capture narrowed references before entering withAIContext callback
+      const commands = testData.commands;
+      const activePage = page!;
       let currentStepIndex = 0;
-      const totalSteps = testData.commands.length;
+      const totalSteps = commands.length;
       let allSuccess = true;
       let finalError: string | undefined;
 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let replayUsageStats: any = null;
+      await withAIContext(
+        {
+          workspaceId,
+          testId: testData.testId,
+          userId: testData.userId,
+          operationType: 'regression',
+        },
+        async () => {
+
       try {
-        for (const command of testData.commands) {
+        for (const command of commands) {
           currentStepIndex++;
           const action = (command as any).action ?? (command as any).type ?? 'action';
           const intentMeta = (command as any).intentMeta as undefined | { elementDescription?: string; stepId?: string };
 
           // Capture URL before step — used by lookahead to detect SPA navigation
-          const urlBeforeStep = page.url();
+          const urlBeforeStep = activePage.url();
 
           // Check cancellation
           await checkTestCancelled(testData.testId);
@@ -445,7 +473,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               finalError = `Silent backend failure: ${firstFatal.method} ${firstFatal.url} → ${firstFatal.error}`;
 
               // Capture bug screenshot before emitting failure
-              const bugScreenshotUrl = await captureBugScreenshot(page, testData, currentStepIndex, 'backend-failure');
+              const bugScreenshotUrl = await captureBugScreenshot(activePage, testData, currentStepIndex, 'backend-failure');
 
               // Enrich runtimeMeta with network evidence
               const enrichedMeta: NonNullable<TestStepCompletedPayload['runtimeMeta']> = {
@@ -532,7 +560,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               // Capture screenshot if UI errors were detected during this step
               const uiErrorsSinceStep = errorCollector.getErrorsSince(stepStartedAt).uiErrors;
               if (uiErrorsSinceStep.length > 0) {
-                await captureBugScreenshot(page, testData, currentStepIndex, 'ui-error');
+                await captureBugScreenshot(activePage, testData, currentStepIndex, 'ui-error');
               }
             } catch (uiErrorCollectionError) {
               // Non-fatal - log and continue
@@ -544,7 +572,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             }
 
             // Auto-waiting (lookahead) for next step's readiness
-            const nextCommand = testData.commands[currentStepIndex]; // currentStepIndex is 1-based, array is 0-based
+            const nextCommand = commands[currentStepIndex]; // currentStepIndex is 1-based, array is 0-based
             if (nextCommand) {
               const prevActionType = (command as any).intentMeta?.actionType;
               const nextIntentMeta = (nextCommand as any).intentMeta;
@@ -562,7 +590,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                     },
                   };
 
-                  const lookahead = await waitForStepReadiness(page, nextStepForLookahead, {
+                  const lookahead = await waitForStepReadiness(activePage, nextStepForLookahead, {
                     maxWaitMs: 10000,
                     settleMs: 3000,
                     autoWaitThresholdMs: 2000,
@@ -649,7 +677,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             };
 
             // Capture bug screenshot at moment of failure
-            const bugScreenshotUrl = await captureBugScreenshot(page, testData, currentStepIndex, 'step-failure');
+            const bugScreenshotUrl = await captureBugScreenshot(activePage, testData, currentStepIndex, 'step-failure');
             finalMeta.bugScreenshotUrl = bugScreenshotUrl;
 
             const failDurationMs = Date.now() - stepStartedAt;
@@ -696,6 +724,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           }
         }
       } finally {
+        // End AI usage tracking session (even on error)
+        replayUsageStats = await AIUsageTracker.endSession(replaySessionId);
+
         // Stop error collection
         errorCollector.stopCollecting();
         logger.info('[PLAYWRIGHT] Stopped error collection', {
@@ -709,10 +740,22 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         // Clean up temporary bg-X refs from background DOM collection
         try {
           const { cleanupTemporaryRefs } = await import('@/agent/execution/background-dom-collector');
-          await cleanupTemporaryRefs(page);
+          await cleanupTemporaryRefs(activePage);
         } catch {
           // Non-fatal: page may already be closed
         }
+      }
+
+      }, // end withAIContext callback
+      ); // end withAIContext
+
+      if (replayUsageStats) {
+        logger.info('[PLAYWRIGHT] Background Replay AI usage stats', {
+          testId: testData.testId,
+          aiCallCount: replayUsageStats.aiCallCount,
+          totalTokens: replayUsageStats.totalTokens,
+          totalCostUSD: replayUsageStats.totalCostUSD.toFixed(6),
+        });
       }
 
       // Collect artifacts and return

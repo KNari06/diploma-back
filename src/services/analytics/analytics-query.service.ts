@@ -611,9 +611,11 @@ export class AnalyticsQueryService {
       const totalCount = counts.reduce((a, b) => a + b, 0);
 
       const days: HeatmapDay[] = [];
-      for (let i = 0; i < rangeDays; i++) {
-        const date = new Date(since);
-        date.setDate(date.getDate() + i);
+      const now = new Date();
+      // Use UTC dates consistently (DB timestamps are ISO/UTC)
+      const startUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - rangeDays));
+      for (let i = 0; i <= rangeDays; i++) {
+        const date = new Date(startUtc.getTime() + i * 86400000);
         const dateKey = date.toISOString().split('T')[0];
         const count = dailyCounts.get(dateKey) || 0;
 
