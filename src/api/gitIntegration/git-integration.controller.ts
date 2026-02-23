@@ -22,8 +22,9 @@ function getUserId(req: AuthenticatedRequest): string {
   return userId;
 }
 
-function getWebhookUrl(req: Request): string {
-  return `${req.protocol}://${req.get('host')}/api/${env.API_VERSION}/git-integrations/webhook`;
+function getWebhookUrl(): string {
+  const backendUrl = env.BACKEND_URL || `http://localhost:${env.PORT}`;
+  return `${backendUrl}/api/${env.API_VERSION}/git-integrations/webhook`;
 }
 
 function sanitizeIntegration(row: any, webhookUrl?: string) {
@@ -68,7 +69,7 @@ export async function createIntegration(req: AuthenticatedRequest, res: Response
       events,
     });
 
-    const webhookUrl = getWebhookUrl(req);
+    const webhookUrl = getWebhookUrl();
 
     res.json({
       success: true,
@@ -100,7 +101,7 @@ export async function listIntegrations(req: AuthenticatedRequest, res: Response)
     }
 
     const integrations = await GitIntegrationService.listIntegrations(projectId, userId);
-    const webhookUrl = getWebhookUrl(req);
+    const webhookUrl = getWebhookUrl();
 
     res.json({
       success: true,
@@ -122,7 +123,7 @@ export async function getIntegration(req: AuthenticatedRequest, res: Response): 
     const userId = getUserId(req);
 
     const integration = await GitIntegrationService.getIntegration(id, userId);
-    const webhookUrl = getWebhookUrl(req);
+    const webhookUrl = getWebhookUrl();
 
     res.json({
       success: true,
