@@ -218,7 +218,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     }
 
     // Start video streaming for Chrome (CDP screencast)
-    if (testData.browser.toLowerCase().includes('chrome') || testData.browser.toLowerCase().includes('chromium')) {
+    // Skip for Background Replay (regression runs) — no one watches the live stream
+    const isBackgroundReplay = !testData.intelligentMode && testData.commands && testData.commands.length > 0;
+    if (!isBackgroundReplay && (testData.browser.toLowerCase().includes('chrome') || testData.browser.toLowerCase().includes('chromium'))) {
       try {
         videoStreamService = createVideoStreamService();
         await videoStreamService.start(

@@ -2,6 +2,7 @@ import { requireAuth } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import {
   cancelRun,
+  getExecutionDetail,
   getPlanHealth,
   getRunExecutions,
   getRunReport,
@@ -464,5 +465,35 @@ router.post('/runs/:runId/cancel', requireAuth, cancelRun);
  *         description: Plan not found
  */
 router.get('/plans/:planId/health', requireAuth, getPlanHealth);
+
+/**
+ * @swagger
+ * /api/v1/regression/runs/{runId}/executions/{executionId}/detail:
+ *   get:
+ *     summary: Get full test detail for a regression execution
+ *     description: Returns execution metadata plus full test data (screenshots, video, logs, errors, AI analysis) without needing to know the testId
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: runId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *       - in: path
+ *         name: executionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Execution detail with full test data
+ *       404:
+ *         description: Run or execution not found
+ */
+router.get('/runs/:runId/executions/:executionId/detail', requireAuth, getExecutionDetail);
 
 export default router;

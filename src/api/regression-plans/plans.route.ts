@@ -11,6 +11,8 @@ import {
     deletePlan,
     expandPlan,
     getPlan,
+    getPlanAnalytics,
+    getPlanBugsSummary,
     getPlanHealthReport,
     getScopeItems,
     listPlans,
@@ -167,6 +169,81 @@ router.get('/scope-items', requireAuth, getScopeItems);
  *         description: Plan not found
  */
 router.get('/:id/health', requireAuth, getPlanHealthReport);
+
+/**
+ * @swagger
+ * /api/v1/regression-plans/{id}/analytics:
+ *   get:
+ *     summary: Get plan-level analytics (trends over time)
+ *     description: Returns trend data for pass_rate, duration, or flaky_rate bucketed by interval
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *       - in: query
+ *         name: metric
+ *         required: true
+ *         schema:
+ *           type: string
+ *           enum: [pass_rate, duration, flaky_rate]
+ *       - in: query
+ *         name: days
+ *         schema:
+ *           type: integer
+ *           default: 30
+ *           minimum: 1
+ *           maximum: 365
+ *       - in: query
+ *         name: interval
+ *         schema:
+ *           type: string
+ *           default: 1d
+ *           description: "Interval format: Nd (days), Nh (hours), Nw (weeks)"
+ *     responses:
+ *       200:
+ *         description: Analytics trend data
+ *       404:
+ *         description: Plan not found
+ */
+router.get('/:id/analytics', requireAuth, getPlanAnalytics);
+
+/**
+ * @swagger
+ * /api/v1/regression-plans/{id}/bugs/summary:
+ *   get:
+ *     summary: Get bug summary aggregated from recent runs
+ *     description: Aggregates bugs from the latest N runs of a plan with severity/category breakdown and deduplication
+ *     tags: [Regression Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 5
+ *           minimum: 1
+ *           maximum: 20
+ *           description: Number of recent runs to analyze
+ *     responses:
+ *       200:
+ *         description: Bug summary with severity/category breakdown and trends
+ *       404:
+ *         description: Plan not found
+ */
+router.get('/:id/bugs/summary', requireAuth, getPlanBugsSummary);
 
 /**
  * @swagger

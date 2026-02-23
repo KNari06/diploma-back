@@ -189,6 +189,7 @@ export class RegressionPlanService {
     return plans.map((plan) => {
       const lastRunRow = lastRunMap.get(plan.id) || null;
       const runId = lastRunRow?.id;
+      const health = (runId && healthMap.get(runId)) || defaultHealth;
 
       return {
         ...plan,
@@ -196,24 +197,72 @@ export class RegressionPlanService {
         lastRun: lastRunRow
           ? {
               runId: lastRunRow.id,
-              status: lastRunRow.status,
+              status: health.state !== 'unknown' ? health.state : lastRunRow.status,
               startedAt: lastRunRow.started_at,
               completedAt: lastRunRow.completed_at,
-              durationMs:
-                lastRunRow.completed_at && lastRunRow.started_at
-                  ? new Date(lastRunRow.completed_at).getTime() -
-                    new Date(lastRunRow.started_at).getTime()
-                  : null,
+              durationMs: this.computeDurationMs(lastRunRow.started_at, lastRunRow.completed_at),
+              passRate: health.total > 0 ? health.passRate : null,
             }
           : null,
-        health: (runId && healthMap.get(runId)) || defaultHealth,
+        health,
       };
     });
+  }
+
+  /**
+   * Enrich a single plan with health, scope, and lastRun stats.
+   * Reuses the same batch methods as listByProject but for one plan.
+   */
+  static async enrichPlanWithStats(plan: RegressionPlan & { items?: any[] }): Promise<any> {
+    const planIds = [plan.id];
+
+    const [scopeMap, lastRunMap] = await Promise.all([
+      this.batchGetPlanScopes(planIds),
+      this.batchGetLatestRuns(planIds),
+    ]);
+
+    const lastRunRow = lastRunMap.get(plan.id) || null;
+    const runId = lastRunRow?.id;
+
+    let health: RegressionPlanWithStats['health'] = {
+      state: 'unknown', passRate: 0, passed: 0, failed: 0, flaky: 0, total: 0,
+    };
+
+    if (runId) {
+      const healthMap = await this.batchGetRunHealths([runId]);
+      health = healthMap.get(runId) || health;
+    }
+
+    return {
+      ...plan,
+      scope: scopeMap.get(plan.id) || { testCount: 0, flowCount: 0 },
+      lastRun: lastRunRow
+        ? {
+            runId: lastRunRow.id,
+            status: health.state !== 'unknown' ? health.state : lastRunRow.status,
+            startedAt: lastRunRow.started_at,
+            completedAt: lastRunRow.completed_at,
+            durationMs: this.computeDurationMs(lastRunRow.started_at, lastRunRow.completed_at),
+            passRate: health.total > 0 ? health.passRate : null,
+          }
+        : null,
+      health,
+    };
   }
 
   // ---------------------------------------------------------------------------
   // BATCH: Scope (test count + flow count) for all plans
   // ---------------------------------------------------------------------------
+
+  /**
+   * Compute duration in ms from two ISO timestamps.
+   * Returns null if inputs are missing or duration is negative.
+   */
+  private static computeDurationMs(startedAt: string | null, completedAt: string | null): number | null {
+    if (!startedAt || !completedAt) return null;
+    const diff = new Date(completedAt).getTime() - new Date(startedAt).getTime();
+    return diff > 0 ? diff : null;
+  }
 
   /**
    * Batch-fetch scope for multiple plans.
@@ -389,21 +438,32 @@ export class RegressionPlanService {
   private static async batchGetRunHealths(
     runIds: string[]
   ): Promise<Map<string, RegressionPlanWithStats['health']>> {
-    // Fetch all execution rows for these runs in one query
-    // (used for both stats and flaky detection)
-    const { data: executions, error } = await supabaseAdmin
-      .from('test_executions')
-      .select('run_id, test_case_id, status')
-      .in('run_id', runIds);
+    // Fetch run statuses and execution rows in parallel
+    const [runsResult, execsResult] = await Promise.all([
+      supabaseAdmin
+        .from('regression_runs')
+        .select('id, status')
+        .in('id', runIds),
+      supabaseAdmin
+        .from('test_executions')
+        .select('run_id, test_case_id, status')
+        .in('run_id', runIds),
+    ]);
 
-    if (error || !executions) {
-      logger.error('[REGRESSION_PLAN_SERVICE] Failed to batch fetch executions', { error });
+    if (execsResult.error || !execsResult.data) {
+      logger.error('[REGRESSION_PLAN_SERVICE] Failed to batch fetch executions', { error: execsResult.error });
       return new Map();
     }
 
-    // Group by run_id
+    // Map run statuses
+    const runStatusMap = new Map<string, string>();
+    for (const run of runsResult.data || []) {
+      runStatusMap.set(run.id, run.status);
+    }
+
+    // Group executions by run_id
     const execsByRun = new Map<string, Array<{ test_case_id: string; status: string }>>();
-    for (const exec of executions) {
+    for (const exec of execsResult.data) {
       if (!execsByRun.has(exec.run_id)) execsByRun.set(exec.run_id, []);
       execsByRun.get(exec.run_id)!.push(exec);
     }
@@ -412,6 +472,7 @@ export class RegressionPlanService {
 
     for (const runId of runIds) {
       const execs = execsByRun.get(runId) || [];
+      const runStatus = runStatusMap.get(runId) || 'unknown';
       const total = execs.length;
       const passed = execs.filter((e) => e.status === 'passed').length;
       const failed = execs.filter((e) => e.status === 'failed').length;
@@ -432,9 +493,11 @@ export class RegressionPlanService {
         if (statuses.has('passed') && statuses.has('failed')) flaky++;
       }
 
+      // Determine health state — consider both execution stats AND run-level status
       let state: 'passing' | 'warning' | 'failing' | 'unknown' = 'passing';
       if (total === 0) {
-        state = 'unknown';
+        // No executions — fall back to the run's own status
+        state = runStatus === 'failed' ? 'failing' : 'unknown';
       } else if (failed > 0) {
         state = passRate >= 90 ? 'warning' : 'failing';
       }
