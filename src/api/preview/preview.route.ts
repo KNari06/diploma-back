@@ -7,7 +7,6 @@ import { requireAuth } from '@/middleware/auth.middleware';
 import { Router } from 'express';
 import multer from 'multer';
 import { uploadTestFile } from './upload.controller';
-import { runFromJiraViaChat } from '../jira/jira.controller';
 import {
   batchRunIntentTestCases,
   createIntentTestCase,
@@ -593,12 +592,6 @@ router.post('/stop', requireAuth, stopPreview);
  *         description: Test case created
  */
 router.post('/intent-test-cases', requireAuth, createIntentTestCase);
-
-/**
- * Run Jira ticket via the same chat handler flow.
- * message = ticket.summary + ticket.description
- */
-router.post('/intent-test-cases/from-jira', requireAuth, runFromJiraViaChat);
 
 /**
  * @swagger
