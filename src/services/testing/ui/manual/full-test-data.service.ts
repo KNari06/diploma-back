@@ -88,22 +88,25 @@ export class FullTestDataService {
       .filter(r => r.screenshot)
       .map(r => ({
         browser: r.browser,
+        url: screenshotUrlMap.get(r.id) || null,
         screenshot: screenshotUrlMap.get(r.id) || null,
         status: r.status,
         completed_at: r.completedAt ?? r.completed_at,
       }))
-      .filter(s => s.screenshot !== null);
+      .filter(s => s.url !== null);
 
     // 7. Collect videos
     const videos = [
       ...(results as any[]).filter(r => r.video_url || r.videoUrl).map(r => ({
         browser: r.browser,
+        url: r.video_url || r.videoUrl,
         video_url: r.video_url || r.videoUrl,
         status: r.status,
         completed_at: r.completedAt ?? r.completed_at,
       })),
       ...(traceFiles || []).filter(tf => tf.public_url && tf.file_name?.endsWith('.webm')).map(tf => ({
         browser: tf.browser,
+        url: tf.public_url,
         video_url: tf.public_url,
         file_name: tf.file_name,
         file_size: tf.file_size,

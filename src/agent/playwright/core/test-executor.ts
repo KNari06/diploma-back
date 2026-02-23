@@ -10,6 +10,7 @@ import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 import { supabaseAdmin } from '@/db/supabase';
 import { saveIntelligentTestResults, uploadArtifacts, uploadIntelligentTestScreenshots } from '../artifacts/artifacts-handler';
+import { uploadScreenshotBufferToStorage } from '@/services/storage/test-artifacts-storage.service';
 import { collectArtifactsAndCleanup } from '../artifacts/test-cleanup';
 import { formatTestResult } from '../artifacts/test-result-formatter';
 import { VideoStreamRegistry } from '../artifacts/video-stream-registry';
@@ -759,7 +760,25 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       }
 
       // Collect artifacts and return
-      const finalScreenshot = await page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => null);
+      const finalScreenshotBuffer = await page.screenshot({ type: 'png', fullPage: true, timeout: 5000 }).catch(() => null);
+
+      // Upload screenshot to storage as PNG (same as Lite/Pro modes)
+      let finalScreenshotUrl: string | undefined;
+      if (finalScreenshotBuffer) {
+        try {
+          finalScreenshotUrl = await uploadScreenshotBufferToStorage(
+            finalScreenshotBuffer,
+            testData.testId,
+            testData.userId || 'anonymous',
+            0,
+          );
+        } catch (screenshotUploadError) {
+          logger.debug('[PLAYWRIGHT] Failed to upload final screenshot in replay mode', {
+            testId: testData.testId,
+            error: screenshotUploadError instanceof Error ? screenshotUploadError.message : String(screenshotUploadError),
+          });
+        }
+      }
       
       // ═══════════════════════════════════════════════════════════════════════
       // Quality Checks: Run final non-UI checks before collecting results
@@ -957,6 +976,20 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Collect artifacts (video/trace) and cleanup browser resources
       const artifacts = await collectArtifactsAndCleanup(testData, context, page, tracePath);
 
+      // Upload video/trace to storage (same as Lite/Pro modes)
+      const uploadedArtifacts = await uploadArtifacts(
+        testData,
+        artifacts.videoPath,
+        artifacts.tracePath,
+      ).catch((uploadError) => {
+        logger.debug('[PLAYWRIGHT] Failed to upload artifacts in replay mode', {
+          testId: testData.testId,
+          browser: testData.browser,
+          error: uploadError instanceof Error ? uploadError.message : String(uploadError),
+        });
+        return { videoUrl: undefined, traceUrl: undefined };
+      });
+
       logger.info('[PLAYWRIGHT] Background Replay Mode completed', {
         testId: testData.testId,
         success: allSuccess,
@@ -974,13 +1007,15 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       return {
         success: allSuccess,
         status: allSuccess ? 'completed' : 'failed',
-        screenshot: finalScreenshot ? `data:image/jpeg;base64,${finalScreenshot.toString('base64')}` : undefined,
+        screenshot: finalScreenshotUrl ?? undefined,
         logs,
         networkLogs,
         errors,
         performance: performanceMetrics, // Web Vitals — stored in test_results.performance
         error: allSuccess ? undefined : finalError,
+        videoUrl: uploadedArtifacts.videoUrl,
         videoPath: artifacts.videoPath,
+        traceUrl: uploadedArtifacts.traceUrl,
         tracePath: artifacts.tracePath,
         stepRuntimeMeta, // Step-level execution intelligence for reporting
         qualityChecks, // Non-UI quality checks — stored in test_results for user viewing

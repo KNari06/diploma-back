@@ -39,6 +39,7 @@ export async function executeApiAgentTestFlow(
     userId: string;
     chatSessionId?: string;
     projectId?: string;
+    workspaceId?: string;
     userMessage?: string;
   }
 ): Promise<void> {
@@ -53,6 +54,7 @@ export async function executeApiAgentTestFlow(
     userId,
     chatSessionId,
     projectId,
+    workspaceId,
     userMessage,
   } = params;
 
@@ -229,6 +231,7 @@ async function saveAgentResult(
     userId: string;
     chatSessionId?: string;
     projectId?: string;
+    workspaceId?: string;
   }
 ): Promise<void> {
   try {
@@ -277,6 +280,7 @@ async function saveAgentResult(
       testId: response.summary.testId,
       chatSessionId: params.chatSessionId,
       projectId: params.projectId,
+      workspaceId: params.workspaceId,
       request: {
         method: params.method,
         url: params.url,
