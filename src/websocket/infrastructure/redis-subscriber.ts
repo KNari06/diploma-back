@@ -229,6 +229,15 @@ class WebSocketRedisSubscriber {
           }
           break;
 
+        // Regression run progress events
+        case 'regression:run:progress':
+          if (target?.userId) {
+            wsService.emitRegressionRunProgress(target.userId, payload);
+          } else if (payload?.userId) {
+            wsService.emitRegressionRunProgress(payload.userId, payload);
+          }
+          break;
+
         // Unknown event type
         default:
           logger.warn('[WS_REDIS_SUB] Unknown event type received', {

@@ -4,6 +4,7 @@ import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/t
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
+import { FullTestDataService } from '@/services/testing/ui/manual/full-test-data.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type { Priority } from '@/types/testing.types';
@@ -888,6 +889,93 @@ export async function cancelRun(req: AuthenticatedRequest, res: Response): Promi
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to cancel run', { error });
     handleControllerError(res, error, 'Failed to cancel run');
+  }
+}
+
+/**
+ * Get full test detail for a regression execution
+ *
+ * @route GET /api/v1/regression/runs/:runId/executions/:executionId/detail
+ * @param {string} runId - Run ID
+ * @param {string} executionId - Execution ID
+ * @returns Execution metadata + full test data (screenshots, video, logs, errors, AI analysis)
+ */
+export async function getExecutionDetail(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { runId, executionId } = req.params;
+    const userId = getUserId(req);
+
+    if (!runId || !executionId) {
+      res.status(400).json({ success: false, error: 'runId and executionId are required' });
+      return;
+    }
+
+    // Verify run ownership
+    const { data: run, error: runError } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, user_id')
+      .eq('id', runId)
+      .eq('user_id', userId)
+      .single();
+
+    if (runError || !run) {
+      res.status(404).json({ success: false, error: 'Run not found' });
+      return;
+    }
+
+    // Get execution and verify it belongs to this run
+    const { data: execution, error: execError } = await supabaseAdmin
+      .from('test_executions')
+      .select('*')
+      .eq('id', executionId)
+      .eq('run_id', runId)
+      .single();
+
+    if (execError || !execution) {
+      res.status(404).json({ success: false, error: 'Execution not found' });
+      return;
+    }
+
+    // Extract testId from execution result
+    const testId = execution.result?.testId || null;
+    let testDetail = null;
+
+    if (testId) {
+      try {
+        testDetail = await FullTestDataService.getFullTestData(testId, userId);
+      } catch (error) {
+        logger.warn('[REGRESSION_API] Could not load test detail for execution', {
+          executionId,
+          testId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        execution: {
+          id: execution.id,
+          runId: execution.run_id,
+          testCaseId: execution.test_case_id,
+          testType: execution.test_type,
+          status: execution.status,
+          browser: execution.browser,
+          durationMs: execution.duration_ms,
+          errorMessage: execution.error_message,
+          testId,
+          startedAt: execution.started_at,
+          completedAt: execution.completed_at,
+          result: execution.result,
+        },
+        testDetail,
+      },
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to get execution detail', { error });
+    handleControllerError(res, error, 'Failed to get execution detail');
   }
 }
 

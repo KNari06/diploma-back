@@ -26,6 +26,7 @@ import regressionPlansRoutes from '@/api/regression-plans/plans.route';
 import regressionRoutes from '@/api/regression/regression.route';
 import reportsRoutes from '@/api/reports/reports.route';
 import savedTestCasesRoutes from '@/api/saved-test-cases/saved-test-cases.route';
+import testsRoutes from '@/api/tests/tests.route';
 import schedulesRoutes from '@/api/schedules/schedules.route';
 import stripeRoutes from '@/api/stripe/stripe.routes';
 import supportRoutes from '@/api/support/support.routes';
@@ -1261,6 +1262,7 @@ app.use(`/api/${env.API_VERSION}/billing`, stripeRoutes); // Stripe billing endp
 app.use(`/api/${env.API_VERSION}/stripe`, stripeRoutes); // Stripe webhook endpoint
 app.use(`/api/${env.API_VERSION}/preview`, previewRoutes); // ✅ NEW: Step editor preview
 app.use(`/api/${env.API_VERSION}/saved-test-cases`, savedTestCasesRoutes); // Saved test cases with AI dependency suggestions
+app.use(`/api/${env.API_VERSION}/tests`, testsRoutes); // Unified test listing (Runs/Debug page)
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
