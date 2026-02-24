@@ -583,11 +583,14 @@ export async function getRunStats(req: AuthenticatedRequest, res: Response): Pro
       .eq('id', runId)
       .maybeSingle();
 
+    // Normalize 'completed' → 'passed' for frontend compatibility
+    const normalizedStatus = run?.status === 'completed' ? 'passed' : (run?.status || null);
+
     res.json({
       success: true,
       data: {
         ...stats,
-        status: run?.status || null,
+        status: normalizedStatus,
       },
       timestamp: new Date(),
     });
