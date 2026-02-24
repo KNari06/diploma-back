@@ -14,7 +14,7 @@ export interface AITrackingContext {
   /** User who initiated the operation */
   userId?: string;
   /** High-level operation category */
-  operationType?: 'lite-test' | 'pro-test' | 'chat' | 'test-plan' | 'api-test' | 'analysis';
+  operationType?: 'lite-test' | 'pro-test' | 'chat' | 'test-plan' | 'api-test' | 'analysis' | 'regression';
 }
 
 export const aiContextStorage = new AsyncLocalStorage<AITrackingContext>();

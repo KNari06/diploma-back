@@ -314,44 +314,316 @@ export class TestCompletionHandlerService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// AI SELECTOR ENGINE (BASIC FALLBACK)
+// AI SELECTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════════════
-// ⚠️ NOTE: This is a basic fallback implementation. The full AI-powered
-// selector engine is not yet implemented. This returns a "not available" response
-// to allow calling code to handle gracefully instead of throwing errors.
+// Resolves selectors using embeddings-based element matching.
+// Converts DOMNode[] → InteractiveNode[], calls resolveWithEmbeddings(),
+// and builds Playwright-compatible selectors from the result.
 
-import type { SelectorResolveRequest, SelectorResolveResponse } from './types';
+import type { DOMNode, SelectorCandidate, SelectorResolveRequest, SelectorResolveResponse, SelectorType } from './types';
+import { resolveWithEmbeddings } from '@/services/testing/ui/preview/embeddings-resolver.service';
+import type { InteractiveNode } from '@/services/testing/ui/preview/preview.types';
 
 export class AISelectorEngine {
   /**
-   * Resolve selector using AI
-   * ⚠️ FALLBACK IMPLEMENTATION - Returns "not available" response
-   *
-   * TODO: Implement full AI-powered selector resolution:
-   * - Intent parsing (natural language → structured intent)
-   * - Vision AI for screenshot analysis (optional)
-   * - DOM analysis and candidate generation
-   * - Selector stability scoring
-   * - Result caching
+   * Resolve selector using embeddings-based element matching.
+   * Converts DOMNode[] to InteractiveNode[], runs resolveWithEmbeddings(),
+   * and returns the best Playwright selector with fallbacks.
    */
   static async resolve(request: SelectorResolveRequest): Promise<SelectorResolveResponse> {
     const startTime = Date.now();
 
-    logger.warn('[AI_SELECTOR_ENGINE] AI selector engine not yet implemented, returning fallback', {
-      intent: request.intent,
-      url: request.metadata.url,
-    });
+    try {
+      // Convert DOMNode[] → InteractiveNode[]
+      const interactiveNodes = request.nodes.map(node => AISelectorEngine.domNodeToInteractiveNode(node));
 
-    // Return a "not available" response that calling code can handle
+      if (interactiveNodes.length === 0) {
+        return {
+          success: false,
+          fallbackSelectors: [],
+          explanation: 'No interactive elements found on page',
+          metrics: { totalDuration: Date.now() - startTime, cacheHit: false },
+        };
+      }
+
+      // Build a minimal IntentStep for resolveWithEmbeddings
+      const stepDraft = {
+        id: `ai-selector-${Date.now()}`,
+        type: AISelectorEngine.inferActionType(request.intent) as any,
+        description: request.intent,
+      };
+
+      // Call embeddings resolver
+      const lintResult = await resolveWithEmbeddings({
+        previewSessionId: `self-heal-${request.metadata.projectId || 'unknown'}`,
+        stepDraft,
+        domNodes: interactiveNodes,
+        pageUrl: request.metadata.url,
+        disableCaching: true, // Self-healing should always use fresh data
+        includeAlternatives: true,
+        enableLLMDisambiguation: true,
+      });
+
+      const aiDuration = Date.now() - startTime;
+
+      // No match found
+      if (lintResult.status === 'not_found' || !lintResult.candidates || lintResult.candidates.length === 0) {
+        return {
+          success: false,
+          fallbackSelectors: [],
+          explanation: lintResult.message || 'No matching element found via embeddings',
+          metrics: { totalDuration: Date.now() - startTime, aiDuration, cacheHit: false },
+        };
+      }
+
+      // Get the best candidate
+      const bestCandidate = lintResult.candidates[0];
+      const bestNode = bestCandidate.node;
+
+      if (!bestNode) {
+        return {
+          success: false,
+          fallbackSelectors: [],
+          explanation: 'Best candidate has no node data',
+          metrics: { totalDuration: Date.now() - startTime, aiDuration, cacheHit: false },
+        };
+      }
+
+      // Build primary selector
+      const primarySelector = AISelectorEngine.buildBestSelector(bestNode);
+      const selectorType = AISelectorEngine.detectSelectorType(primarySelector);
+
+      // Build fallback selectors
+      const fallbackSelectors = AISelectorEngine.buildFallbackSelectors(bestNode);
+
+      // Find the original DOMNode to get bounding box
+      const originalNode = request.nodes.find(n => n.nodeId === bestNode.ref) || request.nodes[0];
+
+      const selectedNode = {
+        nodeId: bestNode.ref || originalNode?.nodeId || 'unknown',
+        primarySelector,
+        selectorType,
+        confidence: bestCandidate.confidence,
+        boundingBox: originalNode?.boundingBox || { x: 0, y: 0, width: 0, height: 0 },
+        element: {
+          tag: bestNode.tag,
+          text: bestNode.text || '',
+          attributes: AISelectorEngine.nodeToAttributes(bestNode),
+        },
+      };
+
+      logger.info('[AI_SELECTOR_ENGINE] Resolution successful', {
+        intent: request.intent.slice(0, 80),
+        primarySelector,
+        selectorType,
+        confidence: bestCandidate.confidence,
+        fallbackCount: fallbackSelectors.length,
+        durationMs: Date.now() - startTime,
+      });
+
+      return {
+        success: true,
+        selectedNode,
+        fallbackSelectors,
+        explanation: `Resolved via embeddings: ${bestCandidate.reason}`,
+        metrics: { totalDuration: Date.now() - startTime, aiDuration, cacheHit: false },
+      };
+    } catch (error) {
+      logger.error('[AI_SELECTOR_ENGINE] Resolution failed', {
+        error: error instanceof Error ? error.message : String(error),
+        intent: request.intent.slice(0, 80),
+      });
+
+      return {
+        success: false,
+        fallbackSelectors: [],
+        explanation: `AI resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+        metrics: { totalDuration: Date.now() - startTime, cacheHit: false },
+      };
+    }
+  }
+
+  /**
+   * Convert DOMNode to InteractiveNode for embeddings resolver.
+   * Uses enriched attributes from DOMNodeExtractor (__resolvedLabel, __containerTitles,
+   * __isTopMostAtCenter) to provide the same data quality as background-dom-collector.
+   */
+  private static domNodeToInteractiveNode(node: DOMNode): InteractiveNode {
+    const attrs = node.attributes;
+
+    // Resolve label: prefer <label for> resolution, fallback to aria-label
+    const resolvedLabel = attrs['__resolvedLabel'] || attrs['aria-label'] || undefined;
+
+    // Parse container titles (stored as pipe-delimited string)
+    const containerTitlesRaw = attrs['__containerTitles'];
+    const containerTitles = containerTitlesRaw ? containerTitlesRaw.split('|').filter(Boolean) : undefined;
+
+    // Parse isTopMostAtCenter
+    const isTopMostAtCenter = attrs['__isTopMostAtCenter'] === 'true';
+
+    // Detect dynamic IDs (GUIDs, random strings) — should not be used as selectors
+    const id = attrs['id'];
+    const isDynamicId = id ? /[0-9a-f]{8,}|[0-9]{4,}|^:r|^:R|^react-|^ember|^ng-/.test(id) : false;
+
     return {
-      success: false,
-      fallbackSelectors: [],
-      explanation: 'AI selector engine is not yet implemented. Please use manual selectors.',
-      warning: 'AI-powered selector resolution is currently unavailable. Consider using Playwright locators (getByRole, getByText, etc.) directly.',
-      metrics: {
-        totalDuration: Date.now() - startTime,
-        cacheHit: false,
-      },
+      ref: node.nodeId,
+      tag: node.tag,
+      role: node.role || attrs['role'],
+      type: attrs['type'],
+      inputType: attrs['type'],
+      text: node.text,
+      labelText: resolvedLabel,
+      ariaLabel: attrs['aria-label'],
+      name: attrs['name'],
+      placeholder: attrs['placeholder'],
+      id,
+      isDynamicId,
+      testIdAttr: attrs['data-testid'] || attrs['data-test'],
+      autocomplete: attrs['autocomplete'],
+      boundingBox: node.boundingBox,
+      isVisible: node.isVisible,
+      isInteractive: true,
+      isTopMostAtCenter,
+      containerTitles,
+      // State from attributes
+      isDisabled: attrs['disabled'] !== undefined || attrs['aria-disabled'] === 'true',
+      readOnly: attrs['readonly'] !== undefined || attrs['aria-readonly'] === 'true',
+      required: attrs['required'] !== undefined || attrs['aria-required'] === 'true',
+      checked: attrs['checked'] !== undefined ? true : undefined,
+      ariaExpanded: attrs['aria-expanded'] === 'true' ? true : (attrs['aria-expanded'] === 'false' ? false : undefined),
+      ariaPressed: attrs['aria-pressed'] === 'true' ? true : (attrs['aria-pressed'] === 'false' ? false : undefined),
+      ariaSelected: attrs['aria-selected'] === 'true' ? true : (attrs['aria-selected'] === 'false' ? false : undefined),
     };
+  }
+
+  /**
+   * Build the best Playwright selector from an InteractiveNode.
+   * Dynamically picks the most stable selector based on available attributes.
+   * Selector format must match what SelfHealingService.getLocatorForPage() supports:
+   *   role=<role>[name="<name>"], label=<label>, [data-testid="<id>"], CSS
+   */
+  private static buildBestSelector(node: InteractiveNode): string {
+    // 1. getByRole with name (most stable)
+    if (node.role && (node.ariaLabel || node.labelText || node.text)) {
+      const name = node.ariaLabel || node.labelText || node.text;
+      return `role=${node.role}[name="${name}"]`;
+    }
+
+    // 2. getByLabel
+    if (node.labelText) {
+      return `label=${node.labelText}`;
+    }
+
+    // 3. getByTestId
+    if (node.testIdAttr) {
+      return `[data-testid="${node.testIdAttr}"]`;
+    }
+
+    // 4. getByPlaceholder
+    if (node.placeholder) {
+      return `[placeholder="${node.placeholder}"]`;
+    }
+
+    // 5. getByRole without name
+    if (node.role) {
+      return `role=${node.role}`;
+    }
+
+    // 6. CSS with id
+    if (node.id && !node.isDynamicId) {
+      return `#${node.id}`;
+    }
+
+    // 7. CSS with name
+    if (node.name) {
+      return `${node.tag}[name="${node.name}"]`;
+    }
+
+    // 8. Fallback CSS tag + type
+    if (node.type) {
+      return `${node.tag}[type="${node.type}"]`;
+    }
+
+    return node.tag;
+  }
+
+  /**
+   * Build fallback selectors dynamically from node attributes.
+   * Only generates selectors for attributes that actually exist on the node.
+   * Deduplicates against primary selector and limits to 3.
+   */
+  private static buildFallbackSelectors(node: InteractiveNode): SelectorCandidate[] {
+    const fallbacks: SelectorCandidate[] = [];
+    const primarySelector = AISelectorEngine.buildBestSelector(node);
+    const seen = new Set<string>([primarySelector]);
+
+    const add = (type: SelectorType, selector: string, confidence: number, stability: number, reasoning: string) => {
+      if (!seen.has(selector)) {
+        seen.add(selector);
+        fallbacks.push({ type, selector, confidence, stability, reasoning });
+      }
+    };
+
+    // Each block only fires if the node actually has that attribute
+    if (node.labelText) {
+      add('getByLabel', `label=${node.labelText}`, 0.85, 0.85, `Label text: "${node.labelText}"`);
+    }
+    if (node.role) {
+      const name = node.ariaLabel || node.labelText || node.text;
+      const sel = name ? `role=${node.role}[name="${name}"]` : `role=${node.role}`;
+      add('getByRole', sel, 0.8, 0.9, `ARIA role: ${node.role}${name ? ` with name "${name}"` : ''}`);
+    }
+    if (node.testIdAttr) {
+      add('data-testid', `[data-testid="${node.testIdAttr}"]`, 0.9, 0.95, `data-testid: "${node.testIdAttr}"`);
+    }
+    if (node.placeholder) {
+      add('css', `[placeholder="${node.placeholder}"]`, 0.7, 0.7, `Placeholder: "${node.placeholder}"`);
+    }
+    if (node.name) {
+      add('css', `${node.tag}[name="${node.name}"]`, 0.6, 0.6, `HTML name attribute: "${node.name}"`);
+    }
+
+    return fallbacks.slice(0, 3);
+  }
+
+  /**
+   * Detect selector type from selector string
+   */
+  private static detectSelectorType(selector: string): SelectorType {
+    if (selector.startsWith('role=')) return 'getByRole';
+    if (selector.startsWith('label=')) return 'getByLabel';
+    if (selector.startsWith('text=')) return 'getByText';
+    if (selector.includes('[data-testid=')) return 'data-testid';
+    if (selector.startsWith('//')) return 'xpath';
+    return 'css';
+  }
+
+  /**
+   * Infer action type from intent description
+   */
+  private static inferActionType(intent: string): string {
+    const lower = intent.toLowerCase();
+    if (lower.includes('type') || lower.includes('fill') || lower.includes('enter') || lower.includes('input')) return 'type';
+    if (lower.includes('click') || lower.includes('press') || lower.includes('tap') || lower.includes('submit')) return 'click';
+    if (lower.includes('select') || lower.includes('choose') || lower.includes('pick')) return 'select';
+    if (lower.includes('check') || lower.includes('toggle')) return 'check';
+    if (lower.includes('hover')) return 'hover';
+    return 'click';
+  }
+
+  /**
+   * Convert InteractiveNode attributes to a Record for SelectedNode.element
+   */
+  private static nodeToAttributes(node: InteractiveNode): Record<string, string> {
+    const attrs: Record<string, string> = {};
+    if (node.id) attrs['id'] = node.id;
+    if (node.name) attrs['name'] = node.name;
+    if (node.type) attrs['type'] = node.type;
+    if (node.role) attrs['role'] = node.role;
+    if (node.ariaLabel) attrs['aria-label'] = node.ariaLabel;
+    if (node.placeholder) attrs['placeholder'] = node.placeholder;
+    if (node.testIdAttr) attrs['data-testid'] = node.testIdAttr;
+    if (node.autocomplete) attrs['autocomplete'] = node.autocomplete;
+    return attrs;
   }
 }

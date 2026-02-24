@@ -1,3 +1,4 @@
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { ChatService } from '@/services/utils/chat.service';
@@ -175,7 +176,7 @@ If NOT skill-worthy: { "isSkillWorthy": false, "key": "", "content": "", "catego
           },
         ],
         {
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.skillSuggestion,
           temperature: 0.2,
           max_tokens: 300,
           response_format: { type: 'json_object' },
@@ -271,7 +272,7 @@ Do NOT suggest generic testing best practices. Only suggest patterns specific to
           },
         ],
         {
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.skillSuggestion,
           temperature: 0.3,
           max_tokens: 500,
           response_format: { type: 'json_object' },

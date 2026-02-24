@@ -3,6 +3,7 @@
  * Builds a normalized expectation model from expectedBehavior (JSON-first, 1 AI fallback).
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import type { ApiAgentExpectationModel, ApiAgentRequest } from './api-agent.types';
@@ -114,7 +115,7 @@ export class ApiAgentExpectationService {
           // LIGHT constraint: keep interpretation cheap
           max_tokens: opts?.maxTokens ?? 350,
           response_format: { type: 'json_object' },
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.apiExpectation,
         }
       );
 

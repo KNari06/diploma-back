@@ -1,3 +1,4 @@
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import type { CommandFingerprint, OverallCluster, OverallEdge } from '@/types/overall.types';
 import { logger } from '@/utils/core/logger';
@@ -531,7 +532,7 @@ If no tests are related, return: {"pairs": []}`,
         },
       ],
       {
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.testVisualization,
         temperature: 0.1,
         max_tokens: 2000,
         response_format: { type: 'json_object' },

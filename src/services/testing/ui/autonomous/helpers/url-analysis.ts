@@ -2,6 +2,7 @@ import {
   buildUrlAnalysisPrompt,
   buildUrlAnalysisSystemPrompt,
 } from '@/ai/prompts';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 
@@ -41,7 +42,7 @@ export async function analyzeUrlContext(url: string): Promise<{
         },
       ],
       {
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.urlAnalysis,
         temperature: 0.1, // Very low temperature for strict format adherence
         max_tokens: 500,
         response_format: { type: 'json_object' }, // Forces JSON mode

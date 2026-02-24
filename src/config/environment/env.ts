@@ -35,6 +35,7 @@ const envSchema = z.object({
   // OpenAI
   OPENAI_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required'),
   OPENAI_MODEL: z.string().default('gpt-4o'),
+  OPENAI_MODEL_FAST: z.string().default('gpt-4o-mini'),
   OPENAI_MAX_TOKENS: z.string().transform(Number).default('4000'),
 
   // Google Gemini

@@ -1,6 +1,7 @@
 import { ChatService } from '@/services/utils/chat.service';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
+import { supabaseAdmin } from '@/db/supabase';
 import { Request, Response } from 'express';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep } from '../shared/utils';
@@ -198,6 +199,26 @@ export async function handleApiTest(
       hasExplicitLevel: !!(parsedIntent?.agentLevel || parsedIntent?.metadata?.agentLevel),
     });
 
+    // Resolve actual project_id from chat_session (workspace_id !== projectId)
+    let resolvedProjectId: string | undefined;
+    if (chatSessionId) {
+      try {
+        const { data: session } = await supabaseAdmin
+          .from('chat_sessions')
+          .select('project_id')
+          .eq('id', chatSessionId)
+          .single();
+        if (session?.project_id) {
+          resolvedProjectId = session.project_id;
+        }
+      } catch (err) {
+        logger.warn('[API_TEST] Failed to resolve project_id from chat session', {
+          error: err instanceof Error ? err.message : String(err),
+          chatSessionId,
+        });
+      }
+    }
+
     await executeApiAgentTestFlow(res, {
       level: agentLevel,
       url: parsedIntent.apiUrl,
@@ -208,7 +229,8 @@ export async function handleApiTest(
       expectedBehavior: parsedIntent.expectedBehavior || parsedIntent?.metadata?.expectedBehavior,
       userId,
       chatSessionId,
-      projectId: workspace_id,
+      projectId: resolvedProjectId,
+      workspaceId: workspace_id,
       userMessage: message,
     });
   } catch (error) {

@@ -4,6 +4,7 @@
  * Similar to Momentic's AI extract functionality
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
@@ -29,7 +30,7 @@ const AI_EXTRACT_CONFIG = {
   OPENAI_MAX_RETRIES: 2,
 
   // Model settings
-  MODEL: 'gpt-4o-mini', // Fast and cheap for extraction
+  MODEL: AI_TASK_MODELS.dataExtraction, // Centralized model config
   TEMPERATURE: 0.1, // Low temperature for deterministic extraction
 
   // Element wait settings

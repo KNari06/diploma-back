@@ -10,7 +10,8 @@ import { browserPool } from '../../browser/browser-pool';
  */
 export async function setupBrowserContext(
   testData: TestJobData,
-  browser: Browser
+  browser: Browser,
+  options?: { disableVideo?: boolean }
 ): Promise<{ context: BrowserContext; tracePath: string }> {
   // ✅ FIX: Prepare video & trace directories
   const fs = await import('fs/promises');
@@ -47,11 +48,13 @@ export async function setupBrowserContext(
       'Sec-Fetch-User': '?1',
       'Cache-Control': 'max-age=0',
     },
-    // ✅ NEW: Enable video recording
-    recordVideo: {
-      dir: videosDir,
-      size: { width: 1920, height: 1080 }
-    },
+    // Video recording (disabled for initial replay attempts to save resources)
+    ...(options?.disableVideo ? {} : {
+      recordVideo: {
+        dir: videosDir,
+        size: { width: 1920, height: 1080 },
+      },
+    }),
     // ✅ FIX: Set locale and timezone to look more realistic
     locale: 'en-US',
     timezoneId: 'America/New_York',

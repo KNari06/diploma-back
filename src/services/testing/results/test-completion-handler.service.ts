@@ -312,6 +312,7 @@ export class TestCompletionHandlerService {
   private static async updateTestExecutionsForCompletedUiTest(test: {
     id: string;
     status: string;
+    user_id?: string;
     created_at?: string;
     completed_at?: string;
   }): Promise<void> {
@@ -342,7 +343,7 @@ export class TestCompletionHandlerService {
           duration_ms: durationMs,
         })
         .eq('result->>testId', testId)
-        .select('id');
+        .select('id, run_id');
 
       if (error) {
         logger.warn('[TEST_COMPLETION] Failed to update test_executions for UI test', {
@@ -362,6 +363,28 @@ export class TestCompletionHandlerService {
         // Signal dependency-aware execution orchestrator so dependents can proceed
         for (const row of data) {
           executionCompletionEmitter.signalCompletion(row.id, mappedStatus);
+        }
+
+        // Emit per-execution progress so frontend updates individual test status in run view.
+        // executeTestCasesAsync runs in main process but handleTestCompletion runs in worker —
+        // EventEmitter signals don't cross process boundaries, so we emit WebSocket directly.
+        const runId = data[0].run_id;
+        if (runId && test.user_id) {
+          try {
+            webSocketService.emitRegressionRunProgress(test.user_id, {
+              runId,
+              userId: test.user_id,
+              status: 'test_completed',
+              progress: -1, // Frontend should compute from execution statuses
+              message: `Test ${mappedStatus}: ${test.id}`,
+              details: {
+                totalTests: 0, // Unknown from this context
+                completedTests: 0,
+                currentTestName: test.id,
+              },
+              timestamp: new Date().toISOString(),
+            });
+          } catch { /* non-fatal */ }
         }
       }
     } catch (error) {
@@ -393,8 +416,10 @@ export class TestCompletionHandlerService {
       }
 
       // Find regression runs that reference this test
-      // Query 1: direct test_id match; Query 2: batch test_ids contains
-      const [directResult, batchResult] = await Promise.all([
+      // Query 1: direct test_id match (single test case runs)
+      // Query 2: test_ids JSONB array contains testId (plan/module/flow runs)
+      // Query 3: test_executions join — fallback for runs linked via test_executions table
+      const [directResult, batchResult, execResult] = await Promise.all([
         supabaseAdmin
           .from('regression_runs')
           .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
@@ -403,16 +428,35 @@ export class TestCompletionHandlerService {
         supabaseAdmin
           .from('regression_runs')
           .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
-          .contains('test_ids', [testId])
+          .filter('test_ids', 'cs', `["${testId}"]`)
           .in('status', ['running', 'pending']),
+        // Fallback: find via test_executions table (most reliable for plan runs)
+        supabaseAdmin
+          .from('test_executions')
+          .select('run_id')
+          .eq('result->>testId', testId)
+          .limit(1),
       ]);
 
-      const runsError = directResult.error || batchResult.error;
       // Deduplicate by run ID
       const runMap = new Map<string, any>();
       for (const r of directResult.data || []) runMap.set(r.id, r);
       for (const r of batchResult.data || []) runMap.set(r.id, r);
+
+      // If test_executions found a run_id not yet in map, fetch it
+      const execRunId = execResult.data?.[0]?.run_id;
+      if (execRunId && !runMap.has(execRunId)) {
+        const { data: execRun } = await supabaseAdmin
+          .from('regression_runs')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
+          .eq('id', execRunId)
+          .in('status', ['running', 'pending'])
+          .maybeSingle();
+        if (execRun) runMap.set(execRun.id, execRun);
+      }
+
       const runs = [...runMap.values()];
+      const runsError = directResult.error || batchResult.error;
 
       if (runsError) {
         logger.error('[TEST_COMPLETION] Failed to find regression runs', {

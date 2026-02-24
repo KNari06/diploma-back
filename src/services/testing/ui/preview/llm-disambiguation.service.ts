@@ -20,6 +20,7 @@
  */
 
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import type { IntentActionType, InteractiveNode } from './preview.types';
 
@@ -34,16 +35,16 @@ const CONFIDENCE_THRESHOLD = 0.75;
 const MAX_CANDIDATES_FOR_LLM = 5;
 
 /** LLM timeout in milliseconds */
-const LLM_TIMEOUT_MS = 2000;
+const LLM_TIMEOUT_MS = 6000;
 
-/** Cache TTL in milliseconds (5 minutes) */
-const CACHE_TTL_MS = 5 * 60 * 1000;
+/** Cache TTL in milliseconds (30 minutes — safe because cache key includes pageSignature + intent + candidates) */
+const CACHE_TTL_MS = 30 * 60 * 1000;
 
 /** Maximum allowed candidates before skipping LLM (to avoid waste) */
 const MAX_ALLOWED_FOR_LLM = 50;
 
 /** Model to use for disambiguation */
-const LLM_MODEL = 'gpt-4o-mini';
+const LLM_MODEL = AI_TASK_MODELS.disambiguation;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -174,6 +175,9 @@ function hashString(str: string): string {
 /** In-memory cache for disambiguation results */
 const disambiguationCache = new Map<string, CacheEntry>();
 
+/** Max cache size to prevent unbounded growth */
+const MAX_CACHE_SIZE = 500;
+
 /**
  * Get cached result if valid
  */
@@ -191,9 +195,28 @@ function getCachedResult(key: string): DisambiguationResult | null {
 }
 
 /**
- * Store result in cache
+ * Store result in cache. Evicts expired entries when cache exceeds MAX_CACHE_SIZE.
  */
 function cacheResult(key: string, result: DisambiguationResult): void {
+  // Evict expired entries if cache is too large
+  if (disambiguationCache.size >= MAX_CACHE_SIZE) {
+    const now = Date.now();
+    for (const [k, v] of disambiguationCache) {
+      if (now - v.createdAt > CACHE_TTL_MS) {
+        disambiguationCache.delete(k);
+      }
+    }
+    // If still too large after TTL eviction, remove oldest entries
+    if (disambiguationCache.size >= MAX_CACHE_SIZE) {
+      const entries = Array.from(disambiguationCache.entries())
+        .sort((a, b) => a[1].createdAt - b[1].createdAt);
+      const toRemove = entries.slice(0, Math.floor(MAX_CACHE_SIZE / 4));
+      for (const [k] of toRemove) {
+        disambiguationCache.delete(k);
+      }
+    }
+  }
+
   disambiguationCache.set(key, {
     result,
     createdAt: Date.now(),
@@ -452,7 +475,7 @@ export async function disambiguateWithLLM(
         latencyMs,
         skipped: false,
       };
-      cacheResult(cacheKey, result);
+      // Don't cache failed parse results — LLM might return valid response on next attempt
       return result;
     }
 

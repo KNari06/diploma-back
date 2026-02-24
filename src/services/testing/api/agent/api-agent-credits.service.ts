@@ -3,6 +3,7 @@
  * Handles fixed-per-level billing + incremental AI-usage billing
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TOKENS_PER_CREDIT } from '@/services/core/token-calculator.service';
@@ -17,7 +18,7 @@ import { getBaselineCredits } from './api-agent-policy';
 const USD_PER_CREDIT = 0.0289; // Based on $28.9 / 1000 credits
 
 /** Model used for AI calls in agent */
-const DEFAULT_MODEL = 'gpt-4o-mini';
+const DEFAULT_MODEL = AI_TASK_MODELS.creditDefault as 'gpt-4o' | 'gpt-4o-mini';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CREDITS SERVICE

@@ -245,6 +245,20 @@ export class ManualTestRunJobHandler {
         // BullMQ retry should NOT happen here - executePlaywrightTestWithRetry already did all retries
       }
 
+      // Post-completion: update regression run status, chat notifications, test_executions.
+      // Non-fatal: errors here must not break the job.
+      try {
+        const { TestCompletionHandlerService } = await import(
+          '@/services/testing/results/test-completion-handler.service'
+        );
+        await TestCompletionHandlerService.handleTestCompletion(testId);
+      } catch (completionError) {
+        logger.warn('[TEST-RUN] Post-completion handler failed (non-fatal)', {
+          testId,
+          error: completionError instanceof Error ? completionError.message : String(completionError),
+        });
+      }
+
     } catch (error) {
       // Handle test cancellation separately
       if (error instanceof TestCancelledError) {
@@ -819,9 +833,8 @@ export class ManualTestResultJobHandler {
         webSocketService.emitTestCompleted(testId, payload);
       }
 
-      // Email notifications disabled - all data is available in DB via API
-      // Real-time updates are sent via WebSocket events (emitTestBrowserCompleted, emitResultReady)
-      // Chat notifications are handled by TestCompletionHandlerService.handleTestCompletion()
+      // Note: Regression run status update + chat notifications are handled in process()
+      // via TestCompletionHandlerService.handleTestCompletion() after both success/failure branches.
 
     } catch (error) {
       logger.error(`[TEST-RESULT] Failed to update test status for ${testId}:`, {

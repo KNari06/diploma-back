@@ -40,6 +40,7 @@ export class CommandExecutor {
   private externalAbortHandler?: () => void; // ✅ FIX 1: Store handler for cleanup
   private selfHealingConfidenceThreshold: number = 0.85; // ✅ FIX 7: Configurable threshold
   private maxHealAttempts: number = 1; // ✅ V2: Limit self-heal attempts to expose flakiness
+  private skipCompiledPlan: boolean = false; // Skip Stage 1 on retry attempts
   /** Runtime metadata for each step (keyed by stepId) */
   private stepRuntimeMeta: Map<string, StepRuntimeMeta> = new Map();
 
@@ -51,6 +52,7 @@ export class CommandExecutor {
       abortSignal?: AbortSignal;
       costManager?: AICostManager;
       selfHealingConfidenceThreshold?: number; // ✅ NEW: Configurable confidence
+      skipCompiledPlan?: boolean; // Skip compiled locator plan (Stage 1) — used on retry attempts
     } = {}
   ) {
     this.page = page;
@@ -58,6 +60,7 @@ export class CommandExecutor {
     this.metadata = options.metadata || { url: '' };
     this.costManager = options.costManager;
     this.selfHealingConfidenceThreshold = options.selfHealingConfidenceThreshold ?? 0.85;
+    this.skipCompiledPlan = options.skipCompiledPlan ?? false;
 
     this.abortController = new AbortController();
 
@@ -66,6 +69,16 @@ export class CommandExecutor {
       this.externalAbortHandler = () => this.abort();
       options.abortSignal.addEventListener('abort', this.externalAbortHandler, { once: true });
     }
+  }
+
+  /**
+   * Reset per-run state (extractedData, stepRuntimeMeta).
+   * Call between test flows to prevent data leaking across runs.
+   */
+  resetRunState(): void {
+    this.extractedData.clear();
+    this.stepRuntimeMeta.clear();
+    logger.debug('[COMMAND_EXECUTOR] Run state reset');
   }
 
   /**
@@ -473,6 +486,26 @@ export class CommandExecutor {
         }
 
         case 'check': {
+          const performCheck = async (checkLocator: Locator) => {
+            await checkLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await this.waitForEnabled(checkLocator, 5000);
+            const alreadyChecked = await checkLocator.isChecked().catch(() => false);
+            if (!alreadyChecked) {
+              await checkLocator.check({ timeout: timeout || 30000 });
+            } else {
+              logger.debug('[COMMAND_EXECUTOR] check: element already checked, skipping');
+            }
+          };
+
+          // Intent command path — compiled plan → embeddings → smart → self-heal
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentCheckLocator } = await this.getLocatorForIntentCommand(
+              intentCommand, 'check', timeout || 30000
+            );
+            await performCheck(intentCheckLocator);
+            break;
+          }
+
           if (!selector) throw new Error('Selector is required for check action');
 
           const checkSmartResult = await getSmartLocator(this.page, selector, 'check', description);
@@ -486,29 +519,16 @@ export class CommandExecutor {
           }
 
           try {
-            await checkSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            await this.waitForEnabled(checkSmartResult.locator, 5000);
-            // Guard: skip if already checked — Playwright throws if already in desired state
-            const alreadyChecked = await checkSmartResult.locator.isChecked().catch(() => false);
-            if (!alreadyChecked) {
-              await checkSmartResult.locator.check({ timeout: timeout || 30000 });
-            } else {
-              logger.debug('[COMMAND_EXECUTOR] check: element already checked, skipping');
-            }
+            await performCheck(checkSmartResult.locator);
           } catch (checkError) {
             logger.warn('[COMMAND_EXECUTOR] Smart locator check failed, trying self-healing', {
               selector: selector.substring(0, 50),
               error: checkError instanceof Error ? checkError.message : String(checkError),
             });
-
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                await this.waitForEnabled(locator, 5000);
-                const alreadyCheckedSH = await locator.isChecked().catch(() => false);
-                if (!alreadyCheckedSH) {
-                  await locator.check({ timeout: timeout || 30000 });
-                }
+                await performCheck(locator);
               },
               { selector, intent: description || 'check checkbox', action: 'check', timeout }
             );
@@ -517,10 +537,29 @@ export class CommandExecutor {
         }
 
         case 'uncheck': {
+          const performUncheck = async (uncheckLocator: Locator) => {
+            await uncheckLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await this.waitForEnabled(uncheckLocator, 5000);
+            const alreadyUnchecked = !(await uncheckLocator.isChecked().catch(() => true));
+            if (!alreadyUnchecked) {
+              await uncheckLocator.uncheck({ timeout: timeout || 30000 });
+            } else {
+              logger.debug('[COMMAND_EXECUTOR] uncheck: element already unchecked, skipping');
+            }
+          };
+
+          // Intent command path
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentUncheckLocator } = await this.getLocatorForIntentCommand(
+              intentCommand, 'uncheck', timeout || 30000
+            );
+            await performUncheck(intentUncheckLocator);
+            break;
+          }
+
           if (!selector) throw new Error('Selector is required for uncheck action');
 
           const uncheckSmartResult = await getSmartLocator(this.page, selector, 'check', description);
-
           if (uncheckSmartResult.wasSmartSelected) {
             logger.info('[COMMAND_EXECUTOR] Smart element selection used for uncheck', {
               selector: selector.substring(0, 50),
@@ -530,29 +569,16 @@ export class CommandExecutor {
           }
 
           try {
-            await uncheckSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            await this.waitForEnabled(uncheckSmartResult.locator, 5000);
-            // Guard: skip if already unchecked — Playwright throws if already in desired state
-            const alreadyUnchecked = !(await uncheckSmartResult.locator.isChecked().catch(() => true));
-            if (!alreadyUnchecked) {
-              await uncheckSmartResult.locator.uncheck({ timeout: timeout || 30000 });
-            } else {
-              logger.debug('[COMMAND_EXECUTOR] uncheck: element already unchecked, skipping');
-            }
+            await performUncheck(uncheckSmartResult.locator);
           } catch (uncheckError) {
             logger.warn('[COMMAND_EXECUTOR] Smart locator uncheck failed, trying self-healing', {
               selector: selector.substring(0, 50),
               error: uncheckError instanceof Error ? uncheckError.message : String(uncheckError),
             });
-
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                await this.waitForEnabled(locator, 5000);
-                const alreadyUncheckedSH = !(await locator.isChecked().catch(() => true));
-                if (!alreadyUncheckedSH) {
-                  await locator.uncheck({ timeout: timeout || 30000 });
-                }
+                await performUncheck(locator);
               },
               { selector, intent: description || 'uncheck checkbox', action: 'uncheck', timeout }
             );
@@ -560,17 +586,24 @@ export class CommandExecutor {
           break;
         }
 
-        case 'hover':
+        case 'hover': {
+          const performHover = async (hoverLocator: Locator) => {
+            await hoverLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await hoverLocator.hover({ timeout: timeout || 30000 });
+          };
+
+          // Intent command path
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentHoverLocator } = await this.getLocatorForIntentCommand(
+              intentCommand, 'hover', timeout || 30000
+            );
+            await performHover(intentHoverLocator);
+            break;
+          }
+
           if (!selector) throw new Error('Selector is required for hover action');
 
-          // ✅ NEW: Use smart locator for hover action
-          const hoverSmartResult = await getSmartLocator(
-            this.page,
-            selector,
-            'hover',
-            description
-          );
-
+          const hoverSmartResult = await getSmartLocator(this.page, selector, 'hover', description);
           if (hoverSmartResult.wasSmartSelected) {
             logger.info('[COMMAND_EXECUTOR] Smart element selection used for hover', {
               selector: selector.substring(0, 50),
@@ -580,40 +613,41 @@ export class CommandExecutor {
           }
 
           try {
-            await hoverSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            await hoverSmartResult.locator.hover({ timeout: timeout || 30000 });
+            await performHover(hoverSmartResult.locator);
           } catch (hoverError) {
             logger.warn('[COMMAND_EXECUTOR] Smart locator hover failed, trying self-healing', {
               selector: selector.substring(0, 50),
               error: hoverError instanceof Error ? hoverError.message : String(hoverError),
             });
-
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                await locator.hover({ timeout: timeout || 30000 });
+                await performHover(locator);
               },
-              {
-                selector,
-                intent: description || 'hover element',
-                action: 'hover',
-                timeout,
-              }
+              { selector, intent: description || 'hover element', action: 'hover', timeout }
             );
           }
           break;
+        }
 
-        case 'dblclick':
+        case 'dblclick': {
+          const performDblclick = async (dblLocator: Locator) => {
+            await dblLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await dblLocator.dblclick({ timeout: timeout || 30000 });
+          };
+
+          // Intent command path
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentDblLocator } = await this.getLocatorForIntentCommand(
+              intentCommand, 'click', timeout || 30000
+            );
+            await performDblclick(intentDblLocator);
+            break;
+          }
+
           if (!selector) throw new Error('Selector is required for dblclick action');
 
-          // ✅ NEW: Use smart locator for dblclick action
-          const dblclickSmartResult = await getSmartLocator(
-            this.page,
-            selector,
-            'click', // Same preferences as click
-            description
-          );
-
+          const dblclickSmartResult = await getSmartLocator(this.page, selector, 'click', description);
           if (dblclickSmartResult.wasSmartSelected) {
             logger.info('[COMMAND_EXECUTOR] Smart element selection used for dblclick', {
               selector: selector.substring(0, 50),
@@ -623,42 +657,84 @@ export class CommandExecutor {
           }
 
           try {
-            await dblclickSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            await dblclickSmartResult.locator.dblclick({ timeout: timeout || 30000 });
+            await performDblclick(dblclickSmartResult.locator);
           } catch (dblclickError) {
             logger.warn('[COMMAND_EXECUTOR] Smart locator dblclick failed, trying self-healing', {
               selector: selector.substring(0, 50),
               error: dblclickError instanceof Error ? dblclickError.message : String(dblclickError),
             });
-
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                await locator.dblclick({ timeout: timeout || 30000 });
+                await performDblclick(locator);
               },
-              {
-                selector,
-                intent: description || 'double click element',
-                action: 'dblclick',
-                timeout,
-              }
+              { selector, intent: description || 'double click element', action: 'dblclick', timeout }
             );
           }
           break;
+        }
 
         case 'focus': {
           if (!selector) throw new Error('Selector is required for focus action');
-          const focusLocator = this.getLocatorInternal(selector);
-          await focusLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-          await focusLocator.focus({ timeout: timeout || 30000 });
+
+          const focusSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (focusSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for focus', {
+              selector: selector.substring(0, 50),
+              totalMatches: focusSmartResult.totalMatches,
+              selectedIndex: focusSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            await focusSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await focusSmartResult.locator.focus({ timeout: timeout || 30000 });
+          } catch (focusError) {
+            logger.warn('[COMMAND_EXECUTOR] Smart locator focus failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: focusError instanceof Error ? focusError.message : String(focusError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+                await locator.focus({ timeout: timeout || 30000 });
+              },
+              { selector, intent: description || 'focus element', action: 'focus', timeout }
+            );
+          }
           break;
         }
 
         case 'blur': {
           if (!selector) throw new Error('Selector is required for blur action');
-          const blurLocator = this.getLocatorInternal(selector);
-          await blurLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-          await blurLocator.blur({ timeout: timeout || 30000 });
+
+          const blurSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (blurSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for blur', {
+              selector: selector.substring(0, 50),
+              totalMatches: blurSmartResult.totalMatches,
+              selectedIndex: blurSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            await blurSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+            await blurSmartResult.locator.blur({ timeout: timeout || 30000 });
+          } catch (blurError) {
+            logger.warn('[COMMAND_EXECUTOR] Smart locator blur failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: blurError instanceof Error ? blurError.message : String(blurError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
+                await locator.blur({ timeout: timeout || 30000 });
+              },
+              { selector, intent: description || 'blur element', action: 'blur', timeout }
+            );
+          }
           break;
         }
 
@@ -790,68 +866,209 @@ export class CommandExecutor {
           };
         }
 
-        case 'assertVisible':
+        case 'assertVisible': {
           if (!selector) throw new Error('Selector is required for assertVisible action');
-          const assertVisibleLocator = this.getLocatorInternal(selector);
-          const isVisible = await assertVisibleLocator.isVisible({ timeout: timeout || 5000 });
-          if (!isVisible) {
-            throw new Error(`Element not visible: ${selector}`);
-          }
-          logger.info(`Assertion passed: Element is visible`, { selector });
-          break;
 
-        case 'assertText':
+          const assertVisSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertVisSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertVisible', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertVisSmartResult.totalMatches,
+              selectedIndex: assertVisSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            const isVisible = await assertVisSmartResult.locator.isVisible({ timeout: timeout || 5000 });
+            if (!isVisible) {
+              throw new Error(`Element not visible: ${selector}`);
+            }
+          } catch (assertVisError) {
+            if (assertVisError instanceof Error && assertVisError.message.startsWith('Element not visible')) throw assertVisError;
+            logger.warn('[COMMAND_EXECUTOR] Smart locator assertVisible failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: assertVisError instanceof Error ? assertVisError.message : String(assertVisError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                const vis = await locator.isVisible({ timeout: timeout || 5000 });
+                if (!vis) throw new Error(`Element not visible: ${selector}`);
+              },
+              { selector, intent: description || 'assert element visible', action: 'assertVisible', timeout }
+            );
+          }
+          logger.info('Assertion passed: Element is visible', { selector });
+          break;
+        }
+
+        case 'assertText': {
           if (!selector) throw new Error('Selector is required for assertText action');
-          const assertTextLocator = this.getLocatorInternal(selector);
-          await assertTextLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
-          const actualText = await assertTextLocator.textContent();
-          const expectedText = String(command.assertion?.expected || '');
-          const operator = command.assertion?.operator || '=';
-          const passed = this.compareValues(actualText || '', expectedText, operator);
-          if (!passed) {
-            throw new Error(`Text assertion failed for ${selector}: expected "${expectedText}", got "${actualText}"`);
-          }
-          logger.info(`Assertion passed: Text matches`, { selector, expected: expectedText, actual: actualText });
-          break;
 
-        case 'assertValue':
-          if (!selector) throw new Error('Selector is required for assertValue action');
-          const assertValueLocator = this.getLocatorInternal(selector);
-          await assertValueLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
-          const actualValue = await assertValueLocator.inputValue();
-          const expectedValue = String(command.assertion?.expected || '');
-          const valueOperator = command.assertion?.operator || '=';
-          const valuePassed = this.compareValues(actualValue, expectedValue, valueOperator);
-          if (!valuePassed) {
-            throw new Error(`Value assertion failed for ${selector}: expected "${expectedValue}", got "${actualValue}"`);
+          const assertTxtSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertTxtSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertText', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertTxtSmartResult.totalMatches,
+              selectedIndex: assertTxtSmartResult.selectedIndex,
+            });
           }
-          logger.info(`Assertion passed: Value matches`, { selector, expected: expectedValue, actual: actualValue });
+
+          const performAssertText = async (locator: Locator) => {
+            await locator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+            const actualText = await locator.textContent();
+            const expectedText = String(command.assertion?.expected || '');
+            const op = command.assertion?.operator || '=';
+            const passed = this.compareValues(actualText || '', expectedText, op);
+            if (!passed) {
+              throw new Error(`Text assertion failed for ${selector}: expected "${expectedText}", got "${actualText}"`);
+            }
+            logger.info('Assertion passed: Text matches', { selector, expected: expectedText, actual: actualText });
+          };
+
+          try {
+            await performAssertText(assertTxtSmartResult.locator);
+          } catch (assertTxtError) {
+            if (assertTxtError instanceof Error && assertTxtError.message.startsWith('Text assertion failed')) throw assertTxtError;
+            logger.warn('[COMMAND_EXECUTOR] Smart locator assertText failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: assertTxtError instanceof Error ? assertTxtError.message : String(assertTxtError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await performAssertText(locator);
+              },
+              { selector, intent: description || `assert text ${command.assertion?.expected}`, action: 'assertText', timeout }
+            );
+          }
           break;
+        }
+
+        case 'assertValue': {
+          if (!selector) throw new Error('Selector is required for assertValue action');
+
+          const assertValSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertValSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertValue', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertValSmartResult.totalMatches,
+              selectedIndex: assertValSmartResult.selectedIndex,
+            });
+          }
+
+          const performAssertValue = async (locator: Locator) => {
+            await locator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+            const actualValue = await locator.inputValue();
+            const expectedValue = String(command.assertion?.expected || '');
+            const valueOperator = command.assertion?.operator || '=';
+            const valuePassed = this.compareValues(actualValue, expectedValue, valueOperator);
+            if (!valuePassed) {
+              throw new Error(`Value assertion failed for ${selector}: expected "${expectedValue}", got "${actualValue}"`);
+            }
+            logger.info('Assertion passed: Value matches', { selector, expected: expectedValue, actual: actualValue });
+          };
+
+          try {
+            await performAssertValue(assertValSmartResult.locator);
+          } catch (assertValError) {
+            if (assertValError instanceof Error && assertValError.message.startsWith('Value assertion failed')) throw assertValError;
+            logger.warn('[COMMAND_EXECUTOR] Smart locator assertValue failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: assertValError instanceof Error ? assertValError.message : String(assertValError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await performAssertValue(locator);
+              },
+              { selector, intent: description || `assert value ${command.assertion?.expected}`, action: 'assertValue', timeout }
+            );
+          }
+          break;
+        }
 
         case 'assertUrl':
           await this.assertUrl(command.assertion);
           break;
 
-        case 'assertCount':
+        case 'assertCount': {
           if (!selector) throw new Error('Selector is required for assertCount action');
-          const assertCountLocator = this.getLocatorInternal(selector);
-          const actualCount = await assertCountLocator.count();
-          const expectedCount = Number(command.assertion?.expected || 0);
-          const countOperator = command.assertion?.operator || '=';
-          const countPassed = this.compareValues(actualCount, expectedCount, countOperator);
-          if (!countPassed) {
-            throw new Error(`Count assertion failed for ${selector}: expected ${expectedCount}, got ${actualCount}`);
+
+          const assertCntSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertCntSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertCount', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertCntSmartResult.totalMatches,
+              selectedIndex: assertCntSmartResult.selectedIndex,
+            });
           }
-          logger.info(`Assertion passed: Count matches`, { selector, expected: expectedCount, actual: actualCount });
+
+          const performAssertCount = async (locator: Locator) => {
+            const actualCount = await locator.count();
+            const expectedCount = Number(command.assertion?.expected || 0);
+            const countOp = command.assertion?.operator || '=';
+            const countPassed = this.compareValues(actualCount, expectedCount, countOp);
+            if (!countPassed) {
+              throw new Error(`Count assertion failed for ${selector}: expected ${expectedCount}, got ${actualCount}`);
+            }
+            logger.info('Assertion passed: Count matches', { selector, expected: expectedCount, actual: actualCount });
+          };
+
+          try {
+            await performAssertCount(assertCntSmartResult.locator);
+          } catch (assertCntError) {
+            if (assertCntError instanceof Error && assertCntError.message.startsWith('Count assertion failed')) throw assertCntError;
+            logger.warn('[COMMAND_EXECUTOR] Smart locator assertCount failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: assertCntError instanceof Error ? assertCntError.message : String(assertCntError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await performAssertCount(locator);
+              },
+              { selector, intent: description || `assert count ${command.assertion?.expected}`, action: 'assertCount', timeout }
+            );
+          }
           break;
+        }
 
         case 'extract': {
           if (!selector) throw new Error('Selector is required for extract action');
           if (!command.extract) throw new Error('Extract config is required for extract action');
-          const extractLocator = this.getLocatorInternal(selector);
-          const extractedValue = await this.extractDataWithLocator(extractLocator, command.extract);
-          this.extractedData.set(command.extract.name, extractedValue);
-          return { success: true, extractedValue };
+
+          const extractSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (extractSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for extract', {
+              selector: selector.substring(0, 50),
+              totalMatches: extractSmartResult.totalMatches,
+              selectedIndex: extractSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            await extractSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+            const extractedValue = await this.extractDataWithLocator(extractSmartResult.locator, command.extract);
+            this.extractedData.set(command.extract.name, extractedValue);
+            return { success: true, extractedValue };
+          } catch (extractError) {
+            logger.warn('[COMMAND_EXECUTOR] Smart locator extract failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: extractError instanceof Error ? extractError.message : String(extractError),
+            });
+            let healedValue: any;
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+                healedValue = await this.extractDataWithLocator(locator, command.extract!);
+                this.extractedData.set(command.extract!.name, healedValue);
+              },
+              { selector, intent: description || `extract ${command.extract.name}`, action: 'extract', timeout }
+            );
+            return { success: true, extractedValue: healedValue };
+          }
         }
 
         case 'fill': {
@@ -924,11 +1141,6 @@ export class CommandExecutor {
 
         // toggle: click only if current state doesn't match desired state
         case 'toggle': {
-          if (!selector) throw new Error('Selector is required for toggle action');
-
-          // Use smart locator + self-healing like other interactive actions
-          const toggleSmartResult = await getSmartLocator(this.page, selector, 'click', description);
-
           const performToggle = async (toggleLocator: import('playwright').Locator) => {
             await toggleLocator.waitFor({ state: 'visible', timeout: timeout || 10000 });
             await this.waitForEnabled(toggleLocator, 5000);
@@ -952,6 +1164,18 @@ export class CommandExecutor {
             }
           };
 
+          // Intent command path
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentToggleLocator } = await this.getLocatorForIntentCommand(
+              intentCommand, 'click', timeout || 30000
+            );
+            await performToggle(intentToggleLocator);
+            break;
+          }
+
+          if (!selector) throw new Error('Selector is required for toggle action');
+
+          const toggleSmartResult = await getSmartLocator(this.page, selector, 'click', description);
           try {
             await performToggle(toggleSmartResult.locator);
           } catch (toggleError) {
@@ -1013,78 +1237,103 @@ export class CommandExecutor {
           break;
         }
 
-        // assert: maps to assertVisible (check that element is present/visible)
+        // assert: compound assertion — smart locator for element resolution, self-healing fallback
         case 'assert': {
           if (!selector) throw new Error('Selector is required for assert action');
-          const assertLocator = this.getLocatorInternal(selector);
 
-          // If assertion.type is specified, delegate to specific handlers
-          if (command.assertion?.type) {
-            switch (command.assertion.type) {
-              case 'visible': {
-                const vis = await assertLocator.isVisible({ timeout: timeout || 5000 });
-                if (!vis) throw new Error(`Assertion failed: element not visible: ${selector}`);
-                break;
-              }
-              case 'hidden': {
-                const hid = await assertLocator.isHidden({ timeout: timeout || 5000 });
-                if (!hid) throw new Error(`Assertion failed: element not hidden: ${selector}`);
-                break;
-              }
-              case 'text': {
-                await assertLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
-                const txt = await assertLocator.textContent();
-                const exp = String(command.assertion.expected || '');
-                const op = command.assertion.operator || 'contains';
-                if (!this.compareValues(txt || '', exp, op)) {
-                  throw new Error(`Text assertion failed: expected "${exp}", got "${txt}"`);
+          const assertSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assert', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertSmartResult.totalMatches,
+              selectedIndex: assertSmartResult.selectedIndex,
+            });
+          }
+
+          const performAssert = async (assertLocator: Locator) => {
+            if (command.assertion?.type) {
+              switch (command.assertion.type) {
+                case 'visible': {
+                  const vis = await assertLocator.isVisible({ timeout: timeout || 5000 });
+                  if (!vis) throw new Error(`Assertion failed: element not visible: ${selector}`);
+                  break;
                 }
-                break;
-              }
-              case 'value': {
-                await assertLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
-                const val = await assertLocator.inputValue();
-                const expVal = String(command.assertion.expected || '');
-                const opVal = command.assertion.operator || '=';
-                if (!this.compareValues(val, expVal, opVal)) {
-                  throw new Error(`Value assertion failed: expected "${expVal}", got "${val}"`);
+                case 'hidden': {
+                  const hid = await assertLocator.isHidden({ timeout: timeout || 5000 });
+                  if (!hid) throw new Error(`Assertion failed: element not hidden: ${selector}`);
+                  break;
                 }
-                break;
-              }
-              case 'enabled': {
-                const enabled = await assertLocator.isEnabled({ timeout: timeout || 5000 });
-                if (!enabled) throw new Error(`Assertion failed: element not enabled: ${selector}`);
-                break;
-              }
-              case 'disabled': {
-                const disabled = await assertLocator.isDisabled({ timeout: timeout || 5000 });
-                if (!disabled) throw new Error(`Assertion failed: element not disabled: ${selector}`);
-                break;
-              }
-              case 'count': {
-                const cnt = await assertLocator.count();
-                const expCnt = Number(command.assertion.expected ?? 0);
-                const cntOp = command.assertion.operator || '=';
-                if (!this.compareValues(cnt, expCnt, cntOp)) {
-                  throw new Error(`Count assertion failed: expected ${expCnt} (${cntOp}), got ${cnt} for ${selector}`);
+                case 'text': {
+                  await assertLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+                  const txt = await assertLocator.textContent();
+                  const exp = String(command.assertion.expected || '');
+                  const op = command.assertion.operator || 'contains';
+                  if (!this.compareValues(txt || '', exp, op)) {
+                    throw new Error(`Text assertion failed: expected "${exp}", got "${txt}"`);
+                  }
+                  break;
                 }
-                break;
+                case 'value': {
+                  await assertLocator.waitFor({ state: 'visible', timeout: timeout || 5000 });
+                  const val = await assertLocator.inputValue();
+                  const expVal = String(command.assertion.expected || '');
+                  const opVal = command.assertion.operator || '=';
+                  if (!this.compareValues(val, expVal, opVal)) {
+                    throw new Error(`Value assertion failed: expected "${expVal}", got "${val}"`);
+                  }
+                  break;
+                }
+                case 'enabled': {
+                  const enabled = await assertLocator.isEnabled({ timeout: timeout || 5000 });
+                  if (!enabled) throw new Error(`Assertion failed: element not enabled: ${selector}`);
+                  break;
+                }
+                case 'disabled': {
+                  const disabled = await assertLocator.isDisabled({ timeout: timeout || 5000 });
+                  if (!disabled) throw new Error(`Assertion failed: element not disabled: ${selector}`);
+                  break;
+                }
+                case 'count': {
+                  const cnt = await assertLocator.count();
+                  const expCnt = Number(command.assertion.expected ?? 0);
+                  const cntOp = command.assertion.operator || '=';
+                  if (!this.compareValues(cnt, expCnt, cntOp)) {
+                    throw new Error(`Count assertion failed: expected ${expCnt} (${cntOp}), got ${cnt} for ${selector}`);
+                  }
+                  break;
+                }
+                case 'url': {
+                  await this.assertUrl(command.assertion);
+                  break;
+                }
+                default: {
+                  const vis2 = await assertLocator.isVisible({ timeout: timeout || 5000 });
+                  if (!vis2) throw new Error(`Assertion failed: element not visible: ${selector}`);
+                }
               }
-              case 'url': {
-                // Selector is not used for url assertions — assert on current page URL
-                await this.assertUrl(command.assertion);
-                break;
-              }
-              default: {
-                // Fallback: just check visibility
-                const vis2 = await assertLocator.isVisible({ timeout: timeout || 5000 });
-                if (!vis2) throw new Error(`Assertion failed: element not visible: ${selector}`);
-              }
+            } else {
+              const vis3 = await assertLocator.isVisible({ timeout: timeout || 5000 });
+              if (!vis3) throw new Error(`Assertion failed: element not visible: ${selector}`);
             }
-          } else {
-            // No assertion type — default to visible check
-            const vis3 = await assertLocator.isVisible({ timeout: timeout || 5000 });
-            if (!vis3) throw new Error(`Assertion failed: element not visible: ${selector}`);
+          };
+
+          try {
+            await performAssert(assertSmartResult.locator);
+          } catch (assertError) {
+            // Re-throw actual assertion failures (element found but assertion logic failed)
+            if (assertError instanceof Error && assertError.message.startsWith('Assertion failed')) throw assertError;
+            if (assertError instanceof Error && assertError.message.includes('assertion failed')) throw assertError;
+            logger.warn('[COMMAND_EXECUTOR] Smart locator assert failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: assertError instanceof Error ? assertError.message : String(assertError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await performAssert(locator);
+              },
+              { selector, intent: description || 'assert element', action: 'assert', timeout }
+            );
           }
           logger.info('[COMMAND_EXECUTOR] Assertion passed', { action: 'assert', selector });
           break;
@@ -1092,10 +1341,28 @@ export class CommandExecutor {
 
         case 'assertHidden': {
           if (!selector) throw new Error('Selector is required for assertHidden action');
-          const assertHiddenLocator = this.getLocatorInternal(selector);
-          const isHidden = await assertHiddenLocator.isHidden({ timeout: timeout || 5000 });
-          if (!isHidden) {
-            throw new Error(`Element is visible but expected to be hidden: ${selector}`);
+          // No smart locator — element is expected to be hidden, so visibility-based resolution is wrong.
+          // Only self-healing to handle stale selectors.
+          try {
+            const assertHiddenLocator = this.getLocatorInternal(selector);
+            const isHidden = await assertHiddenLocator.isHidden({ timeout: timeout || 5000 });
+            if (!isHidden) {
+              throw new Error(`Element is visible but expected to be hidden: ${selector}`);
+            }
+          } catch (assertHidError) {
+            if (assertHidError instanceof Error && assertHidError.message.includes('expected to be hidden')) throw assertHidError;
+            logger.warn('[COMMAND_EXECUTOR] assertHidden locator failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: assertHidError instanceof Error ? assertHidError.message : String(assertHidError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                const hid = await locator.isHidden({ timeout: timeout || 5000 });
+                if (!hid) throw new Error(`Element is visible but expected to be hidden: ${selector}`);
+              },
+              { selector, intent: description || 'assert element hidden', action: 'assertHidden', timeout }
+            );
           }
           logger.info('Assertion passed: Element is hidden', { selector });
           break;
@@ -1103,12 +1370,38 @@ export class CommandExecutor {
 
         case 'assertEnabled': {
           if (!selector) throw new Error('Selector is required for assertEnabled action');
-          const assertEnabledLocator = this.getLocatorInternal(selector);
-          // Use 'attached' not 'visible' — disabled elements can be in DOM but hidden
-          await assertEnabledLocator.waitFor({ state: 'attached', timeout: timeout || 5000 });
-          const isEnabled = await assertEnabledLocator.isEnabled({ timeout: timeout || 5000 });
-          if (!isEnabled) {
-            throw new Error(`Element is disabled but expected to be enabled: ${selector}`);
+
+          const assertEnSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertEnSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertEnabled', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertEnSmartResult.totalMatches,
+              selectedIndex: assertEnSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            // Use 'attached' not 'visible' — disabled elements can be in DOM but hidden
+            await assertEnSmartResult.locator.waitFor({ state: 'attached', timeout: timeout || 5000 });
+            const isEnabled = await assertEnSmartResult.locator.isEnabled({ timeout: timeout || 5000 });
+            if (!isEnabled) {
+              throw new Error(`Element is disabled but expected to be enabled: ${selector}`);
+            }
+          } catch (assertEnError) {
+            if (assertEnError instanceof Error && assertEnError.message.includes('expected to be enabled')) throw assertEnError;
+            logger.warn('[COMMAND_EXECUTOR] Smart locator assertEnabled failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: assertEnError instanceof Error ? assertEnError.message : String(assertEnError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.waitFor({ state: 'attached', timeout: timeout || 5000 });
+                const en = await locator.isEnabled({ timeout: timeout || 5000 });
+                if (!en) throw new Error(`Element is disabled but expected to be enabled: ${selector}`);
+              },
+              { selector, intent: description || 'assert element enabled', action: 'assertEnabled', timeout }
+            );
           }
           logger.info('Assertion passed: Element is enabled', { selector });
           break;
@@ -1116,12 +1409,38 @@ export class CommandExecutor {
 
         case 'assertDisabled': {
           if (!selector) throw new Error('Selector is required for assertDisabled action');
-          const assertDisabledLocator = this.getLocatorInternal(selector);
-          // Use 'attached' not 'visible' — disabled elements can be in DOM but hidden
-          await assertDisabledLocator.waitFor({ state: 'attached', timeout: timeout || 5000 });
-          const isDisabled = await assertDisabledLocator.isDisabled({ timeout: timeout || 5000 });
-          if (!isDisabled) {
-            throw new Error(`Element is enabled but expected to be disabled: ${selector}`);
+
+          const assertDisSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertDisSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertDisabled', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertDisSmartResult.totalMatches,
+              selectedIndex: assertDisSmartResult.selectedIndex,
+            });
+          }
+
+          try {
+            // Use 'attached' not 'visible' — disabled elements can be in DOM but hidden
+            await assertDisSmartResult.locator.waitFor({ state: 'attached', timeout: timeout || 5000 });
+            const isDisabled = await assertDisSmartResult.locator.isDisabled({ timeout: timeout || 5000 });
+            if (!isDisabled) {
+              throw new Error(`Element is enabled but expected to be disabled: ${selector}`);
+            }
+          } catch (assertDisError) {
+            if (assertDisError instanceof Error && assertDisError.message.includes('expected to be disabled')) throw assertDisError;
+            logger.warn('[COMMAND_EXECUTOR] Smart locator assertDisabled failed, trying self-healing', {
+              selector: selector.substring(0, 50),
+              error: assertDisError instanceof Error ? assertDisError.message : String(assertDisError),
+            });
+            await this.executeWithSelfHealing(
+              async () => {
+                const locator = getLocator(this.page, selector);
+                await locator.waitFor({ state: 'attached', timeout: timeout || 5000 });
+                const dis = await locator.isDisabled({ timeout: timeout || 5000 });
+                if (!dis) throw new Error(`Element is enabled but expected to be disabled: ${selector}`);
+              },
+              { selector, intent: description || 'assert element disabled', action: 'assertDisabled', timeout }
+            );
           }
           logger.info('Assertion passed: Element is disabled', { selector });
           break;
@@ -2045,8 +2364,8 @@ export class CommandExecutor {
     // Track healing attempts for this step
     let healAttempts = 0;
 
-    // 1. Try compiled locator plan first (if available)
-    if (intentMeta?.compiled) {
+    // 1. Try compiled locator plan first (skip on retry — already failed on previous attempt)
+    if (intentMeta?.compiled && !this.skipCompiledPlan) {
       const compiledContext = iframeSelector
         ? await this.getFrameFromIframeSelector(iframeSelector, Math.min(timeout, 10000))
         : this.page;
@@ -2475,6 +2794,55 @@ export class CommandExecutor {
    */
   private analyzeSelector(selector: string): SelectorStabilityScore {
     return SmartWaitService.analyzeSelectorStability(selector);
+  }
+
+  /**
+   * Execute an action with smart locator disambiguation + self-healing fallback.
+   * Encapsulates the common pattern: getSmartLocator → try action → catch → executeWithSelfHealing.
+   */
+  private async executeWithSmartLocatorAndHealing(opts: {
+    selector: string;
+    actionType: string;
+    description?: string;
+    timeout?: number;
+    value?: any;
+    waitState?: 'visible' | 'attached';
+    performAction: (locator: Locator) => Promise<void>;
+  }): Promise<void> {
+    const { selector, actionType, description: desc, timeout: to, value: val, waitState = 'visible' } = opts;
+
+    const smartResult = await getSmartLocator(this.page, selector, actionType as any, desc);
+
+    if (smartResult.wasSmartSelected) {
+      logger.info(`[COMMAND_EXECUTOR] Smart element selection used for ${actionType}`, {
+        selector: selector.substring(0, 50),
+        totalMatches: smartResult.totalMatches,
+        selectedIndex: smartResult.selectedIndex,
+      });
+    }
+
+    try {
+      await smartResult.locator.waitFor({ state: waitState, timeout: to || 10000 });
+      await opts.performAction(smartResult.locator);
+    } catch (error) {
+      logger.warn(`[COMMAND_EXECUTOR] Smart locator ${actionType} failed, trying self-healing`, {
+        selector: selector.substring(0, 50),
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      await this.executeWithSelfHealing(
+        async () => {
+          const locator = getLocator(this.page, selector);
+          if (waitState === 'visible') {
+            await locator.waitFor({ state: 'visible', timeout: to || 30000 });
+          } else if (waitState === 'attached') {
+            await locator.waitFor({ state: 'attached', timeout: to || 30000 });
+          }
+          await opts.performAction(locator);
+        },
+        { selector, intent: desc || `${actionType} element`, action: actionType, timeout: to, value: val }
+      );
+    }
   }
 
   /**

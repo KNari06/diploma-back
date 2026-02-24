@@ -14,6 +14,7 @@
  */
 
 import { env } from '@/config/environment/env';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 import { Page } from 'playwright';
@@ -310,17 +311,17 @@ const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
 const AI_CONFIG = {
   formTypeDetection: {
-    model: 'gpt-4o-mini' as const,
+    model: AI_TASK_MODELS.formIntelligence,
     maxTokens: 100, // Increased from 50 for stability
     temperature: 0,
   },
   dependencyDetection: {
-    model: 'gpt-4o-mini' as const,
+    model: AI_TASK_MODELS.formIntelligence,
     maxTokens: 500, // Increased from 300 for complex forms
     temperature: 0,
   },
   errorFix: {
-    model: 'gpt-4o-mini' as const,
+    model: AI_TASK_MODELS.formIntelligence,
     maxTokens: 150, // Increased from 100
     temperature: 0.3,
   },

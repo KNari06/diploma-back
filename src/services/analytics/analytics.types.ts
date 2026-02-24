@@ -24,6 +24,9 @@ export interface SummaryData {
     errorSteps: number;
     flakySteps: number;
     passRate: number;
+    apiTestsRun?: number;
+    apiTestsPassed?: number;
+    apiTestsFailed?: number;
   };
   status: {
     state: 'passing' | 'warning' | 'failing';
@@ -56,6 +59,11 @@ export interface ResultsOverview {
     skipped: number;
     flaky: number;
   };
+  apiTests?: {
+    total: number;
+    passed: number;
+    failed: number;
+  };
 }
 
 /**
@@ -71,6 +79,7 @@ export interface RecentFailure {
   severity: 'failure' | 'warn' | 'recovered';
   failedAt: string;
   timeAgo: string;
+  source?: 'regression' | 'api_test';
 }
 
 /**
@@ -145,6 +154,7 @@ export interface TimeSeriesPoint {
   totalRuns: number;
   passedRuns: number;
   failedRuns: number;
+  apiTestsRun?: number;
 }
 
 /**

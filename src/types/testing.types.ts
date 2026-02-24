@@ -606,6 +606,7 @@ export interface RegressionPlanWithStats extends RegressionPlan {
     startedAt: string;
     completedAt: string | null;
     durationMs: number | null;
+    passRate: number | null;
   } | null;
   health: {
     state: 'passing' | 'warning' | 'failing' | 'unknown';

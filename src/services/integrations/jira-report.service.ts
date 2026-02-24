@@ -333,18 +333,21 @@ ${report.artifacts.trace ? `• 📊 Trace: Available` : '• 📊 Trace: Not av
           try {
             // Check if it's a URL or base64
             let buffer: Buffer;
+            const isJpeg = screenshot.startsWith('data:image/jpeg') || screenshot.startsWith('/9j/');
             if (screenshot.startsWith('http')) {
               buffer = await downloadFromStorage(screenshot);
             } else {
-              // Base64
-              const base64Data = screenshot.replace(/^data:image\/png;base64,/, '');
+              // Base64 — strip any image data URI prefix
+              const base64Data = screenshot.replace(/^data:image\/[a-z]+;base64,/, '');
               buffer = Buffer.from(base64Data, 'base64');
             }
 
+            const ext = isJpeg ? 'jpg' : 'png';
+            const mimeType = isJpeg ? 'image/jpeg' : 'image/png';
             attachments.push({
-              filename: `screenshot-${i + 1}.png`,
+              filename: `screenshot-${i + 1}.${ext}`,
               buffer,
-              mimeType: 'image/png',
+              mimeType,
             });
           } catch (error) {
             logger.warn('[JIRA_REPORT] Failed to process screenshot', { index: i, error });
