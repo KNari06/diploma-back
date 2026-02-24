@@ -320,40 +320,39 @@ async function blindSettle(page: Page, domStableThresholdMs: number): Promise<vo
  */
 function buildFastLocator(page: Page, step: IntentStep): Locator | null {
   // Priority 1: Use compiled locatorPlan if available
+  // Skip ref strategy — data-agent-ref attributes don't exist during background replay
   if (step.compiled?.locatorPlan && step.compiled.locatorPlan.length > 0) {
-    const primary = step.compiled.locatorPlan[0];
+    const stableEntry = step.compiled.locatorPlan.find(e => e.strategy !== 'ref');
+    if (!stableEntry) return null; // Only ref strategies — can't build fast locator
 
     try {
-      switch (primary.strategy) {
-        case 'ref':
-          return page.locator(primary.value).first();
-
+      switch (stableEntry.strategy) {
         case 'role':
           return page
-            .getByRole(primary.roleName as any, { name: primary.value })
+            .getByRole(stableEntry.roleName as any, { name: stableEntry.value })
             .first();
 
         case 'label':
-          return page.getByLabel(primary.value).first();
+          return page.getByLabel(stableEntry.value).first();
 
         case 'testId':
-          return page.getByTestId(primary.value).first();
+          return page.getByTestId(stableEntry.value).first();
 
         case 'placeholder':
-          return page.getByPlaceholder(primary.value).first();
+          return page.getByPlaceholder(stableEntry.value).first();
 
         case 'css':
-          return page.locator(primary.value).first();
+          return page.locator(stableEntry.value).first();
 
         default:
           logger.debug('[STEP_READINESS] Unknown locator strategy', {
-            strategy: primary.strategy,
+            strategy: stableEntry.strategy,
           });
           return null;
       }
     } catch (error) {
       logger.debug('[STEP_READINESS] Failed to build locator from compiled plan', {
-        strategy: primary.strategy,
+        strategy: stableEntry.strategy,
         error: error instanceof Error ? error.message : String(error),
       });
       return null;
@@ -361,9 +360,14 @@ function buildFastLocator(page: Page, step: IntentStep): Locator | null {
   }
 
   // Priority 2: Fallback to evidence.lastSuccessRef
+  // Skip if ref looks like a preview/background ref (not a stable CSS selector)
   if (step.evidence?.lastSuccessRef) {
+    const ref = step.evidence.lastSuccessRef;
+    // data-agent-ref values (e.g. "e6", "bg-1") don't exist during replay — skip
+    if (/^(e\d+|bg-\d+)$/.test(ref)) {
+      return null;
+    }
     try {
-      const ref = step.evidence.lastSuccessRef;
       const escapedRef = ref.replace(/"/g, '\\"');
       return page.locator(`[data-agent-ref="${escapedRef}"]`).first();
     } catch (error) {

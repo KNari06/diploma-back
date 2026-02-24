@@ -21,6 +21,7 @@ import { getBrowserWithProgress, setupBrowserContext } from '../setup/browser-se
 import { buildAllHintsWithMetadata } from '../setup/hints-builder';
 import { buildIntelligentTestConfig } from '../setup/test-config-builder';
 import { checkTestCancelled } from '../utils/test-cancellation-checker';
+import { ReplayTraceWriter } from './replay-trace-writer';
 import { createRunKey, TestRunRegistry } from './test-run-registry';
 import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { waitForStepReadiness, shouldSkipLookaheadAfter } from '@/services/testing/ui/preview/step-readiness.service';
@@ -163,6 +164,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   stepRuntimeMeta?: Record<string, any>;
   /** Non-UI quality checks: performance, broken resources, a11y, slow APIs */
   qualityChecks?: any;
+  /** Flag: self-healing was triggered during replay, enable video on next retry */
+  needsVideoOnRetry?: boolean;
 }> {
   let page: Page | null = null;
   let context: BrowserContext | null = null;
@@ -189,8 +192,13 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     });
 
     // Setup browser and page
+    // For replay mode: disable video on initial attempt (save resources).
+    // Video is enabled on retry attempts (attempt 1+) — the test already failed, we need video for debugging.
+    const isReplayMode = !testData.intelligentMode && testData.commands && testData.commands.length > 0;
+    const retryAttempt = testData._retryAttempt ?? 0;
+    const disableVideo = isReplayMode && retryAttempt === 0;
     const browser = await getBrowserWithProgress(testData);
-    const setupResult = await setupBrowserContext(testData, browser);
+    const setupResult = await setupBrowserContext(testData, browser, { disableVideo });
     context = setupResult.context;
     tracePath = setupResult.tracePath;
 
@@ -309,8 +317,10 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       const { ErrorCollectorService } = await import('@/agent/utils/analysis/error-collector.service');
 
       // Create executor with self-healing enabled (for AI fallback without clarification)
+      // On retry attempts: skip compiled plan (Stage 1) and go straight to embeddings (Stage 2)
       const executor = new CommandExecutor(page, {
         selfHealingEnabled: true,
+        skipCompiledPlan: retryAttempt > 0,
         metadata: {
           url: testData.url,
           projectId: testData.projectId,
@@ -321,6 +331,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Start error collection for background monitoring
       const errorCollector = new ErrorCollectorService(page);
       errorCollector.startCollecting();
+
+      // Initialize replay trace writer (JSONL log per run)
+      const replayTrace = new ReplayTraceWriter({ testId: testData.testId });
 
       // Begin AI usage tracking session for background replay
       // Self-healing may trigger AI calls (OpenAI/Gemini) that need to be tracked
@@ -337,11 +350,22 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         testId: testData.testId,
       });
 
+      // Log run_start to replay trace
+      replayTrace.write({
+        eventType: 'run_start', step: 0, totalSteps: testData.commands.length,
+        payload: {
+          url: testData.url, browser: testData.browser,
+          commandsCount: testData.commands.length, intelligentMode: false,
+          userId: testData.userId, projectId: testData.projectId,
+        },
+      });
+
       // Execute commands step-by-step (wrapped in AI context for self-healing token tracking)
       // Capture narrowed references before entering withAIContext callback
       const commands = testData.commands;
       const activePage = page!;
       let currentStepIndex = 0;
+      let needsVideoOnRetry = false; // Set to true if self-healing triggers
       const totalSteps = commands.length;
       let allSuccess = true;
       let finalError: string | undefined;
@@ -395,6 +419,18 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             stepIndex: currentStepIndex,
             commandType: action,
             description: intentMeta?.elementDescription,
+          });
+
+          // Log step_start to replay trace
+          replayTrace.write({
+            eventType: 'step_start', step: currentStepIndex, totalSteps,
+            payload: {
+              action,
+              selector: (command as any).selector,
+              description: intentMeta?.elementDescription,
+              compiledStrategies: (command as any).intentMeta?.compiled?.locatorPlan?.map((l: any) => l.strategy),
+              hasBindingHints: !!(command as any).intentMeta?.bindingHints,
+            },
           });
 
           // Deduct 1 credit for step execution
@@ -537,6 +573,27 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               },
             });
 
+            // Track if self-healing was triggered — enable video on next retry
+            if (meta?.source === 'self_heal' || meta?.resolutionPath === 'self_heal') {
+              needsVideoOnRetry = true;
+            }
+
+            // Log step_completed to replay trace
+            replayTrace.write({
+              eventType: 'step_completed', step: currentStepIndex, totalSteps,
+              payload: {
+                action, success: true, durationMs: stepDurationMs,
+                source: meta?.source, resolutionPath: meta?.resolutionPath,
+                usedStrategy: meta?.usedLocatorStrategy, confidence: meta?.confidenceTier,
+                healed: meta?.source === 'self_heal', healConfidence: meta?.healConfidence,
+                errors: {
+                  console: stepErrors.consoleErrors.length,
+                  network: stepErrors.networkErrors.length,
+                  ui: stepErrors.uiErrors.length,
+                },
+              },
+            });
+
             // Emit test:step:completed with success (non-fatal)
             try {
               webSocketService.emitTestStepCompleted(testData.testId, {
@@ -653,6 +710,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               confidenceTier: 'low' as const,
             };
 
+            // Any step failure means we need video on retry for debugging
+            needsVideoOnRetry = true;
+
             const finalMeta: NonNullable<TestStepCompletedPayload['runtimeMeta']> = {
               stepId,
               ...baseMeta,
@@ -702,6 +762,22 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               },
             });
 
+            // Log step_failed to replay trace
+            replayTrace.write({
+              eventType: 'step_failed', step: currentStepIndex, totalSteps,
+              payload: {
+                action, success: false, durationMs: failDurationMs,
+                error: finalError, rootCause: finalMeta.rootCause,
+                failedReason: finalMeta.failedReason,
+                source: baseMeta.source, resolutionPath: baseMeta.resolutionPath,
+                errors: {
+                  console: stepErrors.consoleErrors.length,
+                  network: stepErrors.networkErrors.length,
+                  ui: stepErrors.uiErrors.length,
+                },
+              },
+            });
+
             // Emit test:step:completed with failure (non-fatal)
             try {
               webSocketService.emitTestStepCompleted(testData.testId, {
@@ -727,6 +803,16 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       } finally {
         // End AI usage tracking session (even on error)
         replayUsageStats = await AIUsageTracker.endSession(replaySessionId);
+
+        // Log run_end to replay trace
+        replayTrace.write({
+          eventType: 'run_end', step: currentStepIndex, totalSteps,
+          payload: {
+            success: allSuccess, executedSteps: currentStepIndex,
+            finalError, aiUsage: replayUsageStats,
+          },
+        });
+        await replayTrace.close();
 
         // Stop error collection
         errorCollector.stopCollecting();
@@ -923,12 +1009,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       };
       const logs = collectedErrors.consoleErrors.map(e => `[${e.timestamp}] ${e.message}`);
       const networkLogs = collectedErrors.networkErrors;
+      // Errors: only real errors (console, network, UI). Accessibility warnings are separate.
       const errors: any[] = [
         ...collectedErrors.consoleErrors.map(e => ({ type: 'console', message: e.message, timestamp: e.timestamp, source: e.source, line: e.line })),
         ...collectedErrors.networkErrors.map(e => ({ type: 'network', message: `${e.method} ${e.url}: ${e.error}`, timestamp: e.timestamp, url: e.url, method: e.method, status: e.status })),
         ...collectedErrors.uiErrors.map(e => ({ type: 'ui', message: e.text, timestamp: e.timestamp, selector: e.selector })),
-        // Include accessibility warnings as errors for AI analysis visibility
-        ...collectedErrors.accessibilityWarnings.map(w => ({ type: 'accessibility', message: w.message, timestamp: w.timestamp, selector: w.selector, wcag: (w as any).wcag })),
       ];
 
       logger.info('[PLAYWRIGHT] Collected errors and quality checks for reporting', {
@@ -1019,6 +1104,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         tracePath: artifacts.tracePath,
         stepRuntimeMeta, // Step-level execution intelligence for reporting
         qualityChecks, // Non-UI quality checks — stored in test_results for user viewing
+        needsVideoOnRetry, // Flag: self-healing was triggered, enable video on next retry
       };
     }
 

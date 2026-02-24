@@ -40,6 +40,7 @@ export class CommandExecutor {
   private externalAbortHandler?: () => void; // ✅ FIX 1: Store handler for cleanup
   private selfHealingConfidenceThreshold: number = 0.85; // ✅ FIX 7: Configurable threshold
   private maxHealAttempts: number = 1; // ✅ V2: Limit self-heal attempts to expose flakiness
+  private skipCompiledPlan: boolean = false; // Skip Stage 1 on retry attempts
   /** Runtime metadata for each step (keyed by stepId) */
   private stepRuntimeMeta: Map<string, StepRuntimeMeta> = new Map();
 
@@ -51,6 +52,7 @@ export class CommandExecutor {
       abortSignal?: AbortSignal;
       costManager?: AICostManager;
       selfHealingConfidenceThreshold?: number; // ✅ NEW: Configurable confidence
+      skipCompiledPlan?: boolean; // Skip compiled locator plan (Stage 1) — used on retry attempts
     } = {}
   ) {
     this.page = page;
@@ -58,6 +60,7 @@ export class CommandExecutor {
     this.metadata = options.metadata || { url: '' };
     this.costManager = options.costManager;
     this.selfHealingConfidenceThreshold = options.selfHealingConfidenceThreshold ?? 0.85;
+    this.skipCompiledPlan = options.skipCompiledPlan ?? false;
 
     this.abortController = new AbortController();
 
@@ -2045,8 +2048,8 @@ export class CommandExecutor {
     // Track healing attempts for this step
     let healAttempts = 0;
 
-    // 1. Try compiled locator plan first (if available)
-    if (intentMeta?.compiled) {
+    // 1. Try compiled locator plan first (skip on retry — already failed on previous attempt)
+    if (intentMeta?.compiled && !this.skipCompiledPlan) {
       const compiledContext = iframeSelector
         ? await this.getFrameFromIframeSelector(iframeSelector, Math.min(timeout, 10000))
         : this.page;

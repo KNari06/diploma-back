@@ -393,7 +393,7 @@ export class TestCompletionHandlerService {
       }
 
       // Find regression runs that reference this test
-      // Query 1: direct test_id match; Query 2: batch test_ids contains
+      // Query 1: direct test_id match; Query 2: batch test_ids contains (JSONB @> filter)
       const [directResult, batchResult] = await Promise.all([
         supabaseAdmin
           .from('regression_runs')
@@ -403,7 +403,7 @@ export class TestCompletionHandlerService {
         supabaseAdmin
           .from('regression_runs')
           .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
-          .contains('test_ids', [testId])
+          .filter('test_ids', 'cs', JSON.stringify([testId]))
           .in('status', ['running', 'pending']),
       ]);
 

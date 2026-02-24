@@ -361,6 +361,7 @@ export class AIAnalysisJobHandler {
       networkLogs: dbResult.network_logs || [],
       errors: dbResult.errors || [],
       performance: dbResult.performance,
+      qualityChecks: dbResult.quality_checks,
       aiSummary: dbResult.ai_summary,
       videoUrl: dbResult.video_url || dbResult.videoUrl,
       traceUrl: dbResult.trace_url || dbResult.traceUrl,

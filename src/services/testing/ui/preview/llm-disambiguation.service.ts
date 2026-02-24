@@ -34,7 +34,7 @@ const CONFIDENCE_THRESHOLD = 0.75;
 const MAX_CANDIDATES_FOR_LLM = 5;
 
 /** LLM timeout in milliseconds */
-const LLM_TIMEOUT_MS = 2000;
+const LLM_TIMEOUT_MS = 6000;
 
 /** Cache TTL in milliseconds (5 minutes) */
 const CACHE_TTL_MS = 5 * 60 * 1000;
