@@ -312,6 +312,7 @@ export class TestCompletionHandlerService {
   private static async updateTestExecutionsForCompletedUiTest(test: {
     id: string;
     status: string;
+    user_id?: string;
     created_at?: string;
     completed_at?: string;
   }): Promise<void> {
@@ -342,7 +343,7 @@ export class TestCompletionHandlerService {
           duration_ms: durationMs,
         })
         .eq('result->>testId', testId)
-        .select('id');
+        .select('id, run_id');
 
       if (error) {
         logger.warn('[TEST_COMPLETION] Failed to update test_executions for UI test', {
@@ -362,6 +363,28 @@ export class TestCompletionHandlerService {
         // Signal dependency-aware execution orchestrator so dependents can proceed
         for (const row of data) {
           executionCompletionEmitter.signalCompletion(row.id, mappedStatus);
+        }
+
+        // Emit per-execution progress so frontend updates individual test status in run view.
+        // executeTestCasesAsync runs in main process but handleTestCompletion runs in worker —
+        // EventEmitter signals don't cross process boundaries, so we emit WebSocket directly.
+        const runId = data[0].run_id;
+        if (runId && test.user_id) {
+          try {
+            webSocketService.emitRegressionRunProgress(test.user_id, {
+              runId,
+              userId: test.user_id,
+              status: 'test_completed',
+              progress: -1, // Frontend should compute from execution statuses
+              message: `Test ${mappedStatus}: ${test.id}`,
+              details: {
+                totalTests: 0, // Unknown from this context
+                completedTests: 0,
+                currentTestName: test.id,
+              },
+              timestamp: new Date().toISOString(),
+            });
+          } catch { /* non-fatal */ }
         }
       }
     } catch (error) {
