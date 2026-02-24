@@ -649,7 +649,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                   };
 
                   const lookahead = await waitForStepReadiness(activePage, nextStepForLookahead, {
-                    maxWaitMs: 10000,
+                    maxWaitMs: typeof nextIntentMeta.lookaheadTimeoutMs === 'number' ? nextIntentMeta.lookaheadTimeoutMs : 10000,
                     settleMs: 3000,
                     autoWaitThresholdMs: 2000,
                     // Pass context for SPA navigation detection + dynamic DOM stability threshold
