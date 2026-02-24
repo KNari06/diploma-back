@@ -276,10 +276,39 @@ export async function handleCallback(req: Request, res: Response): Promise<void>
       return;
     }
 
+    if (!state) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing state',
+        message: 'OAuth state parameter not provided',
+      });
+      return;
+    }
+
     logger.info('[INTEGRATIONS] Handling OAuth callback', { provider });
 
     // Decode state to get userId and workspaceId
-    const { userId, workspaceId } = decodeState(state);
+    let userId: string;
+    let workspaceId: string | undefined;
+    try {
+      const decoded = decodeState(state);
+      userId = decoded.userId;
+      workspaceId = decoded.workspaceId;
+    } catch (decodeError) {
+      logger.error('[INTEGRATIONS] Failed to decode OAuth state', {
+        error: decodeError instanceof Error ? decodeError.message : String(decodeError),
+      });
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      res.redirect(`${frontendUrl}/integrations?status=error&message=${encodeURIComponent('Invalid OAuth state')}`);
+      return;
+    }
+
+    if (!userId) {
+      logger.error('[INTEGRATIONS] Missing userId in decoded OAuth state');
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      res.redirect(`${frontendUrl}/integrations?status=error&message=${encodeURIComponent('Invalid OAuth state')}`);
+      return;
+    }
 
     // Exchange code for token based on provider
     switch (provider) {
@@ -570,6 +599,10 @@ async function handleGitHubCallback(userId: string, workspaceId: string | undefi
       Accept: 'application/vnd.github+json',
     },
   });
+
+  if (!userResponse.ok) {
+    throw new Error(`GitHub user fetch failed: ${userResponse.status} ${await userResponse.text().catch(() => '')}`);
+  }
 
   const userData = await userResponse.json() as {
     login: string;

@@ -210,12 +210,30 @@ export class GitIntegrationService {
     return (data || null) as GitIntegrationRow | null;
   }
 
+  /**
+   * Detect git provider from a repository URL by parsing the hostname.
+   * Matches github.com (and www.github.com) → 'github', everything else → 'gitlab'.
+   */
+  static detectProviderFromUrl(repositoryUrl: string): GitProvider {
+    try {
+      const url = repositoryUrl.startsWith('http')
+        ? new URL(repositoryUrl)
+        : new URL(`https://${repositoryUrl}`);
+      const host = url.hostname.replace(/^www\./, '').toLowerCase();
+      if (host === 'github.com') return 'github';
+      return 'gitlab';
+    } catch {
+      // If URL parsing fails, fall back to simple check
+      return 'gitlab';
+    }
+  }
+
   /** Find git integration by project and repository URL (for plan automation: repo chosen from user's GitHub/GitLab list). */
   static async findByProjectAndRepositoryUrl(
     projectId: string,
     repositoryUrl: string
   ): Promise<GitIntegrationRow | null> {
-    const provider: GitProvider = repositoryUrl.includes('github.com') ? 'github' : 'gitlab';
+    const provider = this.detectProviderFromUrl(repositoryUrl);
     const normalizedUrl = this.normalizeRepositoryUrl(repositoryUrl, provider);
     this.validateRepositoryUrl(normalizedUrl, provider);
 

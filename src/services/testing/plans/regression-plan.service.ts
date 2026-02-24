@@ -1222,7 +1222,7 @@ export class RegressionPlanService {
         if (existing) {
           integration = { id: existing.id };
         } else if (gitConfig.webhookSecret?.trim()) {
-          const provider = gitConfig.repositoryUrl.includes('github.com') ? 'github' : 'gitlab';
+          const provider = GitIntegrationService.detectProviderFromUrl(gitConfig.repositoryUrl);
           const created = await GitIntegrationService.createIntegration({
             projectId: plan.projectId,
             userId: plan.userId,
@@ -1273,11 +1273,13 @@ export class RegressionPlanService {
         integrationId: integration.id,
       });
     } catch (error) {
-      logger.error('[REGRESSION_PLAN_SERVICE] syncGitIntegration error', {
+      // Log but do NOT rethrow — the plan itself is already persisted.
+      // Rethrowing would cause create()/update() to return 500 even though
+      // the plan was saved successfully, leaving an orphaned record.
+      logger.error('[REGRESSION_PLAN_SERVICE] syncGitIntegration error (plan saved, git link failed)', {
         error: error instanceof Error ? error.message : String(error),
         planId: plan.id,
       });
-      throw error;
     }
   }
 
