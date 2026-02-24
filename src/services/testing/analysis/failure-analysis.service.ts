@@ -5,6 +5,7 @@
  * and intelligent session data.
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { FailureAnalysisResult, FailureCategory } from '@/types/testing.types';
@@ -14,7 +15,7 @@ import { logger } from '@/utils/core/logger';
 // CONSTANTS
 // ============================================================================
 
-const LLM_MODEL = 'gpt-4o-mini';
+const LLM_MODEL = AI_TASK_MODELS.failureAnalysis;
 const LLM_TEMPERATURE = 0.1;
 const LLM_MAX_TOKENS = 1000;
 const MAX_ERROR_SUMMARY_LENGTH = 4000; // Limit context sent to LLM

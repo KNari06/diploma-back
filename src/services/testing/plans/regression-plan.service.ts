@@ -494,12 +494,17 @@ export class RegressionPlanService {
       }
 
       // Determine health state — consider both execution stats AND run-level status
-      let state: 'passing' | 'warning' | 'failing' | 'unknown' = 'passing';
+      let state: 'passing' | 'warning' | 'failing' | 'unknown';
       if (total === 0) {
         // No executions — fall back to the run's own status
         state = runStatus === 'failed' ? 'failing' : 'unknown';
+      } else if (completed === 0) {
+        // Executions exist but none passed/failed (all pending/running/skipped/cancelled)
+        state = runStatus === 'failed' ? 'failing' : 'unknown';
       } else if (failed > 0) {
         state = passRate >= 90 ? 'warning' : 'failing';
+      } else {
+        state = 'passing';
       }
 
       result.set(runId, { state, passRate, passed, failed, flaky, total });

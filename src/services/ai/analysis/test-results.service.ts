@@ -97,13 +97,13 @@ export class AIService {
       domLength: testResult.dom?.length || 0,
     });
 
-    const context = {
+    const context: Record<string, any> = {
       testId: testResult.testId,
       // URL is not directly in TestResult - must be provided by caller from tests table
       // This is handled in ai-analysis.job.ts via JOIN: tests(url)
       browser: testResult.browser,
       status: testResult.status,
-      // ✅ Truncate errors (only last N)
+      // Errors: only real errors (console, network, UI). Accessibility warnings come from qualityChecks.
       errors: this.truncateArray(testResult.errors || [], MAX_ERRORS_COUNT),
       // ✅ Truncate logs (only last N)
       logs: this.truncateArray(testResult.logs || [], MAX_LOGS_COUNT),
@@ -116,6 +116,12 @@ export class AIService {
       videoUrl: testResult.videoUrl || null,
       traceUrl: testResult.traceUrl || null,
     };
+
+    // Accessibility warnings from quality checks (separate from errors)
+    const qualityChecks = testResult.qualityChecks;
+    if (qualityChecks?.accessibility?.warnings?.length > 0) {
+      context.accessibilityWarnings = qualityChecks.accessibility.warnings;
+    }
 
     const contextString = JSON.stringify(context, null, 2);
 
@@ -258,18 +264,29 @@ You will receive:
 - Performance metrics
 - DOM structure (truncated if too large)
 - Screenshot availability
+- Accessibility warnings (WCAG violations detected automatically — these are separate from errors)
+
+IMPORTANT RULES FOR SEVERITY CLASSIFICATION:
+- "errors" array contains REAL bugs: console errors, network failures, UI errors. These are high/critical.
+- "accessibilityWarnings" array contains WCAG compliance findings (automated scan). These are informational:
+  - Classify accessibility warnings as "low" severity by default.
+  - Only classify as "medium" if the violation directly impacts usability (e.g., form inputs without labels).
+  - NEVER classify accessibility warnings as "high" or "critical" unless they completely block a user with disabilities.
+- If test status is "completed" with zero real errors, the overall severity should be "low" regardless of accessibility warnings.
+- Do NOT inflate bug counts — if a warning is minor, it can go into recommendations instead of bugs.
 
 Your analysis should include:
 1. A concise summary of the test results
-2. Detailed bug reports for any issues found
-3. Actionable recommendations for improvements
-4. Severity assessment (low, medium, high, critical)
-5. Confidence level (0-100)
+2. Detailed bug reports for real issues found (from errors array)
+3. Accessibility findings (from accessibilityWarnings, classified appropriately)
+4. Actionable recommendations for improvements
+5. Severity assessment (low, medium, high, critical) — based on REAL errors, not accessibility warnings
+6. Confidence level (0-100)
 
 Focus on:
-- Functional bugs and errors
+- Functional bugs and errors (HIGHEST PRIORITY)
 - Performance issues
-- Accessibility problems
+- Accessibility findings (lower priority — informational)
 - Visual inconsistencies
 - Security vulnerabilities
 - User experience issues

@@ -1,5 +1,6 @@
 import { buildChatSystemPrompt } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
+import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 import { ChatCompletionMessageParam, ChatCompletionTool, ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
@@ -56,7 +57,7 @@ export async function getChatCompletionWithMessages(
       throw new Error('Messages array cannot be empty');
     }
 
-    const model = options?.model || env.OPENAI_MODEL || 'gpt-4o-mini';
+    const model = options?.model || AI_MODELS.fast;
 
     if (options?.abortSignal?.aborted) {
       throw new Error('Request was cancelled. Please try again.');
@@ -218,7 +219,7 @@ export async function getChatCompletion(
 
     messages.push({ role: 'user', content: prompt });
 
-    const model = env.OPENAI_MODEL || 'gpt-4o-mini';
+    const model = AI_MODELS.fast;
 
     const response = await openai.chat.completions.create({
       model,

@@ -18,6 +18,8 @@ import { checkRequestAborted } from '../shared/request-cancellation';
 import { compressMessageContent, deductChatCredits, emitProcessingStep } from '../shared/utils';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
+import { SubAgentPipeline } from './sub-agents/pipeline';
+import { SUB_AGENT_CONFIG } from './sub-agents/config';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -487,6 +489,54 @@ If the user asks to test something on the current page, prefer platform_test int
     }
 
     try {
+      // ═══════════════════════════════════════════════════════════════════════
+      // SUB-AGENT PIPELINE (preferred path — cheaper, faster, more focused)
+      // Falls back to monolithic loop below if pipeline fails or is disabled
+      // ═══════════════════════════════════════════════════════════════════════
+      if (SUB_AGENT_CONFIG.enabled && workspaceId) {
+        try {
+          const pipeline = new SubAgentPipeline({
+            userId,
+            workspaceId,
+            chatSessionId,
+            projectId,
+          });
+
+          const pipelineResult = await pipeline.execute({
+            userMessage: message,
+            messages,
+            availableTools,
+            skillDescriptions,
+            abortSignal,
+          });
+
+          if (pipelineResult.success) {
+            logger.info('[GENERAL_CHAT] Sub-agent pipeline succeeded', {
+              path: pipelineResult.path,
+              metrics: pipelineResult.metrics,
+            });
+
+            gptResponse = { content: pipelineResult.content, usage: undefined };
+            shouldDeductCredits = true;
+            return { gptResponse, shouldDeductCredits };
+          }
+
+          // Pipeline returned { success: false } — fall through to monolithic loop
+          logger.info('[GENERAL_CHAT] Sub-agent pipeline fell back to monolithic', {
+            path: pipelineResult.path,
+            routerClassification: pipelineResult.metrics.routerClassification,
+            routerConfidence: pipelineResult.metrics.routerConfidence,
+          });
+        } catch (pipelineError) {
+          logger.warn('[GENERAL_CHAT] Sub-agent pipeline error, falling back', {
+            error: pipelineError instanceof Error ? pipelineError.message : String(pipelineError),
+          });
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // MONOLITHIC AGENTIC LOOP (fallback — original implementation)
+      // ═══════════════════════════════════════════════════════════════════════
       let toolRound = 0;
       let finalResponse: string | null = null;
 

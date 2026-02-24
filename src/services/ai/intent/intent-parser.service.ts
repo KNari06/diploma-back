@@ -1,3 +1,4 @@
+import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
 import { extractUrlWithGPT } from '@/services/ai/helpers/ai-helpers.service';
@@ -870,7 +871,7 @@ function logContextUsage(context?: IntentParserContext): void {
  * Get model configuration and JSON mode support
  */
 function getModelConfiguration(): { model: string; supportsJsonMode: boolean } {
-    const model = env.OPENAI_MODEL || 'gpt-4o-mini';
+    const model = AI_MODELS.fast;
 
     // JSON mode supported by: gpt-4-turbo, gpt-4o, gpt-4o-mini, o1, o3
     // Since we always use gpt-4* models (from env or default), JSON mode is always supported
@@ -1655,7 +1656,7 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
   parsed.metadata = {
     ...parsed.metadata,
     parsedAt: new Date().toISOString(),
-    model: env.OPENAI_MODEL || 'gpt-4o-mini',
+    model: AI_MODELS.fast,
     messageLength: trimmedMessage.length,
   };
 

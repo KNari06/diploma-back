@@ -202,18 +202,23 @@ export async function uploadScreenshotToStorage(
       index,
     });
 
-    // Convert base64 to buffer
-    const base64Data = screenshotBase64.replace(/^data:image\/png;base64,/, '');
+    // Detect image type from data URI prefix before stripping
+    const isJpeg = screenshotBase64.startsWith('data:image/jpeg') || screenshotBase64.startsWith('/9j/');
+    const ext = isJpeg ? 'jpg' : 'png';
+    const contentType = isJpeg ? 'image/jpeg' : 'image/png';
+
+    // Convert base64 to buffer (handle both PNG and JPEG data URI prefixes)
+    const base64Data = screenshotBase64.replace(/^data:image\/[a-z]+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
 
-    const fileName = `screenshot-${testId}-${index}-${Date.now()}.png`;
+    const fileName = `screenshot-${testId}-${index}-${Date.now()}.${ext}`;
     const storagePath = `${userId}/screenshots/${fileName}`;
 
     // Upload to Supabase Storage
     const { error } = await supabaseAdmin.storage
       .from(env.SUPABASE_BUCKET_NAME)
       .upload(storagePath, buffer, {
-        contentType: 'image/png',
+        contentType,
         upsert: false,
         cacheControl: '3600',
       });

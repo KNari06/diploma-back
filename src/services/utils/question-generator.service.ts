@@ -1,3 +1,4 @@
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { buildDynamicQuestionPrompt } from '@/ai/prompts/index';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { VALID_SCOPES } from '@/types';
@@ -432,7 +433,7 @@ Guidelines:
     ], {
       temperature: 0.1,
       response_format: { type: 'json_object' },
-      model: 'gpt-4o-mini',
+      model: AI_TASK_MODELS.questionGeneration,
     });
 
     if (!response || !response.content || typeof response.content !== 'string') {

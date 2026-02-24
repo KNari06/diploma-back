@@ -324,8 +324,9 @@ export async function executeApiTestFlow(
     // ═══════════════════════════════════════════════════════════════════════
     // SAVE TO DATABASE: Save comprehensive test results to api_test_executions
     // ═══════════════════════════════════════════════════════════════════════
-    // Get projectId from chat session if available
+    // Get projectId and workspaceId from chat session if available
     let projectId: string | undefined;
+    let workspaceId: string | undefined;
     if (chatSessionId) {
       try {
         const { data: session } = await supabaseAdmin
@@ -335,9 +336,18 @@ export async function executeApiTestFlow(
           .single();
         if (session?.project_id) {
           projectId = session.project_id;
+          // Resolve workspace_id from project
+          const { data: project } = await supabaseAdmin
+            .from('projects')
+            .select('workspace_id')
+            .eq('id', session.project_id)
+            .single();
+          if (project?.workspace_id) {
+            workspaceId = project.workspace_id;
+          }
         }
       } catch (sessionError) {
-        logger.warn('[API_TEST] Failed to get project_id from chat session', {
+        logger.warn('[API_TEST] Failed to get project_id/workspace_id from chat session', {
           error: sessionError instanceof Error ? sessionError.message : String(sessionError),
           chatSessionId,
         });
@@ -350,6 +360,7 @@ export async function executeApiTestFlow(
       testId: apiTestId,
       chatSessionId: chatSessionId || undefined,
       projectId,
+      workspaceId,
       request: {
         method: apiDetails.method || 'GET',
         url: plan.url,

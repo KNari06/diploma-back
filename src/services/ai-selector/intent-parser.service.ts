@@ -4,6 +4,7 @@
  * Hybrid approach: Use action.description first, generate from goal+context as fallback
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
@@ -259,7 +260,7 @@ Intent: "first login button"
 Now parse the intent above. Return ONLY valid JSON.`;
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini', // Fast model for intent parsing
+      model: AI_TASK_MODELS.intentParsing, // Centralized model config
       messages: [
         {
           role: 'system',

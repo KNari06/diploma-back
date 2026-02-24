@@ -1,3 +1,4 @@
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { buildVisionPrompt } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
@@ -48,7 +49,7 @@ export async function analyzeScreenshotWithVision(
     const prompt = buildVisionPrompt(context.scope, context.url);
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o', // GPT-4o with vision
+      model: AI_TASK_MODELS.visionAnalysis, // Centralized model config
       messages: [
         {
           role: 'system',

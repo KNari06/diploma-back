@@ -10,6 +10,7 @@
  * - No match (<0.50): passthrough to full LiteEngine
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
 import { generateEmbedding, cosineSimilarity } from '@/services/ai/core/embedding.service';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
@@ -390,7 +391,7 @@ Return JSON: {"isExactMatch": boolean, "confidence": number, "matchedIndex": num
         { role: 'user', content: message },
       ],
       {
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.testCaseResolution,
         temperature: 0.1,
         max_tokens: 100,
         response_format: { type: 'json_object' },

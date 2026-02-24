@@ -133,11 +133,13 @@ export class LiteTraceWriter {
       fs.mkdirSync(this.logsDir, { recursive: true });
     }
 
-    // Create file path: test_logs/<testId>_<date>_<runId>.jsonl
-    // This avoids mixing multiple runs into one file when retries reuse the same testId.
-    const datePart = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    // Create file path: test_logs/<date>_<time>_<testId>.jsonl
+    // Date+time first for easy sorting; testId last for identification.
+    const now = new Date();
+    const datePart = now.toISOString().slice(0, 10); // YYYY-MM-DD
+    const timePart = now.toISOString().slice(11, 19).replace(/:/g, '-'); // HH-MM-SS
     const safeTestId = LiteTraceWriter.sanitizeFilePart(this.testId);
-    this.filePath = path.join(this.logsDir, `${safeTestId}_${datePart}_${this.runId}.jsonl`);
+    this.filePath = path.join(this.logsDir, `${datePart}_${timePart}_${safeTestId}.jsonl`);
 
     // Generate root span ID
     this.rootSpanId = this.generateSpanId();

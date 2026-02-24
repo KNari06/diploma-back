@@ -185,9 +185,10 @@ async function batchCheckHasBugs(testIds: string[]): Promise<Map<string, boolean
  * Map a test row to the API response format
  */
 function mapTestToResponse(test: any, bugsMap: Map<string, boolean>) {
-  const createdAt = test.created_at ? new Date(test.created_at).getTime() : null;
-  const completedAt = test.completed_at ? new Date(test.completed_at).getTime() : null;
-  const durationMs = (createdAt && completedAt) ? completedAt - createdAt : null;
+  const startTime = test.started_at || test.created_at;
+  const startMs = startTime ? new Date(startTime).getTime() : null;
+  const completedMs = test.completed_at ? new Date(test.completed_at).getTime() : null;
+  const durationMs = (startMs && completedMs) ? completedMs - startMs : null;
 
   return {
     id: test.id,

@@ -1,3 +1,4 @@
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { CONSTANTS } from '@/api/chat/shared/constants';
@@ -119,7 +120,7 @@ export async function summarizeOldMessages(sessionId: string): Promise<void> {
       {
         temperature: 0.3,
         max_tokens: 800,
-        model: 'gpt-4o-mini', // Use cheaper model for summarization
+        model: AI_TASK_MODELS.summarization, // Centralized model config
       }
     );
 

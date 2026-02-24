@@ -9,6 +9,7 @@ import {
   buildNextStepPrompt,
 } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { AICostManager, AIModel } from '@/services/ai/cost/ai-cost-manager.service';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
@@ -256,7 +257,7 @@ export class ContextualActionGenerator {
       });
 
       // Get recommended model based on budget constraints
-      const preferredModel: AIModel = 'gpt-4o';
+      const preferredModel = AI_TASK_MODELS.actionGeneration as AIModel;
       const model = costManager ? costManager.getRecommendedModel(preferredModel) : preferredModel;
 
       logger.debug('[ACTION_GENERATOR] Using model', { model, preferredModel });
@@ -621,7 +622,7 @@ export class ContextualActionGenerator {
       });
 
       // Use cheaper model for next step decision to reduce costs
-      const preferredModel: AIModel = 'gpt-4o-mini';
+      const preferredModel = AI_TASK_MODELS.actionGenerationFast as AIModel;
       const model = costManager ? costManager.getRecommendedModel(preferredModel) : preferredModel;
 
       const response = await openai.chat.completions.create({

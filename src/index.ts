@@ -1493,6 +1493,17 @@ const startServer = async () => {
             logger.warn('[SERVER] Running without Redis subscriber - worker events will not reach clients!');
           }
         }
+
+        // Start execution completion emitter Redis subscriber
+        // Bridges worker process test completion signals to main process for dependency-aware execution
+        try {
+          const { executionCompletionEmitter } = await import('@/services/testing/executions/execution-completion-emitter');
+          await executionCompletionEmitter.startSubscriber();
+        } catch (emitterError) {
+          logger.warn('[SERVER] Failed to start execution completion Redis subscriber (dependency coordination may be slow)', {
+            error: emitterError instanceof Error ? emitterError.message : String(emitterError),
+          });
+        }
       }
     } catch (wsError) {
       logger.error('[SERVER] Failed to initialize WebSocket server:', {
@@ -1540,6 +1551,14 @@ const startServer = async () => {
                     error: error instanceof Error ? error.message : String(error),
                   });
                 }
+              })(),
+
+              // Stop execution completion Redis subscriber
+              (async () => {
+                try {
+                  const { executionCompletionEmitter } = await import('@/services/testing/executions/execution-completion-emitter');
+                  await executionCompletionEmitter.stopSubscriber();
+                } catch { /* best effort */ }
               })(),
 
               // Close browser pool

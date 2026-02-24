@@ -2,6 +2,7 @@ import {
   buildCustomScopeStrategyPrompt,
   buildCustomScopeStrategySystemPrompt,
 } from '@/ai/prompts';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { VALID_SCOPES } from '@/types';
 import { logger } from '@/utils/core/logger';
@@ -37,7 +38,7 @@ async function generateCustomScopeStrategy(
         },
       ],
       {
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.scopeStrategy,
         temperature: 0.3,
         max_tokens: 400,
         response_format: { type: 'json_object' },

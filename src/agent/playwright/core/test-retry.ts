@@ -39,7 +39,14 @@ export async function executePlaywrightTestWithRetry(
     }
 
     try {
-      const result = await executePlaywrightTest(testData);
+      // Pass attempt number so executor can adapt strategy:
+      // - Skip compiled plan on retry (go straight to embeddings)
+      // - Enable video on retry (test already failed, need debug recording)
+      const testDataWithRetry = {
+        ...testData,
+        _retryAttempt: attempt,
+      };
+      const result = await executePlaywrightTest(testDataWithRetry);
 
       // Check if test was cancelled (result will have cancelled status)
       if (result.status === 'cancelled' || (result.error && result.error.includes('cancelled'))) {

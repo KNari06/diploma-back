@@ -11,6 +11,7 @@ import {
     type EditorResolverCandidate,
     type ResolverResponse,
 } from '@/ai/prompts/editor-resolver-prompts';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { extractKeywordsSync } from '@/utils/text-processing/ai-keyword-extractor';
 import {
@@ -627,7 +628,7 @@ export class IntentStepLintService {
         {
           max_tokens: 400,
           temperature: 0.1,
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.intentLint,
         }
       );
 
@@ -1094,7 +1095,7 @@ Reply with JSON:
         {
           max_tokens: 200,
           temperature: 0.2,
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.intentLint,
           response_format: { type: 'json_object' },
         }
       );
@@ -1181,7 +1182,7 @@ Reply with JSON:
         {
           max_tokens: 150,
           temperature: 0.1, // Low temperature for deterministic output
-          model: 'gpt-4o-mini', // Use fast/cheap model for disambiguation
+          model: AI_TASK_MODELS.intentLint, // Use fast/cheap model for disambiguation
         }
       );
       const aiResponse = aiResponseResult.content;

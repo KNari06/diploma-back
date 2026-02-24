@@ -82,6 +82,8 @@ export interface TestResult {
   errors: TestError[];
   performance?: PerformanceMetrics;
   aiSummary?: AISummary;
+  /** Quality checks: accessibility, performance, broken resources, slow APIs */
+  qualityChecks?: any;
   // ✅ NEW: Video & Trace support
   videoUrl?: string; // Supabase Storage URL
   videoPath?: string; // Local path (temp)
@@ -342,6 +344,8 @@ export interface TestJobData {
   mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
   chatSessionId?: string; // Chat session ID for WebSocket routing isolation
   prefilledSteps?: import('@/services/testing/resolver/resolver.types').PrefilledStep[]; // Smart Resolver prefilled steps
+  /** Internal: retry attempt number (set by test-retry.ts). 0 = initial, 1+ = retry */
+  _retryAttempt?: number;
 }
 
 export interface AgentResponse {

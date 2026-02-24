@@ -17,6 +17,7 @@ export class ApiTestStorageService {
     testId: string;
     chatSessionId?: string;
     projectId?: string;
+    workspaceId?: string;
     request: {
       method: string;
       url: string;
@@ -156,8 +157,8 @@ export class ApiTestStorageService {
           error_message: params.errorMessage || null,
           chat_session_id: params.chatSessionId || null,
           user_agent: 'QAI-Backend',
-          // Note: environment_id, endpoint_id, test_config_id are optional
-          // and can be added later if we implement API configuration management
+          workspace_id: params.workspaceId || null,
+          project_id: params.projectId || null,
         })
         .select('id')
         .single();

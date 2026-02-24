@@ -192,6 +192,61 @@ export class DOMNodeExtractor {
             const attributes = getAttributes(element);
             const role = element.getAttribute('role') || undefined;
 
+            // Resolve associated <label> text (critical for embeddings accuracy)
+            // Follows: <label for="id"> → aria-labelledby → wrapping <label>
+            let resolvedLabel = '';
+            const elId = element.getAttribute('id');
+            if (elId) {
+              // @ts-ignore - browser context
+              const labelFor = document.querySelector('label[for="' + elId + '"]');
+              if (labelFor) resolvedLabel = labelFor.textContent?.trim() || '';
+            }
+            if (!resolvedLabel) {
+              const ariaLabelledBy = element.getAttribute('aria-labelledby');
+              if (ariaLabelledBy) {
+                // @ts-ignore - browser context
+                const labelEl = document.getElementById(ariaLabelledBy);
+                if (labelEl) resolvedLabel = labelEl.textContent?.trim() || '';
+              }
+            }
+            if (!resolvedLabel) {
+              const parentLabel = element.closest('label');
+              if (parentLabel) resolvedLabel = parentLabel.textContent?.trim() || '';
+            }
+            if (resolvedLabel) {
+              attributes['__resolvedLabel'] = resolvedLabel.substring(0, 200);
+            }
+
+            // Container titles (fieldset/form/section headings — important for disambiguation)
+            const cTitles: string[] = [];
+            let par = element.parentElement;
+            let d = 0;
+            while (par && d < 5) {
+              if (par.tagName === 'FIELDSET') {
+                const leg = par.querySelector('legend');
+                if (leg?.textContent?.trim()) cTitles.push(leg.textContent.trim());
+              } else if (par.tagName === 'FORM' || ['SECTION', 'ARTICLE', 'NAV'].includes(par.tagName)) {
+                const hd = par.querySelector('h1, h2, h3, h4, h5, h6');
+                if (hd?.textContent?.trim()) cTitles.push(hd.textContent.trim());
+              }
+              par = par.parentElement;
+              d++;
+            }
+            if (cTitles.length > 0) {
+              attributes['__containerTitles'] = cTitles.slice(0, 3).join('|');
+            }
+
+            // isTopMostAtCenter (for overlay/modal detection)
+            let topMost = false;
+            if (rect.width > 0 && rect.height > 0) {
+              const cx = rect.left + rect.width / 2;
+              const cy = rect.top + rect.height / 2;
+              // @ts-ignore - browser context
+              const topEl = document.elementFromPoint(cx, cy);
+              topMost = topEl === element || element.contains(topEl);
+            }
+            attributes['__isTopMostAtCenter'] = topMost ? 'true' : 'false';
+
             // ✅ FIX: Use closure to access and increment counter
             // This ensures unique nodeId across all recursive calls
             const nodeId = `node-${nodeCounter}`;

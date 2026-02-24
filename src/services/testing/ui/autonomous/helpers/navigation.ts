@@ -1,3 +1,4 @@
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { buildPageNavigationPrompt, buildPageNavigationSystemPrompt } from '@/ai/prompts';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
@@ -299,7 +300,7 @@ async function findTargetPage(
           },
         ],
         {
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.navigationAnalysis,
           temperature: 0.2,
           max_tokens: 300,
           response_format: { type: 'json_object' },

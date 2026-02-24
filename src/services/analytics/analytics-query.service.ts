@@ -101,6 +101,88 @@ export class AnalyticsQueryService {
   }
 
   /**
+   * Helper: Get API test executions for projects within date range
+   */
+  private static async getApiTestExecutions(
+    projectIds: string[],
+    startDate?: Date,
+    endDate?: Date
+  ): Promise<any[]> {
+    if (projectIds.length === 0) return [];
+
+    try {
+      let query = supabaseAdmin
+        .from('api_test_executions')
+        .select('id, success, duration_ms, executed_at, error_message, request_data, workspace_id, project_id')
+        .in('project_id', projectIds);
+
+      if (startDate) {
+        query = query.gte('executed_at', startDate.toISOString());
+      }
+      if (endDate) {
+        query = query.lte('executed_at', endDate.toISOString());
+      }
+
+      const { data, error } = await query;
+
+      if (error) {
+        logger.error('[ANALYTICS] Failed to get API test executions', { error, projectIds });
+        return [];
+      }
+
+      return data || [];
+    } catch (error) {
+      logger.error('[ANALYTICS] Error getting API test executions', { error });
+      return [];
+    }
+  }
+
+  /**
+   * Helper: Get failed API test executions for recent failures list
+   */
+  private static async getApiTestFailures(
+    projectIds: string[],
+    limit: number
+  ): Promise<RecentFailure[]> {
+    if (projectIds.length === 0) return [];
+
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('api_test_executions')
+        .select('id, success, error_message, executed_at, request_data, project_id')
+        .in('project_id', projectIds)
+        .eq('success', false)
+        .not('executed_at', 'is', null)
+        .order('executed_at', { ascending: false })
+        .limit(limit);
+
+      if (error || !data) return [];
+
+      return data.map((f: any) => {
+        const method = f.request_data?.method || 'API';
+        const url = f.request_data?.url || 'Unknown';
+        const shortUrl = url.length > 60 ? url.substring(0, 60) + '...' : url;
+
+        return {
+          id: f.id,
+          testCaseName: `${method} ${shortUrl}`,
+          testCaseId: f.id,
+          runId: f.id,
+          status: 'failed' as const,
+          errorMessage: f.error_message,
+          severity: 'failure' as const,
+          failedAt: f.executed_at,
+          timeAgo: this.getTimeAgo(f.executed_at),
+          source: 'api_test' as const,
+        };
+      });
+    } catch (error) {
+      logger.error('[ANALYTICS] Error getting API test failures', { error });
+      return [];
+    }
+  }
+
+  /**
    * Helper: Calculate time ago string
    */
   private static getTimeAgo(date: string): string {
@@ -131,7 +213,7 @@ export class AnalyticsQueryService {
       const runIds = await this.getRunIdsForProjects(projectIds, filters.startDate, filters.endDate);
 
       // Parallel queries for performance
-      const [executionsResult, runsResult, tokensResult, scheduleResult] = await Promise.all([
+      const [executionsResult, runsResult, tokensResult, scheduleResult, apiTestExecs] = await Promise.all([
         // Test executions (steps) — only query if we have run IDs
         runIds.length > 0
           ? supabaseAdmin
@@ -165,12 +247,20 @@ export class AnalyticsQueryService {
           .order('next_run_at', { ascending: true })
           .limit(1)
           .maybeSingle(),
+
+        // API test executions
+        this.getApiTestExecutions(projectIds, filters.startDate, filters.endDate),
       ]);
 
       const executions = executionsResult.data || [];
       const runs = runsResult.data || [];
       const tokens = tokensResult;
       const schedule = scheduleResult.data;
+
+      // API test stats
+      const apiTestsRun = apiTestExecs.length;
+      const apiTestsPassed = apiTestExecs.filter((e: any) => e.success === true).length;
+      const apiTestsFailed = apiTestExecs.filter((e: any) => e.success === false).length;
 
       // Calculate summary stats
       const testStepsRun = executions.length;
@@ -230,6 +320,9 @@ export class AnalyticsQueryService {
           errorSteps,
           flakySteps,
           passRate,
+          apiTestsRun: apiTestsRun > 0 ? apiTestsRun : undefined,
+          apiTestsPassed: apiTestsRun > 0 ? apiTestsPassed : undefined,
+          apiTestsFailed: apiTestsRun > 0 ? apiTestsFailed : undefined,
         },
         status: {
           state,
@@ -324,12 +417,15 @@ export class AnalyticsQueryService {
         return { passed: 0, failed: 0, skipped: 0, flaky: 0, total: 0, percentages: { passed: 0, failed: 0, skipped: 0, flaky: 0 } };
       }
 
-      const { data: executions } = await supabaseAdmin
-        .from('test_executions')
-        .select('status, run_id, test_case_id')
-        .in('run_id', runIds);
+      const [execResult, apiTestExecs] = await Promise.all([
+        supabaseAdmin
+          .from('test_executions')
+          .select('status, run_id, test_case_id')
+          .in('run_id', runIds),
+        this.getApiTestExecutions(projectIds, filters.startDate, filters.endDate),
+      ]);
 
-      const execs = executions || [];
+      const execs = execResult.data || [];
       const passed = execs.filter((e) => e.status === 'passed').length;
       const failed = execs.filter((e) => e.status === 'failed').length;
       const skipped = execs.filter((e) => e.status === 'skipped').length;
@@ -343,7 +439,15 @@ export class AnalyticsQueryService {
         flaky: total > 0 ? Math.round((flaky / total) * 100 * 10) / 10 : 0,
       };
 
-      return { passed, failed, skipped, flaky, total, percentages };
+      // API test breakdown
+      const apiTotal = apiTestExecs.length;
+      const apiPassed = apiTestExecs.filter((e: any) => e.success === true).length;
+      const apiFailed = apiTestExecs.filter((e: any) => e.success === false).length;
+
+      return {
+        passed, failed, skipped, flaky, total, percentages,
+        apiTests: apiTotal > 0 ? { total: apiTotal, passed: apiPassed, failed: apiFailed } : undefined,
+      };
     } catch (error) {
       logger.error('[ANALYTICS] Failed to get results overview', { error, filters });
       throw error;
@@ -367,80 +471,88 @@ export class AnalyticsQueryService {
 
       const runIds = await this.getRunIdsForProjects(projectIds);
 
-      if (runIds.length === 0) {
-        return { failures: [] };
-      }
+      // Build regression failures list (only if we have run IDs)
+      let result: RecentFailure[] = [];
 
-      // Get recent failed executions
-      const { data: failures } = await supabaseAdmin
-        .from('test_executions')
-        .select('id, run_id, test_case_id, status, error_message, completed_at')
-        .in('run_id', runIds)
-        .eq('status', 'failed')
-        .not('completed_at', 'is', null)
-        .order('completed_at', { ascending: false })
-        .limit(limit);
-
-      if (!failures || failures.length === 0) {
-        return { failures: [] };
-      }
-
-      // Get test case names and priorities (separate query — no FK between tables)
-      const testCaseIds = [...new Set(failures.map((f) => f.test_case_id))];
-      const [testCasesResult, allExecutionsResult] = await Promise.all([
-        supabaseAdmin
-          .from('intent_test_cases')
-          .select('id, name, priority')
-          .in('id', testCaseIds),
-        // Check for recovery (later passed execution)
-        supabaseAdmin
+      if (runIds.length > 0) {
+        // Get recent failed executions
+        const { data: failures } = await supabaseAdmin
           .from('test_executions')
-          .select('test_case_id, status, completed_at')
-          .in('test_case_id', testCaseIds)
-          .in('status', ['passed', 'failed'])
-          .order('completed_at', { ascending: false }),
-      ]);
+          .select('id, run_id, test_case_id, status, error_message, completed_at')
+          .in('run_id', runIds)
+          .eq('status', 'failed')
+          .not('completed_at', 'is', null)
+          .order('completed_at', { ascending: false })
+          .limit(limit);
 
-      const testCaseMap = new Map<string, { name: string; priority: string | null }>();
-      for (const tc of testCasesResult.data || []) {
-        testCaseMap.set(tc.id, { name: tc.name, priority: tc.priority });
-      }
+        if (failures && failures.length > 0) {
+          // Get test case names and priorities (separate query — no FK between tables)
+          const testCaseIds = [...new Set(failures.map((f) => f.test_case_id))];
+          const [testCasesResult, allExecutionsResult] = await Promise.all([
+            supabaseAdmin
+              .from('intent_test_cases')
+              .select('id, name, priority')
+              .in('id', testCaseIds),
+            // Check for recovery (later passed execution)
+            supabaseAdmin
+              .from('test_executions')
+              .select('test_case_id, status, completed_at')
+              .in('test_case_id', testCaseIds)
+              .in('status', ['passed', 'failed'])
+              .order('completed_at', { ascending: false }),
+          ]);
 
-      const recoveryMap = new Map<string, boolean>();
-      for (const exec of allExecutionsResult.data || []) {
-        if (!recoveryMap.has(exec.test_case_id) && exec.status === 'passed') {
-          recoveryMap.set(exec.test_case_id, true);
+          const testCaseMap = new Map<string, { name: string; priority: string | null }>();
+          for (const tc of testCasesResult.data || []) {
+            testCaseMap.set(tc.id, { name: tc.name, priority: tc.priority });
+          }
+
+          const recoveryMap = new Map<string, boolean>();
+          for (const exec of allExecutionsResult.data || []) {
+            if (!recoveryMap.has(exec.test_case_id) && exec.status === 'passed') {
+              recoveryMap.set(exec.test_case_id, true);
+            }
+          }
+
+          result = failures.map((f: any) => {
+            const testCase = testCaseMap.get(f.test_case_id);
+            const isRecovered = recoveryMap.get(f.test_case_id) || false;
+            const priority = testCase?.priority || 'medium';
+
+            let severity: 'failure' | 'warn' | 'recovered';
+            if (isRecovered) {
+              severity = 'recovered';
+            } else if (priority === 'critical' || priority === 'high') {
+              severity = 'failure';
+            } else {
+              severity = 'warn';
+            }
+
+            return {
+              id: f.id,
+              testCaseName: testCase?.name || 'Unknown Test',
+              testCaseId: f.test_case_id,
+              runId: f.run_id,
+              status: 'failed' as const,
+              errorMessage: f.error_message,
+              severity,
+              failedAt: f.completed_at,
+              timeAgo: this.getTimeAgo(f.completed_at),
+              source: 'regression' as const,
+            };
+          });
         }
       }
 
-      const result: RecentFailure[] = failures.map((f: any) => {
-        const testCase = testCaseMap.get(f.test_case_id);
-        const isRecovered = recoveryMap.get(f.test_case_id) || false;
-        const priority = testCase?.priority || 'medium';
+      // Also get failed API test executions
+      const apiFailures = await this.getApiTestFailures(projectIds, limit);
 
-        let severity: 'failure' | 'warn' | 'recovered';
-        if (isRecovered) {
-          severity = 'recovered';
-        } else if (priority === 'critical' || priority === 'high') {
-          severity = 'failure';
-        } else {
-          severity = 'warn';
-        }
+      // Merge and sort by date descending, then limit
+      const allFailures = [...result, ...apiFailures]
+        .sort((a, b) => new Date(b.failedAt).getTime() - new Date(a.failedAt).getTime())
+        .slice(0, limit);
 
-        return {
-          id: f.id,
-          testCaseName: testCase?.name || 'Unknown Test',
-          testCaseId: f.test_case_id,
-          runId: f.run_id,
-          status: 'failed' as const,
-          errorMessage: f.error_message,
-          severity,
-          failedAt: f.completed_at,
-          timeAgo: this.getTimeAgo(f.completed_at),
-        };
-      });
-
-      return { failures: result };
+      return { failures: allFailures };
     } catch (error) {
       logger.error('[ANALYTICS] Failed to get recent failures', { error, workspaceId });
       throw error;
@@ -544,34 +656,60 @@ export class AnalyticsQueryService {
       let dailyCounts: Map<string, number>;
 
       if (metric === 'runs') {
-        const { data: runs } = await supabaseAdmin
-          .from('regression_runs')
-          .select('started_at')
-          .in('project_id', projectIds)
-          .gte('started_at', since.toISOString())
-          .not('started_at', 'is', null);
+        const [runsResult, apiExecsResult] = await Promise.all([
+          supabaseAdmin
+            .from('regression_runs')
+            .select('started_at')
+            .in('project_id', projectIds)
+            .gte('started_at', since.toISOString())
+            .not('started_at', 'is', null),
+          supabaseAdmin
+            .from('api_test_executions')
+            .select('executed_at')
+            .in('project_id', projectIds)
+            .gte('executed_at', since.toISOString())
+            .not('executed_at', 'is', null),
+        ]);
 
         dailyCounts = new Map();
-        for (const run of runs || []) {
+        for (const run of runsResult.data || []) {
           const dateKey = run.started_at.split('T')[0];
+          dailyCounts.set(dateKey, (dailyCounts.get(dateKey) || 0) + 1);
+        }
+        for (const exec of apiExecsResult.data || []) {
+          const dateKey = exec.executed_at.split('T')[0];
           dailyCounts.set(dateKey, (dailyCounts.get(dateKey) || 0) + 1);
         }
       } else if (metric === 'failures') {
         const runIds = await this.getRunIdsForProjects(projectIds, since);
         dailyCounts = new Map();
 
-        if (runIds.length > 0) {
-          const { data: executions } = await supabaseAdmin
-            .from('test_executions')
-            .select('completed_at')
-            .in('run_id', runIds)
-            .eq('status', 'failed')
-            .not('completed_at', 'is', null);
+        // Regression test failures + API test failures in parallel
+        const [regressionFailures, apiFailures] = await Promise.all([
+          runIds.length > 0
+            ? supabaseAdmin
+                .from('test_executions')
+                .select('completed_at')
+                .in('run_id', runIds)
+                .eq('status', 'failed')
+                .not('completed_at', 'is', null)
+            : Promise.resolve({ data: [] }),
+          supabaseAdmin
+            .from('api_test_executions')
+            .select('executed_at')
+            .in('project_id', projectIds)
+            .eq('success', false)
+            .gte('executed_at', since.toISOString())
+            .not('executed_at', 'is', null),
+        ]);
 
-          for (const exec of executions || []) {
-            const dateKey = exec.completed_at.split('T')[0];
-            dailyCounts.set(dateKey, (dailyCounts.get(dateKey) || 0) + 1);
-          }
+        for (const exec of regressionFailures.data || []) {
+          const dateKey = exec.completed_at.split('T')[0];
+          dailyCounts.set(dateKey, (dailyCounts.get(dateKey) || 0) + 1);
+        }
+        for (const exec of apiFailures.data || []) {
+          const dateKey = exec.executed_at.split('T')[0];
+          dailyCounts.set(dateKey, (dailyCounts.get(dateKey) || 0) + 1);
         }
       } else {
         // flaky metric
@@ -611,9 +749,11 @@ export class AnalyticsQueryService {
       const totalCount = counts.reduce((a, b) => a + b, 0);
 
       const days: HeatmapDay[] = [];
-      for (let i = 0; i < rangeDays; i++) {
-        const date = new Date(since);
-        date.setDate(date.getDate() + i);
+      const now = new Date();
+      // Use UTC dates consistently (DB timestamps are ISO/UTC)
+      const startUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - rangeDays));
+      for (let i = 0; i <= rangeDays; i++) {
+        const date = new Date(startUtc.getTime() + i * 86400000);
         const dateKey = date.toISOString().split('T')[0];
         const count = dailyCounts.get(dateKey) || 0;
 
@@ -716,35 +856,63 @@ export class AnalyticsQueryService {
         return { points: [], interval: filters.interval };
       }
 
-      const { data: runs } = await supabaseAdmin
-        .from('regression_runs')
-        .select('started_at, status')
-        .in('project_id', projectIds)
-        .gte('started_at', filters.startDate?.toISOString() || new Date(Date.now() - 3600000).toISOString())
-        .lte('started_at', filters.endDate?.toISOString() || new Date().toISOString())
-        .not('started_at', 'is', null)
-        .order('started_at', { ascending: true });
+      const startIso = filters.startDate?.toISOString() || new Date(Date.now() - 3600000).toISOString();
+      const endIso = filters.endDate?.toISOString() || new Date().toISOString();
 
-      if (!runs || runs.length === 0) {
+      const [runsResult, apiExecsResult] = await Promise.all([
+        supabaseAdmin
+          .from('regression_runs')
+          .select('started_at, status')
+          .in('project_id', projectIds)
+          .gte('started_at', startIso)
+          .lte('started_at', endIso)
+          .not('started_at', 'is', null)
+          .order('started_at', { ascending: true }),
+        supabaseAdmin
+          .from('api_test_executions')
+          .select('executed_at')
+          .in('project_id', projectIds)
+          .gte('executed_at', startIso)
+          .lte('executed_at', endIso)
+          .not('executed_at', 'is', null),
+      ]);
+
+      const runs = runsResult.data || [];
+      const apiExecs = apiExecsResult.data || [];
+
+      if (runs.length === 0 && apiExecs.length === 0) {
         return { points: [], interval: filters.interval };
       }
 
       // Bucket by interval
       const intervalMs = this.getIntervalMs(filters.interval);
-      const buckets = new Map<number, { total: number; passed: number; failed: number }>();
+      const buckets = new Map<number, { total: number; passed: number; failed: number; apiTests: number }>();
 
       for (const run of runs) {
         const timestamp = new Date(run.started_at).getTime();
         const bucketKey = Math.floor(timestamp / intervalMs) * intervalMs;
 
         if (!buckets.has(bucketKey)) {
-          buckets.set(bucketKey, { total: 0, passed: 0, failed: 0 });
+          buckets.set(bucketKey, { total: 0, passed: 0, failed: 0, apiTests: 0 });
         }
 
         const bucket = buckets.get(bucketKey)!;
         bucket.total++;
         if (run.status === 'completed') bucket.passed++;
         if (run.status === 'failed') bucket.failed++;
+      }
+
+      for (const exec of apiExecs) {
+        const timestamp = new Date(exec.executed_at).getTime();
+        const bucketKey = Math.floor(timestamp / intervalMs) * intervalMs;
+
+        if (!buckets.has(bucketKey)) {
+          buckets.set(bucketKey, { total: 0, passed: 0, failed: 0, apiTests: 0 });
+        }
+
+        const bucket = buckets.get(bucketKey)!;
+        bucket.total++;
+        bucket.apiTests++;
       }
 
       const points: TimeSeriesPoint[] = Array.from(buckets.entries())
@@ -754,6 +922,7 @@ export class AnalyticsQueryService {
           totalRuns: counts.total,
           passedRuns: counts.passed,
           failedRuns: counts.failed,
+          apiTestsRun: counts.apiTests > 0 ? counts.apiTests : undefined,
         }));
 
       return { points, interval: filters.interval };

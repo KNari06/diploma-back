@@ -85,6 +85,11 @@ async function getCurrentPageSignature(page: PageLike): Promise<string> {
 /**
  * Check if page signature matches compiled plan signature
  * Returns true if no signature is stored (backward compatibility)
+ *
+ * Note: Recording (preview-session) stores a base64-encoded signature
+ * (url|nodeCount|refs), while replay computes tag:type:name:id:role strings.
+ * When formats are incompatible, we return matched=true to avoid false negatives
+ * — the locator plan itself (with fingerprint validation) is the real guard.
  */
 async function checkPageSignature(
   page: PageLike,
@@ -97,29 +102,42 @@ async function checkPageSignature(
 
   const currentSignature = await getCurrentPageSignature(page);
 
-  // Signatures don't need to be exact - just similar enough
-  // Use simple overlap check (60% match is enough)
-  const compiledParts = new Set(compiledSignature.split('|'));
+  // Detect format mismatch: recording stores base64 (no ':' inside parts),
+  // replay computes "tag:type:name:id:role" (always contains ':'). If the compiled
+  // signature has no ':' in any split part, it's base64-encoded from recording —
+  // comparison is meaningless, treat as matched and let fingerprint validation guard.
+  const compiledParts = compiledSignature.split('|');
+  const isBase64Signature = compiledParts.length <= 1 || compiledParts.every(p => !p.includes(':'));
+
+  if (isBase64Signature) {
+    logger.debug('[COMPILED_EXECUTOR] Compiled signature is base64 format (from recording), skipping comparison', {
+      compiledSignaturePreview: compiledSignature.slice(0, 30),
+    });
+    return { matched: true, currentSignature };
+  }
+
+  // Both signatures use the same tag:type:name:id:role format — compare overlap
+  const compiledSet = new Set(compiledParts);
   const currentParts = currentSignature.split('|');
 
-  if (compiledParts.size === 0 || currentParts.length === 0) {
+  if (compiledSet.size === 0 || currentParts.length === 0) {
     return { matched: true, currentSignature };
   }
 
   let matchCount = 0;
   for (const part of currentParts) {
-    if (compiledParts.has(part)) {
+    if (compiledSet.has(part)) {
       matchCount++;
     }
   }
 
-  const matchRatio = matchCount / Math.max(compiledParts.size, currentParts.length);
+  const matchRatio = matchCount / Math.max(compiledSet.size, currentParts.length);
   const matched = matchRatio >= 0.6;
 
   logger.debug('[COMPILED_EXECUTOR] Page signature check', {
     matched,
     matchRatio: Math.round(matchRatio * 100),
-    compiledPartsCount: compiledParts.size,
+    compiledPartsCount: compiledSet.size,
     currentPartsCount: currentParts.length,
   });
 
@@ -302,22 +320,35 @@ export async function executeCompiledLocatorPlan(
 
   // 3. Check pageSignature (if present)
   const signatureCheck = await checkPageSignature(page, compiled.context?.pageSignature);
-  if (!signatureCheck.matched) {
-    logger.info('[COMPILED_EXECUTOR] Page signature mismatch, skipping compiled plan', {
-      stored: compiled.context?.pageSignature?.slice(0, 50),
-      current: signatureCheck.currentSignature.slice(0, 50),
+
+  // Always filter out ref strategy — data-agent-ref attributes only exist during preview sessions,
+  // not during background replay/regression. Trying ref locators wastes 5s per step on timeout.
+  // Keep stable strategies (role, label, testId, placeholder, css) that work without injected refs.
+  let locatorsToTry = compiled.locatorPlan.filter(entry => entry.strategy !== 'ref');
+
+  if (locatorsToTry.length === 0) {
+    logger.info('[COMPILED_EXECUTOR] Only ref locators in plan, skipping (refs not available during replay)', {
+      originalCount: compiled.locatorPlan.length,
     });
     return {
       success: false,
-      skipReason: 'signature_mismatch',
-      signatureMatched: false,
+      skipReason: 'no_plan',
+      signatureMatched: signatureCheck.matched,
       source: 'resolver',
     };
   }
 
+  if (locatorsToTry.length < compiled.locatorPlan.length) {
+    logger.debug('[COMPILED_EXECUTOR] Filtered ref strategy from plan', {
+      originalCount: compiled.locatorPlan.length,
+      filteredCount: locatorsToTry.length,
+      remainingStrategies: locatorsToTry.map(e => e.strategy),
+    });
+  }
+
   // 4. Try each locator in order
   let sawAmbiguous = false;
-  for (const entry of compiled.locatorPlan) {
+  for (const entry of locatorsToTry) {
     logger.debug('[COMPILED_EXECUTOR] Trying locator', {
       strategy: entry.strategy,
       value: entry.value.slice(0, 50),
@@ -363,7 +394,7 @@ export async function executeCompiledLocatorPlan(
         usedStrategy: entry.strategy,
         confidence: entry.confidence,
         expired: false,
-        signatureMatched: true,
+        signatureMatched: signatureCheck.matched,
         source: 'compiled',
       };
     }
@@ -384,7 +415,7 @@ export async function executeCompiledLocatorPlan(
     success: false,
     skipReason: sawAmbiguous ? 'ambiguous' : 'locator_failed',
     expired: false,
-    signatureMatched: true,
+    signatureMatched: signatureCheck.matched,
     source: 'resolver',
   };
 }

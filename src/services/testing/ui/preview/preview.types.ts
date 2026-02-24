@@ -371,6 +371,11 @@ export interface StepOptions {
    * Default: false (lookahead wait is enabled)
    */
   disableLookaheadWait?: boolean;
+  /**
+   * Override lookahead wait timeout for this step (ms).
+   * Default: 10000. Use lower values for fast SPAs, higher for slow pages.
+   */
+  lookaheadTimeoutMs?: number;
   /** Upload configuration for upload step (V6) */
   upload?: {
     /** Source type: 'url' (download from public URL) or 'storage' (pre-uploaded file) */

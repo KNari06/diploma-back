@@ -48,6 +48,8 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     actionType?: IntentActionType;
     /** V6: Disable lookahead wait before this step */
     disableLookaheadWait?: boolean;
+    /** Override lookahead wait timeout (ms) */
+    lookaheadTimeoutMs?: number;
   };
 }
 
@@ -176,6 +178,7 @@ export function convertIntentStepToCommand(
       actionType: step.type,
       // V6: Lookahead wait disable flag
       disableLookaheadWait: step.options?.disableLookaheadWait,
+      lookaheadTimeoutMs: step.options?.lookaheadTimeoutMs,
       // V3: AI check metadata
       ...(step.type === 'ai_check' && {
         assertionText: step.assertionText,
