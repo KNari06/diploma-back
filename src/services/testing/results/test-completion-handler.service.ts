@@ -393,8 +393,10 @@ export class TestCompletionHandlerService {
       }
 
       // Find regression runs that reference this test
-      // Query 1: direct test_id match; Query 2: batch test_ids contains (JSONB @> filter)
-      const [directResult, batchResult] = await Promise.all([
+      // Query 1: direct test_id match (single test case runs)
+      // Query 2: test_ids JSONB array contains testId (plan/module/flow runs)
+      // Query 3: test_executions join — fallback for runs linked via test_executions table
+      const [directResult, batchResult, execResult] = await Promise.all([
         supabaseAdmin
           .from('regression_runs')
           .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
@@ -403,16 +405,35 @@ export class TestCompletionHandlerService {
         supabaseAdmin
           .from('regression_runs')
           .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
-          .filter('test_ids', 'cs', JSON.stringify([testId]))
+          .filter('test_ids', 'cs', `["${testId}"]`)
           .in('status', ['running', 'pending']),
+        // Fallback: find via test_executions table (most reliable for plan runs)
+        supabaseAdmin
+          .from('test_executions')
+          .select('run_id')
+          .eq('result->>testId', testId)
+          .limit(1),
       ]);
 
-      const runsError = directResult.error || batchResult.error;
       // Deduplicate by run ID
       const runMap = new Map<string, any>();
       for (const r of directResult.data || []) runMap.set(r.id, r);
       for (const r of batchResult.data || []) runMap.set(r.id, r);
+
+      // If test_executions found a run_id not yet in map, fetch it
+      const execRunId = execResult.data?.[0]?.run_id;
+      if (execRunId && !runMap.has(execRunId)) {
+        const { data: execRun } = await supabaseAdmin
+          .from('regression_runs')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
+          .eq('id', execRunId)
+          .in('status', ['running', 'pending'])
+          .maybeSingle();
+        if (execRun) runMap.set(execRun.id, execRun);
+      }
+
       const runs = [...runMap.values()];
+      const runsError = directResult.error || batchResult.error;
 
       if (runsError) {
         logger.error('[TEST_COMPLETION] Failed to find regression runs', {
