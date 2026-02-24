@@ -867,6 +867,21 @@ export class CommandExecutor {
         }
 
         case 'assertVisible': {
+          const performAssertVisible = async (loc: Locator) => {
+            const isVis = await loc.isVisible({ timeout: timeout || 5000 });
+            if (!isVis) throw new Error(`Element not visible: ${selector}`);
+          };
+
+          // Intent command path — compiled plan → embeddings → smart → self-heal
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentAssertVisLoc } = await this.getLocatorForIntentCommand(
+              intentCommand, 'click', timeout || 5000
+            );
+            await performAssertVisible(intentAssertVisLoc);
+            logger.info('Assertion passed: Element is visible', { selector });
+            break;
+          }
+
           if (!selector) throw new Error('Selector is required for assertVisible action');
 
           const assertVisSmartResult = await getSmartLocator(this.page, selector, 'click', description);
@@ -879,10 +894,7 @@ export class CommandExecutor {
           }
 
           try {
-            const isVisible = await assertVisSmartResult.locator.isVisible({ timeout: timeout || 5000 });
-            if (!isVisible) {
-              throw new Error(`Element not visible: ${selector}`);
-            }
+            await performAssertVisible(assertVisSmartResult.locator);
           } catch (assertVisError) {
             if (assertVisError instanceof Error && assertVisError.message.startsWith('Element not visible')) throw assertVisError;
             logger.warn('[COMMAND_EXECUTOR] Smart locator assertVisible failed, trying self-healing', {
@@ -892,8 +904,7 @@ export class CommandExecutor {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                const vis = await locator.isVisible({ timeout: timeout || 5000 });
-                if (!vis) throw new Error(`Element not visible: ${selector}`);
+                await performAssertVisible(locator);
               },
               { selector, intent: description || 'assert element visible', action: 'assertVisible', timeout }
             );
@@ -903,17 +914,6 @@ export class CommandExecutor {
         }
 
         case 'assertText': {
-          if (!selector) throw new Error('Selector is required for assertText action');
-
-          const assertTxtSmartResult = await getSmartLocator(this.page, selector, 'click', description);
-          if (assertTxtSmartResult.wasSmartSelected) {
-            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertText', {
-              selector: selector.substring(0, 50),
-              totalMatches: assertTxtSmartResult.totalMatches,
-              selectedIndex: assertTxtSmartResult.selectedIndex,
-            });
-          }
-
           const performAssertText = async (locator: Locator) => {
             await locator.waitFor({ state: 'visible', timeout: timeout || 5000 });
             const actualText = await locator.textContent();
@@ -925,6 +925,26 @@ export class CommandExecutor {
             }
             logger.info('Assertion passed: Text matches', { selector, expected: expectedText, actual: actualText });
           };
+
+          // Intent command path — compiled plan → embeddings → smart → self-heal
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentAssertTxtLoc } = await this.getLocatorForIntentCommand(
+              intentCommand, 'click', timeout || 5000
+            );
+            await performAssertText(intentAssertTxtLoc);
+            break;
+          }
+
+          if (!selector) throw new Error('Selector is required for assertText action');
+
+          const assertTxtSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertTxtSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertText', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertTxtSmartResult.totalMatches,
+              selectedIndex: assertTxtSmartResult.selectedIndex,
+            });
+          }
 
           try {
             await performAssertText(assertTxtSmartResult.locator);
@@ -946,17 +966,6 @@ export class CommandExecutor {
         }
 
         case 'assertValue': {
-          if (!selector) throw new Error('Selector is required for assertValue action');
-
-          const assertValSmartResult = await getSmartLocator(this.page, selector, 'click', description);
-          if (assertValSmartResult.wasSmartSelected) {
-            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertValue', {
-              selector: selector.substring(0, 50),
-              totalMatches: assertValSmartResult.totalMatches,
-              selectedIndex: assertValSmartResult.selectedIndex,
-            });
-          }
-
           const performAssertValue = async (locator: Locator) => {
             await locator.waitFor({ state: 'visible', timeout: timeout || 5000 });
             const actualValue = await locator.inputValue();
@@ -968,6 +977,26 @@ export class CommandExecutor {
             }
             logger.info('Assertion passed: Value matches', { selector, expected: expectedValue, actual: actualValue });
           };
+
+          // Intent command path
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentAssertValLoc } = await this.getLocatorForIntentCommand(
+              intentCommand, 'click', timeout || 5000
+            );
+            await performAssertValue(intentAssertValLoc);
+            break;
+          }
+
+          if (!selector) throw new Error('Selector is required for assertValue action');
+
+          const assertValSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertValSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertValue', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertValSmartResult.totalMatches,
+              selectedIndex: assertValSmartResult.selectedIndex,
+            });
+          }
 
           try {
             await performAssertValue(assertValSmartResult.locator);
@@ -993,17 +1022,6 @@ export class CommandExecutor {
           break;
 
         case 'assertCount': {
-          if (!selector) throw new Error('Selector is required for assertCount action');
-
-          const assertCntSmartResult = await getSmartLocator(this.page, selector, 'click', description);
-          if (assertCntSmartResult.wasSmartSelected) {
-            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertCount', {
-              selector: selector.substring(0, 50),
-              totalMatches: assertCntSmartResult.totalMatches,
-              selectedIndex: assertCntSmartResult.selectedIndex,
-            });
-          }
-
           const performAssertCount = async (locator: Locator) => {
             const actualCount = await locator.count();
             const expectedCount = Number(command.assertion?.expected || 0);
@@ -1014,6 +1032,26 @@ export class CommandExecutor {
             }
             logger.info('Assertion passed: Count matches', { selector, expected: expectedCount, actual: actualCount });
           };
+
+          // Intent command path
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentAssertCntLoc } = await this.getLocatorForIntentCommand(
+              intentCommand, 'click', timeout || 5000
+            );
+            await performAssertCount(intentAssertCntLoc);
+            break;
+          }
+
+          if (!selector) throw new Error('Selector is required for assertCount action');
+
+          const assertCntSmartResult = await getSmartLocator(this.page, selector, 'click', description);
+          if (assertCntSmartResult.wasSmartSelected) {
+            logger.info('[COMMAND_EXECUTOR] Smart element selection used for assertCount', {
+              selector: selector.substring(0, 50),
+              totalMatches: assertCntSmartResult.totalMatches,
+              selectedIndex: assertCntSmartResult.selectedIndex,
+            });
+          }
 
           try {
             await performAssertCount(assertCntSmartResult.locator);
