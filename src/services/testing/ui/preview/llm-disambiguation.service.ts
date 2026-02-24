@@ -20,6 +20,7 @@
  */
 
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import type { IntentActionType, InteractiveNode } from './preview.types';
 
@@ -43,7 +44,7 @@ const CACHE_TTL_MS = 30 * 60 * 1000;
 const MAX_ALLOWED_FOR_LLM = 50;
 
 /** Model to use for disambiguation */
-const LLM_MODEL = 'gpt-4o-mini';
+const LLM_MODEL = AI_TASK_MODELS.disambiguation;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES

@@ -3,6 +3,7 @@
  * AI-powered step planning based on current state and policy
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import type {
@@ -338,7 +339,7 @@ export class ApiAgentPlannerService {
           temperature: 0.3,
           max_tokens: policy.level === 'light' ? 650 : 1000,
           response_format: { type: 'json_object' },
-          model: 'gpt-4o-mini', // Cost-effective for planning
+          model: AI_TASK_MODELS.apiAgentPlanning, // Centralized model config
         }
       );
 

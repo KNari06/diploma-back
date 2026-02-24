@@ -5,6 +5,7 @@
  */
 
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { PreviewAccessibilityNode } from '@/websocket/types/types';
 import { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
@@ -269,7 +270,7 @@ export async function evaluateAiCheck(input: AiCheckInput): Promise<AiCheckResul
     }
 
     // Choose model based on whether we have a screenshot
-    const model = input.screenshotBase64 ? 'gpt-4o' : 'gpt-4o-mini';
+    const model = input.screenshotBase64 ? AI_TASK_MODELS.aiCheckVision : AI_TASK_MODELS.aiCheck;
 
     // Call OpenAI
     logger.debug('[AI_CHECK] Calling OpenAI', { model, messageCount: messages.length });

@@ -1,4 +1,5 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { Locator, Page } from 'playwright';
 
@@ -220,7 +221,7 @@ export async function shouldPressEnterAfterFill(
         content: prompt,
       },
     ], {
-      model: 'gpt-4o-mini',
+      model: AI_TASK_MODELS.enterDetection,
       temperature: 0.2,
       max_tokens: 150,
     });

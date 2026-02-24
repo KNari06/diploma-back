@@ -12,6 +12,7 @@
  */
 
 import { env } from '@/config/environment/env';
+import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from './openai.service';
 import { generateTextWithGemini, getChatCompletionWithGemini } from './gemini.service';
@@ -78,7 +79,7 @@ function getDefaultModel(provider: AIProvider, task: AITask): string {
   if (provider === 'gemini') {
     return task === 'fast' ? 'gemini-1.5-flash-latest' : 'gemini-1.5-pro';
   } else {
-    return task === 'fast' ? 'gpt-4o-mini' : (env.OPENAI_MODEL || 'gpt-4o');
+    return task === 'fast' ? AI_MODELS.fast : AI_MODELS.smart;
   }
 }
 

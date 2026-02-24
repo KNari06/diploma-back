@@ -6,6 +6,7 @@
  * No tests are executed — pure DB analysis + LLM summary.
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { PatternsQueryService } from '@/services/kb/patterns-query.service';
@@ -16,7 +17,7 @@ import { logger } from '@/utils/core/logger';
 // CONSTANTS
 // ============================================================================
 
-const LLM_MODEL = 'gpt-4o-mini';
+const LLM_MODEL = AI_TASK_MODELS.coverageAnalysis;
 const LLM_TEMPERATURE = 0.3;
 const LLM_MAX_TOKENS = 1500;
 

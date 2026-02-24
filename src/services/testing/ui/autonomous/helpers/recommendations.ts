@@ -1,3 +1,4 @@
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { env } from '@/config/environment/env';
 import { DOMAnalysisResult } from '@/services/testing/ui/autonomous/dom-analyzer.service';
 import { logger } from '@/utils/core/logger';
@@ -509,7 +510,7 @@ async function detectPageTypeAI(
     };
 
     const response = await openai.chat.completions.create({
-      model: env.OPENAI_MODEL || 'gpt-4o-mini',
+      model: AI_TASK_MODELS.testRecommendation,
       temperature: 0.2, // Low temperature for consistency
       max_tokens: 400, // ✅ FIX 4: Increased from 200 to 400 for complex structures
       messages: [

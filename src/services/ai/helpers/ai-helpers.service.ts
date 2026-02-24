@@ -1,3 +1,4 @@
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { buildApprovalDetectionPrompt } from '@/ai/prompts/index';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
@@ -56,7 +57,7 @@ export async function detectUserApproval(
         content: prompt,
       },
     ], {
-      model: 'gpt-4o-mini', // Cost-effective AI for intent detection
+      model: AI_TASK_MODELS.helpers, // Cost-effective AI for intent detection
       temperature: 0.1, // Low temp for consistent results
       max_tokens: 100,
     });
@@ -187,7 +188,7 @@ Response:`;
     ], {
       temperature: 0,
       max_tokens: 100,
-      model: 'gpt-4o-mini', // Better AI, cheaper than gpt-3.5-turbo
+      model: AI_TASK_MODELS.helpers, // Centralized model config
     });
 
     const detectedPath = response.content.trim().replace(/['"]/g, '');
@@ -268,7 +269,7 @@ Return JSON:
       temperature: 0.2,
       max_tokens: 200,
       response_format: { type: 'json_object' },
-      model: 'gpt-4o-mini', // Better AI, cheaper than gpt-3.5-turbo
+      model: AI_TASK_MODELS.helpers, // Centralized model config
     });
 
     const result = JSON.parse(response.content);
@@ -354,7 +355,7 @@ Extracted answers (JSON only):`;
       temperature: 0,
       max_tokens: 300,
       response_format: { type: 'json_object' },
-      model: 'gpt-4o-mini', // Better AI, cheaper than gpt-3.5-turbo
+      model: AI_TASK_MODELS.helpers, // Centralized model config
     });
 
     const parsed = JSON.parse(response.content);
@@ -434,7 +435,7 @@ Which option should we click? Return ONLY the number (1-${navOptions.length}) or
     ], {
       temperature: 0,
       max_tokens: 10,
-      model: 'gpt-4o-mini',
+      model: AI_TASK_MODELS.helpers,
     });
 
     const choice = response.content.trim();
@@ -580,7 +581,7 @@ RETURN ONLY VALID JSON:
         content: prompt,
       },
     ], {
-      model: 'gpt-4o-mini',
+      model: AI_TASK_MODELS.helpers,
       temperature: 0.1, // Very low for consistent extraction
       max_tokens: 200,
     });

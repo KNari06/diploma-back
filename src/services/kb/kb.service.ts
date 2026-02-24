@@ -1,3 +1,4 @@
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { chunkMarkdown, chunkText } from '@/utils/text-processing/chunking';
@@ -358,7 +359,7 @@ RETURN ONLY: ru, en, or neutral`;
         },
       ],
       {
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.knowledgeBase,
         temperature: 0.1, // Very low for consistent results
         max_tokens: 10, // Just need 1-2 tokens
       }

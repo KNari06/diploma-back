@@ -5,6 +5,7 @@
  * Uses LLM classification (gpt-4o-mini) to suggest what to test next.
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { TestRecommendation, TestRecommendationType } from '@/types/testing.types';
@@ -14,7 +15,7 @@ import { logger } from '@/utils/core/logger';
 // CONSTANTS
 // ============================================================================
 
-const LLM_MODEL = 'gpt-4o-mini';
+const LLM_MODEL = AI_TASK_MODELS.testRecommendation;
 const LLM_TEMPERATURE = 0.3;
 const LLM_MAX_TOKENS = 1200;
 const MAX_RECOMMENDATIONS = 5;

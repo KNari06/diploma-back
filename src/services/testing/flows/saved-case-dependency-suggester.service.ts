@@ -7,6 +7,7 @@
  * Now operates on intent_test_cases (unified table) instead of saved_test_cases.
  */
 
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
@@ -75,7 +76,7 @@ const AUTH_PATH_KEYWORDS = [
 ];
 
 // --- LLM Configuration ---
-const LLM_MODEL = 'gpt-4o-mini';
+const LLM_MODEL = AI_TASK_MODELS.dependencySuggestion;
 const LLM_TEMPERATURE = 0.1;
 const LLM_MAX_TOKENS = 800;
 const MAX_LLM_CANDIDATES = 35;
