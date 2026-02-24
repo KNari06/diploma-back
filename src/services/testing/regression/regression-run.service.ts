@@ -428,7 +428,7 @@ export class RegressionRunService {
    */
   static async updateRunStatus(params: {
     runId: string;
-    status: 'completed' | 'failed' | 'cancelled';
+    status: 'passed' | 'completed' | 'failed' | 'cancelled';
     summary?: any;
   }): Promise<void> {
     const { runId, status, summary } = params;
@@ -557,12 +557,15 @@ export class RegressionRunService {
         : null;
       const bugsFound = run.summary?.bugs_count ?? run.summary?.bugsFound ?? 0;
 
+      // Normalize 'completed' → 'passed' for frontend compatibility
+      const normalizedStatus = run.status === 'completed' ? 'passed' : run.status;
+
       return {
         id: run.id,
         planId: run.plan_id || null,
         planName: (run.regression_plans as any)?.name || null,
         projectId: run.project_id,
-        status: run.status,
+        status: normalizedStatus,
         trigger: run.trigger,
         startedAt: run.started_at,
         completedAt: run.completed_at || null,
@@ -1596,7 +1599,7 @@ export class RegressionRunService {
     }
 
     // If only API tests exist, finalize run immediately
-    const finalStatus = apiFailed > 0 ? 'failed' : 'completed';
+    const finalStatus = apiFailed > 0 ? 'failed' : 'passed';
     await supabaseAdmin
       .from('regression_runs')
       .update({
@@ -1613,7 +1616,7 @@ export class RegressionRunService {
       .eq('id', runId);
 
     emitProgress(
-      finalStatus === 'completed' ? 'completed' : 'failed',
+      finalStatus === 'passed' ? 'completed' : 'failed',
       `Regression run ${finalStatus}: ${apiPassed} passed, ${apiFailed} failed, ${skippedCount} skipped`
     );
   }
@@ -2083,11 +2086,14 @@ export class RegressionRunService {
       durationMs = diff > 0 ? diff : 0;
     }
 
+    // Normalize 'completed' → 'passed' for frontend compatibility
+    const normalizedStatus = run.status === 'completed' ? 'passed' : run.status;
+
     return {
       id: run.id,
       planId: run.plan_id || null,
       planName,
-      status: run.status,
+      status: normalizedStatus,
       trigger: run.trigger,
       startedAt: run.started_at,
       completedAt: run.completed_at || null,

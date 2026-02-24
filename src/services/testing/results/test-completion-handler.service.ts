@@ -496,7 +496,7 @@ export class TestCompletionHandlerService {
    */
   private static async createRegressionRunNotification(
     run: any,
-    finalStatus: 'completed' | 'failed' | 'cancelled',
+    finalStatus: 'passed' | 'completed' | 'failed' | 'cancelled',
     summary: any
   ): Promise<void> {
     try {
@@ -537,7 +537,7 @@ export class TestCompletionHandlerService {
       let title = '';
       let message = '';
 
-      if (finalStatus === 'completed') {
+      if (finalStatus === 'passed' || finalStatus === 'completed') {
         const failedCount = summary.failed || 0;
         if (failedCount > 0) {
           title = `${triggerLabel} regression completed with failures`;
@@ -666,7 +666,7 @@ export class TestCompletionHandlerService {
           return;
         }
 
-        let finalStatus: 'completed' | 'failed' | 'cancelled' = 'completed';
+        let finalStatus: 'passed' | 'failed' | 'cancelled' = 'passed';
         if (statuses.some((s: string) => s === 'cancelled')) {
           finalStatus = 'cancelled';
         } else if (statuses.some((s: string) => s === 'failed')) {
@@ -724,11 +724,11 @@ export class TestCompletionHandlerService {
             webSocketService.emitRegressionRunProgress(run.user_id, {
               runId: run.id,
               userId: run.user_id,
-              status: finalStatus === 'completed' ? 'completed' : 'failed',
+              status: finalStatus === 'passed' ? 'completed' : 'failed',
               progress: 100,
-              message: finalStatus === 'completed'
+              message: finalStatus === 'passed'
                 ? `Run completed: ${summary.passed} passed, ${summary.failed} failed`
-                : `Run failed: ${summary.passed} passed, ${summary.failed} failed`,
+                : `Run ${finalStatus}: ${summary.passed} passed, ${summary.failed} failed`,
               errorCode: summary.creditExhausted ? 'INSUFFICIENT_CREDITS' : undefined,
               details: {
                 totalTests: summary.total,
@@ -800,7 +800,7 @@ export class TestCompletionHandlerService {
       }
 
       // All tests are complete - compute final status
-      let finalStatus: 'completed' | 'failed' | 'cancelled' = 'completed';
+      let finalStatus: 'passed' | 'failed' | 'cancelled' = 'passed';
 
       if (statuses.some(s => s === 'cancelled')) {
         finalStatus = 'cancelled';
@@ -858,11 +858,11 @@ export class TestCompletionHandlerService {
           webSocketService.emitRegressionRunProgress(run.user_id, {
             runId: run.id,
             userId: run.user_id,
-            status: finalStatus === 'completed' ? 'completed' : 'failed',
+            status: finalStatus === 'passed' ? 'completed' : 'failed',
             progress: 100,
-            message: finalStatus === 'completed'
+            message: finalStatus === 'passed'
               ? `Run completed: ${passed} passed, ${failed} failed`
-              : `Run failed: ${passed} passed, ${failed} failed`,
+              : `Run ${finalStatus}: ${passed} passed, ${failed} failed`,
             details: {
               totalTests: tests.length,
               completedTests: tests.length,
