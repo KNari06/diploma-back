@@ -3,7 +3,7 @@
  * Used by /api/v1/test-visualization/project/:projectId/overall
  */
 
-export type EntityType = 'test_run' | 'saved_case' | 'module';
+export type EntityType = 'test_run' | 'test_case' | 'saved_case' | 'module';
 
 export type StatusFlag = 'success' | 'failed' | 'danger' | 'cancelled';
 
@@ -30,6 +30,17 @@ export interface OverallNode {
     hasFindings?: boolean;
     findingsSeverity?: 'critical' | 'high' | 'medium' | 'low';
     fingerprint?: CommandFingerprint;
+    // Aggregation fields (present when runs are grouped into test cases)
+    runCount?: number;
+    passRate?: number; // 0-1 ratio
+    runHistory?: Array<{
+      testId: string;
+      status: string;
+      runAt: string;
+    }>;
+    avgDurationMs?: number;
+    intentTestCaseId?: string;
+    groupKey?: string;
   };
 }
 
@@ -78,8 +89,20 @@ export interface ProjectOverallData {
   metadata: {
     projectId: string;
     totalTests: number;
+    uniqueTestCases: number;
     totalSavedCases: number;
     totalModules: number;
     generatedAt: string;
   };
+}
+
+/**
+ * Internal grouping structure for aggregating test runs into test cases
+ */
+export interface TestCaseGroup {
+  groupKey: string;
+  groupType: 'regression' | 'fingerprint';
+  intentTestCaseId?: string;
+  tests: any[];
+  representative: any;
 }
