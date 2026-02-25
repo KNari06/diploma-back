@@ -39,6 +39,7 @@ export interface SummaryData {
   };
   performance: {
     avgRunTimeMs: number;
+    avgRunTimeFormatted: string;
     failureRate: number;
     runsPerMinute: number;
   };
