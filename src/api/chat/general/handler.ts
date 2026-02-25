@@ -13,6 +13,8 @@ import { logger } from '@/utils/core/logger';
 import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
 import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
+import type { ChatCompletionMessageParam, ChatCompletionContentPart } from 'openai/resources/chat/completions';
+import type { ChatAttachment } from '../chat.types';
 import { CONSTANTS, PROGRESS } from '../shared/constants';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { compressMessageContent, deductChatCredits, emitProcessingStep } from '../shared/utils';
@@ -38,9 +40,10 @@ export async function handleGeneralChat(
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode
+    attachments?: ChatAttachment[]; // File attachments (images + documents)
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context: rawContext, abortSignal, logger: functionLogger, mode } = params;
+  const { message, userId, chatSessionId, context: rawContext, abortSignal, logger: functionLogger, mode, attachments } = params;
 
   // Normalize context: parse JSON string into object if needed (frontend may send stringified JSON)
   let context: any = rawContext;
@@ -399,7 +402,7 @@ If the user asks to test something on the current page, prefer platform_test int
     ? `${systemPrompt}\n--- Previous Conversation Context ---\n${oldContextSummary}\n\nNote: The above is a summary of earlier messages. Recent messages follow below.`
     : systemPrompt;
 
-  const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+  const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: enhancedSystemPrompt },
   ];
 
@@ -447,8 +450,33 @@ If the user asks to test something on the current page, prefer platform_test int
   // Add conversation history
   messages.push(...conversationHistory);
 
-  // Add current message
-  messages.push({ role: 'user', content: message });
+  // Add current message (with multimodal content if attachments present)
+  const hasAttachments = attachments && attachments.length > 0;
+  if (hasAttachments) {
+    // Build content array with text + images
+    const contentParts: ChatCompletionContentPart[] = [];
+
+    // Text part: original message + appended document contents
+    let textContent = message;
+    for (const doc of attachments.filter(f => f.type === 'document' && f.extractedText)) {
+      const ext = doc.name.split('.').pop()?.toLowerCase() || '';
+      const langHint = ext === 'json' ? 'json' : ext === 'md' ? 'markdown' : '';
+      textContent += `\n\nAttached file "${doc.name}":\n\`\`\`${langHint}\n${doc.extractedText}\n\`\`\``;
+    }
+    contentParts.push({ type: 'text', text: textContent });
+
+    // Image parts (only include if base64 data is present)
+    for (const img of attachments.filter(f => f.type === 'image' && f.base64)) {
+      contentParts.push({
+        type: 'image_url',
+        image_url: { url: img.base64!, detail: 'high' },
+      });
+    }
+
+    messages.push({ role: 'user', content: contentParts });
+  } else {
+    messages.push({ role: 'user', content: message });
+  }
 
   logger.info('[GENERAL_CHAT] Built context for AI', {
     totalMessages: messages.length,
@@ -458,6 +486,10 @@ If the user asks to test something on the current page, prefer platform_test int
     hasEditorContext: !!editorPageContext,
     isEditorMode: mode === 'editor',
     recentHistoryCount: conversationHistory.length,
+    attachments: hasAttachments ? {
+      images: attachments.filter(a => a.type === 'image').length,
+      documents: attachments.filter(a => a.type === 'document').length,
+    } : undefined,
   });
 
   // NOTE: Credit check removed here — already performed in chat.controller.ts
@@ -502,8 +534,13 @@ If the user asks to test something on the current page, prefer platform_test int
             projectId,
           });
 
+          // Extract the user content from the last message (may be multimodal array with images)
+          const lastMsg = messages[messages.length - 1];
+          const userContent = lastMsg?.role === 'user' ? lastMsg.content : undefined;
+
           const pipelineResult = await pipeline.execute({
             userMessage: message,
+            userContent: userContent ?? message,
             messages,
             availableTools,
             skillDescriptions,
@@ -828,8 +865,14 @@ If the user asks to test something on the current page, prefer platform_test int
     const saveChatMessagesWithLogging = functionLogger
       ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
       : ChatService.saveChatMessages.bind(ChatService);
+
+    // Build user message metadata (include file info if attachments present)
+    const userMessageMetadata = hasAttachments
+      ? { files: attachments.map(f => ({ name: f.name, type: f.type, mimeType: f.mimeType, size: f.size })) }
+      : undefined;
+
     const timestamps = await saveChatMessagesWithLogging(chatSessionId, [
-      { role: 'user', content: message },
+      { role: 'user', content: message, metadata: userMessageMetadata },
       { role: 'ai', content: gptResponse.content },
     ]);
 

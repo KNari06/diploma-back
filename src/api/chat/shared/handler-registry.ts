@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import type { ChatAttachment } from '../chat.types';
 import { handlePlatformTest as handlePlatformTestOriginal } from '../ai_test/handler';
 import { handleApiTest as handleApiTestOriginal } from '../api_test/handler';
 import { handleGeneralChat as handleGeneralChatOriginal } from '../general/handler';
@@ -47,6 +48,7 @@ export type IntentHandler = (
     context?: any;
     abortSignal?: AbortSignal;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
+    attachments?: ChatAttachment[]; // File attachments (images + documents)
   }
 ) => Promise<void>;
 
@@ -107,6 +109,7 @@ const handleGeneralChat: IntentHandler = async (req, res, params) => {
     userLanguage: params.parsedIntent?.userLanguage,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    attachments: params.attachments,
   });
 };
 

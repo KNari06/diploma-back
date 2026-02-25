@@ -1,5 +1,16 @@
 import { IntentResult } from '@/types';
 
+export interface ChatAttachment {
+  type: 'image' | 'document';
+  name: string;
+  mimeType: string;
+  size: number;
+  /** For images: base64 data URL (e.g. "data:image/png;base64,...") */
+  base64?: string;
+  /** For documents: extracted text content */
+  extractedText?: string;
+}
+
 export interface ApiTestContext {
   method?: string;
   url?: string;

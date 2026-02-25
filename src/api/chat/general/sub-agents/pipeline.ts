@@ -74,7 +74,16 @@ export class SubAgentPipeline {
       const routerStart = Date.now();
       const recentMessages = input.messages
         .filter(m => m.role === 'user' || m.role === 'assistant')
-        .slice(-6) as Array<{ role: string; content: string }>;
+        .slice(-6)
+        .map(m => ({
+          role: m.role as string,
+          // Extract text from multimodal content arrays (e.g. when images are attached)
+          content: typeof m.content === 'string'
+            ? m.content
+            : Array.isArray(m.content)
+              ? (m.content.find((p: any) => p.type === 'text') as any)?.text ?? ''
+              : String(m.content ?? ''),
+        })) as Array<{ role: string; content: string }>;
 
       const routerResult = await classifyRequest(
         input.userMessage,
@@ -131,7 +140,8 @@ export class SubAgentPipeline {
             input.userMessage,
             contextMessages,
             input.skillDescriptions,
-            input.abortSignal
+            input.abortSignal,
+            input.userContent
           );
           metrics.responderMs = Date.now() - responderStart;
           metrics.totalMs = Date.now() - pipelineStart;
@@ -189,7 +199,8 @@ export class SubAgentPipeline {
           filteredTools,
           this.context,
           undefined,
-          input.abortSignal
+          input.abortSignal,
+          input.userContent
         );
         metrics.executorMs = Date.now() - executorStart;
         metrics.toolRounds = executorResult.toolRounds;
@@ -267,7 +278,8 @@ export class SubAgentPipeline {
         filteredTools,
         this.context,
         planText,
-        input.abortSignal
+        input.abortSignal,
+        input.userContent
       );
       metrics.executorMs = Date.now() - executorStart;
       metrics.toolRounds = executorResult.toolRounds;

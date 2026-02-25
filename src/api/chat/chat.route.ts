@@ -2,6 +2,7 @@ import { requireAuth } from '@/middleware/auth.middleware';
 import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
 import { logger } from '@/utils/core/logger';
 import { Request, Response, Router } from 'express';
+import multer from 'multer';
 import { z } from 'zod';
 import {
   clearWorkspaceChat,
@@ -15,9 +16,44 @@ import { debugChatData, getChatHistory, getCurrentChatHistory, handleChat } from
 
 const router = Router();
 
+// ============================================================================
+// MULTER CONFIGURATION FOR CHAT FILE UPLOADS
+// ============================================================================
+
+const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+const ALLOWED_DOCUMENT_MIMES = [
+  'text/plain',
+  'application/json',
+  'text/markdown',
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+];
+const ALLOWED_MIMES = [...ALLOWED_IMAGE_MIMES, ...ALLOWED_DOCUMENT_MIMES];
+
+const chatFileFilter = (
+  _req: any,
+  file: Express.Multer.File,
+  cb: multer.FileFilterCallback
+) => {
+  if (ALLOWED_MIMES.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error(`File type "${file.mimetype}" is not allowed. Allowed: images (JPEG, PNG, GIF, WebP) and documents (TXT, JSON, MD, PDF, DOCX).`));
+  }
+};
+
+const chatUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 20 * 1024 * 1024, // 20MB max per file
+    files: 5, // max 5 files per message
+  },
+  fileFilter: chatFileFilter,
+});
+
 // Validation schema for chat request
 const chatRequestSchema = z.object({
-  message: z.string().min(1, 'Message cannot be empty').max(5000, 'Message too long'),
+  message: z.string().max(5000, 'Message too long'), // min(0): files-only messages allowed
   context: z.union([z.string(), z.record(z.any())]).optional(),
   sessionId: z.string().optional(),
   conversationId: z.string().optional(),
@@ -208,14 +244,39 @@ const chatRequestSchema = z.object({
  */
 router.post('/',
   requireAuth,
+  chatUpload.array('files', 5),
   asyncHandler(async (req: Request, res: Response) => {
   try {
+    // When sent as multipart/form-data, JSON fields may arrive as strings — parse them
+    if (typeof req.body.context === 'string' && req.body.context.startsWith('{')) {
+      try { req.body.context = JSON.parse(req.body.context); } catch { /* keep as string */ }
+    }
+    if (typeof req.body.answers === 'string' && req.body.answers.startsWith('{')) {
+      try { req.body.answers = JSON.parse(req.body.answers); } catch { /* keep as string */ }
+    }
+
     // Validate request body (validation happens via schema.parse)
     chatRequestSchema.parse(req.body);
 
     // User ID comes from auth middleware (req.user)
     await handleChat(req, res);
   } catch (error) {
+    // Handle multer errors with friendly messages
+    if (error instanceof multer.MulterError) {
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        res.status(400).json({ success: false, error: 'File too large. Maximum file size is 20MB.' });
+        return;
+      }
+      if (error.code === 'LIMIT_FILE_COUNT') {
+        res.status(400).json({ success: false, error: 'Too many files. Maximum 5 files per message.' });
+        return;
+      }
+    }
+    // fileFilter throws plain Error (not MulterError) for disallowed file types
+    if (error instanceof Error && error.message.includes('File type')) {
+      res.status(400).json({ success: false, error: error.message });
+      return;
+    }
     handleValidationError(error);
   }
   })

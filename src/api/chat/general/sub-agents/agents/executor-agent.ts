@@ -73,7 +73,8 @@ export async function executeTools(
   filteredTools: ChatCompletionTool[],
   context: PipelineContext,
   plan?: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  userContent?: string | ChatCompletionMessageParam['content']
 ): Promise<ExecutorResult> {
   const startMs = Date.now();
   const toolResults: ToolExecutionRecord[] = [];
@@ -85,7 +86,8 @@ export async function executeTools(
     { role: 'system', content: executorPrompt },
     // Include relevant context messages (system prompts with memory/KB/history)
     ...contextMessages,
-    { role: 'user', content: userMessage },
+    // Use multimodal content if available (includes images), otherwise plain text
+    { role: 'user', content: (userContent ?? userMessage) as any },
   ];
 
   let toolRound = 0;

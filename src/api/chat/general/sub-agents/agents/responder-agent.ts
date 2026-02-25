@@ -102,14 +102,16 @@ export async function generateSimpleResponse(
   userMessage: string,
   contextMessages: ChatCompletionMessageParam[],
   skillDescriptions: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  userContent?: string | ChatCompletionMessageParam['content']
 ): Promise<ResponderResult> {
   const startMs = Date.now();
 
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: buildSimpleChatPrompt(skillDescriptions) },
     ...contextMessages,
-    { role: 'user', content: userMessage },
+    // Use multimodal content if available (includes images), otherwise plain text
+    { role: 'user', content: (userContent ?? userMessage) as any },
   ];
 
   try {
