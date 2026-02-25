@@ -45,7 +45,7 @@ stages:
 .gcp_auth: &gcp_auth
   id_tokens:
     GCP_JWT:
-      aud: "${CI_SERVER_URL}"
+      aud: "//iam.googleapis.com/${GCP_WIF_PROVIDER}"
   before_script:
     - |
       RAW_WIF_PROVIDER="${GCP_WIF_PROVIDER}"
