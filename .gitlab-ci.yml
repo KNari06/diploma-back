@@ -12,9 +12,12 @@
 #
 # CI/CD Variables (Settings → CI/CD → Variables):
 #   GCP_PROJECT_ID      — qait-dev
+#   GCP_PROJECT_NUMBER  — 728473466858
 #   GCP_REGION          — us-central1
 #   GCP_RUNNER_SA_EMAIL — SA email из: terraform output gitlab_runner_sa_email
 #   GCP_WIF_PROVIDER    — Provider из:  terraform output wif_provider_name
+#   WIF_POOL_ID         — gitlab-pool-prod2 (optional fallback)
+#   WIF_PROVIDER_ID     — gitlab-provider-prod2 (optional fallback)
 #   CLOUD_RUN_API       — qai-api-prod
 #   CLOUD_RUN_WORKER    — qai-worker-prod
 # ─────────────────────────────────────────────────────────────────
@@ -46,6 +49,19 @@ stages:
   before_script:
     - |
       RAW_WIF_PROVIDER="${GCP_WIF_PROVIDER}"
+      if [ -z "${RAW_WIF_PROVIDER}" ]; then
+        if [ -n "${GCP_PROJECT_NUMBER}" ] && [ -n "${WIF_POOL_ID}" ] && [ -n "${WIF_PROVIDER_ID}" ]; then
+          RAW_WIF_PROVIDER="projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+          echo "ℹ️ GCP_WIF_PROVIDER is empty, using fallback from GCP_PROJECT_NUMBER/WIF_POOL_ID/WIF_PROVIDER_ID"
+        else
+          echo "❌ GCP_WIF_PROVIDER is empty."
+          echo "Set one of the following in GitLab CI/CD Variables:"
+          echo "  1) GCP_WIF_PROVIDER = \$(terraform -chdir=gcp/terraform output -raw wif_provider_name)"
+          echo "  2) GCP_PROJECT_NUMBER + WIF_POOL_ID + WIF_PROVIDER_ID"
+          exit 1
+        fi
+      fi
+
       case "${RAW_WIF_PROVIDER}" in
         projects/*)
           WIF_PROVIDER="${RAW_WIF_PROVIDER}"
