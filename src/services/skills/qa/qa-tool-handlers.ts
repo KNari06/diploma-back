@@ -554,16 +554,36 @@ export async function handleGetAnalyticsSummary(
   }
 
   try {
-    const sinceDate = new Date();
-    sinceDate.setDate(sinceDate.getDate() - days);
+    // Support custom date range OR days lookback
+    let sinceDate: Date;
+    let untilDate: Date | undefined;
+
+    if (args.start_date) {
+      sinceDate = new Date(args.start_date);
+      if (isNaN(sinceDate.getTime())) {
+        return { success: false, message: 'Invalid start_date format. Use ISO 8601 (e.g. 2025-01-01)', displayToUser: false };
+      }
+      if (args.end_date) {
+        untilDate = new Date(args.end_date);
+        if (isNaN(untilDate.getTime())) {
+          return { success: false, message: 'Invalid end_date format. Use ISO 8601 (e.g. 2025-01-31)', displayToUser: false };
+        }
+      }
+    } else {
+      sinceDate = new Date();
+      sinceDate.setDate(sinceDate.getDate() - days);
+    }
 
     // Get runs for the period
-    const { data: runs, error: runsError } = await supabaseAdmin
+    let runsQuery = supabaseAdmin
       .from('regression_runs')
       .select('id, status, started_at, completed_at')
       .eq('project_id', projectId)
-      .gte('started_at', sinceDate.toISOString())
-      .order('started_at', { ascending: false });
+      .gte('started_at', sinceDate.toISOString());
+    if (untilDate) {
+      runsQuery = runsQuery.lte('started_at', untilDate.toISOString());
+    }
+    const { data: runs, error: runsError } = await runsQuery.order('started_at', { ascending: false });
 
     if (runsError) {
       logger.error('[QA_TOOL] Failed to get runs for analytics', { error: runsError.message });
@@ -1860,6 +1880,304 @@ export async function handleListElementInteractions(
     return {
       success: false,
       message: `Failed to list element interactions: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ANALYTICS DEEP-DIVE TOOLS (direct Supabase queries, no REST API)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * qa_get_results_overview — Donut chart: passed/failed/skipped/flaky counts + API tests
+ */
+export async function handleGetResultsOverview(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const days = Math.min(args.days || 30, 90);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - days);
+
+    // Get runs for the period
+    const { data: runs, error: runsError } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id')
+      .eq('project_id', projectId)
+      .gte('started_at', sinceDate.toISOString());
+
+    if (runsError) {
+      logger.error('[QA_TOOL] Failed to get runs for results overview', { error: runsError.message });
+      return { success: false, message: `Database error: ${runsError.message}`, displayToUser: false };
+    }
+
+    const runIds = (runs || []).map((r) => r.id);
+
+    // Parallel: executions (batched to avoid URL length limits) + API tests
+    const batchSize = 100;
+    const execsPromise = (async () => {
+      if (runIds.length === 0) return [];
+      const allExecs: any[] = [];
+      for (let i = 0; i < runIds.length; i += batchSize) {
+        const batch = runIds.slice(i, i + batchSize);
+        const { data } = await supabaseAdmin
+          .from('test_executions')
+          .select('status, run_id, test_case_id')
+          .in('run_id', batch);
+        if (data) allExecs.push(...data);
+      }
+      return allExecs;
+    })();
+
+    const [execs, apiResult] = await Promise.all([
+      execsPromise,
+      supabaseAdmin
+        .from('api_test_executions')
+        .select('success')
+        .eq('project_id', projectId)
+        .gte('executed_at', sinceDate.toISOString()),
+    ]);
+
+    const passed = execs.filter((e: any) => e.status === 'passed').length;
+    const failed = execs.filter((e: any) => e.status === 'failed').length;
+    const skipped = execs.filter((e: any) => e.status === 'skipped').length;
+    const total = execs.length;
+
+    // Flaky detection
+    const groups = new Map<string, Set<string>>();
+    for (const exec of execs) {
+      const key = `${(exec as any).run_id}:${(exec as any).test_case_id}`;
+      if (!groups.has(key)) groups.set(key, new Set());
+      groups.get(key)!.add((exec as any).status);
+    }
+    let flaky = 0;
+    for (const statuses of groups.values()) {
+      if (statuses.has('passed') && statuses.has('failed')) flaky++;
+    }
+
+    const pct = (n: number) => (total > 0 ? Math.round((n / total) * 1000) / 10 : 0);
+
+    // API tests
+    const apiExecs = apiResult.data || [];
+    const apiTotal = apiExecs.length;
+    const apiPassed = apiExecs.filter((e: any) => e.success === true).length;
+    const apiFailed = apiExecs.filter((e: any) => e.success === false).length;
+
+    return {
+      success: true,
+      data: {
+        passed,
+        failed,
+        skipped,
+        flaky,
+        total,
+        percentages: { passed: pct(passed), failed: pct(failed), skipped: pct(skipped), flaky: pct(flaky) },
+        ...(apiTotal > 0 ? { apiTests: { total: apiTotal, passed: apiPassed, failed: apiFailed } } : {}),
+        periodDays: days,
+      },
+      message: `Results overview (${days}d): ${total} total — ${passed} passed (${pct(passed)}%), ${failed} failed (${pct(failed)}%), ${skipped} skipped, ${flaky} flaky`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetResultsOverview error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get results overview: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_heatmap — Daily activity heatmap (runs/failures/flaky) with intensity levels
+ */
+export async function handleGetHeatmap(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const metric = (['runs', 'failures', 'flaky'].includes(args.metric) ? args.metric : 'runs') as 'runs' | 'failures' | 'flaky';
+  const range = (['30d', '90d', '365d'].includes(args.range) ? args.range : '30d') as '30d' | '90d' | '365d';
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const result = await AnalyticsQueryService.getHeatmap(context.workspaceId, metric, range, projectId);
+
+    // Summarize for LLM — don't send hundreds of day-entries, send a compact summary
+    const activeDays = result.days.filter((d) => d.count > 0);
+    const topDays = [...activeDays].sort((a, b) => b.count - a.count).slice(0, 10);
+
+    return {
+      success: true,
+      data: {
+        metric,
+        range,
+        totalCount: result.totalCount,
+        maxCount: result.maxCount,
+        activeDays: activeDays.length,
+        totalDays: result.days.length,
+        busiestDays: topDays.map((d) => ({ date: d.date, count: d.count, level: d.level })),
+      },
+      message: `Heatmap (${metric}, ${range}): ${result.totalCount} total across ${activeDays.length} active days, peak ${result.maxCount} in a single day`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetHeatmap error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get heatmap: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_time_series — Bucketed run counts over time (1m/5m/15m/1h/1d intervals)
+ */
+export async function handleGetTimeSeries(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const interval = (['1m', '5m', '15m', '1h', '1d'].includes(args.interval) ? args.interval : '1h') as '1m' | '5m' | '15m' | '1h' | '1d';
+  const hours = Math.min(args.hours || 24, 720); // default 24h, max 30 days
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const endDate = new Date();
+    const startDate = new Date(endDate.getTime() - hours * 3600000);
+
+    const result = await AnalyticsQueryService.getTimeSeries({
+      workspaceId: context.workspaceId,
+      projectId,
+      startDate,
+      endDate,
+      interval,
+    });
+
+    // Compute totals from ALL non-zero points before truncation
+    const nonZeroPoints = result.points.filter((p) => p.totalRuns > 0);
+    const totalRuns = nonZeroPoints.reduce((s, p) => s + p.totalRuns, 0);
+    const totalPassed = nonZeroPoints.reduce((s, p) => s + p.passedRuns, 0);
+    const totalFailed = nonZeroPoints.reduce((s, p) => s + p.failedRuns, 0);
+
+    // Compact for LLM: keep only last 50 non-zero points to save tokens
+    const points = nonZeroPoints.length > 50 ? nonZeroPoints.slice(-50) : nonZeroPoints;
+
+    return {
+      success: true,
+      data: {
+        interval,
+        hours,
+        points,
+        summary: { totalRuns, totalPassed, totalFailed, dataPoints: points.length },
+      },
+      message: `Time series (${interval}, ${hours}h): ${totalRuns} runs — ${totalPassed} passed, ${totalFailed} failed across ${points.length} data points`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetTimeSeries error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get time series: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_full_dashboard — Composite: summary + results overview + recent failures in ONE call
+ * Saves agent from making 3-4 separate tool calls for dashboard questions.
+ */
+export async function handleGetFullDashboard(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+  const days = Math.min(args.days || 30, 90);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  try {
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - days);
+
+    const filters = {
+      workspaceId: context.workspaceId,
+      projectId,
+      startDate: sinceDate,
+      endDate: new Date(),
+    };
+
+    // Run all queries in parallel
+    const [summary, resultsOverview, recentFailures, criticalChecks] = await Promise.all([
+      AnalyticsQueryService.getSummary(filters),
+      AnalyticsQueryService.getResultsOverview(filters),
+      AnalyticsQueryService.getRecentFailures(context.workspaceId, projectId, 5),
+      AnalyticsQueryService.getCriticalChecks(context.workspaceId, projectId),
+    ]);
+
+    return {
+      success: true,
+      data: {
+        summary: summary.summary,
+        status: summary.status,
+        performance: summary.performance,
+        resultsOverview: {
+          passed: resultsOverview.passed,
+          failed: resultsOverview.failed,
+          skipped: resultsOverview.skipped,
+          flaky: resultsOverview.flaky,
+          total: resultsOverview.total,
+          percentages: resultsOverview.percentages,
+          ...(resultsOverview.apiTests ? { apiTests: resultsOverview.apiTests } : {}),
+        },
+        recentFailures: recentFailures.failures.map((f) => ({
+          testCaseName: f.testCaseName,
+          severity: f.severity,
+          errorMessage: f.errorMessage?.substring(0, 200) || null,
+          timeAgo: f.timeAgo,
+          source: f.source,
+        })),
+        criticalChecks: criticalChecks.checks.map((c) => ({
+          name: c.name,
+          status: c.status,
+          lastRunAt: c.lastRunAt,
+        })),
+        periodDays: days,
+      },
+      message: `Dashboard (${days}d): ${summary.summary.totalRuns} runs, ${summary.summary.passRate}% pass rate, ${summary.status.state} status, ${recentFailures.failures.length} recent failures, ${criticalChecks.checks.length} critical checks`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetFullDashboard error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get dashboard: ${error instanceof Error ? error.message : String(error)}`,
       displayToUser: false,
     };
   }

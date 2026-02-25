@@ -27,6 +27,11 @@ import {
   handleListDeployments,
   handleListJiraIssues,
   handleListElementInteractions,
+  // Analytics deep-dive tools
+  handleGetResultsOverview,
+  handleGetHeatmap,
+  handleGetTimeSeries,
+  handleGetFullDashboard,
   handleUpdateTestCaseSteps,
   // Write tools — Tier 1
   handleUpdateTestCase,
@@ -215,7 +220,15 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           days: {
             type: 'number',
-            description: 'Look back N days (default 30, max 90)',
+            description: 'Look back N days (default 30, max 90). Ignored if start_date is provided.',
+          },
+          start_date: {
+            type: 'string',
+            description: 'Custom start date in ISO 8601 format (e.g. 2025-01-01). Overrides days param.',
+          },
+          end_date: {
+            type: 'string',
+            description: 'Custom end date in ISO 8601 format (e.g. 2025-01-31). Optional, defaults to now.',
           },
         },
         required: ['project_id'],
@@ -619,6 +632,110 @@ const QA_TOOLS: ChatCompletionTool[] = [
           limit: {
             type: 'number',
             description: 'Max results (default 20, max 50)',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // ANALYTICS DEEP-DIVE tools
+  // ═══════════════════════════════════════════════════════════════
+
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_results_overview',
+      description:
+        'Test results breakdown: passed/failed/skipped/flaky counts with percentages and API test breakdown. Use for donut-chart-style questions about test distribution.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to get results overview for',
+          },
+          days: {
+            type: 'number',
+            description: 'Look back N days (default 30, max 90)',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_heatmap',
+      description:
+        'Activity heatmap: daily counts of runs, failures, or flaky tests over 30/90/365 days. Shows busiest days and activity trends. Use for questions like "when do we test most?", "which days have most failures?".',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to get heatmap for',
+          },
+          metric: {
+            type: 'string',
+            enum: ['runs', 'failures', 'flaky'],
+            description: 'What to measure: test runs, failures, or flaky tests (default: runs)',
+          },
+          range: {
+            type: 'string',
+            enum: ['30d', '90d', '365d'],
+            description: 'Time range (default: 30d)',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_time_series',
+      description:
+        'Time series of test runs: bucketed counts with passed/failed breakdown over time. Use for trend analysis, "how are tests performing today/this week?", or graphing run activity.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to get time series for',
+          },
+          interval: {
+            type: 'string',
+            enum: ['1m', '5m', '15m', '1h', '1d'],
+            description: 'Bucket interval (default: 1h)',
+          },
+          hours: {
+            type: 'number',
+            description: 'Look back N hours (default 24, max 720 = 30 days)',
+          },
+        },
+        required: ['project_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_full_dashboard',
+      description:
+        'All-in-one dashboard snapshot: summary stats + results overview + performance metrics + recent failures + critical checks. Use when user asks about overall project health, full analytics, or dashboard overview. Saves multiple separate calls.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID to get dashboard for',
+          },
+          days: {
+            type: 'number',
+            description: 'Look back N days (default 30, max 90)',
           },
         },
         required: ['project_id'],
@@ -1188,7 +1305,7 @@ export const QASkill: SkillDefinition = {
   name: 'QA Tools',
   provider: 'qa',
   description:
-    'Query and manage test cases, executions, regression plans, analytics, API test configs/history, coverage reports, failure analysis, recommendations, fixtures, deployments, Jira issues, element interactions, AI usage, and more. 26 read-only tools + 11 write tools (create/update/delete test cases, run tests, manage plans/schedules/modules/flows/fixtures, bulk tagging) for comprehensive QA data access and management.',
+    'Query and manage test cases, executions, regression plans, analytics, API test configs/history, coverage reports, failure analysis, recommendations, fixtures, deployments, Jira issues, element interactions, AI usage, heatmaps, time series, and full dashboard snapshots. 30 read-only tools + 11 write tools for comprehensive QA data access and management.',
   tools: QA_TOOLS,
 
   /**
@@ -1294,6 +1411,19 @@ export const QASkill: SkillDefinition = {
 
         case 'qa_list_element_interactions':
           return await handleListElementInteractions(args, context);
+
+        // Analytics deep-dive tools
+        case 'qa_get_results_overview':
+          return await handleGetResultsOverview(args, context);
+
+        case 'qa_get_heatmap':
+          return await handleGetHeatmap(args, context);
+
+        case 'qa_get_time_series':
+          return await handleGetTimeSeries(args, context);
+
+        case 'qa_get_full_dashboard':
+          return await handleGetFullDashboard(args, context);
 
         // Write tools
         case 'qa_update_test_case_steps':
