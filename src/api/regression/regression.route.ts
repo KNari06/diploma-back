@@ -1,12 +1,15 @@
 import { requireAuth } from '@/middleware/auth.middleware';
+import { sharedReportRateLimiter } from '@/middleware/rate-limiter.middleware';
 import { Router } from 'express';
 import {
   cancelRun,
+  createShareLink,
   getExecutionDetail,
   getPlanHealth,
   getRunExecutions,
   getRunReport,
   getRunStats,
+  getSharedReport,
   getTestCaseCommands,
   listRuns,
   listSavedTestCases,
@@ -495,5 +498,50 @@ router.get('/plans/:planId/health', requireAuth, getPlanHealth);
  *         description: Run or execution not found
  */
 router.get('/runs/:runId/executions/:executionId/detail', requireAuth, getExecutionDetail);
+
+/**
+ * @swagger
+ * /api/v1/regression/runs/{runId}/share:
+ *   post:
+ *     summary: Generate a public share link for a run
+ *     description: Creates (or reuses) a share token so the run report can be viewed without authentication
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: runId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Share link created
+ *       404:
+ *         description: Run not found
+ */
+router.post('/runs/:runId/share', requireAuth, createShareLink);
+
+/**
+ * @swagger
+ * /api/v1/regression/shared/{shareToken}:
+ *   get:
+ *     summary: View a shared regression run report (public, no auth)
+ *     description: Returns the full run report for a publicly shared link
+ *     tags: [Regression]
+ *     parameters:
+ *       - in: path
+ *         name: shareToken
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Shared run report
+ *       404:
+ *         description: Shared report not found
+ */
+router.get('/shared/:shareToken', sharedReportRateLimiter, getSharedReport);
 
 export default router;

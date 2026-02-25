@@ -422,12 +422,12 @@ export class TestCompletionHandlerService {
       const [directResult, batchResult, execResult] = await Promise.all([
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, started_at')
           .eq('test_id', testId)
           .in('status', ['running', 'pending']),
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, started_at')
           .filter('test_ids', 'cs', `["${testId}"]`)
           .in('status', ['running', 'pending']),
         // Fallback: find via test_executions table (most reliable for plan runs)
@@ -448,7 +448,7 @@ export class TestCompletionHandlerService {
       if (execRunId && !runMap.has(execRunId)) {
         const { data: execRun } = await supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, started_at')
           .eq('id', execRunId)
           .in('status', ['running', 'pending'])
           .maybeSingle();
@@ -646,7 +646,7 @@ export class TestCompletionHandlerService {
       // Prefer unified executions if present (covers UI + API and avoids relying only on tests table)
       const { data: unifiedExecutions, error: execError } = await supabaseAdmin
         .from('test_executions')
-        .select('status, error_message')
+        .select('id, status, error_message, created_at')
         .eq('run_id', run.id);
 
       if (execError) {
@@ -655,15 +655,44 @@ export class TestCompletionHandlerService {
           runId: run.id,
         });
       } else if (unifiedExecutions && unifiedExecutions.length > 0) {
-        const statuses = unifiedExecutions.map((e: any) => e.status);
+        let statuses = unifiedExecutions.map((e: any) => e.status);
 
-        const hasRunning = statuses.some((s: string) => s === 'running' || s === 'pending');
-        if (hasRunning) {
-          logger.debug('[TEST_COMPLETION] Run still has running executions', {
-            runId: run.id,
-            runningCount: statuses.filter((s: string) => s === 'running' || s === 'pending').length,
-          });
-          return;
+        const stuckExecs = unifiedExecutions.filter(
+          (e: any) => (e.status === 'running' || e.status === 'pending')
+        );
+
+        if (stuckExecs.length > 0) {
+          // Check if stuck executions are older than 30 minutes — force-fail them
+          const thirtyMinutesAgo = Date.now() - 30 * 60 * 1000;
+          const runStarted = run.started_at ? new Date(run.started_at).getTime() : 0;
+          const isStale = runStarted > 0 && runStarted < thirtyMinutesAgo;
+
+          if (isStale) {
+            logger.warn('[TEST_COMPLETION] Force-failing stuck executions for stale run', {
+              runId: run.id,
+              stuckCount: stuckExecs.length,
+            });
+            const stuckIds = stuckExecs.map((e: any) => e.id);
+            await supabaseAdmin
+              .from('test_executions')
+              .update({
+                status: 'failed',
+                error_message: 'Execution timed out (stuck for >30 minutes)',
+                completed_at: new Date().toISOString(),
+              })
+              .in('id', stuckIds);
+
+            // Refresh statuses after force-fail
+            statuses = statuses.map((s: string) =>
+              s === 'running' || s === 'pending' ? 'failed' : s
+            );
+          } else {
+            logger.debug('[TEST_COMPLETION] Run still has running executions', {
+              runId: run.id,
+              runningCount: stuckExecs.length,
+            });
+            return;
+          }
         }
 
         let finalStatus: 'passed' | 'failed' | 'cancelled' = 'passed';
@@ -791,12 +820,23 @@ export class TestCompletionHandlerService {
       const hasRunning = statuses.some(s => s === 'running' || s === 'pending');
 
       if (hasRunning) {
-        logger.debug('[TEST_COMPLETION] Run still has running tests', {
+        // Check if run is stale (>30 min) — force-fail stuck tests
+        const thirtyMinutesAgo = Date.now() - 30 * 60 * 1000;
+        const runStarted = run.started_at ? new Date(run.started_at).getTime() : 0;
+        const isStale = runStarted > 0 && runStarted < thirtyMinutesAgo;
+
+        if (!isStale) {
+          logger.debug('[TEST_COMPLETION] Run still has running tests', {
+            runId: run.id,
+            runningCount: statuses.filter(s => s === 'running' || s === 'pending').length,
+          });
+          return; // Don't update yet
+        }
+
+        logger.warn('[TEST_COMPLETION] Force-failing stale run with stuck tests', {
           runId: run.id,
-          runningCount: statuses.filter(s => s === 'running' || s === 'pending')
-            .length,
+          stuckCount: statuses.filter(s => s === 'running' || s === 'pending').length,
         });
-        return; // Don't update yet
       }
 
       // All tests are complete - compute final status
