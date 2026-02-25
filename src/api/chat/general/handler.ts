@@ -706,12 +706,26 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
             toolResult = await withToolTimeout(SkillRegistry.executeTool(toolName, toolArgs, skillContext));
           }
 
-          // Add tool result to messages
+          // Add tool result as text (OpenAI requires tool messages to be plain text)
+          const toolResultForMessage = toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot
+            ? { success: true, message: toolResult.message, url: toolResult.data.url }
+            : toolResult;
           messages.push({
             role: 'tool',
             tool_call_id: toolCall.id,
-            content: JSON.stringify(toolResult),
+            content: JSON.stringify(toolResultForMessage),
           } as any);
+
+          // For screenshots, inject a user message with the image so the model can see it
+          if (toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot) {
+            messages.push({
+              role: 'user',
+              content: [
+                { type: 'text', text: 'Here is the screenshot I just captured from the live preview. Analyze it and describe what you see.' },
+                { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${toolResult.data.screenshot}`, detail: 'low' } },
+              ],
+            } as any);
+          }
 
           logger.info('[GENERAL_CHAT] Tool executed', {
             toolName,

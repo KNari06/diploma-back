@@ -201,7 +201,9 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // STEP 5.5: SMART TEST CASE RESOLVER
     // Only for platform_test intent — check if existing test cases match
     // ═══════════════════════════════════════════════════════════════════════
-    if (parsedIntent?.intent === 'platform_test') {
+    // Smart Resolver: only when user did NOT provide an explicit URL.
+    // If parsedIntent.page is set, the user gave a URL → they want a NEW test, not a replay.
+    if (parsedIntent?.intent === 'platform_test' && !parsedIntent?.page) {
       try {
         const { TestCaseResolverService } = await import(
           '@/services/testing/resolver/test-case-resolver.service'

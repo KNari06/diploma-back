@@ -1,5 +1,6 @@
-import { getPreviewSessionService } from '@/services/testing/ui/preview';
+import { getPreviewSessionService, getPreviewDevToolsRegistry } from '@/services/testing/ui/preview';
 import type { InteractiveNode } from '@/services/testing/ui/preview/preview.types';
+import type { PreviewConsoleEntry, PreviewNetworkItem } from '@/websocket/types/types';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -18,6 +19,9 @@ export interface PageContext {
   domSummary: string;
   pageText?: string;
   testSteps?: Array<{ id: string; type: string; description: string }>;
+  consoleErrors?: string;    // Recent console errors/warnings
+  networkSummary?: string;   // Failed/slow network requests
+  contentSummary?: string;   // Headings, images, table headers
 }
 
 /**
@@ -40,6 +44,23 @@ export async function getPageContext(previewSessionId: string, userId?: string):
       return null;
     }
 
+    // Capture DevTools data BEFORE the async snapshot to avoid temporal mismatch.
+    // (Snapshot is async and can take 100-500ms; new console/network events during that
+    // time would create a state where the AI sees old DOM + new errors.)
+    let consoleErrors: string | undefined;
+    let networkSummary: string | undefined;
+    try {
+      const devtools = getPreviewDevToolsRegistry().get(previewSessionId);
+      if (devtools) {
+        consoleErrors = compressConsoleForChat(devtools.getConsoleEntries());
+        networkSummary = compressNetworkForChat(devtools.getNetworkItems());
+      }
+    } catch (devtoolsError) {
+      logger.warn('[EDITOR_CONTEXT] Failed to collect devtools data (non-critical)', {
+        error: devtoolsError instanceof Error ? devtoolsError.message : String(devtoolsError),
+      });
+    }
+
     // Collect a fresh snapshot so DOM nodes are up-to-date
     try {
       await service.getSnapshot(previewSessionId, userId, { force: true, includeDomNodes: true });
@@ -59,11 +80,18 @@ export async function getPageContext(previewSessionId: string, userId?: string):
     // Compress DOM nodes into a compact summary
     const domSummary = compressDomForChat(pageState.domNodes || []);
 
+    // Extract non-interactive content summary (headings, images, tables)
+    // Called after snapshot so page is fresh and loaded
+    const contentSummary = await extractContentSummary(previewSessionId, userId);
+
     return {
       url: pageState.url || session.startUrl,
       title: undefined,
       domSummary,
       pageText: pageState.pageText,
+      consoleErrors,
+      networkSummary,
+      contentSummary,
     };
   } catch (error) {
     logger.error('[EDITOR_CONTEXT] Failed to get page context', {
@@ -80,9 +108,9 @@ export async function getPageContext(previewSessionId: string, userId?: string):
  * Groups elements by role (buttons, inputs, links, etc.).
  * Includes ref + text + type for each element.
  * Skips invisible/disabled nodes.
- * Caps at 50 most relevant elements.
+ * Caps at 150 most relevant elements (viewport-first).
  * Truncates text to 30 chars.
- * Target: ~1500 tokens max.
+ * Target: ~3750 tokens max.
  */
 export function compressDomForChat(nodes: InteractiveNode[]): string {
   if (!nodes || nodes.length === 0) {
@@ -92,8 +120,15 @@ export function compressDomForChat(nodes: InteractiveNode[]): string {
   // Filter to visible, interactive nodes only
   const visible = nodes.filter(n => n.isVisible !== false && !n.isDisabled);
 
-  // Cap at 50 most relevant
-  const capped = visible.slice(0, 50);
+  // Sort by viewport priority: elements within viewport (y < 720) first, then off-viewport
+  const sorted = [...visible].sort((a, b) => {
+    const aInViewport = (a.boundingBox?.y ?? Infinity) < 720 ? 0 : 1;
+    const bInViewport = (b.boundingBox?.y ?? Infinity) < 720 ? 0 : 1;
+    return aInViewport - bInViewport;
+  });
+
+  // Cap at 150 most relevant
+  const capped = sorted.slice(0, 150);
 
   // Group by category
   const buttons: string[] = [];
@@ -147,6 +182,122 @@ function truncate(text: string, maxLen: number): string {
 }
 
 /**
+ * Compress console entries into a compact summary for AI context.
+ * Filters to error + warn level, last 15 entries, ~500 tokens budget.
+ */
+export function compressConsoleForChat(entries: PreviewConsoleEntry[]): string | undefined {
+  if (!entries || entries.length === 0) return undefined;
+
+  const filtered = entries
+    .filter(e => e.level === 'error' || e.level === 'warn')
+    .slice(-15);
+
+  if (filtered.length === 0) return undefined;
+
+  return filtered
+    .map(e => {
+      const level = e.level === 'error' ? 'ERROR' : 'WARN';
+      const text = e.text.length > 120 ? e.text.substring(0, 120) + '...' : e.text;
+      const loc = e.location ? ` (${e.location})` : '';
+      return `[${level}] ${text}${loc}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Compress network items into a compact summary for AI context.
+ * Filters to failed (status >= 400), errored, or slow (> 3s) requests.
+ * Last 15 entries, ~500 tokens budget.
+ */
+export function compressNetworkForChat(items: PreviewNetworkItem[]): string | undefined {
+  if (!items || items.length === 0) return undefined;
+
+  const filtered = items
+    .filter(item =>
+      (item.status && item.status >= 400) ||
+      item.phase === 'error' ||
+      (item.durationMs && item.durationMs > 3000)
+    )
+    .slice(-15);
+
+  if (filtered.length === 0) return undefined;
+
+  return filtered
+    .map(item => {
+      const status = item.status ?? 'ERR';
+      const duration = item.durationMs ? ` (${item.durationMs}ms)` : '';
+      let path = item.path;
+      if (!path) {
+        try { path = new URL(item.url, 'http://localhost').pathname; } catch { path = item.url?.slice(0, 60) || '/unknown'; }
+      }
+      return `[${status}] ${item.method} ${path}${duration}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Extract non-interactive content summary from the page.
+ * Headings (h1-h6), images with alt text, table column headers.
+ * ~400 tokens budget. Non-critical — returns undefined on failure.
+ *
+ * Guards: checks page.isClosed(), wraps evaluate with 5s timeout,
+ * catches navigation/CSP errors silently.
+ */
+async function extractContentSummary(previewSessionId: string, userId?: string): Promise<string | undefined> {
+  try {
+    const service = getPreviewSessionService();
+    const page = service.getPage(previewSessionId, userId);
+    if (!page || page.isClosed()) return undefined;
+
+    // Timeout wrapper: page.evaluate can hang on complex/stuck pages
+    const evaluateWithTimeout = Promise.race([
+      page.evaluate(() => {
+        const headings: string[] = [];
+        document.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach((el, i) => {
+          if (i >= 10) return;
+          const tag = el.tagName.toLowerCase();
+          const text = (el.textContent || '').trim().slice(0, 80);
+          if (text) headings.push(`[${tag}] ${text}`);
+        });
+
+        const images: string[] = [];
+        document.querySelectorAll('img[alt]').forEach((el, i) => {
+          if (i >= 8) return;
+          const alt = ((el as HTMLImageElement).alt || '').trim().slice(0, 60);
+          if (alt) images.push(`[${alt}]`);
+        });
+
+        const columns: string[] = [];
+        const seen = new Set<string>();
+        document.querySelectorAll('th').forEach(el => {
+          const text = (el.textContent || '').trim().slice(0, 40);
+          if (text && !seen.has(text) && seen.size < 10) {
+            seen.add(text);
+            columns.push(text);
+          }
+        });
+
+        return { headings, images, columns };
+      }),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+    ]);
+
+    const content = await evaluateWithTimeout;
+    if (!content) return undefined;
+
+    const parts: string[] = [];
+    if (content.headings.length > 0) parts.push(`HEADINGS: ${content.headings.join(', ')}`);
+    if (content.images.length > 0) parts.push(`IMAGES: ${content.images.join(', ')}`);
+    if (content.columns.length > 0) parts.push(`TABLE COLUMNS: ${content.columns.join(', ')}`);
+
+    return parts.length > 0 ? parts.join('\n') : undefined;
+  } catch {
+    // Expected: navigation in progress, page closed, CSP violation — all non-critical
+    return undefined;
+  }
+}
+
+/**
  * Format page context as a system message for AI context injection.
  */
 export function formatPageContextForChat(pageContext: PageContext): string {
@@ -161,6 +312,18 @@ export function formatPageContextForChat(pageContext: PageContext): string {
 
   if (pageContext.pageText) {
     result += `\nVisible Page Text:\n${pageContext.pageText}\n`;
+  }
+
+  if (pageContext.contentSummary) {
+    result += `\nPage Content Structure:\n${pageContext.contentSummary}\n`;
+  }
+
+  if (pageContext.consoleErrors) {
+    result += `\nConsole Errors/Warnings:\n${pageContext.consoleErrors}\n`;
+  }
+
+  if (pageContext.networkSummary) {
+    result += `\nFailed/Slow Network Requests:\n${pageContext.networkSummary}\n`;
   }
 
   if (pageContext.testSteps && pageContext.testSteps.length > 0) {

@@ -3824,3 +3824,68 @@ export async function handleBulkTag(
     };
   }
 }
+
+/**
+ * qa_screenshot — Capture a screenshot of the live preview page.
+ * Returns base64 JPEG for multimodal AI analysis.
+ */
+export async function handleScreenshot(
+  _args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const previewSessionId = context.previewSessionId;
+  if (!previewSessionId) {
+    return {
+      success: false,
+      message: 'No active preview session. Open a page in the AI Editor first.',
+      displayToUser: true,
+    };
+  }
+
+  try {
+    const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+    const service = getPreviewSessionService();
+
+    const snapshot = await service.getSnapshot(previewSessionId, context.userId, {
+      includeScreenshot: true,
+      force: true,
+    });
+
+    if (!snapshot) {
+      return {
+        success: false,
+        message: 'Preview session not found or not accessible.',
+        displayToUser: true,
+      };
+    }
+
+    if (!snapshot.screenshot) {
+      return {
+        success: false,
+        message: 'Failed to capture screenshot from the preview session.',
+        displayToUser: true,
+      };
+    }
+
+    return {
+      success: true,
+      data: {
+        screenshot: snapshot.screenshot,
+        mimeType: 'image/jpeg',
+        url: snapshot.url,
+      },
+      message: `Screenshot captured of ${snapshot.url}`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleScreenshot error', {
+      error: error instanceof Error ? error.message : String(error),
+      previewSessionId,
+    });
+    return {
+      success: false,
+      message: `Failed to capture screenshot: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}

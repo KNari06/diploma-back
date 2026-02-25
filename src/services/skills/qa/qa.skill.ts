@@ -34,6 +34,8 @@ import {
   handleGetFullDashboard,
   handleGetAgentHealth,
   handleUpdateTestCaseSteps,
+  // Editor mode tools
+  handleScreenshot,
   // Write tools — Tier 1
   handleUpdateTestCase,
   handleRunTest,
@@ -764,6 +766,24 @@ const QA_TOOLS: ChatCompletionTool[] = [
   },
 
   // ═══════════════════════════════════════════════════════════════
+  // Editor mode tools
+  // ═══════════════════════════════════════════════════════════════
+
+  {
+    type: 'function',
+    function: {
+      name: 'qa_screenshot',
+      description:
+        'Capture a screenshot of the live preview page. Use when the user asks about visual appearance, colors, layout, or anything that requires seeing the page. Returns a JPEG screenshot that you can analyze visually.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+
+  // ═══════════════════════════════════════════════════════════════
   // WRITE tools (require confirm=true after user approval)
   // ═══════════════════════════════════════════════════════════════
 
@@ -1447,6 +1467,10 @@ export const QASkill: SkillDefinition = {
 
         case 'qa_get_agent_health':
           return await handleGetAgentHealth(args, context);
+
+        // Editor mode tools
+        case 'qa_screenshot':
+          return await handleScreenshot(args, context);
 
         // Write tools
         case 'qa_update_test_case_steps':

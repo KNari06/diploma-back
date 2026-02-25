@@ -212,14 +212,14 @@ async function extractActionWithAI(
 ): Promise<{ type: IntentActionType; description: string; value?: string } | null> {
   const systemPrompt = `You extract a SINGLE browser action from the user's message.
 
-AVAILABLE ACTIONS: click, type, scroll, press, hover, select, check, uncheck, navigate
+AVAILABLE ACTIONS: click, type, scroll, press, hover, select, check, uncheck, navigate, upload
 
 PAGE ELEMENTS:
 ${domSummary}
 
 Return ONLY valid JSON:
 {
-  "type": "click" | "type" | "scroll" | "press" | "hover" | "select" | "check" | "uncheck" | "navigate",
+  "type": "click" | "type" | "scroll" | "press" | "hover" | "select" | "check" | "uncheck" | "navigate" | "upload",
   "description": "human-readable description of the target element (e.g., 'Login button', 'Email input field')",
   "value": "text to type or key to press (only for type/press/select actions, omit otherwise)"
 }
@@ -232,6 +232,7 @@ Examples:
 - "scroll down" → {"type": "scroll", "description": "scroll down"}
 - "press Enter" → {"type": "press", "description": "press Enter", "value": "Enter"}
 - "hover over the menu" → {"type": "hover", "description": "menu"}
+- "upload a profile photo" → {"type": "upload", "description": "profile photo file input", "value": "photo.jpg"}
 - "what does this page do?" → {"type": null}`;
 
   const messages: ChatCompletionMessageParam[] = [
@@ -255,7 +256,7 @@ Examples:
     if (!parsed.type || parsed.type === null) return null;
 
     const validTypes: IntentActionType[] = [
-      'click', 'type', 'scroll', 'press', 'hover', 'select', 'check', 'uncheck', 'navigate',
+      'click', 'type', 'scroll', 'press', 'hover', 'select', 'check', 'uncheck', 'navigate', 'upload',
     ];
     if (!validTypes.includes(parsed.type)) return null;
 
@@ -295,6 +296,8 @@ function buildSuccessMessage(type: IntentActionType, description: string): strin
       return `Done! I unchecked "${description}".`;
     case 'navigate':
       return `Done! Navigating to the specified URL.`;
+    case 'upload':
+      return `Done! I uploaded the file to "${description}".`;
     default:
       return `Done! Action "${type}" completed on "${description}".`;
   }

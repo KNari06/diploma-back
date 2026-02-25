@@ -134,6 +134,9 @@ export interface ServerToClientEvents {
   'preview:accessibility:update': (data: PreviewAccessibilityUpdatePayload) => void;
   'preview:context:update': (data: PreviewContextUpdatePayload) => void;
 
+  // Preview dialog events (native alert/confirm/prompt auto-dismissed)
+  'preview:dialog': (data: PreviewDialogPayload) => void;
+
   // Preview recording events
   'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:state': (data: PreviewRecordingStatePayload) => void;
@@ -921,6 +924,17 @@ export interface PreviewPagePayload {
   domVersion: number;        // Monotonically increasing int, incremented on DOM changes
   pageSignature: string;     // Hash of URL + interactive element refs
   domNodes?: PreviewInteractiveNode[]; // Only sent when domVersion changes
+  timestamp: string;
+}
+
+/**
+ * Native dialog (alert/confirm/prompt) auto-dismissed payload
+ */
+export interface PreviewDialogPayload {
+  previewSessionId: string;
+  type: string;              // 'alert' | 'confirm' | 'prompt' | 'beforeunload'
+  message: string;
+  action: 'accepted' | 'dismissed';
   timestamp: string;
 }
 

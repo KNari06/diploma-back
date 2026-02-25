@@ -41,6 +41,7 @@ const TOOL_TIMEOUTS: Record<string, number> = {
   qa_get_recommendations: 25000,
   qa_run_test: 60000,
   qa_create_test_case: 15000,
+  qa_screenshot: 10000,
   qa_manage_regression_plan: 10000,
   qa_manage_schedule: 10000,
 };
@@ -210,12 +211,26 @@ export async function executeTools(
           );
         }
 
-        // Push result to messages
+        // Push tool result as text (OpenAI requires tool messages to be plain text)
+        const toolResultForMessage = toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot
+          ? { success: true, message: toolResult.message, url: toolResult.data.url }
+          : toolResult;
         messages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
-          content: JSON.stringify(toolResult),
+          content: JSON.stringify(toolResultForMessage),
         } as any);
+
+        // For screenshots, inject a user message with the image so the model can see it
+        if (toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot) {
+          messages.push({
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Here is the screenshot I just captured from the live preview. Analyze it and describe what you see.' },
+              { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${toolResult.data.screenshot}`, detail: 'low' } },
+            ],
+          } as any);
+        }
 
         toolResults.push({
           toolName,

@@ -9,6 +9,7 @@ import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { randomUUID } from 'crypto';
 import { Browser, BrowserContext, Page, chromium } from 'playwright';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { DomAnalysisExtractorService } from './dom-analysis-extractor.service';
 import type { InteractiveNode, PreviewSession } from './preview.types';
 
@@ -335,6 +336,9 @@ export class PreviewSessionService {
         this.sessions.set(sessionId, session);
         this.userToSession.set(userId, sessionId);
 
+        // Auto-dismiss native dialogs (alert/confirm/prompt/beforeunload)
+        this.attachDialogHandler(page, sessionId);
+
         logger.info('[PREVIEW_SESSION] Session started', {
           sessionId,
           url: page.url(),
@@ -429,6 +433,9 @@ export class PreviewSessionService {
       // Swap to new resources
       session.context = newContext;
       session.page = newPage;
+
+      // Auto-dismiss native dialogs on the new page
+      this.attachDialogHandler(newPage, sessionId);
 
       // Reset internal timers/state to avoid throttling weirdness after reset
       session.lastSnapshotEmit = 0;
@@ -1225,6 +1232,59 @@ export class PreviewSessionService {
   setRecordingLastUrl(sessionId: string, userId: string, url: string): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingLastUrl = url;
+  }
+
+  /**
+   * Attach a dialog handler to auto-dismiss native dialogs (alert/confirm/prompt/beforeunload).
+   * Prevents page from hanging on blocking dialogs.
+   */
+  private attachDialogHandler(page: Page, previewSessionId: string): void {
+    page.on('dialog', async (dialog) => {
+      try {
+        const type = dialog.type();
+        const msg = dialog.message();
+        logger.info('[PREVIEW_SESSION] Dialog auto-dismissed', {
+          previewSessionId,
+          type,
+          message: msg.slice(0, 200),
+        });
+
+        try {
+          if (type === 'beforeunload') {
+            await dialog.accept();
+          } else {
+            await dialog.dismiss();
+          }
+        } catch (dialogError) {
+          // Dialog may have already been handled (e.g., by test execution)
+          logger.warn('[PREVIEW_SESSION] Failed to dismiss dialog (may already be handled)', {
+            previewSessionId,
+            type,
+            error: dialogError instanceof Error ? dialogError.message : String(dialogError),
+          });
+          return; // Skip WS notification if dismiss failed
+        }
+
+        // Notify frontend (best-effort)
+        try {
+          webSocketService.emitToRoom('preview', previewSessionId, 'preview:dialog' as any, {
+            previewSessionId,
+            type,
+            message: msg.slice(0, 500),
+            action: type === 'beforeunload' ? 'accepted' : 'dismissed',
+            timestamp: new Date().toISOString(),
+          });
+        } catch {
+          // Non-critical: frontend notification is optional
+        }
+      } catch (error) {
+        // Outer catch: prevent unhandled promise rejection for any unexpected error
+        logger.warn('[PREVIEW_SESSION] Dialog handler error', {
+          previewSessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
   }
 
   /**
