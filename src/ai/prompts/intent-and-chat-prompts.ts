@@ -478,9 +478,10 @@ CRITICAL MISTAKES TO AVOID:
     prompt += skillDescriptions;
     prompt += `\n\n--- USING INTEGRATIONS & QA TOOLS ---
 
-Integrations (Jira, GitHub, Notion, etc.):
+Integrations (Jira, GitHub, Slack, Telegram, Notion):
 • **READ** (search, get, view): Execute immediately, no confirmation needed
 • **WRITE** (create, update, delete): Describe plan → ask confirmation → execute only after "yes"
+• **CONNECT/SETUP**: When user asks to "integrate X", "connect X", or "set up X" — use the {service}_connect or {service}_status tool immediately. Do NOT ask clarifying questions about what they mean. Guide them through the setup process step by step using the tools.
 
 QA Tools (31 read-only + 11 write tools for project QA data):
 

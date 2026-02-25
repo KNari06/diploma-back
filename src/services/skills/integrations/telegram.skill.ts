@@ -30,7 +30,7 @@ const TELEGRAM_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'telegram_connect',
       description:
-        'Connect a Telegram bot for the user. Use when user asks to connect/setup/integrate Telegram. Guides user to get a bot token from @BotFather, then saves it. Does NOT require an existing connection — always available.',
+        'Connect or update a Telegram bot for the user. Use when user asks to connect/setup/integrate Telegram OR change their bot token/chat ID. If already connected, calling again with a new token will replace the old one. Guides user to get a bot token from @BotFather, then saves it. Does NOT require an existing connection — always available.',
       parameters: {
         type: 'object',
         properties: {

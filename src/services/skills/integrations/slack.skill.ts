@@ -41,7 +41,8 @@ const SLACK_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'slack_connect',
       description:
-        'Connect Slack via an Incoming Webhook URL. Use when user asks to connect/setup/integrate Slack. ' +
+        'Connect or update Slack via an Incoming Webhook URL. Use when user asks to connect/setup/integrate Slack OR change their webhook URL/channel. ' +
+        'If already connected, calling again with a new webhook URL will replace the old one. ' +
         'Guide user to: Slack App settings → Incoming Webhooks → Activate → Add New Webhook → copy URL. ' +
         'Does NOT require an existing connection — always available.',
       parameters: {

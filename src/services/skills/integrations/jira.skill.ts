@@ -50,8 +50,9 @@ const JIRA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'jira_connect',
       description:
-        'Start Jira OAuth connection. Use when user asks to connect/setup/integrate Jira. ' +
-        'Returns an authorization URL the user must open in their browser. Always available.',
+        'Start Jira OAuth connection. Use when user asks to connect/setup/integrate Jira OR reconnect/re-authorize. ' +
+        'Returns an authorization URL — tell the user to open it in their browser to authorize. ' +
+        'After authorization, Jira will be connected automatically. Can also be used to refresh an expired connection. Always available.',
       parameters: {
         type: 'object',
         properties: {},
