@@ -438,7 +438,7 @@ export async function handlePlatformTest(
     const emitProcessingStepWithLogging = functionLogger
       ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
       : emitProcessingStep;
-    emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', '🤖 Analyzing your request...', 30);
+    emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', 'Analyzing your request...', 30);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 1: LOAD CHAT SESSION CONTEXT (FIX #1: Error handling)
@@ -657,7 +657,7 @@ export async function handlePlatformTest(
     // STEP 2: FIND OR CREATE PROJECT (FIX #1: Error handling)
     // ═══════════════════════════════════════════════════════════════════════
 
-    emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', '🔍 Setting up project...', 40);
+    emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', 'Setting up project...', 40);
 
     let project_id: string;
     try {
@@ -740,7 +740,7 @@ export async function handlePlatformTest(
     // Priority 2: Saved credentials from DB (if not found in message or answers)
     if (!finalCredentials) {
       try {
-        emitProcessingStepWithLogging(chatSessionId, 'validating_credentials', '🔍 Getting saved credentials...', 45);
+        emitProcessingStepWithLogging(chatSessionId, 'validating_credentials', 'Checking credentials...', 45);
 
         const getProjectCredentialsWithLogging = functionLogger
           ? withFunctionLogging(ProjectContextService.getProjectCredentials.bind(ProjectContextService), 'ProjectContextService.getProjectCredentials', functionLogger)
@@ -787,7 +787,7 @@ export async function handlePlatformTest(
         hasCredentials: !!finalCredentials,
       });
 
-      emitProcessingStepWithLogging(chatSessionId, 'executing_test', '🚀 Starting Lite test...', 50);
+      emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Starting test...', 50);
 
       // Check cancellation before creating test request
       if (abortSignal) {
@@ -820,7 +820,7 @@ export async function handlePlatformTest(
         prefilledSteps: resolvedContext?.prefilledSteps, // Smart Resolver: prefilled steps for fast replay
       };
 
-      emitProcessingStepWithLogging(chatSessionId, 'executing_test', '⚙️ Launching browser...', 60);
+      emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Launching browser...', 60);
 
       // Check cancellation before creating test
       if (abortSignal) {
@@ -977,7 +977,7 @@ export async function handlePlatformTest(
         }
       }
 
-      emitProcessingStepWithLogging(chatSessionId, 'executing_test', '✅ Test started!', 100);
+      emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Test is running!', 100);
 
       // Step L7: Save to chat history (non-blocking)
       const replyMessage = `🚀 **Test Started in Lite Mode!**\n\n` +
@@ -1032,7 +1032,7 @@ export async function handlePlatformTest(
       userId,
     });
 
-    emitProcessingStepWithLogging(chatSessionId, 'generating_plan', '🔍 Analyzing page with real browser...', 50);
+    emitProcessingStepWithLogging(chatSessionId, 'generating_plan', 'Analyzing page with real browser...', 50);
 
     // Determine scope: from answers > from parsedIntent
     const finalScope = parsedAnswers?.scope || parsedIntent.scope;

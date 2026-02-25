@@ -138,7 +138,7 @@ export async function parseIntent(
   const emitProcessingStepWithLogging = functionLogger
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
-  emitProcessingStepWithLogging(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', PROGRESS.INTENT_PARSING);
+  emitProcessingStepWithLogging(chatSessionId, 'parsing_intent', 'Understanding what you need...', PROGRESS.INTENT_PARSING);
 
   // Check if request was cancelled
   if (abortSignal) {
@@ -457,47 +457,44 @@ export async function parseIntent(
  */
 export function buildIntentMessage(parsedIntent: IntentResult | null | undefined): string {
   if (!parsedIntent) {
-    return '🤔 Understanding your request...';
+    return 'Understanding your request...';
   }
 
-  const { intent, scope, target, page, apiMethod, apiUrl, urgency, clarificationQuestion } = parsedIntent;
+  const { intent, scope, target, page, apiMethod, apiUrl, clarificationQuestion } = parsedIntent;
 
   switch (intent) {
     case 'api_test':
       if (apiUrl && apiMethod) {
-        const urgencyEmoji = urgency === 'high' ? '⚡ ' : '';
-        return `${urgencyEmoji}🔍 Got it! Testing ${apiMethod} ${apiUrl}`;
+        return `Got it! Testing ${apiMethod} ${apiUrl}`;
       } else if (apiUrl) {
-        return `🔍 Got it! Testing API endpoint ${apiUrl}`;
+        return `Got it! Testing API endpoint ${apiUrl}`;
       } else {
-        return '🔍 Got it! You want to test an API endpoint';
+        return 'Got it! Testing an API endpoint';
       }
 
     case 'platform_test':
       if (page && scope && target) {
-        const urgencyEmoji = urgency === 'high' ? '⚡ ' : '';
-        return `${urgencyEmoji}🌐 Got it! Testing ${target} on ${page}`;
+        return `Got it! Testing ${target} on ${page}`;
       } else if (page && scope) {
-        return `🌐 Got it! Testing ${scope} on ${page}`;
+        return `Got it! Testing ${scope} on ${page}`;
       } else if (scope && target) {
-        return `🌐 Got it! Testing ${target} (${scope})`;
+        return `Got it! Testing ${target} (${scope})`;
       } else if (page) {
-        return `🌐 Got it! Testing website ${page}`;
+        return `Got it! Testing website ${page}`;
       } else {
-        return '🌐 Got it! You want to test a website';
+        return 'Got it! Testing a website';
       }
 
     case 'needs_clarification':
-      // Use GPT-generated clarification question if available, otherwise fallback
       if (clarificationQuestion && clarificationQuestion.trim().length > 0) {
-        return `❓ ${clarificationQuestion.trim()}`;
+        return clarificationQuestion.trim();
       }
-      return '❓ I need a bit more information to help you better';
+      return 'I need a bit more information to help you better';
 
     case 'general_chat':
-      return '💬 Got it! Let me help you with that';
+      return 'Got it! Let me help you with that';
 
     default:
-      return '✅ Intent understood!';
+      return 'Intent understood!';
   }
 }

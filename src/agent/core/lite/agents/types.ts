@@ -545,6 +545,8 @@ export interface MultiAgentInput {
   recentNetworkErrors?: NetworkError[];
   /** Recent API validation errors (last action) — for Supervisor blocker detection */
   recentValidationErrors?: NetworkValidationError[];
+  /** Optional callback for emitting real-time thinking steps to the user */
+  onThinkingStep?: (phase: string, message: string) => void;
 }
 
 /** Run-level metrics accumulated across all iterations for A/B comparison */

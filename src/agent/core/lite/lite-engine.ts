@@ -991,7 +991,7 @@ export class LiteEngine {
     this.progressEmitter.emit({
       progress: 20,
       phase: 'execution',
-      currentStep: '🚀 Starting Lite Engine',
+      currentStep: 'Starting Lite Engine',
       status: 'running',
     });
 
@@ -2097,7 +2097,7 @@ export class LiteEngine {
                     browser: this.config.browser || 'chrome',
                     progress: Math.round((i / this.MAX_ITERATIONS) * 70) + 20,
                     phase: 'blocked',
-                    currentStep: `🚫 ${blockedReason}`,
+                    currentStep: `Blocked: ${blockedReason}`,
                     status: 'failed',
                     timestamp: new Date().toISOString(),
                     userId: this.config.userId,
@@ -2521,6 +2521,20 @@ export class LiteEngine {
             recentConsoleErrors: this.lastConsoleErrors.length > 0 ? this.lastConsoleErrors.slice(-5) : undefined,
             recentNetworkErrors: this.lastNetworkErrors.length > 0 ? this.lastNetworkErrors.slice(-3) : undefined,
             recentValidationErrors: this.lastValidationErrors.length > 0 ? this.lastValidationErrors.slice(-3) : undefined,
+            // Thinking step callback for real-time agent progress (fire-and-forget)
+            onThinkingStep: (phase: string, message: string) => {
+              try {
+                const progress = Math.round((i / this.MAX_ITERATIONS) * 70) + 20;
+                this.progressEmitter.emit({
+                  progress: Math.min(90, progress),
+                  phase: 'execution',
+                  currentStep: `[${phase}] ${message}`,
+                  status: 'running',
+                });
+              } catch {
+                // Never break test execution for progress emission failures
+              }
+            },
           } : undefined;
           decision = await this.getAIDecision(prompt, i, iterationSpanId, snapshotBefore, multiAgentCtx);
 
@@ -2609,7 +2623,7 @@ export class LiteEngine {
                   browser: this.config.browser || 'chrome',
                   progress: Math.round((i / this.MAX_ITERATIONS) * 70) + 20,
                   phase: 'blocked',
-                  currentStep: `🚫 ${blockedReason}`,
+                  currentStep: `Blocked: ${blockedReason}`,
                   status: 'failed',
                   timestamp: new Date().toISOString(),
                   userId: this.config.userId,
@@ -2705,7 +2719,7 @@ export class LiteEngine {
                 browser: this.config.browser || 'chrome',
                 progress: Math.round((i / this.MAX_ITERATIONS) * 70) + 20,
                 phase: 'blocked',
-                currentStep: `🚫 ${reason}`,
+                currentStep: `Blocked: ${reason}`,
                 status: 'failed', // Use 'failed' for blocked state
                 timestamp: new Date().toISOString(),
                 userId: this.config.userId,
@@ -3720,7 +3734,7 @@ export class LiteEngine {
       this.progressEmitter.emit({
         progress: 95,
         phase: 'finalization',
-        currentStep: success ? `⏳ Finalizing: ${reason}` : `⏳ Stopping: ${reason}`,
+        currentStep: success ? `Finalizing: ${reason}` : `Stopping: ${reason}`,
         status: 'running', // Still running until truly done
       });
     } catch (error) {
@@ -3739,7 +3753,7 @@ export class LiteEngine {
       this.progressEmitter.emit({
         progress: 100,
         phase: 'finalization',
-        currentStep: success ? `✅ ${reason}` : `❌ ${reason}`,
+        currentStep: reason,
         status: success ? 'completed' : 'failed',
       });
     } catch (error) {

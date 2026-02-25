@@ -37,7 +37,7 @@ export async function routeToHandler(
   emitProcessingStepWithLogging(
     params.chatSessionId,
     'generating_plan',
-    '🚀 Processing your request...',
+    'Processing your request...',
     PROGRESS.ROUTING
   );
 

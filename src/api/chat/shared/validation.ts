@@ -234,7 +234,7 @@ export async function manageChatSession(
   const emitProcessingStepWithLogging = functionLogger
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
-  emitProcessingStepWithLogging(chatSessionId, 'enriching_context', '🔍 Analyzing your request...', PROGRESS.ENRICHING);
+  emitProcessingStepWithLogging(chatSessionId, 'enriching_context', 'Analyzing your request...', PROGRESS.ENRICHING);
 
   checkRequestTimeout();
 

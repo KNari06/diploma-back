@@ -47,8 +47,8 @@ export async function runApiFuzzing(
       chatSessionId,
       'analyzing_results',
       executionProfile === 'prod_readonly'
-        ? '🔍 Generating production-safe security checks (read-only)...'
-        : '🔍 Generating initial security scenarios...',
+        ? 'Generating production-safe security checks (read-only)...'
+        : 'Generating initial security scenarios...',
       70
     );
 
@@ -76,7 +76,7 @@ export async function runApiFuzzing(
     emitProcessingStep(
       chatSessionId,
       'analyzing_results',
-      `🎯 Testing ${initialScenarios.length} initial security scenarios...`,
+      `Testing ${initialScenarios.length} initial security scenarios...`,
       73
     );
 
@@ -94,7 +94,7 @@ export async function runApiFuzzing(
       emitProcessingStep(
         chatSessionId,
         'analyzing_results',
-        `🔒 Testing security [Phase 1] (${completed}/${total})...`,
+        `Testing security [Phase 1] (${completed}/${total})...`,
         progressPercent
       );
     };
@@ -139,7 +139,7 @@ export async function runApiFuzzing(
       emitProcessingStep(
         chatSessionId,
         'analyzing_results',
-        `⚠️ ${criticalIssues.length} high-risk issue(s) found! Generating deeper follow-on checks...`,
+        `${criticalIssues.length} high-risk issue(s) found! Generating deeper follow-on checks...`,
         85
       );
 
@@ -163,7 +163,7 @@ export async function runApiFuzzing(
           emitProcessingStep(
             chatSessionId,
             'analyzing_results',
-            `🎯 Testing ${followOnScenarios.length} follow-on scenarios...`,
+            `Testing ${followOnScenarios.length} follow-on scenarios...`,
             87
           );
 
@@ -173,7 +173,7 @@ export async function runApiFuzzing(
             emitProcessingStep(
               chatSessionId,
               'analyzing_results',
-              `🔥 Deep security checks [Phase 2] (${completed}/${total})...`,
+              `Deep security checks [Phase 2] (${completed}/${total})...`,
               progressPercent
             );
           };
@@ -236,7 +236,7 @@ export async function runApiFuzzing(
     emitProcessingStep(
       chatSessionId,
       'analyzing_results',
-      `✅ Security analysis complete! Found ${finalReport.issues.length} issue(s) across ${followOnReport ? '2 phases' : '1 phase'}`,
+      `Security analysis complete! Found ${finalReport.issues.length} issue(s) across ${followOnReport ? '2 phases' : '1 phase'}`,
       100
     );
 
@@ -256,7 +256,7 @@ export async function runApiFuzzing(
       emitProcessingStep(
         chatSessionId,
         'analyzing_results',
-        `⚠️ Security analysis timed out (max ${CONSTANTS.FUZZING_TIMEOUT / 1000}s), skipping fuzzing`,
+        `Security analysis timed out (max ${CONSTANTS.FUZZING_TIMEOUT / 1000}s), skipping fuzzing`,
         100
       );
     }

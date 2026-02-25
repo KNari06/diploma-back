@@ -13,7 +13,7 @@ import { logger } from '@/utils/core/logger';
 import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
 import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
-import { CONSTANTS } from '../shared/constants';
+import { CONSTANTS, PROGRESS } from '../shared/constants';
 import { checkRequestAborted } from '../shared/request-cancellation';
 import { compressMessageContent, deductChatCredits, emitProcessingStep } from '../shared/utils';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
@@ -469,7 +469,7 @@ If the user asks to test something on the current page, prefer platform_test int
   const emitProcessingStepWithLogging = functionLogger
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
-  emitProcessingStepWithLogging(chatSessionId, 'generating_response', '💬 Thinking...', 90);
+  emitProcessingStepWithLogging(chatSessionId, 'generating_response', 'Thinking...', PROGRESS.ROUTING);
 
   let gptResponse: { content: string; usage?: any };
   let shouldDeductCredits = false;

@@ -8,6 +8,9 @@ import { executeTools } from './agents/executor-agent';
 import { formatResponse, generateSimpleResponse } from './agents/responder-agent';
 import type { PipelineContext, PipelineInput, PipelineMetrics, SubAgentPipelineResult } from './types';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import { emitProcessingStep } from '@/api/chat/shared/utils';
+import { PROGRESS } from '@/api/chat/shared/constants';
+import type { ChatProcessingStepPayload } from '@/websocket/types/types';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -31,6 +34,16 @@ export class SubAgentPipeline {
 
   constructor(context: PipelineContext) {
     this.context = context;
+  }
+
+  /** Fire-and-forget thinking step emission. Never throws, never blocks. */
+  private emitStep(
+    step: ChatProcessingStepPayload['step'],
+    message: string,
+    progress: number,
+    metadata?: Record<string, any>
+  ): void {
+    emitProcessingStep(this.context.chatSessionId, step, message, progress, metadata);
   }
 
   async execute(input: PipelineInput): Promise<SubAgentPipelineResult> {
@@ -57,6 +70,7 @@ export class SubAgentPipeline {
       }
 
       // ═══ PHASE 1: ROUTER ═══
+      this.emitStep('agent_routing', 'Analyzing your request...', PROGRESS.PIPELINE_ROUTING);
       const routerStart = Date.now();
       const recentMessages = input.messages
         .filter(m => m.role === 'user' || m.role === 'assistant')
@@ -73,6 +87,15 @@ export class SubAgentPipeline {
       metrics.routerClassification = routerResult.classification;
       metrics.routerConfidence = routerResult.confidence;
       metrics.toolCategories = routerResult.toolCategories;
+
+      const routeDescription = routerResult.classification === 'simple_chat'
+        ? 'Preparing a direct answer'
+        : routerResult.classification === 'single_tool'
+        ? 'Found the right tool to help'
+        : 'Planning a multi-step approach';
+      this.emitStep('agent_routing', routeDescription, PROGRESS.PIPELINE_ROUTING_DONE, {
+        classification: routerResult.classification,
+      });
 
       // Low confidence → fallback (not a pipeline failure, don't penalize circuit breaker)
       if (routerResult.confidence < SUB_AGENT_CONFIG.routerConfidenceThreshold) {
@@ -102,6 +125,7 @@ export class SubAgentPipeline {
       // ═══ PATH A: SIMPLE CHAT ═══
       if (routerResult.classification === 'simple_chat') {
         try {
+          this.emitStep('agent_formatting', 'Composing response...', PROGRESS.PIPELINE_FORMATTING);
           const responderStart = Date.now();
           const response = await generateSimpleResponse(
             input.userMessage,
@@ -157,6 +181,7 @@ export class SubAgentPipeline {
       // ═══ PATH B: SINGLE TOOL ═══
       if (routerResult.classification === 'single_tool') {
         // Execute directly
+        this.emitStep('agent_executing_tool', 'Running tool...', PROGRESS.PIPELINE_TOOL_BASE);
         const executorStart = Date.now();
         const executorResult = await executeTools(
           input.userMessage,
@@ -177,6 +202,7 @@ export class SubAgentPipeline {
         }
 
         // Format response
+        this.emitStep('agent_formatting', 'Formatting results...', PROGRESS.PIPELINE_FORMATTING);
         const responderStart = Date.now();
         const response = await formatResponse(
           input.userMessage,
@@ -208,6 +234,9 @@ export class SubAgentPipeline {
 
       // ═══ PATH C: MULTI TOOL ═══
       // Phase 1: Plan
+      this.emitStep('agent_planning', 'Creating an execution plan...', PROGRESS.PIPELINE_PLANNING, {
+        toolCategories: routerResult.toolCategories,
+      });
       const plannerStart = Date.now();
       const planResult = await createPlan(
         input.userMessage,
@@ -216,12 +245,21 @@ export class SubAgentPipeline {
       );
       metrics.plannerMs = Date.now() - plannerStart;
 
+      if (planResult) {
+        const stepWord = planResult.steps.length === 1 ? 'step' : 'steps';
+        this.emitStep('agent_planning', `Plan ready: ${planResult.steps.length} ${stepWord}`, PROGRESS.PIPELINE_PLANNING_DONE, {
+          summary: planResult.summary,
+          stepCount: planResult.steps.length,
+        });
+      }
+
       // Build plan text for executor
       const planText = planResult
         ? planResult.steps.map(s => `${s.stepNumber}. ${s.description} [${s.category}]`).join('\n')
         : undefined;
 
       // Phase 2: Execute with plan
+      this.emitStep('agent_executing_tool', 'Executing plan...', PROGRESS.PIPELINE_TOOL_BASE);
       const executorStart = Date.now();
       const executorResult = await executeTools(
         input.userMessage,
@@ -241,6 +279,7 @@ export class SubAgentPipeline {
       }
 
       // Phase 3: Format response
+      this.emitStep('agent_formatting', 'Formatting results...', PROGRESS.PIPELINE_FORMATTING);
       const responderStart = Date.now();
       const response = await formatResponse(
         input.userMessage,

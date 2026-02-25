@@ -93,7 +93,7 @@ export async function executeApiAgentTestFlow(
   }
 
   // Emit initial progress
-  emitProcessingStep(chatSessionId, 'executing_test', `🚀 Starting ${level.toUpperCase()} API test...`, 5);
+  emitProcessingStep(chatSessionId, 'executing_test', `Starting ${level.toUpperCase()} API test...`, 5);
 
   // Deduct baseline credits before execution
   const testId = `api_agent_${Date.now()}`;

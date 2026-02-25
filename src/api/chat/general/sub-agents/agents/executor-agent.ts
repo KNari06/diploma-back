@@ -4,6 +4,8 @@ import { SUB_AGENT_CONFIG } from '../config';
 import { buildExecutorPrompt } from '../prompts/executor-prompt';
 import type { ExecutorResult, PipelineContext, ToolExecutionRecord } from '../types';
 import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import { emitProcessingStep } from '@/api/chat/shared/utils';
+import { PROGRESS } from '@/api/chat/shared/constants';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -18,6 +20,20 @@ import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/reso
 
 const TOOL_TIMEOUT_MS = 15000;
 const MEMORY_TOOL_NAMES = ['remember_fact', 'search_memory', 'forget_fact'];
+
+/** Compute dynamic progress for a tool within the executor's 70-88% range. */
+function computeToolProgress(completedTools: number, estimatedTotal: number): number {
+  const range = PROGRESS.PIPELINE_TOOL_CEILING - PROGRESS.PIPELINE_TOOL_BASE;
+  const total = Math.max(estimatedTotal, 1);
+  const fraction = Math.min(completedTools / total, 1);
+  return Math.round(PROGRESS.PIPELINE_TOOL_BASE + fraction * range);
+}
+
+/** Convert qa_get_analytics_summary → "get analytics summary" */
+function humanizeToolName(toolName: string): string {
+  if (!toolName) return 'tool';
+  return toolName.replace(/^qa_/, '').replace(/_/g, ' ') || toolName;
+}
 
 /**
  * Execute tool calls in a focused loop with filtered tool subset.
@@ -118,6 +134,15 @@ export async function executeTools(
         continue;
       }
 
+      // Emit thinking step: which tool is being called
+      emitProcessingStep(
+        context.chatSessionId,
+        'agent_executing_tool',
+        `Using ${humanizeToolName(toolName)}...`,
+        computeToolProgress(toolResults.length, filteredTools.length),
+        { toolName, round: toolRound }
+      );
+
       logger.info('[EXECUTOR_AGENT] Executing tool', { toolName, args: JSON.stringify(toolArgs) });
 
       try {
@@ -166,6 +191,17 @@ export async function executeTools(
           durationMs: Date.now() - toolStartMs,
         });
 
+        // Emit thinking step: tool result
+        emitProcessingStep(
+          context.chatSessionId,
+          'agent_executing_tool',
+          toolResult.success
+            ? `${humanizeToolName(toolName)} done`
+            : `${humanizeToolName(toolName)} had an issue`,
+          computeToolProgress(toolResults.length, filteredTools.length),
+          { toolName, success: toolResult.success, durationMs: Date.now() - toolStartMs }
+        );
+
         logger.info('[EXECUTOR_AGENT] Tool executed', {
           toolName,
           success: toolResult.success,
@@ -193,6 +229,15 @@ export async function executeTools(
           result: { success: false, message: errorResult.message },
           durationMs: Date.now() - toolStartMs,
         });
+
+        // Emit thinking step: tool error
+        emitProcessingStep(
+          context.chatSessionId,
+          'agent_executing_tool',
+          `${humanizeToolName(toolName)} failed`,
+          computeToolProgress(toolResults.length, filteredTools.length),
+          { toolName, success: false }
+        );
       }
     }
   }
