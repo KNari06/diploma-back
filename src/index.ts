@@ -1103,6 +1103,24 @@ app.get('/api/architecture', requireDocsAuth, (req: express.Request, res: expres
 
 /**
  * @swagger
+ * /health/live:
+ *   get:
+ *     summary: Lightweight liveness probe
+ *     description: Always returns 200 when process is running (for Cloud Run startup/liveness probes)
+ *     tags: [Health]
+ *     responses:
+ *       200:
+ *         description: Process is alive
+ */
+app.get('/health/live', (req: express.Request, res: express.Response) => {
+  res.status(200).json({
+    status: 'alive',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * @swagger
  * /health:
  *   get:
  *     summary: Health check endpoint
@@ -1376,15 +1394,26 @@ const startServer = async () => {
 
       const dbConnected = await Promise.race([dbCheckPromise, dbTimeoutPromise]);
       if (!dbConnected) {
-        logger.error('[SERVER] Failed to connect to database. Exiting...');
+        if (env.NODE_ENV === 'production') {
+          logger.warn('[SERVER] Database connection unavailable on startup. Running in limited mode.');
+        } else {
+          logger.error('[SERVER] Failed to connect to database. Exiting...');
+          process.exit(1);
+        }
+      } else {
+        logger.info('✓ Database connection verified');
+      }
+    } catch (dbError) {
+      if (env.NODE_ENV === 'production') {
+        logger.warn('[SERVER] Database connection failed on startup. Running in limited mode.', {
+          error: dbError instanceof Error ? dbError.message : String(dbError),
+        });
+      } else {
+        logger.error('[SERVER] Database connection failed', {
+          error: dbError instanceof Error ? dbError.message : String(dbError),
+        });
         process.exit(1);
       }
-      logger.info('✓ Database connection verified');
-    } catch (dbError) {
-      logger.error('[SERVER] Database connection failed', {
-        error: dbError instanceof Error ? dbError.message : String(dbError),
-      });
-      process.exit(1);
     }
 
     // Test queue connection (non-blocking in development)
@@ -1396,27 +1425,19 @@ const startServer = async () => {
 
       const queueHealth = await Promise.race([queueCheckPromise, queueTimeoutPromise]);
       if (queueHealth.status !== 'healthy') {
-        if (env.NODE_ENV === 'development') {
+        if (env.NODE_ENV === 'production') {
+          logger.warn('[SERVER] Queue service is unhealthy on startup. Running in limited mode.');
+        } else {
           logger.warn('[SERVER] ⚠️  Queue service is unavailable. Running in limited mode.');
           logger.warn('[SERVER] 💡 To enable full functionality, start Redis: redis-server');
-        } else {
-          logger.error('[SERVER] Queue service is unhealthy. Exiting...');
-          process.exit(1);
         }
       } else {
         logger.info('✓ Queue connection verified');
       }
     } catch (queueError) {
-      if (env.NODE_ENV === 'development') {
-        logger.warn('[SERVER] Queue health check failed, continuing in development mode', {
-          error: queueError instanceof Error ? queueError.message : String(queueError),
-        });
-      } else {
-        logger.error('[SERVER] Queue health check failed', {
-          error: queueError instanceof Error ? queueError.message : String(queueError),
-        });
-        process.exit(1);
-      }
+      logger.warn('[SERVER] Queue health check failed on startup, continuing in limited mode', {
+        error: queueError instanceof Error ? queueError.message : String(queueError),
+      });
     }
 
     // Start HTTP server
@@ -1518,10 +1539,8 @@ const startServer = async () => {
       logger.error('[SERVER] Failed to initialize WebSocket server:', {
         error: wsError instanceof Error ? wsError.message : String(wsError),
       });
-      // Continue without WebSocket in development
-      if (env.NODE_ENV !== 'development') {
-        process.exit(1);
-      }
+      // Keep API alive even if WS init fails; health endpoint will reflect dependency status.
+      logger.warn('[SERVER] Continuing without WebSocket subsystem');
     }
 
     // Graceful shutdown
