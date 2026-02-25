@@ -510,6 +510,15 @@ If the user asks to test something on the current page, prefer platform_test int
             abortSignal,
           });
 
+          // Store pipeline metrics for analytics (regardless of success/failure)
+          if (trackingSessionId) {
+            AIUsageTracker.recordPipelineMetrics(trackingSessionId, {
+              path: pipelineResult.path,
+              success: pipelineResult.success,
+              ...pipelineResult.metrics,
+            });
+          }
+
           if (pipelineResult.success) {
             logger.info('[GENERAL_CHAT] Sub-agent pipeline succeeded', {
               path: pipelineResult.path,
@@ -680,6 +689,16 @@ If the user asks to test something on the current page, prefer platform_test int
         ? `${lastAssistantMsg.content}\n\n(Note: I reached the maximum number of analysis steps. The above may be incomplete — feel free to ask a follow-up question for more detail.)`
         : "I ran out of analysis steps before completing my response. Could you try asking a more specific question so I can answer within fewer steps?";
       logger.warn('[GENERAL_CHAT] Max tool rounds reached', { rounds: MAX_TOOL_ROUNDS });
+    }
+
+    // Record monolithic fallback metrics for agent health tracking
+    if (trackingSessionId) {
+      AIUsageTracker.recordPipelineMetrics(trackingSessionId, {
+        path: 'monolithic_fallback',
+        success: true,
+        totalMs: 0, // not tracked in monolithic loop
+        toolRounds: toolRound,
+      });
     }
 
     gptResponse = { content: finalResponse, usage: undefined };

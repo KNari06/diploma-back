@@ -556,7 +556,7 @@ export class PricingPlansService {
             // Get credit options from database for pro and ultra plans
             let creditOptions: any[];
 
-            if (plan.slug === 'pro' || plan.slug === 'ultra') {
+            if (plan.slug === 'pro') {
               logger.info('[PRICING_PLANS] Loading credit options for plan', {
                 planSlug: plan.slug,
                 planId: plan.id,
@@ -590,6 +590,9 @@ export class PricingPlansService {
                   savings: 0,
                 }];
               }
+            } else if (plan.slug === 'ultra') {
+              // Ultra/Business is contact_required — no credit_options needed
+              creditOptions = [];
             } else {
               // For free plan, use default option
               creditOptions = [{

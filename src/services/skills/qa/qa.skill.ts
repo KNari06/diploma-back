@@ -32,6 +32,7 @@ import {
   handleGetHeatmap,
   handleGetTimeSeries,
   handleGetFullDashboard,
+  handleGetAgentHealth,
   handleUpdateTestCaseSteps,
   // Write tools — Tier 1
   handleUpdateTestCase,
@@ -743,6 +744,25 @@ const QA_TOOLS: ChatCompletionTool[] = [
     },
   },
 
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_agent_health',
+      description:
+        'Agent pipeline performance metrics: success/fallback rates, avg latency, router confidence, top tools used. Use for questions about agent performance, reliability, or "how is the AI doing?".',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: {
+            type: 'number',
+            description: 'Look back N days (default 7, max 30)',
+          },
+        },
+        required: [],
+      },
+    },
+  },
+
   // ═══════════════════════════════════════════════════════════════
   // WRITE tools (require confirm=true after user approval)
   // ═══════════════════════════════════════════════════════════════
@@ -1305,7 +1325,7 @@ export const QASkill: SkillDefinition = {
   name: 'QA Tools',
   provider: 'qa',
   description:
-    'Query and manage test cases, executions, regression plans, analytics, API test configs/history, coverage reports, failure analysis, recommendations, fixtures, deployments, Jira issues, element interactions, AI usage, heatmaps, time series, and full dashboard snapshots. 30 read-only tools + 11 write tools for comprehensive QA data access and management.',
+    'Query and manage test cases, executions, regression plans, analytics, API test configs/history, coverage reports, failure analysis, recommendations, fixtures, deployments, Jira issues, element interactions, AI usage, heatmaps, time series, and full dashboard snapshots. 31 read-only tools + 11 write tools for comprehensive QA data access and management.',
   tools: QA_TOOLS,
 
   /**
@@ -1424,6 +1444,9 @@ export const QASkill: SkillDefinition = {
 
         case 'qa_get_full_dashboard':
           return await handleGetFullDashboard(args, context);
+
+        case 'qa_get_agent_health':
+          return await handleGetAgentHealth(args, context);
 
         // Write tools
         case 'qa_update_test_case_steps':

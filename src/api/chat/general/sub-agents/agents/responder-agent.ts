@@ -1,4 +1,5 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
 import { buildResponderPrompt, buildSimpleChatPrompt } from '../prompts/responder-prompt';
@@ -60,7 +61,7 @@ Format these results into a natural response for the user.`,
     });
 
     const aiPromise = getChatCompletionWithMessages(messages, {
-      model: 'gpt-4o-mini',
+      model: AI_TASK_MODELS.chatResponder,
       temperature: 0.5,
       max_tokens: 1500,
       abortSignal,
@@ -113,7 +114,7 @@ export async function generateSimpleResponse(
 
   try {
     const response = await getChatCompletionWithMessages(messages, {
-      model: 'gpt-4o-mini',
+      model: AI_TASK_MODELS.chatResponder,
       temperature: 0.5,
       max_tokens: 1500,
       abortSignal,

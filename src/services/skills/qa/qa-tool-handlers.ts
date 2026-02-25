@@ -2183,6 +2183,115 @@ export async function handleGetFullDashboard(
   }
 }
 
+/**
+ * qa_get_agent_health — Agent pipeline performance metrics from ai_usage_log
+ */
+export async function handleGetAgentHealth(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const days = Math.min(args.days || 7, 30);
+
+  try {
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - days);
+
+    // Query ai_usage_log for chat operations with pipeline_metrics
+    const { data, error } = await supabaseAdmin
+      .from('ai_usage_log')
+      .select('pipeline_metrics, total_tokens, total_cost_usd, session_duration_ms, created_at')
+      .eq('workspace_id', context.workspaceId)
+      .eq('operation_type', 'chat')
+      .gte('created_at', sinceDate.toISOString())
+      .not('pipeline_metrics', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    if (error) {
+      return { success: false, message: `Database error: ${error.message}`, displayToUser: false };
+    }
+
+    const rows = data || [];
+    if (rows.length === 0) {
+      return {
+        success: true,
+        data: { message: 'No pipeline metrics found for this period', periodDays: days },
+        message: `No agent pipeline data in the last ${days} days`,
+        displayToUser: false,
+      };
+    }
+
+    // Aggregate metrics
+    let successCount = 0;
+    let fallbackCount = 0;
+    let totalMs = 0;
+    const pathCounts: Record<string, number> = {};
+    const toolCounts: Record<string, number> = {};
+    let totalConfidence = 0;
+    let confidenceCount = 0;
+
+    for (const row of rows) {
+      const m = row.pipeline_metrics as any;
+      if (!m) continue;
+
+      if (m.success) successCount++;
+      else fallbackCount++;
+
+      totalMs += m.totalMs || 0;
+
+      const path = m.path || 'unknown';
+      pathCounts[path] = (pathCounts[path] || 0) + 1;
+
+      if (Array.isArray(m.toolsExecuted)) {
+        for (const tool of m.toolsExecuted) {
+          toolCounts[tool] = (toolCounts[tool] || 0) + 1;
+        }
+      }
+
+      if (typeof m.routerConfidence === 'number') {
+        totalConfidence += m.routerConfidence;
+        confidenceCount++;
+      }
+    }
+
+    const total = successCount + fallbackCount;
+    const successRate = total > 0 ? Math.round((successCount / total) * 100) : 0;
+    const avgLatencyMs = total > 0 ? Math.round(totalMs / total) : 0;
+    const avgConfidence = confidenceCount > 0 ? Math.round((totalConfidence / confidenceCount) * 100) / 100 : 0;
+
+    // Top 5 most used tools
+    const topTools = Object.entries(toolCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([name, count]) => ({ name, count }));
+
+    return {
+      success: true,
+      data: {
+        periodDays: days,
+        totalRequests: total,
+        successRate,
+        fallbackRate: 100 - successRate,
+        avgLatencyMs,
+        avgRouterConfidence: avgConfidence,
+        pathDistribution: pathCounts,
+        topTools,
+      },
+      message: `Agent health (${days}d): ${total} requests, ${successRate}% success rate, ${avgLatencyMs}ms avg latency, ${avgConfidence} avg router confidence`,
+      displayToUser: false,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetAgentHealth error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get agent health: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WRITE TOOLS (require confirm=true from agent after user approval)
 // ═══════════════════════════════════════════════════════════════════════════
