@@ -863,14 +863,14 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_run_test',
       description:
-        '⚠️ WRITE operation — Run a test case, plan, module, flow, or filter by tag/priority. Describe what will run → get approval → call with confirm=true.',
+        '⚠️ WRITE operation — Run a test case, plan, module, flow, or filter by tag/priority. Use run_type="preview" to run steps on the live editor preview session. Describe what will run → get approval → call with confirm=true.',
       parameters: {
         type: 'object',
         properties: {
           run_type: {
             type: 'string',
-            enum: ['test_case', 'plan', 'module', 'flow', 'tag', 'priority'],
-            description: 'What to run',
+            enum: ['test_case', 'plan', 'module', 'flow', 'tag', 'priority', 'preview'],
+            description: 'What to run. Use "preview" to execute test case steps on the live editor preview browser.',
           },
           target_id: {
             type: 'string',

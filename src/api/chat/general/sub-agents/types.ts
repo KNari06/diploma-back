@@ -137,6 +137,8 @@ export interface PipelineContext {
   workspaceId: string;
   chatSessionId?: string;
   projectId?: string;
+  previewSessionId?: string; // Active editor preview session
+  mode?: 'lite' | 'pro' | 'editor';
 }
 
 /**

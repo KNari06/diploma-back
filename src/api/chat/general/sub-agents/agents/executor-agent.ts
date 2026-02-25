@@ -81,7 +81,7 @@ export async function executeTools(
   let assistantContent = '';
 
   // Build executor messages
-  const executorPrompt = buildExecutorPrompt(plan, context.projectId);
+  const executorPrompt = buildExecutorPrompt(plan, context.projectId, context.mode);
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: executorPrompt },
     // Include relevant context messages (system prompts with memory/KB/history)
@@ -203,6 +203,7 @@ export async function executeTools(
             workspaceId: context.workspaceId,
             chatSessionId: context.chatSessionId,
             projectId: context.projectId,
+            previewSessionId: context.previewSessionId,
           };
           toolResult = await withTimeout(
             SkillRegistry.executeTool(toolName, toolArgs, skillContext)

@@ -393,8 +393,25 @@ You CAN see the current page. A "CURRENT PAGE CONTEXT" system message contains t
 NEVER say "I can't view the page" or "I don't have the ability to view web pages" — you DO have page context provided below.
 When the user asks about elements on the page, ALWAYS refer to the page context provided to you.
 When referencing page elements, use their ref IDs (e.g., ref=b1, ref=i3).
-You can suggest test actions like "click button ref=b1" or "type 'hello' into input ref=i2".
-If the user asks to test something on the current page, prefer platform_test intent with the current URL.`;
+
+EDITOR MODE CAPABILITIES:
+1. **Create/complete test cases from live page**: You can SEE the current page DOM. When the user asks to create a test case or add steps, analyze the page elements (forms, buttons, inputs) and generate concrete test steps with real values based on what you see. Use qa_create_test_case or qa_update_test_case_steps to save them.
+2. **Run test cases on the live preview**: After creating/finding a test case, you can run its steps on the live preview browser using qa_run_test with run_type="preview" and target_id=<test case ID>. Steps execute on the browser the user is looking at. Progress appears in real-time.
+3. **Single actions**: When the user asks to perform a SINGLE action (click, type, scroll, press, hover), this is an editor_action — execute it directly on the live preview.
+4. **Run/replay saved tests**: When the user asks to run or replay a saved test, this is run_regression. There is no platform_test in editor mode.
+
+TYPICAL EDITOR WORKFLOW:
+- User: "create a login test for this page" → You analyze DOM, generate steps, call qa_create_test_case → return the created test case ID
+- User: "run it" / "прогани" / "запусти" → You call qa_run_test(run_type="preview", target_id=<ID from previous response>, confirm=true) → steps execute on live browser
+- Short follow-ups like "прогани", "go", "давай" after test case creation = run on preview. Look at your last response for the test case ID.
+
+WHEN THE PAGE DOESN'T MATCH THE REQUEST:
+- If the user asks to test something NOT visible in the current DOM (e.g., "test booking" but page shows a landing page), tell them:
+  "I can see [what's actually on the page]. The booking form isn't on this page. Navigate to the booking page first, or I can add a 'navigate' step to get there."
+- NEVER invent elements that aren't in the page context. Only reference elements you can actually see.
+- You CAN include a "navigate" step as the first step to go to the right URL, then describe the remaining steps generically (they'll be resolved at runtime by the element resolver).
+
+When generating test steps, be SPECIFIC — use actual element labels, placeholders, and ref IDs from the page context. Don't generate generic steps like "enter username" — generate "type 'student' into input ref=i1 (Username field)".`;
   }
 
   // Enhance system prompt with old context summary from vector search
@@ -532,6 +549,8 @@ If the user asks to test something on the current page, prefer platform_test int
             workspaceId,
             chatSessionId,
             projectId,
+            previewSessionId: parsedContext?.previewSessionId,
+            mode: mode as 'lite' | 'pro' | 'editor' | undefined,
           });
 
           // Extract the user content from the last message (may be multimodal array with images)
@@ -683,7 +702,7 @@ If the user asks to test something on the current page, prefer platform_test int
           } else {
             // Skill tools
             const { SkillRegistry } = await import('@/services/skills');
-            const skillContext = { userId, workspaceId: workspaceId!, chatSessionId, projectId };
+            const skillContext = { userId, workspaceId: workspaceId!, chatSessionId, projectId, previewSessionId: parsedContext?.previewSessionId };
             toolResult = await withToolTimeout(SkillRegistry.executeTool(toolName, toolArgs, skillContext));
           }
 

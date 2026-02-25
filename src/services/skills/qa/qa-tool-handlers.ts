@@ -2613,7 +2613,7 @@ export async function handleRunTest(
     return { success: false, message: 'Missing required field: run_type', displayToUser: false };
   }
 
-  const validRunTypes = ['test_case', 'plan', 'module', 'flow', 'tag', 'priority'];
+  const validRunTypes = ['test_case', 'plan', 'module', 'flow', 'tag', 'priority', 'preview'];
   if (!validRunTypes.includes(runType)) {
     return { success: false, message: `Invalid run_type: ${runType}. Must be one of: ${validRunTypes.join(', ')}`, displayToUser: false };
   }
@@ -2739,6 +2739,33 @@ export async function handleRunTest(
           success: true,
           data: { runId: result.runId, totalTests: result.totalTests, runType, priority: priorityFilter },
           message: `Started priority run "${priorityFilter}": ${result.runId} (${result.totalTests} tests)`,
+          displayToUser: true,
+        };
+      }
+
+      case 'preview': {
+        if (!targetId) {
+          return { success: false, message: 'Missing required field: target_id (intent test case ID)', displayToUser: false };
+        }
+        if (!context.previewSessionId) {
+          return { success: false, message: 'Preview run requires an active editor preview session. This run_type is only available in editor mode.', displayToUser: false };
+        }
+        const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+        if (PreviewRunService.isRunning(context.previewSessionId)) {
+          return { success: false, message: 'A run is already in progress on this preview session. Wait for it to finish or cancel it first.', displayToUser: false };
+        }
+        // Fire-and-forget: progress is streamed via WebSocket events (preview:run:started, preview:run:step, preview:run:completed)
+        PreviewRunService.runSavedSteps(context.previewSessionId, targetId, context.userId).catch(err => {
+          logger.error('[QA_TOOL] Preview run failed', {
+            error: err instanceof Error ? err.message : String(err),
+            previewSessionId: context.previewSessionId,
+            intentTestCaseId: targetId,
+          });
+        });
+        return {
+          success: true,
+          data: { intentTestCaseId: targetId, previewSessionId: context.previewSessionId, runType },
+          message: `Started preview run for test case ${targetId}. Steps are executing on the live preview — watch the browser.`,
           displayToUser: true,
         };
       }

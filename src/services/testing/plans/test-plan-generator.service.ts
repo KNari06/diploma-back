@@ -538,10 +538,10 @@ export function formatTestPlanForConfirmation(
   // ✅ UNIFIED: Support both AI-generated and standard test plans
   const isAiGenerated = plan.intelligentMode;
 
-  // Header with appropriate mode indication (### so it renders smaller on frontend)
+  // Header (bold text, not heading — keeps it compact in chat UI)
   let markdown = isAiGenerated
-    ? `### 🧠 AI Test Plan for Confirmation\n`
-    : `### 🧪 Test Plan for Confirmation\n`;
+    ? `**🧠 AI Test Plan**\n`
+    : `**🧪 Test Plan**\n`;
 
   // Basic info
   markdown += `**Plan ID:** \`${plan.id}\`\n`;
@@ -555,7 +555,7 @@ export function formatTestPlanForConfirmation(
   // markdown += `**Estimated Duration:** ${plan.estimatedDuration}\n`;
 
   // Summary
-  markdown += `### 📋 Summary\n${plan.summary}\n`;
+  markdown += `\n**📋 Summary**\n${plan.summary}\n`;
 
   // AI-specific estimates (if available)
   // if (isAiGenerated && (plan.estimatedPages || plan.estimatedCost)) {
@@ -571,7 +571,7 @@ export function formatTestPlanForConfirmation(
 
   // AI explanation (for AI-generated plans)
   if (isAiGenerated) {
-    markdown += `### 🤖 How AI Testing Works\n`;
+    markdown += `\n**🤖 How AI Testing Works**\n`;
     markdown += `This AI-generated test plan will:\n`;
     markdown += `1. **Execute pre-analyzed test steps** tailored to your specific site\n`;
     markdown += `2. **Adapt to page context** based on URL analysis and user intent\n`;
@@ -580,7 +580,7 @@ export function formatTestPlanForConfirmation(
   }
 
   // What will be tested
-  markdown += `### ✅ What Will Be Tested\n`;
+  markdown += `\n**✅ What Will Be Tested**\n`;
   for (const item of plan.whatWillBeTested) {
     markdown += `- ${item}\n`;
   }
@@ -593,7 +593,7 @@ export function formatTestPlanForConfirmation(
     plan.steps.some(s => s.selector || (s.action && !s.action.startsWith('intelligent_')));
 
   if (hasConcreteSteps || (!isAiGenerated && plan.steps && plan.steps.length > 0)) {
-    markdown += `\n### 🔍 Test Steps\n`;
+    markdown += `\n**🔍 Test Steps**\n`;
     if (isAiGenerated) {
       markdown += `*These steps will be executed intelligently by the AI agent, adapting to page context dynamically.*\n\n`;
     }
@@ -632,7 +632,7 @@ export function formatTestPlanForConfirmation(
     }
   } else if (isAiGenerated && plan.steps && plan.steps.length > 0) {
     // Show intelligent steps even if they don't have selectors
-    markdown += `\n### 🔍 Test Execution\n\n`;
+    markdown += `\n**🔍 Test Execution**\n\n`;
     for (let i = 0; i < plan.steps.length; i++) {
       const step = plan.steps[i];
       markdown += `**${i + 1}. ${step.description}**\n`;
@@ -665,13 +665,13 @@ export function formatTestPlanForConfirmation(
 
   // Notes (NEW) - show before risks
   if (plan.notes) {
-    markdown += `\n### 📝 Notes\n`;
+    markdown += `\n**📝 Notes**\n`;
     markdown += `${plan.notes}\n`;
   }
 
   // Risks
   if (plan.risks.length > 0) {
-    markdown += `### 🚨 Warning Points\n`;
+    markdown += `\n**🚨 Warning Points**\n`;
     for (const risk of plan.risks) {
       markdown += `- ${risk}\n`;
     }
@@ -680,7 +680,7 @@ export function formatTestPlanForConfirmation(
 
   // Safety features (for AI plans)
   if (isAiGenerated) {
-    markdown += `### 🛡️ Safety Features\n`;
+    markdown += `\n**🛡️ Safety Features**\n`;
     markdown += `- Real-time progress updates via WebSocket\n`;
     markdown += `- Automatic detection of dangerous actions (payment, delete, etc.)\n`;
     markdown += `- Intelligent timeout and error handling\n`;

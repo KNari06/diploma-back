@@ -190,7 +190,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       workspace_id,
       checkRequestTimeout,
       abortSignal, // Pass abort signal for cancellation checks
-      functionLogger
+      functionLogger,
+      inputResult.mode || 'lite' // Pass mode for editor action detection
     );
 
     // Check if request was cancelled

@@ -96,7 +96,8 @@ export async function parseIntent(
   workspace_id: string,
   checkRequestTimeout: () => void,
   abortSignal?: AbortSignal,
-  functionLogger?: FunctionLogger
+  functionLogger?: FunctionLogger,
+  mode?: 'lite' | 'pro' | 'editor'
 ): Promise<any> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 4: PARSE INTENT (Only if not responding to test plan) (FIX #5)
@@ -375,7 +376,12 @@ export async function parseIntent(
         : parseUserIntent;
       parsedIntent = await parseUserIntentWithLogging(
         validMessage,
-        { chatHistory, ...regressionContext }, // Include regression context
+        {
+          chatHistory,
+          ...regressionContext,
+          mode,
+          previewSessionId: contextObj?.previewSessionId,
+        },
         projectId ?? workspace_id, // Use project_id from session if available, fallback to workspace_id
         availableIntents // Pass dynamic intent list
       );
@@ -406,6 +412,12 @@ export async function parseIntent(
           userId,
         });
         parsedIntent.intent = 'general_chat'; // Fallback to safe default
+      }
+
+      // Hard guard: platform_test is never valid in editor mode
+      if (mode === 'editor' && parsedIntent.intent === 'platform_test') {
+        logger.warn('[CHAT] platform_test blocked in editor mode, redirecting to general_chat', { userId });
+        parsedIntent.intent = 'general_chat';
       }
     } catch (intentError) {
       logger.error('[CHAT] parseUserIntent failed', {
@@ -491,6 +503,9 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
       }
       return 'I need a bit more information to help you better';
 
+    case 'editor_action':
+      return 'Got it! Executing action on the page...';
+
     case 'general_chat':
       return 'Got it! Let me help you with that';
 
@@ -498,3 +513,4 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
       return 'Intent understood!';
   }
 }
+

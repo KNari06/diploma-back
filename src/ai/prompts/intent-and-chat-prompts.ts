@@ -20,6 +20,10 @@ export interface IntentParserContext {
   projectInfo?: string;
   chatHistory?: Array<{ role: string; content: string }>; // Chat history for context
 
+  // Editor mode context
+  mode?: 'lite' | 'pro' | 'editor';
+  previewSessionId?: string;   // Active preview session (editor mode)
+
   // Regression context (for save/run test intents)
   lastTestId?: string;          // ID of last executed test
   lastTestGoal?: string;        // Goal/description of last test
@@ -97,6 +101,34 @@ CONTEXT RULES:
     • Use Last failed test ID as sourceTestId (preferred)
     • If no failed test ID, fall back to last test ID
     • If neither available → needs_clarification
+`;
+}
+
+/**
+ * Build editor mode context section for intent prompt.
+ * Only included when user is in editor mode with a live preview session.
+ */
+function buildEditorModeSection(context?: IntentParserContext): string {
+  if (!context || context.mode !== 'editor' || !context.previewSessionId) return '';
+
+  return `
+--- EDITOR MODE (ACTIVE) ---
+
+The user is in EDITOR MODE with a live browser preview (previewSessionId: ${context.previewSessionId}).
+The chat is embedded inside the editor — there is NO platform_test flow here.
+
+EDITOR MODE INTENT RULES (override general rules):
+- "platform_test" is NOT AVAILABLE in editor mode. NEVER choose it.
+- Single action on the page (click, type, scroll, press, hover, select, check, uncheck) → "editor_action"
+  Executed DIRECTLY on the live preview — no test plan needed.
+- "create a test case for this page", "make me a login test", "add steps", "finish test case" → "general_chat"
+  The sub-agent uses QA tools + page DOM context to create/update test cases, then can run them on the live preview.
+- "run this test", "replay", "запусти тест", "run it on the preview" → "general_chat"
+  The sub-agent calls qa_run_test(run_type="preview") to execute steps on the live browser.
+- "run saved test", "запусти регресс" (background headless run) → "run_regression"
+- Questions, conversation, analysis, explanations → "general_chat"
+- Everything else follows normal intent rules (save_test, analyze_failure, etc.)
+
 `;
 }
 
@@ -199,8 +231,13 @@ AVAILABLE INTENTS: ${intents.join(', ')}
 9. "coverage_analysis" - See test COVERAGE gaps (no test execution, DB analysis only)
    - "what's not covered?", "coverage analysis", "покажи покрытие", "gap analysis", "что не покрыто", "what's not tested?"
 
-${regressionContextStr}
+10. "editor_action" - Execute a SINGLE direct action on the current page in editor mode
+   - User asks for an IMMEDIATE single action: "click X", "type X in Y", "scroll down", "press Enter", "hover over X"
+   - Only when user has a live preview session (previewSessionId in context)
+   - NOT for questions about the page — use general_chat for those
 
+${regressionContextStr}
+${buildEditorModeSection(context)}
 --- DECISION TREE ---
 
 1. System-provided context ("URL FOUND IN HISTORY" / "extractedUrl"):
@@ -242,7 +279,7 @@ CRITICAL anti-hallucination rule:
 
 REQUIRED FIELDS (always include):
 {
-  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis",
+  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis" | "editor_action",
   "intent_confidence": 0.0-1.0,
   "rawText": string
 }
@@ -345,7 +382,16 @@ Ex21: "what's the pass rate this month?"
 → {"intent": "general_chat", "intent_confidence": 0.90, "rawText": "..."}
 
 Ex22: "сколько регрессионных планов?"
-→ {"intent": "general_chat", "intent_confidence": 0.88, "rawText": "..."}`;
+→ {"intent": "general_chat", "intent_confidence": 0.88, "rawText": "..."}
+
+Ex23: "click the login button" (previewSessionId in context)
+→ {"intent": "editor_action", "intent_confidence": 0.95, "rawText": "..."}
+
+Ex24: "type hello in the search input" (previewSessionId in context)
+→ {"intent": "editor_action", "intent_confidence": 0.93, "rawText": "..."}
+
+Ex25: "run the registration test" (previewSessionId in context, editor mode)
+→ {"intent": "run_regression", "intent_confidence": 0.88, "rawText": "..."}`;
 
   // Add context if available
   if (context) {
