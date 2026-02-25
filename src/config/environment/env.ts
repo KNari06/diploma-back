@@ -128,6 +128,13 @@ if (!parseResult.success) {
 // Generate secrets for development if not provided
 const parsedEnv = parseResult.data;
 
+// If REDIS_URL is not explicitly provided, build it from REDIS_HOST/REDIS_PORT.
+// This avoids accidental localhost fallback in Cloud Run where only host/port are injected.
+if (!process.env.REDIS_URL) {
+  const redisAuthPart = parsedEnv.REDIS_PASSWORD ? `:${encodeURIComponent(parsedEnv.REDIS_PASSWORD)}@` : '';
+  parsedEnv.REDIS_URL = `redis://${redisAuthPart}${parsedEnv.REDIS_HOST}:${parsedEnv.REDIS_PORT}`;
+}
+
 // Set default BullMQ prefix if not provided.
 // IMPORTANT: Must be deterministic across processes on the same host (server + worker),
 // otherwise queues won't match.
