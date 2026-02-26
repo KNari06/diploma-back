@@ -66,6 +66,9 @@ export function getToolTimeout(toolName: string): number {
  * Whichever fires first wins — the tool promise continues in background
  * but its result is discarded (JS can't truly cancel a running Promise).
  *
+ * IMPORTANT: Cleans up timers and listeners after the race settles to prevent
+ * memory leaks under high concurrency (parallel sub-executors × tool rounds).
+ *
  * @param promise  - The tool execution promise
  * @param toolName - Tool name (for timeout lookup + error messages)
  * @param abortSignal - Optional AbortSignal to race against
@@ -77,12 +80,19 @@ export function withToolTimeoutAndAbort<T>(
 ): Promise<T> {
   const timeoutMs = getToolTimeout(toolName);
 
+  // Track cleanup handles
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  let abortHandler: (() => void) | undefined;
+
   const racers: Promise<T>[] = [
     promise,
-    // Timeout racer
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`Tool '${toolName}' timed out after ${timeoutMs}ms`)), timeoutMs)
-    ),
+    // Timeout racer (with clearable timer)
+    new Promise<never>((_, reject) => {
+      timerId = setTimeout(
+        () => reject(new Error(`Tool '${toolName}' timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+    }),
   ];
 
   // Abort racer — only if signal exists and isn't already aborted
@@ -91,15 +101,18 @@ export function withToolTimeoutAndAbort<T>(
       return Promise.reject(new Error(`Tool '${toolName}' skipped — request already cancelled`));
     }
     racers.push(
-      new Promise<never>((_, reject) =>
-        abortSignal.addEventListener(
-          'abort',
-          () => reject(new Error(`Tool '${toolName}' cancelled — request aborted`)),
-          { once: true }
-        )
-      )
+      new Promise<never>((_, reject) => {
+        abortHandler = () => reject(new Error(`Tool '${toolName}' cancelled — request aborted`));
+        abortSignal.addEventListener('abort', abortHandler, { once: true });
+      })
     );
   }
 
-  return Promise.race(racers);
+  // Race and clean up regardless of outcome
+  return Promise.race(racers).finally(() => {
+    if (timerId !== undefined) clearTimeout(timerId);
+    if (abortHandler && abortSignal) {
+      abortSignal.removeEventListener('abort', abortHandler);
+    }
+  });
 }

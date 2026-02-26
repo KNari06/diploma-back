@@ -103,7 +103,26 @@ export class Blackboard {
   }
 
   /**
+   * Status transition precedence (higher = more final).
+   * Guards against backward transitions during concurrent sub-executor updates.
+   * E.g. prevents completed → in_progress if a late update arrives out of order.
+   */
+  private static readonly STATUS_PRECEDENCE: Record<PlanStepStatus, number> = {
+    pending: 0,
+    in_progress: 1,
+    completed: 3,
+    failed: 3,
+    skipped: 2,
+  };
+
+  /**
    * Update the status of a specific plan step (called by executor during execution).
+   *
+   * Concurrent-safe: guards against backward status transitions that can happen
+   * when parallel sub-executors update the same blackboard across await boundaries.
+   * E.g. if step is already 'completed', a late 'in_progress' update is ignored.
+   *
+   * Exception: 'pending' reset (used by retry loop) is always allowed regardless of current status.
    */
   updateStepStatus(
     stepNumber: number,
@@ -117,6 +136,19 @@ export class Blackboard {
     const step = this.state.plan.steps.find(s => s.stepNumber === stepNumber);
     if (!step) {
       logger.warn('[BLACKBOARD] Step not found for status update', { stepNumber, status });
+      return;
+    }
+
+    // Guard against backward transitions (except explicit reset to pending for retries)
+    const currentPrecedence = Blackboard.STATUS_PRECEDENCE[step.status] ?? 0;
+    const newPrecedence = Blackboard.STATUS_PRECEDENCE[status] ?? 0;
+    if (status !== 'pending' && newPrecedence < currentPrecedence) {
+      logger.warn('[BLACKBOARD] Ignoring backward status transition', {
+        stepNumber,
+        from: step.status,
+        to: status,
+        executorId,
+      });
       return;
     }
 
@@ -181,11 +213,22 @@ export class Blackboard {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Return a read-only snapshot of the entire blackboard.
-   * Used by agents that need to read all context (e.g., Responder).
+   * Return a shallow-frozen snapshot of the blackboard.
+   * Steps array is copied so concurrent mutations don't affect the reader.
+   * Used by Responder (reads full context) and Reviewer (reads execution results).
    */
   snapshot(): Readonly<PipelineBlackboard> {
-    return this.state;
+    return {
+      ...this.state,
+      // Copy steps array so reader sees a stable list even if sub-executors update during iteration
+      plan: this.state.plan
+        ? {
+            ...this.state.plan,
+            steps: this.state.plan.steps.map(s => ({ ...s })),
+          }
+        : undefined,
+      insights: [...this.state.insights],
+    };
   }
 
   /**

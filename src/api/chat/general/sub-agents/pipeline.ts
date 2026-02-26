@@ -249,6 +249,18 @@ export class SubAgentPipeline {
           subExecutorIds: [],
         });
 
+        // Lightweight reviewer for single_tool: run if enabled and not aborted.
+        // Uses the same reviewer — deterministic fast-paths handle most cases (0 tokens).
+        // Only reaches AI phase for partial failures or ambiguous outcomes.
+        if (SUB_AGENT_CONFIG.enableReviewer && !input.abortSignal?.aborted) {
+          const singleReviewStart = Date.now();
+          const singleReviewResult = await reviewExecution(blackboard, input.abortSignal);
+          metrics.reviewerMs = Date.now() - singleReviewStart;
+          metrics.reviewerVerdict = singleReviewResult.verdict;
+          blackboard.setReviewResult(singleReviewResult);
+          // No retry loop for single_tool — just capture guidance for the responder
+        }
+
         // Format response (with blackboard context)
         this.emitStep('agent_formatting', 'Formatting results...', PROGRESS.PIPELINE_FORMATTING);
         const responderStart = Date.now();
@@ -298,7 +310,7 @@ export class SubAgentPipeline {
       );
       metrics.plannerMs = Date.now() - plannerStart;
 
-      if (planResult) {
+      if (planResult && planResult.steps.length > 0) {
         // Identify parallel groups and write to blackboard
         const parallelGroups = identifyParallelGroups(planResult.steps);
         blackboard.setPlan(planResult, parallelGroups);
@@ -307,8 +319,15 @@ export class SubAgentPipeline {
         this.emitStep('agent_planning', `Plan ready: ${planResult.steps.length} ${stepWord}`, PROGRESS.PIPELINE_PLANNING_DONE, {
           summary: planResult.summary,
           stepCount: planResult.steps.length,
-          canParallelize: parallelGroups.length > 1,
+          canParallelize: parallelGroups.some(g => g.length > 1),
         });
+      } else {
+        // Planner failed or returned empty plan — log and continue as unplanned multi_tool.
+        // Executor will operate without structured steps (like enhanced single_tool).
+        logger.warn('[SUB_AGENT_PIPELINE] Planner returned no plan — executing without structured plan', {
+          plannerResult: planResult ? 'empty steps' : 'null',
+        });
+        blackboard.addInsight('Planner could not create a plan — executing tools directly');
       }
 
       // Phase 2: Execute (potentially parallel)
@@ -385,17 +404,23 @@ export class SubAgentPipeline {
 
           this.emitStep('agent_executing_tool', 'Re-executing failed steps...', PROGRESS.PIPELINE_TOOL_BASE + 5);
 
-          // Re-execute the entire tool set (executor will skip completed steps via blackboard)
-          // Reset failed steps to pending
+          // Reset ONLY the failed steps to pending (completed steps remain completed)
           for (const stepNum of reviewResult.retrySteps) {
             blackboard.updateStepStatus(stepNum, 'pending');
           }
+
+          // Narrow tools to only the categories needed by failed steps
+          const failedStepCategories = (blackboard.getPlan()?.steps ?? [])
+            .filter(s => reviewResult.retrySteps!.includes(s.stepNumber))
+            .map(s => s.category);
+          const retryCategories = [...new Set([...failedStepCategories, 'memory'])];
+          const retryTools = getToolsForCategories(input.availableTools, retryCategories);
 
           const retryStart = Date.now();
           const retryResult = await executeTools(
             input.userMessage,
             contextMessages,
-            filteredTools,
+            retryTools.length > 0 ? retryTools : filteredTools, // fallback to all if narrowing yields nothing
             this.context,
             undefined,
             input.abortSignal,

@@ -20,6 +20,24 @@ import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/reso
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+/** Max number of context messages each sub-executor receives (keep token cost low). */
+const SUB_EXECUTOR_CONTEXT_LIMIT = 4;
+
+/**
+ * Trim context messages for sub-executors.
+ * Keeps system messages (memory, KB) but limits user/assistant history to save tokens.
+ * Each sub-executor runs in parallel, so N sub-executors × full history = Nx token cost.
+ */
+function trimContextForSubExecutor(contextMessages: ChatCompletionMessageParam[]): ChatCompletionMessageParam[] {
+  // Always keep system messages (agent memory, workspace memory, KB context)
+  const systemMessages = contextMessages.filter(m => m.role === 'system');
+  // Take only the last few user/assistant messages for conversational context
+  const conversationMessages = contextMessages
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .slice(-SUB_EXECUTOR_CONTEXT_LIMIT);
+  return [...systemMessages, ...conversationMessages];
+}
+
 export class SubAgentSpawner {
   private maxConcurrency: number;
 
@@ -61,6 +79,9 @@ export class SubAgentSpawner {
     const stepsToExecute = steps.slice(0, this.maxConcurrency);
     const userGoal = blackboard.getGoal();
 
+    // Trim context once — all sub-executors share the same trimmed context
+    const trimmedContext = trimContextForSubExecutor(contextMessages);
+
     logger.info('[SPAWNER] Launching parallel sub-executors', {
       totalSteps: steps.length,
       executing: stepsToExecute.length,
@@ -80,7 +101,7 @@ export class SubAgentSpawner {
         const result = await executeToolsForStep(
           step,
           userMessage,
-          contextMessages,
+          trimmedContext,
           stepTools,
           context,
           abortSignal,
