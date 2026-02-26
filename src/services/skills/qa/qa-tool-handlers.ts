@@ -264,6 +264,103 @@ export async function handleListPageVisits(
   }
 }
 
+// ── Sensitive Data Sanitization ────────────────────────────────────────────
+// Masks credential values in test steps before sending to the LLM.
+// The AI sees the step structure but not actual passwords/tokens/secrets.
+
+/** Patterns that indicate a step's value contains sensitive data. */
+const SENSITIVE_STEP_PATTERNS = /password|passwd|secret|token|api[_-]?key|auth|credential|pin|otp|cvv/i;
+
+/**
+ * Sanitize steps_json for AI consumption:
+ * - Masks values on steps whose description or type matches sensitive patterns
+ * - Preserves step structure so AI understands the test flow
+ */
+function sanitizeStepsForAI(stepsJson: any): any {
+  if (!stepsJson) return stepsJson;
+
+  // steps_json can be stored as string or array in Supabase jsonb
+  let steps: any[];
+  if (typeof stepsJson === 'string') {
+    try {
+      steps = JSON.parse(stepsJson);
+    } catch {
+      return stepsJson; // Unparseable — return as-is (truncateField will handle)
+    }
+  } else if (Array.isArray(stepsJson)) {
+    steps = stepsJson;
+  } else {
+    return stepsJson;
+  }
+
+  return steps.map((step: any) => {
+    if (!step || typeof step !== 'object') return step;
+
+    const desc = (step.description || '').toLowerCase();
+    const stepType = (step.type || '').toLowerCase();
+
+    // Mask value if description or type hints at sensitive data
+    const isSensitive =
+      SENSITIVE_STEP_PATTERNS.test(desc) ||
+      SENSITIVE_STEP_PATTERNS.test(stepType) ||
+      (stepType === 'type' && SENSITIVE_STEP_PATTERNS.test(desc));
+
+    if (isSensitive && step.value) {
+      return { ...step, value: '••••••••' };
+    }
+    return step;
+  });
+}
+
+// ── Test Type Inference ───────────────────────────────────────────────────
+
+/** Action types that indicate a UI test. */
+const UI_ACTION_TYPES = new Set([
+  'click', 'type', 'navigate', 'scroll', 'hover', 'select',
+  'press', 'wait', 'ai_check', 'drag', 'upload', 'screenshot',
+]);
+
+/**
+ * Infer whether a test case is a UI test or API test based on its steps.
+ * Returns 'ui' | 'api' | 'mixed' | 'unknown'.
+ */
+function inferTestType(stepsJson: any): 'ui' | 'api' | 'mixed' | 'unknown' {
+  if (!stepsJson) return 'unknown';
+
+  let steps: any[];
+  if (typeof stepsJson === 'string') {
+    try {
+      steps = JSON.parse(stepsJson);
+    } catch {
+      return 'unknown';
+    }
+  } else if (Array.isArray(stepsJson)) {
+    steps = stepsJson;
+  } else {
+    return 'unknown';
+  }
+
+  if (steps.length === 0) return 'unknown';
+
+  let uiCount = 0;
+  let apiCount = 0;
+
+  for (const step of steps) {
+    if (!step || typeof step !== 'object') continue;
+    const t = (step.type || '').toLowerCase();
+    if (UI_ACTION_TYPES.has(t)) {
+      uiCount++;
+    } else if (t === 'http_request' || t === 'api_call' || t === 'graphql') {
+      apiCount++;
+    }
+  }
+
+  if (uiCount > 0 && apiCount > 0) return 'mixed';
+  if (uiCount > 0) return 'ui';
+  if (apiCount > 0) return 'api';
+  return 'unknown';
+}
+
 /**
  * qa_get_test_case — Get detailed info about a single test case
  */
@@ -309,13 +406,20 @@ export async function handleGetTestCase(
       return str.length > maxLen ? str.substring(0, maxLen) + '... [truncated]' : str;
     };
 
+    // Infer test type from step actions (ui/api/mixed/unknown)
+    const testType = inferTestType(data.steps_json);
+
+    // Sanitize sensitive values (passwords, tokens) before sending to LLM
+    const sanitizedSteps = sanitizeStepsForAI(data.steps_json);
+
     const testCase = {
       id: data.id,
       name: data.name,
       description: data.description,
       url: data.url || data.start_url,
       status: data.status,
-      stepsJson: truncateField(data.steps_json, 5000),
+      testType,
+      stepsJson: truncateField(sanitizedSteps, 5000),
       commands: truncateField(data.commands, 3000),
       tags: data.tags || [],
       priority: data.priority,
@@ -328,7 +432,7 @@ export async function handleGetTestCase(
     return {
       success: true,
       data: { testCase },
-      message: `Test case: ${data.name}`,
+      message: `Test case: ${data.name} (${testType} test)`,
       displayToUser: false,
     };
   } catch (error) {

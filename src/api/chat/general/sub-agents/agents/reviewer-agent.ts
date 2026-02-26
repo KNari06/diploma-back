@@ -2,6 +2,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
+import { raceWithTimeout } from '../tool-constants';
 import { buildReviewerPrompt } from '../prompts/reviewer-prompt';
 import type { Blackboard } from '../blackboard';
 import type { ReviewerResult, ToolExecutionRecord } from '../types';
@@ -151,10 +152,6 @@ export async function reviewExecution(
   const prompt = buildReviewerPrompt(goal, resultsSummary, planCompletionRate, failedStepNumbers);
 
   try {
-    const timeoutPromise = new Promise<null>((resolve) => {
-      setTimeout(() => resolve(null), SUB_AGENT_CONFIG.reviewerTimeoutMs);
-    });
-
     const aiPromise = getChatCompletionWithMessages(
       [{ role: 'user', content: prompt }],
       {
@@ -166,7 +163,7 @@ export async function reviewExecution(
       }
     );
 
-    const response = await Promise.race([aiPromise, timeoutPromise]);
+    const response = await raceWithTimeout(aiPromise, SUB_AGENT_CONFIG.reviewerTimeoutMs);
 
     if (!response || !response.content) {
       logger.warn('[REVIEWER_AGENT] Timeout — defaulting to approved', {

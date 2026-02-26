@@ -1,6 +1,5 @@
 import { logger } from '@/utils/core/logger';
 import { supabaseAdmin } from '@/db/supabase';
-import { env } from '@/config/environment/env';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -11,7 +10,7 @@ import { env } from '@/config/environment/env';
  * and interacting with Telegram through the QAIT agent.
  *
  * Uses the Bot API directly (no grammy/telegraf dependency).
- * Token stored in env as TELEGRAM_BOT_TOKEN or per-user in integration_tokens.
+ * Token stored per-user in integration_tokens.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -60,18 +59,24 @@ interface TelegramApiResponse<T = any> {
 }
 
 /**
- * Get Telegram bot token for user
- * Falls back to global TELEGRAM_BOT_TOKEN env var
+ * Get Telegram bot token for user from integration_tokens.
+ * When workspaceId is provided, scopes lookup to that workspace.
+ * Returns null if no personal token exists.
  */
-export async function getTelegramToken(userId: string): Promise<TelegramTokenData | null> {
+export async function getTelegramToken(userId: string, workspaceId?: string): Promise<TelegramTokenData | null> {
   try {
-    // First try user-specific token from integration_tokens
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('integration_tokens')
       .select('*')
       .eq('user_id', userId)
       .eq('provider', 'telegram')
-      .eq('enabled', true)
+      .eq('enabled', true);
+
+    if (workspaceId) {
+      query = query.eq('workspace_id', workspaceId);
+    }
+
+    const { data, error } = await query
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -84,23 +89,7 @@ export async function getTelegramToken(userId: string): Promise<TelegramTokenDat
       throw error;
     }
 
-    if (data) {
-      return data as TelegramTokenData;
-    }
-
-    // Fall back to global env token
-    if (env.TELEGRAM_BOT_TOKEN) {
-      return {
-        id: 'env-global',
-        user_id: userId,
-        access_token: env.TELEGRAM_BOT_TOKEN,
-        enabled: true,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-    }
-
-    return null;
+    return (data as TelegramTokenData) ?? null;
   } catch (error) {
     logger.error('[TELEGRAM_SERVICE] Get token error', {
       error: error instanceof Error ? error.message : String(error),

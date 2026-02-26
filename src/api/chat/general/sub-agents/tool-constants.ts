@@ -57,6 +57,38 @@ export function getToolTimeout(toolName: string): number {
 }
 
 /**
+ * Race a promise against a timeout, returning null on timeout.
+ * Used by agent LLM calls (router, reviewer, planner, responder) where timeout = graceful fallback.
+ *
+ * Unlike withToolTimeoutAndAbort (which rejects), this resolves to null — callers use existing
+ * fallback paths for timeout scenarios.
+ *
+ * IMPORTANT: Cleans up the timer on completion AND swallows errors from the losing promise
+ * to prevent dangling timers and unhandled promise rejections.
+ *
+ * @param promise  - The LLM call promise
+ * @param timeoutMs - Timeout in milliseconds
+ * @returns The promise result, or null if timeout fired first
+ */
+export function raceWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T | null> {
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+
+  const timeoutPromise = new Promise<null>((resolve) => {
+    timerId = setTimeout(() => resolve(null), timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timerId !== undefined) clearTimeout(timerId);
+    // Swallow errors from the losing promise (LLM call that completes after timeout)
+    // Without this, a late network error becomes an unhandled rejection.
+    promise.catch(() => {});
+  });
+}
+
+/**
  * Wrap a promise with both a per-tool timeout AND abort signal cancellation.
  *
  * Races the original promise against:

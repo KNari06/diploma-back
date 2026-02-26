@@ -39,7 +39,19 @@ HANDLING EDGE CASES:
 - For write operations needing confirmation: clearly describe what WILL happen and ask for explicit approval
 - For empty results: say so clearly and suggest possible reasons (wrong project, no data yet, etc.)
 - If CLARIFICATION NEEDED is set: ask the user a clear, specific question — don't guess
-- For large datasets: summarize with key stats first, then show details (don't dump everything)`;
+- For large datasets: summarize with key stats first, then show details (don't dump everything)
+
+META-QUESTIONS (when the user asks "in what format?", "what can you show?", "how can you present this?"):
+- Answer the meta-question FIRST, then present the actual data
+- Mention available format options: summary, table, detailed list, JSON snippet, step-by-step breakdown
+- If the user asked a data question AND a format question together, do BOTH: present the data AND explain format options
+- Example: "I can show test data as a summary table, step-by-step list, or detailed breakdown. Here's a summary of your test case:"
+
+DATA QUALITY:
+- If testType is provided (ui/api/mixed), use it — never guess or invent test method/type
+- Sensitive values (shown as "••••••••") are masked intentionally — never try to reveal or guess them
+- When showing test steps, describe WHAT the step does ("enters credentials", "clicks submit") not the raw values
+- If execution results are missing, say "No execution results yet — the test hasn't been run" instead of showing placeholder statuses`;
 }
 
 export function buildSimpleChatPrompt(skillDescriptions: string): string {
@@ -52,5 +64,7 @@ COMMUNICATION:
 - You CAN execute real tests, create issues, send notifications — never say "I can't"
 - If the user is asking about something you already discussed, reference the previous conversation context
 - For ambiguous questions, answer with what you know and offer to look up more
+- When asked about format options ("how can you show data?"), mention: summary, table, step-by-step, JSON, comparison
+- When asked for data about a test case, ALWAYS mention its type (UI test / API test) and last execution status if available
 ${skillDescriptions}`;
 }

@@ -2,8 +2,9 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
+import { raceWithTimeout } from '../tool-constants';
 import { buildPlannerPrompt } from '../prompts/planner-prompt';
-import { buildToolGroups } from '../tool-groups';
+import { buildToolGroups, getValidCategories } from '../tool-groups';
 import type { PlannerResult, PlanStep, ToolCategory } from '../types';
 
 /**
@@ -95,10 +96,6 @@ export async function createPlan(
   const prompt = buildPlannerPrompt(userMessage, toolDescriptions);
 
   try {
-    const timeoutPromise = new Promise<null>((resolve) => {
-      setTimeout(() => resolve(null), SUB_AGENT_CONFIG.agentTimeoutMs);
-    });
-
     const aiPromise = getChatCompletionWithMessages(
       [{ role: 'user', content: prompt }],
       {
@@ -110,7 +107,7 @@ export async function createPlan(
       }
     );
 
-    const response = await Promise.race([aiPromise, timeoutPromise]);
+    const response = await raceWithTimeout(aiPromise, SUB_AGENT_CONFIG.agentTimeoutMs);
 
     if (!response || !response.content) {
       logger.warn('[PLANNER_AGENT] Timeout or empty response');
@@ -120,15 +117,44 @@ export async function createPlan(
     const cleanContent = response.content.replace(/```json\s*|```\s*/g, '').trim();
     const parsed = JSON.parse(cleanContent);
 
+    // Validate and sanitize LLM-generated plan steps
+    const validCategories = getValidCategories();
+    const defaultCategory = toolCategories[0] || validCategories[0] || 'memory';
+
+    /**
+     * Sanitize a category from LLM output.
+     * 1. Exact match → use as-is
+     * 2. Prefix match → e.g. "qa" matches "qa_read" (pick first match)
+     * 3. No match → fallback to the first router-selected category
+     */
+    const sanitizeCategory = (raw: string | undefined): ToolCategory => {
+      if (!raw) return defaultCategory;
+      if (validCategories.includes(raw)) return raw;
+      // Prefix match: LLM said "qa" but valid is "qa_read"
+      const prefixMatch = validCategories.find(vc => vc.startsWith(raw) || raw.startsWith(vc.replace(/_read$|_write$/, '')));
+      if (prefixMatch) {
+        logger.info('[PLANNER_AGENT] Fixed invalid category via prefix match', { raw, fixed: prefixMatch });
+        return prefixMatch;
+      }
+      logger.warn('[PLANNER_AGENT] Unknown category from LLM, using fallback', { raw, fallback: defaultCategory });
+      return defaultCategory;
+    };
+
+    // Parse steps and force unique sequential stepNumbers (LLM may return duplicates)
+    const rawSteps = (parsed.steps || []).map((step: any, idx: number) => ({
+      stepNumber: idx + 1, // Always re-number sequentially — prevents duplicates
+      description: step.description || '',
+      category: sanitizeCategory(step.category),
+      expectedTool: step.expectedTool,
+      // Remap dependsOn from LLM step numbers to our sequential numbers
+      dependsOn: Array.isArray(step.dependsOn)
+        ? (step.dependsOn as number[]).filter((d: number) => typeof d === 'number' && d >= 1 && d <= (parsed.steps || []).length)
+        : [],
+    }));
+
     const result: PlannerResult = {
       summary: parsed.summary || 'Multi-step task',
-      steps: (parsed.steps || []).map((step: any, idx: number) => ({
-        stepNumber: step.stepNumber || idx + 1,
-        description: step.description || '',
-        category: step.category || toolCategories[0],
-        expectedTool: step.expectedTool,
-        dependsOn: step.dependsOn || [],
-      })),
+      steps: rawSteps,
     };
 
     logger.info('[PLANNER_AGENT] Plan created', {

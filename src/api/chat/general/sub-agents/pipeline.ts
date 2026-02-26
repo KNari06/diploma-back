@@ -22,6 +22,28 @@ import { emitProcessingStep } from '@/api/chat/shared/utils';
 import { PROGRESS } from '@/api/chat/shared/constants';
 import type { ChatProcessingStepPayload } from '@/websocket/types/types';
 
+// ── Router Guardrail ──────────────────────────────────────────────────────
+// Deterministic safety net: if the router says "simple_chat" but the user
+// message clearly references QA entities or action verbs, we reclassify to
+// "single_tool" so the executor actually receives tools.
+// This prevents the LLM hallucinating "I don't have access" when tools are
+// available but the router misjudged.
+
+const QA_ENTITY_PATTERNS = /(?:тест(?:\s*[-_]?\s*)?(?:кейс|шаг|степ|ран|результат|сценарий|план|набор|ов|ы|а|ам|ами)?)|test\s*(?:case|step|result|run|execution|plan|suite|s)?|regression|регресси|coverage|покрыти|fixture|фикстур|module|модул|flow|analytics|аналитик|dashboard|дашборд|bug|баг|report|отчёт/i;
+const ACTION_VERB_PATTERNS = /(?:получи|покажи|выведи|дай|найди|создай|измени|обнови|удали|запусти|добавь|отредактируй|список|перечисли)|(?:^|\s)(?:get|fetch|list|show|find|search|create|update|change|modify|delete|remove|run|execute|add|edit)\b/i;
+
+function shouldOverrideSimpleChat(
+  userMessage: string,
+  hasToolsAvailable: boolean,
+): boolean {
+  if (!hasToolsAvailable) return false;
+  // Both entity + action verb must match to avoid false positives on e.g. "what is a test case?"
+  // But entity alone is enough for imperative commands like "тест кейсы" (implied "show me")
+  const hasEntity = QA_ENTITY_PATTERNS.test(userMessage);
+  const hasAction = ACTION_VERB_PATTERNS.test(userMessage);
+  return hasEntity && hasAction;
+}
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════
  * SUB-AGENT PIPELINE ORCHESTRATOR — Cooperative Multi-Agent System
@@ -133,8 +155,34 @@ export class SubAgentPipeline {
         classification: routerResult.classification,
       });
 
-      // Low confidence → fallback (not a pipeline failure, don't penalize circuit breaker)
+      // Low confidence → clarification or fallback
       if (routerResult.confidence < SUB_AGENT_CONFIG.routerConfidenceThreshold) {
+        // Clarification band: confidence is low but router generated a question to ask
+        if (
+          routerResult.confidence >= SUB_AGENT_CONFIG.routerClarificationThreshold &&
+          routerResult.clarificationQuestion
+        ) {
+          logger.info('[SUB_AGENT_PIPELINE] Router confidence in clarification band — asking user', {
+            confidence: routerResult.confidence,
+            clarificationThreshold: SUB_AGENT_CONFIG.routerClarificationThreshold,
+            confidenceThreshold: SUB_AGENT_CONFIG.routerConfidenceThreshold,
+          });
+
+          this.emitStep('agent_routing', 'Need more information...', PROGRESS.PIPELINE_ROUTING_DONE);
+
+          metrics.totalMs = Date.now() - pipelineStart;
+          chatCircuitBreaker.recordResult(true);
+
+          return {
+            success: true,
+            content: routerResult.clarificationQuestion,
+            path: routerResult.classification,
+            metrics,
+            needsClarification: true,
+          };
+        }
+
+        // Below clarification threshold or no question → true fallback
         logger.info('[SUB_AGENT_PIPELINE] Low router confidence — falling back', {
           confidence: routerResult.confidence,
           threshold: SUB_AGENT_CONFIG.routerConfidenceThreshold,
@@ -157,6 +205,26 @@ export class SubAgentPipeline {
         }
         return true;
       }) as ChatCompletionMessageParam[];
+
+      // ═══ GUARDRAIL: Override simple_chat if user clearly wants tool action ═══
+      if (
+        routerResult.classification === 'simple_chat' &&
+        shouldOverrideSimpleChat(input.userMessage, input.availableTools.length > 0)
+      ) {
+        logger.warn('[SUB_AGENT_PIPELINE] Guardrail: overriding simple_chat → single_tool (QA entity + action detected)', {
+          userMessage: input.userMessage.substring(0, 100),
+          originalConfidence: routerResult.confidence,
+        });
+
+        // Reclassify to single_tool with qa_read (safe default — executor can still write if needed)
+        routerResult.classification = 'single_tool';
+        routerResult.toolCategories = ['qa_read'];
+        routerResult.confidence = 0.7; // Synthetic confidence
+        metrics.routerClassification = 'single_tool (guardrail)';
+
+        // Update blackboard with corrected classification
+        blackboard.setRouterResult(routerResult);
+      }
 
       // ═══ PATH A: SIMPLE CHAT ═══
       if (routerResult.classification === 'simple_chat') {
@@ -258,7 +326,36 @@ export class SubAgentPipeline {
           metrics.reviewerMs = Date.now() - singleReviewStart;
           metrics.reviewerVerdict = singleReviewResult.verdict;
           blackboard.setReviewResult(singleReviewResult);
-          // No retry loop for single_tool — just capture guidance for the responder
+
+          // Level 2 clarification: reviewer says results are ambiguous — ask user
+          if (singleReviewResult.verdict === 'needs_clarification' && singleReviewResult.clarificationNeeded) {
+            logger.info('[SUB_AGENT_PIPELINE] Reviewer requested clarification (single_tool)', {
+              clarificationNeeded: singleReviewResult.clarificationNeeded,
+            });
+
+            this.emitStep('agent_formatting', 'Composing a question...', PROGRESS.PIPELINE_FORMATTING);
+            const clarifyResponderStart = Date.now();
+            const clarifyResponse = await formatResponse(
+              input.userMessage,
+              executorResult.toolResults,
+              executorResult.assistantContent,
+              contextMessages,
+              input.abortSignal,
+              blackboard
+            );
+            metrics.responderMs = Date.now() - clarifyResponderStart;
+            metrics.totalMs = Date.now() - pipelineStart;
+
+            chatCircuitBreaker.recordResult(true);
+
+            return {
+              success: true,
+              content: clarifyResponse.content || singleReviewResult.clarificationNeeded,
+              path: 'single_tool',
+              metrics,
+              needsClarification: true,
+            };
+          }
         }
 
         // Format response (with blackboard context)
@@ -450,6 +547,37 @@ export class SubAgentPipeline {
           metrics.reviewerVerdict = retryReviewResult.verdict;
           blackboard.setReviewResult(retryReviewResult);
         }
+      }
+
+      // Level 2 clarification: reviewer says results are ambiguous — ask user
+      const finalReview = blackboard.getReviewResult();
+      if (finalReview?.verdict === 'needs_clarification' && finalReview.clarificationNeeded) {
+        logger.info('[SUB_AGENT_PIPELINE] Reviewer requested clarification (multi_tool)', {
+          clarificationNeeded: finalReview.clarificationNeeded,
+        });
+
+        this.emitStep('agent_formatting', 'Composing a question...', PROGRESS.PIPELINE_FORMATTING);
+        const clarifyResponderStart = Date.now();
+        const clarifyResponse = await formatResponse(
+          input.userMessage,
+          executorResult.toolResults,
+          executorResult.assistantContent,
+          contextMessages,
+          input.abortSignal,
+          blackboard
+        );
+        metrics.responderMs = Date.now() - clarifyResponderStart;
+        metrics.totalMs = Date.now() - pipelineStart;
+
+        chatCircuitBreaker.recordResult(true);
+
+        return {
+          success: true,
+          content: clarifyResponse.content || finalReview.clarificationNeeded,
+          path: 'multi_tool',
+          metrics,
+          needsClarification: true,
+        };
       }
 
       // Phase 4: Format response (with full blackboard context)

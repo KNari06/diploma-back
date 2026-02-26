@@ -236,11 +236,13 @@ export async function saveJiraToken(
  * Dual-read pattern: checks integration_tokens first, falls back to jira_tokens
  * @param userId - User ID
  * @param cloudId - Optional cloud ID filter (maps to external_id in integration_tokens)
+ * @param workspaceId - Optional workspace ID to scope lookup
  * @returns Token data or null
  */
 export async function getJiraToken(
   userId: string,
-  cloudId?: string
+  cloudId?: string,
+  workspaceId?: string
 ): Promise<JiraTokenData | null> {
   try {
     // Try new integration_tokens table first
@@ -253,6 +255,10 @@ export async function getJiraToken(
 
     if (cloudId) {
       query = query.eq('external_id', cloudId);
+    }
+
+    if (workspaceId) {
+      query = query.eq('workspace_id', workspaceId);
     }
 
     const { data: newData, error: newError } = await query

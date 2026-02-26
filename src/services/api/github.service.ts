@@ -81,10 +81,10 @@ export interface GitHubRepo {
  * Get GitHub token for user
  * Now uses centralized IntegrationTokenService
  */
-export async function getGitHubToken(userId: string): Promise<GitHubTokenData | null> {
+export async function getGitHubToken(userId: string, workspaceId?: string): Promise<GitHubTokenData | null> {
   try {
     const { IntegrationTokenService } = await import('./integration-token.service');
-    const token = await IntegrationTokenService.getToken(userId, 'github');
+    const token = await IntegrationTokenService.getToken(userId, 'github', undefined, workspaceId);
 
     if (!token) {
       logger.debug('[GITHUB_SERVICE] No token found', { userId });

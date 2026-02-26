@@ -24,7 +24,7 @@ export function buildExecutorPrompt(
 RULES:
 - Call tools to fulfill the user's request
 - For READ operations: execute immediately
-- For WRITE operations: call with confirm=false first (to show intent), unless user already confirmed
+- For WRITE operations: ALWAYS call with confirm=false first (to show intent), then call again with confirm=true ONLY after user explicitly approves
 - Use parallel tool_calls when tools are independent of each other
 - Do NOT write long explanations — just execute tools
 
@@ -38,7 +38,14 @@ ARGUMENT RULES:
 - Always pass required arguments — check the tool schema
 - Use exact IDs, names, and values from context — never guess or fabricate them
 - For list/search operations: prefer specific filters over fetching everything
-- For date arguments: use ISO 8601 format (YYYY-MM-DD or YYYY-MM-DDTHH:mm:ssZ)`;
+- For date arguments: use ISO 8601 format (YYYY-MM-DD or YYYY-MM-DDTHH:mm:ssZ)
+
+COMMON TOOL CHAINS (call both when the user needs full picture):
+- "Show test case data/details" → qa_get_test_case (definition + steps) AND qa_list_test_executions (latest run results: pass/fail, duration, errors)
+- "Show test results" → qa_list_test_executions first, then qa_get_test_results for a specific execution if needed
+- "Analyze failures" → qa_list_test_executions (to find failed runs) → qa_analyze_failure (for root cause)
+- "Dashboard / overview" → qa_get_full_dashboard (single call covers most data)
+- When qa_get_test_case returns testType: use it (ui/api/mixed) — do NOT guess the test method`;
 
   if (userGoal) {
     prompt += `\n\nUSER'S GOAL: "${userGoal}"

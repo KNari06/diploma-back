@@ -34,6 +34,8 @@ export interface RouterResult {
   toolCategories: ToolCategory[];
   reasoning: string;
   requiresMemory: boolean;
+  /** When confidence is low (clarification band), router may provide a question to ask the user */
+  clarificationQuestion?: string;
 }
 
 /**
@@ -108,6 +110,8 @@ export interface SubAgentPipelineResult {
   content: string;
   path: 'simple_chat' | 'single_tool' | 'multi_tool' | 'fallback';
   metrics: PipelineMetrics;
+  /** True when the pipeline is returning a clarification question, not a real answer */
+  needsClarification?: boolean;
 }
 
 /**
@@ -152,6 +156,8 @@ export interface PipelineContext {
 export interface SubAgentConfig {
   enabled: boolean;
   routerConfidenceThreshold: number;
+  /** Below this → fallback to monolithic. Between this and routerConfidenceThreshold → ask clarification. */
+  routerClarificationThreshold: number;
   maxToolRounds: number;
   circuitBreakerWindowSize: number;
   circuitBreakerFailThreshold: number;
@@ -170,6 +176,8 @@ export interface SubAgentConfig {
   maxReviewRetries: number;
   /** Reviewer agent timeout (ms) */
   reviewerTimeoutMs: number;
+  /** Responder agent timeout (ms) — higher than router because it generates longer responses */
+  responderTimeoutMs: number;
   /** Enable reviewer agent (feature flag) */
   enableReviewer: boolean;
   /** Enable parallel sub-executor spawning */

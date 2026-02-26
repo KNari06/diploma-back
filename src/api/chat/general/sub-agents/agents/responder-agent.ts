@@ -2,6 +2,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
+import { raceWithTimeout } from '../tool-constants';
 import { buildResponderPrompt, buildSimpleChatPrompt } from '../prompts/responder-prompt';
 import type { ResponderResult, ToolExecutionRecord } from '../types';
 import type { Blackboard } from '../blackboard';
@@ -104,10 +105,6 @@ Format these results into a natural response for the user.`,
   ];
 
   try {
-    const timeoutPromise = new Promise<null>((resolve) => {
-      setTimeout(() => resolve(null), SUB_AGENT_CONFIG.agentTimeoutMs);
-    });
-
     const aiPromise = getChatCompletionWithMessages(messages, {
       model: AI_TASK_MODELS.chatResponder,
       temperature: SUB_AGENT_CONFIG.responderTemperature,
@@ -115,7 +112,7 @@ Format these results into a natural response for the user.`,
       abortSignal,
     });
 
-    const response = await Promise.race([aiPromise, timeoutPromise]);
+    const response = await raceWithTimeout(aiPromise, SUB_AGENT_CONFIG.responderTimeoutMs);
 
     if (!response || !response.content) {
       // Fallback: use executor's content or raw results
@@ -163,19 +160,28 @@ export async function generateSimpleResponse(
   ];
 
   try {
-    const response = await getChatCompletionWithMessages(messages, {
+    const aiPromise = getChatCompletionWithMessages(messages, {
       model: AI_TASK_MODELS.chatResponder,
       temperature: SUB_AGENT_CONFIG.responderTemperature,
       max_tokens: SUB_AGENT_CONFIG.responderMaxTokens,
       abortSignal,
     });
 
+    const response = await raceWithTimeout(aiPromise, SUB_AGENT_CONFIG.responderTimeoutMs);
+
+    if (!response || !response.content) {
+      logger.warn('[RESPONDER_AGENT] Simple chat timeout — throwing to trigger monolithic fallback', {
+        durationMs: Date.now() - startMs,
+      });
+      throw new Error('Simple chat response timed out');
+    }
+
     logger.info('[RESPONDER_AGENT] Simple chat response', {
-      responseLength: response.content?.length || 0,
+      responseLength: response.content.length,
       durationMs: Date.now() - startMs,
     });
 
-    return { content: response.content || 'Sorry, I could not generate a response.' };
+    return { content: response.content };
   } catch (error) {
     logger.error('[RESPONDER_AGENT] Simple chat failed', {
       error: error instanceof Error ? error.message : String(error),

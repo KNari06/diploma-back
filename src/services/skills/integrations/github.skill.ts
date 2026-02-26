@@ -151,7 +151,7 @@ export const GitHubSkill: SkillDefinition = {
    */
   async isAvailable(context: SkillContext): Promise<boolean> {
     try {
-      const token = await getGitHubToken(context.userId);
+      const token = await getGitHubToken(context.userId, context.workspaceId);
       return token !== null;
     } catch (error) {
       logger.error('[GITHUB_SKILL] Error checking availability', {
@@ -178,7 +178,7 @@ export const GitHubSkill: SkillDefinition = {
 
     try {
       // Get GitHub token
-      const tokenData = await getGitHubToken(context.userId);
+      const tokenData = await getGitHubToken(context.userId, context.workspaceId);
       if (!tokenData) {
         return {
           success: false,

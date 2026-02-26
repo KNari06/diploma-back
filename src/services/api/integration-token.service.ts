@@ -45,19 +45,22 @@ export interface TokenData {
 
 export class IntegrationTokenService {
   /**
-   * Get valid token for user and provider
-   * Returns null if no token exists
+   * Get valid token for user and provider.
+   * When workspaceId is provided, scopes lookup to that workspace.
+   * Returns null if no token exists.
    */
   static async getToken(
     userId: string,
     provider: IntegrationProvider,
-    externalId?: string
+    externalId?: string,
+    workspaceId?: string
   ): Promise<IntegrationToken | null> {
     try {
       logger.debug('[INTEGRATION_TOKEN] Getting token', {
         userId,
         provider,
         externalId,
+        workspaceId,
       });
 
       let query = supabaseAdmin
@@ -69,6 +72,10 @@ export class IntegrationTokenService {
 
       if (externalId) {
         query = query.eq('external_id', externalId);
+      }
+
+      if (workspaceId) {
+        query = query.eq('workspace_id', workspaceId);
       }
 
       const { data, error } = await query
@@ -152,14 +159,51 @@ export class IntegrationTokenService {
         enabled: true,
       };
 
-      // Upsert by user_id + provider + external_id
-      const { data, error } = await supabaseAdmin
-        .from('integration_tokens')
-        .upsert(record, {
-          onConflict: 'user_id,provider,external_id',
-        })
-        .select()
-        .single();
+      let data: any;
+      let error: any;
+
+      if (workspaceId) {
+        // Workspace-scoped: find-then-insert/update to work with partial unique index
+        const { data: existing } = await supabaseAdmin
+          .from('integration_tokens')
+          .select('id')
+          .eq('user_id', userId)
+          .eq('workspace_id', workspaceId)
+          .eq('provider', provider)
+          .eq('external_id', tokenData.external_id ?? '')
+          .limit(1)
+          .maybeSingle();
+
+        if (existing) {
+          const result = await supabaseAdmin
+            .from('integration_tokens')
+            .update(record)
+            .eq('id', existing.id)
+            .select()
+            .single();
+          data = result.data;
+          error = result.error;
+        } else {
+          const result = await supabaseAdmin
+            .from('integration_tokens')
+            .insert(record)
+            .select()
+            .single();
+          data = result.data;
+          error = result.error;
+        }
+      } else {
+        // Legacy: upsert by user_id + provider + external_id
+        const result = await supabaseAdmin
+          .from('integration_tokens')
+          .upsert(record, {
+            onConflict: 'user_id,provider,external_id',
+          })
+          .select()
+          .single();
+        data = result.data;
+        error = result.error;
+      }
 
       if (error) {
         logger.error('[INTEGRATION_TOKEN] Failed to save token', {
@@ -241,18 +285,21 @@ export class IntegrationTokenService {
   }
 
   /**
-   * Delete token (revoke access)
+   * Delete token (revoke access).
+   * When workspaceId is provided, only deletes tokens scoped to that workspace.
    */
   static async deleteToken(
     userId: string,
     provider: IntegrationProvider,
-    externalId?: string
+    externalId?: string,
+    workspaceId?: string
   ): Promise<boolean> {
     try {
       logger.info('[INTEGRATION_TOKEN] Deleting token', {
         userId,
         provider,
         externalId,
+        workspaceId,
       });
 
       let query = supabaseAdmin
@@ -263,6 +310,10 @@ export class IntegrationTokenService {
 
       if (externalId) {
         query = query.eq('external_id', externalId);
+      }
+
+      if (workspaceId) {
+        query = query.eq('workspace_id', workspaceId);
       }
 
       const { error } = await query;
@@ -333,18 +384,21 @@ export class IntegrationTokenService {
   }
 
   /**
-   * Disable token (soft delete - keeps record but marks as disabled)
+   * Disable token (soft delete - keeps record but marks as disabled).
+   * When workspaceId is provided, only disables tokens scoped to that workspace.
    */
   static async disableToken(
     userId: string,
     provider: IntegrationProvider,
-    externalId?: string
+    externalId?: string,
+    workspaceId?: string
   ): Promise<boolean> {
     try {
       logger.info('[INTEGRATION_TOKEN] Disabling token', {
         userId,
         provider,
         externalId,
+        workspaceId,
       });
 
       let query = supabaseAdmin
@@ -355,6 +409,10 @@ export class IntegrationTokenService {
 
       if (externalId) {
         query = query.eq('external_id', externalId);
+      }
+
+      if (workspaceId) {
+        query = query.eq('workspace_id', workspaceId);
       }
 
       const { error } = await query;

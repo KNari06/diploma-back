@@ -237,7 +237,7 @@ export const NotionSkill: SkillDefinition = {
       }
 
       // All other tools require an existing token
-      const tokenData = await getNotionToken(context.userId);
+      const tokenData = await getNotionToken(context.userId, context.workspaceId);
       if (!tokenData) {
         return {
           success: false,
@@ -295,7 +295,7 @@ export const NotionSkill: SkillDefinition = {
  * Status handler
  */
 async function handleStatus(context: SkillContext): Promise<SkillResult> {
-  const tokenData = await getNotionToken(context.userId);
+  const tokenData = await getNotionToken(context.userId, context.workspaceId);
 
   if (!tokenData) {
     return {
@@ -373,7 +373,7 @@ async function handleDisconnect(
     };
   }
 
-  const tokenData = await getNotionToken(context.userId);
+  const tokenData = await getNotionToken(context.userId, context.workspaceId);
   if (!tokenData) {
     return {
       success: false,
@@ -383,7 +383,7 @@ async function handleDisconnect(
   }
 
   try {
-    await IntegrationTokenService.deleteToken(context.userId, 'notion');
+    await IntegrationTokenService.deleteToken(context.userId, 'notion', undefined, context.workspaceId);
   } catch (error) {
     logger.error('[NOTION_SKILL] Failed to disconnect', {
       error: error instanceof Error ? error.message : String(error),

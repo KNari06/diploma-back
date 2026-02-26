@@ -8,6 +8,7 @@ import {
   getMe,
 } from '@/services/api/telegram.service';
 import { IntegrationTokenService } from '@/services/api/integration-token.service';
+import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -230,12 +231,15 @@ export const TelegramSkill: SkillDefinition = {
       }
 
       // All other tools require an existing token
-      const tokenData = await getTelegramToken(context.userId);
+      const tokenData = await getTelegramToken(context.userId, context.workspaceId);
       if (!tokenData) {
+        // Distinguish "disabled" from "never connected"
+        const hasDisabled = await hasDisabledTelegramToken(context.userId, context.workspaceId);
         return {
           success: false,
-          message:
-            'Telegram not connected. Ask the user to provide their bot token from @BotFather, then call telegram_connect.',
+          message: hasDisabled
+            ? 'Telegram was previously connected but is now disabled. Ask the user to reconnect with telegram_connect.'
+            : 'Telegram not connected. Ask the user to provide their bot token from @BotFather, then call telegram_connect.',
           displayToUser: true,
         };
       }
@@ -243,18 +247,23 @@ export const TelegramSkill: SkillDefinition = {
       const botToken = tokenData.access_token;
 
       // Route to appropriate handler
+      let result: SkillResult;
       switch (toolName) {
         case 'telegram_send_message':
-          return await handleSendMessage(botToken, args);
+          result = await handleSendMessage(botToken, args);
+          break;
 
         case 'telegram_get_chat':
-          return await handleGetChat(botToken, args);
+          result = await handleGetChat(botToken, args);
+          break;
 
         case 'telegram_send_document':
-          return await handleSendDocument(botToken, args);
+          result = await handleSendDocument(botToken, args);
+          break;
 
         case 'telegram_send_notification':
-          return await handleSendNotification(botToken, args);
+          result = await handleSendNotification(botToken, args);
+          break;
 
         default:
           return {
@@ -263,11 +272,31 @@ export const TelegramSkill: SkillDefinition = {
             displayToUser: false,
           };
       }
+
+      // Detect revoked/invalid token from failed results
+      if (!result.success && isTelegramTokenRevokedError(result.message)) {
+        return {
+          success: false,
+          message: 'The Telegram bot token has been revoked or is invalid. Please reconnect using telegram_connect with a new token from @BotFather.',
+          displayToUser: true,
+        };
+      }
+
+      return result;
     } catch (error) {
       logger.error('[TELEGRAM_SKILL] Execution error', {
         toolName,
         error: error instanceof Error ? error.message : String(error),
       });
+
+      // Catch revoked token at the top-level catch too
+      if (isTelegramTokenRevokedError(error)) {
+        return {
+          success: false,
+          message: 'The Telegram bot token has been revoked or is invalid. Please reconnect using telegram_connect with a new token from @BotFather.',
+          displayToUser: true,
+        };
+      }
 
       return {
         success: false,
@@ -371,12 +400,56 @@ async function handleConnect(
 }
 
 /**
+ * Check if an error indicates a revoked/invalid bot token (401/403 from Telegram API)
+ */
+function isTelegramTokenRevokedError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /Telegram API error: (401|403)/i.test(msg) || /Unauthorized/i.test(msg);
+}
+
+/**
+ * Check for a disabled token (exists but enabled=false).
+ * Used to distinguish "never connected" from "was connected but disabled".
+ */
+async function hasDisabledTelegramToken(userId: string, workspaceId?: string): Promise<boolean> {
+  try {
+    let query = supabaseAdmin
+      .from('integration_tokens')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('provider', 'telegram')
+      .eq('enabled', false);
+
+    if (workspaceId) {
+      query = query.eq('workspace_id', workspaceId);
+    }
+
+    const { data } = await query.limit(1).maybeSingle();
+    return !!data;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Status handler — check if Telegram is connected
  */
 async function handleStatus(context: SkillContext): Promise<SkillResult> {
-  const tokenData = await getTelegramToken(context.userId);
+  const tokenData = await getTelegramToken(context.userId, context.workspaceId);
 
   if (!tokenData) {
+    // Check if there's a disabled token — different message than "never connected"
+    const hasDisabled = await hasDisabledTelegramToken(context.userId, context.workspaceId);
+
+    if (hasDisabled) {
+      return {
+        success: true,
+        data: { connected: false, disabled: true },
+        message: 'Telegram was previously connected but is now disabled. Use telegram_connect with a new bot token to reconnect.',
+        displayToUser: true,
+      };
+    }
+
     return {
       success: true,
       data: { connected: false },
@@ -418,7 +491,7 @@ async function handleDisconnect(
   }
 
   // Check if connected at all
-  const tokenData = await getTelegramToken(context.userId);
+  const tokenData = await getTelegramToken(context.userId, context.workspaceId);
   if (!tokenData) {
     return {
       success: false,
@@ -428,7 +501,7 @@ async function handleDisconnect(
   }
 
   try {
-    await IntegrationTokenService.deleteToken(context.userId, 'telegram');
+    await IntegrationTokenService.deleteToken(context.userId, 'telegram', undefined, context.workspaceId);
   } catch (error) {
     logger.error('[TELEGRAM_SKILL] Failed to disconnect', {
       error: error instanceof Error ? error.message : String(error),

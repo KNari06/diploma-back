@@ -159,7 +159,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_get_test_case',
       description:
-        'Get detailed info about a single test case including steps, commands, tags, and preconditions. Use when the user asks about a specific test.',
+        'Get detailed info about a single test case including steps, commands, tags, preconditions, and testType (ui/api/mixed). Returns the test definition only — for execution results (pass/fail, duration, errors), also call qa_list_test_executions with the same test_case_id.',
       parameters: {
         type: 'object',
         properties: {

@@ -523,6 +523,7 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
   let gptResponse: { content: string; usage?: any };
   let shouldDeductCredits = false;
   let requestCancelled = false;
+  let pipelineClarification = false;
   const MAX_TOOL_ROUNDS = 5; // Prevent infinite loops
 
   // Wrap AI calls with tracking context
@@ -578,11 +579,16 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
           if (pipelineResult.success) {
             logger.info('[GENERAL_CHAT] Sub-agent pipeline succeeded', {
               path: pipelineResult.path,
+              needsClarification: pipelineResult.needsClarification ?? false,
               metrics: pipelineResult.metrics,
             });
 
             gptResponse = { content: pipelineResult.content, usage: undefined };
-            shouldDeductCredits = true;
+            // Clarification responses don't deduct credits (user didn't get an answer)
+            shouldDeductCredits = !pipelineResult.needsClarification;
+            if (pipelineResult.needsClarification) {
+              pipelineClarification = true;
+            }
             return { gptResponse, shouldDeductCredits };
           }
 
@@ -874,10 +880,21 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
   // Only deduct if we got a real OpenAI response (not fallback)
 
   if (shouldDeductCredits && gptResponse && gptResponse.content) {
-    const deductChatCreditsWithLogging = functionLogger
-      ? withFunctionLogging(deductChatCredits, 'deductChatCredits', functionLogger)
-      : deductChatCredits;
-    await deductChatCreditsWithLogging(userId, shouldDeductCredits);
+    try {
+      const deductChatCreditsWithLogging = functionLogger
+        ? withFunctionLogging(deductChatCredits, 'deductChatCredits', functionLogger)
+        : deductChatCredits;
+      await deductChatCreditsWithLogging(userId, shouldDeductCredits);
+    } catch (creditError) {
+      // Credit deduction failure must NEVER drop the AI response.
+      // The response is already generated — deliver it to the user regardless.
+      // Credits can be reconciled later via background audit.
+      logger.error('[GENERAL_CHAT] Credit deduction failed — delivering response anyway', {
+        error: creditError instanceof Error ? creditError.message : String(creditError),
+        userId,
+        chatSessionId,
+      });
+    }
   }
 
   if (abortSignal) {
@@ -906,7 +923,15 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
 
     const timestamps = await saveChatMessagesWithLogging(chatSessionId, [
       { role: 'user', content: message, metadata: userMessageMetadata },
-      { role: 'ai', content: gptResponse.content },
+      {
+        role: 'ai',
+        content: gptResponse.content,
+        // Save clarification metadata so intent parser can detect follow-up context
+        // Matches pattern from handleClarificationRequest in shared/clarification.ts
+        metadata: pipelineClarification
+          ? { requiresAnswers: true, needsMoreInfo: true, source: 'sub_agent_pipeline' }
+          : undefined,
+      },
     ]);
 
     // Extract timestamps: first is user message, second is AI reply
