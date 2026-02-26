@@ -432,16 +432,9 @@ export class AIAnalysisJobHandler {
         confidence: aiSummary.confidence ?? 0.8,
       };
 
-      const { data: testPlan } = await dbAdminService.supabaseAdmin
-        .from('test_plans')
-        .select('*')
-        .eq('id', testId)
-        .maybeSingle();
-
       const report = await TestReportGeneratorService.generateFinalReport({
         testId,
         testResult: testResultData,
-        testPlan: testPlan || undefined,
         aiAnalysis: aiAnalysisForReport,
       });
 
