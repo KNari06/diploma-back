@@ -1,7 +1,7 @@
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from './config';
 import { chatCircuitBreaker } from './circuit-breaker';
-import { getToolsForCategories } from './tool-groups';
+import { getToolsForCategories, getValidCategories } from './tool-groups';
 import { Blackboard } from './blackboard';
 import { classifyRequest } from './agents/router-agent';
 import { createPlan, identifyParallelGroups } from './agents/planner-agent';
@@ -22,26 +22,63 @@ import { emitProcessingStep } from '@/api/chat/shared/utils';
 import { PROGRESS } from '@/api/chat/shared/constants';
 import type { ChatProcessingStepPayload } from '@/websocket/types/types';
 
-// ── Router Guardrail ──────────────────────────────────────────────────────
-// Deterministic safety net: if the router says "simple_chat" but the user
-// message clearly references QA entities or action verbs, we reclassify to
-// "single_tool" so the executor actually receives tools.
-// This prevents the LLM hallucinating "I don't have access" when tools are
-// available but the router misjudged.
+// ── Smart Simple-Chat Guardrail ───────────────────────────────────────────
+// If the router says "simple_chat" but tools are available, we check whether
+// the message is truly a no-tool conversation (greeting, thanks, opinion).
+// If it doesn't match a known no-tool pattern → we reclassify to single_tool
+// so the executor gets tools and can decide whether to call them.
+//
+// This is the inverse of hardcoding QA patterns: instead of listing every
+// entity that NEEDS tools, we list the short set that DOESN'T.
+// Any new skill or language is automatically covered.
 
-const QA_ENTITY_PATTERNS = /(?:тест(?:\s*[-_]?\s*)?(?:кейс|шаг|степ|ран|результат|сценарий|план|набор|ов|ы|а|ам|ами)?)|test\s*(?:case|step|result|run|execution|plan|suite|s)?|regression|регресси|coverage|покрыти|fixture|фикстур|module|модул|flow|analytics|аналитик|dashboard|дашборд|bug|баг|report|отчёт/i;
-const ACTION_VERB_PATTERNS = /(?:получи|покажи|выведи|дай|найди|создай|измени|обнови|удали|запусти|добавь|отредактируй|список|перечисли)|(?:^|\s)(?:get|fetch|list|show|find|search|create|update|change|modify|delete|remove|run|execute|add|edit)\b/i;
+/**
+ * Messages that genuinely need NO tools — greetings, thanks, social.
+ * Everything else should go to the executor with tools.
+ */
+const GENUINE_SIMPLE_CHAT = /^(?:привет|здравствуй|салем|hi|hello|hey|thanks|спасибо|рахмет|пока|bye|ок|ok|да$|нет$|yes$|no$|cancel|отмена|что ты умеешь|what can you do|help$|помощь$)/i;
+
+/**
+ * Noise: emoji-only, punctuation-only, repeated characters, very short gibberish.
+ * These are NOT tool requests — sending them to executor wastes an LLM call.
+ */
+const NOISE_MESSAGE = /^[\p{Emoji}\p{Emoji_Component}\s]+$|^[.!?,;:…\-—_*#@^&()+=~`'"<>{}[\]\\/|]+$|^(.)\1{2,}$/u;
+
+/** Confidence above which we trust the router's simple_chat verdict. */
+const SIMPLE_CHAT_TRUST_THRESHOLD = 0.85;
 
 function shouldOverrideSimpleChat(
   userMessage: string,
   hasToolsAvailable: boolean,
+  routerConfidence: number,
 ): boolean {
   if (!hasToolsAvailable) return false;
-  // Both entity + action verb must match to avoid false positives on e.g. "what is a test case?"
-  // But entity alone is enough for imperative commands like "тест кейсы" (implied "show me")
-  const hasEntity = QA_ENTITY_PATTERNS.test(userMessage);
-  const hasAction = ACTION_VERB_PATTERNS.test(userMessage);
-  return hasEntity && hasAction;
+
+  const trimmed = userMessage.trim();
+
+  // Noise messages (emoji, punctuation, gibberish) → never override, let simple_chat handle
+  if (NOISE_MESSAGE.test(trimmed)) {
+    return false;
+  }
+
+  // High confidence + matches known simple-chat → trust the router
+  if (routerConfidence >= SIMPLE_CHAT_TRUST_THRESHOLD && GENUINE_SIMPLE_CHAT.test(trimmed)) {
+    return false;
+  }
+
+  // Low confidence simple_chat with tools available → override
+  if (routerConfidence < SIMPLE_CHAT_TRUST_THRESHOLD) {
+    return true;
+  }
+
+  // High confidence but message is longer than a greeting → still override
+  // (genuine simple_chat messages are almost always short)
+  const wordCount = trimmed.split(/\s+/).length;
+  if (wordCount > 5 && !GENUINE_SIMPLE_CHAT.test(trimmed)) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -206,23 +243,26 @@ export class SubAgentPipeline {
         return true;
       }) as ChatCompletionMessageParam[];
 
-      // ═══ GUARDRAIL: Override simple_chat if user clearly wants tool action ═══
+      // ═══ GUARDRAIL: Override simple_chat when tools are available but router misjudged ═══
+      // simple_chat = ZERO tools. If we're wrong, the user gets "I don't have access".
+      // Better to give the executor tools and let it decide not to call them.
       if (
         routerResult.classification === 'simple_chat' &&
-        shouldOverrideSimpleChat(input.userMessage, input.availableTools.length > 0)
+        shouldOverrideSimpleChat(input.userMessage, input.availableTools.length > 0, routerResult.confidence)
       ) {
-        logger.warn('[SUB_AGENT_PIPELINE] Guardrail: overriding simple_chat → single_tool (QA entity + action detected)', {
+        logger.warn('[SUB_AGENT_PIPELINE] Guardrail: overriding simple_chat → single_tool', {
           userMessage: input.userMessage.substring(0, 100),
           originalConfidence: routerResult.confidence,
+          reason: 'tools available but simple_chat not trusted',
         });
 
-        // Reclassify to single_tool with qa_read (safe default — executor can still write if needed)
         routerResult.classification = 'single_tool';
-        routerResult.toolCategories = ['qa_read'];
-        routerResult.confidence = 0.7; // Synthetic confidence
+        // Don't guess the category — give ALL registered categories.
+        // The executor LLM will pick the right tools from the full set.
+        routerResult.toolCategories = getValidCategories();
+        routerResult.confidence = 0.7;
         metrics.routerClassification = 'single_tool (guardrail)';
 
-        // Update blackboard with corrected classification
         blackboard.setRouterResult(routerResult);
       }
 

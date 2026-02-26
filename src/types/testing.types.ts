@@ -871,7 +871,7 @@ export interface RunReport {
   startedAt: string;
   completedAt: string | null;
   durationMs: number | null;
-  aiConfidence: number;
+  aiConfidence: number | null;
   summary: RunReportSummary;
   executions: RunReportExecution[];
   bugs: EnrichedBug[];

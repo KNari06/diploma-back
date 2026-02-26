@@ -460,7 +460,16 @@ export class TestReportGeneratorService {
         .from('test_reports')
         .select('*')
         .in('test_id', testIds);
-      if (error || !data) return [];
+      if (error) {
+        // PGRST205 = table not found — expected if migration not applied yet
+        if (error.code === 'PGRST205') {
+          logger.debug('[REPORT_GENERATOR] test_reports table not available (migration pending)');
+        } else {
+          logger.warn('[REPORT_GENERATOR] Failed to batch fetch test reports', { error, count: testIds.length });
+        }
+        return [];
+      }
+      if (!data) return [];
       return data.map((row: any) => ({
         testId: row.test_id,
         testUrl: row.test_url,
@@ -472,7 +481,8 @@ export class TestReportGeneratorService {
         analysis: row.analysis,
         summary: row.summary,
       }));
-    } catch {
+    } catch (error) {
+      logger.debug('[REPORT_GENERATOR] Batch report query skipped (table may not exist)', { count: testIds.length });
       return [];
     }
   }

@@ -7,6 +7,9 @@ import {
   addComment,
   getRepoInfo,
 } from '@/services/api/github.service';
+import { IntegrationTokenService } from '@/services/api/integration-token.service';
+import { supabaseAdmin } from '@/db/supabase';
+import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -15,7 +18,7 @@ import { logger } from '@/utils/core/logger';
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * GitHub integration for issue and PR management.
- * Provides: create issue, list PRs, add comment, get repo info
+ * Provides: connect, status, disconnect, create issue, list PRs, add comment, get repo info
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -24,6 +27,53 @@ import { logger } from '@/utils/core/logger';
  * GitHub skill tools
  */
 const GITHUB_TOOLS: ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'github_status',
+      description:
+        'Check if GitHub is connected for the user. Returns connection status, username, and profile URL. Always available.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_connect',
+      description:
+        'Start GitHub OAuth connection. Use when user asks to connect/setup/integrate GitHub OR reconnect/re-authorize. ' +
+        'Returns an authorization URL — tell the user to open it in their browser to authorize. ' +
+        'After authorization, GitHub will be connected automatically. Can also be used to refresh an expired connection. Always available.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_disconnect',
+      description:
+        'Disconnect the GitHub integration for the user. Requires confirmation. Always available.',
+      parameters: {
+        type: 'object',
+        properties: {
+          confirm: {
+            type: 'boolean',
+            description:
+              'Must be true. Set ONLY after warning user that GitHub will be disconnected AND receiving explicit approval.',
+          },
+        },
+        required: ['confirm'],
+      },
+    },
+  },
   {
     type: 'function',
     function: {
@@ -147,19 +197,11 @@ export const GitHubSkill: SkillDefinition = {
   tools: GITHUB_TOOLS,
 
   /**
-   * Check if user has connected GitHub
+   * Always available — github_connect / github_status / github_disconnect work without a token.
+   * Other tools fail gracefully if not connected.
    */
-  async isAvailable(context: SkillContext): Promise<boolean> {
-    try {
-      const token = await getGitHubToken(context.userId, context.workspaceId);
-      return token !== null;
-    } catch (error) {
-      logger.error('[GITHUB_SKILL] Error checking availability', {
-        error: error instanceof Error ? error.message : String(error),
-        userId: context.userId,
-      });
-      return false;
-    }
+  async isAvailable(_context: SkillContext): Promise<boolean> {
+    return true;
   },
 
   /**
@@ -177,12 +219,28 @@ export const GitHubSkill: SkillDefinition = {
     });
 
     try {
-      // Get GitHub token
+      // Tools that do not require an existing token
+      if (toolName === 'github_status') {
+        return await handleStatus(context);
+      }
+
+      if (toolName === 'github_connect') {
+        return await handleConnect();
+      }
+
+      if (toolName === 'github_disconnect') {
+        return await handleDisconnect(args, context);
+      }
+
+      // All other tools require an existing token
       const tokenData = await getGitHubToken(context.userId, context.workspaceId);
       if (!tokenData) {
+        const hasDisabled = await hasDisabledGitHubToken(context.userId, context.workspaceId);
         return {
           success: false,
-          message: 'GitHub integration not connected. Please connect your GitHub account first.',
+          message: hasDisabled
+            ? 'GitHub was previously connected but is now disabled. Use github_connect to reconnect.'
+            : 'GitHub is not connected. Use github_connect to start the OAuth flow and guide the user through authorization.',
           displayToUser: true,
         };
       }
@@ -190,18 +248,23 @@ export const GitHubSkill: SkillDefinition = {
       const accessToken = tokenData.access_token;
 
       // Route to appropriate handler
+      let result: SkillResult;
       switch (toolName) {
         case 'github_create_issue':
-          return await handleCreateIssue(accessToken, args);
+          result = await handleCreateIssue(accessToken, args);
+          break;
 
         case 'github_list_prs':
-          return await handleListPRs(accessToken, args);
+          result = await handleListPRs(accessToken, args);
+          break;
 
         case 'github_add_comment':
-          return await handleAddComment(accessToken, args);
+          result = await handleAddComment(accessToken, args);
+          break;
 
         case 'github_get_repo':
-          return await handleGetRepo(accessToken, args);
+          result = await handleGetRepo(accessToken, args);
+          break;
 
         default:
           return {
@@ -210,11 +273,30 @@ export const GitHubSkill: SkillDefinition = {
             displayToUser: false,
           };
       }
+
+      // Detect revoked/invalid token
+      if (!result.success && isGitHubTokenRevokedError(result.message)) {
+        return {
+          success: false,
+          message: 'The GitHub access token has been revoked or is invalid. Please reconnect using github_connect.',
+          displayToUser: true,
+        };
+      }
+
+      return result;
     } catch (error) {
       logger.error('[GITHUB_SKILL] Execution error', {
         toolName,
         error: error instanceof Error ? error.message : String(error),
       });
+
+      if (isGitHubTokenRevokedError(error)) {
+        return {
+          success: false,
+          message: 'The GitHub access token has been revoked or is invalid. Please reconnect using github_connect.',
+          displayToUser: true,
+        };
+      }
 
       return {
         success: false,
@@ -224,6 +306,171 @@ export const GitHubSkill: SkillDefinition = {
     }
   },
 };
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Check if an error indicates a revoked/invalid GitHub token (401/403)
+ */
+function isGitHubTokenRevokedError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /401|403|Bad credentials|token.*revoked|token.*expired/i.test(msg);
+}
+
+/**
+ * Check for a disabled token (exists but enabled=false).
+ */
+async function hasDisabledGitHubToken(userId: string, workspaceId?: string): Promise<boolean> {
+  try {
+    let query = supabaseAdmin
+      .from('integration_tokens')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('provider', 'github')
+      .eq('enabled', false);
+
+    if (workspaceId) {
+      query = query.eq('workspace_id', workspaceId);
+    }
+
+    const { data } = await query.limit(1).maybeSingle();
+    return !!data;
+  } catch {
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Handlers
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Status handler — check if GitHub is connected
+ */
+async function handleStatus(context: SkillContext): Promise<SkillResult> {
+  const tokenData = await getGitHubToken(context.userId, context.workspaceId);
+
+  if (!tokenData) {
+    const hasDisabled = await hasDisabledGitHubToken(context.userId, context.workspaceId);
+
+    if (hasDisabled) {
+      return {
+        success: true,
+        data: { connected: false, disabled: true },
+        message: 'GitHub was previously connected but is now disabled. Use github_connect to reconnect.',
+        displayToUser: true,
+      };
+    }
+
+    return {
+      success: true,
+      data: { connected: false },
+      message: 'GitHub is not connected. Use github_connect to start the OAuth flow.',
+      displayToUser: true,
+    };
+  }
+
+  const meta = tokenData.metadata || {};
+  return {
+    success: true,
+    data: {
+      connected: true,
+      username: meta.username || tokenData.external_id || null,
+      name: meta.name || null,
+      profileUrl: tokenData.external_url || null,
+      connectedAt: tokenData.created_at,
+    },
+    message: `GitHub connected: @${meta.username || tokenData.external_id || 'unknown'}${tokenData.external_url ? ` (${tokenData.external_url})` : ''}`,
+    displayToUser: true,
+  };
+}
+
+/**
+ * Connect handler — returns GitHub OAuth URL
+ */
+async function handleConnect(): Promise<SkillResult> {
+  const clientId = env.GITHUB_CLIENT_ID;
+
+  if (!clientId) {
+    return {
+      success: false,
+      message:
+        'GitHub OAuth is not configured on the server. Contact your admin to set GITHUB_CLIENT_ID.',
+      displayToUser: true,
+    };
+  }
+
+  const backendUrl = env.BACKEND_URL || `http://localhost:${env.PORT}`;
+  const callbackUrl = `${backendUrl}/api/${env.API_VERSION}/integrations/github/callback`;
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: callbackUrl,
+    scope: 'repo,read:user',
+  });
+
+  const authUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
+
+  return {
+    success: true,
+    data: { authUrl },
+    message:
+      `To connect GitHub, open this URL in your browser:\n\n${authUrl}\n\n` +
+      `Sign in to GitHub and grant access. After completing the flow you will be redirected back and GitHub will be connected.`,
+    displayToUser: true,
+  };
+}
+
+/**
+ * Disconnect handler
+ */
+async function handleDisconnect(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  if (!args.confirm) {
+    return {
+      success: false,
+      message:
+        'Disconnecting GitHub requires confirmation. Warn the user that the integration will be removed and they will need to re-authorize. Set confirm=true after explicit approval.',
+      displayToUser: true,
+    };
+  }
+
+  const tokenData = await getGitHubToken(context.userId, context.workspaceId);
+  if (!tokenData) {
+    return {
+      success: false,
+      message: 'GitHub is not connected — nothing to disconnect.',
+      displayToUser: true,
+    };
+  }
+
+  try {
+    await IntegrationTokenService.deleteToken(context.userId, 'github', undefined, context.workspaceId);
+  } catch (error) {
+    logger.error('[GITHUB_SKILL] Failed to disconnect', {
+      error: error instanceof Error ? error.message : String(error),
+      userId: context.userId,
+    });
+    return {
+      success: false,
+      message: 'Failed to disconnect GitHub. Please try again.',
+      displayToUser: true,
+    };
+  }
+
+  logger.info('[GITHUB_SKILL] GitHub disconnected via chat', { userId: context.userId });
+
+  return {
+    success: true,
+    data: { disconnected: true },
+    message: 'GitHub disconnected successfully. You can reconnect anytime using github_connect.',
+    displayToUser: true,
+  };
+}
 
 /**
  * Create issue handler
@@ -259,7 +506,7 @@ async function handleCreateIssue(
         url: issue.html_url,
         state: issue.state,
       },
-      message: `✅ Created GitHub issue #${issue.number}: ${title}\n${issue.html_url}`,
+      message: `Created GitHub issue #${issue.number}: ${title}\n${issue.html_url}`,
       displayToUser: true,
     };
   } catch (error) {
@@ -361,7 +608,7 @@ async function handleAddComment(
     return {
       success: true,
       data: { issueNumber: issue_number, owner, repo },
-      message: `✅ Added comment to ${owner}/${repo}#${issue_number}`,
+      message: `Added comment to ${owner}/${repo}#${issue_number}`,
       displayToUser: true,
     };
   } catch (error) {

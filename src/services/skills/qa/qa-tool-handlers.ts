@@ -1,4 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { AutomationActionService } from '@/services/automation/automation-action.service';
+import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { PatternsQueryService } from '@/services/kb/patterns-query.service';
 import { CoverageAnalysisService } from '@/services/testing/analysis/coverage-analysis.service';
 import { FailureAnalysisService } from '@/services/testing/analysis/failure-analysis.service';
@@ -15,7 +17,9 @@ import { ModuleService } from '@/services/testing/modules/module.service';
 import { FlowService } from '@/services/testing/flows/flow.service';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import type { SkillContext, SkillResult } from '../types';
+import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
+import * as crypto from 'crypto';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -36,6 +40,135 @@ import { logger } from '@/utils/core/logger';
 function resolveProjectId(args: Record<string, any>, context: SkillContext): string | undefined {
   return context.projectId || args.project_id;
 }
+
+// ── Name → ID resolvers ───────────────────────────────────────────────────
+// Allow users to reference entities by name instead of UUID.
+// Each resolver returns the ID if exactly one match is found,
+// or a descriptive error if zero or multiple matches are found.
+
+type ResolveResult = { id: string } | { error: string };
+
+async function resolveByName(
+  table: string,
+  nameColumn: string,
+  name: string,
+  projectId: string,
+  label: string,
+): Promise<ResolveResult> {
+  const { data, error } = await supabaseAdmin
+    .from(table)
+    .select('id, ' + nameColumn)
+    .eq('project_id', projectId)
+    .ilike(nameColumn, `%${name}%`) as { data: any[] | null; error: any };
+
+  if (error) return { error: `Failed to search ${label}: ${error.message}` };
+  if (!data || data.length === 0) return { error: `No ${label} found matching "${name}"` };
+  if (data.length === 1) return { id: data[0].id };
+
+  // Multiple matches — return list so the AI can disambiguate
+  const list = data.slice(0, 5).map((r: any) => `• ${r[nameColumn]} (${r.id})`).join('\n');
+  return { error: `Multiple ${label}s match "${name}":\n${list}\nPlease specify the exact name or ID.` };
+}
+
+async function resolvePlanByName(name: string, projectId: string): Promise<ResolveResult> {
+  return resolveByName('regression_plans', 'name', name, projectId, 'regression plan');
+}
+
+async function resolveModuleByName(name: string, projectId: string): Promise<ResolveResult> {
+  return resolveByName('test_modules', 'name', name, projectId, 'module');
+}
+
+async function resolveScheduleByName(name: string, projectId: string): Promise<ResolveResult> {
+  return resolveByName('test_schedules', 'name', name, projectId, 'schedule');
+}
+
+async function resolveTestCaseByName(name: string, projectId: string): Promise<ResolveResult> {
+  return resolveByName('intent_test_cases', 'name', name, projectId, 'test case');
+}
+
+async function resolveFlowByName(name: string, moduleId: string): Promise<ResolveResult> {
+  const { data, error } = await supabaseAdmin
+    .from('test_flows')
+    .select('id, name')
+    .eq('module_id', moduleId)
+    .ilike('name', `%${name}%`) as { data: any[] | null; error: any };
+
+  if (error) return { error: `Failed to search flow: ${error.message}` };
+  if (!data || data.length === 0) return { error: `No flow found matching "${name}"` };
+  if (data.length === 1) return { id: data[0].id };
+
+  const list = data.slice(0, 5).map((r: any) => `• ${r.name} (${r.id})`).join('\n');
+  return { error: `Multiple flows match "${name}":\n${list}\nPlease specify the exact name or ID.` };
+}
+
+async function resolveAutomationActionByName(name: string, userId: string): Promise<ResolveResult> {
+  const { data, error } = await supabaseAdmin
+    .from('automation_actions')
+    .select('id, name')
+    .eq('user_id', userId)
+    .ilike('name', `%${name}%`) as { data: any[] | null; error: any };
+
+  if (error) return { error: `Failed to search automation action: ${error.message}` };
+  if (!data || data.length === 0) return { error: `No automation action found matching "${name}"` };
+  if (data.length === 1) return { id: data[0].id };
+
+  const list = data.slice(0, 5).map((r: any) => `• ${r.name} (${r.id})`).join('\n');
+  return { error: `Multiple automation actions match "${name}":\n${list}\nPlease specify the exact name or ID.` };
+}
+
+/**
+ * Resolve a run_id: if the user provides a plan name instead of UUID,
+ * find the latest run for that plan. Used by qa_get_run_status, qa_cancel_run, qa_share_result.
+ */
+async function resolveRunId(
+  runId: string | undefined,
+  search: string | undefined,
+  projectId: string | undefined,
+  userId: string,
+): Promise<{ id: string | undefined; error?: string }> {
+  if (runId && isUUID(runId)) return { id: runId };
+
+  // If runId looks like a name or search is provided, resolve via plan name → latest run
+  const nameQuery = (runId && !isUUID(runId)) ? runId : search;
+  if (!nameQuery) return { id: undefined };
+  if (!projectId) return { id: undefined, error: 'project_id required when searching runs by name' };
+
+  // Find plans matching the name
+  const { data: plans } = await supabaseAdmin
+    .from('regression_plans')
+    .select('id, name')
+    .eq('project_id', projectId)
+    .ilike('name', `%${nameQuery}%`);
+
+  if (!plans || plans.length === 0) {
+    return { id: undefined, error: `No regression plan found matching "${nameQuery}"` };
+  }
+
+  const planIds = plans.map(p => p.id);
+
+  // Get the latest run for matching plans
+  const { data: latestRun } = await supabaseAdmin
+    .from('regression_runs')
+    .select('id, plan_id')
+    .eq('user_id', userId)
+    .in('plan_id', planIds)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!latestRun) {
+    const planNames = plans.map(p => p.name).join(', ');
+    return { id: undefined, error: `No regression runs found for plan(s): ${planNames}` };
+  }
+
+  return { id: latestRun.id };
+}
+
+/** Resolve an ID param: if it looks like a UUID, use directly; otherwise treat as name search. */
+function isUUID(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
 
 /**
  * qa_list_test_cases — Query saved test cases with filters
@@ -116,11 +249,18 @@ export async function handleListTestExecutions(
   const projectId = resolveProjectId(args, context);
   const days = Math.min(args.days || 30, 90);
   const status = args.status as string | undefined;
-  const testCaseId = args.test_case_id as string | undefined;
+  let testCaseId = args.test_case_id as string | undefined;
   const limit = Math.min(args.limit || 20, 50);
 
   if (!projectId) {
     return { success: false, message: 'Missing required field: project_id', displayToUser: false };
+  }
+
+  // Resolve test_case_id by name
+  if (testCaseId && !isUUID(testCaseId)) {
+    const r = await resolveTestCaseByName(testCaseId, projectId);
+    if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+    testCaseId = r.id;
   }
 
   try {
@@ -368,10 +508,20 @@ export async function handleGetTestCase(
   args: Record<string, any>,
   context: SkillContext
 ): Promise<SkillResult> {
-  const testCaseId = args.test_case_id;
+  let testCaseId = args.test_case_id as string | undefined;
+
+  // Resolve test_case_id by name
+  if (testCaseId && !isUUID(testCaseId)) {
+    const projectId = resolveProjectId(args, context);
+    if (projectId) {
+      const r = await resolveTestCaseByName(testCaseId, projectId);
+      if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+      testCaseId = r.id;
+    }
+  }
 
   if (!testCaseId) {
-    return { success: false, message: 'Missing required field: test_case_id', displayToUser: false };
+    return { success: false, message: 'Missing required field: test_case_id (UUID or name)', displayToUser: false };
   }
 
   try {
@@ -454,10 +604,18 @@ export async function handleGetRunReport(
   args: Record<string, any>,
   context: SkillContext
 ): Promise<SkillResult> {
-  const runId = args.run_id;
+  let runId = args.run_id as string | undefined;
+
+  // Resolve run_id: accept UUID or plan name (finds latest run for that plan)
+  if (runId && !isUUID(runId)) {
+    const projectId = resolveProjectId(args, context);
+    const resolved = await resolveRunId(runId, undefined, projectId, context.userId);
+    if (resolved.error) return { success: false, message: resolved.error, displayToUser: true };
+    runId = resolved.id;
+  }
 
   if (!runId) {
-    return { success: false, message: 'Missing required field: run_id', displayToUser: false };
+    return { success: false, message: 'Missing required field: run_id (UUID or plan name)', displayToUser: false };
   }
 
   try {
@@ -1078,11 +1236,18 @@ export async function handleListTestFlows(
   args: Record<string, any>,
   context: SkillContext
 ): Promise<SkillResult> {
-  const moduleId = args.module_id;
+  let moduleId = args.module_id as string | undefined;
   const projectId = resolveProjectId(args, context);
 
+  // Resolve module_id by name
+  if (moduleId && !isUUID(moduleId) && projectId) {
+    const r = await resolveModuleByName(moduleId, projectId);
+    if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+    moduleId = r.id;
+  }
+
   if (!moduleId) {
-    return { success: false, message: 'Missing required field: module_id', displayToUser: false };
+    return { success: false, message: 'Missing required field: module_id (UUID or name)', displayToUser: false };
   }
 
   try {
@@ -2420,12 +2585,22 @@ export async function handleUpdateTestCaseSteps(
   args: Record<string, any>,
   context: SkillContext
 ): Promise<SkillResult> {
-  const testCaseId = args.test_case_id;
+  let testCaseId = args.test_case_id as string | undefined;
   const steps = args.steps as IntentStep[] | undefined;
   const confirm = args.confirm === true;
 
+  // Resolve test_case_id by name
+  if (testCaseId && !isUUID(testCaseId)) {
+    const projectId = resolveProjectId(args, context);
+    if (projectId) {
+      const r = await resolveTestCaseByName(testCaseId, projectId);
+      if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+      testCaseId = r.id;
+    }
+  }
+
   if (!testCaseId) {
-    return { success: false, message: 'Missing required field: test_case_id', displayToUser: false };
+    return { success: false, message: 'Missing required field: test_case_id (UUID or name)', displayToUser: false };
   }
 
   if (!steps || !Array.isArray(steps) || steps.length === 0) {
@@ -2579,11 +2754,21 @@ export async function handleUpdateTestCase(
   args: Record<string, any>,
   context: SkillContext
 ): Promise<SkillResult> {
-  const testCaseId = args.test_case_id as string | undefined;
+  let testCaseId = args.test_case_id as string | undefined;
   const confirm = args.confirm === true;
 
+  // Resolve test_case_id by name
+  if (testCaseId && !isUUID(testCaseId)) {
+    const projectId = resolveProjectId(args, context);
+    if (projectId) {
+      const r = await resolveTestCaseByName(testCaseId, projectId);
+      if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+      testCaseId = r.id;
+    }
+  }
+
   if (!testCaseId) {
-    return { success: false, message: 'Missing required field: test_case_id', displayToUser: false };
+    return { success: false, message: 'Missing required field: test_case_id (UUID or name)', displayToUser: false };
   }
 
   // Gate: confirm required
@@ -2731,15 +2916,44 @@ export async function handleRunTest(
   }
 
   try {
-    const targetId = args.target_id as string | undefined;
+    let targetId = args.target_id as string | undefined;
     const tag = args.tag as string | undefined;
     const priorityFilter = args.priority_filter as string | undefined;
     const projectId = resolveProjectId(args, context);
 
+    // Smart name→ID resolution for target_id based on run_type
+    if (targetId && !isUUID(targetId) && projectId) {
+      const resolverMap: Record<string, (name: string, scope: string) => Promise<ResolveResult>> = {
+        test_case: resolveTestCaseByName,
+        plan: resolvePlanByName,
+        module: resolveModuleByName,
+      };
+      const resolver = resolverMap[runType];
+      if (resolver) {
+        const resolved = await resolver(targetId, projectId);
+        if ('error' in resolved) return { success: false, message: resolved.error, displayToUser: true };
+        targetId = resolved.id;
+      }
+
+      // Flow: resolve by name using module_id scope
+      if (runType === 'flow') {
+        let moduleId = args.module_id as string | undefined;
+        if (moduleId && !isUUID(moduleId)) {
+          const mr = await resolveModuleByName(moduleId, projectId);
+          if ('id' in mr) moduleId = mr.id;
+        }
+        if (moduleId) {
+          const fr = await resolveFlowByName(targetId!, moduleId);
+          if ('error' in fr) return { success: false, message: fr.error, displayToUser: true };
+          targetId = fr.id;
+        }
+      }
+    }
+
     switch (runType) {
       case 'test_case': {
         if (!targetId) {
-          return { success: false, message: 'Missing required field: target_id (test case ID)', displayToUser: false };
+          return { success: false, message: 'Missing required field: target_id (test case ID or name)', displayToUser: false };
         }
         const result = await RegressionRunService.runSavedTestCase({
           savedTestCaseId: targetId,
@@ -2756,7 +2970,7 @@ export async function handleRunTest(
 
       case 'plan': {
         if (!targetId) {
-          return { success: false, message: 'Missing required field: target_id (plan ID)', displayToUser: false };
+          return { success: false, message: 'Missing required field: target_id (plan ID or name)', displayToUser: false };
         }
         const result = await RegressionRunService.runPlan({
           planId: targetId,
@@ -2773,7 +2987,7 @@ export async function handleRunTest(
 
       case 'module': {
         if (!targetId) {
-          return { success: false, message: 'Missing required field: target_id (module ID)', displayToUser: false };
+          return { success: false, message: 'Missing required field: target_id (module ID or name)', displayToUser: false };
         }
         const result = await RegressionRunService.runModule({
           moduleId: targetId,
@@ -2790,7 +3004,7 @@ export async function handleRunTest(
 
       case 'flow': {
         if (!targetId) {
-          return { success: false, message: 'Missing required field: target_id (flow ID)', displayToUser: false };
+          return { success: false, message: 'Missing required field: target_id (flow ID or name)', displayToUser: false };
         }
         const result = await RegressionRunService.runFlow({
           flowId: targetId,
@@ -3060,9 +3274,16 @@ export async function handleManageRegressionPlan(
       }
 
       case 'update': {
-        const planId = args.plan_id as string | undefined;
+        let planId = args.plan_id as string | undefined;
+        if (planId && !isUUID(planId)) {
+          const projectId = resolveProjectId(args, context);
+          if (!projectId) return { success: false, message: 'project_id required when searching plans by name', displayToUser: false };
+          const r = await resolvePlanByName(planId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          planId = r.id;
+        }
         if (!planId) {
-          return { success: false, message: 'Missing required field: plan_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: plan_id (UUID or name)', displayToUser: false };
         }
 
         const plan = await RegressionPlanService.update({
@@ -3085,18 +3306,42 @@ export async function handleManageRegressionPlan(
       }
 
       case 'add_item': {
-        const planId = args.plan_id as string | undefined;
+        let planId = args.plan_id as string | undefined;
         const itemType = args.item_type as string | undefined;
-        const itemId = args.item_id as string | undefined;
+        let itemId = args.item_id as string | undefined;
+        const projectId = resolveProjectId(args, context);
+
+        // Resolve plan_id by name
+        if (planId && !isUUID(planId)) {
+          if (!projectId) return { success: false, message: 'project_id required when searching plans by name', displayToUser: false };
+          const r = await resolvePlanByName(planId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          planId = r.id;
+        }
 
         if (!planId) {
-          return { success: false, message: 'Missing required field: plan_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: plan_id (UUID or name)', displayToUser: false };
         }
         if (!itemType || !['module', 'flow', 'test_case'].includes(itemType)) {
           return { success: false, message: 'Missing or invalid item_type. Must be module, flow, or test_case.', displayToUser: false };
         }
+
+        // Resolve item_id by name based on item_type
+        if (itemId && !isUUID(itemId) && projectId) {
+          const itemResolvers: Record<string, (name: string, scope: string) => Promise<ResolveResult>> = {
+            module: resolveModuleByName,
+            test_case: resolveTestCaseByName,
+          };
+          const resolver = itemResolvers[itemType];
+          if (resolver) {
+            const r = await resolver(itemId, projectId);
+            if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+            itemId = r.id;
+          }
+        }
+
         if (!itemId) {
-          return { success: false, message: 'Missing required field: item_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: item_id (UUID or name)', displayToUser: false };
         }
 
         const item = await RegressionPlanService.addItem({
@@ -3199,11 +3444,26 @@ export async function handleManageSchedule(
           return { success: false, message: 'Missing required field: cron_expression', displayToUser: false };
         }
 
+        // Resolve plan_id/module_id by name if needed
+        let resolvedPlanId = args.plan_id as string | undefined;
+        let resolvedModuleId = args.module_id as string | undefined;
+
+        if (resolvedPlanId && !isUUID(resolvedPlanId)) {
+          const r = await resolvePlanByName(resolvedPlanId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          resolvedPlanId = r.id;
+        }
+        if (resolvedModuleId && !isUUID(resolvedModuleId)) {
+          const r = await resolveModuleByName(resolvedModuleId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          resolvedModuleId = r.id;
+        }
+
         // Validate exactly one of plan_id/module_id
-        const hasPlanId = !!args.plan_id;
-        const hasModuleId = !!args.module_id;
+        const hasPlanId = !!resolvedPlanId;
+        const hasModuleId = !!resolvedModuleId;
         if (!hasPlanId && !hasModuleId) {
-          return { success: false, message: 'Must provide exactly one of plan_id or module_id', displayToUser: false };
+          return { success: false, message: 'Must provide exactly one of plan_id or module_id (name or UUID)', displayToUser: false };
         }
         if (hasPlanId && hasModuleId) {
           return { success: false, message: 'Must provide exactly one of plan_id or module_id, not both', displayToUser: false };
@@ -3215,8 +3475,8 @@ export async function handleManageSchedule(
           name,
           cronExpression,
           timezone: args.timezone || undefined,
-          planId: args.plan_id || undefined,
-          moduleId: args.module_id || undefined,
+          planId: resolvedPlanId || undefined,
+          moduleId: resolvedModuleId || undefined,
         });
 
         logger.info('[QA_TOOL] Schedule created', { scheduleId: schedule.id, userId: context.userId });
@@ -3236,9 +3496,16 @@ export async function handleManageSchedule(
       }
 
       case 'update': {
-        const scheduleId = args.schedule_id as string | undefined;
+        let scheduleId = args.schedule_id as string | undefined;
+        if (scheduleId && !isUUID(scheduleId)) {
+          const projectId = resolveProjectId(args, context);
+          if (!projectId) return { success: false, message: 'project_id required when searching schedules by name', displayToUser: false };
+          const r = await resolveScheduleByName(scheduleId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          scheduleId = r.id;
+        }
         if (!scheduleId) {
-          return { success: false, message: 'Missing required field: schedule_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: schedule_id (UUID or name)', displayToUser: false };
         }
 
         const schedule = await ScheduleService.update({
@@ -3267,9 +3534,16 @@ export async function handleManageSchedule(
       }
 
       case 'activate': {
-        const scheduleId = args.schedule_id as string | undefined;
+        let scheduleId = args.schedule_id as string | undefined;
+        if (scheduleId && !isUUID(scheduleId)) {
+          const projectId = resolveProjectId(args, context);
+          if (!projectId) return { success: false, message: 'project_id required when searching schedules by name', displayToUser: false };
+          const r = await resolveScheduleByName(scheduleId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          scheduleId = r.id;
+        }
         if (!scheduleId) {
-          return { success: false, message: 'Missing required field: schedule_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: schedule_id (UUID or name)', displayToUser: false };
         }
 
         const schedule = await ScheduleService.activate(scheduleId, context.userId);
@@ -3290,9 +3564,16 @@ export async function handleManageSchedule(
       }
 
       case 'deactivate': {
-        const scheduleId = args.schedule_id as string | undefined;
+        let scheduleId = args.schedule_id as string | undefined;
+        if (scheduleId && !isUUID(scheduleId)) {
+          const projectId = resolveProjectId(args, context);
+          if (!projectId) return { success: false, message: 'project_id required when searching schedules by name', displayToUser: false };
+          const r = await resolveScheduleByName(scheduleId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          scheduleId = r.id;
+        }
         if (!scheduleId) {
-          return { success: false, message: 'Missing required field: schedule_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: schedule_id (UUID or name)', displayToUser: false };
         }
 
         const schedule = await ScheduleService.deactivate(scheduleId, context.userId);
@@ -3312,9 +3593,16 @@ export async function handleManageSchedule(
       }
 
       case 'delete': {
-        const scheduleId = args.schedule_id as string | undefined;
+        let scheduleId = args.schedule_id as string | undefined;
+        if (scheduleId && !isUUID(scheduleId)) {
+          const projectId = resolveProjectId(args, context);
+          if (!projectId) return { success: false, message: 'project_id required when searching schedules by name', displayToUser: false };
+          const r = await resolveScheduleByName(scheduleId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          scheduleId = r.id;
+        }
         if (!scheduleId) {
-          return { success: false, message: 'Missing required field: schedule_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: schedule_id (UUID or name)', displayToUser: false };
         }
 
         await ScheduleService.delete(scheduleId, context.userId);
@@ -3357,11 +3645,21 @@ export async function handleDeleteTestCase(
   args: Record<string, any>,
   context: SkillContext
 ): Promise<SkillResult> {
-  const testCaseId = args.test_case_id as string | undefined;
+  let testCaseId = args.test_case_id as string | undefined;
   const confirm = args.confirm === true;
 
+  // Resolve test_case_id by name
+  if (testCaseId && !isUUID(testCaseId)) {
+    const projectId = resolveProjectId(args, context);
+    if (projectId) {
+      const r = await resolveTestCaseByName(testCaseId, projectId);
+      if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+      testCaseId = r.id;
+    }
+  }
+
   if (!testCaseId) {
-    return { success: false, message: 'Missing required field: test_case_id', displayToUser: false };
+    return { success: false, message: 'Missing required field: test_case_id (UUID or name)', displayToUser: false };
   }
 
   if (!confirm) {
@@ -3639,9 +3937,16 @@ export async function handleManageModule(
       }
 
       case 'update': {
-        const moduleId = args.module_id as string | undefined;
+        let moduleId = args.module_id as string | undefined;
+        if (moduleId && !isUUID(moduleId)) {
+          const projectId = resolveProjectId(args, context);
+          if (!projectId) return { success: false, message: 'project_id required when searching modules by name', displayToUser: false };
+          const r = await resolveModuleByName(moduleId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          moduleId = r.id;
+        }
         if (!moduleId) {
-          return { success: false, message: 'Missing required field: module_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: module_id (UUID or name)', displayToUser: false };
         }
 
         const mod = await ModuleService.update({
@@ -3712,11 +4017,20 @@ export async function handleManageFlow(
   try {
     switch (action) {
       case 'create': {
-        const moduleId = args.module_id as string | undefined;
+        let moduleId = args.module_id as string | undefined;
         const name = args.name as string | undefined;
 
+        // Resolve module_id by name
+        if (moduleId && !isUUID(moduleId)) {
+          const projectId = resolveProjectId(args, context);
+          if (!projectId) return { success: false, message: 'project_id required when searching modules by name', displayToUser: false };
+          const r = await resolveModuleByName(moduleId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          moduleId = r.id;
+        }
+
         if (!moduleId) {
-          return { success: false, message: 'Missing required field: module_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: module_id (UUID or name)', displayToUser: false };
         }
         if (!name) {
           return { success: false, message: 'Missing required field: name', displayToUser: false };
@@ -3745,9 +4059,25 @@ export async function handleManageFlow(
       }
 
       case 'update': {
-        const flowId = args.flow_id as string | undefined;
+        let flowId = args.flow_id as string | undefined;
+        // Flow resolution needs module_id scope
+        if (flowId && !isUUID(flowId)) {
+          let moduleId = args.module_id as string | undefined;
+          if (moduleId && !isUUID(moduleId)) {
+            const projectId = resolveProjectId(args, context);
+            if (projectId) {
+              const mr = await resolveModuleByName(moduleId, projectId);
+              if ('id' in mr) moduleId = mr.id;
+            }
+          }
+          if (moduleId) {
+            const r = await resolveFlowByName(flowId, moduleId);
+            if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+            flowId = r.id;
+          }
+        }
         if (!flowId) {
-          return { success: false, message: 'Missing required field: flow_id', displayToUser: false };
+          return { success: false, message: 'Missing required field: flow_id (UUID or name; provide module_id for name lookup)', displayToUser: false };
         }
 
         const flow = await FlowService.update({
@@ -3989,6 +4319,613 @@ export async function handleScreenshot(
     return {
       success: false,
       message: `Failed to capture screenshot: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_share_result — Generate a public share link for a regression run
+ */
+export async function handleShareResult(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  let runId = args.run_id as string | undefined;
+
+  // Resolve run_id: accept UUID or plan name (finds latest run for that plan)
+  if (runId && !isUUID(runId)) {
+    const projectId = resolveProjectId(args, context);
+    const resolved = await resolveRunId(runId, undefined, projectId, context.userId);
+    if (resolved.error) return { success: false, message: resolved.error, displayToUser: true };
+    runId = resolved.id;
+  }
+
+  if (!runId) {
+    return { success: false, message: 'Missing required field: run_id (UUID or plan name)', displayToUser: false };
+  }
+
+  try {
+    // Verify run exists and belongs to user's project
+    const projectId = resolveProjectId(args, context);
+
+    let query = supabaseAdmin
+      .from('regression_runs')
+      .select('id, share_token, project_id, status')
+      .eq('id', runId);
+
+    if (projectId) {
+      query = query.eq('project_id', projectId);
+    }
+
+    const { data: run, error: runError } = await query.single();
+
+    if (runError || !run) {
+      return {
+        success: false,
+        message: runError?.code === 'PGRST116' ? `Run not found: ${runId}` : `Database error: ${runError?.message}`,
+        displayToUser: false,
+      };
+    }
+
+    // Reuse existing token or generate new one (idempotent)
+    let shareToken = run.share_token;
+
+    if (!shareToken) {
+      shareToken = crypto.randomBytes(16).toString('hex');
+
+      const { error: updateError } = await supabaseAdmin
+        .from('regression_runs')
+        .update({ share_token: shareToken })
+        .eq('id', runId)
+        .is('share_token', null); // Race-safe: only set if still null
+
+      if (updateError) {
+        logger.error('[QA_TOOL] Failed to set share token', { error: updateError, runId });
+        return {
+          success: false,
+          message: 'Failed to generate share link. Please try again.',
+          displayToUser: true,
+        };
+      }
+
+      // Re-fetch in case concurrent request set a different token
+      const { data: refreshed } = await supabaseAdmin
+        .from('regression_runs')
+        .select('share_token')
+        .eq('id', runId)
+        .single();
+
+      if (refreshed?.share_token) {
+        shareToken = refreshed.share_token;
+      }
+    }
+
+    const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+    const shareUrl = `${frontendUrl}/shared/report/${shareToken}`;
+
+    return {
+      success: true,
+      data: { shareToken, shareUrl, runId, status: run.status },
+      message: `Share link for run ${runId}: ${shareUrl}`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleShareResult error', {
+      error: error instanceof Error ? error.message : String(error),
+      runId,
+    });
+    return {
+      success: false,
+      message: `Failed to generate share link: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_last_runs — Get recent regression runs
+ */
+export async function handleGetLastRuns(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const projectId = resolveProjectId(args, context);
+
+  if (!projectId) {
+    return { success: false, message: 'Missing project_id', displayToUser: false };
+  }
+
+  let planId = args.plan_id;
+  const search = args.search as string | undefined;
+  const limit = Math.min(Math.max(args.limit || 5, 1), 20);
+
+  try {
+    // If search is provided, resolve plan name → plan IDs first
+    let searchPlanIds: string[] | undefined;
+
+    if (search && !planId) {
+      const { data: matchingPlans } = await supabaseAdmin
+        .from('regression_plans')
+        .select('id')
+        .eq('project_id', projectId)
+        .ilike('name', `%${search}%`);
+
+      if (!matchingPlans || matchingPlans.length === 0) {
+        return {
+          success: true,
+          data: { runs: [], total: 0 },
+          message: `No regression plans matching "${search}" found`,
+          displayToUser: true,
+        };
+      }
+
+      if (matchingPlans.length === 1) {
+        planId = matchingPlans[0].id;
+      } else {
+        searchPlanIds = matchingPlans.map(p => p.id);
+      }
+    }
+
+    let query = supabaseAdmin
+      .from('regression_runs')
+      .select('id, plan_id, trigger, status, summary, started_at, completed_at, created_at')
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (planId) {
+      query = query.eq('plan_id', planId);
+    } else if (searchPlanIds) {
+      query = query.in('plan_id', searchPlanIds);
+    }
+
+    const { data: runs, error } = await query;
+
+    if (error) {
+      return { success: false, message: `Database error: ${error.message}`, displayToUser: false };
+    }
+
+    if (!runs || runs.length === 0) {
+      return {
+        success: true,
+        data: { runs: [], total: 0 },
+        message: planId
+          ? 'No regression runs found for this plan'
+          : 'No regression runs found for this project',
+        displayToUser: true,
+      };
+    }
+
+    // Enrich with plan names
+    const planIds = [...new Set(runs.filter(r => r.plan_id).map(r => r.plan_id))];
+    let planNames: Record<string, string> = {};
+
+    if (planIds.length > 0) {
+      const { data: plans } = await supabaseAdmin
+        .from('regression_plans')
+        .select('id, name')
+        .in('id', planIds);
+
+      if (plans) {
+        planNames = Object.fromEntries(plans.map(p => [p.id, p.name]));
+      }
+    }
+
+    const formattedRuns = runs.map(r => ({
+      id: r.id,
+      planName: r.plan_id ? planNames[r.plan_id] || 'Unknown plan' : 'Ad-hoc run',
+      trigger: r.trigger,
+      status: r.status,
+      summary: r.summary,
+      startedAt: r.started_at,
+      completedAt: r.completed_at,
+    }));
+
+    return {
+      success: true,
+      data: { runs: formattedRuns, total: formattedRuns.length },
+      message: `Found ${formattedRuns.length} recent regression run(s)`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetLastRuns error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      success: false,
+      message: `Failed to get last runs: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_get_run_status — Check execution status of a regression run
+ */
+export async function handleGetRunStatus(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  let runId = args.run_id as string | undefined;
+
+  // Resolve run_id: accept UUID or plan name (finds latest run for that plan)
+  if (runId && !isUUID(runId)) {
+    const projectId = resolveProjectId(args, context);
+    const resolved = await resolveRunId(runId, undefined, projectId, context.userId);
+    if (resolved.error) return { success: false, message: resolved.error, displayToUser: true };
+    runId = resolved.id;
+  }
+
+  if (!runId) {
+    return { success: false, message: 'Missing required field: run_id (UUID or plan name)', displayToUser: false };
+  }
+
+  try {
+    // Get run
+    const { data: run, error: runError } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, status, trigger, plan_id, summary, started_at, completed_at, user_id')
+      .eq('id', runId)
+      .single();
+
+    if (runError || !run) {
+      return {
+        success: false,
+        message: runError?.code === 'PGRST116' ? `Run not found: ${runId}` : `Database error: ${runError?.message}`,
+        displayToUser: false,
+      };
+    }
+
+    // Security: verify user owns this run
+    if (run.user_id !== context.userId) {
+      return { success: false, message: 'Access denied', displayToUser: false };
+    }
+
+    // Count executions by status
+    const { data: executions } = await supabaseAdmin
+      .from('test_executions')
+      .select('status')
+      .eq('run_id', runId);
+
+    const progress = {
+      total: executions?.length || 0,
+      passed: 0,
+      failed: 0,
+      running: 0,
+      pending: 0,
+      cancelled: 0,
+      skipped: 0,
+    };
+
+    for (const exec of executions || []) {
+      const s = exec.status as keyof typeof progress;
+      if (s in progress && s !== 'total') {
+        progress[s]++;
+      }
+    }
+
+    // Get plan name
+    let planName: string | undefined;
+    if (run.plan_id) {
+      const { data: plan } = await supabaseAdmin
+        .from('regression_plans')
+        .select('name')
+        .eq('id', run.plan_id)
+        .maybeSingle();
+      planName = plan?.name;
+    }
+
+    return {
+      success: true,
+      data: {
+        runId: run.id,
+        status: run.status,
+        trigger: run.trigger,
+        planName,
+        progress,
+        summary: run.summary,
+        startedAt: run.started_at,
+        completedAt: run.completed_at,
+      },
+      message: run.status === 'running'
+        ? `Run is in progress: ${progress.passed + progress.failed}/${progress.total} completed (${progress.passed} passed, ${progress.failed} failed)`
+        : `Run ${run.status}: ${progress.passed} passed, ${progress.failed} failed out of ${progress.total}`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleGetRunStatus error', {
+      error: error instanceof Error ? error.message : String(error),
+      runId,
+    });
+    return {
+      success: false,
+      message: `Failed to get run status: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_cancel_run — Cancel a running or pending regression run
+ */
+export async function handleCancelRun(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  let runId = args.run_id as string | undefined;
+  const confirm = args.confirm === true;
+
+  // Resolve run_id: accept UUID or plan name (finds latest run for that plan)
+  if (runId && !isUUID(runId)) {
+    const projectId = resolveProjectId(args, context);
+    const resolved = await resolveRunId(runId, undefined, projectId, context.userId);
+    if (resolved.error) return { success: false, message: resolved.error, displayToUser: true };
+    runId = resolved.id;
+  }
+
+  if (!runId) {
+    return { success: false, message: 'Missing required field: run_id (UUID or plan name)', displayToUser: false };
+  }
+
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. Describe the cancellation to the user, wait for approval, then call with confirm=true.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    // Verify run exists and belongs to user
+    const { data: run, error: runError } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, user_id, status, test_ids')
+      .eq('id', runId)
+      .single();
+
+    if (runError || !run) {
+      return {
+        success: false,
+        message: runError?.code === 'PGRST116' ? `Run not found: ${runId}` : `Database error: ${runError?.message}`,
+        displayToUser: false,
+      };
+    }
+
+    if (run.user_id !== context.userId) {
+      return { success: false, message: 'Access denied', displayToUser: false };
+    }
+
+    if (run.status !== 'running' && run.status !== 'pending') {
+      return {
+        success: false,
+        message: `Cannot cancel run with status "${run.status}". Only running or pending runs can be cancelled.`,
+        displayToUser: true,
+      };
+    }
+
+    // Cancel all underlying tests
+    const testIds: string[] = run.test_ids || [];
+    let cancelledTests = 0;
+
+    for (const testId of testIds) {
+      try {
+        const result = await ManualTestService.cancelTest(testId, context.userId);
+        if (result.success) cancelledTests++;
+      } catch {
+        // Some tests may already be completed — skip
+      }
+    }
+
+    // Cancel pending/running test_executions
+    await supabaseAdmin
+      .from('test_executions')
+      .update({
+        status: 'cancelled',
+        completed_at: new Date().toISOString(),
+        error_message: 'Cancelled by user via chat',
+      })
+      .eq('run_id', runId)
+      .in('status', ['pending', 'running']);
+
+    // Mark run as cancelled
+    await supabaseAdmin
+      .from('regression_runs')
+      .update({
+        status: 'cancelled',
+        completed_at: new Date().toISOString(),
+      })
+      .eq('id', runId)
+      .in('status', ['running', 'pending']);
+
+    logger.info('[QA_TOOL] Run cancelled via chat', { runId, cancelledTests, totalTestIds: testIds.length });
+
+    return {
+      success: true,
+      data: { runId, cancelledTests, totalTests: testIds.length },
+      message: `Run ${runId} cancelled. ${cancelledTests} test(s) were stopped.`,
+      displayToUser: true,
+    };
+  } catch (error) {
+    logger.error('[QA_TOOL] handleCancelRun error', {
+      error: error instanceof Error ? error.message : String(error),
+      runId,
+    });
+    return {
+      success: false,
+      message: `Failed to cancel run: ${error instanceof Error ? error.message : String(error)}`,
+      displayToUser: false,
+    };
+  }
+}
+
+/**
+ * qa_manage_automation_action — CRUD for automation actions
+ */
+export async function handleManageAutomationAction(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const action = args.action as string;
+  const confirm = args.confirm === true;
+
+  if (!action) {
+    return { success: false, message: 'Missing required field: action', displayToUser: false };
+  }
+
+  // list does not require confirmation
+  if (action !== 'list' && !confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. Describe the exact changes to the user, wait for approval, then call with confirm=true.',
+      displayToUser: false,
+    };
+  }
+
+  try {
+    switch (action) {
+      case 'create': {
+        if (!args.trigger_event || !args.action_type || !args.config) {
+          return {
+            success: false,
+            message: 'Missing required fields for create: trigger_event, action_type, config',
+            displayToUser: false,
+          };
+        }
+
+        const projectId = resolveProjectId(args, context);
+
+        // Resolve plan_id/schedule_id by name
+        let resolvedPlanId = args.plan_id as string | undefined;
+        let resolvedScheduleId = args.schedule_id as string | undefined;
+
+        if (resolvedPlanId && !isUUID(resolvedPlanId) && projectId) {
+          const r = await resolvePlanByName(resolvedPlanId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          resolvedPlanId = r.id;
+        }
+        if (resolvedScheduleId && !isUUID(resolvedScheduleId) && projectId) {
+          const r = await resolveScheduleByName(resolvedScheduleId, projectId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          resolvedScheduleId = r.id;
+        }
+
+        const result = await AutomationActionService.create({
+          userId: context.userId,
+          projectId,
+          scheduleId: resolvedScheduleId,
+          planId: resolvedPlanId,
+          triggerEvent: args.trigger_event,
+          actionType: args.action_type,
+          condition: args.condition || 'always',
+          config: args.config,
+          name: args.name,
+        });
+
+        return {
+          success: true,
+          data: {
+            actionId: result.id,
+            name: result.name,
+            triggerEvent: result.triggerEvent,
+            actionType: result.actionType,
+            condition: result.condition,
+            isActive: result.isActive,
+          },
+          message: `Created automation: "${result.name || result.actionType}" — fires on ${result.triggerEvent}`,
+          displayToUser: true,
+        };
+      }
+
+      case 'update': {
+        let actionId = args.action_id as string | undefined;
+        if (actionId && !isUUID(actionId)) {
+          const r = await resolveAutomationActionByName(actionId, context.userId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          actionId = r.id;
+        }
+        if (!actionId) {
+          return { success: false, message: 'Missing required field: action_id (UUID or name)', displayToUser: false };
+        }
+
+        const result = await AutomationActionService.update({
+          id: actionId,
+          userId: context.userId,
+          triggerEvent: args.trigger_event,
+          actionType: args.action_type,
+          condition: args.condition,
+          config: args.config,
+          name: args.name,
+          isActive: args.is_active,
+        });
+
+        return {
+          success: true,
+          data: { actionId: result.id, name: result.name, isActive: result.isActive },
+          message: `Updated automation "${result.name || result.id}"`,
+          displayToUser: true,
+        };
+      }
+
+      case 'delete': {
+        let actionId = args.action_id as string | undefined;
+        if (actionId && !isUUID(actionId)) {
+          const r = await resolveAutomationActionByName(actionId, context.userId);
+          if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+          actionId = r.id;
+        }
+        if (!actionId) {
+          return { success: false, message: 'Missing required field: action_id (UUID or name)', displayToUser: false };
+        }
+
+        await AutomationActionService.delete(actionId, context.userId);
+
+        return {
+          success: true,
+          data: { actionId },
+          message: `Deleted automation ${actionId}`,
+          displayToUser: true,
+        };
+      }
+
+      case 'list': {
+        const projectId = resolveProjectId(args, context);
+        const actions = projectId
+          ? await AutomationActionService.listByProject(projectId, context.userId)
+          : await AutomationActionService.listByUser(context.userId);
+
+        return {
+          success: true,
+          data: {
+            actions: actions.map(a => ({
+              id: a.id,
+              name: a.name,
+              triggerEvent: a.triggerEvent,
+              actionType: a.actionType,
+              condition: a.condition,
+              isActive: a.isActive,
+              priority: a.priority,
+            })),
+            total: actions.length,
+          },
+          message: actions.length > 0
+            ? `Found ${actions.length} automation action(s)`
+            : 'No automation actions configured yet',
+          displayToUser: true,
+        };
+      }
+
+      default:
+        return { success: false, message: `Unknown action: ${action}`, displayToUser: false };
+    }
+  } catch (error) {
+    logger.error('[QA_TOOL] handleManageAutomationAction error', {
+      error: error instanceof Error ? error.message : String(error),
+      action,
+    });
+    return {
+      success: false,
+      message: `Failed to ${action} automation action: ${error instanceof Error ? error.message : String(error)}`,
       displayToUser: false,
     };
   }

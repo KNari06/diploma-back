@@ -8,6 +8,9 @@ import { logger } from '@/utils/core/logger';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { getTelegramToken, sendMessage as sendTelegramMessage } from '@/services/api/telegram.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import { env } from '@/config/environment/env';
+import { AutomationActionService } from '@/services/automation/automation-action.service';
+import * as crypto from 'crypto';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -182,6 +185,21 @@ export class TestCompletionHandlerService {
       // Also update unified test_executions records linked to this UI test
       await this.updateTestExecutionsForCompletedUiTest(test);
       await this.updateRegressionRuns(testId);
+
+      // Fire automation actions for test-level events (non-blocking)
+      AutomationActionService.fireEvent({
+        triggerEvent: test.status === 'failed' ? 'test_failed' : 'test_completed',
+        sourceEntityType: 'test',
+        sourceEntityId: testId,
+        userId: test.user_id,
+        projectId: test.project_id,
+        eventData: {
+          status: test.status,
+          testId,
+          title: `Test ${test.status}`,
+          message: `Test on ${test.url} ${test.status}`,
+        },
+      }).catch(() => {});
     } catch (error) {
       logger.error('[TEST_COMPLETION] Unexpected error', { error, testId });
     }
@@ -422,12 +440,12 @@ export class TestCompletionHandlerService {
       const [directResult, batchResult, execResult] = await Promise.all([
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, started_at')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at')
           .eq('test_id', testId)
           .in('status', ['running', 'pending']),
         supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, started_at')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at')
           .filter('test_ids', 'cs', `["${testId}"]`)
           .in('status', ['running', 'pending']),
         // Fallback: find via test_executions table (most reliable for plan runs)
@@ -448,7 +466,7 @@ export class TestCompletionHandlerService {
       if (execRunId && !runMap.has(execRunId)) {
         const { data: execRun } = await supabaseAdmin
           .from('regression_runs')
-          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, started_at')
+          .select('id, test_id, test_ids, status, user_id, trigger, plan_id, project_id, started_at')
           .eq('id', execRunId)
           .in('status', ['running', 'pending'])
           .maybeSingle();
@@ -594,8 +612,9 @@ export class TestCompletionHandlerService {
   }
 
   /**
-   * Send Telegram notification for regression run completion
-   * Failures are logged but never thrown (don't break completion pipeline)
+   * Send Telegram notification for regression run completion.
+   * Auto-generates a share link so the recipient can view the report.
+   * Failures are logged but never thrown (don't break completion pipeline).
    */
   private static async sendTelegramNotification(
     userId: string,
@@ -610,7 +629,22 @@ export class TestCompletionHandlerService {
         return;
       }
 
-      const htmlMessage = `<b>${title}</b>\n\n${message}\n\n<i>Run ID: ${runId}</i>`;
+      // Auto-generate share link for the run (idempotent — reuses existing token)
+      let shareUrl: string | null = null;
+      try {
+        shareUrl = await this.ensureShareLink(runId);
+      } catch (err) {
+        logger.warn('[TEST_COMPLETION] Failed to generate share link for Telegram', {
+          error: err instanceof Error ? err.message : String(err),
+          runId,
+        });
+        // Continue without share link — still send the notification
+      }
+
+      let htmlMessage = `<b>${title}</b>\n\n${message}`;
+      if (shareUrl) {
+        htmlMessage += `\n\n<a href="${shareUrl}">View full report</a>`;
+      }
 
       await sendTelegramMessage(tokenData.access_token, tokenData.external_id, htmlMessage, 'HTML');
 
@@ -618,6 +652,7 @@ export class TestCompletionHandlerService {
         userId,
         runId,
         chatId: tokenData.external_id,
+        hasShareLink: !!shareUrl,
       });
     } catch (error) {
       logger.warn('[TEST_COMPLETION] Failed to send Telegram notification', {
@@ -627,6 +662,58 @@ export class TestCompletionHandlerService {
       });
       // Don't throw - Telegram failure shouldn't break completion pipeline
     }
+  }
+
+  /**
+   * Ensure a regression run has a share_token and return the public share URL.
+   * Reuses existing token if present (idempotent).
+   */
+  private static async ensureShareLink(runId: string): Promise<string | null> {
+    // 1. Check if token already exists
+    const { data: run, error } = await supabaseAdmin
+      .from('regression_runs')
+      .select('share_token')
+      .eq('id', runId)
+      .single();
+
+    if (error || !run) return null;
+
+    if (run.share_token) {
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      return `${frontendUrl}/shared/report/${run.share_token}`;
+    }
+
+    // 2. No token yet — try to set one atomically
+    const newToken = crypto.randomBytes(16).toString('hex');
+    const { data: updated, error: updateError } = await supabaseAdmin
+      .from('regression_runs')
+      .update({ share_token: newToken })
+      .eq('id', runId)
+      .is('share_token', null)
+      .select('share_token')
+      .maybeSingle();
+
+    if (updateError) {
+      logger.warn('[TEST_COMPLETION] Failed to set share token', { error: updateError, runId });
+      return null;
+    }
+
+    // 3. If update matched (we won the race), use our token.
+    //    If not (another handler set it first), re-fetch theirs.
+    let finalToken = updated?.share_token;
+    if (!finalToken) {
+      const { data: refreshed } = await supabaseAdmin
+        .from('regression_runs')
+        .select('share_token')
+        .eq('id', runId)
+        .single();
+      finalToken = refreshed?.share_token;
+    }
+
+    if (!finalToken) return null;
+
+    const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+    return `${frontendUrl}/shared/report/${finalToken}`;
   }
 
   /**
@@ -662,36 +749,53 @@ export class TestCompletionHandlerService {
         );
 
         if (stuckExecs.length > 0) {
-          // Check if stuck executions are older than 30 minutes — force-fail them
-          const thirtyMinutesAgo = Date.now() - 30 * 60 * 1000;
-          const runStarted = run.started_at ? new Date(run.started_at).getTime() : 0;
-          const isStale = runStarted > 0 && runStarted < thirtyMinutesAgo;
+          // Before giving up, check if the underlying UI tests have already completed
+          // (race condition: BullMQ job can finish before result.testId is persisted)
+          const { data: freshExecs } = await supabaseAdmin
+            .from('test_executions')
+            .select('id, status')
+            .eq('run_id', run.id);
 
-          if (isStale) {
-            logger.warn('[TEST_COMPLETION] Force-failing stuck executions for stale run', {
-              runId: run.id,
-              stuckCount: stuckExecs.length,
-            });
-            const stuckIds = stuckExecs.map((e: any) => e.id);
-            await supabaseAdmin
-              .from('test_executions')
-              .update({
-                status: 'failed',
-                error_message: 'Execution timed out (stuck for >30 minutes)',
-                completed_at: new Date().toISOString(),
-              })
-              .in('id', stuckIds);
+          const stillStuck = (freshExecs || []).filter(
+            (e: any) => e.status === 'running' || e.status === 'pending'
+          );
 
-            // Refresh statuses after force-fail
-            statuses = statuses.map((s: string) =>
-              s === 'running' || s === 'pending' ? 'failed' : s
-            );
+          if (stillStuck.length === 0) {
+            // All executions resolved between first query and re-check
+            statuses = (freshExecs || []).map((e: any) => e.status);
           } else {
-            logger.debug('[TEST_COMPLETION] Run still has running executions', {
-              runId: run.id,
-              runningCount: stuckExecs.length,
-            });
-            return;
+            // Check if stuck executions are older than 30 minutes — force-fail them
+            const thirtyMinutesAgo = Date.now() - 30 * 60 * 1000;
+            const runStarted = run.started_at ? new Date(run.started_at).getTime() : 0;
+            const isStale = runStarted > 0 && runStarted < thirtyMinutesAgo;
+
+            if (isStale) {
+              logger.warn('[TEST_COMPLETION] Force-failing stuck executions for stale run', {
+                runId: run.id,
+                stuckCount: stillStuck.length,
+              });
+              const stuckIds = stillStuck.map((e: any) => e.id);
+              await supabaseAdmin
+                .from('test_executions')
+                .update({
+                  status: 'failed',
+                  error_message: 'Execution timed out (stuck for >30 minutes)',
+                  completed_at: new Date().toISOString(),
+                })
+                .in('id', stuckIds);
+
+              // Refresh statuses after force-fail
+              statuses = (freshExecs || []).map((e: any) => {
+                const s = e.status;
+                return s === 'running' || s === 'pending' ? 'failed' : s;
+              });
+            } else {
+              logger.debug('[TEST_COMPLETION] Run still has running executions', {
+                runId: run.id,
+                runningCount: stillStuck.length,
+              });
+              return;
+            }
           }
         }
 
@@ -772,6 +876,23 @@ export class TestCompletionHandlerService {
 
           // Create notification for regression run
           await this.createRegressionRunNotification(run, finalStatus, summary);
+
+          // Fire automation actions for run-level events (non-blocking)
+          AutomationActionService.fireEvent({
+            triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
+            sourceEntityType: 'regression_run',
+            sourceEntityId: run.id,
+            userId: run.user_id,
+            projectId: run.project_id,
+            planId: run.plan_id,
+            eventData: {
+              status: finalStatus,
+              runId: run.id,
+              summary,
+              title: `Regression ${finalStatus}`,
+              message: `${summary.passed}/${summary.total} passed`,
+            },
+          }).catch(() => {});
         }
 
         return;
@@ -916,6 +1037,23 @@ export class TestCompletionHandlerService {
 
         // Create notification for regression run
         await this.createRegressionRunNotification(run, finalStatus, summary);
+
+        // Fire automation actions for run-level events (non-blocking)
+        AutomationActionService.fireEvent({
+          triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
+          sourceEntityType: 'regression_run',
+          sourceEntityId: run.id,
+          userId: run.user_id,
+          projectId: run.project_id,
+          planId: run.plan_id,
+          eventData: {
+            status: finalStatus,
+            runId: run.id,
+            summary,
+            title: `Regression ${finalStatus}`,
+            message: `${passed}/${tests.length} passed`,
+          },
+        }).catch(() => {});
       }
     } catch (error) {
       logger.error('[TEST_COMPLETION] Error recomputing run status', {
