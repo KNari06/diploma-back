@@ -913,10 +913,8 @@ async function extractUrlFromChatHistory(
       return { extractedUrl: null, extractedMethod: null };
     }
 
-    // OPTIMIZATION: Skip approval detection here — it's already handled by
-    // checkPendingApproval() in chat.controller.ts (Step 4) BEFORE intent parsing.
-    // This eliminates a redundant AI call (~200ms + $0.0004 per message).
-    // Instead, use simple heuristic to detect potential approval messages.
+    // OPTIMIZATION: Use simple heuristic to detect potential approval-like messages
+    // and skip URL extraction for them (they never contain URLs).
     const approvalKeywords = /^(да|yes|ок|ok|go|run|запусти|подтвер|approve|confirm|давай|start|lgtm|выполн)/i;
     const isLikelyApproval = approvalKeywords.test(message.trim());
 

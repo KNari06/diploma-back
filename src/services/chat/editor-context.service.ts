@@ -249,27 +249,46 @@ async function extractContentSummary(previewSessionId: string, userId?: string):
     const page = service.getPage(previewSessionId, userId);
     if (!page || page.isClosed()) return undefined;
 
+    type BrowserElementLike = {
+      tagName?: string;
+      textContent?: string | null;
+      alt?: string | null;
+    };
+    type BrowserDocumentLike = {
+      querySelectorAll: (selector: string) => ArrayLike<BrowserElementLike>;
+    };
+    type ExtractedContentSummary = {
+      headings: string[];
+      images: string[];
+      columns: string[];
+    };
+
     // Timeout wrapper: page.evaluate can hang on complex/stuck pages
+    // Uses globalThis cast to stay compatible with server-side TS config (no DOM lib).
     const evaluateWithTimeout = Promise.race([
       page.evaluate(() => {
+        const doc = (globalThis as { document?: BrowserDocumentLike }).document;
+        if (!doc) return null;
+
+        const toArray = (nodes: ArrayLike<BrowserElementLike>): BrowserElementLike[] => Array.from(nodes);
         const headings: string[] = [];
-        document.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach((el, i) => {
+        toArray(doc.querySelectorAll('h1, h2, h3, h4, h5, h6')).forEach((el, i) => {
           if (i >= 10) return;
-          const tag = el.tagName.toLowerCase();
+          const tag = (el.tagName || '').toLowerCase();
           const text = (el.textContent || '').trim().slice(0, 80);
-          if (text) headings.push(`[${tag}] ${text}`);
+          if (text) headings.push('[' + tag + '] ' + text);
         });
 
         const images: string[] = [];
-        document.querySelectorAll('img[alt]').forEach((el, i) => {
+        toArray(doc.querySelectorAll('img[alt]')).forEach((el, i) => {
           if (i >= 8) return;
-          const alt = ((el as HTMLImageElement).alt || '').trim().slice(0, 60);
-          if (alt) images.push(`[${alt}]`);
+          const alt = (el.alt || '').trim().slice(0, 60);
+          if (alt) images.push('[' + alt + ']');
         });
 
         const columns: string[] = [];
         const seen = new Set<string>();
-        document.querySelectorAll('th').forEach(el => {
+        toArray(doc.querySelectorAll('th')).forEach((el) => {
           const text = (el.textContent || '').trim().slice(0, 40);
           if (text && !seen.has(text) && seen.size < 10) {
             seen.add(text);
@@ -278,7 +297,7 @@ async function extractContentSummary(previewSessionId: string, userId?: string):
         });
 
         return { headings, images, columns };
-      }),
+      }) as Promise<ExtractedContentSummary | null>,
       new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
     ]);
 
