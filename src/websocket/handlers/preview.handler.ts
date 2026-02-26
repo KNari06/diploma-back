@@ -1598,6 +1598,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         emitPageActionResult(socket, previewSessionId, 'refresh', true);
         setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
 
+        // Inject a fresh screenshot frame so frontend doesn't show stale/white frame
+        // while CDP screencast catches up after page reload
+        setImmediate(async () => {
+          try {
+            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
+          } catch {
+            // Non-critical — CDP screencast will resume on its own
+          }
+        });
+
         // V9: Recording hook — flush buffers and update URL baseline after refresh
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
           setImmediate(async () => {
@@ -1695,6 +1706,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'reset', true);
         setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+
+        // Inject a fresh screenshot frame after reset
+        setImmediate(async () => {
+          try {
+            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
+          } catch {
+            // Non-critical
+          }
+        });
 
         // V9: Recording — reset destroys old page+context, so recording must stop
         // (resetSession already sets recording=false and clears buffer)
