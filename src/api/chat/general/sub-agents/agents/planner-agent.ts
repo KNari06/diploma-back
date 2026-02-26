@@ -4,7 +4,7 @@ import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
 import { buildPlannerPrompt } from '../prompts/planner-prompt';
 import { buildToolGroups } from '../tool-groups';
-import type { PlannerResult, ToolCategory } from '../types';
+import type { PlannerResult, PlanStep, ToolCategory } from '../types';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -15,8 +15,61 @@ import type { PlannerResult, ToolCategory } from '../types';
  * Only called when Router classifies as multi_tool.
  * Uses gpt-4o for complex reasoning about tool orchestration.
  *
+ * Also provides identifyParallelGroups() for topological grouping of steps
+ * by dependency level — used by the spawner for parallel execution.
+ *
  * ═══════════════════════════════════════════════════════════════════════════
  */
+
+/**
+ * Identify groups of plan steps that can run in parallel.
+ *
+ * Performs a topological sort by dependency level:
+ * - Steps with no unmet dependencies at the same level form a parallel group
+ * - Groups are executed sequentially, steps within a group concurrently
+ *
+ * @example
+ * Steps: 1(deps:[]), 2(deps:[]), 3(deps:[1,2])
+ * Result: [[1, 2], [3]] — steps 1,2 are parallel, then step 3
+ *
+ * @example
+ * Steps: 1(deps:[]), 2(deps:[1]), 3(deps:[2])
+ * Result: [[1], [2], [3]] — all sequential, no parallelism
+ */
+export function identifyParallelGroups(steps: PlanStep[]): number[][] {
+  if (steps.length === 0) return [];
+
+  const groups: number[][] = [];
+  const completed = new Set<number>();
+  let remaining = [...steps];
+
+  // Safety: max iterations = number of steps (prevents infinite loop on circular deps)
+  let maxIterations = steps.length;
+
+  while (remaining.length > 0 && maxIterations > 0) {
+    maxIterations--;
+
+    // Find all steps whose dependencies are met
+    const ready = remaining.filter(s =>
+      s.dependsOn.every(dep => completed.has(dep))
+    );
+
+    if (ready.length === 0) {
+      // Circular dependency or broken deps — put all remaining in one group
+      logger.warn('[PLANNER_AGENT] Circular/broken dependencies detected, grouping remaining steps', {
+        remaining: remaining.map(s => s.stepNumber),
+      });
+      groups.push(remaining.map(s => s.stepNumber));
+      break;
+    }
+
+    groups.push(ready.map(s => s.stepNumber));
+    ready.forEach(s => completed.add(s.stepNumber));
+    remaining = remaining.filter(s => !completed.has(s.stepNumber));
+  }
+
+  return groups;
+}
 
 /**
  * Create an execution plan for a multi-tool task.
@@ -50,8 +103,8 @@ export async function createPlan(
       [{ role: 'user', content: prompt }],
       {
         model: AI_TASK_MODELS.chatPlanner,
-        temperature: 0.2,
-        max_tokens: 800,
+        temperature: SUB_AGENT_CONFIG.plannerTemperature,
+        max_tokens: SUB_AGENT_CONFIG.plannerMaxTokens,
         response_format: { type: 'json_object' },
         abortSignal,
       }

@@ -641,7 +641,9 @@ export interface ChatProcessingStepPayload {
   'preparing_workspace' | 'checking_project' | 'validating_credentials' |
   'creating_test_plan' | 'waiting_approval' |
   // Sub-agent pipeline thinking steps
-  'agent_routing' | 'agent_planning' | 'agent_executing_tool' | 'agent_formatting';
+  'agent_routing' | 'agent_planning' | 'agent_executing_tool' | 'agent_formatting' |
+  // Cooperative multi-agent pipeline steps
+  'agent_reviewing' | 'agent_spawning';
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;

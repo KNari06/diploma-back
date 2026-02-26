@@ -4,7 +4,9 @@ import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
 import { buildResponderPrompt, buildSimpleChatPrompt } from '../prompts/responder-prompt';
 import type { ResponderResult, ToolExecutionRecord } from '../types';
+import type { Blackboard } from '../blackboard';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -14,8 +16,49 @@ import type { ChatCompletionMessageParam } from 'openai/resources/chat/completio
  * Formats tool results or plain chat into user-friendly response.
  * Uses gpt-4o-mini for cost efficiency — prose generation doesn't need gpt-4o.
  *
+ * When a Blackboard is provided, reads full pipeline context (goal, plan summary,
+ * reviewer guidance, insights) to produce more accurate and goal-aligned responses.
+ *
  * ═══════════════════════════════════════════════════════════════════════════
  */
+
+/**
+ * Build enriched context sections from the blackboard for the responder prompt.
+ */
+function buildBlackboardContext(blackboard?: Blackboard): string {
+  if (!blackboard) return '';
+
+  const bb = blackboard.snapshot();
+  const sections: string[] = [];
+
+  // Goal context
+  sections.push(`USER'S ORIGINAL GOAL: "${bb.userGoal}"`);
+
+  // Plan summary (if available)
+  if (bb.plan) {
+    const completed = bb.plan.steps.filter(s => s.status === 'completed').length;
+    const failed = bb.plan.steps.filter(s => s.status === 'failed').length;
+    const total = bb.plan.steps.length;
+    sections.push(`PLAN: ${bb.plan.summary} (${completed}/${total} steps completed${failed > 0 ? `, ${failed} failed` : ''})`);
+  }
+
+  // Reviewer guidance (if available)
+  if (bb.review?.responseGuidance) {
+    sections.push(`RESPONSE GUIDANCE: ${bb.review.responseGuidance}`);
+  }
+
+  // Clarification needed (if reviewer flagged)
+  if (bb.review?.verdict === 'needs_clarification' && bb.review.clarificationNeeded) {
+    sections.push(`CLARIFICATION NEEDED: ${bb.review.clarificationNeeded}`);
+  }
+
+  // Insights accumulated during pipeline
+  if (bb.insights.length > 0) {
+    sections.push(`INSIGHTS: ${bb.insights.join('; ')}`);
+  }
+
+  return sections.join('\n');
+}
 
 /**
  * Format tool results into a user-friendly response.
@@ -25,26 +68,31 @@ export async function formatResponse(
   toolResults: ToolExecutionRecord[],
   executorContent: string,
   contextMessages: ChatCompletionMessageParam[],
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  blackboard?: Blackboard
 ): Promise<ResponderResult> {
   const startMs = Date.now();
 
   // Build results summary for the responder
+  const truncateLimit = SUB_AGENT_CONFIG.responderResultTruncateChars;
   const resultsSummary = toolResults.map(r => {
     const status = r.result.success ? 'SUCCESS' : 'FAILED';
     const data = r.result.data
-      ? JSON.stringify(r.result.data).substring(0, 2000)
+      ? JSON.stringify(r.result.data).substring(0, truncateLimit)
       : r.result.message;
     return `[${status}] ${r.toolName}: ${data}`;
   }).join('\n\n');
 
+  // Build enriched context from blackboard (goal, plan, reviewer guidance)
+  const blackboardContext = buildBlackboardContext(blackboard);
+
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: buildResponderPrompt() },
     // Include conversation history for context (limited)
-    ...extractRecentHistory(contextMessages, 5),
+    ...extractRecentHistory(contextMessages, SUB_AGENT_CONFIG.responderHistoryLimit),
     {
       role: 'user',
-      content: `USER'S ORIGINAL MESSAGE: "${userMessage}"
+      content: `${blackboardContext ? `${blackboardContext}\n\n` : ''}USER'S ORIGINAL MESSAGE: "${userMessage}"
 
 TOOL RESULTS:
 ${resultsSummary}
@@ -62,8 +110,8 @@ Format these results into a natural response for the user.`,
 
     const aiPromise = getChatCompletionWithMessages(messages, {
       model: AI_TASK_MODELS.chatResponder,
-      temperature: 0.5,
-      max_tokens: 1500,
+      temperature: SUB_AGENT_CONFIG.responderTemperature,
+      max_tokens: SUB_AGENT_CONFIG.responderMaxTokens,
       abortSignal,
     });
 
@@ -117,8 +165,8 @@ export async function generateSimpleResponse(
   try {
     const response = await getChatCompletionWithMessages(messages, {
       model: AI_TASK_MODELS.chatResponder,
-      temperature: 0.5,
-      max_tokens: 1500,
+      temperature: SUB_AGENT_CONFIG.responderTemperature,
+      max_tokens: SUB_AGENT_CONFIG.responderMaxTokens,
       abortSignal,
     });
 

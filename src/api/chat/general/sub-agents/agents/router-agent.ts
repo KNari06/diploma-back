@@ -119,8 +119,8 @@ export async function classifyRequest(
       [{ role: 'user', content: prompt }],
       {
         model: AI_TASK_MODELS.chatRouter,
-        temperature: 0.1,
-        max_tokens: 300,
+        temperature: SUB_AGENT_CONFIG.routerTemperature,
+        max_tokens: SUB_AGENT_CONFIG.routerMaxTokens,
         response_format: { type: 'json_object' },
         abortSignal,
       }

@@ -5,6 +5,52 @@ import os from 'os';
 import { resolve } from 'path';
 import { z } from 'zod';
 
+/**
+ * Detect whether the process is running inside a Docker container.
+ */
+function isRunningInDocker(): boolean {
+  // Common marker file created by Docker
+  if (existsSync('/.dockerenv')) return true;
+
+  // Optional explicit override (useful in CI / custom containers)
+  if (process.env.DOCKER === 'true') return true;
+
+  return false;
+}
+
+/**
+ * Normalize `host.docker.internal` for non-Docker local execution.
+ *
+ * `host.docker.internal` usually resolves only from inside Docker containers.
+ * When running directly on the host machine, prefer a loopback address.
+ */
+function normalizeHostForLocalExecution(hostname: string): string {
+  if (!hostname) return hostname;
+  if (hostname !== 'host.docker.internal') return hostname;
+  // Never rewrite in production to avoid any accidental prod behavior change.
+  if (process.env.NODE_ENV === 'production') return hostname;
+  if (isRunningInDocker()) return hostname;
+  return '127.0.0.1';
+}
+
+/**
+ * Normalize Redis URL hostname for non-Docker local execution.
+ */
+function normalizeRedisUrlForLocalExecution(redisUrl: string): string {
+  if (!redisUrl) return redisUrl;
+  // Never rewrite in production to avoid any accidental prod behavior change.
+  if (process.env.NODE_ENV === 'production') return redisUrl;
+
+  try {
+    const url = new URL(redisUrl);
+    url.hostname = normalizeHostForLocalExecution(url.hostname);
+    return url.toString();
+  } catch {
+    // If it's not a valid URL, keep it as-is (schema validation already ran).
+    return redisUrl;
+  }
+}
+
 // Load environment variables
 // First load .env, then .env.local (if exists) which will override .env values
 dotenv.config();
@@ -127,6 +173,10 @@ if (!parseResult.success) {
 
 // Generate secrets for development if not provided
 const parsedEnv = parseResult.data;
+
+// Normalize Docker-only hostname for local execution (host machine).
+parsedEnv.REDIS_HOST = normalizeHostForLocalExecution(parsedEnv.REDIS_HOST);
+parsedEnv.REDIS_URL = normalizeRedisUrlForLocalExecution(parsedEnv.REDIS_URL);
 
 // If REDIS_URL is not explicitly provided, build it from REDIS_HOST/REDIS_PORT.
 // This avoids accidental localhost fallback in Cloud Run where only host/port are injected.

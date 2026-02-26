@@ -102,6 +102,10 @@ export const AI_TASK_MODELS = {
   chatExecutor: AI_MODELS.smart,
   /** Response generation */
   chatResponder: AI_MODELS.fast,
+  /** Pipeline reviewer (goal verification, double-blind) */
+  chatReviewer: AI_MODELS.fast,
+  /** Sub-executor (parallel step execution) */
+  chatSubExecutor: AI_MODELS.fast,
 
   // ── Services ──────────────────────────────────────────────────────────
   /** Test failure analysis */
