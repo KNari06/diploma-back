@@ -1432,6 +1432,15 @@ const startServer = async () => {
         try {
           const { RegressionRunService } = await import('@/services/testing/regression/regression-run.service');
           await RegressionRunService.cleanupZombieRuns();
+
+          // Run zombie cleanup every 10 minutes to catch runs stuck during runtime
+          setInterval(async () => {
+            try {
+              await RegressionRunService.cleanupZombieRuns();
+            } catch (err) {
+              logger.error('[SERVER] Periodic zombie cleanup failed', { error: err });
+            }
+          }, 10 * 60 * 1000);
         } catch (cleanupError) {
           logger.error('[SERVER] Failed to cleanup zombie runs', { error: cleanupError });
         }

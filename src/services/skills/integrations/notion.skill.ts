@@ -46,8 +46,9 @@ const NOTION_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'notion_connect',
       description:
-        'Start Notion OAuth connection. Use when user asks to connect/setup/integrate Notion. ' +
-        'Returns an authorization URL the user must open in their browser. Always available.',
+        'Start Notion OAuth connection. Use when user asks to connect/setup/integrate Notion OR reconnect/re-authorize. ' +
+        'Returns an authorization URL — tell the user to open it in their browser to authorize. ' +
+        'After authorization, Notion will be connected automatically. Can also be used to refresh an expired connection. Always available.',
       parameters: {
         type: 'object',
         properties: {},

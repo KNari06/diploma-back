@@ -131,6 +131,17 @@ export async function uploadTraceToStorage(
       throw new Error('Trace file is empty');
     }
 
+    // Validate ZIP magic bytes (PK\x03\x04)
+    if (fileBuffer[0] !== 0x50 || fileBuffer[1] !== 0x4B) {
+      logger.error('[STORAGE] Trace file is not a valid ZIP archive', {
+        testId,
+        localPath,
+        fileSize,
+        firstBytes: fileBuffer.slice(0, 16).toString('hex'),
+      });
+      throw new Error(`Trace file is not a valid ZIP: starts with ${fileBuffer.slice(0, 4).toString('hex')} instead of 504B`);
+    }
+
     logger.debug('[STORAGE] Trace file read successfully', {
       testId,
       fileSize: `${Math.round(fileSize / 1024)}KB`,

@@ -97,8 +97,33 @@ export class FailureAnalysisService {
       errorDetails = errorDetails.substring(0, MAX_ERROR_SUMMARY_LENGTH) + '\n\n[... truncated]';
     }
 
-    // 6. Call LLM for analysis
-    const analysis = await this.callLLM(errorDetails);
+    // 6. Search workspace memory for similar past failures
+    const workspaceId = (test.projects as any)?.workspace_id;
+    let memoryContext = '';
+    if (workspaceId) {
+      try {
+        const { WorkspaceMemoryService } = await import('@/services/ai/memory/workspace-memory.service');
+        const similar = await WorkspaceMemoryService.searchMemory(
+          workspaceId,
+          errorDetails.slice(0, 200),
+          'bug_pattern',
+          3,
+          0.6
+        );
+        if (similar.length > 0) {
+          memoryContext = '\n\nPreviously seen similar issues in this workspace:\n' +
+            similar.map(m => `- ${m.content}`).join('\n');
+          logger.info('[FAILURE_ANALYSIS] Found similar past failures', {
+            testId, matchCount: similar.length,
+          });
+        }
+      } catch {
+        // Non-fatal — continue analysis without memory context
+      }
+    }
+
+    // 7. Call LLM for analysis (with memory context if available)
+    const analysis = await this.callLLM(errorDetails + memoryContext);
 
     logger.info('[FAILURE_ANALYSIS] Analysis complete', {
       testId,
@@ -115,7 +140,7 @@ export class FailureAnalysisService {
   private static async fetchTest(testId: string, userId: string): Promise<any> {
     const { data: test, error } = await supabaseAdmin
       .from('tests')
-      .select('id, status, url, goal, browsers, metadata, created_at, projects!inner(user_id)')
+      .select('id, status, url, goal, browsers, metadata, created_at, projects!inner(user_id, workspace_id)')
       .eq('id', testId)
       .single();
 

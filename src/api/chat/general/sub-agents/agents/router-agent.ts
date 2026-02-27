@@ -1,4 +1,5 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
 import { buildRouterPrompt } from '../prompts/router-prompt';
@@ -117,7 +118,7 @@ export async function classifyRequest(
     const aiPromise = getChatCompletionWithMessages(
       [{ role: 'user', content: prompt }],
       {
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.chatRouter,
         temperature: 0.1,
         max_tokens: 300,
         response_format: { type: 'json_object' },

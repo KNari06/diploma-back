@@ -23,8 +23,37 @@ export async function stopTracingAndGetVideo(
   if (context && tracePath) {
     try {
       await context.tracing.stop({ path: tracePath });
-      result.tracePath = tracePath;
-      logger.info('[PLAYWRIGHT] Trace saved', { tracePath });
+      // Validate trace file was written correctly
+      const fsSync = await import('fs');
+      if (fsSync.existsSync(tracePath)) {
+        const stats = fsSync.statSync(tracePath);
+        const buf = Buffer.alloc(4);
+        let fd: number | undefined;
+        try {
+          fd = fsSync.openSync(tracePath, 'r');
+          fsSync.readSync(fd, buf, 0, 4, 0);
+        } finally {
+          if (fd !== undefined) fsSync.closeSync(fd);
+        }
+        const isValidZip = buf[0] === 0x50 && buf[1] === 0x4B;
+        logger.info('[PLAYWRIGHT] Trace saved', {
+          tracePath,
+          fileSize: stats.size,
+          isValidZip,
+          magicBytes: buf.toString('hex'),
+        });
+        if (isValidZip) {
+          result.tracePath = tracePath;
+        } else {
+          logger.error('[PLAYWRIGHT] Trace file is NOT a valid ZIP — skipping upload', {
+            tracePath,
+            fileSize: stats.size,
+            firstBytes: buf.toString('hex'),
+          });
+        }
+      } else {
+        logger.error('[PLAYWRIGHT] Trace file does not exist after tracing.stop()', { tracePath });
+      }
     } catch (traceError) {
       logger.warn('[PLAYWRIGHT] Failed to stop tracing', {
         error: traceError instanceof Error ? traceError.message : String(traceError),

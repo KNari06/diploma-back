@@ -32,6 +32,7 @@ export interface SkillContext {
   workspaceId: string;
   chatSessionId?: string;
   projectId?: string;
+  previewSessionId?: string; // Active editor preview session (for live preview execution)
 }
 
 /**

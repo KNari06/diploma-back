@@ -278,7 +278,7 @@ class WebSocketService {
     if (!this.isReady()) return;
 
     // Validate inputs
-    if (!roomType || !['test', 'chat', 'user'].includes(roomType)) {
+    if (!roomType || !['test', 'chat', 'user', 'preview'].includes(roomType)) {
       logger.warn('[WebSocketService] Invalid roomType in emitToRoom', { roomType, roomId, event });
       return;
     }

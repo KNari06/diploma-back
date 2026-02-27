@@ -1,6 +1,7 @@
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
+import type { ChatAttachment } from '../chat.types';
 import { PROGRESS } from './constants';
 import { getHandler, type IntentHandler } from './handler-registry';
 import { checkRequestAborted } from './request-cancellation';
@@ -25,6 +26,7 @@ export async function routeToHandler(
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
+    attachments?: ChatAttachment[]; // File attachments (images + documents)
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
@@ -37,7 +39,7 @@ export async function routeToHandler(
   emitProcessingStepWithLogging(
     params.chatSessionId,
     'generating_plan',
-    '🚀 Processing your request...',
+    'Processing your request...',
     PROGRESS.ROUTING
   );
 
@@ -81,5 +83,6 @@ export async function routeToHandler(
     context: params.context,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    attachments: params.attachments,
   });
 }

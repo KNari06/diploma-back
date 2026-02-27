@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import type { ChatAttachment } from '../chat.types';
 import { handlePlatformTest as handlePlatformTestOriginal } from '../ai_test/handler';
 import { handleApiTest as handleApiTestOriginal } from '../api_test/handler';
 import { handleGeneralChat as handleGeneralChatOriginal } from '../general/handler';
@@ -12,6 +13,7 @@ import { handleRunPlanIntent } from '../regression/run-plan.handler';
 import { handleRunRegressionIntent } from '../regression/run-regression.handler';
 import { handleSaveTestIntent } from '../regression/save-test.handler';
 import { handleTestRecommendationsIntent } from '../regression/test-recommendations.handler';
+import { handleEditorAction } from '../editor_action/handler';
 import { handleClarificationRequest as handleClarificationOriginal } from './clarification';
 
 /**
@@ -47,6 +49,7 @@ export type IntentHandler = (
     context?: any;
     abortSignal?: AbortSignal;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
+    attachments?: ChatAttachment[]; // File attachments (images + documents)
   }
 ) => Promise<void>;
 
@@ -107,6 +110,7 @@ const handleGeneralChat: IntentHandler = async (req, res, params) => {
     userLanguage: params.parsedIntent?.userLanguage,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    attachments: params.attachments,
   });
 };
 
@@ -150,6 +154,9 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
   analyze_failure: handleAnalyzeFailureIntent,
   test_recommendations: handleTestRecommendationsIntent,
   coverage_analysis: handleCoverageAnalysisIntent,
+
+  // Editor mode intent
+  editor_action: handleEditorAction,
 };
 
 /**
@@ -207,5 +214,6 @@ export function getIntentDescriptions(): Record<string, string> {
     analyze_failure: 'User wants to understand why a test failed (root-cause analysis)',
     test_recommendations: 'User wants suggestions on what to test next',
     coverage_analysis: 'User wants to see test coverage gaps and what\'s not tested',
+    editor_action: 'User wants to perform a direct action on the live page in editor mode',
   };
 }

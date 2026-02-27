@@ -718,6 +718,22 @@ interface JiraSearchIssueRaw {
 function mapDescription(v: string | unknown): string | null {
   if (v == null) return null;
   if (typeof v === 'string') return v;
+  // Map Jira "description" (ADF or legacy) to plain text.
+  // Handles rich Atlassian Document Format ("doc") as seen in cloud REST APIs.
+  if (typeof v === 'object' && v && (v as any).type === 'doc' && Array.isArray((v as any).content)) {
+    // Collapse all text nodes recursively
+    const extractText = (node: any): string => {
+      if (!node) return '';
+      if (typeof node === 'string') return node;
+      if (node.text) return node.text;
+      // Recursively walk content array
+      if (Array.isArray(node.content)) {
+        return node.content.map(extractText).join('');
+      }
+      return '';
+    };
+    return extractText(v).trim() || null;
+  }
   return '';
 }
 

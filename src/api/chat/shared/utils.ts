@@ -171,7 +171,8 @@ export function emitProcessingStep(
   sessionId: string | undefined,
   step: ChatProcessingStepPayload['step'],
   message: string,
-  progress: number
+  progress: number,
+  metadata?: Record<string, any>
 ): void {
   // ✅ FIX: Skip if no sessionId (can't send to chat room)
   if (!sessionId) {
@@ -216,6 +217,7 @@ export function emitProcessingStep(
       step,
       message,
       progress,
+      ...(metadata && typeof metadata === 'object' && !Array.isArray(metadata) && { metadata }),
       timestamp: new Date().toISOString(),
     };
 

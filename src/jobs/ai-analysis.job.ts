@@ -169,6 +169,9 @@ export class AIAnalysisJobHandler {
       // Sync on bug creation: create Jira issue if project has syncOnCreate enabled
       await this.handleSyncOnCreate(testId, testResult, aiSummary);
 
+      // Auto-extract bug patterns to workspace memory for agent learning
+      await this.extractBugPatterns(testId, testResult, aiSummary);
+
       logger.info(`[AI-ANALYSIS] Analysis completed successfully: ${testResultId}`);
       logAIAnalysis(testId, aiSummary);
 
@@ -323,7 +326,10 @@ export class AIAnalysisJobHandler {
             id,
             url,
             project_id,
-            user_id
+            user_id,
+            projects (
+              workspace_id
+            )
           )
         `)
         .eq('id', testResultId)
@@ -572,6 +578,54 @@ export class AIAnalysisJobHandler {
 
     } catch (error) {
       logger.error(`[AI-ANALYSIS] Failed to send webhook notifications for test ${testId}:`, error);
+    }
+  }
+
+  /**
+   * Auto-extract bug patterns from AI analysis into workspace memory.
+   * Non-fatal: if memory write fails, analysis still completes.
+   */
+  private static async extractBugPatterns(
+    testId: string,
+    testResult: any,
+    aiSummary: any
+  ): Promise<void> {
+    try {
+      const bugs = aiSummary?.bugs;
+      if (!bugs || !Array.isArray(bugs) || bugs.length === 0) return;
+
+      const workspaceId = testResult?.tests?.projects?.workspace_id;
+      const userId = testResult?.tests?.user_id;
+      if (!workspaceId || !userId) return;
+
+      const { WorkspaceMemoryService } = await import('@/services/ai/memory/workspace-memory.service');
+
+      for (const bug of bugs.slice(0, 3)) {
+        const severity = bug.severity || 'medium';
+        const title = bug.title || bug.description?.slice(0, 80) || 'Unknown bug';
+        const key = `bug_${testId.slice(0, 8)}_${title.replace(/\W+/g, '_').slice(0, 30).toLowerCase()}`;
+
+        await WorkspaceMemoryService.writeMemory(
+          workspaceId,
+          userId,
+          key,
+          `[${severity}] ${title}: ${(bug.description || '').slice(0, 200)}`,
+          'bug_pattern',
+          'auto_extracted',
+          { testId, severity, confidence: aiSummary.confidence || 0.7 }
+        );
+      }
+
+      logger.info('[AI-ANALYSIS] Bug patterns extracted to workspace memory', {
+        testId,
+        patternsCount: Math.min(bugs.length, 3),
+        workspaceId,
+      });
+    } catch (error) {
+      logger.warn('[AI-ANALYSIS] Failed to extract bug patterns (non-fatal)', {
+        testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 }

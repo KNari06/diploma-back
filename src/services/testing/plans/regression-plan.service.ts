@@ -1555,7 +1555,8 @@ export class RegressionPlanService {
       const health = healthMap.get(run.id);
       return {
         id: run.id,
-        status: run.status,
+        // Normalize 'completed' → 'passed' for frontend compatibility
+        status: run.status === 'completed' ? 'passed' : run.status,
         passRate: health?.passRate || 0,
         startedAt: run.started_at,
         bugsFound: run.summary?.bugs_count ?? run.summary?.bugsFound ?? 0,

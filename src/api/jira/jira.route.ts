@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { startJiraAuth, getConnectUrl, handleJiraCallback, getProjects, getBoards, getBoardConfigurationHandler, getIssues, createIssue, updateIssue, updateIssueStatus, getConnectionStatus, disconnectJira, getConnections, getJiraSettings, updateJiraSettings, qaAnalyze } from './jira.controller';
+import { startJiraAuth, getConnectUrl, handleJiraCallback, getProjects, getBoards, getBoardConfigurationHandler, getIssues, createIssue, updateIssue, updateIssueStatus, getConnectionStatus, disconnectJira, getConnections, getJiraSettings, updateJiraSettings, qaAnalyze, runFromJiraViaChat } from './jira.controller';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { requireAuth } from '@/middleware/auth.middleware';
 
@@ -672,6 +672,20 @@ router.put('/issues', requireAuth, asyncHandler(updateIssue));
  *         description: Ошибка Jira API
  */
 router.patch('/issues', requireAuth, asyncHandler(updateIssueStatus));
+
+/**
+ * @swagger
+ * /api/v1/jira/intent-test-cases/from-jira:
+ *   post:
+ *     summary: Запустить Jira тикет через чат-обработчик (алиас preview-flow)
+ *     description: |
+ *       Склеивает summary+description в message и прокидывает в общий чат-флоу
+ *       (тот же, что POST /api/v1/chat). Используется для генерации тестов из Jira.
+ *     tags: [Jira]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post('/intent-test-cases/from-jira', requireAuth, asyncHandler(runFromJiraViaChat));
 
 /**
  * @swagger

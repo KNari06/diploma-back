@@ -1,4 +1,5 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
 import { buildPlannerPrompt } from '../prompts/planner-prompt';
@@ -48,7 +49,7 @@ export async function createPlan(
     const aiPromise = getChatCompletionWithMessages(
       [{ role: 'user', content: prompt }],
       {
-        model: 'gpt-4o',
+        model: AI_TASK_MODELS.chatPlanner,
         temperature: 0.2,
         max_tokens: 800,
         response_format: { type: 'json_object' },

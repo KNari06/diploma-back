@@ -288,10 +288,18 @@ export class MultiAgentOrchestrator {
       }
     }
 
+    // Fire-and-forget thinking step callback — never throws, never blocks
+    const think = input.onThinkingStep
+      ? (phase: string, message: string) => {
+          try { input.onThinkingStep!(phase, message); } catch { /* swallow */ }
+        }
+      : undefined;
+
     try {
       // ═══════════════════════════════════════════════════════════════════════
       // Phase 1: Observer — "What do I see?"
       // ═══════════════════════════════════════════════════════════════════════
+      think?.('observer', 'Observing page structure...');
       const observerStart = Date.now();
       let observation: ObserverOutput | null = null;
 
@@ -365,6 +373,9 @@ export class MultiAgentOrchestrator {
       // ═══════════════════════════════════════════════════════════════════════
       // Phase 2: Strategist — "What should I do?"
       // ═══════════════════════════════════════════════════════════════════════
+      const pageType = observation.pageType || 'page';
+      const actionsCount = observation.availableActions?.length || 0;
+      think?.('strategist', `Observed ${pageType} with ${actionsCount} actions, planning next step...`);
       const strategistStart = Date.now();
       const strategy = await StrategistAgent.strategize({
         observation,
@@ -498,6 +509,7 @@ export class MultiAgentOrchestrator {
       // Cognitive: Pass structured strategy for direct resolution
       // Manus: Branching with validated alternatives
       // ═══════════════════════════════════════════════════════════════════════
+      think?.('actor', `Strategy: ${strategy.thought.slice(0, 60)}`);
       const actorStart = Date.now();
 
       // Build hypothesis tree: primary strategy + alternatives
@@ -637,6 +649,7 @@ export class MultiAgentOrchestrator {
       // Phase 4: Critic — "Should we really do this?" (Manus Red Teaming)
       // Cognitive: Skip for low-risk deterministic actions, apply structured overrides
       // ═══════════════════════════════════════════════════════════════════════
+      think?.('critic', `Checking safety: ${action.command.action}${action.command.ref ? ` on ${action.command.ref}` : ''}...`);
       let policyViolationCount = 0;
 
       // Cognitive: Skip critic for low-risk deterministic actions

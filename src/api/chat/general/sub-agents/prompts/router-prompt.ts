@@ -42,6 +42,9 @@ CLASSIFICATION RULES:
    - Request targets a single integration or data source
    - Read OR write within the same category counts as single_tool
    - Categories ending in "_read" and "_write" from the SAME source count as ONE category
+   - "Connect/integrate/setup X" requests → single_tool with that service's category (e.g. "integrate telegram" → telegram category)
+   - "Send notification via X" → single_tool with that service's category
+   - ANY request mentioning a specific service name (telegram, jira, slack, github, notion) that has a matching category → single_tool
 
 3. **multi_tool** — Needs tools from 2+ DIFFERENT categories:
    - Request spans multiple integrations or data sources
@@ -52,6 +55,7 @@ IMPORTANT:
 - "memory" category should be added as extra when user shares preferences or facts worth remembering
 - When uncertain, prefer single_tool over multi_tool (simpler is better)
 - Only use category names from the AVAILABLE TOOL CATEGORIES list above
+- NEVER classify integration requests as simple_chat. If user mentions connecting, integrating, or setting up ANY service that has a matching tool category → use single_tool with that category. Do NOT ask for clarification — use the tools to guide the user through setup.
 
 Respond in JSON:
 {

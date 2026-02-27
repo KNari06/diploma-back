@@ -1,4 +1,5 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
 import { buildResponderPrompt, buildSimpleChatPrompt } from '../prompts/responder-prompt';
@@ -60,7 +61,7 @@ Format these results into a natural response for the user.`,
     });
 
     const aiPromise = getChatCompletionWithMessages(messages, {
-      model: 'gpt-4o-mini',
+      model: AI_TASK_MODELS.chatResponder,
       temperature: 0.5,
       max_tokens: 1500,
       abortSignal,
@@ -101,19 +102,21 @@ export async function generateSimpleResponse(
   userMessage: string,
   contextMessages: ChatCompletionMessageParam[],
   skillDescriptions: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  userContent?: string | ChatCompletionMessageParam['content']
 ): Promise<ResponderResult> {
   const startMs = Date.now();
 
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: buildSimpleChatPrompt(skillDescriptions) },
     ...contextMessages,
-    { role: 'user', content: userMessage },
+    // Use multimodal content if available (includes images), otherwise plain text
+    { role: 'user', content: (userContent ?? userMessage) as any },
   ];
 
   try {
     const response = await getChatCompletionWithMessages(messages, {
-      model: 'gpt-4o-mini',
+      model: AI_TASK_MODELS.chatResponder,
       temperature: 0.5,
       max_tokens: 1500,
       abortSignal,

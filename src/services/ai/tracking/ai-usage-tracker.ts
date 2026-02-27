@@ -39,6 +39,7 @@ interface AIUsageSession {
   context: AITrackingContext;
   records: AIUsageRecord[];
   startedAt: number;
+  pipelineMetrics?: Record<string, any>;
 }
 
 /**
@@ -118,6 +119,17 @@ export class AIUsageTracker {
       outputTokens: record.outputTokens,
       costUSD: record.costUSD.toFixed(6),
     });
+  }
+
+  /**
+   * Attach pipeline metrics to current session.
+   * Called after sub-agent pipeline completes (success or fallback).
+   */
+  static recordPipelineMetrics(sessionId: string, metrics: Record<string, any>): void {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.pipelineMetrics = metrics;
+    }
   }
 
   /**
@@ -226,6 +238,7 @@ export class AIUsageTracker {
         ai_call_count: summary.aiCallCount,
         call_breakdown: summary.breakdown,
         session_duration_ms: Date.now() - session.startedAt,
+        ...(session.pipelineMetrics && { pipeline_metrics: session.pipelineMetrics }),
       });
 
       if (error) {

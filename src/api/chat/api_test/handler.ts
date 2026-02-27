@@ -107,7 +107,7 @@ export async function handleApiTest(
     const emitProcessingStepWithLogging = functionLogger
       ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
       : emitProcessingStep;
-    emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', '🔍 Analyzing API request...', 30);
+    emitProcessingStepWithLogging(chatSessionId, 'checking_autonomous', 'Analyzing API request...', 30);
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 1: VALIDATE API INFO - ASK FOR MISSING DETAILS

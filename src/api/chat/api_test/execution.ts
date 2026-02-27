@@ -94,8 +94,7 @@ export async function executeApiTestFlow(
 
   try {
     // FIX #13: Consistent progress starting from 0%
-    emitProcessingStep(chatSessionId, 'executing_test', '🚀 Starting API test execution...', 0);
-    emitProcessingStep(chatSessionId, 'executing_test', '📋 Confirming test plan...', 5);
+    emitProcessingStep(chatSessionId, 'executing_test', 'Starting API test...', 0);
 
     // FIX #4: Validate plan.url before execution
     if (!plan.url || typeof plan.url !== 'string' || plan.url.trim().length === 0) {
@@ -118,7 +117,6 @@ export async function executeApiTestFlow(
       throw new Error(`Failed to confirm test plan: ${confirmResult.message}`);
     }
 
-    emitProcessingStep(chatSessionId, 'executing_test', '💳 Checking credits...', 10);
     checkTimeout();
 
     // ✅ GUARD: Only 1 active test per chat session - REJECT if one already exists
@@ -218,7 +216,7 @@ export async function executeApiTestFlow(
       throw new Error('Insufficient credits or payment error');
     }
 
-    emitProcessingStep(chatSessionId, 'executing_test', '🔧 Preparing API request...', 15);
+    emitProcessingStep(chatSessionId, 'executing_test', 'Preparing API request...', 15);
     checkTimeout();
 
     // ═══════════════════════════════════════════════════════════════════════

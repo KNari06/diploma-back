@@ -96,7 +96,8 @@ export async function parseIntent(
   workspace_id: string,
   checkRequestTimeout: () => void,
   abortSignal?: AbortSignal,
-  functionLogger?: FunctionLogger
+  functionLogger?: FunctionLogger,
+  mode?: 'lite' | 'pro' | 'editor'
 ): Promise<any> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 4: PARSE INTENT (Only if not responding to test plan) (FIX #5)
@@ -138,7 +139,7 @@ export async function parseIntent(
   const emitProcessingStepWithLogging = functionLogger
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
-  emitProcessingStepWithLogging(chatSessionId, 'parsing_intent', '🧠 Understanding what you need...', PROGRESS.INTENT_PARSING);
+  emitProcessingStepWithLogging(chatSessionId, 'parsing_intent', 'Understanding what you need...', PROGRESS.INTENT_PARSING);
 
   // Check if request was cancelled
   if (abortSignal) {
@@ -375,7 +376,12 @@ export async function parseIntent(
         : parseUserIntent;
       parsedIntent = await parseUserIntentWithLogging(
         validMessage,
-        { chatHistory, ...regressionContext }, // Include regression context
+        {
+          chatHistory,
+          ...regressionContext,
+          mode,
+          previewSessionId: contextObj?.previewSessionId,
+        },
         projectId ?? workspace_id, // Use project_id from session if available, fallback to workspace_id
         availableIntents // Pass dynamic intent list
       );
@@ -406,6 +412,12 @@ export async function parseIntent(
           userId,
         });
         parsedIntent.intent = 'general_chat'; // Fallback to safe default
+      }
+
+      // Hard guard: platform_test is never valid in editor mode
+      if (mode === 'editor' && parsedIntent.intent === 'platform_test') {
+        logger.warn('[CHAT] platform_test blocked in editor mode, redirecting to general_chat', { userId });
+        parsedIntent.intent = 'general_chat';
       }
     } catch (intentError) {
       logger.error('[CHAT] parseUserIntent failed', {
@@ -457,47 +469,48 @@ export async function parseIntent(
  */
 export function buildIntentMessage(parsedIntent: IntentResult | null | undefined): string {
   if (!parsedIntent) {
-    return '🤔 Understanding your request...';
+    return 'Understanding your request...';
   }
 
-  const { intent, scope, target, page, apiMethod, apiUrl, urgency, clarificationQuestion } = parsedIntent;
+  const { intent, scope, target, page, apiMethod, apiUrl, clarificationQuestion } = parsedIntent;
 
   switch (intent) {
     case 'api_test':
       if (apiUrl && apiMethod) {
-        const urgencyEmoji = urgency === 'high' ? '⚡ ' : '';
-        return `${urgencyEmoji}🔍 Got it! Testing ${apiMethod} ${apiUrl}`;
+        return `Got it! Testing ${apiMethod} ${apiUrl}`;
       } else if (apiUrl) {
-        return `🔍 Got it! Testing API endpoint ${apiUrl}`;
+        return `Got it! Testing API endpoint ${apiUrl}`;
       } else {
-        return '🔍 Got it! You want to test an API endpoint';
+        return 'Got it! Testing an API endpoint';
       }
 
     case 'platform_test':
       if (page && scope && target) {
-        const urgencyEmoji = urgency === 'high' ? '⚡ ' : '';
-        return `${urgencyEmoji}🌐 Got it! Testing ${target} on ${page}`;
+        return `Got it! Testing ${target} on ${page}`;
       } else if (page && scope) {
-        return `🌐 Got it! Testing ${scope} on ${page}`;
+        return `Got it! Testing ${scope} on ${page}`;
       } else if (scope && target) {
-        return `🌐 Got it! Testing ${target} (${scope})`;
+        return `Got it! Testing ${target} (${scope})`;
       } else if (page) {
-        return `🌐 Got it! Testing website ${page}`;
+        return `Got it! Testing website ${page}`;
       } else {
-        return '🌐 Got it! You want to test a website';
+        return 'Got it! Testing a website';
       }
 
     case 'needs_clarification':
-      // Use GPT-generated clarification question if available, otherwise fallback
       if (clarificationQuestion && clarificationQuestion.trim().length > 0) {
-        return `❓ ${clarificationQuestion.trim()}`;
+        return clarificationQuestion.trim();
       }
-      return '❓ I need a bit more information to help you better';
+      return 'I need a bit more information to help you better';
+
+    case 'editor_action':
+      return 'Got it! Executing action on the page...';
 
     case 'general_chat':
-      return '💬 Got it! Let me help you with that';
+      return 'Got it! Let me help you with that';
 
     default:
-      return '✅ Intent understood!';
+      return 'Intent understood!';
   }
 }
+

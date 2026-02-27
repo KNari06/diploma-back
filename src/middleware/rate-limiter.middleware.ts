@@ -122,3 +122,65 @@ export const testRetryRateLimiter = createRateLimiter({
   maxRequests: 2, // Max 2 retries per 10 seconds
   keyPrefix: 'test-retry',
 });
+
+/**
+ * Create an IP-based rate limiter for public (unauthenticated) endpoints.
+ * Uses the same in-memory sliding window store.
+ */
+export function createIpRateLimiter(options: {
+  windowMs?: number;
+  maxRequests?: number;
+  keyPrefix?: string;
+}) {
+  const windowMs = options.windowMs || 60000;
+  const maxRequests = options.maxRequests || 30;
+  const keyPrefix = options.keyPrefix || 'ip';
+
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const key = `${keyPrefix}:${ip}`;
+    const now = Date.now();
+    const entry = rateLimitStore.get(key);
+
+    if (!entry || now - entry.windowStart >= windowMs) {
+      rateLimitStore.set(key, { count: 1, windowStart: now });
+      next();
+      return;
+    }
+
+    if (entry.count >= maxRequests) {
+      const retryAfterMs = windowMs - (now - entry.windowStart);
+      const retryAfterSec = Math.ceil(retryAfterMs / 1000);
+
+      logger.warn('[RATE_LIMITER] IP rate limit exceeded', {
+        ip,
+        endpoint: keyPrefix,
+        count: entry.count,
+        maxRequests,
+      });
+
+      res.status(429).json({
+        success: false,
+        error: 'Too many requests',
+        message: `Rate limit exceeded. Please wait ${retryAfterSec} seconds.`,
+        retryAfter: retryAfterSec,
+        code: 'RATE_LIMIT_EXCEEDED',
+      });
+      return;
+    }
+
+    entry.count++;
+    rateLimitStore.set(key, entry);
+    next();
+  };
+}
+
+/**
+ * Rate limiter for public shared report endpoint
+ * 30 requests per 60 seconds per IP
+ */
+export const sharedReportRateLimiter = createIpRateLimiter({
+  windowMs: 60000,
+  maxRequests: 30,
+  keyPrefix: 'shared-report',
+});

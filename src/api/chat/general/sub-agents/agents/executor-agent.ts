@@ -1,9 +1,12 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
 import { buildExecutorPrompt } from '../prompts/executor-prompt';
 import type { ExecutorResult, PipelineContext, ToolExecutionRecord } from '../types';
 import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import { emitProcessingStep } from '@/api/chat/shared/utils';
+import { PROGRESS } from '@/api/chat/shared/constants';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -16,8 +19,50 @@ import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/reso
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-const TOOL_TIMEOUT_MS = 15000;
 const MEMORY_TOOL_NAMES = ['remember_fact', 'search_memory', 'forget_fact'];
+
+/** Per-tool timeout overrides. Tools not listed use DEFAULT_TOOL_TIMEOUT_MS. */
+const TOOL_TIMEOUTS: Record<string, number> = {
+  // Fast tools (memory, simple reads)
+  remember_fact: 3000,
+  search_memory: 3000,
+  forget_fact: 3000,
+  // Medium tools (DB aggregate queries)
+  qa_list_test_cases: 8000,
+  qa_get_analytics_summary: 10000,
+  qa_get_results_overview: 10000,
+  qa_get_full_dashboard: 15000,
+  qa_get_heatmap: 10000,
+  qa_get_time_series: 10000,
+  qa_list_test_executions: 10000,
+  // Slow tools (AI analysis, write operations)
+  qa_get_coverage_report: 25000,
+  qa_analyze_failure: 25000,
+  qa_get_recommendations: 25000,
+  qa_run_test: 60000,
+  qa_create_test_case: 15000,
+  qa_manage_regression_plan: 10000,
+  qa_manage_schedule: 10000,
+};
+const DEFAULT_TOOL_TIMEOUT_MS = 15000;
+
+function getToolTimeout(toolName: string): number {
+  return TOOL_TIMEOUTS[toolName] ?? DEFAULT_TOOL_TIMEOUT_MS;
+}
+
+/** Compute dynamic progress for a tool within the executor's 70-88% range. */
+function computeToolProgress(completedTools: number, estimatedTotal: number): number {
+  const range = PROGRESS.PIPELINE_TOOL_CEILING - PROGRESS.PIPELINE_TOOL_BASE;
+  const total = Math.max(estimatedTotal, 1);
+  const fraction = Math.min(completedTools / total, 1);
+  return Math.round(PROGRESS.PIPELINE_TOOL_BASE + fraction * range);
+}
+
+/** Convert qa_get_analytics_summary → "get analytics summary" */
+function humanizeToolName(toolName: string): string {
+  if (!toolName) return 'tool';
+  return toolName.replace(/^qa_/, '').replace(/_/g, ' ') || toolName;
+}
 
 /**
  * Execute tool calls in a focused loop with filtered tool subset.
@@ -28,19 +73,21 @@ export async function executeTools(
   filteredTools: ChatCompletionTool[],
   context: PipelineContext,
   plan?: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  userContent?: string | ChatCompletionMessageParam['content']
 ): Promise<ExecutorResult> {
   const startMs = Date.now();
   const toolResults: ToolExecutionRecord[] = [];
   let assistantContent = '';
 
   // Build executor messages
-  const executorPrompt = buildExecutorPrompt(plan, context.projectId);
+  const executorPrompt = buildExecutorPrompt(plan, context.projectId, context.mode);
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: executorPrompt },
     // Include relevant context messages (system prompts with memory/KB/history)
     ...contextMessages,
-    { role: 'user', content: userMessage },
+    // Use multimodal content if available (includes images), otherwise plain text
+    { role: 'user', content: (userContent ?? userMessage) as any },
   ];
 
   let toolRound = 0;
@@ -62,7 +109,7 @@ export async function executeTools(
 
     // Call OpenAI with filtered tools
     const response = await getChatCompletionWithMessages(messages, {
-      model: 'gpt-4o',
+      model: AI_TASK_MODELS.chatExecutor,
       temperature: 0.3,
       max_tokens: 1500,
       tools: filteredTools.length > 0 ? filteredTools : undefined,
@@ -118,17 +165,27 @@ export async function executeTools(
         continue;
       }
 
+      // Emit thinking step: which tool is being called
+      emitProcessingStep(
+        context.chatSessionId,
+        'agent_executing_tool',
+        `Using ${humanizeToolName(toolName)}...`,
+        computeToolProgress(toolResults.length, filteredTools.length),
+        { toolName, round: toolRound }
+      );
+
       logger.info('[EXECUTOR_AGENT] Executing tool', { toolName, args: JSON.stringify(toolArgs) });
 
       try {
         let toolResult: any;
 
-        // Timeout wrapper
+        // Timeout wrapper (per-tool)
+        const timeoutMs = getToolTimeout(toolName);
         const withTimeout = <T>(promise: Promise<T>): Promise<T> => {
           return Promise.race([
             promise,
             new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error(`Tool '${toolName}' timed out after ${TOOL_TIMEOUT_MS}ms`)), TOOL_TIMEOUT_MS)
+              setTimeout(() => reject(new Error(`Tool '${toolName}' timed out after ${timeoutMs}ms`)), timeoutMs)
             ),
           ]);
         };
@@ -146,6 +203,7 @@ export async function executeTools(
             workspaceId: context.workspaceId,
             chatSessionId: context.chatSessionId,
             projectId: context.projectId,
+            previewSessionId: context.previewSessionId,
           };
           toolResult = await withTimeout(
             SkillRegistry.executeTool(toolName, toolArgs, skillContext)
@@ -165,6 +223,17 @@ export async function executeTools(
           result: toolResult,
           durationMs: Date.now() - toolStartMs,
         });
+
+        // Emit thinking step: tool result
+        emitProcessingStep(
+          context.chatSessionId,
+          'agent_executing_tool',
+          toolResult.success
+            ? `${humanizeToolName(toolName)} done`
+            : `${humanizeToolName(toolName)} had an issue`,
+          computeToolProgress(toolResults.length, filteredTools.length),
+          { toolName, success: toolResult.success, durationMs: Date.now() - toolStartMs }
+        );
 
         logger.info('[EXECUTOR_AGENT] Tool executed', {
           toolName,
@@ -193,6 +262,15 @@ export async function executeTools(
           result: { success: false, message: errorResult.message },
           durationMs: Date.now() - toolStartMs,
         });
+
+        // Emit thinking step: tool error
+        emitProcessingStep(
+          context.chatSessionId,
+          'agent_executing_tool',
+          `${humanizeToolName(toolName)} failed`,
+          computeToolProgress(toolResults.length, filteredTools.length),
+          { toolName, success: false }
+        );
       }
     }
   }

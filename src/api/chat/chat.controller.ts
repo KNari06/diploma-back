@@ -56,13 +56,13 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // STEP 0: INPUT VALIDATION (FIX #1 & #2)
     // ═══════════════════════════════════════════════════════════════════════
     const validateInputWithLogging = withFunctionLogging(validateInput, 'validateInput', functionLogger);
-    const inputResult = validateInputWithLogging(req, res, checkConnection);
+    const inputResult = await validateInputWithLogging(req, res, checkConnection);
     if (!inputResult) {
       return; // Response already sent in validateInput
     }
 
     userId = inputResult.userId;
-    const { message, context, sessionId, conversationId, answers } = inputResult;
+    const { message, context, sessionId, conversationId, answers, attachments } = inputResult;
     checkRequestTimeout(); // Check timeout after validation
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -190,7 +190,8 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       workspace_id,
       checkRequestTimeout,
       abortSignal, // Pass abort signal for cancellation checks
-      functionLogger
+      functionLogger,
+      inputResult.mode || 'lite' // Pass mode for editor action detection
     );
 
     // Check if request was cancelled
@@ -259,6 +260,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       abortSignal, // Pass abort signal for cancellation checks
       logger: functionLogger,
       mode: inputResult.mode || 'lite', // Pass mode from request
+      attachments, // File attachments (images + documents)
     });
 
     // Unregister request on successful completion

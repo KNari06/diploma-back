@@ -145,9 +145,24 @@ export class RegressionRunService {
       const testRequest = await this.buildTestRequest(intentCase, userId, parameters);
 
       // 4. Execute test using existing test service
-      const testResult = await ManualTestService.runTest(testRequest);
+      let testResult;
+      try {
+        testResult = await ManualTestService.runTest(testRequest);
+      } catch (execError) {
+        // Mark run as failed — it was already created with 'running' status
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({ status: 'failed', completed_at: new Date().toISOString() })
+          .eq('id', run.id);
+        throw execError;
+      }
 
       if (!testResult.success || !testResult.data?.id) {
+        // Mark run as failed — test could not start
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({ status: 'failed', completed_at: new Date().toISOString() })
+          .eq('id', run.id);
         throw new Error('Failed to start test execution');
       }
 
@@ -428,7 +443,7 @@ export class RegressionRunService {
    */
   static async updateRunStatus(params: {
     runId: string;
-    status: 'completed' | 'failed' | 'cancelled';
+    status: 'passed' | 'completed' | 'failed' | 'cancelled';
     summary?: any;
   }): Promise<void> {
     const { runId, status, summary } = params;
@@ -557,12 +572,15 @@ export class RegressionRunService {
         : null;
       const bugsFound = run.summary?.bugs_count ?? run.summary?.bugsFound ?? 0;
 
+      // Normalize 'completed' → 'passed' for frontend compatibility
+      const normalizedStatus = run.status === 'completed' ? 'passed' : run.status;
+
       return {
         id: run.id,
         planId: run.plan_id || null,
         planName: (run.regression_plans as any)?.name || null,
         projectId: run.project_id,
-        status: run.status,
+        status: normalizedStatus,
         trigger: run.trigger,
         startedAt: run.started_at,
         completedAt: run.completed_at || null,
@@ -788,6 +806,7 @@ export class RegressionRunService {
     parameters?: Record<string, any>;
   }): Promise<RunResult> {
     const { moduleId, userId, trigger, parameters = {} } = params;
+    let createdRunId: string | null = null;
 
     try {
       logger.info('[REGRESSION_RUN] Running module', { moduleId, userId, trigger });
@@ -849,6 +868,7 @@ export class RegressionRunService {
       if (runError || !run) {
         throw new Error(`Failed to create module run: ${runError?.message}`);
       }
+      createdRunId = run.id;
 
       // 6. Create execution records
       const executions = await ExecutionService.createBatch(run.id, testCases);
@@ -860,8 +880,12 @@ export class RegressionRunService {
         userId,
         trigger,
         parameters
-      ).catch((error) => {
+      ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({ status: 'failed', completed_at: new Date().toISOString() })
+          .eq('id', run.id);
       });
 
       return {
@@ -870,6 +894,15 @@ export class RegressionRunService {
         totalTests: testCases.length,
       };
     } catch (error) {
+      // Mark run as failed if it was already created
+      if (createdRunId) {
+        try {
+          await supabaseAdmin
+            .from('regression_runs')
+            .update({ status: 'failed', completed_at: new Date().toISOString() })
+            .eq('id', createdRunId);
+        } catch { /* non-fatal */ }
+      }
       logger.error('[REGRESSION_RUN] Failed to run module', { error, moduleId });
       throw error;
     }
@@ -891,6 +924,7 @@ export class RegressionRunService {
     parameters?: Record<string, any>;
   }): Promise<RunResult> {
     const { flowId, userId, trigger, parameters = {} } = params;
+    let createdRunId: string | null = null;
 
     try {
       logger.info('[REGRESSION_RUN] Running flow', { flowId, userId, trigger });
@@ -939,6 +973,7 @@ export class RegressionRunService {
       if (runError || !run) {
         throw new Error(`Failed to create flow run: ${runError?.message}`);
       }
+      createdRunId = run.id;
 
       // 4. Create execution records
       const executions = await ExecutionService.createBatch(run.id, testCases);
@@ -950,8 +985,12 @@ export class RegressionRunService {
         userId,
         trigger,
         parameters
-      ).catch((error) => {
+      ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({ status: 'failed', completed_at: new Date().toISOString() })
+          .eq('id', run.id);
       });
 
       return {
@@ -960,6 +999,14 @@ export class RegressionRunService {
         totalTests: testCases.length,
       };
     } catch (error) {
+      if (createdRunId) {
+        try {
+          await supabaseAdmin
+            .from('regression_runs')
+            .update({ status: 'failed', completed_at: new Date().toISOString() })
+            .eq('id', createdRunId);
+        } catch { /* non-fatal */ }
+      }
       logger.error('[REGRESSION_RUN] Failed to run flow', { error, flowId });
       throw error;
     }
@@ -981,6 +1028,7 @@ export class RegressionRunService {
     trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
   }): Promise<RunResult> {
     const { projectId, tag, userId, trigger } = params;
+    let createdRunId: string | null = null;
 
     try {
       logger.info('[REGRESSION_RUN] Running by tag', { projectId, tag, userId });
@@ -1036,6 +1084,7 @@ export class RegressionRunService {
       if (runError || !run) {
         throw new Error(`Failed to create tag run: ${runError?.message}`);
       }
+      createdRunId = run.id;
 
       // Create execution records
       const executions = await ExecutionService.createBatch(run.id, testCases);
@@ -1047,8 +1096,12 @@ export class RegressionRunService {
         userId,
         trigger,
         {}
-      ).catch((error) => {
+      ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({ status: 'failed', completed_at: new Date().toISOString() })
+          .eq('id', run.id);
       });
 
       return {
@@ -1057,6 +1110,14 @@ export class RegressionRunService {
         totalTests: testCases.length,
       };
     } catch (error) {
+      if (createdRunId) {
+        try {
+          await supabaseAdmin
+            .from('regression_runs')
+            .update({ status: 'failed', completed_at: new Date().toISOString() })
+            .eq('id', createdRunId);
+        } catch { /* non-fatal */ }
+      }
       logger.error('[REGRESSION_RUN] Failed to run by tag', { error, projectId, tag });
       throw error;
     }
@@ -1078,6 +1139,7 @@ export class RegressionRunService {
     trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
   }): Promise<RunResult> {
     const { projectId, priority, userId, trigger } = params;
+    let createdRunId: string | null = null;
 
     try {
       logger.info('[REGRESSION_RUN] Running by priority', { projectId, priority, userId });
@@ -1133,6 +1195,7 @@ export class RegressionRunService {
       if (runError || !run) {
         throw new Error(`Failed to create priority run: ${runError?.message}`);
       }
+      createdRunId = run.id;
 
       // Create execution records
       const executions = await ExecutionService.createBatch(run.id, testCases);
@@ -1144,8 +1207,12 @@ export class RegressionRunService {
         userId,
         trigger,
         {}
-      ).catch((error) => {
+      ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({ status: 'failed', completed_at: new Date().toISOString() })
+          .eq('id', run.id);
       });
 
       return {
@@ -1154,6 +1221,14 @@ export class RegressionRunService {
         totalTests: testCases.length,
       };
     } catch (error) {
+      if (createdRunId) {
+        try {
+          await supabaseAdmin
+            .from('regression_runs')
+            .update({ status: 'failed', completed_at: new Date().toISOString() })
+            .eq('id', createdRunId);
+        } catch { /* non-fatal */ }
+      }
       logger.error('[REGRESSION_RUN] Failed to run by priority', { error, projectId, priority });
       throw error;
     }
@@ -1596,7 +1671,7 @@ export class RegressionRunService {
     }
 
     // If only API tests exist, finalize run immediately
-    const finalStatus = apiFailed > 0 ? 'failed' : 'completed';
+    const finalStatus = apiFailed > 0 ? 'failed' : 'passed';
     await supabaseAdmin
       .from('regression_runs')
       .update({
@@ -1613,7 +1688,7 @@ export class RegressionRunService {
       .eq('id', runId);
 
     emitProgress(
-      finalStatus === 'completed' ? 'completed' : 'failed',
+      finalStatus === 'passed' ? 'completed' : 'failed',
       `Regression run ${finalStatus}: ${apiPassed} passed, ${apiFailed} failed, ${skippedCount} skipped`
     );
   }
@@ -1732,6 +1807,23 @@ export class RegressionRunService {
 
     if (error) {
       logger.error('[REGRESSION_RUN] Failed to get run', { error, runId });
+      return null;
+    }
+    return data;
+  }
+
+  /**
+   * Fetch a run by its public share token (no ownership check)
+   */
+  static async getRunByShareToken(shareToken: string): Promise<any | null> {
+    const { data, error } = await supabaseAdmin
+      .from('regression_runs')
+      .select('*, regression_plans(name)')
+      .eq('share_token', shareToken)
+      .maybeSingle();
+
+    if (error) {
+      logger.error('[REGRESSION_RUN] Failed to get run by share token', { error, shareToken });
       return null;
     }
     return data;
@@ -2083,11 +2175,282 @@ export class RegressionRunService {
       durationMs = diff > 0 ? diff : 0;
     }
 
+    // Normalize 'completed' → 'passed' for frontend compatibility
+    const normalizedStatus = run.status === 'completed' ? 'passed' : run.status;
+
     return {
       id: run.id,
       planId: run.plan_id || null,
       planName,
-      status: run.status,
+      status: normalizedStatus,
+      trigger: run.trigger,
+      startedAt: run.started_at,
+      completedAt: run.completed_at || null,
+      durationMs,
+      aiConfidence: confidenceCount > 0 ? Math.round(totalConfidence / confidenceCount) : 0,
+      summary,
+      executions: reportExecutions,
+      bugs: allBugs,
+      recommendations: [...allRecommendations],
+      artifactsSummary: aggArtifacts,
+    };
+  }
+
+  /**
+   * Build a full report for a publicly shared run (no ownership check).
+   * Uses the same enrichment logic as buildFullReport but fetches the run by share_token.
+   */
+  static async buildPublicReport(shareToken: string): Promise<RunReport | null> {
+    const run = await this.getRunByShareToken(shareToken);
+    if (!run) return null;
+
+    // Reuse the same enrichment logic as buildFullReport, passing the run's own id
+    const [stats, executions] = await Promise.all([
+      ExecutionService.getStats(run.id),
+      ExecutionService.getByRunId(run.id),
+    ]);
+
+    const planName = (run.regression_plans as any)?.name || null;
+    const testCaseIds = [...new Set(executions.map((e) => e.testCaseId))];
+    const namesMap = await this.batchGetTestCaseNames(testCaseIds);
+
+    const testIdToExecId = new Map<string, string>();
+    const testIds: string[] = [];
+    for (const exec of executions) {
+      const testId = exec.result?.testId;
+      if (testId && exec.testType === 'ui') {
+        testIds.push(testId);
+        testIdToExecId.set(testId, exec.id);
+      }
+    }
+
+    const [testResultsMap, testReports, executedStepsMap] = await Promise.all([
+      this.batchGetTestResults(testIds),
+      TestReportGeneratorService.batchGetReportsByTestIds(testIds),
+      this.batchGetExecutedSteps(testIds),
+    ]);
+
+    const reportsMap = new Map<string, any>();
+    for (const report of testReports) {
+      reportsMap.set(report.testId, report);
+    }
+
+    const reportExecutions: RunReportExecution[] = [];
+    const allBugs: EnrichedBug[] = [];
+    const allRecommendations = new Set<string>();
+    let totalConfidence = 0;
+    let confidenceCount = 0;
+
+    const aggArtifacts: RunReportArtifactsSummary = {
+      screenshots: [],
+      bugScreenshots: [],
+      consoleLogs: [],
+      networkLogs: [],
+    };
+
+    const validSeverities = new Set(['critical', 'high', 'medium', 'low']);
+    const validCategories = new Set(['functional', 'performance', 'accessibility', 'visual', 'security']);
+
+    for (const exec of executions) {
+      const testCaseName = namesMap.get(exec.testCaseId) || 'Unknown';
+      const testId = exec.result?.testId;
+
+      const steps: RunReportStep[] = [];
+      let execArtifacts: {
+        videoUrl?: string;
+        traceUrl?: string;
+        screenshots: string[];
+        bugScreenshots: string[];
+        consoleLogs: string[];
+        networkLogs: Array<{ method: string; url: string; status?: number; durationMs?: number }>;
+        qualityChecks?: any;
+      } = {
+        videoUrl: undefined,
+        traceUrl: undefined,
+        screenshots: [],
+        bugScreenshots: [],
+        consoleLogs: [],
+        networkLogs: [],
+      };
+      let bugsCount = 0;
+
+      if (testId && exec.testType === 'ui') {
+        const rawSteps = executedStepsMap.get(testId) || [];
+        const completedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        for (let i = 0; i < completedSteps.length; i++) {
+          const step = completedSteps[i];
+          const meta = step.data?.runtimeMeta;
+          const success = step.data?.success !== false;
+          steps.push({
+            index: i + 1,
+            description: step.data?.stepDescription || step.data?.step || `Step ${i + 1}`,
+            status: success ? 'passed' : 'failed',
+            durationMs: meta?.executionMs,
+            error: !success ? {
+              message: meta?.failureExplanation || meta?.failedReason || 'Step failed',
+              failedReason: meta?.failedReason,
+              screenshot: meta?.bugScreenshotUrl,
+            } : undefined,
+          });
+        }
+
+        const testResult = testResultsMap.get(testId);
+        if (testResult) {
+          execArtifacts.videoUrl = testResult.video_url || undefined;
+          execArtifacts.traceUrl = testResult.trace_url || undefined;
+          if (testResult.screenshot) {
+            const screenshots = Array.isArray(testResult.screenshot)
+              ? testResult.screenshot
+              : [testResult.screenshot];
+            execArtifacts.screenshots = screenshots.filter(
+              (s: string) => typeof s === 'string' && !s.startsWith('data:'),
+            );
+          }
+          if (testResult.logs) {
+            execArtifacts.consoleLogs = Array.isArray(testResult.logs) ? testResult.logs : [];
+          }
+          if (testResult.network_logs && Array.isArray(testResult.network_logs)) {
+            execArtifacts.networkLogs = testResult.network_logs.map((nl: any) => ({
+              method: nl.method || '',
+              url: nl.url || '',
+              status: nl.status ?? undefined,
+              durationMs: nl.responseTime || nl.durationMs,
+            }));
+          }
+          if (testResult.quality_checks && typeof testResult.quality_checks === 'object') {
+            const qc = testResult.quality_checks;
+            execArtifacts.qualityChecks = {
+              webVitals: qc.webVitals || undefined,
+              accessibility: qc.accessibility || undefined,
+              brokenResources: Array.isArray(qc.brokenResources) ? qc.brokenResources : undefined,
+              slowAPIs: Array.isArray(qc.slowAPIs) ? qc.slowAPIs : undefined,
+            };
+          }
+          if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
+          if (execArtifacts.traceUrl && !aggArtifacts.traceUrl) aggArtifacts.traceUrl = execArtifacts.traceUrl;
+          aggArtifacts.screenshots.push(...execArtifacts.screenshots);
+          aggArtifacts.consoleLogs.push(...execArtifacts.consoleLogs);
+          aggArtifacts.networkLogs.push(...execArtifacts.networkLogs);
+        }
+
+        for (const step of steps) {
+          if (step.error?.screenshot && typeof step.error.screenshot === 'string') {
+            execArtifacts.bugScreenshots.push(step.error.screenshot);
+          }
+        }
+        aggArtifacts.bugScreenshots.push(...execArtifacts.bugScreenshots);
+
+        if (execArtifacts.qualityChecks) {
+          if (!aggArtifacts.qualityChecks) {
+            aggArtifacts.qualityChecks = { brokenResources: [], slowAPIs: [] };
+          }
+          const agg = aggArtifacts.qualityChecks;
+          const ec = execArtifacts.qualityChecks;
+          if (ec.webVitals) agg.webVitals = ec.webVitals;
+          if (ec.accessibility) {
+            if (!agg.accessibility) {
+              agg.accessibility = { warnings: [], totalWarnings: 0 };
+            }
+            agg.accessibility.warnings.push(...(ec.accessibility.warnings || []));
+            agg.accessibility.totalWarnings += ec.accessibility.totalWarnings || 0;
+          }
+          if (ec.brokenResources) {
+            agg.brokenResources = [...(agg.brokenResources || []), ...ec.brokenResources];
+          }
+          if (ec.slowAPIs) {
+            agg.slowAPIs = [...(agg.slowAPIs || []), ...ec.slowAPIs];
+          }
+        }
+
+        const report = reportsMap.get(testId);
+        const testResultData = testResultsMap.get(testId);
+        const rawBugSource =
+          report?.analysis?.bugs ||
+          testResultData?.ai_summary?.bugs ||
+          [];
+        const rawBugs: any[] = Array.isArray(rawBugSource) ? rawBugSource : [];
+
+        for (let i = 0; i < rawBugs.length; i++) {
+          const bug = rawBugs[i];
+          if (!bug || typeof bug !== 'object') continue;
+          allBugs.push({
+            id: bug.id || `${exec.id}-bug-${i}`,
+            title: bug.title || bug.message || bug.description || '',
+            severity: validSeverities.has(bug.severity) ? bug.severity : 'medium',
+            category: validCategories.has(bug.category) ? bug.category : 'functional',
+            testCaseId: exec.testCaseId,
+            testCaseName,
+            executionId: exec.id,
+            steps: Array.isArray(bug.steps) ? bug.steps : (Array.isArray(bug.stepsToReproduce) ? bug.stepsToReproduce : []),
+            expected: bug.expectedResult || bug.expected || '',
+            actual: bug.actualResult || bug.actual || '',
+            selector: bug.domSelector || bug.selector,
+            recommendation: bug.recommendation || '',
+          });
+        }
+        bugsCount = rawBugs.length;
+
+        const recsSource =
+          report?.analysis?.recommendations ||
+          testResultData?.ai_summary?.recommendations ||
+          [];
+        const recs: string[] = Array.isArray(recsSource) ? recsSource : [];
+        for (const r of recs) {
+          if (typeof r === 'string' && r.trim()) {
+            allRecommendations.add(r);
+          }
+        }
+
+        const conf = report?.analysis?.confidence ?? testResultData?.ai_summary?.confidence;
+        if (typeof conf === 'number') {
+          totalConfidence += conf;
+          confidenceCount++;
+        }
+      }
+
+      reportExecutions.push({
+        id: exec.id,
+        testCaseId: exec.testCaseId,
+        testCaseName,
+        status: exec.status,
+        durationMs: exec.durationMs || 0,
+        browser: exec.browser || 'chrome',
+        bugsCount,
+        steps,
+        artifacts: execArtifacts,
+      });
+    }
+
+    const bySeverity: Record<string, number> = {};
+    const byCategory: Record<string, number> = {};
+    for (const bug of allBugs) {
+      bySeverity[bug.severity] = (bySeverity[bug.severity] || 0) + 1;
+      byCategory[bug.category] = (byCategory[bug.category] || 0) + 1;
+    }
+    const summary: RunReportSummary = {
+      total: stats.total,
+      passed: stats.passed,
+      failed: stats.failed,
+      skipped: stats.skipped,
+      flaky: 0,
+      totalBugs: allBugs.length,
+      bySeverity,
+      byCategory,
+    };
+
+    let durationMs: number | null = null;
+    if (run.started_at && run.completed_at) {
+      const diff = new Date(run.completed_at).getTime() - new Date(run.started_at).getTime();
+      durationMs = diff > 0 ? diff : 0;
+    }
+
+    const normalizedStatus = run.status === 'completed' ? 'passed' : run.status;
+
+    return {
+      id: run.id,
+      planId: run.plan_id || null,
+      planName,
+      status: normalizedStatus,
       trigger: run.trigger,
       startedAt: run.started_at,
       completedAt: run.completed_at || null,

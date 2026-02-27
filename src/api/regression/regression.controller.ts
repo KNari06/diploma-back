@@ -1,3 +1,5 @@
+import crypto from 'crypto';
+import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { ExecutionService } from '@/services/testing/executions/execution.service';
 import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/testing/flows/saved-case-dependency-suggester.service';
@@ -583,11 +585,14 @@ export async function getRunStats(req: AuthenticatedRequest, res: Response): Pro
       .eq('id', runId)
       .maybeSingle();
 
+    // Normalize 'completed' → 'passed' for frontend compatibility
+    const normalizedStatus = run?.status === 'completed' ? 'passed' : (run?.status || null);
+
     res.json({
       success: true,
       data: {
         ...stats,
-        status: run?.status || null,
+        status: normalizedStatus,
       },
       timestamp: new Date(),
     });
@@ -976,6 +981,113 @@ export async function getExecutionDetail(req: AuthenticatedRequest, res: Respons
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to get execution detail', { error });
     handleControllerError(res, error, 'Failed to get execution detail');
+  }
+}
+
+/**
+ * Generate a public share link for a regression run.
+ * If the run already has a share_token, reuse it (idempotent).
+ *
+ * @route POST /api/v1/regression/runs/:runId/share
+ * @param {string} runId - Run ID
+ * @returns {shareToken, shareUrl}
+ */
+export async function createShareLink(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { runId } = req.params;
+    const userId = getUserId(req);
+
+    if (!runId) {
+      res.status(400).json({ success: false, error: 'runId is required' });
+      return;
+    }
+
+    // Verify ownership and fetch existing share_token
+    const { data: run, error: runError } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, user_id, share_token')
+      .eq('id', runId)
+      .eq('user_id', userId)
+      .single();
+
+    if (runError || !run) {
+      res.status(404).json({ success: false, error: 'Run not found' });
+      return;
+    }
+
+    // Reuse existing token if present (idempotent)
+    let shareToken = run.share_token;
+    if (!shareToken) {
+      shareToken = crypto.randomBytes(16).toString('hex');
+      const { error: updateError } = await supabaseAdmin
+        .from('regression_runs')
+        .update({ share_token: shareToken })
+        .eq('id', runId)
+        .eq('user_id', userId)
+        .is('share_token', null); // Only set if still null (prevents race condition)
+
+      if (updateError) {
+        logger.error('[REGRESSION_API] Failed to set share token', { error: updateError, runId });
+        res.status(500).json({ success: false, error: 'Failed to generate share link' });
+        return;
+      }
+
+      // Re-fetch in case a concurrent request already set the token
+      const { data: refreshed } = await supabaseAdmin
+        .from('regression_runs')
+        .select('share_token')
+        .eq('id', runId)
+        .single();
+
+      if (refreshed?.share_token) {
+        shareToken = refreshed.share_token;
+      }
+    }
+
+    // Build the full public share URL using configured frontend origin
+    const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+    const shareUrl = `${frontendUrl}/shared/report/${shareToken}`;
+
+    res.json({
+      success: true,
+      data: { shareToken, shareUrl },
+      timestamp: new Date(),
+    });
+
+    logger.info('[REGRESSION_API] Share link created', { runId, shareToken });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to create share link', { error });
+    handleControllerError(res, error, 'Failed to create share link');
+  }
+}
+
+/**
+ * Get a shared regression run report (public — no auth required).
+ *
+ * @route GET /api/v1/regression/shared/:shareToken
+ * @param {string} shareToken - Public share token
+ * @returns RunReport (read-only, no sensitive user info)
+ */
+export async function getSharedReport(req: Request, res: Response): Promise<void> {
+  try {
+    const { shareToken } = req.params;
+
+    if (!shareToken) {
+      res.status(400).json({ success: false, error: 'shareToken is required' });
+      return;
+    }
+
+    const report = await RegressionRunService.buildPublicReport(shareToken);
+
+    if (!report) {
+      res.status(404).json({ success: false, error: 'Shared report not found' });
+      return;
+    }
+
+    res.json({ success: true, data: report, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to get shared report', { error });
+    handleControllerError(res, error, 'Failed to get shared report');
   }
 }
 

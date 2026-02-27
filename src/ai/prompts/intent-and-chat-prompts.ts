@@ -20,6 +20,10 @@ export interface IntentParserContext {
   projectInfo?: string;
   chatHistory?: Array<{ role: string; content: string }>; // Chat history for context
 
+  // Editor mode context
+  mode?: 'lite' | 'pro' | 'editor';
+  previewSessionId?: string;   // Active preview session (editor mode)
+
   // Regression context (for save/run test intents)
   lastTestId?: string;          // ID of last executed test
   lastTestGoal?: string;        // Goal/description of last test
@@ -97,6 +101,34 @@ CONTEXT RULES:
     • Use Last failed test ID as sourceTestId (preferred)
     • If no failed test ID, fall back to last test ID
     • If neither available → needs_clarification
+`;
+}
+
+/**
+ * Build editor mode context section for intent prompt.
+ * Only included when user is in editor mode with a live preview session.
+ */
+function buildEditorModeSection(context?: IntentParserContext): string {
+  if (!context || context.mode !== 'editor' || !context.previewSessionId) return '';
+
+  return `
+--- EDITOR MODE (ACTIVE) ---
+
+The user is in EDITOR MODE with a live browser preview (previewSessionId: ${context.previewSessionId}).
+The chat is embedded inside the editor — there is NO platform_test flow here.
+
+EDITOR MODE INTENT RULES (override general rules):
+- "platform_test" is NOT AVAILABLE in editor mode. NEVER choose it.
+- Single action on the page (click, type, scroll, press, hover, select, check, uncheck) → "editor_action"
+  Executed DIRECTLY on the live preview — no test plan needed.
+- "create a test case for this page", "make me a login test", "add steps", "finish test case" → "general_chat"
+  The sub-agent uses QA tools + page DOM context to create/update test cases, then can run them on the live preview.
+- "run this test", "replay", "запусти тест", "run it on the preview" → "general_chat"
+  The sub-agent calls qa_run_test(run_type="preview") to execute steps on the live browser.
+- "run saved test", "запусти регресс" (background headless run) → "run_regression"
+- Questions, conversation, analysis, explanations → "general_chat"
+- Everything else follows normal intent rules (save_test, analyze_failure, etc.)
+
 `;
 }
 
@@ -199,8 +231,13 @@ AVAILABLE INTENTS: ${intents.join(', ')}
 9. "coverage_analysis" - See test COVERAGE gaps (no test execution, DB analysis only)
    - "what's not covered?", "coverage analysis", "покажи покрытие", "gap analysis", "что не покрыто", "what's not tested?"
 
-${regressionContextStr}
+10. "editor_action" - Execute a SINGLE direct action on the current page in editor mode
+   - User asks for an IMMEDIATE single action: "click X", "type X in Y", "scroll down", "press Enter", "hover over X"
+   - Only when user has a live preview session (previewSessionId in context)
+   - NOT for questions about the page — use general_chat for those
 
+${regressionContextStr}
+${buildEditorModeSection(context)}
 --- DECISION TREE ---
 
 1. System-provided context ("URL FOUND IN HISTORY" / "extractedUrl"):
@@ -242,7 +279,7 @@ CRITICAL anti-hallucination rule:
 
 REQUIRED FIELDS (always include):
 {
-  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis",
+  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis" | "editor_action",
   "intent_confidence": 0.0-1.0,
   "rawText": string
 }
@@ -345,7 +382,16 @@ Ex21: "what's the pass rate this month?"
 → {"intent": "general_chat", "intent_confidence": 0.90, "rawText": "..."}
 
 Ex22: "сколько регрессионных планов?"
-→ {"intent": "general_chat", "intent_confidence": 0.88, "rawText": "..."}`;
+→ {"intent": "general_chat", "intent_confidence": 0.88, "rawText": "..."}
+
+Ex23: "click the login button" (previewSessionId in context)
+→ {"intent": "editor_action", "intent_confidence": 0.95, "rawText": "..."}
+
+Ex24: "type hello in the search input" (previewSessionId in context)
+→ {"intent": "editor_action", "intent_confidence": 0.93, "rawText": "..."}
+
+Ex25: "run the registration test" (previewSessionId in context, editor mode)
+→ {"intent": "run_regression", "intent_confidence": 0.88, "rawText": "..."}`;
 
   // Add context if available
   if (context) {
@@ -384,7 +430,7 @@ MINDSET: Understand CONTEXT, not just keywords.
 
 --- YOUR CAPABILITIES ---
 
-You work with a real testing platform that has 37 QA tools (26 read + 11 write). Here's what you can do:
+You work with a real testing platform that has 42 QA tools (31 read + 11 write). Here's what you can do:
 
 **Test execution & management:**
 - Execute UI tests on real browsers using our browser automation tool
@@ -396,6 +442,11 @@ You work with a real testing platform that has 37 QA tools (26 read + 11 write).
 
 **Analytics & AI analysis:**
 - Dashboard analytics: pass/fail rates, avg duration, top failures
+- Full dashboard snapshot in one call (summary + results + failures + critical checks)
+- Test results overview: passed/failed/skipped/flaky counts with percentages
+- Activity heatmap: daily counts of runs/failures/flaky tests over 30/90/365 days
+- Time series trends: bucketed run counts with passed/failed breakdown (1m/5m/15m/1h/1d)
+- Custom date range support for analytics queries
 - Detect flaky (unstable) tests with flakiness rate
 - AI-powered root cause analysis of failed tests (severity, suggestions)
 - AI-powered recommendations: what to test next based on coverage and patterns
@@ -473,16 +524,17 @@ CRITICAL MISTAKES TO AVOID:
     prompt += skillDescriptions;
     prompt += `\n\n--- USING INTEGRATIONS & QA TOOLS ---
 
-Integrations (Jira, GitHub, Notion, etc.):
+Integrations (Jira, GitHub, Slack, Telegram, Notion):
 • **READ** (search, get, view): Execute immediately, no confirmation needed
 • **WRITE** (create, update, delete): Describe plan → ask confirmation → execute only after "yes"
+• **CONNECT/SETUP**: When user asks to "integrate X", "connect X", or "set up X" — use the {service}_connect or {service}_status tool immediately. Do NOT ask clarifying questions about what they mean. Guide them through the setup process step by step using the tools.
 
-QA Tools (26 read-only + 11 write tools for project QA data):
+QA Tools (31 read-only + 11 write tools for project QA data):
 
 **READ tools (execute immediately, no confirmation needed):**
 • Test data: qa_list_test_cases, qa_get_test_case, qa_list_test_executions, qa_get_run_report, qa_get_test_results
 • Organization: qa_list_test_modules, qa_list_test_flows, qa_list_regression_plans
-• Analytics: qa_get_analytics_summary, qa_detect_flaky_tests, qa_list_page_visits, qa_get_recent_failures, qa_get_critical_checks
+• Analytics: qa_get_analytics_summary, qa_get_full_dashboard (all-in-one), qa_get_results_overview, qa_get_heatmap, qa_get_time_series, qa_detect_flaky_tests, qa_list_page_visits, qa_get_recent_failures, qa_get_critical_checks, qa_get_agent_health (pipeline performance)
 • API testing: qa_list_api_test_configs, qa_list_api_test_history, qa_list_api_environments
 • AI analysis: qa_get_coverage_report (coverage score + gaps), qa_analyze_failure (root cause analysis), qa_get_recommendations (what to test next)
 • Operations: qa_list_schedules, qa_list_test_findings, qa_list_deployments

@@ -635,9 +635,10 @@ export interface ChatProcessingStepPayload {
   'generating_questions' | 'exploring_site' | 'generating_plan' |
   'executing_test' | 'analyzing_results' | 'generating_response' |
   'generating_scenarios' | 'executing_tests' |
-  // NEW: Added for better clarity
   'preparing_workspace' | 'checking_project' | 'validating_credentials' |
-  'creating_test_plan' | 'waiting_approval';
+  'creating_test_plan' | 'waiting_approval' |
+  // Sub-agent pipeline thinking steps
+  'agent_routing' | 'agent_planning' | 'agent_executing_tool' | 'agent_formatting';
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;

@@ -82,8 +82,7 @@ export async function executeUiTestFlow(
 
   try {
     // FIX #13: Consistent progress starting from 0%
-    emitProcessingStep(chatSessionId, 'executing_test', '🚀 Starting UI test execution...', 0);
-    emitProcessingStep(chatSessionId, 'executing_test', '📋 Confirming test plan...', 5);
+    emitProcessingStep(chatSessionId, 'executing_test', 'Starting UI test...', 0);
 
     // Validate plan.url
     if (!plan.url || typeof plan.url !== 'string') {
@@ -102,7 +101,6 @@ export async function executeUiTestFlow(
     // ✅ REMOVED: Standard mode validation - all UI tests now use intelligent mode
     // Intelligent mode doesn't require commands validation as AI generates actions dynamically
 
-    emitProcessingStep(chatSessionId, 'executing_test', '💳 Checking credits...', 10);
     checkTimeout();
 
     // ✅ GUARD: Only 1 active test per chat session - REJECT if one already exists
@@ -188,7 +186,7 @@ export async function executeUiTestFlow(
       note: 'Credits will be deducted per-step during execution',
     });
 
-    emitProcessingStep(chatSessionId, 'executing_test', '🔍 Finding project context...', 20);
+    emitProcessingStep(chatSessionId, 'executing_test', 'Setting up test environment...', 20);
     checkTimeout();
 
     // ✅ OPTIMIZATION: Try to get project_id from chat session first (avoid duplicate findOrCreateProject)
@@ -246,7 +244,7 @@ export async function executeUiTestFlow(
       throw new Error('project_id is required but was not found or created');
     }
 
-    emitProcessingStep(chatSessionId, 'executing_test', '⚙️ Launching browser test...', 30);
+    emitProcessingStep(chatSessionId, 'executing_test', 'Launching browser...', 30);
     checkTimeout();
 
     // FIX #9: Wrap ManualTestService.runTest in try-catch
@@ -396,7 +394,7 @@ export async function executeUiTestFlow(
       });
     }
 
-    emitProcessingStep(chatSessionId, 'executing_test', '✅ Test started successfully!', 100);
+    emitProcessingStep(chatSessionId, 'executing_test', 'Test is running!', 100);
 
     // ✅ FIX: Save test-chat mapping SYNCHRONOUSLY (awaited)
     // This is critical for the "1 active test per chat" guard to work reliably

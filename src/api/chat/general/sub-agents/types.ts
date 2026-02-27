@@ -1,4 +1,4 @@
-import type { ChatCompletionTool } from 'openai/resources/chat/completions';
+import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import type { SkillResult } from '@/services/skills/types';
 
 /**
@@ -121,7 +121,9 @@ export interface ToolGroup {
  */
 export interface PipelineInput {
   userMessage: string;
-  messages: Array<{ role: string; content: string; [key: string]: any }>;
+  /** Full user content for the OpenAI message (string or multimodal content array with images). Falls back to userMessage if not set. */
+  userContent?: string | ChatCompletionMessageParam['content'];
+  messages: ChatCompletionMessageParam[];
   availableTools: ChatCompletionTool[];
   skillDescriptions: string;
   abortSignal?: AbortSignal;
@@ -135,6 +137,8 @@ export interface PipelineContext {
   workspaceId: string;
   chatSessionId?: string;
   projectId?: string;
+  previewSessionId?: string; // Active editor preview session
+  mode?: 'lite' | 'pro' | 'editor';
 }
 
 /**

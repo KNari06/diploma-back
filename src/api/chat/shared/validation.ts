@@ -3,7 +3,7 @@ import { WorkspaceService } from '@/services/core/workspace.service';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
-import { ChatRequest } from '../chat.types';
+import { ChatAttachment, ChatRequest } from '../chat.types';
 import { CONSTANTS, MESSAGES } from './constants';
 import { PROGRESS, emitProcessingStep, getOrCreateWorkspaceChat } from './utils';
 
@@ -18,16 +18,17 @@ export interface Step0Result {
   conversationId?: string;
   answers?: Record<string, any>;
   mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
+  attachments?: ChatAttachment[]; // Processed file attachments (images + documents)
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-export function validateInput(
+export async function validateInput(
   req: Request,
   res: Response,
   checkConnection: () => void,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   // _functionLogger?: FunctionLogger
-): Step0Result | null {
+): Promise<Step0Result | null> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 0: INPUT VALIDATION (FIX #1 & #2)
   // ═══════════════════════════════════════════════════════════════════════
@@ -64,9 +65,11 @@ export function validateInput(
 
   const { message, context, sessionId, conversationId, answers, mode } = req.body as ChatRequest;
 
-  // Validate message (FIX #1)
-  if (!message || typeof message !== 'string' || message.trim().length === 0) {
-    logger.error('[CHAT] Message is required', { userId, messageType: typeof message });
+  // Validate message (FIX #1) — allow empty message when files are attached
+  const files = req.files as Express.Multer.File[] | undefined;
+  const hasFiles = files && files.length > 0;
+  if ((!message || typeof message !== 'string' || message.trim().length === 0) && !hasFiles) {
+    logger.error('[CHAT] Message is required (no files attached)', { userId, messageType: typeof message });
     res.status(400).json({
       success: false,
       error: MESSAGES.INVALID_REQUEST,
@@ -85,6 +88,9 @@ export function validateInput(
     timeout: CONSTANTS.CHAT_REQUEST_TIMEOUT,
   });
 
+  // Process uploaded files (if any)
+  const attachments = await processUploadedFiles(req);
+
   return {
     userId,
     message,
@@ -93,7 +99,103 @@ export function validateInput(
     conversationId,
     answers,
     mode: (mode as 'lite' | 'pro' | 'editor') || 'lite', // Default to 'lite' mode
+    attachments: attachments.length > 0 ? attachments : undefined,
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// FILE PROCESSING FOR CHAT ATTACHMENTS
+// ═══════════════════════════════════════════════════════════════════════
+
+const IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+const MAX_EXTRACTED_TEXT_LENGTH = 50_000;
+
+async function processUploadedFiles(req: Request): Promise<ChatAttachment[]> {
+  const files = req.files as Express.Multer.File[] | undefined;
+  if (!files || files.length === 0) return [];
+
+  const attachments: ChatAttachment[] = [];
+
+  for (const file of files) {
+    try {
+      if (IMAGE_MIMES.includes(file.mimetype)) {
+        // Convert image buffer to base64 data URL
+        const base64 = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
+        attachments.push({
+          type: 'image',
+          name: file.originalname,
+          mimeType: file.mimetype,
+          size: file.size,
+          base64,
+        });
+      } else {
+        // Document: extract text via fileParser
+        let extractedText = '';
+        try {
+          const { promises: fs } = await import('fs');
+          const path = await import('path');
+          const os = await import('os');
+          const { parseFile } = await import('@/utils/parsing/fileParser');
+
+          // Write buffer to temp file (fileParser requires file path)
+          const tmpDir = os.tmpdir();
+          const uniqueSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+          const tmpPath = path.join(tmpDir, `chat-upload-${uniqueSuffix}-${file.originalname}`);
+          await fs.writeFile(tmpPath, file.buffer);
+
+          try {
+            const parsed = await parseFile(tmpPath, file.originalname);
+            extractedText = parsed.content;
+          } finally {
+            // Cleanup temp file
+            await fs.unlink(tmpPath).catch(() => {});
+          }
+        } catch (parseError) {
+          logger.warn('[CHAT] Failed to parse uploaded document, using raw text fallback', {
+            fileName: file.originalname,
+            mimeType: file.mimetype,
+            error: parseError instanceof Error ? parseError.message : String(parseError),
+          });
+          // Fallback: for text-like files try UTF-8, for binary formats give a clear message
+          const isBinaryMime = ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'].includes(file.mimetype);
+          extractedText = isBinaryMime
+            ? `[Could not extract text from "${file.originalname}"]`
+            : file.buffer.toString('utf-8');
+        }
+
+        // Truncate if too long
+        if (extractedText.length > MAX_EXTRACTED_TEXT_LENGTH) {
+          extractedText = extractedText.substring(0, MAX_EXTRACTED_TEXT_LENGTH)
+            + `\n\n[... truncated — original file was ${extractedText.length} characters]`;
+        }
+
+        attachments.push({
+          type: 'document',
+          name: file.originalname,
+          mimeType: file.mimetype,
+          size: file.size,
+          extractedText,
+        });
+      }
+    } catch (fileError) {
+      logger.error('[CHAT] Failed to process uploaded file', {
+        fileName: file.originalname,
+        mimeType: file.mimetype,
+        error: fileError instanceof Error ? fileError.message : String(fileError),
+      });
+      // Skip this file, continue with others
+    }
+  }
+
+  if (attachments.length > 0) {
+    logger.info('[CHAT] Processed uploaded files', {
+      total: attachments.length,
+      images: attachments.filter(a => a.type === 'image').length,
+      documents: attachments.filter(a => a.type === 'document').length,
+    });
+  }
+
+  return attachments;
 }
 
 /**
@@ -234,7 +336,7 @@ export async function manageChatSession(
   const emitProcessingStepWithLogging = functionLogger
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
-  emitProcessingStepWithLogging(chatSessionId, 'enriching_context', '🔍 Analyzing your request...', PROGRESS.ENRICHING);
+  emitProcessingStepWithLogging(chatSessionId, 'enriching_context', 'Analyzing your request...', PROGRESS.ENRICHING);
 
   checkRequestTimeout();
 

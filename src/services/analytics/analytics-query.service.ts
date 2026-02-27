@@ -29,6 +29,22 @@ import type {
  * Analytics Query Service
  * Static methods for querying test analytics across workspace
  */
+/**
+ * Format milliseconds into a human-readable duration string
+ */
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (days > 0) return `${days}d ${hours % 24}h`;
+  if (hours > 0) return `${hours}h ${minutes % 60}m`;
+  if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+  return `${seconds}s`;
+}
+
 export class AnalyticsQueryService {
   /**
    * Helper: Get all project IDs for a workspace
@@ -293,24 +309,36 @@ export class AnalyticsQueryService {
       const completedRuns = runs.filter(
         (r) => r.completed_at && r.started_at
       );
-      const durations = completedRuns.map((r) => {
-        const start = new Date(r.started_at).getTime();
-        const end = new Date(r.completed_at).getTime();
-        return end - start;
-      });
+      const durations = completedRuns
+        .map((r) => {
+          const start = new Date(r.started_at).getTime();
+          const end = new Date(r.completed_at).getTime();
+          return end - start;
+        })
+        .filter((d) => d > 0 && Number.isFinite(d));
       const avgRunTimeMs = durations.length > 0
         ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)
         : 0;
 
       const failedRuns = runs.filter((r) => r.status === 'failed').length;
-      const failureRate = runs.length > 0 ? Math.round((failedRuns / runs.length) * 100 * 10) / 10 : 0;
-
-      // Calculate runs per minute (last hour of activity)
-      const oneHourAgo = new Date(Date.now() - 3600000);
-      const recentRuns = runs.filter(
-        (r) => r.started_at && new Date(r.started_at) > oneHourAgo
+      const finishedRuns = runs.filter(
+        (r) => r.status === 'failed' || r.status === 'passed' || r.status === 'completed'
       );
-      const runsPerMinute = Math.round((recentRuns.length / 60) * 10) / 10;
+      const failureRate = finishedRuns.length > 0
+        ? Math.round((failedRuns / finishedRuns.length) * 100 * 10) / 10
+        : 0;
+
+      // Calculate runs per minute from actual data window
+      let runsPerMinute = 0;
+      if (completedRuns.length >= 2) {
+        const timestamps = completedRuns.map((r) => new Date(r.started_at).getTime());
+        const earliest = Math.min(...timestamps);
+        const latest = Math.max(...timestamps);
+        const windowMinutes = (latest - earliest) / 60000;
+        runsPerMinute = windowMinutes > 0
+          ? Math.round((completedRuns.length / windowMinutes) * 10) / 10
+          : 0;
+      }
 
       return {
         summary: {
@@ -337,6 +365,7 @@ export class AnalyticsQueryService {
         },
         performance: {
           avgRunTimeMs,
+          avgRunTimeFormatted: formatDuration(avgRunTimeMs),
           failureRate,
           runsPerMinute,
         },
@@ -394,6 +423,7 @@ export class AnalyticsQueryService {
       },
       performance: {
         avgRunTimeMs: 0,
+        avgRunTimeFormatted: '0s',
         failureRate: 0,
         runsPerMinute: 0,
       },
@@ -870,7 +900,7 @@ export class AnalyticsQueryService {
           .order('started_at', { ascending: true }),
         supabaseAdmin
           .from('api_test_executions')
-          .select('executed_at')
+          .select('executed_at, success')
           .in('project_id', projectIds)
           .gte('executed_at', startIso)
           .lte('executed_at', endIso)
@@ -898,7 +928,7 @@ export class AnalyticsQueryService {
 
         const bucket = buckets.get(bucketKey)!;
         bucket.total++;
-        if (run.status === 'completed') bucket.passed++;
+        if (run.status === 'completed' || run.status === 'passed') bucket.passed++;
         if (run.status === 'failed') bucket.failed++;
       }
 
@@ -913,6 +943,8 @@ export class AnalyticsQueryService {
         const bucket = buckets.get(bucketKey)!;
         bucket.total++;
         bucket.apiTests++;
+        if (exec.success === true) bucket.passed++;
+        else if (exec.success === false) bucket.failed++;
       }
 
       const points: TimeSeriesPoint[] = Array.from(buckets.entries())
