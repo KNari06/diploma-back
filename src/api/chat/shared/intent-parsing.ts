@@ -507,10 +507,81 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
       return 'Got it! Executing action on the page...';
 
     case 'general_chat':
-      return 'Got it! Let me help you with that';
+      return buildGeneralChatMessage(parsedIntent);
+
+    case 'save_test':
+      return 'Got it! Saving your test...';
+
+    case 'run_regression':
+      return 'Got it! Loading saved test...';
+
+    case 'run_plan':
+      return 'Got it! Loading regression plan...';
+
+    case 'run_module':
+      return 'Got it! Loading test module...';
+
+    case 'run_by_tag':
+      return 'Got it! Finding tests by tag...';
+
+    case 'analyze_failure':
+      return 'Got it! Investigating the failure...';
+
+    case 'test_recommendations':
+      return 'Got it! Analyzing your testing patterns...';
+
+    case 'coverage_analysis':
+      return 'Got it! Calculating coverage...';
+
+    case 'create_plan':
+      return 'Got it! Creating regression plan...';
+
+    case 'add_to_plan':
+      return 'Got it! Updating regression plan...';
 
     default:
       return 'Intent understood!';
   }
+}
+
+/**
+ * Build context-aware message for general_chat intent
+ * based on keywords in the user's original message.
+ */
+function buildGeneralChatMessage(parsedIntent: IntentResult): string {
+  const msg = (parsedIntent.rawText || '').toLowerCase();
+
+  if (/dashboard|analytics|statist|аналитик|статистик|метрик|heatmap|график/.test(msg)) {
+    return 'Got it! Pulling up your data...';
+  }
+  if (/test\s*case|тест.*кейс|list.*test|покаж.*тест|мои тест/.test(msg)) {
+    return 'Got it! Looking up your tests...';
+  }
+  if (/jira|github|gitlab|slack|telegram|notion|интеграц|integrat/.test(msg)) {
+    return 'Got it! Checking your integrations...';
+  }
+  if (/schedule|расписан|cron|планиров/.test(msg)) {
+    return 'Got it! Checking your schedules...';
+  }
+  if (/fail|error|bug|ошибк|баг|упал|сломал|красн/.test(msg)) {
+    return 'Got it! Investigating the issue...';
+  }
+  if (/coverage|покрыт|recommend|рекоменд|suggest|предлож/.test(msg)) {
+    return 'Got it! Running analysis...';
+  }
+  if (/remember|запомни|memory|помн|забудь|forget/.test(msg)) {
+    return 'Got it! Checking my memory...';
+  }
+  if (/report|отчёт|отчет|result|результат/.test(msg)) {
+    return 'Got it! Fetching results...';
+  }
+  if (/flaky|нестабильн|unstable/.test(msg)) {
+    return 'Got it! Checking test stability...';
+  }
+  if (/what can you|что .*умеешь|что .*можешь|help|помо[гщ]/.test(msg)) {
+    return 'Got it! Let me tell you what I can do';
+  }
+
+  return 'Got it! Let me help you with that';
 }
 

@@ -523,7 +523,8 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
   const emitProcessingStepWithLogging = functionLogger
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
-  emitProcessingStepWithLogging(chatSessionId, 'generating_response', 'Thinking...', PROGRESS.ROUTING);
+  const thinkingMessage = mode === 'editor' ? 'Analyzing the page...' : 'Thinking...';
+  emitProcessingStepWithLogging(chatSessionId, 'generating_response', thinkingMessage, PROGRESS.ROUTING);
 
   let gptResponse: { content: string; usage?: any };
   let shouldDeductCredits = false;
