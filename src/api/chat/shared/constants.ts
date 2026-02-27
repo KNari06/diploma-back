@@ -18,6 +18,9 @@ export const CONSTANTS = {
   // Test plan expiration
   TEST_PLAN_EXPIRY_HOURS: 72, // 3 days
 
+  // Temporal markers
+  TEMPORAL_GAP_THRESHOLD_MS: 4 * 60 * 60 * 1000, // 4 hours — insert time marker when gap exceeds this
+
   // Auto-summarization
   SUMMARIZE_THRESHOLD: 50, // Trigger summarization when total messages exceed this
   MESSAGES_TO_SUMMARIZE: 30, // Number of oldest messages to summarize per batch

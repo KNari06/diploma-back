@@ -517,7 +517,13 @@ CRITICAL MISTAKES TO AVOID:
 
 • Natural, conversational, concise but thorough
 • ALWAYS respond in user's language (English/Russian/etc.)
-• Reference conversation history when relevant`;
+• Reference conversation history when relevant
+
+--- TEMPORAL CONTEXT ---
+Current time: ${new Date().toISOString()}
+Conversation messages may include time markers like [25 Feb, 14:30] and separators "── 2d later ──".
+Use these to understand WHEN things happened. If user references "those bugs" or "that test" after a time gap — they mean the context BEFORE the gap.
+When a significant time gap exists, acknowledge it naturally (e.g., "Welcome back!" or "Since last time...") only if relevant.`;
 
   // Add skill/integration descriptions if provided
   if (skillDescriptions) {

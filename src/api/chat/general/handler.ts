@@ -10,7 +10,7 @@ import { searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
-import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
+import { convertRoleForOpenAI, injectTemporalMarkers } from '@/utils/helpers/chat-helpers';
 import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
 import type { ChatCompletionMessageParam, ChatCompletionContentPart } from 'openai/resources/chat/completions';
@@ -71,7 +71,7 @@ export async function handleGeneralChat(
   // STEP 1: BUILD CONTEXT WITH HISTORY
   // ═══════════════════════════════════════════════════════════════════════
 
-  let conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  let conversationHistory: ChatCompletionMessageParam[] = [];
   let oldContextSummary = '';
 
   if (chatSessionId) {
@@ -154,7 +154,8 @@ export async function handleGeneralChat(
 
     // Build conversation history with compressed content (use helper for role conversion)
     // ✅ FIX: Include test results from metadata so AI can see them
-    conversationHistory = recentMessages.map(msg => {
+    // Build messages with timestamps preserved for temporal marker injection
+    const messagesWithTime = recentMessages.map(msg => {
       let content = compressMessageContent(msg.content);
 
       // ✅ FIX: If message has test results in metadata, append them to content
@@ -230,8 +231,12 @@ export async function handleGeneralChat(
       return {
         role: convertRoleForOpenAI(msg.role) as 'user' | 'assistant',
         content,
+        created_at: msg.created_at,
       };
-    }) as Array<{ role: 'user' | 'assistant'; content: string }>;
+    });
+
+    // Inject temporal markers (date prefixes + gap separators) for time-aware AI
+    conversationHistory = injectTemporalMarkers(messagesWithTime, CONSTANTS.TEMPORAL_GAP_THRESHOLD_MS);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
