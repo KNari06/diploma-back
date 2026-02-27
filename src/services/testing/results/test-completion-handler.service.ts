@@ -799,6 +799,8 @@ export class TestCompletionHandlerService {
           }
         }
 
+        // NOTE: `regression_runs.status` in DB uses 'completed' (not 'passed').
+        // We keep 'passed' as an outcome for notifications/automation, and map it to 'completed' for persistence.
         let finalStatus: 'passed' | 'failed' | 'cancelled' = 'passed';
         if (statuses.some((s: string) => s === 'cancelled')) {
           finalStatus = 'cancelled';
@@ -822,10 +824,12 @@ export class TestCompletionHandlerService {
 
         // Optimistic lock: only update if run is still in running/pending status
         // Prevents race condition when multiple tests complete simultaneously
+        const persistedStatus = finalStatus === 'passed' ? 'completed' : finalStatus;
+
         const { data: updatedRun, error: updateError } = await supabaseAdmin
           .from('regression_runs')
           .update({
-            status: finalStatus,
+            status: persistedStatus,
             summary,
             completed_at: new Date().toISOString(),
           })
@@ -839,6 +843,7 @@ export class TestCompletionHandlerService {
             error: updateError,
             runId: run.id,
             finalStatus,
+            persistedStatus,
           });
         } else if (!updatedRun) {
           // Another completion handler already finalized this run
@@ -961,6 +966,8 @@ export class TestCompletionHandlerService {
       }
 
       // All tests are complete - compute final status
+      // NOTE: `regression_runs.status` in DB uses 'completed' (not 'passed').
+      // We keep 'passed' as an outcome for notifications/automation, and map it to 'completed' for persistence.
       let finalStatus: 'passed' | 'failed' | 'cancelled' = 'passed';
 
       if (statuses.some(s => s === 'cancelled')) {
@@ -985,10 +992,12 @@ export class TestCompletionHandlerService {
       };
 
       // Update regression run (optimistic lock: only if still running/pending)
+      const persistedStatus = finalStatus === 'passed' ? 'completed' : finalStatus;
+
       const { data: updatedRun, error: updateError } = await supabaseAdmin
         .from('regression_runs')
         .update({
-          status: finalStatus,
+          status: persistedStatus,
           summary,
           completed_at: new Date().toISOString(),
         })
@@ -1002,6 +1011,7 @@ export class TestCompletionHandlerService {
           error: updateError,
           runId: run.id,
           finalStatus,
+          persistedStatus,
         });
       } else if (!updatedRun) {
         logger.debug('[TEST_COMPLETION] Run already finalized by another handler', {

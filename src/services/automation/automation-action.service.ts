@@ -214,7 +214,12 @@ export class AutomationActionService {
       .order('priority', { ascending: true });
 
     if (error || !data) {
-      logger.error('[AUTOMATION] findMatchingActions error', { error: error?.message });
+      // PGRST205 = table not found (expected if migration not applied yet)
+      if ((error as any)?.code === 'PGRST205') {
+        logger.debug('[AUTOMATION] automation_actions table not available (migration pending)');
+      } else {
+        logger.error('[AUTOMATION] findMatchingActions error', { error: error?.message });
+      }
       return [];
     }
 
