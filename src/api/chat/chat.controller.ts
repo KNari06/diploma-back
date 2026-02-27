@@ -13,7 +13,6 @@ import {
   unregisterActiveRequest,
 } from './shared/request-cancellation';
 import { routeToHandler } from './shared/routing';
-import { checkPendingApproval } from './shared/test-plan-approval';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
 
 // History handlers
@@ -151,35 +150,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     checkRequestAbortedWithLogging(abortSignal);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 4: CHECK FOR PENDING TEST PLAN APPROVAL
-    // ═══════════════════════════════════════════════════════════════════════
-    const checkPendingApprovalWithLogging = withFunctionLogging(checkPendingApproval, 'checkPendingApproval', functionLogger);
-    const approvalHandled = await checkPendingApprovalWithLogging({
-      req,
-      res,
-      message,
-      conversationId,
-      userId,
-      chatSessionId,
-      workspace_id,
-      checkRequestTimeout,
-      abortSignal, // Pass abort signal for cancellation checks
-      logger: functionLogger,
-    });
-
-    if (approvalHandled) {
-      // ✅ FIX #2: unregisterActiveRequest is now async
-      const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
-      await unregisterActiveRequestWithLogging(chatSessionId, userId);
-      await functionLogger.flushSync();
-      return; // Approval was handled, response already sent
-    }
-
-    // Check if request was cancelled
-    checkRequestAbortedWithLogging(abortSignal);
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // STEP 5: PARSE INTENT (Only if not responding to test plan) (FIX #5)
+    // STEP 5: PARSE INTENT (FIX #5)
     // ═══════════════════════════════════════════════════════════════════════
     const parseIntentWithLogging = withFunctionLogging(parseIntent, 'parseIntent', functionLogger);
     const parsedIntent = await parseIntentWithLogging(
@@ -201,7 +172,9 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     // STEP 5.5: SMART TEST CASE RESOLVER
     // Only for platform_test intent — check if existing test cases match
     // ═══════════════════════════════════════════════════════════════════════
-    if (parsedIntent?.intent === 'platform_test') {
+    // Smart Resolver: only when user did NOT provide an explicit URL.
+    // If parsedIntent.page is set, the user gave a URL → they want a NEW test, not a replay.
+    if (parsedIntent?.intent === 'platform_test' && !parsedIntent?.page) {
       try {
         const { TestCaseResolverService } = await import(
           '@/services/testing/resolver/test-case-resolver.service'
@@ -225,8 +198,10 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
           // Enrich with prefilled steps for LiteEngine
           parsedIntent.resolvedContext = {
             prefilledSteps: resolverResult.prefilledSteps,
-            sourceTestCases: resolverResult.relatedCases?.map(c => ({
-              id: c.id, name: c.name, matchScore: c.score,
+            sourceTestCases: resolverResult.relatedCases?.map((c) => ({
+              id: c.id,
+              name: c.name,
+              matchScore: c.score,
             })),
             resolverStrategy: resolverResult.resolverMeta.strategy,
           };

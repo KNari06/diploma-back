@@ -1,0 +1,176 @@
+# ─────────────────────────────────────────────────────────────────
+# QAI Backend — GitLab CI/CD
+#
+# Одна Docker image → деплой двух Cloud Run сервисов:
+#   • qai-api-prod    — CMD: node -r tsconfig-paths/register dist/index.js
+#   • qai-worker-prod — CMD: node -r tsconfig-paths/register dist/worker/index.js
+#
+# Образ хранится в Google Artifact Registry (GCP-native, Cloud Run тянет без доп. auth).
+# Перед первым запуском CI создай репозиторий один раз:
+#   gcloud artifacts repositories create qai \
+#     --repository-format=docker --location=us-central1 --project=qait-dev
+#
+# CI/CD Variables (Settings → CI/CD → Variables):
+#   GCP_PROJECT_ID      — qait-dev
+#   GCP_PROJECT_NUMBER  — 728473466858
+#   GCP_REGION          — us-central1
+#   GCP_RUNNER_SA_EMAIL — SA email из: terraform output gitlab_runner_sa_email
+#   GCP_WIF_PROVIDER    — Provider из:  terraform output wif_provider_name
+#   WIF_POOL_ID         — gitlab-pool-prod2 (optional fallback)
+#   WIF_PROVIDER_ID     — gitlab-provider-prod2 (optional fallback)
+#   CLOUD_RUN_API       — qai-api-prod
+#   CLOUD_RUN_WORKER    — qai-worker-prod
+# ─────────────────────────────────────────────────────────────────
+
+variables:
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_TLS_VERIFY: "1"
+  DOCKER_CERT_PATH: "/certs/client"
+  # Shared runner image may not include buildx plugin; use classic docker build.
+  DOCKER_BUILDKIT: "0"
+  GCP_REGION: "us-central1"
+  AR_HOST: "us-central1-docker.pkg.dev"
+  # Полный путь: us-central1-docker.pkg.dev/qait-dev/qai/qai-backend
+  IMAGE: "${AR_HOST}/${GCP_PROJECT_ID}/qai/qai-backend:${CI_COMMIT_SHORT_SHA}"
+  IMAGE_LATEST: "${AR_HOST}/${GCP_PROJECT_ID}/qai/qai-backend:latest"
+
+stages:
+  - build
+  - deploy
+
+# ─────────────────────────────────────────────────────────────────
+# Шаблон: авторизация в GCP через Workload Identity Federation
+# ─────────────────────────────────────────────────────────────────
+.gcp_auth: &gcp_auth
+  id_tokens:
+    GCP_JWT:
+      aud: "//iam.googleapis.com/${GCP_WIF_PROVIDER}"
+  before_script:
+    - |
+      RAW_WIF_PROVIDER="${GCP_WIF_PROVIDER}"
+      if [ -z "${RAW_WIF_PROVIDER}" ]; then
+        if [ -n "${GCP_PROJECT_NUMBER}" ] && [ -n "${WIF_POOL_ID}" ] && [ -n "${WIF_PROVIDER_ID}" ]; then
+          RAW_WIF_PROVIDER="projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+          echo "ℹ️ GCP_WIF_PROVIDER is empty, using fallback from GCP_PROJECT_NUMBER/WIF_POOL_ID/WIF_PROVIDER_ID"
+        else
+          echo "❌ GCP_WIF_PROVIDER is empty."
+          echo "Set one of the following in GitLab CI/CD Variables:"
+          echo "  1) GCP_WIF_PROVIDER = \$(terraform -chdir=gcp/terraform output -raw wif_provider_name)"
+          echo "  2) GCP_PROJECT_NUMBER + WIF_POOL_ID + WIF_PROVIDER_ID"
+          exit 1
+        fi
+      fi
+
+      case "${RAW_WIF_PROVIDER}" in
+        projects/*)
+          WIF_PROVIDER="${RAW_WIF_PROVIDER}"
+          ;;
+        //iam.googleapis.com/*)
+          WIF_PROVIDER="${RAW_WIF_PROVIDER#//iam.googleapis.com/}"
+          ;;
+        https://iam.googleapis.com/*)
+          WIF_PROVIDER="${RAW_WIF_PROVIDER#https://iam.googleapis.com/}"
+          ;;
+        *)
+          echo "❌ Invalid GCP_WIF_PROVIDER value: ${RAW_WIF_PROVIDER}"
+          echo "Expected one of:"
+          echo "  projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>"
+          echo "  //iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>"
+          echo "  https://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>"
+          exit 1
+          ;;
+      esac
+
+      echo "$GCP_JWT" > /tmp/gitlab-jwt.json
+      gcloud iam workload-identity-pools create-cred-config "$WIF_PROVIDER" \
+        --service-account="$GCP_RUNNER_SA_EMAIL" \
+        --credential-source-file=/tmp/gitlab-jwt.json \
+        --output-file=/tmp/gcp-creds.json
+      gcloud auth login --cred-file=/tmp/gcp-creds.json --quiet
+      gcloud config set project "$GCP_PROJECT_ID"
+  after_script:
+    - rm -f /tmp/gitlab-jwt.json /tmp/gcp-creds.json
+
+# ─────────────────────────────────────────────────────────────────
+# Сборка Docker образа и push в Artifact Registry
+# Используем google/cloud-sdk + docker-dind сервис
+# ─────────────────────────────────────────────────────────────────
+build:
+  stage: build
+  image: google/cloud-sdk:alpine
+  services:
+    - name: docker:26-dind
+      alias: docker
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  <<: *gcp_auth
+  script:
+    - apk add --no-cache docker-cli
+    - gcloud auth configure-docker "${AR_HOST}" --quiet
+    - echo "🔨 Building $IMAGE"
+    - |
+      docker build \
+        --cache-from "$IMAGE_LATEST" \
+        --tag "$IMAGE" \
+        --tag "$IMAGE_LATEST" \
+        .
+    - echo "⬆️  Pushing to Artifact Registry..."
+    - docker push "$IMAGE"
+    - docker push "$IMAGE_LATEST"
+
+# ─────────────────────────────────────────────────────────────────
+# Деплой API — Cloud Run (HTTP API, публичный)
+# ─────────────────────────────────────────────────────────────────
+deploy:api:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs: [build]
+  <<: *gcp_auth
+  script:
+    - echo "🚀 Deploying API → $CLOUD_RUN_API"
+    - |
+      gcloud run deploy "$CLOUD_RUN_API" \
+        --image="$IMAGE" \
+        --region="$GCP_REGION" \
+        --platform=managed \
+        --allow-unauthenticated \
+        --port=3000 \
+        --execution-environment=gen2 \
+        --quiet
+    - |
+      URL=$(gcloud run services describe "$CLOUD_RUN_API" \
+        --region="$GCP_REGION" --format="value(status.url)")
+      echo "✅ API deployed → $URL"
+  environment:
+    name: production/api
+    url: https://api.qait.dev
+
+# ─────────────────────────────────────────────────────────────────
+# Деплой Worker — Cloud Run (приватный, другой entrypoint)
+# ─────────────────────────────────────────────────────────────────
+deploy:worker:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs: [build]
+  <<: *gcp_auth
+  script:
+    - echo "🚀 Deploying Worker → $CLOUD_RUN_WORKER"
+    - |
+      gcloud run deploy "$CLOUD_RUN_WORKER" \
+        --image="$IMAGE" \
+        --region="$GCP_REGION" \
+        --platform=managed \
+        --no-allow-unauthenticated \
+        --port=3000 \
+        --execution-environment=gen2 \
+        --command="node" \
+        --args="-e,require('http').createServer((...a)=>a[1].end('ok')).listen(process.env.PORT||8080);require('tsconfig-paths/register');require('./dist/worker/index.js');" \
+        --quiet
+    - echo "✅ Worker deployed"
+  environment:
+    name: production/worker

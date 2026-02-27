@@ -306,7 +306,7 @@ export const JiraSkill: SkillDefinition = {
       }
 
       // All other tools require an existing token
-      const tokenData = await getJiraToken(context.userId);
+      const tokenData = await getJiraToken(context.userId, undefined, context.workspaceId);
       if (!tokenData) {
         return {
           success: false,
@@ -380,7 +380,7 @@ export const JiraSkill: SkillDefinition = {
  * Status handler
  */
 async function handleStatus(context: SkillContext): Promise<SkillResult> {
-  const tokenData = await getJiraToken(context.userId);
+  const tokenData = await getJiraToken(context.userId, undefined, context.workspaceId);
 
   if (!tokenData) {
     return {
@@ -445,7 +445,7 @@ async function handleDisconnect(
     };
   }
 
-  const tokenData = await getJiraToken(context.userId);
+  const tokenData = await getJiraToken(context.userId, undefined, context.workspaceId);
   if (!tokenData) {
     return {
       success: false,
@@ -455,7 +455,7 @@ async function handleDisconnect(
   }
 
   try {
-    await IntegrationTokenService.deleteToken(context.userId, 'jira');
+    await IntegrationTokenService.deleteToken(context.userId, 'jira', undefined, context.workspaceId);
   } catch (error) {
     logger.error('[JIRA_SKILL] Failed to disconnect', {
       error: error instanceof Error ? error.message : String(error),

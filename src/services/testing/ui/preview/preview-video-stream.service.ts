@@ -452,6 +452,58 @@ export class PreviewVideoStreamService {
   }
 
   /**
+   * Inject a manual screenshot frame into the video stream.
+   * Used after page reload/navigation when CDP screencast may lag behind.
+   */
+  async injectFrame(): Promise<boolean> {
+    if (!this.isStreaming || this.isStopped || !this.page || !this.nsp) {
+      return false;
+    }
+
+    try {
+      const buf = await this.page.screenshot({
+        type: 'jpeg',
+        quality: PREVIEW_VIDEO_CONFIG.quality,
+      });
+      const base64 = buf.toString('base64');
+
+      this.seq++;
+      this.framesEmitted++;
+      this.lastFrameTime = Date.now();
+      this.frameTimestamps.push(this.lastFrameTime);
+      if (this.frameTimestamps.length > 30) {
+        this.frameTimestamps.shift();
+      }
+
+      const payload: PreviewVideoFramePayload = {
+        previewSessionId: this.previewSessionId,
+        seq: this.seq,
+        format: 'jpeg',
+        data: base64,
+        width: PREVIEW_VIDEO_CONFIG.maxWidth,
+        height: PREVIEW_VIDEO_CONFIG.maxHeight,
+        domVersion: this.currentDomVersion,
+        timestamp: new Date().toISOString(),
+      };
+
+      this.nsp.to(this.room).emit('preview:video:frame', payload);
+
+      logger.debug('[PREVIEW_VIDEO] Injected manual frame after navigation', {
+        previewSessionId: this.previewSessionId,
+        seq: this.seq,
+      });
+
+      return true;
+    } catch (error) {
+      logger.debug('[PREVIEW_VIDEO] Failed to inject frame', {
+        previewSessionId: this.previewSessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
    * Check if stream is active
    */
   isActive(): boolean {
@@ -535,6 +587,17 @@ export class PreviewVideoStreamRegistry {
    */
   getStream(previewSessionId: string): PreviewVideoStreamService | undefined {
     return this.streams.get(previewSessionId);
+  }
+
+  /**
+   * Inject a manual screenshot frame for a preview session
+   */
+  async injectFrame(previewSessionId: string): Promise<boolean> {
+    const stream = this.streams.get(previewSessionId);
+    if (stream) {
+      return stream.injectFrame();
+    }
+    return false;
   }
 
   /**

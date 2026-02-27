@@ -1442,7 +1442,11 @@ export class RegressionRunService {
 
         // Execute test (existing logic preserved)
         try {
-          if (execId) {
+          // For non-UI tests, mark execution as running before dispatch.
+          // For UI tests, we defer this to after runTest() so we can write
+          // result.testId atomically — prevents a race where the BullMQ job
+          // completes before result.testId is persisted.
+          if (execId && testCase.testType !== 'ui') {
             await ExecutionService.updateStatus({ id: execId, status: 'running' });
           }
 
@@ -1455,6 +1459,10 @@ export class RegressionRunService {
             // Run UI test without creating nested regression_runs
             const savedCase = await this.getSavedTestCase(testCase.testCaseId, userId);
             const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
+
+            // Write result.testId BEFORE dispatching the BullMQ job so the
+            // completion handler can always find this execution via
+            // result->>testId, even if the job finishes instantly.
             const testResult = await ManualTestService.runTest(testRequest);
 
             if (!testResult.success || !testResult.data?.id) {
@@ -1838,10 +1846,14 @@ export class RegressionRunService {
     const map = new Map<string, string>();
     if (!testCaseIds.length) return map;
 
-    const { data } = await supabaseAdmin
+    const { data, error } = await supabaseAdmin
       .from('intent_test_cases')
       .select('id, name')
       .in('id', testCaseIds);
+
+    if (error) {
+      logger.warn('[REGRESSION_RUN] Failed to fetch test case names', { error, count: testCaseIds.length });
+    }
 
     for (const row of data || []) {
       map.set(row.id, row.name);
@@ -1860,11 +1872,15 @@ export class RegressionRunService {
     const map = new Map<string, any>();
     if (!testIds.length) return map;
 
-    const { data } = await supabaseAdmin
+    const { data, error } = await supabaseAdmin
       .from('test_results')
       .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary, quality_checks')
       .in('test_id', testIds)
       .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.warn('[REGRESSION_RUN] Failed to fetch test results', { error, count: testIds.length });
+    }
 
     for (const row of data || []) {
       // Prefer the result that has ai_summary
@@ -1885,10 +1901,14 @@ export class RegressionRunService {
     const map = new Map<string, any[]>();
     if (!testIds.length) return map;
 
-    const { data } = await supabaseAdmin
+    const { data, error } = await supabaseAdmin
       .from('tests')
       .select('id, executed_steps')
       .in('id', testIds);
+
+    if (error) {
+      logger.warn('[REGRESSION_RUN] Failed to fetch executed steps', { error, count: testIds.length });
+    }
 
     for (const row of data || []) {
       map.set(row.id, row.executed_steps || []);
@@ -1897,20 +1917,35 @@ export class RegressionRunService {
   }
 
   /**
-   * Build a full aggregated run report
+   * Build a full aggregated run report (authenticated — checks ownership)
    */
   static async buildFullReport(
     runId: string,
     userId: string,
   ): Promise<RunReport | null> {
-    // Phase 1: Fetch run ownership first
     const run = await this.getRunWithOwnership(runId, userId);
     if (!run) return null;
+    return this.assembleReport(run);
+  }
 
-    // Phase 1b: Parallel fetch stats + executions (safe — run exists)
+  /**
+   * Build a full report for a publicly shared run (no ownership check).
+   */
+  static async buildPublicReport(shareToken: string): Promise<RunReport | null> {
+    const run = await this.getRunByShareToken(shareToken);
+    if (!run) return null;
+    return this.assembleReport(run);
+  }
+
+  /**
+   * Shared report assembly logic used by both buildFullReport and buildPublicReport.
+   * Fetches executions, test results, steps, bugs, artifacts and assembles RunReport.
+   */
+  private static async assembleReport(run: any): Promise<RunReport> {
+    // Phase 1: Parallel fetch stats + executions
     const [stats, executions] = await Promise.all([
-      ExecutionService.getStats(runId),
-      ExecutionService.getByRunId(runId),
+      ExecutionService.getStats(run.id),
+      ExecutionService.getByRunId(run.id),
     ]);
 
     const planName = (run.regression_plans as any)?.name || null;
@@ -1920,13 +1955,11 @@ export class RegressionRunService {
     const namesMap = await this.batchGetTestCaseNames(testCaseIds);
 
     // Extract testIds from UI executions (stored in execution.result.testId)
-    const testIdToExecId = new Map<string, string>();
     const testIds: string[] = [];
     for (const exec of executions) {
       const testId = exec.result?.testId;
       if (testId && exec.testType === 'ui') {
         testIds.push(testId);
-        testIdToExecId.set(testId, exec.id);
       }
     }
 
@@ -1950,7 +1983,6 @@ export class RegressionRunService {
     let totalConfidence = 0;
     let confidenceCount = 0;
 
-    // Aggregated artifacts across all executions (actual data for artifactsSummary)
     const aggArtifacts: RunReportArtifactsSummary = {
       screenshots: [],
       bugScreenshots: [],
@@ -2176,7 +2208,7 @@ export class RegressionRunService {
     }
 
     // Normalize 'completed' → 'passed' for frontend compatibility
-    const normalizedStatus = run.status === 'completed' ? 'passed' : run.status;
+    const normalizedStatus = run.status === 'completed' ? 'passed' : (run.status || null);
 
     return {
       id: run.id,
@@ -2187,275 +2219,7 @@ export class RegressionRunService {
       startedAt: run.started_at,
       completedAt: run.completed_at || null,
       durationMs,
-      aiConfidence: confidenceCount > 0 ? Math.round(totalConfidence / confidenceCount) : 0,
-      summary,
-      executions: reportExecutions,
-      bugs: allBugs,
-      recommendations: [...allRecommendations],
-      artifactsSummary: aggArtifacts,
-    };
-  }
-
-  /**
-   * Build a full report for a publicly shared run (no ownership check).
-   * Uses the same enrichment logic as buildFullReport but fetches the run by share_token.
-   */
-  static async buildPublicReport(shareToken: string): Promise<RunReport | null> {
-    const run = await this.getRunByShareToken(shareToken);
-    if (!run) return null;
-
-    // Reuse the same enrichment logic as buildFullReport, passing the run's own id
-    const [stats, executions] = await Promise.all([
-      ExecutionService.getStats(run.id),
-      ExecutionService.getByRunId(run.id),
-    ]);
-
-    const planName = (run.regression_plans as any)?.name || null;
-    const testCaseIds = [...new Set(executions.map((e) => e.testCaseId))];
-    const namesMap = await this.batchGetTestCaseNames(testCaseIds);
-
-    const testIdToExecId = new Map<string, string>();
-    const testIds: string[] = [];
-    for (const exec of executions) {
-      const testId = exec.result?.testId;
-      if (testId && exec.testType === 'ui') {
-        testIds.push(testId);
-        testIdToExecId.set(testId, exec.id);
-      }
-    }
-
-    const [testResultsMap, testReports, executedStepsMap] = await Promise.all([
-      this.batchGetTestResults(testIds),
-      TestReportGeneratorService.batchGetReportsByTestIds(testIds),
-      this.batchGetExecutedSteps(testIds),
-    ]);
-
-    const reportsMap = new Map<string, any>();
-    for (const report of testReports) {
-      reportsMap.set(report.testId, report);
-    }
-
-    const reportExecutions: RunReportExecution[] = [];
-    const allBugs: EnrichedBug[] = [];
-    const allRecommendations = new Set<string>();
-    let totalConfidence = 0;
-    let confidenceCount = 0;
-
-    const aggArtifacts: RunReportArtifactsSummary = {
-      screenshots: [],
-      bugScreenshots: [],
-      consoleLogs: [],
-      networkLogs: [],
-    };
-
-    const validSeverities = new Set(['critical', 'high', 'medium', 'low']);
-    const validCategories = new Set(['functional', 'performance', 'accessibility', 'visual', 'security']);
-
-    for (const exec of executions) {
-      const testCaseName = namesMap.get(exec.testCaseId) || 'Unknown';
-      const testId = exec.result?.testId;
-
-      const steps: RunReportStep[] = [];
-      let execArtifacts: {
-        videoUrl?: string;
-        traceUrl?: string;
-        screenshots: string[];
-        bugScreenshots: string[];
-        consoleLogs: string[];
-        networkLogs: Array<{ method: string; url: string; status?: number; durationMs?: number }>;
-        qualityChecks?: any;
-      } = {
-        videoUrl: undefined,
-        traceUrl: undefined,
-        screenshots: [],
-        bugScreenshots: [],
-        consoleLogs: [],
-        networkLogs: [],
-      };
-      let bugsCount = 0;
-
-      if (testId && exec.testType === 'ui') {
-        const rawSteps = executedStepsMap.get(testId) || [];
-        const completedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
-        for (let i = 0; i < completedSteps.length; i++) {
-          const step = completedSteps[i];
-          const meta = step.data?.runtimeMeta;
-          const success = step.data?.success !== false;
-          steps.push({
-            index: i + 1,
-            description: step.data?.stepDescription || step.data?.step || `Step ${i + 1}`,
-            status: success ? 'passed' : 'failed',
-            durationMs: meta?.executionMs,
-            error: !success ? {
-              message: meta?.failureExplanation || meta?.failedReason || 'Step failed',
-              failedReason: meta?.failedReason,
-              screenshot: meta?.bugScreenshotUrl,
-            } : undefined,
-          });
-        }
-
-        const testResult = testResultsMap.get(testId);
-        if (testResult) {
-          execArtifacts.videoUrl = testResult.video_url || undefined;
-          execArtifacts.traceUrl = testResult.trace_url || undefined;
-          if (testResult.screenshot) {
-            const screenshots = Array.isArray(testResult.screenshot)
-              ? testResult.screenshot
-              : [testResult.screenshot];
-            execArtifacts.screenshots = screenshots.filter(
-              (s: string) => typeof s === 'string' && !s.startsWith('data:'),
-            );
-          }
-          if (testResult.logs) {
-            execArtifacts.consoleLogs = Array.isArray(testResult.logs) ? testResult.logs : [];
-          }
-          if (testResult.network_logs && Array.isArray(testResult.network_logs)) {
-            execArtifacts.networkLogs = testResult.network_logs.map((nl: any) => ({
-              method: nl.method || '',
-              url: nl.url || '',
-              status: nl.status ?? undefined,
-              durationMs: nl.responseTime || nl.durationMs,
-            }));
-          }
-          if (testResult.quality_checks && typeof testResult.quality_checks === 'object') {
-            const qc = testResult.quality_checks;
-            execArtifacts.qualityChecks = {
-              webVitals: qc.webVitals || undefined,
-              accessibility: qc.accessibility || undefined,
-              brokenResources: Array.isArray(qc.brokenResources) ? qc.brokenResources : undefined,
-              slowAPIs: Array.isArray(qc.slowAPIs) ? qc.slowAPIs : undefined,
-            };
-          }
-          if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
-          if (execArtifacts.traceUrl && !aggArtifacts.traceUrl) aggArtifacts.traceUrl = execArtifacts.traceUrl;
-          aggArtifacts.screenshots.push(...execArtifacts.screenshots);
-          aggArtifacts.consoleLogs.push(...execArtifacts.consoleLogs);
-          aggArtifacts.networkLogs.push(...execArtifacts.networkLogs);
-        }
-
-        for (const step of steps) {
-          if (step.error?.screenshot && typeof step.error.screenshot === 'string') {
-            execArtifacts.bugScreenshots.push(step.error.screenshot);
-          }
-        }
-        aggArtifacts.bugScreenshots.push(...execArtifacts.bugScreenshots);
-
-        if (execArtifacts.qualityChecks) {
-          if (!aggArtifacts.qualityChecks) {
-            aggArtifacts.qualityChecks = { brokenResources: [], slowAPIs: [] };
-          }
-          const agg = aggArtifacts.qualityChecks;
-          const ec = execArtifacts.qualityChecks;
-          if (ec.webVitals) agg.webVitals = ec.webVitals;
-          if (ec.accessibility) {
-            if (!agg.accessibility) {
-              agg.accessibility = { warnings: [], totalWarnings: 0 };
-            }
-            agg.accessibility.warnings.push(...(ec.accessibility.warnings || []));
-            agg.accessibility.totalWarnings += ec.accessibility.totalWarnings || 0;
-          }
-          if (ec.brokenResources) {
-            agg.brokenResources = [...(agg.brokenResources || []), ...ec.brokenResources];
-          }
-          if (ec.slowAPIs) {
-            agg.slowAPIs = [...(agg.slowAPIs || []), ...ec.slowAPIs];
-          }
-        }
-
-        const report = reportsMap.get(testId);
-        const testResultData = testResultsMap.get(testId);
-        const rawBugSource =
-          report?.analysis?.bugs ||
-          testResultData?.ai_summary?.bugs ||
-          [];
-        const rawBugs: any[] = Array.isArray(rawBugSource) ? rawBugSource : [];
-
-        for (let i = 0; i < rawBugs.length; i++) {
-          const bug = rawBugs[i];
-          if (!bug || typeof bug !== 'object') continue;
-          allBugs.push({
-            id: bug.id || `${exec.id}-bug-${i}`,
-            title: bug.title || bug.message || bug.description || '',
-            severity: validSeverities.has(bug.severity) ? bug.severity : 'medium',
-            category: validCategories.has(bug.category) ? bug.category : 'functional',
-            testCaseId: exec.testCaseId,
-            testCaseName,
-            executionId: exec.id,
-            steps: Array.isArray(bug.steps) ? bug.steps : (Array.isArray(bug.stepsToReproduce) ? bug.stepsToReproduce : []),
-            expected: bug.expectedResult || bug.expected || '',
-            actual: bug.actualResult || bug.actual || '',
-            selector: bug.domSelector || bug.selector,
-            recommendation: bug.recommendation || '',
-          });
-        }
-        bugsCount = rawBugs.length;
-
-        const recsSource =
-          report?.analysis?.recommendations ||
-          testResultData?.ai_summary?.recommendations ||
-          [];
-        const recs: string[] = Array.isArray(recsSource) ? recsSource : [];
-        for (const r of recs) {
-          if (typeof r === 'string' && r.trim()) {
-            allRecommendations.add(r);
-          }
-        }
-
-        const conf = report?.analysis?.confidence ?? testResultData?.ai_summary?.confidence;
-        if (typeof conf === 'number') {
-          totalConfidence += conf;
-          confidenceCount++;
-        }
-      }
-
-      reportExecutions.push({
-        id: exec.id,
-        testCaseId: exec.testCaseId,
-        testCaseName,
-        status: exec.status,
-        durationMs: exec.durationMs || 0,
-        browser: exec.browser || 'chrome',
-        bugsCount,
-        steps,
-        artifacts: execArtifacts,
-      });
-    }
-
-    const bySeverity: Record<string, number> = {};
-    const byCategory: Record<string, number> = {};
-    for (const bug of allBugs) {
-      bySeverity[bug.severity] = (bySeverity[bug.severity] || 0) + 1;
-      byCategory[bug.category] = (byCategory[bug.category] || 0) + 1;
-    }
-    const summary: RunReportSummary = {
-      total: stats.total,
-      passed: stats.passed,
-      failed: stats.failed,
-      skipped: stats.skipped,
-      flaky: 0,
-      totalBugs: allBugs.length,
-      bySeverity,
-      byCategory,
-    };
-
-    let durationMs: number | null = null;
-    if (run.started_at && run.completed_at) {
-      const diff = new Date(run.completed_at).getTime() - new Date(run.started_at).getTime();
-      durationMs = diff > 0 ? diff : 0;
-    }
-
-    const normalizedStatus = run.status === 'completed' ? 'passed' : run.status;
-
-    return {
-      id: run.id,
-      planId: run.plan_id || null,
-      planName,
-      status: normalizedStatus,
-      trigger: run.trigger,
-      startedAt: run.started_at,
-      completedAt: run.completed_at || null,
-      durationMs,
-      aiConfidence: confidenceCount > 0 ? Math.round(totalConfidence / confidenceCount) : 0,
+      aiConfidence: confidenceCount > 0 ? Math.round(totalConfidence / confidenceCount) : null,
       summary,
       executions: reportExecutions,
       bugs: allBugs,

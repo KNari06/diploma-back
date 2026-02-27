@@ -6,6 +6,7 @@ import {
   handleListPageVisits,
   handleGetTestCase,
   handleGetRunReport,
+  handleShareResult,
   handleListRegressionPlans,
   handleGetAnalyticsSummary,
   handleGetTestResults,
@@ -34,6 +35,8 @@ import {
   handleGetFullDashboard,
   handleGetAgentHealth,
   handleUpdateTestCaseSteps,
+  // Editor mode tools
+  handleScreenshot,
   // Write tools — Tier 1
   handleUpdateTestCase,
   handleRunTest,
@@ -47,6 +50,10 @@ import {
   handleManageModule,
   handleManageFlow,
   handleBulkTag,
+  handleGetLastRuns,
+  handleGetRunStatus,
+  handleCancelRun,
+  handleManageAutomationAction,
 } from './qa-tool-handlers';
 import { logger } from '@/utils/core/logger';
 
@@ -157,7 +164,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_get_test_case',
       description:
-        'Get detailed info about a single test case including steps, commands, tags, and preconditions. Use when the user asks about a specific test.',
+        'Get detailed info about a single test case including steps, commands, tags, preconditions, and testType (ui/api/mixed). Returns the test definition only — for execution results (pass/fail, duration, errors), also call qa_list_test_executions with the same test_case_id.',
       parameters: {
         type: 'object',
         properties: {
@@ -185,6 +192,161 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
         },
         required: ['run_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_share_result',
+      description:
+        'Generate a public share link for a regression run report. The link can be sent to anyone (Telegram, Slack, email) — no authentication required to view. Idempotent: returns the same link if already generated.',
+      parameters: {
+        type: 'object',
+        properties: {
+          run_id: {
+            type: 'string',
+            description: 'The regression run ID to share',
+          },
+        },
+        required: ['run_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_last_runs',
+      description:
+        'Get the most recent regression runs for a project or plan. Use this when the user asks about recent regressions, last run, or wants to re-run the latest test. Returns run ID, plan name, trigger, status, summary, timing.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: {
+            type: 'string',
+            description: 'Project ID (auto-resolved from context if not provided)',
+          },
+          plan_id: {
+            type: 'string',
+            description: 'Filter by specific regression plan (optional)',
+          },
+          search: {
+            type: 'string',
+            description:
+              'Search by plan name (fuzzy match). Use when user refers to a plan by name instead of ID, e.g. "покажи последние регрессии Login" or "last runs for checkout flow"',
+          },
+          limit: {
+            type: 'number',
+            description: 'Number of runs to return (default: 5, max: 20)',
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_get_run_status',
+      description:
+        'Check the current execution status and progress of a regression run. Shows how many tests passed, failed, are still running, or pending. Use when user asks "how is my regression going?" or "is the test done?".',
+      parameters: {
+        type: 'object',
+        properties: {
+          run_id: {
+            type: 'string',
+            description: 'The regression run ID to check',
+          },
+        },
+        required: ['run_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_cancel_run',
+      description:
+        '⚠️ WRITE operation — Cancel/stop a running or pending regression run. Cancels all underlying tests and BullMQ jobs. Only works on runs with status "running" or "pending". Describe action → get approval → confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          run_id: {
+            type: 'string',
+            description: 'The regression run ID to cancel',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing the cancellation to user AND receiving explicit approval.',
+          },
+        },
+        required: ['run_id', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'qa_manage_automation_action',
+      description:
+        '⚠️ WRITE operation — Create/update/delete/list automation actions. Automation actions fire automatically when events happen (e.g., send Telegram when regression fails, create Jira ticket on test failure). Actions: create (trigger_event + action_type + config), update, delete, list. Describe changes → get approval → confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['create', 'update', 'delete', 'list'],
+            description: 'Operation to perform',
+          },
+          project_id: {
+            type: 'string',
+            description: 'Project ID (auto-resolved from context)',
+          },
+          action_id: {
+            type: 'string',
+            description: 'Automation action ID (required for update/delete)',
+          },
+          trigger_event: {
+            type: 'string',
+            enum: ['run_completed', 'run_failed', 'run_passed', 'test_completed', 'test_failed', 'schedule_executed'],
+            description: 'When to fire the action (required for create)',
+          },
+          action_type: {
+            type: 'string',
+            enum: ['telegram_notify', 'slack_notify', 'jira_create_issue', 'webhook_post', 'generate_share_link'],
+            description: 'What to do when triggered (required for create)',
+          },
+          condition: {
+            type: 'string',
+            enum: ['always', 'on_failure', 'on_success'],
+            description: 'Additional filter. Default: always',
+          },
+          config: {
+            type: 'object',
+            description: 'Action-specific config. telegram_notify: {chat_id?, include_share_link?}. webhook_post: {url, headers?}. jira_create_issue: {project_key, issue_type?, priority?}.',
+          },
+          name: {
+            type: 'string',
+            description: 'Human-readable label for this automation',
+          },
+          schedule_id: {
+            type: 'string',
+            description: 'Scope to a specific schedule (optional)',
+          },
+          plan_id: {
+            type: 'string',
+            description: 'Scope to a specific regression plan (optional)',
+          },
+          is_active: {
+            type: 'boolean',
+            description: 'Enable/disable (for update)',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true for write operations. Set ONLY after describing changes to user AND receiving explicit approval.',
+          },
+        },
+        required: ['action'],
       },
     },
   },
@@ -758,6 +920,24 @@ const QA_TOOLS: ChatCompletionTool[] = [
             description: 'Look back N days (default 7, max 30)',
           },
         },
+        required: [],
+      },
+    },
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Editor mode tools
+  // ═══════════════════════════════════════════════════════════════
+
+  {
+    type: 'function',
+    function: {
+      name: 'qa_screenshot',
+      description:
+        'Capture a screenshot of the live preview page. Use when the user asks about visual appearance, colors, layout, or anything that requires seeing the page. Returns a JPEG screenshot that you can analyze visually.',
+      parameters: {
+        type: 'object',
+        properties: {},
         required: [],
       },
     },
@@ -1367,6 +1547,21 @@ export const QASkill: SkillDefinition = {
         case 'qa_get_run_report':
           return await handleGetRunReport(args, context);
 
+        case 'qa_share_result':
+          return await handleShareResult(args, context);
+
+        case 'qa_get_last_runs':
+          return await handleGetLastRuns(args, context);
+
+        case 'qa_get_run_status':
+          return await handleGetRunStatus(args, context);
+
+        case 'qa_cancel_run':
+          return await handleCancelRun(args, context);
+
+        case 'qa_manage_automation_action':
+          return await handleManageAutomationAction(args, context);
+
         case 'qa_list_regression_plans':
           return await handleListRegressionPlans(args, context);
 
@@ -1447,6 +1642,10 @@ export const QASkill: SkillDefinition = {
 
         case 'qa_get_agent_health':
           return await handleGetAgentHealth(args, context);
+
+        // Editor mode tools
+        case 'qa_screenshot':
+          return await handleScreenshot(args, context);
 
         // Write tools
         case 'qa_update_test_case_steps':

@@ -586,7 +586,7 @@ export async function getRunStats(req: AuthenticatedRequest, res: Response): Pro
       .maybeSingle();
 
     // Normalize 'completed' → 'passed' for frontend compatibility
-    const normalizedStatus = run?.status === 'completed' ? 'passed' : (run?.status || null);
+    const normalizedStatus = run?.status === 'completed' ? 'passed' : run?.status || null;
 
     res.json({
       success: true,
@@ -1018,13 +1018,16 @@ export async function createShareLink(req: AuthenticatedRequest, res: Response):
     // Reuse existing token if present (idempotent)
     let shareToken = run.share_token;
     if (!shareToken) {
-      shareToken = crypto.randomBytes(16).toString('hex');
-      const { error: updateError } = await supabaseAdmin
+      // Try to set a new token atomically (only if still null)
+      const newToken = crypto.randomBytes(16).toString('hex');
+      const { data: updated, error: updateError } = await supabaseAdmin
         .from('regression_runs')
-        .update({ share_token: shareToken })
+        .update({ share_token: newToken })
         .eq('id', runId)
         .eq('user_id', userId)
-        .is('share_token', null); // Only set if still null (prevents race condition)
+        .is('share_token', null)
+        .select('share_token')
+        .maybeSingle();
 
       if (updateError) {
         logger.error('[REGRESSION_API] Failed to set share token', { error: updateError, runId });
@@ -1032,15 +1035,21 @@ export async function createShareLink(req: AuthenticatedRequest, res: Response):
         return;
       }
 
-      // Re-fetch in case a concurrent request already set the token
-      const { data: refreshed } = await supabaseAdmin
-        .from('regression_runs')
-        .select('share_token')
-        .eq('id', runId)
-        .single();
+      // If update matched (we won the race), use our token.
+      // If not (concurrent request set it first), re-fetch theirs.
+      shareToken = updated?.share_token;
+      if (!shareToken) {
+        const { data: refreshed } = await supabaseAdmin
+          .from('regression_runs')
+          .select('share_token')
+          .eq('id', runId)
+          .single();
+        shareToken = refreshed?.share_token;
+      }
 
-      if (refreshed?.share_token) {
-        shareToken = refreshed.share_token;
+      if (!shareToken) {
+        res.status(500).json({ success: false, error: 'Failed to generate share link' });
+        return;
       }
     }
 

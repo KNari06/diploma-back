@@ -3,8 +3,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 import { ResolverMatchType } from '@/types/testing.types';
-import { NavigationRequiresClarificationError } from '@/services/testing/ui/autonomous/autonomous-explorer.service';
-import { requestMissingInformation, runAutonomousExploration } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
+import { requestMissingInformation } from '@/services/testing/ui/autonomous/autonomous-orchestrator.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
@@ -253,13 +252,10 @@ function extractCredentialsFromMessage(message: string): { email?: string; usern
  * - FIX #5: Fixed extractUrlFromMessage undefined issue
  * - FIX #6: Removed duplicate question asking logic
  *
- * NEW FLOW (CORRECT):
+ * FLOW (Lite mode — always):
  * 1. Validate URL + scope
  * 2. Create/find project
- * 3. GENERATE TEST PLAN (not run immediately!)
- * 4. Save test plan to DB
- * 5. Show to user for APPROVAL
- * 6. User approves → handlePendingTestPlanApproval → executeUiTestFlow
+ * 3. Run test immediately (no approval step)
  */
 export async function handlePlatformTest(
   req: Request,
@@ -767,20 +763,18 @@ export async function handlePlatformTest(
     checkTimeout('handle_credentials');
 
     // ═══════════════════════════════════════════════════════════════════════
-    // ✅ LITE MODE: SKIP EXPLORATION → RUN TEST IMMEDIATELY
-    // Pro mode continues with exploration → plan confirmation flow
+    // RUN TEST IMMEDIATELY (Lite mode — always)
     // ═══════════════════════════════════════════════════════════════════════
 
-    if (effectiveMode === 'lite') {
-      // Check if request was cancelled before starting Lite test
-      if (abortSignal) {
-        const checkRequestAbortedWithLogging = functionLogger
-          ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
-          : checkRequestAborted;
-        checkRequestAbortedWithLogging(abortSignal);
-      }
+    // Check if request was cancelled before starting test
+    if (abortSignal) {
+      const checkRequestAbortedWithLogging = functionLogger
+        ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+        : checkRequestAborted;
+      checkRequestAbortedWithLogging(abortSignal);
+    }
 
-      logger.info('[PLATFORM_TEST] Lite mode: running test immediately (no exploration)', {
+    logger.info('[PLATFORM_TEST] Running test immediately (no exploration)', {
         url: extractedUrl,
         userId,
         project_id,
@@ -1014,290 +1008,10 @@ export async function handlePlatformTest(
         sessionId: chatSessionId,
       });
 
-      logger.info('[PLATFORM_TEST] Lite mode: test started successfully', {
+      logger.info('[PLATFORM_TEST] Test started successfully', {
         testId: actualTestId,
         duration: Date.now() - flowStartTime,
       });
-
-      return; // Exit early - Lite mode complete
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // ✅ PRO MODE (STEP 4): RUN AUTONOMOUS EXPLORATION + GENERATE REAL TEST PLAN
-    // Replaces UiTestPlanService with real browser-based exploration
-    // ═══════════════════════════════════════════════════════════════════════
-
-    logger.info('[PLATFORM_TEST] Pro mode: running autonomous exploration', {
-      url: extractedUrl,
-      userId,
-    });
-
-    emitProcessingStepWithLogging(chatSessionId, 'generating_plan', 'Analyzing page with real browser...', 50);
-
-    // Determine scope: from answers > from parsedIntent
-    const finalScope = parsedAnswers?.scope || parsedIntent.scope;
-
-    logger.info('[PLATFORM_TEST] Starting autonomous exploration', {
-      url: extractedUrl,
-      scope: finalScope,
-      hasCredentials: !!finalCredentials,
-      needsAuth,
-      fromAnswers: !!parsedAnswers,
-    });
-
-    // ✅ Run autonomous exploration: Launch browser → Analyze real page → Generate accurate plan
-    let testPlan, formattedPlan;
-
-    try {
-      const runAutonomousExplorationWithLogging = functionLogger
-        ? withFunctionLogging(runAutonomousExploration, 'runAutonomousExploration', functionLogger)
-        : runAutonomousExploration;
-      const result = await runAutonomousExplorationWithLogging({
-        userMessage: message,
-        answers: {
-          url: extractedUrl,
-          scope: finalScope,
-          target: parsedIntent.target,
-          credentials: finalCredentials,
-          needsAuth,
-          additionalInfo: {
-            projectName: sessionProject?.name,
-            ...(parsedAnswers?.additionalInfo || {}),
-          },
-        },
-        userId,
-        projectId: project_id,
-        sessionId: chatSessionId,
-        mode: mode || 'lite', // Pass mode to exploration
-      });
-
-      // ✅ FIX: Validate that testPlan and message exist
-      if (!result.testPlan) {
-        logger.error('[PLATFORM_TEST] runAutonomousExploration returned without testPlan', {
-          hasExploration: !!result.exploration,
-          hasMessage: !!result.message,
-        });
-        throw new Error('Failed to generate test plan: testPlan is missing from exploration result');
-      }
-
-      if (!result.message || typeof result.message !== 'string') {
-        logger.error('[PLATFORM_TEST] runAutonomousExploration returned without valid message', {
-          hasTestPlan: !!result.testPlan,
-          messageType: typeof result.message,
-        });
-        throw new Error('Failed to generate test plan: message is missing or invalid from exploration result');
-      }
-
-      testPlan = result.testPlan;
-      formattedPlan = result.message;
-
-    } catch (explorationError) {
-      const errorMsg = explorationError instanceof Error ? explorationError.message : String(explorationError);
-
-      // ✅ NEW: Check if error is about navigation requiring clarification
-      if (explorationError instanceof NavigationRequiresClarificationError) {
-        logger.info('[PLATFORM_TEST] Navigation requires clarification, asking user', {
-          url: explorationError.currentUrl,
-          goal: explorationError.attemptedGoal,
-          reason: explorationError.reason,
-        });
-
-        const clarificationMsg = explorationError.reason === 'no_links_found'
-          ? `🤔 I couldn't identify navigation links on ${explorationError.currentUrl}.\n\nI'll continue on the current page and try to find the registration flow. If you know the direct registration URL, you can share it to speed things up.`
-          : `🤔 I tried to navigate to the target page but couldn't find it after 3 attempts.\n\nCould you provide the direct URL to the page you want to test?`;
-
-        // Generate clarifying question for URL
-        const clarifyingQuestion = {
-          id: 'target_url',
-          question: 'Please provide the direct URL to the page you want to test:',
-          required: explorationError.reason !== 'no_links_found',
-          type: 'url' as const,
-          placeholder: 'example.com/register (or full URL)',
-        };
-
-        // Save to history
-        if (chatSessionId) {
-          const saveChatMessagesWithLogging = functionLogger
-            ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
-            : ChatService.saveChatMessages.bind(ChatService);
-          saveChatMessagesWithLogging(chatSessionId, [
-            { role: 'user', content: message },
-            {
-              role: 'ai',
-              content: clarificationMsg,
-              metadata: {
-                questions: [clarifyingQuestion],
-                conversationId: 'nav_clarification_' + Date.now(),
-                requiresAnswers: true,
-                navigationError: {
-                  currentUrl: explorationError.currentUrl,
-                  attemptedGoal: explorationError.attemptedGoal,
-                  reason: explorationError.reason,
-                },
-              },
-            },
-          ]).catch(saveError => {
-            logger.error('[PLATFORM_TEST] Failed to save navigation clarification', {
-              error: saveError instanceof Error ? saveError.message : String(saveError),
-            });
-          });
-        }
-
-        res.json({
-          reply: clarificationMsg,
-          questions: [clarifyingQuestion],
-          conversationId: 'nav_clarification_' + Date.now(),
-          timestamp: new Date().toISOString(),
-          sessionId: chatSessionId,
-        });
-        return;
-      }
-
-      // ✅ FIX: Check if error is about missing credentials
-      if (errorMsg.includes('Authentication required') || errorMsg.includes('credentials')) {
-        logger.info('[PLATFORM_TEST] Auth required, asking for credentials', {
-          url: extractedUrl,
-          originalError: errorMsg,
-        });
-
-        // Re-ask with credentials question
-        // Note: userProjects not needed here (only credentials question)
-        try {
-          const requestMissingInformationWithLogging = functionLogger
-            ? withFunctionLogging(requestMissingInformation, 'requestMissingInformation', functionLogger)
-            : requestMissingInformation;
-          const result = await requestMissingInformationWithLogging(message, {
-            hasUrl: true,
-            hasScope: true,
-            hasCredentials: false, // ← Force credentials question
-            intent: 'platform_test',
-            userProjects: [], // Not needed for credentials question
-          });
-
-          // Save to history
-          if (chatSessionId) {
-            // ✅ IMPROVEMENT: Include questions in content so AI can see them in history
-            const questionsText = result.questions
-              .map((q: any, idx: number) => `${idx + 1}. ${q.question || q.id}`)
-              .join('\n');
-
-            const fullContent = `🔐 This site requires authentication. Please provide your credentials:\n\n${questionsText}`;
-
-            const saveChatMessagesWithLogging = functionLogger
-              ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
-              : ChatService.saveChatMessages.bind(ChatService);
-            saveChatMessagesWithLogging(chatSessionId, [
-              { role: 'user', content: message },
-              {
-                role: 'ai',
-                content: fullContent,
-                metadata: {
-                  questions: result.questions,
-                  conversationId: result.conversationId,
-                  requiresAnswers: true,
-                },
-              },
-            ]).catch(saveError => {
-              logger.error('[PLATFORM_TEST] Failed to save credential request', {
-                error: saveError instanceof Error ? saveError.message : String(saveError),
-              });
-            });
-          }
-
-          res.json({
-            reply: '🔐 This site requires authentication. Please provide your credentials:',
-            questions: result.questions,
-            conversationId: result.conversationId,
-            timestamp: new Date().toISOString(),
-            sessionId: chatSessionId,
-          });
-          return;
-
-        } catch (reqError) {
-          logger.error('[PLATFORM_TEST] Failed to request credentials', {
-            error: reqError instanceof Error ? reqError.message : String(reqError),
-          });
-          // Fall through to generic error handler
-        }
-      }
-
-      // Re-throw if not a credentials error
-      throw explorationError;
-    }
-
-    // ✅ FIX: Validate testPlan structure before accessing properties
-    if (!testPlan || typeof testPlan !== 'object') {
-      logger.error('[PLATFORM_TEST] testPlan is invalid after assignment', {
-        testPlanType: typeof testPlan,
-        testPlanValue: testPlan,
-      });
-      throw new Error('Invalid test plan: testPlan is not a valid object');
-    }
-
-    logger.info('[PLATFORM_TEST] Autonomous exploration completed', {
-      planId: testPlan.id,
-      stepsCount: testPlan.steps?.length || 0,
-      commandsCount: testPlan.commands?.length || 0,
-      intelligentMode: testPlan.intelligentMode || false,
-    });
-
-    checkTimeout('autonomous_exploration');
-
-    // ✅ FIX: Validate formattedPlan before using it
-    if (!formattedPlan || typeof formattedPlan !== 'string') {
-      logger.error('[PLATFORM_TEST] formattedPlan is invalid before saving to history', {
-        formattedPlanType: typeof formattedPlan,
-        formattedPlanValue: formattedPlan,
-      });
-      throw new Error('Invalid formatted plan: formattedPlan is missing or not a string');
-    }
-
-    // Save to history (non-blocking)
-    if (chatSessionId) {
-      const saveChatMessagesWithLogging = functionLogger
-        ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
-        : ChatService.saveChatMessages.bind(ChatService);
-      saveChatMessagesWithLogging(chatSessionId, [
-        { role: 'user', content: message },
-        {
-          role: 'ai',
-          content: formattedPlan,
-          metadata: {
-            testPlan,
-            requiresApproval: true,
-          },
-        },
-      ]).catch(saveError => {
-        logger.error('[PLATFORM_TEST] Failed to save messages', {
-          error: saveError instanceof Error ? saveError.message : String(saveError),
-        });
-      });
-    }
-
-    // ✅ FIX: Check if connection is still alive before sending response
-    if (req.aborted || req.socket?.destroyed) {
-      logger.warn('[PLATFORM_TEST] Client connection closed, cannot send response', {
-        planId: testPlan.id,
-        duration: Date.now() - flowStartTime,
-      });
-      return;
-    }
-
-    // Send response with test plan
-    res.json({
-      success: true, // ← Frontend expects this!
-      reply: formattedPlan,
-      testPlan,
-      conversationId: testPlan.id, // ← For tracking approval
-      requiresApproval: true, // ← KEY! User must approve
-      timestamp: new Date().toISOString(),
-      sessionId: chatSessionId,
-    });
-
-    logger.info('[PLATFORM_TEST] Test plan sent for user approval', {
-      planId: testPlan.id,
-      duration: Date.now() - flowStartTime,
-    });
 
   } catch (error) {
     // ✅ Release Redis lock on error to prevent stuck locks

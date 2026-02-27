@@ -10,7 +10,7 @@ import { searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
-import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
+import { convertRoleForOpenAI, injectTemporalMarkers } from '@/utils/helpers/chat-helpers';
 import { isValidUUID } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
 import type { ChatCompletionMessageParam, ChatCompletionContentPart } from 'openai/resources/chat/completions';
@@ -71,7 +71,7 @@ export async function handleGeneralChat(
   // STEP 1: BUILD CONTEXT WITH HISTORY
   // ═══════════════════════════════════════════════════════════════════════
 
-  let conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  let conversationHistory: ChatCompletionMessageParam[] = [];
   let oldContextSummary = '';
 
   if (chatSessionId) {
@@ -154,7 +154,8 @@ export async function handleGeneralChat(
 
     // Build conversation history with compressed content (use helper for role conversion)
     // ✅ FIX: Include test results from metadata so AI can see them
-    conversationHistory = recentMessages.map(msg => {
+    // Build messages with timestamps preserved for temporal marker injection
+    const messagesWithTime = recentMessages.map(msg => {
       let content = compressMessageContent(msg.content);
 
       // ✅ FIX: If message has test results in metadata, append them to content
@@ -230,8 +231,12 @@ export async function handleGeneralChat(
       return {
         role: convertRoleForOpenAI(msg.role) as 'user' | 'assistant',
         content,
+        created_at: msg.created_at,
       };
-    }) as Array<{ role: 'user' | 'assistant'; content: string }>;
+    });
+
+    // Inject temporal markers (date prefixes + gap separators) for time-aware AI
+    conversationHistory = injectTemporalMarkers(messagesWithTime, CONSTANTS.TEMPORAL_GAP_THRESHOLD_MS);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -518,11 +523,13 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
   const emitProcessingStepWithLogging = functionLogger
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
-  emitProcessingStepWithLogging(chatSessionId, 'generating_response', 'Thinking...', PROGRESS.ROUTING);
+  const thinkingMessage = mode === 'editor' ? 'Analyzing the page...' : 'Thinking...';
+  emitProcessingStepWithLogging(chatSessionId, 'generating_response', thinkingMessage, PROGRESS.ROUTING);
 
   let gptResponse: { content: string; usage?: any };
   let shouldDeductCredits = false;
   let requestCancelled = false;
+  let pipelineClarification = false;
   const MAX_TOOL_ROUNDS = 5; // Prevent infinite loops
 
   // Wrap AI calls with tracking context
@@ -578,11 +585,16 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
           if (pipelineResult.success) {
             logger.info('[GENERAL_CHAT] Sub-agent pipeline succeeded', {
               path: pipelineResult.path,
+              needsClarification: pipelineResult.needsClarification ?? false,
               metrics: pipelineResult.metrics,
             });
 
             gptResponse = { content: pipelineResult.content, usage: undefined };
-            shouldDeductCredits = true;
+            // Clarification responses don't deduct credits (user didn't get an answer)
+            shouldDeductCredits = !pipelineResult.needsClarification;
+            if (pipelineResult.needsClarification) {
+              pipelineClarification = true;
+            }
             return { gptResponse, shouldDeductCredits };
           }
 
@@ -706,12 +718,26 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
             toolResult = await withToolTimeout(SkillRegistry.executeTool(toolName, toolArgs, skillContext));
           }
 
-          // Add tool result to messages
+          // Add tool result as text (OpenAI requires tool messages to be plain text)
+          const toolResultForMessage = toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot
+            ? { success: true, message: toolResult.message, url: toolResult.data.url }
+            : toolResult;
           messages.push({
             role: 'tool',
             tool_call_id: toolCall.id,
-            content: JSON.stringify(toolResult),
+            content: JSON.stringify(toolResultForMessage),
           } as any);
+
+          // For screenshots, inject a user message with the image so the model can see it
+          if (toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot) {
+            messages.push({
+              role: 'user',
+              content: [
+                { type: 'text', text: 'Here is the screenshot I just captured from the live preview. Analyze it and describe what you see.' },
+                { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${toolResult.data.screenshot}`, detail: 'low' } },
+              ],
+            } as any);
+          }
 
           logger.info('[GENERAL_CHAT] Tool executed', {
             toolName,
@@ -860,10 +886,21 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
   // Only deduct if we got a real OpenAI response (not fallback)
 
   if (shouldDeductCredits && gptResponse && gptResponse.content) {
-    const deductChatCreditsWithLogging = functionLogger
-      ? withFunctionLogging(deductChatCredits, 'deductChatCredits', functionLogger)
-      : deductChatCredits;
-    await deductChatCreditsWithLogging(userId, shouldDeductCredits);
+    try {
+      const deductChatCreditsWithLogging = functionLogger
+        ? withFunctionLogging(deductChatCredits, 'deductChatCredits', functionLogger)
+        : deductChatCredits;
+      await deductChatCreditsWithLogging(userId, shouldDeductCredits);
+    } catch (creditError) {
+      // Credit deduction failure must NEVER drop the AI response.
+      // The response is already generated — deliver it to the user regardless.
+      // Credits can be reconciled later via background audit.
+      logger.error('[GENERAL_CHAT] Credit deduction failed — delivering response anyway', {
+        error: creditError instanceof Error ? creditError.message : String(creditError),
+        userId,
+        chatSessionId,
+      });
+    }
   }
 
   if (abortSignal) {
@@ -892,7 +929,15 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
 
     const timestamps = await saveChatMessagesWithLogging(chatSessionId, [
       { role: 'user', content: message, metadata: userMessageMetadata },
-      { role: 'ai', content: gptResponse.content },
+      {
+        role: 'ai',
+        content: gptResponse.content,
+        // Save clarification metadata so intent parser can detect follow-up context
+        // Matches pattern from handleClarificationRequest in shared/clarification.ts
+        metadata: pipelineClarification
+          ? { requiresAnswers: true, needsMoreInfo: true, source: 'sub_agent_pipeline' }
+          : undefined,
+      },
     ]);
 
     // Extract timestamps: first is user message, second is AI reply

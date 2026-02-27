@@ -517,7 +517,13 @@ CRITICAL MISTAKES TO AVOID:
 
 • Natural, conversational, concise but thorough
 • ALWAYS respond in user's language (English/Russian/etc.)
-• Reference conversation history when relevant`;
+• Reference conversation history when relevant
+
+--- TEMPORAL CONTEXT ---
+Current time: ${new Date().toISOString()}
+Conversation messages may include time markers like [25 Feb, 14:30] and separators "── 2d later ──".
+Use these to understand WHEN things happened. If user references "those bugs" or "that test" after a time gap — they mean the context BEFORE the gap.
+When a significant time gap exists, acknowledge it naturally (e.g., "Welcome back!" or "Since last time...") only if relevant.`;
 
   // Add skill/integration descriptions if provided
   if (skillDescriptions) {
@@ -569,71 +575,4 @@ Persistent workspace memory (use naturally during conversation):
   return prompt;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// APPROVAL DETECTION PROMPTS
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Detect if user approved or rejected test plan
- * Used for natural language approval detection
- */
-export function buildApprovalDetectionPrompt(
-  userMessage: string,
-  context?: {
-    lastAiMessageWasTestPlan?: boolean;
-  }
-): string {
-  const hasTestPlanContext = context?.lastAiMessageWasTestPlan === true;
-
-  return `You are an expert at interpreting user intent in natural language.
-
-Your task: determine whether the user is approving a TEST EXECUTION.
-
-${hasTestPlanContext
-  ? `✅ CONTEXT: The LAST AI message WAS a TEST PLAN. User is responding to that plan.
-     This means short approval commands like "run it", "start", "go", "давай" should be treated as APPROVAL.`
-  : `⚠️ CONTEXT: Unknown if last AI message was a test plan.
-     If user message is ambiguous without context → return approved=null with low confidence.`}
-
-USER MESSAGE:
-"${userMessage}"
-
-You must classify the message:
-
-1. approved = true
-   User clearly wants to START/RUN/EXECUTE the test plan.
-
-2. approved = false
-   User rejects, cancels, or refuses the test execution.
-
-3. approved = null
-   Anything else (questions, modifications, clarifications, unrelated messages).
-
-Important rules:
-${hasTestPlanContext
-  ? `• Since last AI message WAS a test plan, treat these as APPROVAL (high confidence):
-     - "run it", "start", "go", "go ahead", "execute", "давай", "запускай", "иә", "ok", "yes"
-     - Short commands are APPROVAL when responding to test plan
-     - Only return approved=null if message is clearly a question or modification request
-• If user asks to modify something → NOT approval (approved=false or null).
-• If user asks a question → NOT approval (approved=null).
-• If user comments or discusses results → NOT approval (approved=null).`
-  : `• Approval must be explicit or strongly implied ("yes, run it", "давай запускай", "ok go", "start the test").
-• A simple "yes" = approval ONLY if context makes sense (the last message was a plan).
-• If user asks to modify something → NOT approval.
-• If user asks a question → NOT approval.
-• If user comments or discusses results → NOT approval.
-• If the message is ambiguous → use approved=null unless confidence is high.`}
-
-Multilingual approval examples:
-• "run it", "start", "go ahead", "ok let's run", "давай", "запускай", "иә бастаңдар", "ok bro go", "жарайды іске қос".
-Rejection examples:
-• "cancel", "stop", "don't run", "не надо", "жоқ", "ойланайық".
-
-Return ONLY JSON:
-{
-  "approved": true | false | null,
-  "confidence": 0.0-1.0,
-  "reasoning": "short explanation"
-}`;
-}
+// Approval detection prompt removed — Pro mode approval flow was deleted.

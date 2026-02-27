@@ -1,6 +1,5 @@
 import { logger } from '@/utils/core/logger';
 import { supabaseAdmin } from '@/db/supabase';
-import { env } from '@/config/environment/env';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -9,7 +8,7 @@ import { env } from '@/config/environment/env';
  *
  * Slack Incoming Webhook client for sending messages and notifications.
  * Uses Incoming Webhooks (no OAuth required — user provides webhook URL).
- * Token stored in env as SLACK_WEBHOOK_URL or per-user in integration_tokens.
+ * Token stored per-user in integration_tokens.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -46,17 +45,24 @@ export interface SlackMessagePayload {
 }
 
 /**
- * Get Slack webhook token for user.
- * Falls back to global SLACK_WEBHOOK_URL env var.
+ * Get Slack webhook token for user from integration_tokens.
+ * When workspaceId is provided, scopes lookup to that workspace.
+ * Returns null if no personal token exists.
  */
-export async function getSlackToken(userId: string): Promise<SlackTokenData | null> {
+export async function getSlackToken(userId: string, workspaceId?: string): Promise<SlackTokenData | null> {
   try {
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('integration_tokens')
       .select('*')
       .eq('user_id', userId)
       .eq('provider', 'slack')
-      .eq('enabled', true)
+      .eq('enabled', true);
+
+    if (workspaceId) {
+      query = query.eq('workspace_id', workspaceId);
+    }
+
+    const { data, error } = await query
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -69,23 +75,7 @@ export async function getSlackToken(userId: string): Promise<SlackTokenData | nu
       throw error;
     }
 
-    if (data) {
-      return data as SlackTokenData;
-    }
-
-    // Fall back to global env webhook URL
-    if (env.SLACK_WEBHOOK_URL) {
-      return {
-        id: 'env-global',
-        user_id: userId,
-        access_token: env.SLACK_WEBHOOK_URL,
-        enabled: true,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-    }
-
-    return null;
+    return (data as SlackTokenData) ?? null;
   } catch (error) {
     logger.error('[SLACK_SERVICE] Get token error', {
       error: error instanceof Error ? error.message : String(error),

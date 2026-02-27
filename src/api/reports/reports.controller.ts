@@ -83,13 +83,6 @@ export const generateReport = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Fetch test plan if exists
-    const { data: testPlan } = await supabaseAdmin
-      .from('test_plans')
-      .select('*')
-      .eq('id', testId)
-      .single();
-
     // Fetch AI analysis if exists
     const { data: aiAnalysis } = await supabaseAdmin
       .from('ai_analysis')
@@ -101,7 +94,6 @@ export const generateReport = async (req: Request, res: Response): Promise<void>
     const report = await TestReportGeneratorService.generateFinalReport({
       testId,
       testResult,
-      testPlan: testPlan || undefined,
       aiAnalysis: aiAnalysis || undefined,
     });
 
@@ -259,13 +251,6 @@ export const createJiraIssue = async (req: Request, res: Response): Promise<void
         return;
       }
 
-      // Fetch test plan
-      const { data: testPlan } = await supabaseAdmin
-        .from('test_plans')
-        .select('*')
-        .eq('id', testId)
-        .single();
-
       // Fetch AI analysis
       const { data: aiAnalysis } = await supabaseAdmin
         .from('ai_analysis')
@@ -277,7 +262,6 @@ export const createJiraIssue = async (req: Request, res: Response): Promise<void
       report = await TestReportGeneratorService.generateFinalReport({
         testId,
         testResult,
-        testPlan: testPlan || undefined,
         aiAnalysis: aiAnalysis || undefined,
       });
     }

@@ -17,6 +17,19 @@ class SkillRegistryClass {
   private skills: Map<string, SkillDefinition> = new Map();
   private toolNameToSkillId: Map<string, string> = new Map();
 
+  /** Tools whose schema includes a `confirm` parameter */
+  private toolsWithConfirm: Set<string> = new Set();
+
+  /**
+   * Tracks confirm=false (preview) calls.
+   * Key: `chatSessionId:toolName`, Value: timestamp (ms).
+   * A confirm=true call is only allowed if a preview exists for this key.
+   */
+  private confirmPreviews: Map<string, number> = new Map();
+
+  /** Preview entries expire after 5 minutes */
+  private static readonly CONFIRM_TTL_MS = 5 * 60 * 1000;
+
   /**
    * Register a skill
    */
@@ -29,7 +42,7 @@ class SkillRegistryClass {
 
     this.skills.set(skill.id, skill);
 
-    // Map tool names to skill ID for routing
+    // Map tool names to skill ID for routing, detect confirm-bearing tools
     skill.tools.forEach((tool) => {
       const toolName = tool.function.name;
       if (this.toolNameToSkillId.has(toolName)) {
@@ -40,6 +53,12 @@ class SkillRegistryClass {
         });
       }
       this.toolNameToSkillId.set(toolName, skill.id);
+
+      // Track tools that have a `confirm` parameter in their schema
+      const props = (tool.function.parameters as any)?.properties;
+      if (props && 'confirm' in props) {
+        this.toolsWithConfirm.add(toolName);
+      }
     });
 
     logger.info('[SKILL_REGISTRY] Skill registered', {
@@ -186,6 +205,51 @@ class SkillRegistryClass {
       };
     }
 
+    // ── Confirm guard: prevent LLM from bypassing user approval ──
+    if (this.toolsWithConfirm.has(toolName)) {
+      const sessionId = context.chatSessionId;
+
+      if (args.confirm === true) {
+        // Exception: qa_run_test in editor mode — user explicitly runs from editor
+        const isEditorPreview = toolName === 'qa_run_test' && !!context.previewSessionId;
+
+        if (!isEditorPreview && sessionId) {
+          const previewKey = `${sessionId}:${toolName}`;
+          const previewTs = this.confirmPreviews.get(previewKey);
+
+          if (!previewTs || Date.now() - previewTs > SkillRegistryClass.CONFIRM_TTL_MS) {
+            // No prior preview or expired — override to false so handler returns preview message
+            logger.warn('[SKILL_REGISTRY] Confirm guard: overriding confirm=true (no prior preview)', {
+              toolName,
+              chatSessionId: sessionId,
+            });
+            args.confirm = false;
+          } else {
+            // Valid preview exists — allow through and consume it
+            this.confirmPreviews.delete(previewKey);
+            logger.info('[SKILL_REGISTRY] Confirm guard: allowing confirm=true (preview found)', {
+              toolName,
+              chatSessionId: sessionId,
+            });
+          }
+        }
+      } else if (args.confirm === false && sessionId) {
+        // Record the preview call
+        const previewKey = `${sessionId}:${toolName}`;
+        this.confirmPreviews.set(previewKey, Date.now());
+
+        // Periodic cleanup: evict expired entries every 100 records
+        if (this.confirmPreviews.size > 100) {
+          const now = Date.now();
+          for (const [key, ts] of this.confirmPreviews) {
+            if (now - ts > SkillRegistryClass.CONFIRM_TTL_MS) {
+              this.confirmPreviews.delete(key);
+            }
+          }
+        }
+      }
+    }
+
     // Execute tool
     try {
       const result = await skill.execute(toolName, args, context);
@@ -229,6 +293,8 @@ class SkillRegistryClass {
   clear(): void {
     this.skills.clear();
     this.toolNameToSkillId.clear();
+    this.toolsWithConfirm.clear();
+    this.confirmPreviews.clear();
     logger.info('[SKILL_REGISTRY] Registry cleared');
   }
 }

@@ -46,10 +46,10 @@ export interface NotionSearchResult {
  * Get Notion token for user
  * Now uses centralized IntegrationTokenService
  */
-export async function getNotionToken(userId: string): Promise<NotionTokenData | null> {
+export async function getNotionToken(userId: string, workspaceId?: string): Promise<NotionTokenData | null> {
   try {
     const { IntegrationTokenService } = await import('./integration-token.service');
-    const token = await IntegrationTokenService.getToken(userId, 'notion');
+    const token = await IntegrationTokenService.getToken(userId, 'notion', undefined, workspaceId);
 
     if (!token) {
       logger.debug('[NOTION_SERVICE] No token found', { userId });

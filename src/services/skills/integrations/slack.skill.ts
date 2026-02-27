@@ -6,6 +6,7 @@ import {
   validateWebhookUrl,
 } from '@/services/api/slack.service';
 import { IntegrationTokenService } from '@/services/api/integration-token.service';
+import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -219,27 +220,33 @@ export const SlackSkill: SkillDefinition = {
       }
 
       // All other tools require an existing token
-      const tokenData = await getSlackToken(context.userId);
+      const tokenData = await getSlackToken(context.userId, context.workspaceId);
       if (!tokenData) {
+        const hasDisabled = await hasDisabledSlackToken(context.userId, context.workspaceId);
         return {
           success: false,
-          message:
-            'Slack is not connected. Ask the user to provide their Incoming Webhook URL from Slack App settings, then call slack_connect.',
+          message: hasDisabled
+            ? 'Slack was previously connected but is now disabled. Ask the user to reconnect with slack_connect.'
+            : 'Slack is not connected. Ask the user to provide their Incoming Webhook URL from Slack App settings, then call slack_connect.',
           displayToUser: true,
         };
       }
 
       const webhookUrl = tokenData.access_token;
 
+      let result: SkillResult;
       switch (toolName) {
         case 'slack_send_message':
-          return await handleSendMessage(webhookUrl, args);
+          result = await handleSendMessage(webhookUrl, args);
+          break;
 
         case 'slack_send_notification':
-          return await handleSendNotification(webhookUrl, args);
+          result = await handleSendNotification(webhookUrl, args);
+          break;
 
         case 'slack_send_blocks':
-          return await handleSendBlocks(webhookUrl, args);
+          result = await handleSendBlocks(webhookUrl, args);
+          break;
 
         default:
           return {
@@ -248,11 +255,30 @@ export const SlackSkill: SkillDefinition = {
             displayToUser: false,
           };
       }
+
+      // Detect revoked/invalid webhook from failed results
+      if (!result.success && isSlackWebhookRevokedError(result.message)) {
+        return {
+          success: false,
+          message: 'The Slack webhook URL is no longer valid (revoked or deleted). Please reconnect using slack_connect with a new webhook URL.',
+          displayToUser: true,
+        };
+      }
+
+      return result;
     } catch (error) {
       logger.error('[SLACK_SKILL] Execution error', {
         toolName,
         error: error instanceof Error ? error.message : String(error),
       });
+
+      if (isSlackWebhookRevokedError(error)) {
+        return {
+          success: false,
+          message: 'The Slack webhook URL is no longer valid (revoked or deleted). Please reconnect using slack_connect with a new webhook URL.',
+          displayToUser: true,
+        };
+      }
 
       return {
         success: false,
@@ -264,6 +290,41 @@ export const SlackSkill: SkillDefinition = {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Check if an error indicates a revoked/invalid webhook URL
+ */
+function isSlackWebhookRevokedError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /Slack webhook error: (403|404|410)/i.test(msg) || /invalid_token|token_revoked/i.test(msg);
+}
+
+/**
+ * Check for a disabled token (exists but enabled=false).
+ */
+async function hasDisabledSlackToken(userId: string, workspaceId?: string): Promise<boolean> {
+  try {
+    let query = supabaseAdmin
+      .from('integration_tokens')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('provider', 'slack')
+      .eq('enabled', false);
+
+    if (workspaceId) {
+      query = query.eq('workspace_id', workspaceId);
+    }
+
+    const { data } = await query.limit(1).maybeSingle();
+    return !!data;
+  } catch {
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Handlers
 // ═══════════════════════════════════════════════════════════════
 
@@ -271,9 +332,20 @@ export const SlackSkill: SkillDefinition = {
  * Check Slack connection status
  */
 async function handleStatus(context: SkillContext): Promise<SkillResult> {
-  const tokenData = await getSlackToken(context.userId);
+  const tokenData = await getSlackToken(context.userId, context.workspaceId);
 
   if (!tokenData) {
+    const hasDisabled = await hasDisabledSlackToken(context.userId, context.workspaceId);
+
+    if (hasDisabled) {
+      return {
+        success: true,
+        data: { connected: false, disabled: true },
+        message: 'Slack was previously connected but is now disabled. Use slack_connect with a new webhook URL to reconnect.',
+        displayToUser: true,
+      };
+    }
+
     return {
       success: true,
       data: { connected: false },
@@ -385,7 +457,7 @@ async function handleDisconnect(
     };
   }
 
-  const tokenData = await getSlackToken(context.userId);
+  const tokenData = await getSlackToken(context.userId, context.workspaceId);
   if (!tokenData) {
     return {
       success: false,
@@ -395,7 +467,7 @@ async function handleDisconnect(
   }
 
   try {
-    await IntegrationTokenService.deleteToken(context.userId, 'slack');
+    await IntegrationTokenService.deleteToken(context.userId, 'slack', undefined, context.workspaceId);
   } catch (error) {
     logger.error('[SLACK_SKILL] Failed to disconnect', {
       error: error instanceof Error ? error.message : String(error),

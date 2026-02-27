@@ -1,5 +1,4 @@
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
-import { buildApprovalDetectionPrompt } from '@/ai/prompts/index';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
@@ -8,108 +7,6 @@ import { Page } from 'playwright';
  * AI-powered helper functions
  * Uses GPT-3.5-turbo for cost-effective simple tasks
  */
-
-/**
- * Detect user approval/rejection of test plan
- * Universal AI-powered detection - user can write ANYTHING
- * Uses GPT-3.5-turbo for cost efficiency
- */
-export async function detectUserApproval(
-  userMessage: string,
-  context?: {
-    lastAiMessageWasTestPlan?: boolean; // Context: was last AI message a test plan?
-  }
-): Promise<{
-  approved: boolean | null; // true = approve, false = reject, null = unclear
-  confidence: number; // 0.0-1.0
-  reasoning?: string;
-}> {
-  // Validate input
-  if (!userMessage || typeof userMessage !== 'string') {
-    logger.warn('[APPROVAL_DETECT] Invalid input message', { userMessage });
-    return { approved: null, confidence: 0.0, reasoning: 'Invalid input' };
-  }
-
-  const trimmedMessage = userMessage.trim();
-  if (trimmedMessage.length === 0) {
-    logger.warn('[APPROVAL_DETECT] Empty message');
-    return { approved: null, confidence: 0.0, reasoning: 'Empty message' };
-  }
-
-  // ✅ AI-FIRST APPROACH: Always use AI to understand user intent
-  // No hardcoded lists - AI understands natural language, context, and intent
-  try {
-    logger.info('🔍 [APPROVAL_DETECT] Starting AI detection', {
-      message: trimmedMessage,
-      length: trimmedMessage.length,
-    });
-
-    // Use centralized prompt with context
-    const prompt = buildApprovalDetectionPrompt(trimmedMessage, context);
-
-    const response = await getChatCompletionWithMessages([
-      {
-        role: 'system',
-        content: 'You are an intent detection expert. Detect approval/rejection from ANY natural language input. Return ONLY valid JSON.',
-      },
-      {
-        role: 'user',
-        content: prompt,
-      },
-    ], {
-      model: AI_TASK_MODELS.helpers, // Cost-effective AI for intent detection
-      temperature: 0.1, // Low temp for consistent results
-      max_tokens: 100,
-    });
-
-    logger.info('🔍 [APPROVAL_DETECT] AI response received', {
-      rawContent: response.content?.substring(0, 100),
-    });
-
-    // Safe JSON parsing
-    let parsed: any;
-    try {
-      parsed = JSON.parse(response.content);
-    } catch (parseError) {
-      logger.error('[APPROVAL_DETECT] Failed to parse AI response', {
-        response: response.content?.substring(0, 200),
-        parseError,
-      });
-      throw new Error('Invalid JSON response from AI');
-    }
-
-    // Validate parsed response structure
-    if (typeof parsed !== 'object' || parsed === null) {
-      throw new Error('AI response is not a valid object');
-    }
-
-    // Log based on actual result
-    const logPrefix = parsed.approved === true ? '✅ [APPROVAL_DETECT] Approved'
-                    : parsed.approved === false ? '❌ [APPROVAL_DETECT] Rejected'
-                    : '⚠️ [APPROVAL_DETECT] Unclear/Not approval';
-
-    logger.info(logPrefix, {
-      approved: parsed.approved,
-      confidence: parsed.confidence,
-      reasoning: parsed.reasoning,
-    });
-
-    return {
-      approved: parsed.approved,
-      confidence: parsed.confidence || 0,
-      reasoning: parsed.reasoning,
-    };
-  } catch (error) {
-    logger.error('❌ [APPROVAL_DETECT] AI detection failed', {
-      error: error instanceof Error ? error.message : String(error),
-      message: trimmedMessage,
-    });
-
-    // Fallback: return unclear if AI fails (better than guessing with hardcoded keywords)
-    // This ensures we don't accidentally approve/reject based on keyword matching
-    return { approved: null, confidence: 0.0, reasoning: 'AI detection failed - unable to determine intent' };
-  }
-}
 
 /**
  * Detect login page using AI (fallback to hardcode)

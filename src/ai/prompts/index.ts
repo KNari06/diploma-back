@@ -4,8 +4,8 @@
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * All prompts are organized into logical files:
- * - intent-and-chat-prompts.ts: Intent parsing, chat, approval detection
- * - test-plan-prompts.ts: API test plans, UI test plans, fuzzing, questions
+ * - intent-and-chat-prompts.ts: Intent parsing, chat
+ * - test-plan-prompts.ts: API test plans, fuzzing, questions, URL analysis
  * - intelligent-testing-prompts.ts: Intelligent mode (page analysis, actions, etc.)
  *
  * This file re-exports all prompts for backward compatibility.
@@ -13,7 +13,7 @@
 
 // Re-export from intent-and-chat-prompts.ts
 export {
-  buildApprovalDetectionPrompt, buildChatSystemPrompt, buildIntentPrompt, type IntentParserContext
+  buildChatSystemPrompt, buildIntentPrompt, type IntentParserContext
 } from './intent-and-chat-prompts';
 
 // Re-export from test-plan-prompts.ts
@@ -25,7 +25,6 @@ export {
   buildDynamicQuestionPrompt,
   buildPageNavigationPrompt,
   buildPageNavigationSystemPrompt,
-  buildTestPlanPrompt,
   buildUrlAnalysisPrompt,
   buildUrlAnalysisSystemPrompt,
 } from './test-plan-prompts';
@@ -84,14 +83,13 @@ export function buildContextString(context?: {
 
 import { buildEditorResolverUserPrompt, EDITOR_RESOLVER_SYSTEM_PROMPT } from './editor-resolver-prompts';
 import { buildActionGenerationPrompt, buildLogicAnalysisPrompt, buildNextStepPrompt, buildPageAnalysisPrompt, buildVisionPrompt } from './intelligent-testing-prompts';
-import { buildApprovalDetectionPrompt, buildChatSystemPrompt, buildIntentPrompt } from './intent-and-chat-prompts';
+import { buildChatSystemPrompt, buildIntentPrompt } from './intent-and-chat-prompts';
 import {
   buildApiFuzzingPrompt,
   buildApiTestPlanPrompt,
   buildCustomScopeStrategyPrompt,
   buildCustomScopeStrategySystemPrompt,
   buildDynamicQuestionPrompt,
-  buildTestPlanPrompt,
   buildUrlAnalysisPrompt,
   buildUrlAnalysisSystemPrompt,
 } from './test-plan-prompts';
@@ -106,39 +104,33 @@ export const Prompts = {
   // 3. Chat/conversation
   buildChatSystemPrompt,
 
-  // 4. User interaction
-  buildApprovalDetectionPrompt,
-
-  // 5. API Fuzzing
+  // 4. API Fuzzing
   buildApiFuzzingPrompt,
 
-  // 6. Intelligent testing
+  // 5. Intelligent testing
   buildPageAnalysisPrompt,
   buildActionGenerationPrompt,
   buildNextStepPrompt,
   buildLogicAnalysisPrompt,
 
-  // 7. Vision analysis
+  // 6. Vision analysis
   buildVisionPrompt,
 
-  // 8. Test plan generator
-  buildTestPlanPrompt,
-
-  // 9. Dynamic questions
+  // 7. Dynamic questions
   buildDynamicQuestionPrompt,
 
-  // 10. URL analysis
+  // 8. URL analysis
   buildUrlAnalysisPrompt,
   buildUrlAnalysisSystemPrompt,
 
-  // 11. Custom scope strategy
+  // 9. Custom scope strategy
   buildCustomScopeStrategyPrompt,
   buildCustomScopeStrategySystemPrompt,
 
-  // 12. Utilities
+  // 10. Utilities
   buildContextString,
 
-  // 13. Editor resolver (step editor AI matching)
+  // 11. Editor resolver (step editor AI matching)
   buildEditorResolverUserPrompt,
   EDITOR_RESOLVER_SYSTEM_PROMPT,
 };

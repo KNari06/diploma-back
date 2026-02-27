@@ -134,6 +134,9 @@ export interface ServerToClientEvents {
   'preview:accessibility:update': (data: PreviewAccessibilityUpdatePayload) => void;
   'preview:context:update': (data: PreviewContextUpdatePayload) => void;
 
+  // Preview dialog events (native alert/confirm/prompt auto-dismissed)
+  'preview:dialog': (data: PreviewDialogPayload) => void;
+
   // Preview recording events
   'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:state': (data: PreviewRecordingStatePayload) => void;
@@ -638,7 +641,9 @@ export interface ChatProcessingStepPayload {
   'preparing_workspace' | 'checking_project' | 'validating_credentials' |
   'creating_test_plan' | 'waiting_approval' |
   // Sub-agent pipeline thinking steps
-  'agent_routing' | 'agent_planning' | 'agent_executing_tool' | 'agent_formatting';
+  'agent_routing' | 'agent_planning' | 'agent_executing_tool' | 'agent_formatting' |
+  // Cooperative multi-agent pipeline steps
+  'agent_reviewing' | 'agent_spawning';
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;
@@ -921,6 +926,17 @@ export interface PreviewPagePayload {
   domVersion: number;        // Monotonically increasing int, incremented on DOM changes
   pageSignature: string;     // Hash of URL + interactive element refs
   domNodes?: PreviewInteractiveNode[]; // Only sent when domVersion changes
+  timestamp: string;
+}
+
+/**
+ * Native dialog (alert/confirm/prompt) auto-dismissed payload
+ */
+export interface PreviewDialogPayload {
+  previewSessionId: string;
+  type: string;              // 'alert' | 'confirm' | 'prompt' | 'beforeunload'
+  message: string;
+  action: 'accepted' | 'dismissed';
   timestamp: string;
 }
 

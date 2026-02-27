@@ -3,7 +3,8 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
 import { buildExecutorPrompt } from '../prompts/executor-prompt';
-import type { ExecutorResult, PipelineContext, ToolExecutionRecord } from '../types';
+import type { ExecutorResult, PipelineContext, ToolExecutionRecord, TrackedPlanStep } from '../types';
+import type { Blackboard } from '../blackboard';
 import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import { emitProcessingStep } from '@/api/chat/shared/utils';
 import { PROGRESS } from '@/api/chat/shared/constants';
@@ -16,39 +17,14 @@ import { PROGRESS } from '@/api/chat/shared/constants';
  * Focused tool-calling loop. Sees ONLY the filtered subset of tools.
  * Routes through existing SkillRegistry.executeTool() and executeMemoryTool().
  *
+ * When a Blackboard is provided, reads structured plan steps and updates
+ * step status as execution progresses. This enables cross-agent context
+ * sharing and plan tracking.
+ *
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-const MEMORY_TOOL_NAMES = ['remember_fact', 'search_memory', 'forget_fact'];
-
-/** Per-tool timeout overrides. Tools not listed use DEFAULT_TOOL_TIMEOUT_MS. */
-const TOOL_TIMEOUTS: Record<string, number> = {
-  // Fast tools (memory, simple reads)
-  remember_fact: 3000,
-  search_memory: 3000,
-  forget_fact: 3000,
-  // Medium tools (DB aggregate queries)
-  qa_list_test_cases: 8000,
-  qa_get_analytics_summary: 10000,
-  qa_get_results_overview: 10000,
-  qa_get_full_dashboard: 15000,
-  qa_get_heatmap: 10000,
-  qa_get_time_series: 10000,
-  qa_list_test_executions: 10000,
-  // Slow tools (AI analysis, write operations)
-  qa_get_coverage_report: 25000,
-  qa_analyze_failure: 25000,
-  qa_get_recommendations: 25000,
-  qa_run_test: 60000,
-  qa_create_test_case: 15000,
-  qa_manage_regression_plan: 10000,
-  qa_manage_schedule: 10000,
-};
-const DEFAULT_TOOL_TIMEOUT_MS = 15000;
-
-function getToolTimeout(toolName: string): number {
-  return TOOL_TIMEOUTS[toolName] ?? DEFAULT_TOOL_TIMEOUT_MS;
-}
+import { MEMORY_TOOL_NAMES, withToolTimeoutAndAbort } from '../tool-constants';
 
 /** Compute dynamic progress for a tool within the executor's 70-88% range. */
 function computeToolProgress(completedTools: number, estimatedTotal: number): number {
@@ -65,7 +41,37 @@ function humanizeToolName(toolName: string): string {
 }
 
 /**
+ * Try to match a tool execution to a plan step.
+ * Matches by expectedTool first, then by category prefix.
+ */
+function findMatchingStep(
+  steps: TrackedPlanStep[] | undefined,
+  toolName: string
+): TrackedPlanStep | undefined {
+  if (!steps) return undefined;
+
+  // 1. Exact match on expectedTool (highest confidence)
+  const exactMatch = steps.find(
+    s => s.status === 'in_progress' && s.expectedTool === toolName
+  );
+  if (exactMatch) return exactMatch;
+
+  // 2. Match by category prefix (e.g., tool "qa_list_test_cases" → category "qa_read")
+  const categoryMatch = steps.find(
+    s => s.status === 'in_progress' && toolName.startsWith(s.category.replace(/_read$|_write$/, ''))
+  );
+  if (categoryMatch) return categoryMatch;
+
+  // 3. Any in_progress step (fallback for single-step execution)
+  return steps.find(s => s.status === 'in_progress');
+}
+
+/**
  * Execute tool calls in a focused loop with filtered tool subset.
+ *
+ * Supports two modes:
+ * - Legacy: pass `plan` as string (backward-compatible)
+ * - Blackboard: pass `blackboard` for structured plan tracking and step updates
  */
 export async function executeTools(
   userMessage: string,
@@ -74,14 +80,33 @@ export async function executeTools(
   context: PipelineContext,
   plan?: string,
   abortSignal?: AbortSignal,
-  userContent?: string | ChatCompletionMessageParam['content']
+  userContent?: string | ChatCompletionMessageParam['content'],
+  blackboard?: Blackboard
 ): Promise<ExecutorResult> {
   const startMs = Date.now();
   const toolResults: ToolExecutionRecord[] = [];
   let assistantContent = '';
 
+  // Determine plan source: blackboard (structured) or legacy text
+  let promptPlan: string | TrackedPlanStep[] | undefined;
+  let userGoal: string | undefined;
+
+  if (blackboard) {
+    const bbPlan = blackboard.getPlan();
+    if (bbPlan) {
+      promptPlan = bbPlan.steps;
+      // Mark all pending steps as in_progress
+      bbPlan.steps
+        .filter(s => s.status === 'pending')
+        .forEach(s => blackboard.updateStepStatus(s.stepNumber, 'in_progress'));
+    }
+    userGoal = blackboard.getGoal();
+  } else if (plan) {
+    promptPlan = plan;
+  }
+
   // Build executor messages
-  const executorPrompt = buildExecutorPrompt(plan, context.projectId, context.mode);
+  const executorPrompt = buildExecutorPrompt(promptPlan, context.projectId, context.mode, userGoal);
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: executorPrompt },
     // Include relevant context messages (system prompts with memory/KB/history)
@@ -110,8 +135,8 @@ export async function executeTools(
     // Call OpenAI with filtered tools
     const response = await getChatCompletionWithMessages(messages, {
       model: AI_TASK_MODELS.chatExecutor,
-      temperature: 0.3,
-      max_tokens: 1500,
+      temperature: SUB_AGENT_CONFIG.executorTemperature,
+      max_tokens: SUB_AGENT_CONFIG.executorMaxTokens,
       tools: filteredTools.length > 0 ? filteredTools : undefined,
       tool_choice: filteredTools.length > 0 ? 'auto' : undefined,
       abortSignal,
@@ -179,22 +204,13 @@ export async function executeTools(
       try {
         let toolResult: any;
 
-        // Timeout wrapper (per-tool)
-        const timeoutMs = getToolTimeout(toolName);
-        const withTimeout = <T>(promise: Promise<T>): Promise<T> => {
-          return Promise.race([
-            promise,
-            new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error(`Tool '${toolName}' timed out after ${timeoutMs}ms`)), timeoutMs)
-            ),
-          ]);
-        };
-
-        // Route to correct executor
+        // Route to correct executor (with per-tool timeout + abort signal)
         if (MEMORY_TOOL_NAMES.includes(toolName)) {
           const { executeMemoryTool } = await import('@/services/ai/memory/memory-tools');
-          toolResult = await withTimeout(
-            executeMemoryTool(toolName, toolArgs, context.workspaceId, context.userId)
+          toolResult = await withToolTimeoutAndAbort(
+            executeMemoryTool(toolName, toolArgs, context.workspaceId, context.userId),
+            toolName,
+            abortSignal,
           );
         } else {
           const { SkillRegistry } = await import('@/services/skills');
@@ -205,24 +221,54 @@ export async function executeTools(
             projectId: context.projectId,
             previewSessionId: context.previewSessionId,
           };
-          toolResult = await withTimeout(
-            SkillRegistry.executeTool(toolName, toolArgs, skillContext)
+          toolResult = await withToolTimeoutAndAbort(
+            SkillRegistry.executeTool(toolName, toolArgs, skillContext),
+            toolName,
+            abortSignal,
           );
         }
 
-        // Push result to messages
+        // Push tool result as text (OpenAI requires tool messages to be plain text)
+        const toolResultForMessage = toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot
+          ? { success: true, message: toolResult.message, url: toolResult.data.url }
+          : toolResult;
         messages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
-          content: JSON.stringify(toolResult),
+          content: JSON.stringify(toolResultForMessage),
         } as any);
 
-        toolResults.push({
+        // For screenshots, inject a user message with the image so the model can see it
+        if (toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot) {
+          messages.push({
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Here is the screenshot I just captured from the live preview. Analyze it and describe what you see.' },
+              { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${toolResult.data.screenshot}`, detail: 'low' } },
+            ],
+          } as any);
+        }
+
+        const record: ToolExecutionRecord = {
           toolName,
           args: toolArgs,
           result: toolResult,
           durationMs: Date.now() - toolStartMs,
-        });
+        };
+        toolResults.push(record);
+
+        // Update blackboard step status if available
+        if (blackboard) {
+          const matchedStep = findMatchingStep(blackboard.getPlan()?.steps, toolName);
+          if (matchedStep) {
+            blackboard.updateStepStatus(
+              matchedStep.stepNumber,
+              toolResult.success ? 'completed' : 'failed',
+              [record],
+              toolResult.success ? undefined : (toolResult.message || 'Tool execution failed'),
+            );
+          }
+        }
 
         // Emit thinking step: tool result
         emitProcessingStep(
@@ -246,9 +292,10 @@ export async function executeTools(
           error: toolError instanceof Error ? toolError.message : String(toolError),
         });
 
+        const errorMessage = `Tool execution failed: ${toolError instanceof Error ? toolError.message : String(toolError)}`;
         const errorResult = {
           success: false,
-          message: `Tool execution failed: ${toolError instanceof Error ? toolError.message : String(toolError)}`,
+          message: errorMessage,
         };
         messages.push({
           role: 'tool',
@@ -256,12 +303,21 @@ export async function executeTools(
           content: JSON.stringify(errorResult),
         } as any);
 
-        toolResults.push({
+        const errorRecord: ToolExecutionRecord = {
           toolName,
           args: toolArgs,
           result: { success: false, message: errorResult.message },
           durationMs: Date.now() - toolStartMs,
-        });
+        };
+        toolResults.push(errorRecord);
+
+        // Update blackboard step status for failures
+        if (blackboard) {
+          const matchedStep = findMatchingStep(blackboard.getPlan()?.steps, toolName);
+          if (matchedStep) {
+            blackboard.updateStepStatus(matchedStep.stepNumber, 'failed', [errorRecord], errorMessage);
+          }
+        }
 
         // Emit thinking step: tool error
         emitProcessingStep(
