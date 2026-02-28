@@ -1178,7 +1178,8 @@ export class RegressionPlanService {
 
   /**
    * Link/unlink git_integrations.plan_id for this plan.
-   * Priority: integrationId > repositoryUrl (find or create) > first enabled integration (backward compatible).
+   * Only links to existing integrations — user must create git-integration first via POST /git-integrations.
+   * Priority: integrationId > repositoryUrl (lookup only) > first enabled integration (backward compatible).
    */
   private static async syncGitIntegration(
     plan: RegressionPlan,
@@ -1198,6 +1199,7 @@ export class RegressionPlanService {
       let integration: { id: string } | null = null;
 
       if (gitConfig.integrationId) {
+        // Explicit integration ID — verify it belongs to this project
         const { data } = await supabaseAdmin
           .from('git_integrations')
           .select('id')
@@ -1215,36 +1217,23 @@ export class RegressionPlanService {
           return;
         }
       } else if (gitConfig.repositoryUrl?.trim()) {
+        // Lookup existing integration by repo URL — no auto-creation
         const existing = await GitIntegrationService.findByProjectAndRepositoryUrl(
           plan.projectId,
           gitConfig.repositoryUrl.trim()
         );
         if (existing) {
           integration = { id: existing.id };
-        } else if (gitConfig.webhookSecret?.trim()) {
-          const provider = GitIntegrationService.detectProviderFromUrl(gitConfig.repositoryUrl);
-          const created = await GitIntegrationService.createIntegration({
-            projectId: plan.projectId,
-            userId: plan.userId,
-            provider,
-            repositoryUrl: gitConfig.repositoryUrl.trim(),
-            webhookSecret: gitConfig.webhookSecret.trim(),
-            events: ['pull_request', 'push', 'release'],
-          });
-          integration = { id: created.id };
-          logger.info('[REGRESSION_PLAN_SERVICE] Created git integration from repositoryUrl', {
-            planId: plan.id,
-            integrationId: created.id,
-            repositoryUrl: created.repository_url,
-          });
         } else {
-          logger.warn('[REGRESSION_PLAN_SERVICE] repositoryUrl set but no matching integration and no webhookSecret', {
+          logger.warn('[REGRESSION_PLAN_SERVICE] No git integration found for repositoryUrl — create one via POST /git-integrations first', {
             planId: plan.id,
             projectId: plan.projectId,
+            repositoryUrl: gitConfig.repositoryUrl,
           });
           return;
         }
       } else {
+        // Fallback: use first enabled integration for this project (backward compatible)
         const { data } = await supabaseAdmin
           .from('git_integrations')
           .select('id')

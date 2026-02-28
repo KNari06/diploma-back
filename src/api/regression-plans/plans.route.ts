@@ -103,13 +103,10 @@ const router = Router();
  *                       integrationId:
  *                         type: string
  *                         format: uuid
- *                         description: Git integration ID (from GET /git-integrations). Use when repo already added.
+ *                         description: Git integration ID (from GET /git-integrations). User must create integration first.
  *                       repositoryUrl:
  *                         type: string
- *                         description: "Repo URL from GET /integrations/github/repos (e.g. https://github.com/owner/repo). Used when dropdown shows user's repos."
- *                       webhookSecret:
- *                         type: string
- *                         description: Required when repositoryUrl is set and no git-integration exists for this project+repo
+ *                         description: "Repo URL to find existing git-integration (e.g. https://github.com/owner/repo)."
  *                   runtime:
  *                     type: object
  *                     properties:

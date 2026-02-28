@@ -530,20 +530,18 @@ export interface PlanScheduleConfig {
 }
 
 /**
- * Git triggers configuration for plan automation
- * Either integrationId (existing git-integration) or repositoryUrl (from GitHub/GitLab list) can be set.
- * When repositoryUrl is set and no matching integration exists, webhookSecret is required to create one.
+ * Git triggers configuration for plan automation.
+ * Uses integrationId to link to an existing git-integration (created via POST /git-integrations).
+ * Alternatively, repositoryUrl can be used to find an existing integration by repo URL.
  */
 export interface PlanGitTriggersConfig {
   enabled: boolean;
   triggerTypes: GitTriggerType[];
   branch: string;
-  /** Optional. UUID of git_integrations row. */
+  /** UUID of an existing git_integrations row (from GET /git-integrations). */
   integrationId?: string;
-  /** Optional. Repository URL (e.g. from GET /integrations/github/repos). Used when dropdown is filled from user's repos. */
+  /** Repository URL to find an existing git-integration by repo (e.g. https://github.com/owner/repo). */
   repositoryUrl?: string;
-  /** Optional. Required when repositoryUrl is set and no git-integration exists yet for this project+repo. */
-  webhookSecret?: string;
 }
 
 /**
