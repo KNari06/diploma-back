@@ -99,6 +99,14 @@ const router = Router();
  *                           enum: [merge_to_main, pr_opened, release]
  *                       branch:
  *                         type: string
+ *                         description: Branch to trigger on (e.g. main, develop)
+ *                       integrationId:
+ *                         type: string
+ *                         format: uuid
+ *                         description: Git integration ID (from GET /git-integrations). User must create integration first.
+ *                       repositoryUrl:
+ *                         type: string
+ *                         description: "Repo URL to find existing git-integration (e.g. https://github.com/owner/repo)."
  *                   runtime:
  *                     type: object
  *                     properties:

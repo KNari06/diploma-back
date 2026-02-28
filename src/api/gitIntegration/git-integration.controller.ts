@@ -1,3 +1,4 @@
+import { env } from '@/config/environment/env';
 import { GitIntegrationService, GitProvider } from '@/services/integrations/git-integration.service';
 import { GitWebhookService } from '@/services/integrations/git-webhook.service';
 import { NotFoundError, ValidationError } from '@/types';
@@ -21,10 +22,15 @@ function getUserId(req: AuthenticatedRequest): string {
   return userId;
 }
 
-function sanitizeIntegration(row: any) {
-  // Never return secrets
+function getWebhookUrl(): string {
+  const backendUrl = env.BACKEND_URL || `http://localhost:${env.PORT}`;
+  return `${backendUrl}/api/${env.API_VERSION}/git-integrations/webhook`;
+}
+
+function sanitizeIntegration(row: any, webhookUrl?: string) {
   const safe = { ...row };
   delete safe.webhook_secret;
+  if (webhookUrl !== undefined) (safe as any).webhook_url = webhookUrl;
   return safe;
 }
 
@@ -63,11 +69,11 @@ export async function createIntegration(req: AuthenticatedRequest, res: Response
       events,
     });
 
-    const webhookUrl = `${req.protocol}://${req.get('host')}/api/v1/git-integrations/webhook`;
+    const webhookUrl = getWebhookUrl();
 
     res.json({
       success: true,
-      data: sanitizeIntegration(integration),
+      data: sanitizeIntegration(integration, webhookUrl),
       message: 'Git integration created successfully',
       webhookUrl,
       timestamp: new Date(),
@@ -95,10 +101,11 @@ export async function listIntegrations(req: AuthenticatedRequest, res: Response)
     }
 
     const integrations = await GitIntegrationService.listIntegrations(projectId, userId);
+    const webhookUrl = getWebhookUrl();
 
     res.json({
       success: true,
-      data: integrations.map(sanitizeIntegration),
+      data: integrations.map((i) => sanitizeIntegration(i, webhookUrl)),
       timestamp: new Date(),
     });
   } catch (error) {
@@ -116,10 +123,11 @@ export async function getIntegration(req: AuthenticatedRequest, res: Response): 
     const userId = getUserId(req);
 
     const integration = await GitIntegrationService.getIntegration(id, userId);
+    const webhookUrl = getWebhookUrl();
 
     res.json({
       success: true,
-      data: sanitizeIntegration(integration),
+      data: sanitizeIntegration(integration, webhookUrl),
       timestamp: new Date(),
     });
   } catch (error) {
@@ -185,6 +193,13 @@ export async function deleteIntegration(req: AuthenticatedRequest, res: Response
  * Uses raw body parsing (Buffer) for GitHub signature verification.
  */
 export async function handleWebhook(req: Request, res: Response): Promise<void> {
+  logger.info('[GIT_WEBHOOK_API] Webhook received', {
+    method: req.method,
+    path: req.path,
+    url: req.originalUrl,
+    githubEvent: req.header('x-github-event'),
+    gitlabEvent: req.header('x-gitlab-event'),
+  });
   try {
     const githubEvent = req.header('x-github-event');
     const gitlabEvent = req.header('x-gitlab-event');
@@ -237,6 +252,15 @@ export async function handleWebhook(req: Request, res: Response): Promise<void> 
       rawBody,
       payload,
       signature,
+    });
+
+    logger.info('[GIT_WEBHOOK_API] Webhook processed', {
+      deliveryId,
+      provider,
+      eventType,
+      queued: result.queued,
+      ignored: result.ignored,
+      reason: result.reason,
     });
 
     res.status(result.queued ? 202 : 200).json({

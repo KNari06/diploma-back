@@ -6,6 +6,8 @@ import {
   startAuthorization,
   handleCallback,
   disconnectIntegration,
+  listGitHubRepos,
+  listGitHubBranches,
   setupSlack,
   setupTelegram,
 } from './integrations.controller';
@@ -55,6 +57,60 @@ router.get('/', authenticateUser, listIntegrations);
  *         description: Unauthorized
  */
 router.get('/status', authenticateUser, getIntegrationStatus);
+
+/**
+ * @swagger
+ * /integrations/github/repos:
+ *   get:
+ *     summary: List GitHub repos for the authenticated user (for repo dropdown)
+ *     tags: [Integrations]
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: per_page
+ *         schema:
+ *           type: integer
+ *           default: 30
+ *         description: Repos per page (max 100)
+ *     responses:
+ *       200:
+ *         description: List of repos
+ *       403:
+ *         description: GitHub not connected
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/github/repos', authenticateUser, listGitHubRepos);
+
+/**
+ * @swagger
+ * /integrations/github/repos/{owner}/{repo}/branches:
+ *   get:
+ *     summary: List branches for a GitHub repo (for branch dropdown)
+ *     tags: [Integrations]
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: owner
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: path
+ *         name: repo
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: List of branches
+ *       403:
+ *         description: GitHub not connected
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/github/repos/:owner/:repo/branches', authenticateUser, listGitHubBranches);
 
 /**
  * @swagger

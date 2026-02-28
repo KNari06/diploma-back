@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { IntegrationTokenService, type IntegrationProvider } from '@/services/api/integration-token.service';
+import { getGitHubToken, listUserRepos, listBranches } from '@/services/api/github.service';
 import { logger } from '@/utils/core/logger';
 import { env } from '@/config/environment/env';
 
@@ -185,13 +186,28 @@ export async function startAuthorization(req: Request, res: Response): Promise<v
       return;
     }
 
+    // Prefer JSON with redirect_url when client uses fetch (avoids CORS: client does window.location.href = data.redirect_url)
+    const wantsJson =
+      req.query.return_url === '1' || req.query.return_url === 'true' || req.get('Accept')?.includes('application/json');
+
     // Generate OAuth URL based on provider
     let authUrl: string;
 
     switch (provider) {
-      case 'github':
+      case 'github': {
+        const clientId = env.GITHUB_CLIENT_ID;
+        if (!clientId?.trim()) {
+          res.status(503).json({
+            success: false,
+            error: 'GitHub integration not configured',
+            message: 'GITHUB_CLIENT_ID is not set on the server. Ask the administrator to configure GitHub OAuth.',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
         authUrl = buildGitHubAuthUrl(userId, workspaceId);
         break;
+      }
 
       case 'notion':
         authUrl = buildNotionAuthUrl(userId, workspaceId);
@@ -199,7 +215,11 @@ export async function startAuthorization(req: Request, res: Response): Promise<v
 
       case 'jira':
         // Jira OAuth is already implemented in jira.service.ts
-        // Redirect to existing Jira route
+        if (wantsJson) {
+          const jiraAuthUrl = `${req.protocol}://${req.get('host')}/api/${env.API_VERSION}/jira/authorize`;
+          res.json({ success: true, redirect_url: jiraAuthUrl, timestamp: new Date().toISOString() });
+          return;
+        }
         res.redirect(`/api/${env.API_VERSION}/jira/authorize`);
         return;
 
@@ -212,17 +232,27 @@ export async function startAuthorization(req: Request, res: Response): Promise<v
         return;
     }
 
-    // Redirect to OAuth authorization URL
+    if (wantsJson) {
+      res.json({
+        success: true,
+        redirect_url: authUrl,
+        message: 'Redirect user to redirect_url to complete OAuth.',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Redirect to OAuth authorization URL (normal browser navigation)
     res.redirect(authUrl);
   } catch (error) {
-    logger.error('[INTEGRATIONS] Start authorization error', {
-      error: error instanceof Error ? error.message : String(error),
-    });
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error('[INTEGRATIONS] Start authorization error', { error: message });
 
-    res.status(500).json({
+    const isConfigError = /not configured|not set/i.test(message);
+    res.status(isConfigError ? 503 : 500).json({
       success: false,
-      error: 'Internal server error',
-      message: 'Failed to start authorization',
+      error: isConfigError ? 'Integration not configured' : 'Internal server error',
+      message: isConfigError ? message : `Failed to start authorization: ${message}`,
       timestamp: new Date().toISOString(),
     });
   }
@@ -246,10 +276,39 @@ export async function handleCallback(req: Request, res: Response): Promise<void>
       return;
     }
 
+    if (!state) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing state',
+        message: 'OAuth state parameter not provided',
+      });
+      return;
+    }
+
     logger.info('[INTEGRATIONS] Handling OAuth callback', { provider });
 
     // Decode state to get userId and workspaceId
-    const { userId, workspaceId } = decodeState(state);
+    let userId: string;
+    let workspaceId: string | undefined;
+    try {
+      const decoded = decodeState(state);
+      userId = decoded.userId;
+      workspaceId = decoded.workspaceId;
+    } catch (decodeError) {
+      logger.error('[INTEGRATIONS] Failed to decode OAuth state', {
+        error: decodeError instanceof Error ? decodeError.message : String(decodeError),
+      });
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      res.redirect(`${frontendUrl}/integrations?status=error&message=${encodeURIComponent('Invalid OAuth state')}`);
+      return;
+    }
+
+    if (!userId) {
+      logger.error('[INTEGRATIONS] Missing userId in decoded OAuth state');
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      res.redirect(`${frontendUrl}/integrations?status=error&message=${encodeURIComponent('Invalid OAuth state')}`);
+      return;
+    }
 
     // Exchange code for token based on provider
     switch (provider) {
@@ -329,6 +388,116 @@ export async function disconnectIntegration(req: Request, res: Response): Promis
   }
 }
 
+/**
+ * Get user ID for GitHub (for API routes that need auth)
+ */
+function getUserIdForGitHub(req: Request): string | null {
+  return (req as any).user?.id ?? null;
+}
+
+/**
+ * List GitHub repos for the authenticated user (for regression plan repo dropdown).
+ * GET /api/v1/integrations/github/repos?per_page=100
+ */
+export async function listGitHubRepos(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = getUserIdForGitHub(req);
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'User ID not found',
+      });
+      return;
+    }
+
+    const token = await getGitHubToken(userId);
+    if (!token?.access_token) {
+      res.status(403).json({
+        success: false,
+        error: 'GitHub not connected',
+        message: 'Connect GitHub in integrations first',
+      });
+      return;
+    }
+
+    const perPage = Math.min(Number(req.query.per_page) || 30, 100);
+    const repos = await listUserRepos(token.access_token, perPage);
+
+    res.json({
+      success: true,
+      data: repos,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[INTEGRATIONS] List GitHub repos error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error instanceof Error ? error.message : 'Failed to list GitHub repos',
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
+/**
+ * List GitHub branches for a repo (for regression plan branch dropdown).
+ * GET /api/v1/integrations/github/repos/:owner/:repo/branches
+ */
+export async function listGitHubBranches(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = getUserIdForGitHub(req);
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'User ID not found',
+      });
+      return;
+    }
+
+    const token = await getGitHubToken(userId);
+    if (!token?.access_token) {
+      res.status(403).json({
+        success: false,
+        error: 'GitHub not connected',
+        message: 'Connect GitHub in integrations first',
+      });
+      return;
+    }
+
+    const { owner, repo } = req.params;
+    if (!owner || !repo) {
+      res.status(400).json({
+        success: false,
+        error: 'Bad request',
+        message: 'owner and repo are required',
+      });
+      return;
+    }
+
+    const branches = await listBranches(token.access_token, owner, repo);
+
+    res.json({
+      success: true,
+      data: branches,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[INTEGRATIONS] List GitHub branches error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error instanceof Error ? error.message : 'Failed to list branches',
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Helper Functions
 // ═══════════════════════════════════════════════════════════════════════════
@@ -389,7 +558,9 @@ async function handleGitHubCallback(userId: string, workspaceId: string | undefi
     throw new Error('GitHub OAuth credentials not configured');
   }
 
-  // Exchange code for token
+  const callbackUrl = `${env.BACKEND_URL || `http://localhost:${env.PORT}`}/api/${env.API_VERSION}/integrations/github/callback`;
+
+  // Exchange code for token (redirect_uri must match the one used in authorize request)
   const response = await fetch('https://github.com/login/oauth/access_token', {
     method: 'POST',
     headers: {
@@ -400,6 +571,7 @@ async function handleGitHubCallback(userId: string, workspaceId: string | undefi
       client_id: clientId,
       client_secret: clientSecret,
       code,
+      redirect_uri: callbackUrl,
     }),
   });
 
@@ -408,10 +580,17 @@ async function handleGitHubCallback(userId: string, workspaceId: string | undefi
   }
 
   const tokenData = await response.json() as {
-    access_token: string;
-    scope: string;
-    token_type: string;
+    access_token?: string;
+    scope?: string;
+    token_type?: string;
+    error?: string;
+    error_description?: string;
   };
+
+  if (tokenData.error || !tokenData.access_token) {
+    const msg = tokenData.error_description || tokenData.error || 'No access_token in GitHub response';
+    throw new Error(`GitHub token exchange failed: ${msg}`);
+  }
 
   // Get user info for external_id
   const userResponse = await fetch('https://api.github.com/user', {
@@ -420,6 +599,10 @@ async function handleGitHubCallback(userId: string, workspaceId: string | undefi
       Accept: 'application/vnd.github+json',
     },
   });
+
+  if (!userResponse.ok) {
+    throw new Error(`GitHub user fetch failed: ${userResponse.status} ${await userResponse.text().catch(() => '')}`);
+  }
 
   const userData = await userResponse.json() as {
     login: string;

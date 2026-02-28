@@ -530,12 +530,18 @@ export interface PlanScheduleConfig {
 }
 
 /**
- * Git triggers configuration for plan automation
+ * Git triggers configuration for plan automation.
+ * Uses integrationId to link to an existing git-integration (created via POST /git-integrations).
+ * Alternatively, repositoryUrl can be used to find an existing integration by repo URL.
  */
 export interface PlanGitTriggersConfig {
   enabled: boolean;
   triggerTypes: GitTriggerType[];
   branch: string;
+  /** UUID of an existing git_integrations row (from GET /git-integrations). */
+  integrationId?: string;
+  /** Repository URL to find an existing git-integration by repo (e.g. https://github.com/owner/repo). */
+  repositoryUrl?: string;
 }
 
 /**

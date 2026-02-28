@@ -4,6 +4,7 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
+import { GitIntegrationService } from '@/services/integrations/git-integration.service';
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import { ValidationError } from '@/types';
 import type {
@@ -1176,30 +1177,72 @@ export class RegressionPlanService {
   }
 
   /**
-   * Link/unlink git_integrations.plan_id for this plan
+   * Link/unlink git_integrations.plan_id for this plan.
+   * Only links to existing integrations — user must create git-integration first via POST /git-integrations.
+   * Priority: integrationId > repositoryUrl (lookup only) > first enabled integration (backward compatible).
    */
   private static async syncGitIntegration(
     plan: RegressionPlan,
     gitConfig?: PlanGitTriggersConfig
   ): Promise<void> {
     try {
+      // Unlink any integrations currently pointing to this plan
+      await supabaseAdmin
+        .from('git_integrations')
+        .update({ plan_id: null })
+        .eq('plan_id', plan.id);
+
       if (!gitConfig || !gitConfig.enabled) {
-        // Unlink any integrations pointing to this plan
-        await supabaseAdmin
-          .from('git_integrations')
-          .update({ plan_id: null })
-          .eq('plan_id', plan.id);
         return;
       }
 
-      // Find the project's git integration and link to this plan
-      const { data: integration } = await supabaseAdmin
-        .from('git_integrations')
-        .select('id')
-        .eq('project_id', plan.projectId)
-        .eq('enabled', true)
-        .limit(1)
-        .maybeSingle();
+      let integration: { id: string } | null = null;
+
+      if (gitConfig.integrationId) {
+        // Explicit integration ID — verify it belongs to this project
+        const { data } = await supabaseAdmin
+          .from('git_integrations')
+          .select('id')
+          .eq('id', gitConfig.integrationId)
+          .eq('project_id', plan.projectId)
+          .eq('enabled', true)
+          .maybeSingle();
+        integration = data;
+        if (!integration) {
+          logger.warn('[REGRESSION_PLAN_SERVICE] Chosen git integration not found or not allowed', {
+            planId: plan.id,
+            integrationId: gitConfig.integrationId,
+            projectId: plan.projectId,
+          });
+          return;
+        }
+      } else if (gitConfig.repositoryUrl?.trim()) {
+        // Lookup existing integration by repo URL — no auto-creation
+        const existing = await GitIntegrationService.findByProjectAndRepositoryUrl(
+          plan.projectId,
+          gitConfig.repositoryUrl.trim()
+        );
+        if (existing) {
+          integration = { id: existing.id };
+        } else {
+          logger.warn('[REGRESSION_PLAN_SERVICE] No git integration found for repositoryUrl — create one via POST /git-integrations first', {
+            planId: plan.id,
+            projectId: plan.projectId,
+            repositoryUrl: gitConfig.repositoryUrl,
+          });
+          return;
+        }
+      } else {
+        // Fallback: use first enabled integration for this project (backward compatible)
+        const { data } = await supabaseAdmin
+          .from('git_integrations')
+          .select('id')
+          .eq('project_id', plan.projectId)
+          .eq('enabled', true)
+          .limit(1)
+          .maybeSingle();
+        integration = data;
+      }
 
       if (!integration) {
         logger.warn('[REGRESSION_PLAN_SERVICE] No git integration found for project', {
@@ -1219,7 +1262,10 @@ export class RegressionPlanService {
         integrationId: integration.id,
       });
     } catch (error) {
-      logger.error('[REGRESSION_PLAN_SERVICE] syncGitIntegration error', {
+      // Log but do NOT rethrow — the plan itself is already persisted.
+      // Rethrowing would cause create()/update() to return 500 even though
+      // the plan was saved successfully, leaving an orphaned record.
+      logger.error('[REGRESSION_PLAN_SERVICE] syncGitIntegration error (plan saved, git link failed)', {
         error: error instanceof Error ? error.message : String(error),
         planId: plan.id,
       });
