@@ -1,5 +1,5 @@
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
-import type { SkillDefinition, SkillContext, SkillResult, SkillErrorContext } from './types';
+import type { SkillDefinition, SkillContext, SkillResult } from './types';
 import { logger } from '@/utils/core/logger';
 import { supabaseAdmin } from '@/db/supabase';
 
@@ -291,36 +291,6 @@ class SkillRegistryClass {
         argsSnapshot,
         stack: stackLines,
       });
-
-      // ── onError lifecycle hook ──
-      // Give skill a chance to recover (e.g., token refresh + retry)
-      if (skill.onError) {
-        const errorCtx: SkillErrorContext = {
-          error,
-          toolName,
-          context,
-          attempt: 0, // first call (retries increment this in tool-executor.ts)
-        };
-
-        try {
-          const overrideResult = await skill.onError(errorCtx);
-          if (overrideResult) {
-            logger.info('[SKILL_REGISTRY] onError returned override result', {
-              toolName,
-              skillId,
-              overrideSuccess: overrideResult.success,
-            });
-            return overrideResult;
-          }
-        } catch (hookError) {
-          // Buggy onError hook must NOT crash the pipeline
-          logger.warn('[SKILL_REGISTRY] onError hook threw', {
-            toolName,
-            skillId,
-            hookError: hookError instanceof Error ? hookError.message : String(hookError),
-          });
-        }
-      }
 
       return {
         success: false,

@@ -104,42 +104,27 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
   const startMs = Date.now();
 
   // ── 1. Before Hooks ──────────────────────────────────────────────────
-  let effectiveArgs = ctx.args;
+  // Keep a mutable effective context so every stage (hooks, execution, tracking)
+  // sees the same, up-to-date arguments.
+  let effectiveCtx: ToolCallContext = { ...ctx, args: ctx.args };
   let loopWarning: string | undefined;
-
-  // Loop detection (if tracker provided)
-  if (ctx.tracker) {
-    const loopCheck = ctx.tracker.check(ctx.toolName, ctx.args);
-    if (loopCheck.severity === 'block') {
-      const blockedResult: SkillResult = { success: false, message: loopCheck.message };
-      return buildBlockedResult(ctx, blockedResult, startMs);
-    }
-    // Warn: save warning to inject into tool result so LLM can see it
-    if (loopCheck.severity === 'warn') {
-      loopWarning = loopCheck.message;
-      logger.info('[TOOL_EXECUTOR] Loop detection warning, proceeding', {
-        toolName: ctx.toolName,
-        message: loopCheck.message,
-      });
-    }
-  }
 
   // Custom before hooks
   for (const hook of hooks) {
     if (!hook.before) continue;
     try {
-      const hookResult = await hook.before(ctx);
+      const hookResult = await hook.before(effectiveCtx);
       if (hookResult.action === 'block') {
         logger.info('[TOOL_EXECUTOR] Blocked by hook', {
           hook: hook.name,
-          toolName: ctx.toolName,
+          toolName: effectiveCtx.toolName,
           reason: hookResult.reason,
         });
         const blockedResult: SkillResult = { success: false, message: hookResult.reason };
-        return buildBlockedResult(ctx, blockedResult, startMs);
+        return buildBlockedResult(effectiveCtx, blockedResult, startMs);
       }
       if ('args' in hookResult && hookResult.args) {
-        effectiveArgs = hookResult.args;
+        effectiveCtx = { ...effectiveCtx, args: hookResult.args };
       }
     } catch (hookError) {
       logger.warn('[TOOL_EXECUTOR] Before hook error, continuing', {
@@ -150,17 +135,33 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
     }
   }
 
+  // Loop detection runs after before hooks so checks use final execution args.
+  if (effectiveCtx.tracker) {
+    const loopCheck = effectiveCtx.tracker.check(effectiveCtx.toolName, effectiveCtx.args);
+    if (loopCheck.severity === 'block') {
+      const blockedResult: SkillResult = { success: false, message: loopCheck.message };
+      return buildBlockedResult(effectiveCtx, blockedResult, startMs);
+    }
+    if (loopCheck.severity === 'warn') {
+      loopWarning = loopCheck.message;
+      logger.info('[TOOL_EXECUTOR] Loop detection warning, proceeding', {
+        toolName: effectiveCtx.toolName,
+        message: loopCheck.message,
+      });
+    }
+  }
+
   // ── 2. Execute Tool (with retry loop) ───────────────────────────────
   let toolResult: SkillResult;
 
   const { SkillRegistry } = await import('@/services/skills');
-  const skill = SkillRegistry.getSkillForTool(ctx.toolName);
+  const skill = SkillRegistry.getSkillForTool(effectiveCtx.toolName);
   const retryConfig = resolveRetryConfig(skill?.retryConfig);
   const maxAttempts = retryConfig.maxRetries + 1; // initial + retries
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // Check abort before each attempt
-    if (ctx.abortSignal?.aborted) {
+    if (effectiveCtx.abortSignal?.aborted) {
       toolResult = { success: false, message: 'Request aborted before execution' };
       break;
     }
@@ -169,13 +170,13 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
     if (attempt > 0) {
       const delay = calculateRetryDelay(attempt - 1, retryConfig);
       logger.info('[TOOL_EXECUTOR] Retrying tool', {
-        toolName: ctx.toolName,
+        toolName: effectiveCtx.toolName,
         attempt,
         maxAttempts,
         delayMs: delay,
       });
       try {
-        await sleep(delay, ctx.abortSignal);
+        await sleep(delay, effectiveCtx.abortSignal);
       } catch {
         // Abort signal fired during sleep
         toolResult = { success: false, message: 'Request aborted during retry backoff' };
@@ -186,9 +187,9 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
     try {
       // Each attempt gets its own timeout (from TOOL_TIMEOUTS via withToolTimeoutAndAbort)
       toolResult = await withToolTimeoutAndAbort(
-        SkillRegistry.executeTool(ctx.toolName, effectiveArgs, ctx.skillContext),
-        ctx.toolName,
-        ctx.abortSignal,
+        SkillRegistry.executeTool(effectiveCtx.toolName, effectiveCtx.args, effectiveCtx.skillContext),
+        effectiveCtx.toolName,
+        effectiveCtx.abortSignal,
       );
 
       // Success → done
@@ -198,7 +199,7 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
       const resultError = new Error(toolResult.message);
       if (attempt < retryConfig.maxRetries && isRetryableError(resultError)) {
         // Give skill a chance to handle (e.g., token refresh)
-        const overrideResult = await callOnError(skill, resultError, ctx, attempt);
+        const overrideResult = await callOnError(skill, resultError, effectiveCtx, attempt);
         if (overrideResult) {
           toolResult = overrideResult;
           break; // onError provided a resolution
@@ -214,7 +215,7 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
 
       if (attempt < retryConfig.maxRetries && isRetryableError(error)) {
         // Give skill a chance to handle before retrying
-        const overrideResult = await callOnError(skill, error, ctx, attempt);
+        const overrideResult = await callOnError(skill, error, effectiveCtx, attempt);
         if (overrideResult) {
           toolResult = overrideResult;
           break;
@@ -223,14 +224,14 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
       }
 
       // Last attempt or non-retryable → call onError for final chance, then fail
-      const overrideResult = await callOnError(skill, error, ctx, attempt);
+      const overrideResult = await callOnError(skill, error, effectiveCtx, attempt);
       if (overrideResult) {
         toolResult = overrideResult;
         break;
       }
 
       logger.error('[TOOL_EXECUTOR] Tool execution error (final)', {
-        toolName: ctx.toolName,
+        toolName: effectiveCtx.toolName,
         attempt,
         error: error.message,
       });
@@ -255,8 +256,8 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
   }
 
   // ── 4. Record in loop tracker (use effectiveArgs for consistency) ──
-  if (ctx.tracker) {
-    ctx.tracker.record(ctx.toolName, effectiveArgs);
+  if (effectiveCtx.tracker) {
+    effectiveCtx.tracker.record(effectiveCtx.toolName, effectiveCtx.args);
   }
 
   // ── 5. After Hooks (fire-and-forget) ─────────────────────────────────
@@ -264,7 +265,7 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
     if (!hook.after) continue;
     try {
       // Don't await — after hooks should not slow down the response
-      const maybePromise = hook.after(ctx, toolResult, durationMs);
+      const maybePromise = hook.after(effectiveCtx, toolResult, durationMs);
       if (maybePromise && typeof (maybePromise as any).catch === 'function') {
         (maybePromise as Promise<void>).catch(err => {
           logger.warn('[TOOL_EXECUTOR] After hook error', {
@@ -285,7 +286,7 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
   const messages: ChatCompletionMessageParam[] = [];
 
   // Screenshot special handling: strip blob from tool message, inject multimodal image
-  const isScreenshot = ctx.toolName === 'qa_screenshot'
+  const isScreenshot = effectiveCtx.toolName === 'qa_screenshot'
     && toolResult.success
     && toolResult.data?.screenshot;
 
@@ -321,14 +322,14 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
 
   // ── 7. Build Record (use effectiveArgs — may be modified by hooks) ──
   const record: ToolExecutionRecord = {
-    toolName: ctx.toolName,
-    args: effectiveArgs,
+    toolName: effectiveCtx.toolName,
+    args: effectiveCtx.args,
     result: toolResult,
     durationMs,
   };
 
   logger.info('[TOOL_EXECUTOR] Tool executed', {
-    toolName: ctx.toolName,
+    toolName: effectiveCtx.toolName,
     success: toolResult.success,
     durationMs,
   });

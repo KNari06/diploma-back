@@ -25,16 +25,46 @@ export const DEFAULT_RETRY_CONFIG: Required<SkillRetryConfig> = {
   backoffMultiplier: 2,
 };
 
+/** Hard bounds to prevent pathological retry behavior from bad config values. */
+const RETRY_BOUNDS = {
+  maxRetries: { min: 0, max: 5 },
+  initialDelayMs: { min: 50, max: 10_000 },
+  backoffMultiplier: { min: 1, max: 5 },
+} as const;
+
+/** Cap each retry delay so a single call cannot hang too long. */
+const MAX_RETRY_DELAY_MS = 30_000;
+
 /**
  * Merge per-skill retry config with defaults.
+ * Applies safety bounds so invalid configs cannot cause runaway retries.
  */
 export function resolveRetryConfig(
   skillConfig?: SkillRetryConfig,
 ): Required<SkillRetryConfig> {
+  const maxRetries = clampNumber(
+    skillConfig?.maxRetries,
+    DEFAULT_RETRY_CONFIG.maxRetries,
+    RETRY_BOUNDS.maxRetries.min,
+    RETRY_BOUNDS.maxRetries.max,
+  );
+  const initialDelayMs = clampNumber(
+    skillConfig?.initialDelayMs,
+    DEFAULT_RETRY_CONFIG.initialDelayMs,
+    RETRY_BOUNDS.initialDelayMs.min,
+    RETRY_BOUNDS.initialDelayMs.max,
+  );
+  const backoffMultiplier = clampNumber(
+    skillConfig?.backoffMultiplier,
+    DEFAULT_RETRY_CONFIG.backoffMultiplier,
+    RETRY_BOUNDS.backoffMultiplier.min,
+    RETRY_BOUNDS.backoffMultiplier.max,
+  );
+
   return {
-    maxRetries: skillConfig?.maxRetries ?? DEFAULT_RETRY_CONFIG.maxRetries,
-    initialDelayMs: skillConfig?.initialDelayMs ?? DEFAULT_RETRY_CONFIG.initialDelayMs,
-    backoffMultiplier: skillConfig?.backoffMultiplier ?? DEFAULT_RETRY_CONFIG.backoffMultiplier,
+    maxRetries: Math.round(maxRetries),
+    initialDelayMs: Math.round(initialDelayMs),
+    backoffMultiplier,
   };
 }
 
@@ -72,12 +102,26 @@ const RETRYABLE_PATTERNS = [
   /ENOTFOUND/i,
   /ETIMEDOUT/i,
   /socket hang up/i,
-  /network/i,
+  /network (error|timeout|unreachable)/i,
+  /\bfetch failed\b/i,
   /internal server/i,
   /bad gateway/i,
   /service unavailable/i,
   /gateway timeout/i,
 ];
+
+/** Structured error codes from Node/fetch clients. */
+const RETRYABLE_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
 
 /**
  * Determine if an error is retryable.
@@ -90,7 +134,23 @@ const RETRYABLE_PATTERNS = [
  * 5. Default: NOT retryable (conservative / fail-safe)
  */
 export function isRetryableError(error: Error): boolean {
-  const message = error.message || '';
+  const err = error as Error & { status?: unknown; statusCode?: unknown; code?: unknown };
+  const message = err.message || '';
+
+  // Prefer structured status codes when available.
+  const structuredStatus =
+    parseStatusCode(err.status) ??
+    parseStatusCode(err.statusCode);
+
+  if (structuredStatus !== undefined) {
+    if (NON_RETRYABLE_STATUS_CODES.has(structuredStatus)) return false;
+    if (RETRYABLE_STATUS_CODES.has(structuredStatus)) return true;
+  }
+
+  // Structured network error codes.
+  if (typeof err.code === 'string' && RETRYABLE_ERROR_CODES.has(err.code)) {
+    return true;
+  }
 
   // Extract HTTP status code from error message if present
   const statusMatch = message.match(/\b(4\d\d|5\d\d)\b/);
@@ -128,7 +188,8 @@ export function calculateRetryDelay(
   const baseDelay = config.initialDelayMs * Math.pow(config.backoffMultiplier, attempt);
   // Jitter: ±20%
   const jitter = baseDelay * 0.2 * (Math.random() * 2 - 1);
-  return Math.round(baseDelay + jitter);
+  const withJitter = Math.round(baseDelay + jitter);
+  return Math.min(withJitter, MAX_RETRY_DELAY_MS);
 }
 
 /**
@@ -160,4 +221,34 @@ export function sleep(ms: number, abortSignal?: AbortSignal): Promise<void> {
       abortSignal.addEventListener('abort', onAbort, { once: true });
     }
   });
+}
+
+/**
+ * Clamp config value to a safe numeric range.
+ * Falls back to default for undefined, NaN, or non-finite values.
+ */
+function clampNumber(
+  value: number | undefined,
+  defaultValue: number,
+  min: number,
+  max: number,
+): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return defaultValue;
+  }
+  return Math.min(Math.max(value, min), max);
+}
+
+/**
+ * Parse possible status code values from structured error fields.
+ * Supports number and numeric-string representations.
+ */
+function parseStatusCode(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && /^\d{3}$/.test(value)) {
+    return Number(value);
+  }
+  return undefined;
 }
