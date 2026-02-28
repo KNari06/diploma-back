@@ -34,10 +34,19 @@ class SkillRegistryClass {
    * Register a skill
    */
   register(skill: SkillDefinition): void {
+    // Validate: unique skill ID
     if (this.skills.has(skill.id)) {
-      logger.warn('[SKILL_REGISTRY] Skill already registered, overwriting', {
-        skillId: skill.id,
-      });
+      throw new Error(`[SKILL_REGISTRY] Skill '${skill.id}' already registered. Duplicate registration is not allowed.`);
+    }
+
+    // Validate: no tool name conflicts across skills
+    for (const tool of skill.tools) {
+      const existingSkillId = this.toolNameToSkillId.get(tool.function.name);
+      if (existingSkillId) {
+        throw new Error(
+          `[SKILL_REGISTRY] Tool '${tool.function.name}' from skill '${skill.id}' conflicts with skill '${existingSkillId}'.`
+        );
+      }
     }
 
     this.skills.set(skill.id, skill);
@@ -45,13 +54,6 @@ class SkillRegistryClass {
     // Map tool names to skill ID for routing, detect confirm-bearing tools
     skill.tools.forEach((tool) => {
       const toolName = tool.function.name;
-      if (this.toolNameToSkillId.has(toolName)) {
-        logger.warn('[SKILL_REGISTRY] Tool name conflict, overwriting', {
-          toolName,
-          oldSkillId: this.toolNameToSkillId.get(toolName),
-          newSkillId: skill.id,
-        });
-      }
       this.toolNameToSkillId.set(toolName, skill.id);
 
       // Track tools that have a `confirm` parameter in their schema

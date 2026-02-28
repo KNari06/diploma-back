@@ -22,7 +22,8 @@ export type IntegrationProvider =
   | 'trello'
   | 'slack'
   | 'telegram'
-  | 'qa';
+  | 'qa'
+  | 'memory';
 
 /**
  * Context provided to skills during execution

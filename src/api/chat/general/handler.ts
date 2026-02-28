@@ -22,6 +22,8 @@ import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 import { SubAgentPipeline } from './sub-agents/pipeline';
 import { SUB_AGENT_CONFIG } from './sub-agents/config';
+import { executeTool } from '@/services/skills/tool-executor';
+import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -363,20 +365,14 @@ export async function handleGeneralChat(
   if (workspaceId) {
     try {
       const { SkillRegistry } = await import('@/services/skills');
-      const { MEMORY_TOOLS } = await import('@/services/ai/memory/memory-tools');
 
-      // Get available skill tools
+      // Get available skill tools (includes MemorySkill — registered in SkillRegistry)
       const skillContext = { userId, workspaceId, chatSessionId, projectId };
-      const skillTools = await SkillRegistry.getAvailableTools(skillContext);
+      availableTools = await SkillRegistry.getAvailableTools(skillContext);
       skillDescriptions = await SkillRegistry.getSkillDescriptions(skillContext);
-
-      // Combine skill tools + memory tools
-      availableTools = [...skillTools, ...MEMORY_TOOLS];
 
       logger.info('[GENERAL_CHAT] Tools collected', {
         totalTools: availableTools.length,
-        skillTools: skillTools.length,
-        memoryTools: MEMORY_TOOLS.length,
       });
     } catch (toolsError) {
       logger.warn('[GENERAL_CHAT] Failed to load tools, continuing without them', {
@@ -549,6 +545,9 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
       // SUB-AGENT PIPELINE (preferred path — cheaper, faster, more focused)
       // Falls back to monolithic loop below if pipeline fails or is disabled
       // ═══════════════════════════════════════════════════════════════════════
+      // Track tools executed by pipeline (used to seed monolithic tracker on fallback)
+      let pipelineExecutedTools: Array<{ toolName: string; args: Record<string, any> }> | undefined;
+
       if (SUB_AGENT_CONFIG.enabled && workspaceId) {
         try {
           const pipeline = new SubAgentPipeline({
@@ -599,10 +598,12 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
           }
 
           // Pipeline returned { success: false } — fall through to monolithic loop
+          pipelineExecutedTools = pipelineResult.executedTools;
           logger.info('[GENERAL_CHAT] Sub-agent pipeline fell back to monolithic', {
             path: pipelineResult.path,
             routerClassification: pipelineResult.metrics.routerClassification,
             routerConfidence: pipelineResult.metrics.routerConfidence,
+            priorToolsCount: pipelineExecutedTools?.length ?? 0,
           });
         } catch (pipelineError) {
           logger.warn('[GENERAL_CHAT] Sub-agent pipeline error, falling back', {
@@ -616,6 +617,18 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
       // ═══════════════════════════════════════════════════════════════════════
       let toolRound = 0;
       let finalResponse: string | null = null;
+      const monolithicTracker = new ToolCallTracker(SUB_AGENT_CONFIG.loopDetection);
+
+      // Seed tracker with tools already executed by pipeline (prevents duplicate calls)
+      if (pipelineExecutedTools?.length) {
+        for (const prior of pipelineExecutedTools) {
+          monolithicTracker.record(prior.toolName, prior.args);
+        }
+        logger.info('[GENERAL_CHAT] Monolithic tracker seeded with pipeline history', {
+          count: pipelineExecutedTools.length,
+          tools: pipelineExecutedTools.map(t => t.toolName),
+        });
+      }
 
       // Agentic loop: keep calling OpenAI until no more tool calls
       while (toolRound < MAX_TOOL_ROUNDS) {
@@ -658,13 +671,11 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
         tool_calls: toolCalls,
       } as any);
 
-      // Execute each tool call
-      const TOOL_TIMEOUT_MS = 15000; // 15 seconds per tool
-
+      // Execute each tool call via centralized ToolExecutor
       for (const toolCall of toolCalls) {
         const toolName = toolCall.function.name;
 
-        // A1: Safely parse tool arguments — malformed JSON from LLM should not crash the loop
+        // Safely parse tool arguments — malformed JSON from LLM should not crash the loop
         let toolArgs: Record<string, any>;
         try {
           toolArgs = JSON.parse(toolCall.function.arguments);
@@ -689,76 +700,31 @@ When generating test steps, be SPECIFIC — use actual element labels, placehold
           args: JSON.stringify(toolArgs),
         });
 
-        try {
-          let toolResult: any;
+        // Execute through centralized pipeline (routing, hooks, timeout, screenshot handling)
+        const skillContext = {
+          userId,
+          workspaceId: workspaceId!,
+          chatSessionId,
+          projectId,
+          previewSessionId: parsedContext?.previewSessionId,
+        };
 
-          // A3: Wrap tool execution with timeout to prevent stalling
-          const withToolTimeout = <T>(promise: Promise<T>): Promise<T> => {
-            return Promise.race([
-              promise,
-              new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error(`Tool '${toolName}' timed out after ${TOOL_TIMEOUT_MS}ms`)), TOOL_TIMEOUT_MS)
-              ),
-            ]);
-          };
+        const callResult = await executeTool({
+          toolName,
+          toolCallId: toolCall.id,
+          args: toolArgs,
+          skillContext,
+          abortSignal,
+          tracker: monolithicTracker,
+        });
 
-          // Route to appropriate executor
-          if (['remember_fact', 'search_memory', 'forget_fact'].includes(toolName)) {
-            // Memory tools — guard against missing workspaceId
-            if (!workspaceId) {
-              toolResult = { success: false, message: 'Workspace context required for memory tools' };
-            } else {
-              const { executeMemoryTool } = await import('@/services/ai/memory/memory-tools');
-              toolResult = await withToolTimeout(executeMemoryTool(toolName, toolArgs, workspaceId, userId));
-            }
-          } else {
-            // Skill tools
-            const { SkillRegistry } = await import('@/services/skills');
-            const skillContext = { userId, workspaceId: workspaceId!, chatSessionId, projectId, previewSessionId: parsedContext?.previewSessionId };
-            toolResult = await withToolTimeout(SkillRegistry.executeTool(toolName, toolArgs, skillContext));
-          }
+        messages.push(...callResult.messages);
 
-          // Add tool result as text (OpenAI requires tool messages to be plain text)
-          const toolResultForMessage = toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot
-            ? { success: true, message: toolResult.message, url: toolResult.data.url }
-            : toolResult;
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            content: JSON.stringify(toolResultForMessage),
-          } as any);
-
-          // For screenshots, inject a user message with the image so the model can see it
-          if (toolName === 'qa_screenshot' && toolResult.success && toolResult.data?.screenshot) {
-            messages.push({
-              role: 'user',
-              content: [
-                { type: 'text', text: 'Here is the screenshot I just captured from the live preview. Analyze it and describe what you see.' },
-                { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${toolResult.data.screenshot}`, detail: 'low' } },
-              ],
-            } as any);
-          }
-
-          logger.info('[GENERAL_CHAT] Tool executed', {
-            toolName,
-            success: toolResult.success,
-          });
-        } catch (toolError) {
-          logger.error('[GENERAL_CHAT] Tool execution error', {
-            toolName,
-            error: toolError instanceof Error ? toolError.message : String(toolError),
-          });
-
-          // Add error result to messages
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            content: JSON.stringify({
-              success: false,
-              message: `Tool execution failed: ${toolError instanceof Error ? toolError.message : String(toolError)}`,
-            }),
-          } as any);
-        }
+        logger.info('[GENERAL_CHAT] Tool executed', {
+          toolName,
+          success: callResult.toolResult.success,
+          durationMs: callResult.record.durationMs,
+        });
       }
 
       // Continue loop to get next response from OpenAI

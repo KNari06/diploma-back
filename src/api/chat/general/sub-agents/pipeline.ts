@@ -412,11 +412,12 @@ export class SubAgentPipeline {
         metrics.responderMs = Date.now() - responderStart;
         metrics.totalMs = Date.now() - pipelineStart;
 
-        // Guard: empty response → fallback
+        // Guard: empty response → fallback (pass executed tools so monolithic tracker is seeded)
         if (!response.content) {
           logger.warn('[SUB_AGENT_PIPELINE] Single-tool: empty responder output — falling back');
           chatCircuitBreaker.recordResult(false);
-          return this.fallbackResult(metrics, pipelineStart);
+          const priorTools = executorResult.toolResults.map(r => ({ toolName: r.toolName, args: r.args }));
+          return this.fallbackResult(metrics, pipelineStart, priorTools);
         }
 
         chatCircuitBreaker.recordResult(true);
@@ -634,11 +635,12 @@ export class SubAgentPipeline {
       metrics.responderMs = Date.now() - responderStart;
       metrics.totalMs = Date.now() - pipelineStart;
 
-      // Guard: empty response → fallback
+      // Guard: empty response → fallback (pass executed tools so monolithic tracker is seeded)
       if (!response.content) {
         logger.warn('[SUB_AGENT_PIPELINE] Multi-tool: empty responder output — falling back');
         chatCircuitBreaker.recordResult(false);
-        return this.fallbackResult(metrics, pipelineStart);
+        const priorTools = executorResult.toolResults.map(r => ({ toolName: r.toolName, args: r.args }));
+        return this.fallbackResult(metrics, pipelineStart, priorTools);
       }
 
       chatCircuitBreaker.recordResult(true);
@@ -661,7 +663,10 @@ export class SubAgentPipeline {
         blackboard: blackboard.toLogSummary(),
       });
       chatCircuitBreaker.recordResult(false);
-      return this.fallbackResult(metrics, pipelineStart);
+      // Extract any tools already executed before the error — seed monolithic tracker
+      const execution = blackboard.getExecutionResults();
+      const priorTools = execution?.ungroupedResults?.map(r => ({ toolName: r.toolName, args: r.args }));
+      return this.fallbackResult(metrics, pipelineStart, priorTools);
     }
   }
 
@@ -758,13 +763,18 @@ export class SubAgentPipeline {
     };
   }
 
-  private fallbackResult(metrics: PipelineMetrics, pipelineStart: number): SubAgentPipelineResult {
+  private fallbackResult(
+    metrics: PipelineMetrics,
+    pipelineStart: number,
+    executedTools?: Array<{ toolName: string; args: Record<string, any> }>,
+  ): SubAgentPipelineResult {
     metrics.totalMs = Date.now() - pipelineStart;
     return {
       success: false,
       content: '',
       path: 'fallback',
       metrics,
+      executedTools,
     };
   }
 }

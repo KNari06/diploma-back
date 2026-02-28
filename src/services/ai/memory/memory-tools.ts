@@ -1,6 +1,7 @@
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
 import { WorkspaceMemoryService, type MemoryCategory } from './workspace-memory.service';
 import { logger } from '@/utils/core/logger';
+import type { SkillResult } from '@/services/skills/types';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -14,13 +15,6 @@ import { logger } from '@/utils/core/logger';
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
-
-export interface SkillResult {
-  success: boolean;
-  data?: any;
-  message: string;
-  displayToUser?: boolean;
-}
 
 /**
  * Memory tool definitions for OpenAI function calling

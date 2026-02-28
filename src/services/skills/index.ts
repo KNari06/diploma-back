@@ -5,6 +5,7 @@ import { NotionSkill } from './integrations/notion.skill';
 import { TelegramSkill } from './integrations/telegram.skill';
 import { SlackSkill } from './integrations/slack.skill';
 import { QASkill } from './qa/qa.skill';
+import { MemorySkill } from './memory/memory.skill';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -35,6 +36,9 @@ export function registerAllSkills(): void {
 
     // Register QA tools skill (read-only project analytics)
     SkillRegistry.register(QASkill);
+
+    // Register memory tools (workspace-level persistent memory)
+    SkillRegistry.register(MemorySkill);
 
     const registeredSkills = SkillRegistry.listSkills();
     logger.info('[SKILLS] All skills registered successfully', {

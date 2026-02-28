@@ -110,4 +110,12 @@ export const SUB_AGENT_CONFIG: SubAgentConfig = {
 
   routerRecentMessagesLimit: envNum(process.env.CHAT_ROUTER_RECENT_MESSAGES_LIMIT, 6),
   responderHistoryLimit: envNum(process.env.CHAT_RESPONDER_HISTORY_LIMIT, 5),
+
+  // ── Loop Detection ────────────────────────────────────────────────
+
+  loopDetection: {
+    exactRepeatWarn: envNum(process.env.CHAT_LOOP_EXACT_REPEAT_WARN, 2),
+    exactRepeatBlock: envNum(process.env.CHAT_LOOP_EXACT_REPEAT_BLOCK, 3),
+    oscillationWindow: envNum(process.env.CHAT_LOOP_OSCILLATION_WINDOW, 6),
+  },
 };

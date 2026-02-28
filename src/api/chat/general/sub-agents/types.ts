@@ -112,6 +112,8 @@ export interface SubAgentPipelineResult {
   metrics: PipelineMetrics;
   /** True when the pipeline is returning a clarification question, not a real answer */
   needsClarification?: boolean;
+  /** Tools already executed before fallback — used to seed monolithic loop tracker */
+  executedTools?: Array<{ toolName: string; args: Record<string, any> }>;
 }
 
 /**
@@ -233,6 +235,18 @@ export interface SubAgentConfig {
   routerRecentMessagesLimit: number;
   /** Number of recent user/assistant messages for responder history */
   responderHistoryLimit: number;
+
+  // ── Loop Detection ────────────────────────────────────────────────
+
+  /** Loop detection thresholds for tool call deduplication */
+  loopDetection: {
+    /** Warn after N identical calls (tool+args match) */
+    exactRepeatWarn: number;
+    /** Block after N identical calls */
+    exactRepeatBlock: number;
+    /** Window size for A→B→A→B oscillation detection */
+    oscillationWindow: number;
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
