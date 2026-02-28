@@ -1,6 +1,7 @@
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
-import type { SkillDefinition, SkillContext, SkillResult } from './types';
+import type { SkillDefinition, SkillContext, SkillResult, SkillErrorContext } from './types';
 import { logger } from '@/utils/core/logger';
+import { supabaseAdmin } from '@/db/supabase';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -252,24 +253,78 @@ class SkillRegistryClass {
       }
     }
 
-    // Execute tool
+    // Execute tool with enhanced error boundary
+    const executeStart = Date.now();
+
     try {
       const result = await skill.execute(toolName, args, context);
+      const durationMs = Date.now() - executeStart;
+
       logger.info('[SKILL_REGISTRY] Tool executed', {
         toolName,
         skillId,
         success: result.success,
+        durationMs,
       });
       return result;
-    } catch (error) {
+    } catch (rawError) {
+      const durationMs = Date.now() - executeStart;
+      const error = rawError instanceof Error ? rawError : new Error(String(rawError));
+
+      // Structured error logging with args snapshot and truncated stack
+      const argsSnapshot = (() => {
+        try {
+          const json = JSON.stringify(args);
+          return json.length > 500 ? json.slice(0, 500) + '…' : json;
+        } catch {
+          return '[unserializable]';
+        }
+      })();
+
+      const stackLines = error.stack?.split('\n').slice(0, 5).join('\n') ?? 'no stack';
+
       logger.error('[SKILL_REGISTRY] Tool execution error', {
         toolName,
         skillId,
-        error: error instanceof Error ? error.message : String(error),
+        durationMs,
+        error: error.message,
+        argsSnapshot,
+        stack: stackLines,
       });
+
+      // ── onError lifecycle hook ──
+      // Give skill a chance to recover (e.g., token refresh + retry)
+      if (skill.onError) {
+        const errorCtx: SkillErrorContext = {
+          error,
+          toolName,
+          context,
+          attempt: 0, // first call (retries increment this in tool-executor.ts)
+        };
+
+        try {
+          const overrideResult = await skill.onError(errorCtx);
+          if (overrideResult) {
+            logger.info('[SKILL_REGISTRY] onError returned override result', {
+              toolName,
+              skillId,
+              overrideSuccess: overrideResult.success,
+            });
+            return overrideResult;
+          }
+        } catch (hookError) {
+          // Buggy onError hook must NOT crash the pipeline
+          logger.warn('[SKILL_REGISTRY] onError hook threw', {
+            toolName,
+            skillId,
+            hookError: hookError instanceof Error ? hookError.message : String(hookError),
+          });
+        }
+      }
+
       return {
         success: false,
-        message: `Failed to execute ${toolName}: ${error instanceof Error ? error.message : String(error)}`,
+        message: `Failed to execute ${toolName}: ${error.message}`,
         displayToUser: false,
       };
     }
@@ -287,6 +342,46 @@ class SkillRegistryClass {
    */
   getSkill(skillId: string): SkillDefinition | undefined {
     return this.skills.get(skillId);
+  }
+
+  /**
+   * Get the skill that owns a given tool name.
+   * Used by tool-executor.ts to access retryConfig and onError.
+   */
+  getSkillForTool(toolName: string): SkillDefinition | undefined {
+    const skillId = this.toolNameToSkillId.get(toolName);
+    return skillId ? this.skills.get(skillId) : undefined;
+  }
+
+  /**
+   * Read per-workspace skill configuration from workspaces.settings JSONB.
+   * Path: `settings.skills[skillId]`
+   *
+   * Returns empty object if no config exists (never throws).
+   * No cache — queries are infrequent and use PK lookup (fast).
+   */
+  async getSkillConfig(workspaceId: string, skillId: string): Promise<Record<string, any>> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('workspaces')
+        .select('settings')
+        .eq('id', workspaceId)
+        .single();
+
+      if (error || !data?.settings) {
+        return {};
+      }
+
+      const settings = data.settings as Record<string, any>;
+      return settings?.skills?.[skillId] ?? {};
+    } catch (err) {
+      logger.warn('[SKILL_REGISTRY] Failed to read workspace skill config', {
+        workspaceId,
+        skillId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return {};
+    }
   }
 
   /**

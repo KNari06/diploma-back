@@ -11,12 +11,13 @@
  *
  * Pipeline:
  *   1. Before hooks (loop detection, custom)
- *   2. Routing (SkillRegistry — all tools including memory)
- *   3. Timeout + abort signal (withToolTimeoutAndAbort)
- *   4. Execution
- *   5. After hooks (analytics, custom)
- *   6. Result normalization (screenshot special handling)
- *   7. Return ToolCallResult
+ *   2. Retry loop (per-skill config, exponential backoff + jitter)
+ *      a. Timeout + abort signal (withToolTimeoutAndAbort)
+ *      b. Execution via SkillRegistry
+ *      c. On transient error → onError hook → retry or break
+ *   3. After hooks (analytics, custom)
+ *   4. Result normalization (screenshot special handling)
+ *   5. Return ToolCallResult
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -24,8 +25,9 @@
 import { logger } from '@/utils/core/logger';
 import { withToolTimeoutAndAbort } from '@/api/chat/general/sub-agents/tool-constants';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
-import type { SkillContext, SkillResult } from './types';
+import type { SkillContext, SkillResult, SkillErrorContext } from './types';
 import type { ToolCallTracker } from './hooks/loop-detection.hook';
+import { resolveRetryConfig, isRetryableError, calculateRetryDelay, sleep } from './retry';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -148,27 +150,100 @@ export async function executeTool(ctx: ToolCallContext): Promise<ToolCallResult>
     }
   }
 
-  // ── 2. Execute Tool ──────────────────────────────────────────────────
+  // ── 2. Execute Tool (with retry loop) ───────────────────────────────
   let toolResult: SkillResult;
 
-  try {
-    const { SkillRegistry } = await import('@/services/skills');
-    toolResult = await withToolTimeoutAndAbort(
-      SkillRegistry.executeTool(ctx.toolName, effectiveArgs, ctx.skillContext),
-      ctx.toolName,
-      ctx.abortSignal,
-    );
-  } catch (toolError) {
-    const errorMessage = toolError instanceof Error ? toolError.message : String(toolError);
-    logger.error('[TOOL_EXECUTOR] Tool execution error', {
-      toolName: ctx.toolName,
-      error: errorMessage,
-    });
-    toolResult = {
-      success: false,
-      message: `Tool execution failed: ${errorMessage}`,
-    };
+  const { SkillRegistry } = await import('@/services/skills');
+  const skill = SkillRegistry.getSkillForTool(ctx.toolName);
+  const retryConfig = resolveRetryConfig(skill?.retryConfig);
+  const maxAttempts = retryConfig.maxRetries + 1; // initial + retries
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Check abort before each attempt
+    if (ctx.abortSignal?.aborted) {
+      toolResult = { success: false, message: 'Request aborted before execution' };
+      break;
+    }
+
+    // Wait before retry (not before first attempt)
+    if (attempt > 0) {
+      const delay = calculateRetryDelay(attempt - 1, retryConfig);
+      logger.info('[TOOL_EXECUTOR] Retrying tool', {
+        toolName: ctx.toolName,
+        attempt,
+        maxAttempts,
+        delayMs: delay,
+      });
+      try {
+        await sleep(delay, ctx.abortSignal);
+      } catch {
+        // Abort signal fired during sleep
+        toolResult = { success: false, message: 'Request aborted during retry backoff' };
+        break;
+      }
+    }
+
+    try {
+      // Each attempt gets its own timeout (from TOOL_TIMEOUTS via withToolTimeoutAndAbort)
+      toolResult = await withToolTimeoutAndAbort(
+        SkillRegistry.executeTool(ctx.toolName, effectiveArgs, ctx.skillContext),
+        ctx.toolName,
+        ctx.abortSignal,
+      );
+
+      // Success → done
+      if (toolResult.success) break;
+
+      // Failed result — check if the error message indicates a retryable condition
+      const resultError = new Error(toolResult.message);
+      if (attempt < retryConfig.maxRetries && isRetryableError(resultError)) {
+        // Give skill a chance to handle (e.g., token refresh)
+        const overrideResult = await callOnError(skill, resultError, ctx, attempt);
+        if (overrideResult) {
+          toolResult = overrideResult;
+          break; // onError provided a resolution
+        }
+        continue; // retry
+      }
+
+      // Non-retryable failure or last attempt → break with current result
+      break;
+
+    } catch (toolError) {
+      const error = toolError instanceof Error ? toolError : new Error(String(toolError));
+
+      if (attempt < retryConfig.maxRetries && isRetryableError(error)) {
+        // Give skill a chance to handle before retrying
+        const overrideResult = await callOnError(skill, error, ctx, attempt);
+        if (overrideResult) {
+          toolResult = overrideResult;
+          break;
+        }
+        continue; // retry
+      }
+
+      // Last attempt or non-retryable → call onError for final chance, then fail
+      const overrideResult = await callOnError(skill, error, ctx, attempt);
+      if (overrideResult) {
+        toolResult = overrideResult;
+        break;
+      }
+
+      logger.error('[TOOL_EXECUTOR] Tool execution error (final)', {
+        toolName: ctx.toolName,
+        attempt,
+        error: error.message,
+      });
+      toolResult = {
+        success: false,
+        message: `Tool execution failed: ${error.message}`,
+      };
+      break;
+    }
   }
+
+  // Safety: ensure toolResult is always set
+  toolResult ??= { success: false, message: 'Tool execution failed: no result produced' };
 
   const durationMs = Date.now() - startMs;
 
@@ -285,4 +360,45 @@ function buildBlockedResult(
       durationMs,
     },
   };
+}
+
+/**
+ * Call skill.onError() lifecycle hook if defined.
+ * Returns override SkillResult if the hook provides one, undefined otherwise.
+ * Never throws — buggy hooks are caught and logged.
+ */
+async function callOnError(
+  skill: import('./types').SkillDefinition | undefined,
+  error: Error,
+  ctx: ToolCallContext,
+  attempt: number,
+): Promise<SkillResult | undefined> {
+  if (!skill?.onError) return undefined;
+
+  const errorCtx: SkillErrorContext = {
+    error,
+    toolName: ctx.toolName,
+    context: ctx.skillContext,
+    attempt,
+  };
+
+  try {
+    const overrideResult = await skill.onError(errorCtx);
+    if (overrideResult) {
+      logger.info('[TOOL_EXECUTOR] onError returned override result', {
+        toolName: ctx.toolName,
+        attempt,
+        overrideSuccess: overrideResult.success,
+      });
+      return overrideResult;
+    }
+  } catch (hookError) {
+    // Buggy onError hook must NOT crash the retry loop
+    logger.warn('[TOOL_EXECUTOR] onError hook threw', {
+      toolName: ctx.toolName,
+      hookError: hookError instanceof Error ? hookError.message : String(hookError),
+    });
+  }
+
+  return undefined;
 }
