@@ -44,3 +44,5 @@ export const MemorySkill: SkillDefinition = {
     return executeMemoryTool(toolName, args, context.workspaceId, context.userId);
   },
 };
+
+export default MemorySkill;

@@ -25,4 +25,7 @@ export const SKILL_MANIFEST: SkillEntry[] = [
 
   // ── QA tools ────────────────────────────────────────────────────────
   { load: () => import('./qa/qa.skill') },
+
+  // ── Memory (always available, no external integration) ─────────────
+  { load: () => import('./memory/memory.skill') },
 ];

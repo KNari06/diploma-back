@@ -45,10 +45,44 @@ export async function registerAllSkills(): Promise<void> {
   }
 
   const registered = SkillRegistry.listSkills();
-  logger.info('[SKILLS] All skills registered successfully', {
+  logger.info('[SKILLS] Phase 1 complete — all skills registered', {
     count: registered.length,
     skills: registered.map((s) => s.id),
   });
+
+  // ── Phase 2: Initialize (async, non-fatal) ───────────────────────────
+  const skillsWithInit = registered.filter((s) => typeof s.onInit === 'function');
+
+  if (skillsWithInit.length > 0) {
+    logger.info('[SKILLS] Phase 2 — running onInit() hooks', {
+      skills: skillsWithInit.map((s) => s.id),
+    });
+
+    const initResults = await Promise.allSettled(
+      skillsWithInit.map(async (skill) => {
+        const initStart = Date.now();
+        try {
+          await skill.onInit!();
+          logger.info('[SKILLS] onInit() succeeded', {
+            skillId: skill.id,
+            durationMs: Date.now() - initStart,
+          });
+        } catch (err) {
+          logger.warn('[SKILLS] onInit() failed (skill remains registered)', {
+            skillId: skill.id,
+            durationMs: Date.now() - initStart,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          throw err; // rethrow so Promise.allSettled marks it as rejected
+        }
+      }),
+    );
+
+    const succeeded = initResults.filter((r) => r.status === 'fulfilled').length;
+    const failed = initResults.filter((r) => r.status === 'rejected').length;
+
+    logger.info('[SKILLS] Phase 2 complete', { total: skillsWithInit.length, succeeded, failed });
+  }
 }
 
 // Re-export core types and registry for convenience
