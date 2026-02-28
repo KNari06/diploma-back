@@ -124,10 +124,168 @@ export class ShadowDOMHandler {
       }
 
       await locator.fill(value, { timeout: 5000 });
+      // ✅ FIX: Post-fill event reinforcement for Angular/React/Vue reactive forms
+      try {
+        await locator.evaluate((el, val) => {
+          const input = el as HTMLInputElement;
+          if (input.value !== val) {
+            const setter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value'
+            )?.set || Object.getOwnPropertyDescriptor(
+              window.HTMLTextAreaElement.prototype, 'value'
+            )?.set;
+            if (setter) setter.call(input, val); else input.value = val;
+          }
+          input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+          input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+        }, value);
+      } catch { /* non-critical */ }
       logger.debug('[SHADOW_DOM] Filled element', { ref, value: value.slice(0, 30) });
       return true;
     } catch (error) {
       logger.error('[SHADOW_DOM] Failed to fill element', {
+        ref,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Toggle (click) element that may be inside Shadow DOM
+   * Used for checkboxes, switches, radio buttons inside shadow roots
+   *
+   * @param page - Playwright page
+   * @param ref - Element reference
+   * @returns Success status
+   */
+  static async toggle(page: Page, ref: string): Promise<boolean> {
+    try {
+      const locator = await this.findInShadowDOM(page, ref);
+      if (!locator) return false;
+
+      await locator.click({ timeout: 5000 });
+      // ✅ FIX: Dispatch change event for Angular/React forms
+      try {
+        await locator.evaluate((el) => {
+          el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        });
+      } catch { /* non-critical */ }
+      logger.debug('[SHADOW_DOM] Toggled element', { ref });
+      return true;
+    } catch (error) {
+      logger.error('[SHADOW_DOM] Failed to toggle element', {
+        ref,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Clear an input field that may be inside Shadow DOM
+   *
+   * @param page - Playwright page
+   * @param ref - Element reference
+   * @returns Success status
+   */
+  static async clear(page: Page, ref: string): Promise<boolean> {
+    try {
+      const locator = await this.findInShadowDOM(page, ref);
+      if (!locator) return false;
+
+      await locator.clear({ timeout: 5000 });
+      // ✅ FIX: Dispatch events so framework forms detect the cleared value
+      try {
+        await locator.evaluate((el) => {
+          el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+          el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+        });
+      } catch { /* non-critical */ }
+      logger.debug('[SHADOW_DOM] Cleared element', { ref });
+      return true;
+    } catch (error) {
+      logger.error('[SHADOW_DOM] Failed to clear element', {
+        ref,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Set range/slider value on element that may be inside Shadow DOM
+   * Uses JavaScript evaluation to set value and dispatch events
+   *
+   * @param page - Playwright page
+   * @param ref - Element reference
+   * @param value - Value to set
+   * @returns Success status
+   */
+  static async setRange(page: Page, ref: string, value: string): Promise<boolean> {
+    try {
+      const locator = await this.findInShadowDOM(page, ref);
+      if (!locator) return false;
+
+      await locator.evaluate((el: HTMLInputElement, val: string) => {
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, 'value'
+        )?.set;
+        if (nativeSetter) {
+          nativeSetter.call(el, val);
+        } else {
+          el.value = val;
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+      }, value);
+
+      logger.debug('[SHADOW_DOM] Set range value', { ref, value });
+      return true;
+    } catch (error) {
+      logger.error('[SHADOW_DOM] Failed to set range value', {
+        ref,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Set date/time value on element that may be inside Shadow DOM
+   * Uses JavaScript evaluation to set value and dispatch events
+   *
+   * @param page - Playwright page
+   * @param ref - Element reference
+   * @param value - ISO format date/time value
+   * @returns Success status
+   */
+  static async selectDate(page: Page, ref: string, value: string): Promise<boolean> {
+    try {
+      const locator = await this.findInShadowDOM(page, ref);
+      if (!locator) return false;
+
+      await locator.evaluate((el: HTMLInputElement, val: string) => {
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, 'value'
+        )?.set;
+        if (nativeSetter) {
+          nativeSetter.call(el, val);
+        } else {
+          el.value = val;
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+      }, value);
+
+      logger.debug('[SHADOW_DOM] Set date value', { ref, value });
+      return true;
+    } catch (error) {
+      logger.error('[SHADOW_DOM] Failed to set date value', {
         ref,
         error: error instanceof Error ? error.message : String(error),
       });

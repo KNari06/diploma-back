@@ -306,8 +306,8 @@ export class ActionExecutor {
    * Validate command before execution
    */
   private validateCommand(command: AICommand): void {
-    // Validate ref format if present
-    if (command.ref && !/^e\d+$/.test(command.ref)) {
+    // Validate ref format if present (e-prefix for light DOM, s-prefix for shadow DOM)
+    if (command.ref && !/^[es]\d+$/.test(command.ref)) {
       throw new Error(`Invalid ref format: ${command.ref}`);
     }
 
@@ -342,10 +342,22 @@ export class ActionExecutor {
     if (command.action === 'hover' && !command.ref) {
       throw new Error('hover requires ref');
     }
+    if (command.action === 'toggle' && !command.ref) {
+      throw new Error('toggle requires ref');
+    }
+    if (command.action === 'setRange' && (!command.ref || command.value === undefined)) {
+      throw new Error('setRange requires ref and value');
+    }
+    if (command.action === 'clear' && !command.ref) {
+      throw new Error('clear requires ref');
+    }
+    if (command.action === 'selectDate' && (!command.ref || !command.value)) {
+      throw new Error('selectDate requires ref and value (date string)');
+    }
 
     // Validate scroll extras
     if (command.action === 'scroll') {
-      if (command.targetRef && !/^e\d+$/.test(command.targetRef)) {
+      if (command.targetRef && !/^[es]\d+$/.test(command.targetRef)) {
         throw new Error(`Invalid targetRef format: ${command.targetRef}`);
       }
       if (command.amount !== undefined) {
@@ -383,22 +395,114 @@ export class ActionExecutor {
         // PHASE B: Pre-scroll to ensure element is visible before fill
         // ═══════════════════════════════════════════════════════════════════
         await this.ensureElementVisible(locator);
-        // ✅ FIX: Use pressSequentially() for better compatibility with masked inputs
-        // This simulates real typing and works better with phone masks, date pickers, etc.
-        try {
-          // First, clear the field
-          await locator.clear({ timeout: this.DEFAULT_TIMEOUT });
-          // Then type character by character (more realistic)
-          await locator.pressSequentially(cmd.value, {
-            timeout: this.DEFAULT_TIMEOUT,
-            delay: 50, // 50ms between keystrokes (realistic typing speed)
+
+        // ✅ FIX: Detect special input types and route to appropriate handler
+        const inputType = await locator.evaluate(
+          (el) => (el as HTMLInputElement).type?.toLowerCase() || ''
+        ).catch(() => '');
+
+        if (inputType === 'range') {
+          // Range inputs: fill()/pressSequentially() don't work — use evaluate
+          logger.debug('[ACTION_EXECUTOR] Detected range input, using evaluate to set value');
+          await locator.evaluate((el, val) => {
+            const input = el as HTMLInputElement;
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value'
+            )?.set;
+            if (nativeInputValueSetter) {
+              nativeInputValueSetter.call(input, val);
+            } else {
+              input.value = val;
+            }
+            input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+          }, cmd.value);
+        } else if (['date', 'time', 'datetime-local', 'month', 'week'].includes(inputType)) {
+          // Date/time inputs: pressSequentially opens calendar UI, fill() is more reliable
+          // But even fill() can fail on some frameworks, so use evaluate as primary
+          logger.debug('[ACTION_EXECUTOR] Detected date/time input, using evaluate to set value', {
+            inputType,
           });
-        } catch (error) {
-          // Fallback to fill() if pressSequentially() fails
-          logger.debug('[ACTION_EXECUTOR] pressSequentially failed, falling back to fill()', {
-            error: error instanceof Error ? error.message : String(error),
-          });
-          await locator.fill(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
+          await locator.evaluate((el, val) => {
+            const input = el as HTMLInputElement;
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value'
+            )?.set;
+            if (nativeInputValueSetter) {
+              nativeInputValueSetter.call(input, val);
+            } else {
+              input.value = val;
+            }
+            input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+          }, cmd.value);
+        } else if (inputType === 'color') {
+          // Color inputs: set value directly
+          logger.debug('[ACTION_EXECUTOR] Detected color input, using evaluate to set value');
+          await locator.evaluate((el, val) => {
+            const input = el as HTMLInputElement;
+            input.value = val;
+            input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+          }, cmd.value);
+        } else {
+          // Standard text-like inputs: use pressSequentially with fill() fallback
+          try {
+            // First, clear the field
+            await locator.clear({ timeout: this.DEFAULT_TIMEOUT });
+            // Then type character by character (more realistic)
+            await locator.pressSequentially(cmd.value, {
+              timeout: this.DEFAULT_TIMEOUT,
+              delay: 50, // 50ms between keystrokes (realistic typing speed)
+            });
+          } catch (error) {
+            // Fallback to fill() if pressSequentially() fails
+            logger.debug('[ACTION_EXECUTOR] pressSequentially failed, falling back to fill()', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            await locator.fill(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
+          }
+
+          // ✅ FIX BUG 7: Post-fill event reinforcement for Angular/React/Vue reactive forms
+          // Framework form controls (especially Angular reactive forms) may not detect
+          // Playwright's fill/pressSequentially because they rely on specific DOM events.
+          // After typing, verify the value persisted and dispatch framework events if needed.
+          try {
+            await locator.evaluate((el, val) => {
+              const input = el as HTMLInputElement;
+              // Only reinforce if value doesn't match what we typed
+              // (framework may have eaten the input or validation cleared it)
+              if (input.value !== val) {
+                // Use nativeInputValueSetter to bypass framework getter/setter
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype, 'value'
+                )?.set || Object.getOwnPropertyDescriptor(
+                  window.HTMLTextAreaElement.prototype, 'value'
+                )?.set;
+                if (nativeInputValueSetter) {
+                  nativeInputValueSetter.call(input, val);
+                } else {
+                  input.value = val;
+                }
+              }
+              // Always dispatch events to ensure framework picks up the value:
+              // Angular listens for 'input' event via DefaultValueAccessor
+              // React uses 'input' + its synthetic event system
+              // Vue uses 'input' for v-model
+              input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+              input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+              // Also dispatch blur to trigger validation (Angular validators fire on blur)
+              input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+            }, cmd.value);
+          } catch (eventError) {
+            // Non-critical: event dispatch failure doesn't mean fill failed
+            logger.debug('[ACTION_EXECUTOR] Post-fill event reinforcement failed (non-critical)', {
+              error: eventError instanceof Error ? eventError.message : String(eventError),
+            });
+          }
         }
         break;
 
@@ -476,6 +580,89 @@ export class ActionExecutor {
 
       case 'wait':
         await this.page.waitForTimeout(1000);
+        break;
+
+      case 'toggle':
+        if (!locator) throw new Error('toggle requires ref');
+        await this.ensureElementVisible(locator);
+        // Toggle works for: switches (role="switch"), checkboxes, radio buttons,
+        // custom toggles with aria-pressed, accordion details/summary
+        await locator.click({ timeout: this.DEFAULT_TIMEOUT });
+        // ✅ FIX: Dispatch change event for Angular/React checkbox/switch forms
+        try {
+          await locator.evaluate((el) => {
+            el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+          });
+        } catch { /* non-critical */ }
+        break;
+
+      case 'setRange':
+        if (!locator || cmd.value === undefined) throw new Error('setRange requires ref and value');
+        await this.ensureElementVisible(locator);
+        // Set value on range/slider input using page.evaluate for reliable operation
+        // fill() and pressSequentially() don't work on <input type="range">
+        await locator.evaluate((el, val) => {
+          const input = el as HTMLInputElement;
+          // Use nativeInputValueSetter to trigger React/Vue change events
+          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+          )?.set;
+          if (nativeInputValueSetter) {
+            nativeInputValueSetter.call(input, val);
+          } else {
+            input.value = val;
+          }
+          // Dispatch input, change, and blur (Angular validators fire on blur)
+          input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+          input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+        }, cmd.value);
+        break;
+
+      case 'clear':
+        if (!locator) throw new Error('clear requires ref');
+        await this.ensureElementVisible(locator);
+        // Clear field value: works for inputs, textareas, contenteditable
+        try {
+          await locator.clear({ timeout: this.DEFAULT_TIMEOUT });
+        } catch (clearError) {
+          // Fallback: triple-click to select all + delete
+          logger.debug('[ACTION_EXECUTOR] clear() failed, using select-all + delete fallback', {
+            error: clearError instanceof Error ? clearError.message : String(clearError),
+          });
+          await locator.click({ clickCount: 3, timeout: this.DEFAULT_TIMEOUT });
+          await this.page.keyboard.press('Backspace');
+        }
+        // ✅ FIX: Dispatch events so framework forms detect the cleared value
+        try {
+          await locator.evaluate((el) => {
+            el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+          });
+        } catch { /* non-critical */ }
+        break;
+
+      case 'selectDate':
+        if (!locator || !cmd.value) throw new Error('selectDate requires ref and value');
+        await this.ensureElementVisible(locator);
+        // Date inputs require special handling: fill() is most reliable for type="date"
+        // because pressSequentially doesn't work (browser opens calendar UI).
+        // We use evaluate to set the value directly and trigger change events.
+        await locator.evaluate((el, dateStr) => {
+          const input = el as HTMLInputElement;
+          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+          )?.set;
+          if (nativeInputValueSetter) {
+            nativeInputValueSetter.call(input, dateStr);
+          } else {
+            input.value = dateStr;
+          }
+          input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+          input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+        }, cmd.value);
         break;
 
       default:
@@ -820,6 +1007,23 @@ export class ActionExecutor {
             });
             await locator.fill(cmd.value, { timeout: this.FALLBACK_TIMEOUT });
           }
+          // ✅ FIX: Post-fill event reinforcement (same as primary path)
+          try {
+            await locator.evaluate((el, val) => {
+              const input = el as HTMLInputElement;
+              if (input.value !== val) {
+                const setter = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype, 'value'
+                )?.set || Object.getOwnPropertyDescriptor(
+                  window.HTMLTextAreaElement.prototype, 'value'
+                )?.set;
+                if (setter) setter.call(input, val); else input.value = val;
+              }
+              input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+              input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+              input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+            }, cmd.value);
+          } catch { /* non-critical */ }
         }
         break;
       case 'hover':
@@ -846,6 +1050,67 @@ export class ActionExecutor {
           }
         }
         break;
+      case 'toggle':
+        await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+        // ✅ FIX: Dispatch change event for Angular/React checkbox/switch forms
+        try {
+          await locator.evaluate((el) => {
+            el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+          });
+        } catch { /* non-critical */ }
+        break;
+      case 'setRange':
+        if (cmd.value !== undefined) {
+          await locator.evaluate((el, val) => {
+            const input = el as HTMLInputElement;
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value'
+            )?.set;
+            if (nativeInputValueSetter) {
+              nativeInputValueSetter.call(input, val);
+            } else {
+              input.value = val;
+            }
+            input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+          }, cmd.value);
+        }
+        break;
+      case 'clear':
+        try {
+          await locator.clear({ timeout: this.FALLBACK_TIMEOUT });
+        } catch {
+          await locator.click({ clickCount: 3, timeout: this.FALLBACK_TIMEOUT });
+          await this.page.keyboard.press('Backspace');
+        }
+        // ✅ FIX: Dispatch events so framework forms detect the cleared value
+        try {
+          await locator.evaluate((el) => {
+            el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+          });
+        } catch { /* non-critical */ }
+        break;
+      case 'selectDate':
+        if (cmd.value) {
+          await locator.evaluate((el, dateStr) => {
+            const input = el as HTMLInputElement;
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value'
+            )?.set;
+            if (nativeInputValueSetter) {
+              nativeInputValueSetter.call(input, dateStr);
+            } else {
+              input.value = dateStr;
+            }
+            input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+          }, cmd.value);
+        }
+        break;
       default:
         throw new Error(`Fallback not supported for action: ${cmd.action}`);
     }
@@ -855,7 +1120,11 @@ export class ActionExecutor {
 
   /**
    * Custom dropdown select: click trigger → find visible option → click option.
-   * 3-phase strategy: scoped ARIA container → page-level ARIA roles → text fallback.
+   * 4-phase strategy:
+   *   1. Pre-collected option refs from snapshot (fastest, most reliable)
+   *   2. Scoped ARIA container search
+   *   3. Page-level ARIA roles (handles portals)
+   *   4. Universal text fallback (non-ARIA dropdowns)
    */
   private async selectFromCustomDropdown(
     locator: Locator,
@@ -865,10 +1134,46 @@ export class ActionExecutor {
     await locator.click({ timeout });
     await this.page.waitForTimeout(300);
 
+    const valueLower = value.toLowerCase().trim();
+
+    // Phase 0: Try pre-collected option elements from snapshot (role="option" with matching text)
+    // SnapshotCollector now collects [role="option"], [role="menuitem"], etc.
+    // If snapshot has these, we can target them directly by ref — faster & more reliable
+    // IMPORTANT: Only consider elements with option-like roles/tags to avoid clicking non-option elements
+    const OPTION_ROLES = new Set(['option', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'treeitem', 'listitem']);
+    const OPTION_TAGS = new Set(['option', 'li']);
+    for (const [ref, info] of this.elementMap.entries()) {
+      // Filter: only match elements that look like dropdown options
+      const role = (info.role || '').toLowerCase();
+      const tag = (info.tag || '').toLowerCase();
+      if (!OPTION_ROLES.has(role) && !OPTION_TAGS.has(tag)) continue;
+
+      const textLower = (info.text || '').toLowerCase().trim();
+      if (textLower === valueLower || textLower.includes(valueLower)) {
+        try {
+          const optLocator = this.currentContext.locator(`[data-agent-ref="${ref}"]`);
+          const isVis = await optLocator.isVisible().catch(() => false);
+          if (isVis) {
+            await optLocator.click({ timeout: 2000 });
+            logger.debug('[ACTION_EXECUTOR] Selected option via pre-collected ref', {
+              ref,
+              text: info.text?.slice(0, 40),
+              role,
+              tag,
+            });
+            return;
+          }
+        } catch {
+          // Option ref not found/visible, continue to next phase
+        }
+      }
+    }
+
     // Phase 1: Scoped search inside visible ARIA container
     const containers = [
       this.page.locator('[role="listbox"]:visible'),
       this.page.locator('[role="menu"]:visible'),
+      this.page.locator('[role="tree"]:visible'),
     ];
 
     for (const container of containers) {
@@ -889,8 +1194,10 @@ export class ActionExecutor {
     const roleStrategies = [
       this.page.getByRole('option', { name: value, exact: true }),
       this.page.getByRole('menuitem', { name: value, exact: true }),
+      this.page.getByRole('treeitem', { name: value, exact: true }),
       this.page.getByRole('option', { name: value, exact: false }),
       this.page.getByRole('menuitem', { name: value, exact: false }),
+      this.page.getByRole('treeitem', { name: value, exact: false }),
     ];
 
     for (const strategy of roleStrategies) {
@@ -1240,8 +1547,10 @@ export class ActionExecutor {
         const modalArea = rect.width * rect.height;
         const coverage = modalArea / viewportArea;
 
-        const hasModalRole = modal.getAttribute('role') === 'dialog' ||
-                             modal.getAttribute('aria-modal') === 'true' ||
+        // ✅ FIX: Strip escaped quotes from role (Angular outputs role="\"dialog\"")
+        const modalRoleRaw = (modal.getAttribute('role') || '').replace(/["']/g, '').trim();
+        const hasModalRole = modalRoleRaw === 'dialog' ||
+                             (modal.getAttribute('aria-modal') || '').replace(/["']/g, '').trim() === 'true' ||
                              modal.classList.contains('modal') ||
                              modal.classList.contains('overlay') ||
                              modal.classList.contains('popup');
@@ -1365,8 +1674,8 @@ export class ActionExecutor {
           // Prefer short text (likely just X or icon)
           if (text.length <= 3) score += 2;
 
-          // Prefer role="button"
-          if (candidate.getAttribute('role') === 'button') score += 1;
+          // Prefer role="button" (strip escaped quotes for Angular compatibility)
+          if ((candidate.getAttribute('role') || '').replace(/["']/g, '').trim() === 'button') score += 1;
 
           if (score > bestScore) {
             bestScore = score;
@@ -1464,8 +1773,10 @@ export class ActionExecutor {
           const modalArea = rect.width * rect.height;
           const coverage = modalArea / viewportArea;
 
-          const hasModalRole = modal.getAttribute('role') === 'dialog' ||
-                               modal.getAttribute('aria-modal') === 'true' ||
+          // ✅ FIX: Strip escaped quotes from role (Angular outputs role="\"dialog\"")
+          const modalRoleRaw2 = (modal.getAttribute('role') || '').replace(/["']/g, '').trim();
+          const hasModalRole = modalRoleRaw2 === 'dialog' ||
+                               (modal.getAttribute('aria-modal') || '').replace(/["']/g, '').trim() === 'true' ||
                                modal.classList.contains('modal') ||
                                modal.classList.contains('overlay');
 

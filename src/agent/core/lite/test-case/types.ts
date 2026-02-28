@@ -45,6 +45,12 @@ export type TestAction =
   | 'hover' // Hover over element
   | 'scroll' // Scroll page
   | 'wait' // Wait for condition
+  | 'toggle' // Toggle switch/checkbox/radio
+  | 'check' // Check a checkbox (maps to toggle)
+  | 'uncheck' // Uncheck a checkbox (maps to toggle)
+  | 'setRange' // Set slider/range value
+  | 'clear' // Clear an input field
+  | 'selectDate' // Set date/time input value
   | 'verify' // Run assertions only (no action)
   | 'custom'; // AI-driven "do X" action
 

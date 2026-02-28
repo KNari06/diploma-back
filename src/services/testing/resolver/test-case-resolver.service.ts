@@ -72,8 +72,12 @@ const ACTION_MAP: Record<string, AICommand['action'] | null> = {
   hover: 'hover',
   scroll: 'scroll',
   wait: 'wait',
-  check: 'click',
-  uncheck: 'click',
+  check: 'toggle',
+  uncheck: 'toggle',
+  toggle: 'toggle',
+  setRange: 'setRange',
+  clear: 'clear',
+  selectDate: 'selectDate',
 };
 
 // ============================================================================
@@ -486,6 +490,20 @@ Return JSON: {"isExactMatch": boolean, "confidence": number, "matchedIndex": num
         aiCommand.amount = cmd.amount;
         break;
       case 'wait':
+        break;
+      case 'toggle':
+        aiCommand.ref = cmd.selector || cmd.ref;
+        break;
+      case 'setRange':
+        aiCommand.ref = cmd.selector || cmd.ref;
+        aiCommand.value = cmd.value;
+        break;
+      case 'clear':
+        aiCommand.ref = cmd.selector || cmd.ref;
+        break;
+      case 'selectDate':
+        aiCommand.ref = cmd.selector || cmd.ref;
+        aiCommand.value = cmd.value;
         break;
     }
 

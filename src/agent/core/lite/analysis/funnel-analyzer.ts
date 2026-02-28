@@ -241,29 +241,43 @@ export class FunnelAnalyzer {
     const nameLower = (element.name || '').toLowerCase();
     const tag = element.tag;
     const type = element.type;
+    const roleLower = (element.role || '').toLowerCase();
 
     // Form detection
     if (tag === 'form') return 'form';
 
-    // Input fields
-    if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+    // Input fields — standard tags AND ARIA widget roles that accept user input
+    if (
+      tag === 'input' || tag === 'textarea' || tag === 'select' ||
+      tag === 'meter' || tag === 'output' ||
+      roleLower === 'textbox' || roleLower === 'searchbox' ||
+      roleLower === 'spinbutton' || roleLower === 'combobox' ||
+      roleLower === 'listbox' || roleLower === 'slider'
+    ) {
       return 'input-field';
     }
 
+    // Toggle/switch/checkbox elements — categorize as primary action
+    if (
+      roleLower === 'switch' || roleLower === 'checkbox' || roleLower === 'radio'
+    ) {
+      return 'primary-action';
+    }
+
     // Pagination / load-more / sort / filter detection (before generic button/link)
-    if (tag === 'button' || tag === 'a' || element.role === 'button') {
+    if (tag === 'button' || tag === 'a' || roleLower === 'button') {
       if (/\b(next|prev|previous|»|«|›|‹)\b/i.test(nameLower) || element.context?.toLowerCase().includes('pagination'))
         return 'pagination-button';
       if (this.matchesAnyPattern(nameLower, FUNNEL_ELEMENT_PATTERNS.load_more))
         return 'load-more-button';
     }
-    if ((tag === 'button' || element.role === 'button') && element.context?.toLowerCase().includes('header') && /\b(sort|↑|↓)\b/i.test(nameLower))
+    if ((tag === 'button' || roleLower === 'button') && element.context?.toLowerCase().includes('header') && /\b(sort|↑|↓)\b/i.test(nameLower))
       return 'sort-control';
     if ((tag === 'input' || tag === 'select') && (/\b(filter|search)\b/i.test(nameLower) || element.context?.toLowerCase().includes('filter')))
       return 'filter-control';
 
     // Button categorization
-    if (tag === 'button' || element.role === 'button') {
+    if (tag === 'button' || roleLower === 'button') {
       if (this.matchesAnyPattern(nameLower, FUNNEL_ELEMENT_PATTERNS.submit)) {
         return 'submit-button';
       }
@@ -277,7 +291,7 @@ export class FunnelAnalyzer {
     }
 
     // Link categorization
-    if (tag === 'a' || element.role === 'link') {
+    if (tag === 'a' || roleLower === 'link') {
       // Check context for footer
       if (element.context?.toLowerCase().includes('footer')) {
         return 'footer-link';

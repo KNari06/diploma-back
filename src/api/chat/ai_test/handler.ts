@@ -17,6 +17,9 @@ import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
+import { ExplorationEngine } from '@/agent/core/lite/exploration/exploration-engine';
+import type { ExplorationConfig } from '@/agent/core/lite/exploration/types';
+import { DEFAULT_EXPLORATION_BUDGET } from '@/agent/core/lite/exploration/types';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // REDIS LOCK HELPER: Prevents concurrent test starts for the same chat session
@@ -44,6 +47,48 @@ async function releaseChatTestLock(chatSessionId: string): Promise<void> {
     await redisConnection.del(lockKey);
   } catch {
     // Best-effort release
+  }
+}
+
+/**
+ * Run an async operation with timeout and optional cancellation support.
+ * Throws when timeout is exceeded or AbortSignal is triggered.
+ */
+async function runWithTimeoutAndAbort<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  abortSignal?: AbortSignal,
+  timeoutLabel: string = 'Operation',
+): Promise<T> {
+  let timeoutId: NodeJS.Timeout | null = null;
+  let abortHandler: (() => void) | null = null;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${timeoutLabel} timeout after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
+  });
+
+  const races: Array<Promise<T>> = [operation, timeoutPromise as Promise<T>];
+  if (abortSignal) {
+    const abortPromise = new Promise<never>((_, reject) => {
+      if (abortSignal.aborted) {
+        reject(new Error('Request aborted'));
+        return;
+      }
+      abortHandler = () => reject(new Error('Request aborted'));
+      abortSignal.addEventListener('abort', abortHandler, { once: true });
+    });
+    races.push(abortPromise as Promise<T>);
+  }
+
+  try {
+    return await Promise.race(races);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    if (abortSignal && abortHandler) {
+      abortSignal.removeEventListener('abort', abortHandler);
+    }
   }
 }
 
@@ -763,7 +808,7 @@ export async function handlePlatformTest(
     checkTimeout('handle_credentials');
 
     // ═══════════════════════════════════════════════════════════════════════
-    // RUN TEST IMMEDIATELY (Lite mode — always)
+    // STRATEGY SELECTION: standard (single-goal run) vs exploration (BFS discovery)
     // ═══════════════════════════════════════════════════════════════════════
 
     // Check if request was cancelled before starting test
@@ -774,7 +819,123 @@ export async function handlePlatformTest(
       checkRequestAbortedWithLogging(abortSignal);
     }
 
-    logger.info('[PLATFORM_TEST] Running test immediately (no exploration)', {
+    const executionStrategy = parsedIntent?.executionStrategy || 'standard';
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXPLORATION BRANCH — autonomous BFS discovery + multi-flow execution
+    // ═══════════════════════════════════════════════════════════════════════
+    if (executionStrategy === 'exploration') {
+      logger.info('[PLATFORM_TEST] Running exploration mode', {
+        url: extractedUrl,
+        userId,
+        project_id,
+        hasCredentials: !!finalCredentials,
+      });
+
+      emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Starting site exploration...', 50);
+
+      const { chromium } = await import('playwright');
+      let browser;
+      try {
+        browser = await chromium.launch({ headless: true });
+
+        const explorationConfig: ExplorationConfig = {
+          entryUrl: extractedUrl.trim(),
+          explorationId: `expl-${Date.now()}-${userId.slice(0, 8)}`,
+          projectId: project_id,
+          userId,
+          chatSessionId,
+          workspaceId: workspace_id,
+          scopeHint: parsedIntent?.target || parsedIntent?.scope || undefined,
+          credentials: finalCredentials || undefined,
+          budget: { ...DEFAULT_EXPLORATION_BUDGET },
+          maxConcurrency: 5,
+        };
+
+        emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Surveying pages...', 60);
+
+        // Keep parity with standard branch: respect request cancellation + handler timeout budget.
+        const remainingFlowTimeoutMs = Math.max(5_000, flowTimeout - (Date.now() - flowStartTime));
+        const explorationEngine = new ExplorationEngine(browser, explorationConfig);
+        const explorationResult = await runWithTimeoutAndAbort(
+          explorationEngine.run(),
+          remainingFlowTimeoutMs,
+          abortSignal,
+          'Exploration',
+        );
+
+        emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Exploration complete!', 100);
+
+        const summary = explorationResult.summary;
+        const replyMessage =
+          `**Exploration Complete**\n\n` +
+          `Explored **${extractedUrl}** autonomously.\n\n` +
+          `**Results:**\n` +
+          `- Pages surveyed: ${summary.pagesSurveyed}\n` +
+          `- Entry points discovered: ${summary.entryPointsDiscovered}\n` +
+          `- Flows explored: ${summary.flowsExplored}\n` +
+          `- Passed: ${summary.flowsPassed} | Failed: ${summary.flowsFailed} | Blocked: ${summary.flowsBlocked}\n` +
+          `- Test cases generated: ${explorationResult.testCases.length}\n` +
+          `- Total steps discovered: ${summary.totalStepsDiscovered}\n` +
+          `- Duration: ${Math.round(explorationResult.durationMs / 1000)}s\n\n` +
+          `Exploration ID: \`${explorationResult.explorationId}\``;
+
+        if (chatSessionId) {
+          ChatService.saveChatMessages(chatSessionId, [
+            { role: 'user', content: message },
+            {
+              role: 'ai',
+              content: replyMessage,
+              metadata: {
+                explorationId: explorationResult.explorationId,
+                mode: 'exploration',
+                url: extractedUrl,
+                testCasesCount: explorationResult.testCases.length,
+              },
+            },
+          ]).catch(() => {});
+        }
+
+        res.json({
+          success: true,
+          reply: replyMessage,
+          mode: 'exploration',
+          explorationId: explorationResult.explorationId,
+          explorationResult,
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+
+        logger.info('[PLATFORM_TEST] Exploration completed successfully', {
+          explorationId: explorationResult.explorationId,
+          testCases: explorationResult.testCases.length,
+          duration: explorationResult.durationMs,
+        });
+
+        // Release lock in exploration success path (standard path releases later with mapping).
+        if (lockAcquired && chatSessionId) {
+          await releaseChatTestLock(chatSessionId);
+          lockAcquired = false;
+        }
+
+        return;
+      } catch (explorationError) {
+        logger.error('[PLATFORM_TEST] Exploration failed, falling back to standard', {
+          error: explorationError instanceof Error ? explorationError.message : String(explorationError),
+        });
+        // Fallback: continue to standard run below
+      } finally {
+        if (browser) {
+          await browser.close().catch(() => {});
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STANDARD BRANCH — single-goal immediate lite run
+    // ═══════════════════════════════════════════════════════════════════════
+
+    logger.info('[PLATFORM_TEST] Running test immediately (standard mode)', {
         url: extractedUrl,
         userId,
         project_id,

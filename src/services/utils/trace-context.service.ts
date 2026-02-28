@@ -119,8 +119,9 @@ function guessElementType(action: string, selector?: string): string {
   // Guess from action
   if (actionLC === 'click') return 'button';
   if (actionLC === 'fill' || actionLC === 'type') return 'input';
-  if (actionLC === 'check') return 'checkbox';
+  if (actionLC === 'check' || actionLC === 'toggle') return 'checkbox';
   if (actionLC === 'select') return 'select';
+  if (actionLC === 'setrange' || actionLC === 'clear' || actionLC === 'selectdate') return 'input';
 
   return 'element';
 }

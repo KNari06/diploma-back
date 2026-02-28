@@ -879,6 +879,10 @@ export interface IntentResult {
     sourceTestCases?: Array<{ id: string; name: string; matchScore: number }>;
     resolverStrategy: 'embedding' | 'hybrid' | 'name_only';
   };
+
+  // Execution strategy for platform_test: 'standard' runs a single goal via LiteEngine,
+  // 'exploration' runs autonomous BFS discovery + multi-flow execution via ExplorationEngine.
+  executionStrategy?: 'standard' | 'exploration';
 }
 
 // Playwright Command types

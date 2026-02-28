@@ -364,7 +364,7 @@ function buildFastLocator(page: Page, step: IntentStep): Locator | null {
   if (step.evidence?.lastSuccessRef) {
     const ref = step.evidence.lastSuccessRef;
     // data-agent-ref values (e.g. "e6", "bg-1") don't exist during replay — skip
-    if (/^(e\d+|bg-\d+)$/.test(ref)) {
+    if (/^(e\d+|s\d+|bg-\d+)$/.test(ref)) {
       return null;
     }
     try {

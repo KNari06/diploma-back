@@ -343,6 +343,10 @@ AVAILABLE ACTIONS (choose ONE):
 - select: { "action": "select", "ref": "e3", "value": "option" }
 - hover: { "action": "hover", "ref": "e4" }
 - wait: { "action": "wait" }
+- toggle: { "action": "toggle", "ref": "e6" }  (for switches, checkboxes, radio buttons)
+- setRange: { "action": "setRange", "ref": "e7", "value": "75" }  (for sliders/range inputs)
+- clear: { "action": "clear", "ref": "e8" }  (clear an input field)
+- selectDate: { "action": "selectDate", "ref": "e9", "value": "2024-01-15" }  (for date/time inputs, use ISO format)
 
 IMPORTANT RULES:
 ${allRules}

@@ -389,7 +389,11 @@ const HEURISTIC_RULES: HeuristicRule[] = [
     name: 'PrimaryActionRule',
     priority: 3,
     matches: (el: LiteElement, ctx: RuleContext) => {
-      if (el.tag !== 'button') return false;
+      // Match buttons by tag or role (covers custom button components)
+      const isButton = el.tag === 'button' || el.role === 'button';
+      // Match interactive toggles/switches that act as primary actions
+      const isToggleAction = el.role === 'switch';
+      if (!isButton && !isToggleAction) return false;
       const nameText = el.name || '';
       return ctx.matchesAnyKeyword(nameText, PRIMARY_ACTION_KEYWORDS);
     },
@@ -411,7 +415,11 @@ const HEURISTIC_RULES: HeuristicRule[] = [
     priority: 4,
     matches: (el: LiteElement) => {
       if (el.tag !== 'input') return false;
-      return el.type === 'email' || el.type === 'password' || el.type === 'tel';
+      // Core credential types
+      if (el.type === 'email' || el.type === 'password' || el.type === 'tel') return true;
+      // Autocomplete-hinted credential fields (text inputs with credential autocomplete)
+      if (el.autocomplete && /^(username|email|tel|new-password|current-password)/.test(el.autocomplete)) return true;
+      return false;
     },
     evaluate: () => ({ weight: 0.7, needsAI: false, category: 'credential-input' }),
   },
@@ -429,6 +437,21 @@ const HEURISTIC_RULES: HeuristicRule[] = [
       return ctx.matchesKeyword(nameText, 'search') || ctx.matchesKeyword(nameText, 'поиск');
     },
     evaluate: () => ({ weight: 0.7, needsAI: false, category: 'search-input' }),
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Priority 5b: Specialized Interactive Inputs (0.6)
+  // Date, range, color, datetime-local — user-interactable but not credential
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    name: 'SpecializedInputRule',
+    priority: 5.5,
+    matches: (el: LiteElement) => {
+      if (el.tag !== 'input') return false;
+      const specializedTypes = new Set(['date', 'datetime-local', 'time', 'month', 'week', 'range', 'color', 'number']);
+      return specializedTypes.has(el.type || '');
+    },
+    evaluate: () => ({ weight: 0.6, needsAI: false, category: 'specialized-input' }),
   },
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -472,13 +495,23 @@ const HEURISTIC_RULES: HeuristicRule[] = [
   {
     name: 'ButtonGrayZoneRule',
     priority: 8,
-    matches: (el: LiteElement) => el.tag === 'button',
+    matches: (el: LiteElement) => el.tag === 'button' || el.role === 'button',
     evaluate: () => ({ weight: 0.5, needsAI: true, category: 'button' }),
   },
   {
     name: 'InputGrayZoneRule',
     priority: 9,
-    matches: (el: LiteElement) => el.tag === 'input',
+    matches: (el: LiteElement) => {
+      // Standard input tags
+      if (el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select') return true;
+      // ARIA widget roles that represent interactive inputs
+      const inputRoles = new Set([
+        'textbox', 'searchbox', 'spinbutton', 'combobox', 'listbox',
+        'slider', 'switch', 'checkbox', 'radio',
+        'menuitemcheckbox', 'menuitemradio',
+      ]);
+      return inputRoles.has(el.role || '');
+    },
     evaluate: () => ({ weight: 0.5, needsAI: true, category: 'input' }),
   },
   {

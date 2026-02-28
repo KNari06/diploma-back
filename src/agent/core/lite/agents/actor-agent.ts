@@ -108,7 +108,53 @@ export class ActorAgent {
         };
       }
 
-      // click, hover, scroll_to
+      // toggle — click-based toggle for checkboxes/switches/radios
+      if (strategy.actionType === 'toggle') {
+        return {
+          command: {
+            action: 'toggle',
+            ref: strategy.targetRef,
+          },
+          reasoning: `Structured: toggle "${strategy.target}" (${strategy.targetRef})`,
+        };
+      }
+
+      // setRange — slider/range input value
+      if (strategy.actionType === 'setRange') {
+        return {
+          command: {
+            action: 'setRange',
+            ref: strategy.targetRef,
+            value: strategy.value || '50',
+          },
+          reasoning: `Structured: setRange "${strategy.target}" to ${strategy.value} (${strategy.targetRef})`,
+        };
+      }
+
+      // clear — clear input field
+      if (strategy.actionType === 'clear') {
+        return {
+          command: {
+            action: 'clear',
+            ref: strategy.targetRef,
+          },
+          reasoning: `Structured: clear "${strategy.target}" (${strategy.targetRef})`,
+        };
+      }
+
+      // selectDate — date/time input value
+      if (strategy.actionType === 'selectDate') {
+        return {
+          command: {
+            action: 'selectDate',
+            ref: strategy.targetRef,
+            value: strategy.value || '',
+          },
+          reasoning: `Structured: selectDate "${strategy.target}" to ${strategy.value} (${strategy.targetRef})`,
+        };
+      }
+
+      // click, hover — other ref-based actions
       return {
         command: {
           action: strategy.actionType as 'click' | 'hover',

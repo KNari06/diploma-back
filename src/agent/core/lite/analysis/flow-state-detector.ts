@@ -65,18 +65,55 @@ export class FlowStateDetector {
   }
 
   /**
-   * Detect flow type from goal
+   * Detect flow type from goal using pattern matching
+   * Supports authentication, e-commerce, search, settings, and multi-step flows
    */
-  private detectFlowType(): 'login' | 'register' | 'checkout' | 'unknown' {
+  private detectFlowType(): string {
+    // Authentication flows
     if (/login|sign\s*in|log\s*in|auth|вход|войти/i.test(this.goal)) {
       return 'login';
     }
     if (/register|sign\s*up|create\s+account|зарегистр|регистрац/i.test(this.goal)) {
       return 'register';
     }
-    if (/checkout|payment|pay|order|purchase/i.test(this.goal)) {
+    if (/forgot\s*password|reset\s*password|recover|восстанов/i.test(this.goal)) {
+      return 'password_reset';
+    }
+
+    // E-commerce flows
+    if (/checkout|payment|pay|order|purchase|оплат|заказ|купить/i.test(this.goal)) {
       return 'checkout';
     }
+    if (/add\s*to\s*cart|корзин|добавить в корзину/i.test(this.goal)) {
+      return 'cart';
+    }
+
+    // Search & filter flows
+    if (/search|find|filter|sort|поиск|найти|фильтр|сортировк/i.test(this.goal)) {
+      return 'search';
+    }
+
+    // Profile & settings flows
+    if (/profile|settings|preferences|account|настройк|профиль|аккаунт/i.test(this.goal)) {
+      return 'settings';
+    }
+    if (/change\s*password|update\s*password|сменить\s*пароль/i.test(this.goal)) {
+      return 'password_change';
+    }
+
+    // Form & wizard flows
+    if (/form|submit|fill|заполн|отправ|анкет/i.test(this.goal)) {
+      return 'form';
+    }
+    if (/wizard|step|onboarding|setup|мастер|шаг/i.test(this.goal)) {
+      return 'wizard';
+    }
+
+    // Navigation flows
+    if (/navigate|go\s*to|open|visit|перейти|открыть/i.test(this.goal)) {
+      return 'navigation';
+    }
+
     return 'unknown';
   }
 
@@ -157,28 +194,36 @@ export class FlowStateDetector {
 
   /**
    * Check if current state is success
+   * Uses broad patterns to work across different flow types
    */
   private isSuccessState(url: string, elements: LiteElement[]): boolean {
-    // Success URL patterns
+    // Success URL patterns (broad coverage for multiple flow types)
     const successUrlPatterns = [
       'dashboard', 'home', 'welcome', 'profile', 'account', 'app',
-      'logged-in', 'success', 'complete', 'thank-you'
+      'logged-in', 'success', 'complete', 'thank-you', 'thankyou',
+      'confirmed', 'done', 'finished', 'result', 'overview',
+      'order-confirmation', 'receipt', 'saved',
     ];
 
     const hasSuccessUrl = successUrlPatterns.some(pattern => url.includes(pattern));
 
-    // Success content keywords
+    // Success content keywords (EN + RU)
     const successKeywords = [
       'welcome', 'dashboard', 'logged in', 'successfully', 'success',
-      'добро пожаловать', 'успешно', 'авторизован'
+      'saved', 'updated', 'confirmed', 'complete', 'thank you',
+      'order placed', 'submitted', 'created',
+      'добро пожаловать', 'успешно', 'авторизован', 'сохранено',
+      'обновлено', 'подтверждено', 'завершено', 'заказ оформлен',
     ];
 
     const hasSuccessContent = this.hasKeywords(elements, successKeywords);
 
-    // Check for logout button (indicates authenticated state)
+    // Check for logout/signout button (indicates authenticated state)
     const hasLogoutButton = elements.some(el =>
-      (el.tag === 'button' || el.tag === 'a') &&
-      (el.name?.toLowerCase().includes('logout') || el.name?.toLowerCase().includes('выйти'))
+      (el.tag === 'button' || el.tag === 'a' || el.role === 'button') &&
+      (el.name?.toLowerCase().includes('logout') ||
+       el.name?.toLowerCase().includes('sign out') ||
+       el.name?.toLowerCase().includes('выйти'))
     );
 
     // Success if:

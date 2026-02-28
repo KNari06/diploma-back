@@ -174,7 +174,7 @@ export interface ObserverInput {
 /** Structured strategy action — replaces free-form text between Strategist→Actor */
 export interface StrategyAction {
   /** What type of action to take */
-  actionType: 'fill' | 'click' | 'scroll' | 'wait' | 'goto' | 'select' | 'press' | 'hover';
+  actionType: 'fill' | 'click' | 'scroll' | 'wait' | 'goto' | 'select' | 'press' | 'hover' | 'toggle' | 'setRange' | 'clear' | 'selectDate';
   /** Target description (e.g., "email field", "submit button") */
   target: string;
   /** Optional target ref if Strategist can identify it from Observer's formAnalysis */

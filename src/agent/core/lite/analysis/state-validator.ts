@@ -84,11 +84,15 @@ export class StateValidator {
         return 'state_changed';
       }
 
-      // 3b. Fill/select actions always change state (input value) even when diff doesn't detect it
-      // The diff engine tracks DOM structure changes but not input value mutations.
-      // If fill/select executed without error, the field was filled — treat as state_changed.
-      if ((actionType === 'fill' || actionType === 'select') && !executionError) {
-        logger.debug('[STATE_VALIDATOR] Fill/select completed without error — treating as state_changed', {
+      // 3b. Value-mutating actions always change state even when diff doesn't detect it.
+      // The diff engine tracks DOM structure changes but not input value mutations,
+      // checkbox/toggle state changes, or range/date value updates.
+      // If these actions executed without error, the element was mutated — treat as state_changed.
+      const VALUE_MUTATING_ACTIONS = new Set([
+        'fill', 'select', 'toggle', 'setRange', 'clear', 'selectDate',
+      ]);
+      if (actionType && VALUE_MUTATING_ACTIONS.has(actionType) && !executionError) {
+        logger.debug('[STATE_VALIDATOR] Value-mutating action completed without error — treating as state_changed', {
           actionType,
           hasPageErrors: diff.newPageErrors.length > 0,
         });

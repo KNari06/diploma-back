@@ -255,22 +255,39 @@ export function buildSnapshotSummary(
   const summary: string[] = [];
   const maxElements = 50;
 
-  // Priority order: forms, inputs, buttons, links, headings
-  const priorityTags = ['form', 'input', 'textarea', 'select', 'button', 'a', 'h1', 'h2', 'h3'];
+  // Priority tags: forms, all input types, buttons, links, headings, dialogs, navigation
+  const priorityTags = new Set([
+    'form', 'input', 'textarea', 'select', 'button', 'a',
+    'h1', 'h2', 'h3', 'h4',
+    'dialog', 'details', 'summary', 'meter', 'output', 'nav',
+  ]);
+
+  // Priority ARIA roles: interactive widgets that may not use standard tags
+  const priorityRoles = new Set([
+    'button', 'link', 'textbox', 'checkbox', 'radio',
+    'switch', 'slider', 'spinbutton', 'combobox', 'listbox',
+    'menuitem', 'tab', 'tabpanel', 'dialog', 'alertdialog',
+    'progressbar', 'searchbox', 'option', 'menuitemcheckbox',
+    'menuitemradio', 'treeitem',
+  ]);
 
   for (const el of elements) {
     if (summary.length >= maxElements) break;
 
-    // Only include priority elements
-    if (!priorityTags.includes(el.tag?.toLowerCase() || '')) continue;
+    const tagLower = el.tag?.toLowerCase() || '';
+    const roleLower = el.role?.toLowerCase() || '';
+
+    // Include if tag is priority OR role is priority
+    if (!priorityTags.has(tagLower) && !priorityRoles.has(roleLower)) continue;
 
     // Skip empty names
     const name = el.name?.trim();
     if (!name) continue;
 
-    // Format: "tag[type]:name" or "tag:name"
+    // Format: "tag[type]:name" or "tag(role):name" for role-based elements
     const typeInfo = el.type ? `[${el.type}]` : '';
-    const entry = `${el.tag}${typeInfo}:${name.slice(0, 50)}`;
+    const roleInfo = !el.type && roleLower && !priorityTags.has(tagLower) ? `(${roleLower})` : '';
+    const entry = `${el.tag}${typeInfo}${roleInfo}:${name.slice(0, 50)}`;
 
     summary.push(entry);
   }

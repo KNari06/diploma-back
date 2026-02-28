@@ -234,6 +234,20 @@ export class TestCaseExecutor {
       case 'wait':
         return `Wait for ${selector || value || 'page to load'}`;
 
+      case 'toggle':
+      case 'check':
+      case 'uncheck':
+        return `Toggle ${selector}`;
+
+      case 'setRange':
+        return `Set ${selector} to "${value}"`;
+
+      case 'clear':
+        return `Clear ${selector}`;
+
+      case 'selectDate':
+        return `Set date ${selector} to "${value}"`;
+
       case 'custom':
         return step.description; // Use description as goal for custom actions
 

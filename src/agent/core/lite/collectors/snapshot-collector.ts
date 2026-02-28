@@ -56,23 +56,28 @@ export class SnapshotCollector {
 
         /**
          * TASK 10: Get element fingerprint for ref stability
-         * Creates a unique signature for an element based on stable attributes
+         * Creates a unique signature for an element based on stable attributes.
+         * ✅ FIX BUG 6: Enhanced with id, data-testid, and deeper DOM path (5 levels)
+         * to survive full Angular/React re-renders where the component tree is rebuilt.
          */
         function getElementFingerprint(el: any): string {
           const tag = el.tagName.toLowerCase();
-          const role = el.getAttribute('role') || '';
+          const role = (el.getAttribute('role') || '').replace(/["']/g, '').trim();
           const type = el.getAttribute('type') || '';
           const name = el.getAttribute('name') || '';
+          const id = el.getAttribute('id') || '';
           const ariaLabel = el.getAttribute('aria-label') || '';
           const placeholder = el.getAttribute('placeholder') || '';
-          const text = (el.textContent || '').trim().slice(0, 30);
+          const testId = el.getAttribute('data-testid') || el.getAttribute('data-test') || '';
+          const text = (el.textContent || '').trim().slice(0, 40);
 
-          // Build a short DOM path (up to 4 ancestors) using tag + child-index at each level.
+          // Build a short DOM path (up to 5 ancestors) using tag + child-index at each level.
           // This is scroll/resize-stable and distinguishes identical elements in different
           // containers (e.g. "Забронировать" buttons inside separate tutor cards).
+          // 5 levels provides better disambiguation for repeated UI patterns.
           const pathParts: string[] = [];
           let cur: Element | null = el;
-          for (let i = 0; i < 4 && cur && cur.parentElement; i++) {
+          for (let i = 0; i < 5 && cur && cur.parentElement; i++) {
             const parent = cur.parentElement;
             const idx = Array.prototype.indexOf.call(parent.children, cur);
             pathParts.push(`${cur.tagName.toLowerCase()}[${idx}]`);
@@ -80,7 +85,18 @@ export class SnapshotCollector {
           }
           const domPath = pathParts.join('/');
 
-          return `${tag}|${role}|${type}|${name}|${ariaLabel}|${placeholder}|${text}|${domPath}`;
+          return `${tag}|${role}|${type}|${name}|${id}|${ariaLabel}|${placeholder}|${testId}|${text}|${domPath}`;
+        }
+
+        /**
+         * ✅ FIX: Safe ARIA attribute reader — strips escaped quotes from Angular/framework output.
+         * Angular can output aria-expanded="\"true\"" which getAttribute returns as '"true"'.
+         * This helper strips those quotes so comparisons work reliably.
+         */
+        function getCleanAttr(el: Element, attr: string): string | null {
+          const raw = el.getAttribute(attr);
+          if (raw === null) return null;
+          return raw.replace(/["']/g, '').trim() || null;
         }
 
         /**
@@ -89,25 +105,60 @@ export class SnapshotCollector {
          * Returns ref of modal container if found
          */
         const detectActiveModal = (): string | undefined => {
-          // Find all potential overlay containers
-          const potentialModals = Array.from(document.querySelectorAll('*')).filter((el: Element) => {
+          // ✅ FIX: Check for native <dialog> elements first (showModal() uses ::backdrop, not position:fixed)
+          const openDialogs = Array.from(document.querySelectorAll('dialog[open]'));
+          for (const dialog of openDialogs) {
+            const style = window.getComputedStyle(dialog);
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            // Native <dialog> with showModal() is always a top-layer modal
+            const existingRef = dialog.getAttribute('data-agent-ref');
+            if (existingRef) return existingRef;
+            const newRef = `e${win.__agentRefCounter++}`;
+            dialog.setAttribute('data-agent-ref', newRef);
+            return newRef;
+          }
+
+          // ✅ PERF FIX: Use targeted selectors instead of querySelectorAll('*')
+          // Only check elements that are likely to be overlays (positioned with z-index)
+          const overlaySelectors = [
+            '[role="dialog"]', '[aria-modal="true"]',
+            '.modal', '.overlay', '.popup', '.drawer',
+            '[class*="modal"]', '[class*="overlay"]', '[class*="popup"]',
+            '[class*="dialog"]', '[class*="backdrop"]',
+          ].join(', ');
+
+          // Collect from targeted selectors + all fixed/absolute positioned elements
+          // Use a two-pass approach: first targeted (cheap), then positional (more expensive but limited)
+          const targetedModals = Array.from(document.querySelectorAll(overlaySelectors));
+
+          // Second pass: fixed/absolute elements with z-index (limited to direct body children + common containers)
+          const positionalCandidates = Array.from(document.querySelectorAll(
+            'body > *, body > * > *, [style*="position: fixed"], [style*="position:fixed"], [style*="position: absolute"], [style*="position:absolute"]'
+          ));
+
+          // Merge and deduplicate
+          const seen = new WeakSet<Element>();
+          const potentialModals: Element[] = [];
+          for (const el of [...targetedModals, ...positionalCandidates]) {
+            if (seen.has(el)) continue;
+            seen.add(el);
+
             const style = window.getComputedStyle(el);
             const position = style.position;
 
             // Must be fixed or absolute
-            if (position !== 'fixed' && position !== 'absolute') return false;
+            if (position !== 'fixed' && position !== 'absolute') continue;
 
             // Must be visible
-            if (style.display === 'none' || style.visibility === 'hidden') return false;
-            if (parseFloat(style.opacity) < 0.1) return false;
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            if (parseFloat(style.opacity) < 0.1) continue;
 
-            // ✅ FIX: Get z-index (must be present, allow any positive value)
-            // Many sites use z-index: 10-50 for modals, not just 100+
+            // Get z-index (must be present, allow any positive value)
             const zIndex = parseInt(style.zIndex, 10);
-            if (isNaN(zIndex) || zIndex < 1) return false;
+            if (isNaN(zIndex) || zIndex < 1) continue;
 
-            return true;
-          });
+            potentialModals.push(el);
+          }
 
           if (potentialModals.length === 0) return undefined;
 
@@ -128,8 +179,10 @@ export class SnapshotCollector {
             const coverage = modalArea / viewportArea;
 
             // Check for modal indicators
-            const hasModalRole = modal.getAttribute('role') === 'dialog' ||
-              modal.getAttribute('aria-modal') === 'true' ||
+            // ✅ FIX: Strip escaped quotes from role attribute (Angular outputs role="\"dialog\"")
+            const modalRole = (modal.getAttribute('role') || '').replace(/["']/g, '').trim();
+            const hasModalRole = modalRole === 'dialog' ||
+              getCleanAttr(modal, 'aria-modal') === 'true' ||
               modal.classList.contains('modal') ||
               modal.classList.contains('overlay') ||
               modal.classList.contains('popup');
@@ -419,12 +472,44 @@ export class SnapshotCollector {
         // Performance bounded to prevent slowdowns on deep web-component pages
         // ═══════════════════════════════════════════════════════════════════════
         const interactiveSelectors = [
+          // ── Core interactive elements ──
           'button', 'a', 'input', 'select', 'textarea',
+
+          // ── ARIA widget roles (covers MUI, Ant Design, Chakra, Radix, Headless UI) ──
           '[role="button"]', '[role="link"]', '[role="menuitem"]',
           '[role="checkbox"]', '[role="radio"]', '[role="tab"]',
+          // ✅ FIX: Dropdown/listbox/combobox — critical for custom selects (MUI Autocomplete, Ant Select)
+          '[role="option"]', '[role="listbox"]', '[role="combobox"]',
+          // ✅ FIX: Menus — context menus, dropdown menus, nav menus (MUI Menu, Headless UI Menu)
+          '[role="menu"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
+          // ✅ FIX: Toggle switches (MUI Switch, Ant Switch, Chakra Switch)
+          '[role="switch"]',
+          // ✅ FIX: Sliders/range inputs (MUI Slider, Ant Slider, native range)
+          '[role="slider"]', '[role="spinbutton"]',
+          // ✅ FIX: Search/text roles — contenteditable regions, search fields
+          '[role="searchbox"]', '[role="textbox"]',
+          // ✅ FIX: Tree navigation (file browsers, nested menus)
+          '[role="treeitem"]',
+          // ✅ FIX: Alert dialogs with confirm/cancel (browser-like alerts)
+          '[role="alertdialog"]',
+
+          // ── Attribute-based interactive elements ──
           '[onclick]', '[tabindex]:not([tabindex="-1"])',
           '[data-testid]', '[data-test]',
-          'canvas' // ✅ L5: Include canvas for vision escalation trigger
+          // ✅ FIX: Bootstrap/Tailwind toggle triggers
+          '[data-toggle]',
+          // ✅ FIX: Popup triggers (elements that open menus/listboxes on click)
+          '[aria-haspopup]',
+          // ✅ FIX: Drag-and-drop targets
+          '[draggable="true"]',
+
+          // ── Semantic HTML elements ──
+          'canvas', // L5: Include canvas for vision escalation trigger
+          'h1', 'h2', 'h3', // GoalDetector/GoalExpander/SemanticWeight
+          '[contenteditable="true"]', '[contenteditable=""]', // Rich text editors
+          'dialog[open]', // Native <dialog> elements
+          // ✅ FIX: Native accordion/disclosure (details/summary)
+          'summary',
         ];
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -523,6 +608,12 @@ export class SnapshotCollector {
 
         // activeModalElement is already computed above via detectActiveModal + activeModalRef.
 
+        // ✅ FIX BUG 5: Track refs used in THIS snapshot pass to prevent duplicates
+        // When two elements produce the same fingerprint (e.g. repeated UI cards),
+        // the fingerprint map would restore the same ref → duplicate data-agent-ref.
+        // This set ensures every element gets a unique ref in each collection pass.
+        const usedRefsThisPass = new Set<string>();
+
         // Process each unique element (including shadow DOM elements)
         uniqueElements.forEach((el: Element) => {
           try {
@@ -592,22 +683,26 @@ export class SnapshotCollector {
             const existingRef = el.getAttribute('data-agent-ref');
 
             let ref: string;
-            if (existingRef && refPattern.test(existingRef)) {
-              // Case 1: Element already has a valid ref, reuse it
+            if (existingRef && refPattern.test(existingRef) && !usedRefsThisPass.has(existingRef)) {
+              // Case 1: Element already has a valid ref AND it's not already used in this pass
               ref = existingRef;
             } else {
               // Case 2: Check fingerprint map for restoration
               const fingerprint = getElementFingerprint(el);
               const restoredRef = win.__agentFingerprintMap.get(fingerprint);
-              if (restoredRef && refPattern.test(restoredRef)) {
+              if (restoredRef && refPattern.test(restoredRef) && !usedRefsThisPass.has(restoredRef)) {
+                // ✅ FIX BUG 5: Only restore if ref isn't already used by another element
                 ref = restoredRef;
               } else {
-                // Case 3: Assign new ref
+                // Case 3: Assign new ref (fingerprint collision or first time)
                 ref = `${refPrefix}${win.__agentRefCounter++}`;
               }
               // Store fingerprint → ref mapping
               win.__agentFingerprintMap.set(fingerprint, ref);
             }
+
+            // ✅ FIX BUG 5: Mark ref as used in this pass to prevent duplicates
+            usedRefsThisPass.add(ref);
 
             if (!existingRef || existingRef !== ref) {
               el.setAttribute('data-agent-ref', ref);
@@ -645,16 +740,19 @@ export class SnapshotCollector {
 
             // SECURITY: Redact sensitive input values to prevent credential leakage
             // Password fields and credential-related inputs should never have values in snapshot
+            // ✅ FIX: Use token-level matching for autocomplete (space-separated per spec)
+            // to avoid false positives like 'tel' matching 'hotel'
+            const autocompleteTokens = new Set(
+              (el.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/).filter(Boolean)
+            );
+            const SENSITIVE_AUTOCOMPLETE = new Set([
+              'password', 'current-password', 'new-password',
+              'username', 'email', 'tel', 'phone',
+            ]);
+            const hasSensitiveAutocomplete = [...SENSITIVE_AUTOCOMPLETE].some(s => autocompleteTokens.has(s));
             const isSensitiveInput = isInput && (
               input.type === 'password' ||
-              el.getAttribute('autocomplete')?.includes('password') ||
-              el.getAttribute('autocomplete')?.includes('current-password') ||
-              el.getAttribute('autocomplete')?.includes('new-password') ||
-              // Also redact common identifier fields (username/email/phone) to avoid leaking PII/autofill to LLM
-              el.getAttribute('autocomplete')?.includes('username') ||
-              el.getAttribute('autocomplete')?.includes('email') ||
-              el.getAttribute('autocomplete')?.includes('tel') ||
-              el.getAttribute('autocomplete')?.includes('phone') ||
+              hasSensitiveAutocomplete ||
               /password|passwd|pwd|secret|credential/i.test(el.getAttribute('name') || '') ||
               /password|passwd|pwd|secret|credential/i.test(el.getAttribute('id') || '') ||
               /user|username|login|email|phone|tel|mobile/i.test(el.getAttribute('name') || '') ||
@@ -664,16 +762,17 @@ export class SnapshotCollector {
             // ═══════════════════════════════════════════════════════════════
             // STEP EDITOR V2: Extract ARIA state
             // ═══════════════════════════════════════════════════════════════
-            const ariaExpandedRaw = el.getAttribute('aria-expanded');
+            // ✅ FIX: Use getCleanAttr to strip Angular escaped quotes from ARIA states
+            const ariaExpandedRaw = getCleanAttr(el, 'aria-expanded');
             const ariaExpanded = ariaExpandedRaw === 'true' ? true : ariaExpandedRaw === 'false' ? false : undefined;
 
-            const ariaPressedRaw = el.getAttribute('aria-pressed');
+            const ariaPressedRaw = getCleanAttr(el, 'aria-pressed');
             const ariaPressed = ariaPressedRaw === 'true' ? true : ariaPressedRaw === 'false' ? false : undefined;
 
-            const ariaSelectedRaw = el.getAttribute('aria-selected');
+            const ariaSelectedRaw = getCleanAttr(el, 'aria-selected');
             const ariaSelected = ariaSelectedRaw === 'true' ? true : ariaSelectedRaw === 'false' ? false : undefined;
 
-            const ariaCheckedRaw = el.getAttribute('aria-checked');
+            const ariaCheckedRaw = getCleanAttr(el, 'aria-checked');
             const ariaChecked = ariaCheckedRaw === 'true' ? true :
               ariaCheckedRaw === 'false' ? false :
                 ariaCheckedRaw === 'mixed' ? 'mixed' : undefined;
@@ -681,11 +780,11 @@ export class SnapshotCollector {
             // ═══════════════════════════════════════════════════════════════
             // STEP EDITOR V2: Extract validation state
             // ═══════════════════════════════════════════════════════════════
-            const required = input.required || el.hasAttribute('required') || el.getAttribute('aria-required') === 'true';
-            const readOnly = input.readOnly || el.hasAttribute('readonly') || el.getAttribute('aria-readonly') === 'true';
+            const required = input.required || el.hasAttribute('required') || getCleanAttr(el, 'aria-required') === 'true';
+            const readOnly = input.readOnly || el.hasAttribute('readonly') || getCleanAttr(el, 'aria-readonly') === 'true';
 
             // Check invalid via aria-invalid or :invalid pseudo-class
-            const ariaInvalid = el.getAttribute('aria-invalid');
+            const ariaInvalid = getCleanAttr(el, 'aria-invalid');
             let invalid = ariaInvalid === 'true';
             if (!invalid && isInput) {
               try {
@@ -732,7 +831,7 @@ export class SnapshotCollector {
 
             elements.push({
               ref,
-              role: el.getAttribute('role') || el.tagName.toLowerCase(),
+              role: (el.getAttribute('role') || el.tagName.toLowerCase()).replace(/["']/g, '').trim(),
               name: ariaLabel ||
                 el.getAttribute('title') ||
                 el.getAttribute('placeholder') ||
@@ -835,11 +934,15 @@ export class SnapshotCollector {
             }
           });
 
-          // Priority 4: All visible text as fallback (for edge cases)
-          // @ts-expect-error - document available in browser context
-          const bodyText = document.body?.innerText || '';
-          if (bodyText) {
-            textParts.push(bodyText);
+          // Priority 4: Fallback - only body text NOT already captured above
+          // ✅ FIX: Skip full body text to avoid 50% duplication; only add if no credential
+          // texts found in priorities 1-3 (rare edge case fallback)
+          if (textParts.length === 0) {
+            // @ts-expect-error - document available in browser context
+            const bodyText = document.body?.innerText || '';
+            if (bodyText) {
+              textParts.push(bodyText.slice(0, 5000));
+            }
           }
 
           // Join and limit to 10k chars
@@ -1027,6 +1130,75 @@ export class SnapshotCollector {
           return { tables, lists, pagination };
         })();
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // PAGE ALERTS: Collect visible error/alert/warning text from non-interactive elements.
+        // These are invisible to the interactive-only element collection above.
+        // Critical for detecting: wrong credentials, validation errors, auth failures,
+        // rate limiting, account locked, etc.
+        // ═══════════════════════════════════════════════════════════════════════
+        const pageAlerts: string[] = [];
+        try {
+          const alertSelectors = [
+            '[role="alert"]',
+            '.error-message, .form-error, .field-error, .validation-error',
+            '.invalid-feedback',
+            '[aria-live="assertive"]',
+          ];
+
+          // Broader selectors that need extra filtering to avoid false positives
+          const broadSelectors = [
+            '[class*="error"]:not(input):not(select):not(textarea):not(button):not(a)',
+            '[class*="danger"]:not(input):not(button):not(a)',
+            '.alert:not([class*="alert-info"]):not([class*="alert-success"]):not([class*="alert-primary"])',
+          ];
+
+          const seenAlertTexts = new Set<string>();
+
+          // Collect from precise selectors first
+          for (const selector of alertSelectors) {
+            try {
+              document.querySelectorAll(selector).forEach((el: Element) => {
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+                if (parseFloat(style.opacity) < 0.1) return;
+                const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (text.length >= 3 && text.length <= 300 && !seenAlertTexts.has(text)) {
+                  seenAlertTexts.add(text);
+                  pageAlerts.push(text.slice(0, 150));
+                }
+              });
+            } catch {
+              // Selector may be invalid on some pages
+            }
+          }
+
+          // Collect from broader selectors (only if we didn't already find alerts)
+          if (pageAlerts.length === 0) {
+            for (const selector of broadSelectors) {
+              try {
+                document.querySelectorAll(selector).forEach((el: Element) => {
+                  const style = window.getComputedStyle(el);
+                  if (style.display === 'none' || style.visibility === 'hidden') return;
+                  if (parseFloat(style.opacity) < 0.1) return;
+                  // Extra size filter: error messages are typically small elements, not page-wide containers
+                  const rect = el.getBoundingClientRect();
+                  // @ts-expect-error - window available in browser context
+                  if (rect.width > window.innerWidth * 0.9 && rect.height > 200) return; // Skip large containers
+                  const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                  if (text.length >= 3 && text.length <= 300 && !seenAlertTexts.has(text)) {
+                    seenAlertTexts.add(text);
+                    pageAlerts.push(text.slice(0, 150));
+                  }
+                });
+              } catch {
+                // Selector may be invalid
+              }
+            }
+          }
+        } catch {
+          // Page alert collection is non-critical — never break snapshot
+        }
+
         return {
           // @ts-expect-error - window and document available in browser context
           url: window.location.href,
@@ -1039,6 +1211,7 @@ export class SnapshotCollector {
           pageTextForExtraction, // For credential extraction only
           metadata, // P0: Visual content metadata for proactive vision detection
           pageStructure, // Manus: Tables, lists, pagination detection
+          pageAlerts: pageAlerts.length > 0 ? pageAlerts.slice(0, 5) : undefined, // Max 5 alerts
         };
       });
 
@@ -1079,7 +1252,7 @@ export class SnapshotCollector {
                 if (rect.width < 5 || rect.height < 5) return;
 
                 const tag = htmlEl.tagName.toLowerCase();
-                const role = htmlEl.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'input' || tag === 'select' || tag === 'textarea' ? 'input' : 'button');
+                const role = (htmlEl.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'input' || tag === 'select' || tag === 'textarea' ? 'input' : 'button')).replace(/["']/g, '').trim();
                 const name = htmlEl.getAttribute('aria-label') || htmlEl.title || htmlEl.textContent?.trim().slice(0, 80) || htmlEl.getAttribute('placeholder') || '';
 
                 els.push({
@@ -1090,7 +1263,7 @@ export class SnapshotCollector {
                   type: htmlEl.getAttribute('type') || undefined,
                   placeholder: htmlEl.getAttribute('placeholder') || undefined,
                   checked: (htmlEl as HTMLInputElement).checked || undefined,
-                  disabled: htmlEl.hasAttribute('disabled') || htmlEl.getAttribute('aria-disabled') === 'true' || undefined,
+                  disabled: htmlEl.hasAttribute('disabled') || (htmlEl.getAttribute('aria-disabled') || '').replace(/["']/g, '').trim() === 'true' || undefined,
                   visible: true,
                   context: `iframe: ${fName}`,
                   iframeSource: fName,
@@ -1144,9 +1317,21 @@ export class SnapshotCollector {
     let elements = snapshot.elements;
     if (maxElements > 0 && snapshot.elements.length > maxElements) {
       const priorityScore = (el: LiteElement): number => {
+        // P4: Form inputs — highest priority (user needs to fill these)
         if (el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select') return 4;
+        // P4: ARIA input widgets (combobox, slider, spinbutton, switch, searchbox, textbox)
+        const inputRoles = ['combobox', 'slider', 'spinbutton', 'switch', 'searchbox', 'textbox'];
+        if (inputRoles.includes(el.role)) return 4;
+        // P3: Buttons, headings, and actionable elements
         if (el.tag === 'button' || el.role === 'button') return 3;
+        if (el.tag === 'h1' || el.tag === 'h2' || el.tag === 'h3') return 3;
+        // P3: Dropdown options/menu items — critical for selection flows
+        const actionRoles = ['option', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'treeitem'];
+        if (actionRoles.includes(el.role)) return 3;
+        // P2: Links, tabs, summary (accordion triggers)
         if (el.tag === 'a' || el.role === 'link') return 2;
+        if (el.role === 'tab' || el.tag === 'summary') return 2;
+        // P1: Everything else (containers, listbox, menu, canvas, etc.)
         return 1;
       };
       elements = [...snapshot.elements]
@@ -1189,6 +1374,17 @@ export class SnapshotCollector {
       if (ps.pagination) {
         lines.push(`PAGINATION: page=${ps.pagination.currentPage || '?'}/${ps.pagination.totalPages || '?'} nextRef=${ps.pagination.nextRef || 'none'} prevRef=${ps.pagination.prevRef || 'none'}`);
       }
+    }
+
+    // Page alerts/errors (non-interactive error messages visible on page)
+    // CRITICAL: These are error toasts, validation messages, auth failures that
+    // are NOT interactive elements and would otherwise be invisible to the agent.
+    if (snapshot.pageAlerts && snapshot.pageAlerts.length > 0) {
+      lines.push('[PAGE ALERTS]');
+      snapshot.pageAlerts.slice(0, 5).forEach(alert => {
+        lines.push(`  ⚠ "${alert}"`);
+      });
+      lines.push('');
     }
 
     lines.push('');

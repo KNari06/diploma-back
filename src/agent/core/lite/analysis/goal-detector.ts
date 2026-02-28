@@ -456,9 +456,9 @@ Respond with JSON ONLY.`;
           'cookie', 'cookies', 'consent', 'location', 'newsletter', 'subscribe',
           'notification', 'разрешить', 'подписка', 'уведомления',
         ],
-        systemErrorKeywords: response.systemErrorKeywords?.slice(0, 8) || [
-          '500', '502', '503', '504', 'server error', 'internal error',
-          'crash', 'fatal', 'service unavailable',
+        systemErrorKeywords: response.systemErrorKeywords?.slice(0, 12) || [
+          '500', '502', '503', '504', '429', 'server error', 'internal error',
+          'crash', 'fatal', 'service unavailable', 'rate limit', 'timeout',
         ],
         validationErrorKeywords: response.validationErrorKeywords?.slice(0, 10) || [
           'wrong password', 'invalid', 'incorrect', 'неверный', 'ошибка',
@@ -655,6 +655,34 @@ Respond with JSON ONLY.`;
       // Dynamic weights: contact needs form + heading focus
       parsed.weights = { url: 0.3, form: 0.3, heading: 0.25, cta: 0.1, content: 0.05 };
       parsed.confidenceThreshold = 0.6; // Standard threshold
+    // ✅ FIX: Add common goal types that were falling through to default
+    } else if (/add\s*to\s*cart|добавить\s*в\s*корзин|корзин/i.test(lowerGoal)) {
+      parsed.action = 'add_to_cart';
+      parsed.keywords = ['add to cart', 'add to bag', 'buy', 'в корзину', 'добавить', 'купить'];
+      parsed.successKeywords = [
+        'added to cart', 'added to bag', 'added successfully', 'in cart', 'добавлено', 'в корзине',
+      ];
+      parsed.urlPatterns = ['cart', 'basket', 'bag'];
+      parsed.weights = { url: 0.2, form: 0.1, heading: 0.2, cta: 0.35, content: 0.15 };
+      parsed.confidenceThreshold = 0.5;
+    } else if (/book|забронир|бронир|reserv/i.test(lowerGoal)) {
+      parsed.action = 'booking';
+      parsed.keywords = ['book', 'reserve', 'забронировать', 'бронирование', 'reservation'];
+      parsed.successKeywords = [
+        'booked', 'reserved', 'confirmed', 'booking confirmed', 'забронировано', 'подтверждено',
+      ];
+      parsed.urlPatterns = ['book', 'reservation', 'booking', 'confirm'];
+      parsed.weights = { url: 0.3, form: 0.25, heading: 0.2, cta: 0.15, content: 0.1 };
+      parsed.confidenceThreshold = 0.6;
+    } else if (/subscribe|подпис|newsletter/i.test(lowerGoal)) {
+      parsed.action = 'subscribe';
+      parsed.keywords = ['subscribe', 'newsletter', 'подписаться', 'подписка', 'рассылка'];
+      parsed.successKeywords = [
+        'subscribed', 'thank you', 'confirmed', 'подписка оформлена', 'спасибо',
+      ];
+      parsed.urlPatterns = ['subscribe', 'newsletter', 'confirm'];
+      parsed.weights = { url: 0.25, form: 0.3, heading: 0.2, cta: 0.15, content: 0.1 };
+      parsed.confidenceThreshold = 0.5;
     } else {
       // Default weights for unknown actions
       parsed.weights = { url: 0.35, form: 0.25, heading: 0.2, cta: 0.15, content: 0.05 };
@@ -688,8 +716,9 @@ Respond with JSON ONLY.`;
     totalWeight += weights.url;
     if (urlSignal.match) matchedWeight += weights.url * urlSignal.weight;
 
-    // 2. Form presence (dynamic weight, only for form-related goals)
-    if (['register', 'login', 'contact', 'auth'].includes(this.parsedGoal.action || '')) {
+    // 2. Form presence (dynamic weight, for any goal that involves forms)
+    // ✅ FIX: Include 'checkout' — checkout always has forms (address, payment, etc.)
+    if (['register', 'login', 'contact', 'auth', 'checkout'].includes(this.parsedGoal.action || '')) {
       const formSignal = this.checkFormPresence(snapshot);
       signals.push(formSignal);
       totalWeight += weights.form;
@@ -740,18 +769,22 @@ Respond with JSON ONLY.`;
     const threshold = this.parsedGoal.confidenceThreshold || 0.6;
 
     // Determine if goal is reached (using dynamic threshold)
-    // ✅ NEW: Also reject if negative signals are found (error messages on page)
+    // ✅ FIX: Require majority of available signals, not fixed 3
+    // When form signal is skipped (search/unknown goals), total signals = 4, not 5
+    // Requiring 3/4 is too strict for simple goals. Use majority rule instead.
     const matchedSignalCount = signals.filter(s => s.match).length;
-    const goalReached = progressScore >= threshold && matchedSignalCount >= 3 && !negativeFound;
+    const totalSignalCount = signals.length;
+    const minMatchedSignals = Math.max(2, Math.ceil(totalSignalCount * 0.5)); // At least 50% of signals
+    const goalReached = progressScore >= threshold && matchedSignalCount >= minMatchedSignals && !negativeFound;
 
     // Determine confidence
-    // ✅ NEW: Lower confidence when negative signals are present
+    // ✅ FIX: Use dynamic signal count thresholds instead of hardcoded 4/2
     let confidence: 'low' | 'medium' | 'high' = 'low';
     if (negativeFound) {
       confidence = 'low'; // Always low if errors on page
-    } else if (progressScore >= threshold + 0.2 && matchedSignalCount >= 4) {
+    } else if (progressScore >= threshold + 0.2 && matchedSignalCount >= Math.ceil(totalSignalCount * 0.8)) {
       confidence = 'high';
-    } else if (progressScore >= threshold - 0.1 && matchedSignalCount >= 2) {
+    } else if (progressScore >= threshold - 0.1 && matchedSignalCount >= minMatchedSignals) {
       confidence = 'medium';
     }
 
@@ -772,7 +805,8 @@ Respond with JSON ONLY.`;
       threshold: Math.round(threshold * 100) + '%',
       confidence,
       matchedSignals: matchedSignalCount,
-      totalSignals: signals.length,
+      totalSignals: totalSignalCount,
+      minMatchedRequired: minMatchedSignals,
       negativeSignalsFound: negativeFound,
     });
 
@@ -793,24 +827,58 @@ Respond with JSON ONLY.`;
       'ошибка', 'неверн', 'отказ', 'заблокир', 'некорректн'
     ];
 
+    // ✅ FIX: Patterns that contain negative keywords but are NOT actual errors
+    // e.g. "Report Error", "Error Handling Tutorial", "Invalid Date Format Guide"
+    const falsePositivePatterns = [
+      'report error', 'error report', 'error handling', 'error log',
+      'error boundary', 'error page', 'no errors', 'without error',
+      'fix error', 'debug error', 'error free', '0 errors',
+      'handle error', 'catch error', 'throw error',
+      'invalid date', 'invalid format', // Tutorial/guide content
+      'report invalid', 'mark as invalid',
+    ];
+
     const details: string[] = [];
 
-    // Check all element names for negative signals
-    const allText = snapshot.elements
-      .map(el => el.name || '')
-      .join(' ')
-      .toLowerCase();
+    // Check pageAlerts FIRST — these are the most reliable negative signals
+    // (they come from [role="alert"], .error-message, etc.)
+    const alertText = (snapshot.pageAlerts || []).join(' ').toLowerCase();
 
     for (const signal of negativeSignals) {
-      if (allText.includes(signal.toLowerCase())) {
-        details.push(signal);
+      if (alertText.includes(signal.toLowerCase())) {
+        details.push(`alert:${signal}`);
       }
     }
 
-    // Also check page title
+    // ✅ FIX: For element text, use word-boundary matching to reduce false positives
+    // "Report Error" button should NOT trigger, but "Error: Invalid password" should
+    const elementTexts = snapshot.elements
+      .map(el => (el.name || '').toLowerCase())
+      .filter(t => t.length > 0);
+
+    for (const signal of negativeSignals) {
+      const signalLower = signal.toLowerCase();
+      // Build regex with word boundary for Latin, simple includes for Cyrillic
+      const isCyrillic = /[а-яё]/i.test(signal);
+      const regex = isCyrillic ? null : new RegExp(`\\b${signalLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+
+      for (const text of elementTexts) {
+        const matched = regex ? regex.test(text) : text.includes(signalLower);
+        if (matched) {
+          // ✅ FIX: Check against false positive patterns
+          const isFalsePositive = falsePositivePatterns.some(fp => text.includes(fp));
+          if (!isFalsePositive && !details.includes(signal)) {
+            details.push(signal);
+          }
+          break; // One match per signal is enough
+        }
+      }
+    }
+
+    // Also check page title (less strict — title is short and intentional)
     const titleLower = (snapshot.title || '').toLowerCase();
     for (const signal of negativeSignals) {
-      if (titleLower.includes(signal.toLowerCase()) && !details.includes(signal)) {
+      if (titleLower.includes(signal.toLowerCase()) && !details.includes(signal) && !details.includes(`alert:${signal}`)) {
         details.push(`title:${signal}`);
       }
     }
@@ -1193,12 +1261,17 @@ Respond with JSON ONLY.`;
 
     // Scenario 3: Button text changed from "Continue" to "Register"/"Finish"
     // This indicates moving from intermediate step to final step
+    const finishKeywords = ['register', 'finish', 'complete', 'submit', 'зарегистрироваться', 'завершить'];
     const hasFinishButton = snapshot.elements.some(el =>
-      el.tag === 'button' && ['register', 'finish', 'complete', 'submit', 'зарегистрироваться', 'завершить'].some(
+      el.tag === 'button' && finishKeywords.some(
         kw => (el.name || '').toLowerCase().includes(kw)
       )
     );
-    const hadContinueButton = removedRefs.length > 0; // Simplified check
+    // ✅ FIX: Check if removed elements actually had a continue/next button
+    // instead of treating any removal as "had continue button"
+    const hadContinueButton = stateDiff.addedElements.length > 0 && removedRefs.length > 0 &&
+      // At least some removed elements should have been interactive (buttons/links)
+      removedRefs.length <= addedElements.length * 3; // Sanity: not a full page reload
 
     if (hasFinishButton && hadContinueButton && stateDiff.hasVisualChange) {
       logger.info('[GOAL_DETECTOR] Multi-step progress detected: continue → finish', {
@@ -1269,8 +1342,18 @@ Respond with JSON ONLY.`;
     }
 
     // Check for success indicators in AI's thought
+    // ✅ FIX: Use word-boundary regex to prevent "not done" matching "done",
+    // "not completed" matching "completed", etc.
     if (aiThought) {
       const thoughtLower = aiThought.toLowerCase();
+
+      // Negative prefixes that negate success phrases
+      const negationPatterns = [
+        'not ', 'no ', 'isn\'t ', 'hasn\'t ', 'haven\'t ', 'wasn\'t ',
+        'cannot ', 'can\'t ', 'didn\'t ', 'doesn\'t ', 'won\'t ',
+        'never ', 'almost ', 'nearly ', 'partially ', 'not yet ',
+      ];
+
       const successPhrases = [
         'completed',
         'successfully',
@@ -1283,7 +1366,14 @@ Respond with JSON ONLY.`;
       ];
 
       for (const phrase of successPhrases) {
-        if (thoughtLower.includes(phrase)) {
+        const phraseIndex = thoughtLower.indexOf(phrase);
+        if (phraseIndex === -1) continue;
+
+        // ✅ FIX: Check if phrase is preceded by negation
+        const contextBefore = thoughtLower.slice(Math.max(0, phraseIndex - 15), phraseIndex);
+        const isNegated = negationPatterns.some(neg => contextBefore.endsWith(neg));
+
+        if (!isNegated) {
           // Cross-check with at least some signals
           if (detection.progressScore >= 0.3) {
             return true;
@@ -1351,12 +1441,26 @@ Respond with JSON ONLY.`;
     }
 
     // Check for success indicators in AI's thought (quick check)
+    // ✅ FIX: Use negation-aware matching (same as validateDoneClaim)
     if (aiThought && heuristicResult.progressScore >= MIN_HEURISTIC_CONFIDENCE) {
       const thoughtLower = aiThought.toLowerCase();
       const successPhrases = ['completed', 'successfully', 'goal reached', 'done', 'finished', 'submitted', 'registered', 'logged in'];
 
+      const negationPatterns = [
+        'not ', 'no ', 'isn\'t ', 'hasn\'t ', 'haven\'t ', 'wasn\'t ',
+        'cannot ', 'can\'t ', 'didn\'t ', 'doesn\'t ', 'won\'t ',
+        'never ', 'almost ', 'nearly ', 'partially ', 'not yet ',
+      ];
+
       for (const phrase of successPhrases) {
-        if (thoughtLower.includes(phrase)) {
+        const phraseIndex = thoughtLower.indexOf(phrase);
+        if (phraseIndex === -1) continue;
+
+        // Check if phrase is preceded by negation
+        const contextBefore = thoughtLower.slice(Math.max(0, phraseIndex - 15), phraseIndex);
+        const isNegated = negationPatterns.some(neg => contextBefore.endsWith(neg));
+
+        if (!isNegated) {
           logger.info('[GOAL_DETECTOR] Heuristic accepted done claim with thought phrase', {
             testId: this.testId,
             phrase,
@@ -1695,12 +1799,14 @@ Set isBlocked=true ONLY for hard blocks (captcha, 2FA, phone verification).`;
     const isRegisterGoal = /register|sign\s*up|create.*account/i.test(goalLower);
     const isCheckoutGoal = /checkout|payment|purchase/i.test(goalLower);
 
-    // Group elements by containerRef (form parent)
+    // ✅ FIX: Group elements by containerRef (unique ref) instead of regex on context string
+    // Using containerRef ensures two different Forms with same parentType don't merge
     const containerGroups = new Map<string, LiteElement[]>();
     for (const el of elements) {
       if (el.tag !== 'input' && el.tag !== 'select' && el.tag !== 'textarea') continue;
 
-      const container = el.context?.match(/inside:\s*([^"]+)/)?.[1] || 'root';
+      // Prefer containerRef (unique element ref), fallback to context string, then 'root'
+      const container = el.containerRef || el.context?.match(/inside:\s*([^"]+)/)?.[1] || 'root';
       if (!containerGroups.has(container)) {
         containerGroups.set(container, []);
       }

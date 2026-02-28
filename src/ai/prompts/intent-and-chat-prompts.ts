@@ -186,6 +186,14 @@ AVAILABLE INTENTS: ${intents.join(', ')}
    - User gives a website URL (or bare domain) + action request
    - Apply URL CLASSIFICATION rules above → must resolve to platform_test
    - Keywords: "test", "check", "verify" + website URL
+   - EXECUTION STRATEGY (set executionStrategy field):
+     • "exploration" — user wants AUTONOMOUS DISCOVERY of ALL flows on a site.
+       Signal: user asks to explore, discover, find all flows, map the app, generate test cases for whole site, crawl, survey.
+       Examples: "explore this site", "find all flows on example.com", "discover test cases", "map all pages", "исследуй сайт", "найди все flow", "сгенерируй тест-кейсы по всему сайту"
+     • "standard" (default) — user wants to test a SPECIFIC flow or page.
+       Signal: user names a concrete goal, page, form, or action to test.
+       Examples: "test login on example.com", "check registration form", "verify checkout"
+     • If unclear, default to "standard".
 
 2. "api_test" - RUN a new API test (or approve existing one)
    - User gives an API URL/path + action request, OR approves a pending test plan
@@ -289,6 +297,7 @@ OPTIONAL FIELDS (include if relevant):
   "scope": "full" | "page" | "element" | "flow" | "form" | "auth" | "navigation" | null,
   "target": string | null,
   "page": string | null,
+  "executionStrategy": "standard" | "exploration",
   "apiMethod": "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | null,
   "apiUrl": string | null,
   "apiBody": object | null,
@@ -391,7 +400,16 @@ Ex24: "type hello in the search input" (previewSessionId in context)
 → {"intent": "editor_action", "intent_confidence": 0.93, "rawText": "..."}
 
 Ex25: "run the registration test" (previewSessionId in context, editor mode)
-→ {"intent": "run_regression", "intent_confidence": 0.88, "rawText": "..."}`;
+→ {"intent": "run_regression", "intent_confidence": 0.88, "rawText": "..."}
+
+Ex26: "explore this site https://myapp.com"
+→ {"intent": "platform_test", "intent_confidence": 0.92, "page": "https://myapp.com", "scope": "full", "executionStrategy": "exploration", "rawText": "..."}
+
+Ex27: "найди все flow на repetino.kz"
+→ {"intent": "platform_test", "intent_confidence": 0.90, "page": "repetino.kz", "scope": "full", "executionStrategy": "exploration", "rawText": "..."}
+
+Ex28: "discover all test cases on example.com"
+→ {"intent": "platform_test", "intent_confidence": 0.93, "page": "example.com", "scope": "full", "executionStrategy": "exploration", "rawText": "..."}`;
 
   // Add context if available
   if (context) {

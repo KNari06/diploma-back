@@ -254,6 +254,18 @@ export const LITE_ENGINE_FLAGS = {
   enableSupervisorTier2: true,
   /** Timeout for Tier 2 AI call (ms) */
   supervisorTier2TimeoutMs: 3000,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PIPELINE V2: COLLABORATIVE AGENT TEAM (Planner → Executor → Reviewer)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable Pipeline v2 (replaces multi-agent brain + monolithic fallback) */
+  enablePipelineV2: false,
+  /** Maximum pipeline rounds (Planner→Executor→Reviewer cycles) */
+  pipelineMaxRounds: 10,
+  /** Pipeline timeout in ms */
+  pipelineTimeoutMs: 5 * 60 * 1000,
+  /** Max command-calling rounds per Executor invocation */
+  pipelineExecutorMaxRounds: 3,
 } as const;
 
 /**

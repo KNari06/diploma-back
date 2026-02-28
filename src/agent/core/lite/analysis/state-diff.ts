@@ -68,9 +68,13 @@ export class StateDiffComputer {
         const afterEl = after.elements.find((el) => el.ref === beforeEl.ref);
         if (!afterEl) return;
 
-        // Check each property for changes
+        // Check each property for changes — covers native state + ARIA state
         const fieldsToCheck: Array<keyof LiteElement> = [
-          'name', 'value', 'checked', 'disabled', 'visible'
+          'name', 'value', 'checked', 'disabled', 'visible',
+          // ARIA states: toggle switches, custom checkboxes, accordions, tabs
+          'ariaChecked', 'ariaExpanded', 'ariaPressed', 'ariaSelected',
+          // Validation state changes
+          'invalid', 'required', 'readOnly',
         ];
 
         fieldsToCheck.forEach((field) => {
@@ -267,10 +271,12 @@ export class StateDiffComputer {
     } else if (totalChanges > 0 || diff.meaningfulChange) {
       lines.push(`✅ DOM CHANGED: +${diff.addedElements.length} added, -${diff.removedRefs.length} removed, ~${diff.changedElements.length} modified`);
 
-      // Show key added elements (forms, buttons, inputs)
+      // Show key added elements (interactive elements with high semantic weight)
+      const KEY_TAGS = new Set(['form', 'button', 'input', 'textarea', 'select', 'dialog', 'details', 'nav']);
+      const KEY_ROLES = new Set(['button', 'textbox', 'switch', 'slider', 'checkbox', 'radio', 'dialog', 'alertdialog', 'combobox']);
       const keyElements = diff.addedElements
         .filter(el =>
-          el.tag === 'form' || el.tag === 'button' || el.tag === 'input' || el.type === 'password'
+          KEY_TAGS.has(el.tag) || KEY_ROLES.has(el.role || '') || el.type === 'password'
         )
         .slice(0, 3);
 

@@ -27,6 +27,10 @@ function mapActionType(action: AICommand['action']): DynamicActionType {
     select: 'select',
     hover: 'hover',
     wait: 'wait',
+    toggle: 'click',    // toggles map to click in graph (checkbox/switch click)
+    setRange: 'fill',   // range slider maps to fill in graph (setting a value)
+    clear: 'fill',      // clear maps to fill in graph (modifying field value)
+    selectDate: 'fill', // date selection maps to fill in graph (setting a value)
   };
   return mapping[action] || 'click';
 }
@@ -89,6 +93,18 @@ export function toDynamicAction(
       break;
     case 'wait':
       description = 'Wait for page stability';
+      break;
+    case 'toggle':
+      description = `Toggle${elementInfo || (ref ? ` element ${ref}` : '')}`;
+      break;
+    case 'setRange':
+      description = `Set range${elementInfo || (ref ? ` element ${ref}` : '')} to "${command.value || ''}"`;
+      break;
+    case 'clear':
+      description = `Clear${elementInfo || (ref ? ` element ${ref}` : '')}`;
+      break;
+    case 'selectDate':
+      description = `Set date${elementInfo || (ref ? ` element ${ref}` : '')} to "${command.value || ''}"`;
       break;
     default:
       description = `${command.action}${elementInfo || ''}`;

@@ -227,7 +227,7 @@ export class MultiAgentOrchestrator {
           // Validate: action type valid + ref exists on page + NOT in forbidden list
           if (diagnosis.mandatoryAction) {
             const ma = diagnosis.mandatoryAction;
-            const VALID_ACTIONS = new Set(['click', 'fill', 'press', 'goto', 'scroll', 'select', 'hover', 'wait']);
+            const VALID_ACTIONS = new Set(['click', 'fill', 'press', 'goto', 'scroll', 'select', 'hover', 'wait', 'toggle', 'setRange', 'clear', 'selectDate']);
             const refValid = !ma.ref || new RegExp(`\\b${ma.ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(input.snapshotElements);
 
             // Check against forbidden actions — mandatory actions must NOT repeat failed actions
@@ -916,7 +916,7 @@ export class MultiAgentOrchestrator {
             }
           } else if (verdict.verdict === 'override') {
             // Cognitive: Apply structured override if available and valid
-            const VALID_ACTIONS = new Set(['click', 'fill', 'press', 'goto', 'scroll', 'select', 'hover', 'wait']);
+            const VALID_ACTIONS = new Set(['click', 'fill', 'press', 'goto', 'scroll', 'select', 'hover', 'wait', 'toggle', 'setRange', 'clear', 'selectDate']);
             if (LITE_ENGINE_FLAGS.enableCriticOverride && verdict.structuredOverride?.ref) {
               const overrideRef = verdict.structuredOverride.ref;
               const overrideAction = verdict.structuredOverride.action;
@@ -931,7 +931,7 @@ export class MultiAgentOrchestrator {
                 if (refPattern.test(input.snapshotElements)) {
                   action = {
                     command: {
-                      action: overrideAction as 'click' | 'fill' | 'press' | 'goto' | 'scroll' | 'select' | 'hover' | 'wait',
+                      action: overrideAction as 'click' | 'fill' | 'press' | 'goto' | 'scroll' | 'select' | 'hover' | 'wait' | 'toggle' | 'setRange' | 'clear' | 'selectDate',
                       ref: overrideRef,
                       value: verdict.structuredOverride.value,
                     },
@@ -1178,6 +1178,14 @@ export class MultiAgentOrchestrator {
       case 'click': return `Clicked ${refLabel}`;
       case 'goto': return `Navigated to new page`;
       case 'select': return `Selected option in ${refLabel}`;
+      case 'press': return `Pressed key "${command.value || 'Enter'}"`;
+      case 'scroll': return `Scrolled page`;
+      case 'hover': return `Hovered over ${refLabel}`;
+      case 'wait': return `Waited for page`;
+      case 'toggle': return `Toggled ${refLabel}`;
+      case 'setRange': return `Set range on ${refLabel}`;
+      case 'clear': return `Cleared ${refLabel}`;
+      case 'selectDate': return `Set date on ${refLabel}`;
       default: return strategy.length > 60 ? strategy.slice(0, 57) + '...' : strategy;
     }
   }

@@ -245,6 +245,42 @@ export class TestReportGeneratorService {
         }
         break;
 
+      case 'toggle':
+        if (command.selector) {
+          code += `${indent}await page.locator('${command.selector}').click();\n`;
+        }
+        break;
+
+      case 'setRange':
+        if (command.selector && command.value) {
+          code += `${indent}await page.locator('${command.selector}').evaluate((el, val) => {\n`;
+          code += `${indent}  const input = el as HTMLInputElement;\n`;
+          code += `${indent}  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;\n`;
+          code += `${indent}  if (setter) setter.call(input, val); else input.value = val;\n`;
+          code += `${indent}  input.dispatchEvent(new Event('input', { bubbles: true }));\n`;
+          code += `${indent}  input.dispatchEvent(new Event('change', { bubbles: true }));\n`;
+          code += `${indent}}, '${command.value}');\n`;
+        }
+        break;
+
+      case 'clear':
+        if (command.selector) {
+          code += `${indent}await page.locator('${command.selector}').clear();\n`;
+        }
+        break;
+
+      case 'selectDate':
+        if (command.selector && command.value) {
+          code += `${indent}await page.locator('${command.selector}').evaluate((el, val) => {\n`;
+          code += `${indent}  const input = el as HTMLInputElement;\n`;
+          code += `${indent}  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;\n`;
+          code += `${indent}  if (setter) setter.call(input, val); else input.value = val;\n`;
+          code += `${indent}  input.dispatchEvent(new Event('input', { bubbles: true }));\n`;
+          code += `${indent}  input.dispatchEvent(new Event('change', { bubbles: true }));\n`;
+          code += `${indent}}, '${command.value}');\n`;
+        }
+        break;
+
       default:
         code += `${indent}// ${command.action}: ${command.description || 'No description'}\n`;
     }

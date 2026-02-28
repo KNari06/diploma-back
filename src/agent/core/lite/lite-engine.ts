@@ -493,18 +493,50 @@ export class LiteEngine {
     actionType: string,
     count: number
   ): RankedCandidate[] {
-    // Filter by action type
+    // Filter by action type — only show elements eligible for the intended action
     const eligible = snapshot.elements.filter(el => {
-      if (actionType === 'click') {
-        return ['button', 'a', 'input'].includes(el.tag) || el.role === 'button' || el.role === 'link';
+      const tag = el.tag;
+      const role = el.role || '';
+
+      switch (actionType) {
+        case 'click':
+          return ['button', 'a', 'input'].includes(tag) || role === 'button' || role === 'link';
+
+        case 'fill':
+          return tag === 'input' || tag === 'textarea' || role === 'textbox' || role === 'searchbox';
+
+        case 'select':
+          return tag === 'select' || role === 'combobox' || role === 'listbox';
+
+        case 'toggle':
+          // Checkboxes, switches, radios, toggle buttons
+          return (tag === 'input' && (el.type === 'checkbox' || el.type === 'radio'))
+            || role === 'checkbox' || role === 'radio' || role === 'switch'
+            || role === 'menuitemcheckbox' || role === 'menuitemradio';
+
+        case 'hover':
+          // Anything interactive can be hovered
+          return ['button', 'a', 'input', 'select', 'textarea'].includes(tag)
+            || role === 'button' || role === 'link' || role === 'menuitem' || role === 'tab';
+
+        case 'setRange':
+          // Range sliders and spinbuttons
+          return (tag === 'input' && (el.type === 'range' || el.type === 'number'))
+            || role === 'slider' || role === 'spinbutton';
+
+        case 'clear':
+          // Any writable input
+          return tag === 'input' || tag === 'textarea' || role === 'textbox' || role === 'searchbox'
+            || role === 'combobox' || role === 'spinbutton';
+
+        case 'selectDate':
+          // Date/time input types
+          return (tag === 'input' && ['date', 'datetime-local', 'time', 'month', 'week'].includes(el.type || ''));
+
+        // scroll, wait, goto, press — not element-targeted, accept all
+        default:
+          return true;
       }
-      if (actionType === 'fill') {
-        return el.tag === 'input' || el.tag === 'textarea' || el.role === 'textbox';
-      }
-      if (actionType === 'select') {
-        return el.tag === 'select' || el.role === 'combobox' || el.role === 'listbox';
-      }
-      return true;
     });
 
     // Calculate composite score for each element
@@ -718,9 +750,10 @@ export class LiteEngine {
             const centerY = rect.top + rect.height / 2;
 
             // Check if disabled
+            // ✅ FIX: Strip escaped quotes for Angular compatibility
             const isDisabled =
               htmlEl.disabled ||
-              htmlEl.getAttribute('aria-disabled') === 'true' ||
+              (htmlEl.getAttribute('aria-disabled') || '').replace(/["']/g, '').trim() === 'true' ||
               htmlEl.classList?.contains('disabled');
 
             // Check if visible in viewport
@@ -1225,6 +1258,68 @@ export class LiteEngine {
       logger.info('[LITE_ENGINE] Phase 0.5: Fast replay complete, starting AI loop', {
         testId: this.config.testId,
       });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PIPELINE V2: Collaborative Agent Team (Planner → Executor → Reviewer)
+    // When enabled, replaces the entire multi-agent + monolithic loop below.
+    // All agents share context through a Blackboard.
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (LITE_ENGINE_FLAGS.enablePipelineV2) {
+      try {
+        const { TestPipeline } = await import('./pipeline/test-pipeline');
+
+        const pipeline = new TestPipeline({
+          page: this.page,
+          actionExecutor: this.executor,
+          networkTracker: this.networkTracker,
+          goalDetector: this.goalDetector,
+          graphBuilder: this.graphBuilder,
+          progressEmitter: this.progressEmitter,
+          traceWriter: this.traceWriter,
+          consoleCollector: this.consoleCollector,
+          browserContext: this.page.context(),
+        });
+
+        const pipelineResult = await pipeline.run(this.config.goal, {
+          url: this.config.url,
+          credentials: this.config.credentials,
+          hasCredentials: !!this.config.credentials,
+          testId: this.config.testId,
+          maxRounds: LITE_ENGINE_FLAGS.pipelineMaxRounds,
+          timeoutMs: LITE_ENGINE_FLAGS.pipelineTimeoutMs,
+          skillsContext: this.skillsContext,
+        });
+
+        logger.info('[LITE_ENGINE] Pipeline v2 complete', {
+          testId: this.config.testId,
+          success: pipelineResult.success,
+          rounds: pipelineResult.roundsExecuted,
+          commands: pipelineResult.commandsExecuted,
+          progress: pipelineResult.progressScore,
+          durationMs: pipelineResult.durationMs,
+        });
+
+        this.emitCompletion(
+          pipelineResult.success,
+          pipelineResult.success ? 'Goal achieved' : pipelineResult.reason,
+        );
+
+        await this.flushPendingGraphScreenshotUploads();
+
+        return await this.buildResult(
+          pipelineResult.success,
+          pipelineResult.reason,
+        );
+      } catch (pipelineError) {
+        const errorMsg = pipelineError instanceof Error ? pipelineError.message : String(pipelineError);
+        logger.error('[LITE_ENGINE] Pipeline v2 error', {
+          testId: this.config.testId,
+          error: errorMsg,
+        });
+        // Fall through to old loop as safety net
+        logger.info('[LITE_ENGINE] Falling back to legacy loop after pipeline error');
+      }
     }
 
     try {
@@ -5369,6 +5464,10 @@ export class LiteEngine {
       select: 'select',
       hover: 'hover',
       wait: 'wait',
+      toggle: 'click',      // toggle maps to click action
+      setRange: 'fill',     // range slider maps to fill
+      clear: 'fill',        // clear maps to fill (clearing a field)
+      selectDate: 'fill',   // date selection maps to fill
     };
 
     return {

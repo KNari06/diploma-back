@@ -40,27 +40,47 @@ const EXTRACT_SCRIPT = `
   const MAX_TEXT_LENGTH = 100;
   const MAX_PARENT_CHAIN = 6;
 
-  // Interactive element selectors
+  // Interactive element selectors (synced with snapshot-collector.ts)
   const INTERACTIVE_SELECTORS = [
+    // ── Core interactive elements ──
     'a[href]',
     'button',
     'input:not([type="hidden"])',
     'select',
     'textarea',
+    // ── ARIA widget roles (covers MUI, Ant Design, Chakra, Radix, Headless UI) ──
     '[role="button"]',
     '[role="link"]',
-    '[role="tab"]',
     '[role="menuitem"]',
-    '[role="option"]',
     '[role="checkbox"]',
     '[role="radio"]',
-    '[role="textbox"]',
-    '[role="searchbox"]',
-    '[role="combobox"]',
+    '[role="tab"]',
+    '[role="option"]',
     '[role="listbox"]',
+    '[role="combobox"]',
+    '[role="menu"]',
+    '[role="menuitemcheckbox"]',
+    '[role="menuitemradio"]',
+    '[role="switch"]',
+    '[role="slider"]',
+    '[role="spinbutton"]',
+    '[role="searchbox"]',
+    '[role="textbox"]',
     '[role="treeitem"]',
+    '[role="alertdialog"]',
+    // ── Attribute-based interactive elements ──
     '[onclick]',
+    '[tabindex]:not([tabindex="-1"])',
+    '[data-testid]',
+    '[data-test]',
+    '[data-toggle]',
+    '[aria-haspopup]',
+    '[draggable="true"]',
+    // ── Semantic elements ──
     '[contenteditable="true"]',
+    '[contenteditable=""]',
+    'dialog[open]',
+    'summary',
   ];
 
   // Collect elements from main document + shadow DOMs recursively
@@ -155,7 +175,7 @@ const EXTRACT_SCRIPT = `
     const node = {
       ref,
       tag: el.tagName.toLowerCase(),
-      role: el.getAttribute('role') || undefined,
+      role: (el.getAttribute('role') || '').replace(/["']/g, '').trim() || undefined,
       type: el.getAttribute('type') || undefined,
       inputType: el.getAttribute('type') || undefined,
       text: el.textContent?.trim().substring(0, MAX_TEXT_LENGTH) || undefined,

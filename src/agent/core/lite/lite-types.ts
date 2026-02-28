@@ -191,6 +191,8 @@ export interface LiteSnapshot {
   metadata?: SnapshotMetadata;
   /** Page structure metadata (tables, lists, pagination) */
   pageStructure?: PageStructureMetadata;
+  /** Visible page alerts/errors (non-interactive error messages, validation errors, auth failures) */
+  pageAlerts?: string[];
 }
 
 /**
@@ -344,9 +346,10 @@ export interface StuckCheck {
  * AI command (SECURE: no arbitrary code)
  */
 export interface AICommand {
-  action: 'click' | 'fill' | 'press' | 'goto' | 'scroll' | 'select' | 'hover' | 'wait';
+  action: 'click' | 'fill' | 'press' | 'goto' | 'scroll' | 'select' | 'hover' | 'wait'
+    | 'toggle' | 'setRange' | 'clear' | 'selectDate';
   ref?: string;           // target element ref
-  value?: string;         // for fill, select
+  value?: string;         // for fill, select, setRange (target value), selectDate (date string)
   key?: string;           // for press
   url?: string;           // for goto
   direction?: 'up' | 'down'; // for scroll
@@ -630,8 +633,8 @@ export interface GoalContext {
  * Helps AI understand current step and make correct next decisions
  */
 export interface FlowState {
-  /** Flow type */
-  flowType: 'login' | 'register' | 'checkout' | 'unknown';
+  /** Flow type (authentication, e-commerce, search, settings, form, navigation, etc.) */
+  flowType: string;
 
   /** Current step in the flow */
   currentStep: FlowStep;

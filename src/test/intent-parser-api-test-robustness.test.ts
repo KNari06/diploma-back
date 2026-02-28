@@ -77,3 +77,57 @@ describe('parseUserIntent(api_test) robustness', () => {
   });
 });
 
+describe('parseUserIntent(platform_test) executionStrategy normalization', () => {
+  beforeEach(() => {
+    process.env.OPENAI_API_KEY = 'test';
+    process.env.OPENAI_MODEL = 'gpt-4o-mini';
+    mockCreate.mockReset();
+    jest.resetModules();
+  });
+
+  it('keeps valid exploration executionStrategy', async () => {
+    mockCreate.mockResolvedValue({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            intent: 'platform_test',
+            intent_confidence: 0.93,
+            page: 'example.com',
+            executionStrategy: 'exploration',
+            rawText: 'explore example.com',
+          }),
+        },
+      }],
+    });
+
+    const { parseUserIntent } = require('@/services/ai/intent/intent-parser.service');
+    const res = await parseUserIntent('explore example.com', {}, 'proj');
+
+    expect(res.intent).toBe('platform_test');
+    expect(res.page).toBe('https://example.com');
+    expect(res.executionStrategy).toBe('exploration');
+  });
+
+  it('normalizes invalid executionStrategy to standard', async () => {
+    mockCreate.mockResolvedValue({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            intent: 'platform_test',
+            intent_confidence: 0.9,
+            page: 'example.com',
+            executionStrategy: 'crawl_everything',
+            rawText: 'test example.com',
+          }),
+        },
+      }],
+    });
+
+    const { parseUserIntent } = require('@/services/ai/intent/intent-parser.service');
+    const res = await parseUserIntent('test example.com', {}, 'proj');
+
+    expect(res.intent).toBe('platform_test');
+    expect(res.executionStrategy).toBe('standard');
+  });
+});
+

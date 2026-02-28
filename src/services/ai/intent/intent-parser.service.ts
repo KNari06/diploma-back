@@ -1581,6 +1581,18 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
 
   // Step 5.2: Finalize platform_test URL normalization and cleanup
   if (parsed.intent === 'platform_test') {
+    // Normalize executionStrategy contract for platform_test.
+    // Keep handler-side fallback as a second safety net.
+    const strategy = (parsed as any).executionStrategy;
+    if (strategy === 'exploration' || strategy === 'standard') {
+      (parsed as any).executionStrategy = strategy;
+    } else if (strategy !== undefined && strategy !== null && strategy !== '') {
+      logger.warn('[INTENT_PARSER] Invalid executionStrategy for platform_test, using standard', {
+        strategy,
+      });
+      (parsed as any).executionStrategy = 'standard';
+    }
+
     // Clean and normalize page URL (consolidated from multiple places)
     if (parsed.page) {
       parsed.page = parsed.page.trim();
