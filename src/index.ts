@@ -1374,11 +1374,11 @@ const startServer = async () => {
       });
     }
 
-    // Register all skills (Jira, GitHub, Notion, etc.)
+    // Register all skills from manifest (Jira, GitHub, Notion, etc.)
     try {
       const { registerAllSkills } = await import('@/services/skills');
       await registerAllSkills();
-      logger.info('✓ Skills registered and initialized successfully');
+      logger.info('✓ Skills registered successfully');
     } catch (skillsError) {
       logger.warn('[SERVER] Failed to register skills, continuing without them', {
         error: skillsError instanceof Error ? skillsError.message : String(skillsError),

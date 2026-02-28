@@ -676,3 +676,5 @@ async function handleGetRepo(
     };
   }
 }
+
+export default GitHubSkill;
