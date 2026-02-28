@@ -2,7 +2,9 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { SUB_AGENT_CONFIG } from '../config';
-import { MEMORY_TOOL_NAMES, withToolTimeoutAndAbort } from '../tool-constants';
+import { executeTool } from '@/services/skills/tool-executor';
+import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
+// Note: MEMORY_TOOL_NAMES removed — memory tools now go through SkillRegistry
 import type { ExecutorResult, PipelineContext, ToolExecutionRecord, TrackedPlanStep } from '../types';
 import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 
@@ -65,6 +67,7 @@ export async function executeToolsForStep(
 ): Promise<ExecutorResult> {
   const startMs = Date.now();
   const toolResults: ToolExecutionRecord[] = [];
+  const tracker = new ToolCallTracker(SUB_AGENT_CONFIG.loopDetection);
   let assistantContent = '';
 
   const prompt = buildSubExecutorPrompt(step, userGoal, context.projectId);
@@ -120,6 +123,7 @@ export async function executeToolsForStep(
       const toolName = toolCall.function.name;
       const toolStartMs = Date.now();
 
+      // Parse arguments safely (LLM output parsing stays here)
       let toolArgs: Record<string, any>;
       try {
         toolArgs = JSON.parse(toolCall.function.arguments);
@@ -145,76 +149,33 @@ export async function executeToolsForStep(
 
       logger.info('[SUB_EXECUTOR] Executing tool', { step: step.stepNumber, toolName });
 
-      try {
-        let toolResult: any;
+      // Execute through centralized pipeline
+      const skillContext = {
+        userId: context.userId,
+        workspaceId: context.workspaceId,
+        chatSessionId: context.chatSessionId,
+        projectId: context.projectId,
+        previewSessionId: context.previewSessionId,
+      };
 
-        // Route to correct executor (with per-tool timeout + abort signal)
-        if (MEMORY_TOOL_NAMES.includes(toolName)) {
-          const { executeMemoryTool } = await import('@/services/ai/memory/memory-tools');
-          toolResult = await withToolTimeoutAndAbort(
-            executeMemoryTool(toolName, toolArgs, context.workspaceId, context.userId),
-            toolName,
-            abortSignal,
-          );
-        } else {
-          const { SkillRegistry } = await import('@/services/skills');
-          const skillContext = {
-            userId: context.userId,
-            workspaceId: context.workspaceId,
-            chatSessionId: context.chatSessionId,
-            projectId: context.projectId,
-            previewSessionId: context.previewSessionId,
-          };
-          toolResult = await withToolTimeoutAndAbort(
-            SkillRegistry.executeTool(toolName, toolArgs, skillContext),
-            toolName,
-            abortSignal,
-          );
-        }
+      const callResult = await executeTool({
+        toolName,
+        toolCallId: toolCall.id,
+        args: toolArgs,
+        skillContext,
+        abortSignal,
+        tracker,
+      });
 
-        messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: JSON.stringify(toolResult),
-        } as any);
+      messages.push(...callResult.messages);
+      toolResults.push(callResult.record);
 
-        toolResults.push({
-          toolName,
-          args: toolArgs,
-          result: toolResult,
-          durationMs: Date.now() - toolStartMs,
-        });
-
-        logger.info('[SUB_EXECUTOR] Tool executed', {
-          step: step.stepNumber,
-          toolName,
-          success: toolResult.success,
-          durationMs: Date.now() - toolStartMs,
-        });
-      } catch (toolError) {
-        logger.error('[SUB_EXECUTOR] Tool execution error', {
-          step: step.stepNumber,
-          toolName,
-          error: toolError instanceof Error ? toolError.message : String(toolError),
-        });
-
-        const errorResult = {
-          success: false,
-          message: `Tool execution failed: ${toolError instanceof Error ? toolError.message : String(toolError)}`,
-        };
-        messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: JSON.stringify(errorResult),
-        } as any);
-
-        toolResults.push({
-          toolName,
-          args: toolArgs,
-          result: { success: false, message: errorResult.message },
-          durationMs: Date.now() - toolStartMs,
-        });
-      }
+      logger.info('[SUB_EXECUTOR] Tool executed', {
+        step: step.stepNumber,
+        toolName,
+        success: callResult.toolResult.success,
+        durationMs: callResult.record.durationMs,
+      });
     }
   }
 

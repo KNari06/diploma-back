@@ -9,8 +9,7 @@
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/** Memory tool names that route to executeMemoryTool instead of SkillRegistry. */
-export const MEMORY_TOOL_NAMES = ['remember_fact', 'search_memory', 'forget_fact'];
+// Note: MEMORY_TOOL_NAMES removed — memory tools now registered as MemorySkill in SkillRegistry
 
 /**
  * Per-tool timeout overrides (ms).

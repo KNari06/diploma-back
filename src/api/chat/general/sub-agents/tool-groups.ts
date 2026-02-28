@@ -14,8 +14,7 @@ import { logger } from '@/utils/core/logger';
  * 1. Reads all registered skills from SkillRegistry.listSkills()
  * 2. Skills with many tools (like QA) are split into read/write categories
  *    based on whether tools have a `confirm` parameter
- * 3. Memory tools are added as a separate 'memory' category
- * 4. Everything else becomes a single category per skill
+ * 3. Everything else (including MemorySkill) becomes a single category per skill
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -99,14 +98,9 @@ export function buildToolGroups(): ToolGroup[] {
     }
   }
 
-  // Add memory tools category (separate from SkillRegistry)
-  groups.push({
-    category: 'memory',
-    description: 'Persistent workspace memory: remember facts, search memory, forget facts',
-    keywords: ['remember', 'forget', 'memory', 'preference'],
-    readOnly: false,
-    toolNames: ['remember_fact', 'search_memory', 'forget_fact'],
-  });
+  // Note: Memory tools are now auto-discovered from MemorySkill in SkillRegistry
+  // (no hardcoded memory category needed — MemorySkill has 3 tools < SPLIT_THRESHOLD,
+  //  so it becomes a single "memory" group via the else branch above)
 
   cachedGroups = groups;
   cachedSkillCount = skills.length;

@@ -53,4 +53,12 @@ export async function registerAllSkills(): Promise<void> {
 
 // Re-export core types and registry for convenience
 export { SkillRegistry } from './skill-registry';
-export type { SkillDefinition, SkillContext, SkillResult, IntegrationProvider } from './types';
+export type {
+  SkillDefinition,
+  SkillContext,
+  SkillResult,
+  SkillRetryConfig,
+  SkillErrorContext,
+  WorkspaceSkillConfig,
+  IntegrationProvider,
+} from './types';

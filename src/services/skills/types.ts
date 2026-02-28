@@ -22,7 +22,8 @@ export type IntegrationProvider =
   | 'trello'
   | 'slack'
   | 'telegram'
-  | 'qa';
+  | 'qa'
+  | 'memory';
 
 /**
  * Context provided to skills during execution
@@ -43,6 +44,41 @@ export interface SkillResult {
   data?: any;
   message: string;
   displayToUser?: boolean; // Whether to show this result to the user
+}
+
+/**
+ * Retry configuration for a skill's tool executions.
+ * Used by tool-executor.ts to determine retry strategy for transient errors.
+ */
+export interface SkillRetryConfig {
+  /** Max retry attempts after initial failure (default: 2) */
+  maxRetries?: number;
+  /** Initial delay in ms before first retry (default: 500) */
+  initialDelayMs?: number;
+  /** Multiplier for exponential backoff (default: 2) */
+  backoffMultiplier?: number;
+}
+
+/**
+ * Error context passed to skill's onError lifecycle hook.
+ */
+export interface SkillErrorContext {
+  /** The error that occurred */
+  error: Error;
+  /** The tool that was being executed */
+  toolName: string;
+  /** Execution context (user, workspace, session) */
+  context: SkillContext;
+  /** Which attempt this is (0 = first call, 1 = first retry, etc.) */
+  attempt: number;
+}
+
+/**
+ * Per-workspace skill configuration shape.
+ * Stored in workspaces.settings JSONB: `settings.skills[skillId]`
+ */
+export interface WorkspaceSkillConfig {
+  [skillId: string]: Record<string, any>;
 }
 
 /**
@@ -95,4 +131,26 @@ export interface SkillDefinition {
     args: Record<string, any>,
     context: SkillContext
   ): Promise<SkillResult>;
+
+  // ── Optional Lifecycle Hooks ───────────────────────────────────────
+
+  /**
+   * Called once during registerAllSkills() at server startup.
+   * Use for warm-up, cache preloading, or connection validation.
+   * If it throws, the skill is still registered but a warning is logged (non-fatal).
+   */
+  onInit?(): Promise<void>;
+
+  /**
+   * Called when tool execution fails (transient or permanent error).
+   * Can return a SkillResult to override the default error result (e.g., after token refresh + retry).
+   * If it returns void/undefined, the default error handling continues.
+   */
+  onError?(errorCtx: SkillErrorContext): Promise<SkillResult | void>;
+
+  /**
+   * Per-skill retry configuration for transient errors (429, 5xx, timeout).
+   * If not provided, global defaults are used: { maxRetries: 2, initialDelayMs: 500, backoffMultiplier: 2 }
+   */
+  retryConfig?: SkillRetryConfig;
 }
