@@ -1705,3 +1705,5 @@ export const QASkill: SkillDefinition = {
     }
   },
 };
+
+export default QASkill;

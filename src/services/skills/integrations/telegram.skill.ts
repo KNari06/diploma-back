@@ -714,3 +714,5 @@ async function handleSendNotification(
     };
   }
 }
+
+export default TelegramSkill;

@@ -640,3 +640,5 @@ async function handleSendBlocks(
     displayToUser: true,
   };
 }
+
+export default SlackSkill;

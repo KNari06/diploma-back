@@ -655,3 +655,5 @@ async function handleListDatabases(accessToken: string): Promise<SkillResult> {
     };
   }
 }
+
+export default NotionSkill;

@@ -876,3 +876,5 @@ async function handleUpdateIssue(
     };
   }
 }
+
+export default JiraSkill;
