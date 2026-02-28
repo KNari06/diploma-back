@@ -182,8 +182,16 @@ export class VideoStreamService {
           testId,
           error: redisError instanceof Error ? redisError.message : String(redisError),
         });
-        // Continue without Redis - streaming still works, just no catchup buffer
-        this.redis = null;
+        // Explicitly close the failed client before nulling the reference to avoid
+        // accumulating "zombie" Redis connections across repeated stream starts.
+        if (this.redis) {
+          try {
+            this.redis.disconnect();
+          } catch {
+            // Ignore — client may already be in a closed/errored state
+          }
+          this.redis = null;
+        }
       }
 
       // Acquire Redis lock to prevent duplicate streams (if Redis is available)
@@ -658,21 +666,32 @@ export class VideoStreamService {
 
         try {
           const lockKey = `stream:lock:${this.testId}`;
-          const currentValue = await this.redis.get(lockKey);
 
-          // Only renew if we still own the lock
-          if (currentValue === this.lockValue) {
-            await this.redis.expire(lockKey, VIDEO_STREAM_CONFIG.lockTTL);
-            logger.debug('[VIDEO_STREAM] Lock renewed', {
+          // Use a Lua script to atomically check ownership and renew TTL in a single
+          // round-trip. A separate GET + EXPIRE pair has a race window where another
+          // process could acquire the lock between the two commands.
+          // Returns 1 if we still own the lock and TTL was renewed, 0 otherwise.
+          const renewed = await (this.redis as any).eval(
+            `if redis.call("get", KEYS[1]) == ARGV[1] then
+               return redis.call("expire", KEYS[1], ARGV[2])
+             else
+               return 0
+             end`,
+            1,           // numkeys
+            lockKey,     // KEYS[1]
+            this.lockValue,                            // ARGV[1] — our lock value
+            String(VIDEO_STREAM_CONFIG.lockTTL),      // ARGV[2] — TTL in seconds
+          );
+
+          if (renewed === 1) {
+            logger.debug('[VIDEO_STREAM] Lock renewed atomically', {
               testId: this.testId,
               ttl: VIDEO_STREAM_CONFIG.lockTTL,
             });
           } else {
-            // Lock was taken by another process
+            // Lock was taken by another process between renewal intervals
             logger.warn('[VIDEO_STREAM] Lost lock ownership, stopping stream', {
               testId: this.testId,
-              expectedValue: this.lockValue,
-              actualValue: currentValue,
             });
             await this.stop('error');
           }

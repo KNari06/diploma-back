@@ -108,7 +108,7 @@ const EXTRACT_SCRIPT = `
 
     // Skip if not visible or disabled and not visible
     const isVisible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-    const isDisabled = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+    const isDisabled = el.hasAttribute('disabled') || (el.getAttribute('aria-disabled') || '').replace(/["']/g, '').trim() === 'true';
     if (!isVisible && isDisabled) continue;
 
     // Inject temporary ref
@@ -194,14 +194,14 @@ const EXTRACT_SCRIPT = `
 
       // ARIA state
       checked: el.hasAttribute('checked') ? true : (el.checked === true ? true : undefined),
-      ariaExpanded: el.getAttribute('aria-expanded') === 'true' ? true : (el.getAttribute('aria-expanded') === 'false' ? false : undefined),
-      ariaPressed: el.getAttribute('aria-pressed') === 'true' ? true : (el.getAttribute('aria-pressed') === 'false' ? false : undefined),
-      ariaSelected: el.getAttribute('aria-selected') === 'true' ? true : (el.getAttribute('aria-selected') === 'false' ? false : undefined),
+      ariaExpanded: (el.getAttribute('aria-expanded') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-expanded') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
+      ariaPressed: (el.getAttribute('aria-pressed') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-pressed') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
+      ariaSelected: (el.getAttribute('aria-selected') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-selected') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
 
       // Validation state
-      required: el.hasAttribute('required') || el.getAttribute('aria-required') === 'true',
-      readOnly: el.hasAttribute('readonly') || el.getAttribute('aria-readonly') === 'true',
-      invalid: el.getAttribute('aria-invalid') === 'true' || el.matches(':invalid'),
+      required: el.hasAttribute('required') || (el.getAttribute('aria-required') || '').replace(/["']/g, '').trim() === 'true',
+      readOnly: el.hasAttribute('readonly') || (el.getAttribute('aria-readonly') || '').replace(/["']/g, '').trim() === 'true',
+      invalid: (el.getAttribute('aria-invalid') || '').replace(/["']/g, '').trim() === 'true' || el.matches(':invalid'),
       hasValue: !!(el.value && el.value.length > 0),
 
       // Container info

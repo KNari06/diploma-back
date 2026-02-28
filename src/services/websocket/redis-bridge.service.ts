@@ -127,22 +127,72 @@ class RedisWebSocketBridge {
 
       const serialized = JSON.stringify(message);
 
-      // ✅ FIX: Limit payload size (1MB max) to prevent Redis overload
-      if (serialized.length > 1000000) {
-        // ✅ REMOVED: REDIS_BRIDGE logs
-        // Truncate payload (keep only first 1MB)
-        const truncatedPayload = {
-          ...payload,
-          _truncated: true,
-          _originalSize: serialized.length,
-        };
-        const truncatedMessage: WebSocketEventMessage = {
+      // Guard: keep published messages below 1 MB to prevent Redis overload.
+      // We NEVER truncate JSON mid-string (that would break JSON.parse on the subscriber side).
+      // Instead we build a structurally valid replacement payload:
+      //   - For video frame events the base64 `data` field is the bulk; drop it and emit
+      //     a metadata-only marker so the subscriber can skip the frame gracefully.
+      //   - For all other events strip any string-valued field whose length exceeds 50 KB,
+      //     attach a `_truncated` map listing which fields were dropped, and re-check size.
+      //   - If the stripped message is still >= 1 MB, drop the event entirely and log a warning.
+      if (serialized.length > 1_000_000) {
+        logger.warn('[REDIS_BRIDGE] Oversized event payload — building safe fallback', {
           event,
-          payload: truncatedPayload,
+          originalSize: serialized.length,
+        });
+
+        let fallbackPayload: Record<string, unknown>;
+
+        if (event === 'test:video:frame') {
+          // Video frame: drop the large base64 data field, keep only metadata so downstream
+          // subscribers can track seq/timing without receiving a corrupt partial image.
+          const { data: _droppedData, ...meta } = payload as Record<string, unknown>;
+          fallbackPayload = {
+            ...meta,
+            _dropped: true,
+            _droppedFields: ['data'],
+            _originalSize: serialized.length,
+          };
+        } else {
+          // Generic fallback: strip string fields that individually exceed 50 KB.
+          const FIELD_SIZE_LIMIT = 50_000;
+          const droppedFields: string[] = [];
+          const strippedPayload: Record<string, unknown> = {};
+
+          for (const [key, value] of Object.entries(payload as Record<string, unknown>)) {
+            if (typeof value === 'string' && value.length > FIELD_SIZE_LIMIT) {
+              droppedFields.push(key);
+            } else {
+              strippedPayload[key] = value;
+            }
+          }
+
+          fallbackPayload = {
+            ...strippedPayload,
+            _truncated: true,
+            _droppedFields: droppedFields,
+            _originalSize: serialized.length,
+          };
+        }
+
+        const fallbackMessage: WebSocketEventMessage = {
+          event,
+          payload: fallbackPayload,
           target,
           timestamp: Date.now(),
         };
-        await publisher.publish(WEBSOCKET_EVENTS_CHANNEL, JSON.stringify(truncatedMessage).substring(0, 1000000));
+        const fallbackSerialized = JSON.stringify(fallbackMessage);
+
+        if (fallbackSerialized.length >= 1_000_000) {
+          // Even the stripped version is too large — drop entirely rather than send garbage.
+          logger.warn('[REDIS_BRIDGE] Fallback payload still oversized — dropping event', {
+            event,
+            fallbackSize: fallbackSerialized.length,
+          });
+          return;
+        }
+
+        await publisher.publish(WEBSOCKET_EVENTS_CHANNEL, fallbackSerialized);
       } else {
         await publisher.publish(WEBSOCKET_EVENTS_CHANNEL, serialized);
       }
