@@ -97,6 +97,18 @@ interface InternalSession extends PreviewSession {
     startElement: any; // ProbedElement from recording-capture.service
     startedAt: number;
   } | null;
+  /** V10: Last emitted type step — for merging consecutive typing in same element */
+  recordingLastTypeStep: {
+    id: string;
+    elementRef?: string;
+    value: string;
+  } | null;
+  /** V10: Last emitted scroll step — for merging consecutive scrolls */
+  recordingLastScrollStep: {
+    id: string;
+    totalDelta: number;
+    emittedAt: number;
+  } | null;
 }
 
 /**
@@ -340,6 +352,8 @@ export class PreviewSessionService {
           recordingTypingBuffer: null,
           recordingLastUrl: safeStartUrl,
           recordingDragState: null,
+          recordingLastTypeStep: null,
+          recordingLastScrollStep: null,
         };
 
         // Store session
@@ -462,6 +476,8 @@ export class PreviewSessionService {
       session.recordingTypingBuffer = null;
       session.recordingLastUrl = startUrl;
       session.recordingDragState = null;
+      session.recordingLastTypeStep = null;
+      session.recordingLastScrollStep = null;
 
       // Close old resources after swap (do not break reset if close fails)
       await this.safeCloseBrowserResources(undefined, oldContext, oldPage);
@@ -1202,6 +1218,8 @@ export class PreviewSessionService {
     if (!recording) {
       session.recordingTypingBuffer = null;
       session.recordingDragState = null;
+      session.recordingLastTypeStep = null;
+      session.recordingLastScrollStep = null;
     }
     return true;
   }
@@ -1260,6 +1278,38 @@ export class PreviewSessionService {
   setRecordingDragState(sessionId: string, userId: string, state: InternalSession['recordingDragState']): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingDragState = state;
+  }
+
+  /**
+   * V10: Get last emitted type step (for merge detection)
+   */
+  getRecordingLastTypeStep(sessionId: string, userId?: string): InternalSession['recordingLastTypeStep'] {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingLastTypeStep ?? null;
+  }
+
+  /**
+   * V10: Set last emitted type step
+   */
+  setRecordingLastTypeStep(sessionId: string, userId: string, step: InternalSession['recordingLastTypeStep']): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingLastTypeStep = step;
+  }
+
+  /**
+   * V10: Get last emitted scroll step (for merge detection)
+   */
+  getRecordingLastScrollStep(sessionId: string, userId?: string): InternalSession['recordingLastScrollStep'] {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingLastScrollStep ?? null;
+  }
+
+  /**
+   * V10: Set last emitted scroll step
+   */
+  setRecordingLastScrollStep(sessionId: string, userId: string, step: InternalSession['recordingLastScrollStep']): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingLastScrollStep = step;
   }
 
   /**

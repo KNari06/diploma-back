@@ -139,6 +139,7 @@ export interface ServerToClientEvents {
 
   // Preview recording events
   'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
+  'preview:recording:step:update': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:state': (data: PreviewRecordingStatePayload) => void;
 
   // Preview interactive control responses
