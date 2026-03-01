@@ -29,51 +29,75 @@ interface SnapshotSanitizationResult {
   blocked: SanitizationResult['blocked'];
 }
 
+/**
+ * Unicode-aware whitespace character class for injection detection.
+ * Matches ASCII \s PLUS Unicode whitespace that attackers use to bypass:
+ * U+00A0 NO-BREAK SPACE, U+200B ZERO-WIDTH SPACE, U+2000-U+200A various spaces,
+ * U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR, U+FEFF BOM, U+3000 IDEOGRAPHIC SPACE
+ */
+const UWS = `[\\s\\u00A0\\u200B-\\u200D\\u2000-\\u200A\\u2028\\u2029\\uFEFF\\u3000]`;
+
+/**
+ * Build a regex with Unicode-aware whitespace.
+ * In the source pattern, write \\s+ and \\s* as usual — this function
+ * replaces them with the broader Unicode whitespace character class.
+ */
+function uws(pattern: string, flags: string = 'gi'): RegExp {
+  return new RegExp(
+    pattern.replace(/\\s\+/g, `${UWS}+`).replace(/\\s\*/g, `${UWS}*`),
+    flags,
+  );
+}
+
 export class PromptSanitizer {
   /**
    * Injection patterns to detect and block
    * Covers common prompt injection techniques
+   *
+   * FIX: All patterns now use Unicode-aware whitespace to prevent bypass via
+   * U+00A0, U+200B, U+FEFF, etc. Event handler list expanded.
    */
   private static readonly INJECTION_PATTERNS: Array<{ pattern: RegExp; severity: 'high' | 'medium' }> = [
     // Direct instruction override patterns
-    { pattern: /ignore\s+(all\s+)?previous\s+(instructions?|commands?)/gi, severity: 'high' },
-    { pattern: /disregard\s+(all\s+)?previous\s+(instructions?|commands?)/gi, severity: 'high' },
-    { pattern: /forget\s+(all\s+)?previous\s+(instructions?|commands?)/gi, severity: 'high' },
-    { pattern: /override\s+(all\s+)?previous\s+(instructions?|commands?)/gi, severity: 'high' },
+    { pattern: uws('ignore\\s+(all\\s+)?previous\\s+(instructions?|commands?)'), severity: 'high' },
+    { pattern: uws('disregard\\s+(all\\s+)?previous\\s+(instructions?|commands?)'), severity: 'high' },
+    { pattern: uws('forget\\s+(all\\s+)?previous\\s+(instructions?|commands?)'), severity: 'high' },
+    { pattern: uws('override\\s+(all\\s+)?previous\\s+(instructions?|commands?)'), severity: 'high' },
 
     // Goal manipulation patterns
-    { pattern: /your\s+new\s+goal\s+is/gi, severity: 'high' },
-    { pattern: /change\s+your\s+goal\s+to/gi, severity: 'high' },
-    { pattern: /instead\s+of\s+.*?,?\s*(do|perform|execute|click|fill|type|navigate)/gi, severity: 'high' },
-    { pattern: /don't\s+do\s+.*?,?\s*(instead|but|and)\s+(do|perform|execute)/gi, severity: 'high' },
+    { pattern: uws('your\\s+new\\s+goal\\s+is'), severity: 'high' },
+    { pattern: uws('change\\s+your\\s+goal\\s+to'), severity: 'high' },
+    { pattern: uws('instead\\s+of\\s+.*?,?\\s*(do|perform|execute|click|fill|type|navigate)'), severity: 'high' },
+    { pattern: uws("don't\\s+do\\s+.*?,?\\s*(instead|but|and)\\s+(do|perform|execute)"), severity: 'high' },
 
     // System prompt leakage attempts
-    { pattern: /repeat\s+your\s+(system\s+)?instructions?/gi, severity: 'high' },
-    { pattern: /what\s+are\s+your\s+(system\s+)?(instructions?|rules?|prompts?)/gi, severity: 'high' },
-    { pattern: /show\s+me\s+your\s+(system\s+)?(prompt|instructions?)/gi, severity: 'high' },
-    { pattern: /print\s+your\s+(system\s+)?(prompt|instructions?)/gi, severity: 'high' },
+    { pattern: uws('repeat\\s+your\\s+(system\\s+)?instructions?'), severity: 'high' },
+    { pattern: uws('what\\s+are\\s+your\\s+(system\\s+)?(instructions?|rules?|prompts?)'), severity: 'high' },
+    { pattern: uws('show\\s+me\\s+your\\s+(system\\s+)?(prompt|instructions?)'), severity: 'high' },
+    { pattern: uws('print\\s+your\\s+(system\\s+)?(prompt|instructions?)'), severity: 'high' },
 
     // Code execution attempts (XSS-like)
     { pattern: /<script[\s\S]*?<\/script>/gi, severity: 'high' },
     { pattern: /javascript:/gi, severity: 'medium' },
-    { pattern: /eval\s*\(/gi, severity: 'high' },
-    { pattern: /function\s*\(/gi, severity: 'medium' },
-    { pattern: /on(load|error|click|mouseover)\s*=/gi, severity: 'medium' },
+    { pattern: uws('eval\\s*\\('), severity: 'high' },
+    { pattern: uws('function\\s*\\('), severity: 'medium' },
+    // FIX: Expanded event handler list — covers all common inline event attributes
+    { pattern: uws('on(load|error|click|mouseover|mouseenter|mouseleave|focus|blur|submit|input|change|keydown|keyup|keypress|dblclick|contextmenu|drag|drop|pointerdown|pointerup|touchstart|touchend|animationend|animationstart|beforeunload|unload)\\s*='), severity: 'medium' },
 
     // Credential harvesting attempts
-    { pattern: /send\s+(all\s+)?(credentials?|passwords?|tokens?|secrets?)\s+to/gi, severity: 'high' },
-    { pattern: /submit\s+(your\s+)?(credentials?|passwords?|tokens?)\s+to/gi, severity: 'high' },
-    { pattern: /post\s+(your\s+)?(credentials?|passwords?|tokens?)\s+to/gi, severity: 'high' },
+    { pattern: uws('send\\s+(all\\s+)?(credentials?|passwords?|tokens?|secrets?)\\s+to'), severity: 'high' },
+    { pattern: uws('submit\\s+(your\\s+)?(credentials?|passwords?|tokens?)\\s+to'), severity: 'high' },
+    { pattern: uws('post\\s+(your\\s+)?(credentials?|passwords?|tokens?)\\s+to'), severity: 'high' },
 
     // Role manipulation
-    { pattern: /you\s+are\s+now\s+(a|an)\s+/gi, severity: 'high' },
-    { pattern: /act\s+as\s+(a|an)\s+/gi, severity: 'medium' },
-    { pattern: /pretend\s+(you\s+are|to\s+be)\s+(a|an)\s+/gi, severity: 'medium' },
+    { pattern: uws('you\\s+are\\s+now\\s+(a|an)\\s+'), severity: 'high' },
+    { pattern: uws('act\\s+as\\s+(a|an)\\s+'), severity: 'medium' },
+    { pattern: uws('pretend\\s+(you\\s+are|to\\s+be)\\s+(a|an)\\s+'), severity: 'medium' },
 
     // Output manipulation
-    { pattern: /respond\s+with\s+only/gi, severity: 'medium' },
-    { pattern: /output\s+only/gi, severity: 'medium' },
-    { pattern: /return\s+only/gi, severity: 'medium' },
+    { pattern: uws('respond\\s+with\\s+only'), severity: 'medium' },
+    { pattern: uws('output\\s+only'), severity: 'medium' },
+    { pattern: uws('return\\s+only'), severity: 'medium' },
   ];
 
   /**

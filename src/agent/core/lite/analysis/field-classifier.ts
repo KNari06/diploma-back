@@ -31,6 +31,12 @@ import type { LiteElement } from '../lite-types';
 /** Threshold: patterns <= this length require exact token match */
 const SHORT_PATTERN_THRESHOLD = 4;
 
+/** Maximum allowed pattern length (ReDoS defense) */
+const MAX_PATTERN_LENGTH = 50;
+
+/** Maximum input text length for regex matching (ReDoS defense) */
+const MAX_INPUT_LENGTH_FOR_REGEX = 200;
+
 /** Compiled patterns for each credential kind */
 interface CompiledPatterns {
   /** Short patterns that require exact token match */
@@ -45,6 +51,9 @@ const compiledPatternsCache: Record<CredentialKind, CompiledPatterns> = {} as an
 /**
  * Compile patterns for a credential kind (cached)
  * Short patterns go into exactTokens set, long patterns become boundary regexes
+ *
+ * FIX: Added MAX_PATTERN_LENGTH guard to prevent ReDoS from unexpectedly long patterns.
+ * Patterns come from our config (not user input), but defense-in-depth is important.
  */
 function getCompiledPatterns(kind: CredentialKind): CompiledPatterns {
   if (compiledPatternsCache[kind]) {
@@ -56,6 +65,11 @@ function getCompiledPatterns(kind: CredentialKind): CompiledPatterns {
   const boundaryRegexes: RegExp[] = [];
 
   for (const pattern of patterns) {
+    // ReDoS defense: skip excessively long patterns
+    if (pattern.length > MAX_PATTERN_LENGTH) {
+      continue;
+    }
+
     if (pattern.length <= SHORT_PATTERN_THRESHOLD) {
       // Short pattern: require exact token match
       exactTokens.add(pattern.toLowerCase());
@@ -63,12 +77,16 @@ function getCompiledPatterns(kind: CredentialKind): CompiledPatterns {
       // Long pattern: use boundary-aware regex
       // Matches pattern at word boundaries (start/end or non-alphanumeric)
       // Supports Latin and Cyrillic characters
-      const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const regex = new RegExp(
-        `(?:^|[^a-zа-яёA-ZА-ЯЁ0-9])${escaped}(?:$|[^a-zа-яёA-ZА-ЯЁ0-9])`,
-        'i'
-      );
-      boundaryRegexes.push(regex);
+      try {
+        const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(
+          `(?:^|[^a-zа-яёA-ZА-ЯЁ0-9])${escaped}(?:$|[^a-zа-яёA-ZА-ЯЁ0-9])`,
+          'i'
+        );
+        boundaryRegexes.push(regex);
+      } catch {
+        // Invalid regex from pattern — skip silently
+      }
     }
   }
 
@@ -127,7 +145,10 @@ function matchesPattern(text: string, kind: CredentialKind): boolean {
   }
 
   // Check boundary regexes for long patterns
-  const normalized = text.toLowerCase();
+  // FIX: Truncate input to prevent ReDoS on unexpectedly long attribute values
+  const normalized = text.length > MAX_INPUT_LENGTH_FOR_REGEX
+    ? text.slice(0, MAX_INPUT_LENGTH_FOR_REGEX).toLowerCase()
+    : text.toLowerCase();
   for (const regex of boundaryRegexes) {
     if (regex.test(normalized)) {
       return true;

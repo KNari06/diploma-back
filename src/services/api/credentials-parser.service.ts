@@ -111,13 +111,20 @@ export class CredentialsParserService {
   /**
    * Parse key-value format: "email: test@test.com, password: 123"
    * Now also supports phone: "+7..."
+   *
+   * FIX: Password pattern now supports quoted values to preserve special chars
+   * e.g. password: "my,complex;pass" → captures full value including , and ;
+   * Unquoted passwords still stop at whitespace/comma/semicolon (backward compat)
    */
   private static parseKeyValueFormat(text: string): Credentials | null {
-    const patterns = {
-      email: /email[:\s]+([^\s,;]+)/i,
-      username: /username[:\s]+([^\s,;]+)/i,
-      phone: /(?:phone|tel|mobile|телефон|номер)[:\s]+([^\s,;]+)/i,
-      password: /password[:\s]+([^\s,;]+)/i,
+    // Quoted-aware value pattern: "quoted value" OR 'quoted value' OR unquoted
+    const qval = `(?:"([^"]{1,100})"|'([^']{1,100})'|([^\\s,;]+))`;
+
+    const patterns: Record<string, RegExp> = {
+      email: new RegExp(`email[:\\s]+${qval}`, 'i'),
+      username: new RegExp(`username[:\\s]+${qval}`, 'i'),
+      phone: new RegExp(`(?:phone|tel|mobile|телефон|номер)[:\\s]+${qval}`, 'i'),
+      password: new RegExp(`password[:\\s]+${qval}`, 'i'),
     };
 
     const result: Partial<Credentials> = {};
@@ -125,7 +132,8 @@ export class CredentialsParserService {
     for (const [key, regex] of Object.entries(patterns)) {
       const match = text.match(regex);
       if (match) {
-        result[key as keyof Credentials] = match[1];
+        // Pick first non-empty capture group (double-quoted, single-quoted, unquoted)
+        result[key as keyof Credentials] = match[1] || match[2] || match[3];
       }
     }
 
@@ -139,12 +147,20 @@ export class CredentialsParserService {
 
   /**
    * Parse slash/pipe format: "test@test.com / 123" or "username | pass" or "+7... / pass"
+   *
+   * FIX: Split only on the FIRST ` / ` or ` | ` delimiter (with surrounding whitespace).
+   * Previous regex `([^\s/|]+)` truncated passwords containing / or |
+   * e.g. "admin / P@ss/word!" → password was "P@ss" instead of "P@ss/word!"
    */
   private static parseSlashFormat(text: string): Credentials | null {
-    const match = text.match(/([^\s/|]+)[\s]*[/|][\s]*([^\s]+)/);
+    // Match: <login> <whitespace?> / or | <whitespace?> <password>
+    // Split on FIRST occurrence of / or | surrounded by optional whitespace
+    const match = text.match(/^(.+?)\s+[/|]\s+(.+)$/);
     if (match) {
       const firstPart = match[1].trim();
       const secondPart = match[2].trim();
+
+      if (!firstPart || !secondPart) return null;
 
       // Check if first part is email
       if (firstPart.includes('@')) {

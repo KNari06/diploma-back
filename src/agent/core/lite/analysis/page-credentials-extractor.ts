@@ -33,100 +33,115 @@ export interface PageCredentialsResult {
  * - "username is student" / "Логин: admin" / "Kullanıcı adı: test"
  * - "password = Password123" / "Пароль: 123456" / "Şifre: demo"
  */
+// ═══════════════════════════════════════════════════════════════════════════
+// Value capture pattern: supports both quoted and unquoted values
+// - Quoted: captures everything between matching quotes (allows spaces, special chars)
+// - Unquoted: captures non-whitespace run (original behavior, for simple values)
+// Separators: :, =, –, -, ：(fullwidth colon), is
+// ═══════════════════════════════════════════════════════════════════════════
+const SEP = `(?:is\\s*:?|:|：|=|–|-)`;           // separator (including fullwidth colon ：)
+const QVAL = `(?:"([^"]{2,80})"|'([^']{2,80})')`; // quoted value capture (groups 1,2)
+const UVAL = `([^\\s"'<>]{2,50})`;                 // unquoted value capture (group 3)
+const VAL = `(?:${QVAL}|${UVAL})`;                 // combined: try quoted first, then unquoted
+
+function buildCredPattern(keywords: string): RegExp {
+  return new RegExp(`(?:${keywords})\\s*${SEP}\\s*${VAL}`, 'i');
+}
+
 const USERNAME_PATTERNS = [
-  // English: username, user, login, email, user id, userid
-  /(?:username|user|login|email|user\s*id|userid)\s*(?:is|:|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
-  /(?:^|\s)(?:user|login|email|userid|user\s*id)\s*:\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // English
+  buildCredPattern('username|user|login|email|user\\s*id|userid'),
+  /(?:^|\s)(?:user|login|email|userid|user\s*id)\s*[:：]\s*(?:"([^"]{2,80})"|'([^']{2,80})'|([^\s"'<>]{2,50}))/i,
 
-  // Russian: логин, пользователь, имя пользователя, почта, емейл
-  /(?:логин|пользователь|имя\s+пользователя|почта|емейл|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Russian
+  buildCredPattern('логин|пользователь|имя\\s+пользователя|почта|емейл|email'),
 
-  // Turkish: kullanıcı adı, kullanıcı, giriş, e-posta
-  /(?:kullanıcı\s+adı|kullanıcı|giriş|e-posta|eposta)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Turkish
+  buildCredPattern('kullanıcı\\s+adı|kullanıcı|giriş|e-posta|eposta'),
 
-  // Kazakh: пайдаланушы, кіру, электрондық пошта
-  /(?:пайдаланушы|кіру|электрондық\s+пошта)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Kazakh
+  buildCredPattern('пайдаланушы|кіру|электрондық\\s+пошта'),
 
-  // Ukrainian: користувач, логін, електронна пошта
-  /(?:користувач|логін|електронна\s+пошта|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Ukrainian
+  buildCredPattern('користувач|логін|електронна\\s+пошта|email'),
 
-  // German: benutzername, benutzer, anmelden, e-mail
-  /(?:benutzername|benutzer|anmelden|e-mail)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // German
+  buildCredPattern('benutzername|benutzer|anmelden|e-mail'),
 
-  // French: nom d'utilisateur, utilisateur, connexion, e-mail
-  /(?:nom\s+d'utilisateur|nom\s+utilisateur|utilisateur|connexion|e-mail|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // French
+  buildCredPattern("nom\\s+d'utilisateur|nom\\s+utilisateur|utilisateur|connexion|e-mail|email"),
 
-  // Spanish: nombre de usuario, usuario, iniciar sesión, correo
-  /(?:nombre\s+de\s+usuario|usuario|iniciar\s+sesión|correo|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Spanish
+  buildCredPattern('nombre\\s+de\\s+usuario|usuario|iniciar\\s+sesión|correo|email'),
 
-  // Portuguese: nome de usuário, usuário, login, e-mail
-  /(?:nome\s+de\s+usuário|usuário|login|e-mail|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Portuguese
+  buildCredPattern('nome\\s+de\\s+usuário|usuário|login|e-mail|email'),
 
-  // Italian: nome utente, utente, accesso, e-mail
-  /(?:nome\s+utente|utente|accesso|e-mail|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Italian
+  buildCredPattern('nome\\s+utente|utente|accesso|e-mail|email'),
 
-  // Polish: nazwa użytkownika, użytkownik, login, e-mail
-  /(?:nazwa\s+użytkownika|użytkownik|login|e-mail|email)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Polish
+  buildCredPattern('nazwa\\s+użytkownika|użytkownik|login|e-mail|email'),
 
-  // Chinese: 用户名, 用户, 登录, 邮箱
-  /(?:用户名|用户|登录|邮箱)\s*(?::|：|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Chinese (with fullwidth colon)
+  buildCredPattern('用户名|用户|登录|邮箱'),
 
-  // Japanese: ユーザー名, ユーザー, ログイン, メール
-  /(?:ユーザー名|ユーザー|ログイン|メール)\s*(?::|：|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Japanese (with fullwidth colon)
+  buildCredPattern('ユーザー名|ユーザー|ログイン|メール'),
 
-  // Arabic: اسم المستخدم, المستخدم, تسجيل الدخول, البريد الإلكتروني
-  /(?:اسم\s+المستخدم|المستخدم|تسجيل\s+الدخول|البريد\s+الإلكتروني)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Arabic
+  buildCredPattern('اسم\\s+المستخدم|المستخدم|تسجيل\\s+الدخول|البريد\\s+الإلكتروني'),
 ];
 
 const PASSWORD_PATTERNS = [
-  // English: password, pass, pwd, pin, passcode, secret
-  /(?:password|pass|pwd|pin|passcode|secret)\s*(?:is\s*:?|:|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
-  /(?:^|\s)(?:password|pass|pwd|pin|passcode)\s*:\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // English
+  buildCredPattern('password|pass|pwd|pin|passcode|secret'),
+  /(?:^|\s)(?:password|pass|pwd|pin|passcode)\s*[:：]\s*(?:"([^"]{2,80})"|'([^']{2,80})'|([^\s"'<>]{2,50}))/i,
 
-  // Russian: пароль, пасс, секрет, код
-  /(?:пароль|пасс|секрет|код)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Russian
+  buildCredPattern('пароль|пасс|секрет|код'),
 
-  // Turkish: şifre, parola, gizli kod
-  /(?:şifre|parola|gizli\s+kod)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Turkish
+  buildCredPattern('şifre|parola|gizli\\s+kod'),
 
-  // Kazakh: құпия сөз, пароль, код
-  /(?:құпия\s+сөз|пароль|код)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Kazakh
+  buildCredPattern('құпия\\s+сөз|пароль|код'),
 
-  // Ukrainian: пароль, секретний код
-  /(?:пароль|секретний\s+код)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Ukrainian
+  buildCredPattern('пароль|секретний\\s+код'),
 
-  // German: passwort, kennwort, geheimcode
-  /(?:passwort|kennwort|geheimcode)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // German
+  buildCredPattern('passwort|kennwort|geheimcode'),
 
-  // French: mot de passe, code secret
-  /(?:mot\s+de\s+passe|code\s+secret)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // French
+  buildCredPattern('mot\\s+de\\s+passe|code\\s+secret'),
 
-  // Spanish: contraseña, clave, código secreto
-  /(?:contraseña|clave|código\s+secreto)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Spanish
+  buildCredPattern('contraseña|clave|código\\s+secreto'),
 
-  // Portuguese: senha, código secreto
-  /(?:senha|código\s+secreto)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Portuguese
+  buildCredPattern('senha|código\\s+secreto'),
 
-  // Italian: password, parola d'ordine, codice segreto
-  /(?:password|parola\s+d'ordine|codice\s+segreto)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Italian
+  buildCredPattern("password|parola\\s+d'ordine|codice\\s+segreto"),
 
-  // Polish: hasło, kod tajny
-  /(?:hasło|kod\s+tajny)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Polish
+  buildCredPattern('hasło|kod\\s+tajny'),
 
-  // Chinese: 密码, 口令
-  /(?:密码|口令)\s*(?::|：|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Chinese
+  buildCredPattern('密码|口令'),
 
-  // Japanese: パスワード, 暗証番号
-  /(?:パスワード|暗証番号)\s*(?::|：|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Japanese
+  buildCredPattern('パスワード|暗証番号'),
 
-  // Arabic: كلمة المرور, كلمة السر, الرمز السري
-  /(?:كلمة\s+المرور|كلمة\s+السر|الرمز\s+السري)\s*(?::|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i,
+  // Arabic
+  buildCredPattern('كلمة\\s+المرور|كلمة\\s+السر|الرمز\\s+السري'),
 ];
 
 // Only used when we know the field kind (e.g., placeholder of a username/password input).
 // Keeps this conservative to avoid extracting random tokens from arbitrary text.
 const DEMO_MARKER_VALUE_PATTERN =
-  /(?:demo|test|example|sample)\s*(?:is|:|=|–|-)\s*["']?([^\s"'<>]{2,50})["']?/i;
+  new RegExp(`(?:demo|test|example|sample)\\s*${SEP}\\s*${VAL}`, 'i');
 
 /**
  * Clean extracted credential value
@@ -152,12 +167,18 @@ function cleanCredentialValue(value: string, isPassword = false): string {
 
 /**
  * Extract a credential from text using multiple patterns
+ *
+ * Patterns use 3 capture groups: (1) double-quoted, (2) single-quoted, (3) unquoted.
+ * We pick the first non-empty group.
  */
 function extractWithPatterns(text: string, patterns: RegExp[], isPassword = false): string | undefined {
   for (const pattern of patterns) {
     const match = text.match(pattern);
-    if (match && match[1]) {
-      const cleaned = cleanCredentialValue(match[1], isPassword);
+    if (match) {
+      // Pick first non-empty capture group (groups 1-3 from buildCredPattern)
+      const raw = match[1] || match[2] || match[3];
+      if (!raw) continue;
+      const cleaned = cleanCredentialValue(raw, isPassword);
       if (cleaned.length >= 2) {
         return cleaned;
       }
