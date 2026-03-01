@@ -307,6 +307,9 @@ You MUST choose a fundamentally different element/action. Forbidden actions will
 
     // URL context
     const urlLine = input.currentUrl ? `- Current URL: ${input.currentUrl}\n` : '';
+    const transitionSection = input.transitionSummary
+      ? `\nGOAL COMPLETION SIGNALS:\n${input.transitionSummary}\nIf this transition already satisfies the goal, set "done": true immediately.\n`
+      : '';
 
     // Manus parity: Table context from Observer
     const tableSection = input.tableContext
@@ -339,7 +342,7 @@ ${urlLine}- Available actions: ${input.observation.availableActions.join(', ') |
 - Form: ${input.observation.formAnalysis ? `${input.observation.formAnalysis.fields.length} fields, submit="${input.observation.formAnalysis.submitButtonText || 'unknown'}"` : 'none'}
 - Error state: ${input.observation.errorState || 'none'}
 - Modal: ${input.observation.modalInfo || 'none'}${formRefsHint}
-${impactSection}${spatialSection}${networkStateSection}${expectationSection}${tableSection}${listSection}${loadingContextSection}${overlapSection}${workingMemorySection}
+${impactSection}${spatialSection}${networkStateSection}${expectationSection}${tableSection}${listSection}${loadingContextSection}${overlapSection}${transitionSection}${workingMemorySection}
 ═══ TOOL COST & RISK MATRIX ═══
 Before choosing an action, consider its cost and risk:
 | Action   | Cost   | Risk   | When to use                              |
@@ -373,6 +376,7 @@ ${rollingHistory}
 - If data is not visible, try pagination (Next button) or Load More before blind scrolling
 - Prefer fill/scroll (LOW cost) over click (MEDIUM cost) when both achieve the same goal
 - Prefer deterministic form filling (fill email → fill password → click submit) over exploratory clicks
+- CRITICAL: After ANY action, verify whether goal is already complete. If transition signals indicate success, set "done": true and stop acting
 ${credentialNegativeConstraints}
 
 ═══ OUTPUT FORMAT ═══

@@ -64,6 +64,10 @@ export const AI_TASK_MODELS = {
   selectorResolution: AI_MODELS.fast,
   /** Intent parsing (NL → structured command) */
   intentParsing: AI_MODELS.fast,
+  /** Vision-based element resolution (Gemini multimodal, screenshot + DOM) */
+  visionElementResolution: 'gemini-2.0-flash-exp' as const,
+  /** Post-healing visual verification (Gemini multimodal, confirm correct element) */
+  healingVerification: 'gemini-2.0-flash-exp' as const,
 
   // ── Lite Engine / Test Orchestration ───────────────────────────────────
   /** Core brain for Lite engine decision making */

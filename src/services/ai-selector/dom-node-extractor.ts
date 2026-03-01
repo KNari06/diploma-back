@@ -217,23 +217,51 @@ export class DOMNodeExtractor {
               attributes['__resolvedLabel'] = resolvedLabel.substring(0, 200);
             }
 
-            // Container titles (fieldset/form/section headings — important for disambiguation)
+            // Container titles (Phase 7: expanded semantic container detection)
+            // Detects fieldset legends, form/section headings, ARIA group labels, landmarks
+            const LANDMARK_ROLES_SET = ['banner', 'navigation', 'main', 'complementary', 'contentinfo', 'search', 'form', 'region'];
+            const SEMANTIC_TAGS_SET = ['FIELDSET', 'FORM', 'SECTION', 'ARTICLE', 'NAV', 'ASIDE', 'DIALOG', 'HEADER', 'FOOTER', 'MAIN'];
+
             const cTitles: string[] = [];
+            let nearestLandmark = '';
             let par = element.parentElement;
             let d = 0;
-            while (par && d < 5) {
-              if (par.tagName === 'FIELDSET') {
+            while (par && d < 8) {
+              const parRole = (par.getAttribute('role') || '').toLowerCase();
+              const parAriaLabel = par.getAttribute('aria-label');
+              const parTag = par.tagName;
+
+              // Track nearest landmark
+              if (!nearestLandmark) {
+                if (parRole && LANDMARK_ROLES_SET.includes(parRole)) nearestLandmark = parRole;
+                else if (parTag === 'NAV') nearestLandmark = 'navigation';
+                else if (parTag === 'MAIN') nearestLandmark = 'main';
+                else if (parTag === 'HEADER') nearestLandmark = 'banner';
+                else if (parTag === 'FOOTER') nearestLandmark = 'contentinfo';
+                else if (parTag === 'ASIDE') nearestLandmark = 'complementary';
+              }
+
+              // Extract container title
+              if (parTag === 'FIELDSET') {
                 const leg = par.querySelector('legend');
                 if (leg?.textContent?.trim()) cTitles.push(leg.textContent.trim());
-              } else if (par.tagName === 'FORM' || ['SECTION', 'ARTICLE', 'NAV'].includes(par.tagName)) {
-                const hd = par.querySelector('h1, h2, h3, h4, h5, h6');
-                if (hd?.textContent?.trim()) cTitles.push(hd.textContent.trim());
+              } else if (SEMANTIC_TAGS_SET.includes(parTag) || (parRole && ['group', 'region', 'form', 'navigation', 'banner', 'main', 'complementary', 'search'].includes(parRole))) {
+                if (parAriaLabel?.trim()) {
+                  cTitles.push(parAriaLabel.trim());
+                } else {
+                  const hd = par.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6');
+                  if (hd?.textContent?.trim()) cTitles.push(hd.textContent.trim());
+                }
               }
+
               par = par.parentElement;
               d++;
             }
             if (cTitles.length > 0) {
-              attributes['__containerTitles'] = cTitles.slice(0, 3).join('|');
+              attributes['__containerTitles'] = cTitles.slice(0, 5).join('|');
+            }
+            if (nearestLandmark) {
+              attributes['__nearestLandmark'] = nearestLandmark;
             }
 
             // isTopMostAtCenter (for overlay/modal detection)

@@ -698,6 +698,21 @@ export interface GoalEval {
 }
 
 /**
+ * AI-based goal completion evaluator result.
+ * gpt-4o-mini decides whether the goal is achieved by comparing before/after state.
+ */
+export interface GoalCompletionResult {
+  /** AI verdict: whether the user goal is fully achieved. */
+  isDone: boolean;
+  /** AI confidence score (0..1). */
+  confidence: number;
+  /** AI-generated explanation of the decision. */
+  reason: string;
+  /** Compact transition summary injected into next AI prompt and traces. */
+  transitionSummary: string;
+}
+
+/**
  * Guidance from AI fallback to inject into prompt
  * Used when agent is stuck to help it recover
  */

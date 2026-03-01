@@ -20,6 +20,7 @@ import { isDownloadText, isFileUploadTarget, isPaymentContext } from './analysis
 import { classifyField } from './analysis/field-classifier';
 import { FlowStateDetector } from './analysis/flow-state-detector';
 import { FunnelAnalyzer, FunnelPhase } from './analysis/funnel-analyzer';
+import { GoalCompletionEvaluator } from './analysis/goal-completion-evaluator';
 import { GoalDetector } from './analysis/goal-detector';
 import { GoalExpander, type ExpandedGoal } from './analysis/goal-expander';
 import { HybridSemanticWeightCalculator, matchesKeyword } from './analysis/hybrid-semantic-weight';
@@ -59,6 +60,7 @@ export class LiteEngine {
   private progressEmitter: TestProgressEmitter;
   private graphBuilder: GraphBuilder; // ✅ NEW: Full graph like Pro
   private goalDetector: GoalDetector; // ✅ NEW: Goal-first detection
+  private goalCompletionEvaluator: GoalCompletionEvaluator; // ✅ AI-based post-action goal completion check
   private flowStateDetector: FlowStateDetector; // ✅ Task #21: Multi-step flow tracking
   private currentFlowState: FlowState | null = null; // ✅ Task #21: Current flow state
   private traceWriter: LiteTraceWriter; // ✅ NEW: Always-on JSONL trace for debugging
@@ -113,6 +115,7 @@ export class LiteEngine {
   private transientWaitStartTime: number | null = null;
   private readonly MAX_TRANSIENT_WAIT_MS = 15000; // 15 seconds max wait for loaders
   private lastGoalOrientedSummary: string | null = null; // ✅ NEW: Goal-Oriented Summary from last iteration (Hybrid Semantic Weight)
+  private lastTransitionSummary: string | null = null; // ✅ NEW: Transition summary from last meaningful state change
   private skillsContext = ''; // Workspace skills from KB (loaded once at start)
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -175,6 +178,7 @@ export class LiteEngine {
     this.consoleCollector = new ConsoleCollector(page);
     this.graphBuilder = new GraphBuilder(); // ✅ NEW: Initialize graph builder
     this.goalDetector = new GoalDetector(config.goal, config.testId); // ✅ NEW: Initialize goal detector with testId for AI fallback
+    this.goalCompletionEvaluator = new GoalCompletionEvaluator(config.testId); // ✅ AI-based goal completion evaluator
     this.flowStateDetector = new FlowStateDetector(config.testId, config.goal); // ✅ Task #21: Initialize flow state detector
     this.traceWriter = new LiteTraceWriter({ testId: config.testId }); // ✅ NEW: Initialize trace writer
     this.semanticWeightCalculator = new HybridSemanticWeightCalculator(config.goal, config.testId); // ✅ NEW: Initialize hybrid semantic weight calculator
@@ -1414,14 +1418,17 @@ export class LiteEngine {
         // Re-wait and re-collect so the AI doesn't see the old page.
         if (this.credentialFillState === 'done' && !this.staleSnapshotGuardDone) {
           this.staleSnapshotGuardDone = true;
+          const urlChangedFromAuth = !!this.config.url && snapshotBefore.url !== this.config.url;
           const hasPasswordField = snapshotBefore.elements.some(
             el => el.tag === 'input' && el.type === 'password' && el.visible
           );
-          if (hasPasswordField) {
+          if (hasPasswordField || urlChangedFromAuth) {
             logger.info('[LITE_ENGINE] Stale snapshot after auto-fill: login form still visible, re-waiting', {
               testId: this.config.testId,
               url: snapshotBefore.url,
               iteration: i,
+              hasPasswordField,
+              urlChangedFromAuth,
             });
             try {
               await this.page.waitForLoadState('networkidle', { timeout: 8000 });
@@ -1976,11 +1983,14 @@ export class LiteEngine {
                 Date.now() - 10000
               );
 
+              // Re-collect fresh post-navigation snapshot to avoid stale auth-page context.
+              const freshPostCredSnapshot = await SnapshotCollector.collect(this.page);
+
               // Build enriched goal context with credential-fill + auth signals
               const credGoalContext: GoalContext = {
-                ...goalContext,
+                ...this.buildGoalContext(freshPostCredSnapshot, i, stuckCheck),
                 urlBefore: this.config.url,
-                urlAfter: snapshotBefore.url,
+                urlAfter: freshPostCredSnapshot.url,
                 urlChanged: true,
                 lastOutcome: 'Credentials filled and submitted via auto-fill, page redirected',
                 authSignals: {
@@ -1996,7 +2006,7 @@ export class LiteEngine {
                     status: r.status || 0,
                     error: r.error,
                   })),
-                  titleAfter: snapshotBefore.title,
+                  titleAfter: freshPostCredSnapshot.title,
                 },
               };
 
@@ -2018,7 +2028,7 @@ export class LiteEngine {
                 this.config.testId,
                 this.goalDetector.auditDone(
                   credGoalContext,
-                  'Credentials filled and submitted via auto-fill, page redirected to ' + snapshotBefore.url
+                  'Credentials filled and submitted via auto-fill, page redirected to ' + freshPostCredSnapshot.url
                 ),
                 'goalDetector.auditDone (post-credential-fill)'
               );
@@ -2538,6 +2548,7 @@ export class LiteEngine {
           stateDriftAnalysis, // ✅ NEW: State drift from last action
           lastAction: lastStateDiff?.action, // ✅ NEW: Last action for context
           goalOrientedSummary: this.lastGoalOrientedSummary || undefined, // ✅ NEW: Goal-Oriented Summary (Secret Sauce)
+          transitionSummary: this.lastTransitionSummary || undefined, // ✅ NEW: Transition summary to help done detection
           visionHints: visionHints || undefined, // ✅ NEW: L5 Vision hints when DOM is weak
           formFocusHint, // ✅ TASK 9: Goal form identification
           failedActions, // Negative Reinforcement: blacklisted actions
@@ -2619,6 +2630,7 @@ export class LiteEngine {
             recentConsoleErrors: this.lastConsoleErrors.length > 0 ? this.lastConsoleErrors.slice(-5) : undefined,
             recentNetworkErrors: this.lastNetworkErrors.length > 0 ? this.lastNetworkErrors.slice(-3) : undefined,
             recentValidationErrors: this.lastValidationErrors.length > 0 ? this.lastValidationErrors.slice(-3) : undefined,
+            transitionSummary: this.lastTransitionSummary || undefined,
             // Thinking step callback for real-time agent progress (fire-and-forget)
             onThinkingStep: (phase: string, message: string) => {
               try {
@@ -3426,8 +3438,29 @@ export class LiteEngine {
             consecutiveCount: this.consecutiveNoEffectCount,
             iteration: i,
           });
+
+          // Hard early stop: agent has been unable to make any progress
+          if (this.consecutiveNoEffectCount >= LITE_ENGINE_FLAGS.maxConsecutiveNoEffect) {
+            logger.warn('[LITE_ENGINE] Max consecutive no-effect reached, stopping early', {
+              testId: this.config.testId,
+              consecutiveNoEffect: this.consecutiveNoEffectCount,
+              threshold: LITE_ENGINE_FLAGS.maxConsecutiveNoEffect,
+              iteration: i,
+            });
+            const reason = `Unable to make progress after ${this.consecutiveNoEffectCount} consecutive attempts`;
+            this.emitCompletion(false, reason);
+            await this.flushPendingGraphScreenshotUploads();
+            closeIteration({
+              iteration: i,
+              outcome: 'no_effect',
+              urlAfter: snapshotAfter.url,
+              stateChanged: false,
+              earlyStop: 'max_consecutive_no_effect',
+            });
+            return await this.buildResult(false, reason);
+          }
         } else {
-          this.consecutiveNoEffectCount = 0; // Reset on any progress
+          this.consecutiveNoEffectCount = 0;
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -3527,6 +3560,42 @@ export class LiteEngine {
 
         if (enrichedDiff.progressSentiment === 'Major Progress') {
           this.state.resetRecoveryAttempts(this.config.goal, snapshotAfter.url);
+        }
+
+        // AI-based post-action goal completion check.
+        // Sends before/after state to gpt-4o-mini which decides if the goal is achieved.
+        if (outcome === 'state_changed' || diff.urlChanged || enrichedDiff.progressSentiment === 'Major Progress') {
+          const completionCheck = await withCancellation(
+            this.config.testId,
+            this.goalCompletionEvaluator.evaluate(
+              snapshotBefore,
+              snapshotAfter,
+              diff,
+              this.config.goal
+            ),
+            'goalCompletionEvaluator.evaluate'
+          );
+          this.lastTransitionSummary = completionCheck.transitionSummary;
+
+          if (completionCheck.isDone && completionCheck.confidence >= 0.6) {
+            const reason = completionCheck.reason || 'Goal reached';
+            logger.info('[LITE_ENGINE] AI goal completion evaluator confirmed goal reached', {
+              testId: this.config.testId,
+              iteration: i,
+              confidence: completionCheck.confidence,
+              reason,
+            });
+            this.emitCompletion(true, reason);
+            await this.flushPendingGraphScreenshotUploads();
+            closeIteration({
+              iteration: i,
+              outcome: 'goal_reached',
+              trigger: 'ai_goal_completion_evaluator',
+            });
+            return await this.buildResult(true, reason);
+          }
+        } else {
+          this.lastTransitionSummary = null;
         }
 
         // ✅ NEW: Trace validation

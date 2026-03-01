@@ -49,6 +49,8 @@ export interface CompiledExecutionResult {
   signatureMatched?: boolean;
   /** Runtime source for reporting */
   source: RuntimeSource;
+  /** Ambiguity details — which strategies hit multiple elements and how many */
+  ambiguityDetails?: Array<{ strategy: string; matchCount: number }>;
 }
 
 /**
@@ -145,8 +147,14 @@ async function checkPageSignature(
 }
 
 /**
- * Quick fingerprint check to validate found element matches expected attributes
- * Returns match score 0-1 (1 = perfect match)
+ * Quick fingerprint check to validate found element matches expected attributes.
+ * Returns match score 0-1 (1 = perfect match).
+ *
+ * ── BUG FIX: Now checks ALL 8 fingerprint attributes ──
+ * Previously only 4 were checked (tag, role, ariaLabel, placeholder).
+ * Now also checks: labelText, testIdAttr, containerTitles, boundingBox.
+ * This catches cases like two "Submit" buttons in different forms
+ * (same tag/role but different containers/labels).
  */
 async function quickFingerprintCheck(
   page: PageLike,
@@ -154,15 +162,56 @@ async function quickFingerprintCheck(
   fingerprint: TargetFingerprint
 ): Promise<number> {
   try {
-    const element = await locator.evaluate((el: any) => ({
-      tag: el?.tagName?.toLowerCase(),
-      role: el?.getAttribute?.('role'),
-      ariaLabel: el?.getAttribute?.('aria-label'),
-      placeholder: el?.getAttribute?.('placeholder'),
-    }));
+    const element = await locator.evaluate((el: any) => {
+      // Extract associated label text
+      let labelText: string | null = null;
+      const doc = el.ownerDocument;
+      if (el.id && doc) {
+        const label = doc.querySelector(`label[for="${el.id}"]`);
+        if (label) labelText = label.textContent?.trim() || null;
+      }
+      if (!labelText && el.closest?.('label')) {
+        labelText = el.closest('label').textContent?.trim() || null;
+      }
+
+      // Extract container titles (nearest semantic containers)
+      const containerTitles: string[] = [];
+      let parent = el.parentElement;
+      let depth = 0;
+      while (parent && depth < 5) {
+        const tag = parent.tagName?.toLowerCase();
+        if (['fieldset', 'form', 'section', 'article', 'nav', 'dialog'].includes(tag)) {
+          const legend = parent.querySelector(':scope > legend');
+          const heading = parent.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4');
+          const title = legend?.textContent?.trim() || heading?.textContent?.trim() || parent.getAttribute('aria-label') || '';
+          if (title) containerTitles.push(title);
+        } else if (parent.getAttribute('role') === 'group' || parent.getAttribute('role') === 'region') {
+          const title = parent.getAttribute('aria-label') || '';
+          if (title) containerTitles.push(title);
+        }
+        parent = parent.parentElement;
+        depth++;
+      }
+
+      return {
+        tag: el?.tagName?.toLowerCase(),
+        role: el?.getAttribute?.('role'),
+        ariaLabel: el?.getAttribute?.('aria-label'),
+        placeholder: el?.getAttribute?.('placeholder'),
+        labelText,
+        testIdAttr: el?.getAttribute?.('data-testid'),
+        containerTitles,
+        boundingBox: el?.getBoundingClientRect ? (() => {
+          const r = el.getBoundingClientRect();
+          return { x: r.x, y: r.y, width: r.width, height: r.height };
+        })() : null,
+      };
+    });
 
     let matches = 0;
     let total = 0;
+
+    // ── Core attributes (weighted: each counts as 1) ──
 
     // Compare tag
     if (fingerprint.tag) {
@@ -186,6 +235,39 @@ async function quickFingerprintCheck(
     if (fingerprint.placeholder) {
       total++;
       if (element.placeholder === fingerprint.placeholder) matches++;
+    }
+
+    // ── Extended attributes (also weighted: each counts as 1) ──
+
+    // Compare labelText
+    if (fingerprint.labelText) {
+      total++;
+      if (element.labelText === fingerprint.labelText) matches++;
+    }
+
+    // Compare testIdAttr
+    if (fingerprint.testIdAttr) {
+      total++;
+      if (element.testIdAttr === fingerprint.testIdAttr) matches++;
+    }
+
+    // Compare containerTitles (at least one common container = match)
+    if (fingerprint.containerTitles && fingerprint.containerTitles.length > 0) {
+      total++;
+      const fpContainers = new Set(fingerprint.containerTitles.map(c => c.toLowerCase()));
+      const elContainers = (element.containerTitles || []).map((c: string) => c.toLowerCase());
+      const hasCommon = elContainers.some((c: string) => fpContainers.has(c));
+      if (hasCommon) matches++;
+    }
+
+    // Compare boundingBox (within 100px tolerance — catches major repositioning)
+    if (fingerprint.boundingBox && element.boundingBox) {
+      total++;
+      const fp = fingerprint.boundingBox;
+      const el = element.boundingBox;
+      const dx = Math.abs(fp.x - el.x);
+      const dy = Math.abs(fp.y - el.y);
+      if (dx <= 100 && dy <= 100) matches++;
     }
 
     // If no fingerprint attributes, return 1 (no validation needed)
@@ -321,6 +403,22 @@ export async function executeCompiledLocatorPlan(
   // 3. Check pageSignature (if present)
   const signatureCheck = await checkPageSignature(page, compiled.context?.pageSignature);
 
+  // ── BUG FIX: Signature mismatch must skip compiled execution ──────────
+  // Previously this check was performed but never enforced — locators ran
+  // even on drastically different pages, risking wrong element interaction.
+  if (!signatureCheck.matched) {
+    logger.warn('[COMPILED_EXECUTOR] Page signature mismatch — skipping compiled plan', {
+      compiledSignaturePreview: compiled.context?.pageSignature?.slice(0, 50),
+      currentSignaturePreview: signatureCheck.currentSignature.slice(0, 50),
+    });
+    return {
+      success: false,
+      skipReason: 'signature_mismatch',
+      signatureMatched: false,
+      source: 'resolver',
+    };
+  }
+
   // Always filter out ref strategy — data-agent-ref attributes only exist during preview sessions,
   // not during background replay/regression. Trying ref locators wastes 5s per step on timeout.
   // Keep stable strategies (role, label, testId, placeholder, css) that work without injected refs.
@@ -348,6 +446,7 @@ export async function executeCompiledLocatorPlan(
 
   // 4. Try each locator in order
   let sawAmbiguous = false;
+  const ambiguityDetails: Array<{ strategy: string; matchCount: number }> = [];
   for (const entry of locatorsToTry) {
     logger.debug('[COMPILED_EXECUTOR] Trying locator', {
       strategy: entry.strategy,
@@ -401,6 +500,12 @@ export async function executeCompiledLocatorPlan(
 
     if (result.failureKind === 'ambiguous') {
       sawAmbiguous = true;
+      // Extract match count from error message (e.g., "Ambiguous: 3 elements matched")
+      const countMatch = result.error?.match(/Ambiguous:\s*(\d+)/);
+      ambiguityDetails.push({
+        strategy: entry.strategy,
+        matchCount: countMatch ? parseInt(countMatch[1], 10) : 0,
+      });
     }
 
     logger.debug('[COMPILED_EXECUTOR] Locator failed, trying next', {
@@ -410,13 +515,17 @@ export async function executeCompiledLocatorPlan(
   }
 
   // All locators failed
-  logger.warn('[COMPILED_EXECUTOR] All locators in plan failed');
+  logger.warn('[COMPILED_EXECUTOR] All locators in plan failed', {
+    sawAmbiguous,
+    ambiguityDetails: ambiguityDetails.length > 0 ? ambiguityDetails : undefined,
+  });
   return {
     success: false,
     skipReason: sawAmbiguous ? 'ambiguous' : 'locator_failed',
     expired: false,
     signatureMatched: signatureCheck.matched,
     source: 'resolver',
+    ambiguityDetails: ambiguityDetails.length > 0 ? ambiguityDetails : undefined,
   };
 }
 
@@ -472,10 +581,17 @@ export function buildRuntimeMeta(
         meta.failedReason = 'element_not_found';
         meta.failureExplanation = 'All compiled locators failed to find element. Element may have been removed or changed.';
         break;
-      case 'ambiguous':
+      case 'ambiguous': {
         meta.failedReason = 'element_not_found';
-        meta.failureExplanation = 'Multiple elements matched the locator. Cannot determine which element to interact with without user clarification.';
+        const details = result.ambiguityDetails;
+        if (details && details.length > 0) {
+          const strategyInfo = details.map(d => `${d.strategy}(${d.matchCount} matches)`).join(', ');
+          meta.failureExplanation = `Multiple elements matched compiled locators [${strategyInfo}]. Cannot determine which element to interact with.`;
+        } else {
+          meta.failureExplanation = 'Multiple elements matched the locator. Cannot determine which element to interact with.';
+        }
         break;
+      }
       default:
         meta.failedReason = 'unknown';
         meta.failureExplanation = 'Unknown failure reason.';

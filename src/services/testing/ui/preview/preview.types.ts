@@ -99,8 +99,12 @@ export interface InteractiveNode {
   parentRefChain?: string[];
   /** Ref of nearest form/dialog/section container */
   containerRef?: string;
-  /** Titles of key containers (form legend, fieldset legend, section heading) */
+  /** Titles of key containers (form legend, fieldset legend, section heading, ARIA groups) */
   containerTitles?: string[];
+  /** Nearest ARIA landmark role (banner, navigation, main, complementary, search, etc.) */
+  nearestLandmark?: string;
+  /** Phase 4: Framework event binding detected (React/Vue/Angular) */
+  frameworkClickable?: 'react' | 'vue' | 'angular';
 }
 
 /**
@@ -242,6 +246,8 @@ export interface TargetFingerprint {
   placeholder?: string;
   boundingBox?: ElementBoundingBox;
   containerTitles?: string[];
+  /** Nearest ARIA landmark (Phase 7) */
+  nearestLandmark?: string;
 }
 
 /**
@@ -642,14 +648,25 @@ export const COMPILED_TTL_MS: Record<string, number> = {
 };
 
 /**
- * Check if a compiled plan is expired based on action type
+ * Check if a compiled plan is expired based on action type.
+ *
+ * ── BUG FIX: Malformed compiledAt now treated as expired ──
+ * Previously, `new Date(invalidString).getTime()` returned NaN,
+ * and `NaN > number` = false → TTL check was silently bypassed.
+ * Now: if compiledAt is missing or unparseable → treat as expired.
  */
 export function isCompiledPlanExpired(
   compiledAt: string,
   actionType: string
 ): boolean {
+  if (!compiledAt) return true;
+
   const ttl = COMPILED_TTL_MS[actionType] || COMPILED_TTL_MS.default;
   const compiledTime = new Date(compiledAt).getTime();
+
+  // NaN check: if compiledAt is malformed, treat as expired
+  if (isNaN(compiledTime)) return true;
+
   const now = Date.now();
   return now > compiledTime + ttl;
 }

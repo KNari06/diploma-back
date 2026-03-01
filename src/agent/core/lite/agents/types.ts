@@ -346,6 +346,8 @@ export interface StrategistInput {
   hasCredentials?: boolean;
   /** Current page URL for URL-aware decisions */
   currentUrl?: string;
+  /** Summary of last meaningful state transition for done detection */
+  transitionSummary?: string;
 
   // Manus parity: structured context from Observer
   /** Table context from Observer (for table navigation strategies) */
@@ -507,6 +509,8 @@ export interface MultiAgentInput {
   isStuck: boolean;
   /** Last outcome */
   lastOutcome?: string;
+  /** Summary of last meaningful state transition for done detection */
+  transitionSummary?: string;
   /** Whether credentials are provided */
   hasCredentials: boolean;
   /** Snapshot elements for actor filtering */

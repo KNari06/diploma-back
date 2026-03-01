@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenerativeAI, type Part } from '@google/generative-ai';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { AIUsageTracker, calculateGeminiCost } from '../tracking/ai-usage-tracker';
@@ -223,6 +223,124 @@ export async function getChatCompletionWithGemini(params: {
       error: error instanceof Error ? error.message : String(error),
       model,
       messageCount: messages.length,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Generate text with Gemini Vision (multimodal: image + text → text)
+ * Sends a screenshot (base64) alongside a text prompt for visual element analysis.
+ *
+ * Best for: element identification by visual appearance, screenshot-based disambiguation,
+ * visual verification of healed selectors.
+ */
+export async function generateTextWithGeminiVision(params: {
+  prompt: string;
+  imageBase64: string;
+  mimeType?: 'image/png' | 'image/jpeg';
+  model?: 'gemini-1.5-flash-latest' | 'gemini-1.5-pro' | 'gemini-2.0-flash-exp';
+  temperature?: number;
+  maxTokens?: number;
+  timeout?: number;
+}): Promise<GeminiResponse> {
+  const {
+    prompt,
+    imageBase64,
+    mimeType = 'image/png',
+    model = 'gemini-2.0-flash-exp',
+    temperature = 0,
+    maxTokens = 300,
+    timeout = 8000,
+  } = params;
+
+  if (!imageBase64 || imageBase64.length === 0) {
+    throw new Error('imageBase64 is required for vision requests');
+  }
+
+  try {
+    const client = getGeminiClient();
+    const genModel = client.getGenerativeModel({
+      model,
+      generationConfig: {
+        temperature,
+        maxOutputTokens: maxTokens,
+      },
+    });
+
+    // Build multimodal content: image + text
+    const parts: Part[] = [
+      {
+        inlineData: {
+          mimeType,
+          data: imageBase64,
+        },
+      },
+      {
+        text: prompt,
+      },
+    ];
+
+    // Create timeout promise (unref to avoid keeping event loop alive)
+    let timeoutId: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error('Gemini vision request timeout')), timeout);
+      (timeoutId as any)?.unref?.();
+    });
+
+    const resultPromise = genModel.generateContent(parts);
+
+    let genResult;
+    try {
+      genResult = await Promise.race([resultPromise, timeoutPromise]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+
+    const response = genResult.response;
+    const text = response.text();
+
+    const usage = response.usageMetadata || {
+      promptTokenCount: 0,
+      candidatesTokenCount: 0,
+      totalTokenCount: 0,
+    };
+
+    const result: GeminiResponse = {
+      content: text,
+      usage: {
+        inputTokens: usage.promptTokenCount || 0,
+        outputTokens: usage.candidatesTokenCount || 0,
+        totalTokens: usage.totalTokenCount || 0,
+        model,
+      },
+    };
+
+    // Track AI usage for billing/analytics
+    AIUsageTracker.record({
+      provider: 'gemini',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      totalTokens: result.usage.totalTokens,
+      costUSD: calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens),
+      timestamp: Date.now(),
+    });
+
+    logger.info('[GEMINI] Vision generation completed', {
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      imageSize: `${(imageBase64.length / 1024).toFixed(1)}KB`,
+    });
+
+    return result;
+  } catch (error) {
+    logger.error('[GEMINI] Vision generation failed', {
+      error: error instanceof Error ? error.message : String(error),
+      model,
+      promptLength: prompt.length,
+      imageSize: `${(imageBase64.length / 1024).toFixed(1)}KB`,
     });
     throw error;
   }

@@ -87,6 +87,10 @@ export const LITE_ENGINE_FLAGS = {
   /** Consecutive "No Effect" count to trigger vision */
   visionEscalationThreshold: 3,
 
+  /** Consecutive "No Effect" iterations before hard early stop.
+   *  Prevents the agent from burning iterations when completely stuck. */
+  maxConsecutiveNoEffect: 5,
+
   /** Enable cross-check with iframes */
   enableIframeCrosscheck: true,
 

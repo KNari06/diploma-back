@@ -2428,13 +2428,18 @@ export class CommandExecutor {
         return { locator: compiledResult.locator, runtimeMeta };
       }
 
-      // Log why compiled failed
+      // Log why compiled failed and store runtime meta for trace
       logger.info('[COMMAND_EXECUTOR] Compiled locator failed, falling back', {
         stepId,
         skipReason: compiledResult.skipReason,
         expired: compiledResult.expired,
         signatureMatched: compiledResult.signatureMatched,
       });
+
+      // Store failure meta so replay trace includes compiled plan failure info
+      // (even when subsequent healing succeeds, the compiled failure is useful for debugging)
+      const compiledFailureMeta = buildRuntimeMeta(compiledResult, Date.now() - startTime);
+      this.stepRuntimeMeta.set(stepId, compiledFailureMeta);
     }
 
     // 2. Try embeddings-based resolution (intent-aware, accurate)
@@ -2610,7 +2615,8 @@ export class CommandExecutor {
       }
 
       try {
-        const healingResult = await SelfHealingService.healSelector({
+        // Fast mode first
+        let healingResult = await SelfHealingService.healSelector({
           oldSelector: command.selector || '',
           intent: intentMeta?.intentDescription || command.description || '',
           page: this.page,
@@ -2623,16 +2629,76 @@ export class CommandExecutor {
           mode: 'fast',
         });
 
-        if (healingResult.success && healingResult.newSelector) {
+        // Phase 1: Escalate to accurate mode if fast fails
+        if (!healingResult.success || (!healingResult.newSelector && !healingResult.coordinates)) {
+          logger.info('[COMMAND_EXECUTOR] Intent healing fast failed, escalating to accurate', {
+            intent: intentMeta?.intentDescription?.substring(0, 80),
+          });
+          healingResult = await SelfHealingService.healSelector({
+            oldSelector: command.selector || '',
+            intent: intentMeta?.intentDescription || command.description || '',
+            page: this.page,
+            errorMessage: 'Element not found via compiled or smart locator (escalated)',
+            metadata: {
+              url: this.metadata.url || this.page.url(),
+              projectId: this.metadata.projectId,
+              userId: this.metadata.userId,
+            },
+            mode: 'accurate',
+          });
+          healingResult.escalated = true;
+        }
+
+        if (healingResult.success && (healingResult.newSelector || healingResult.coordinates)) {
           const healConfidence = healingResult.diff?.confidence ?? 0;
 
           // GUARD RAILS: Check confidence threshold before auto-applying healed selector
           // This prevents "quietly wrong heal" - a key safety feature
-          if (healConfidence >= this.selfHealingConfidenceThreshold) {
+          if (healConfidence >= this.selfHealingConfidenceThreshold && healingResult.newSelector) {
+            const healedSelector = healingResult.newSelector;
+
+            // ── Phase 8: Post-selection verification for intent healing path ──
+            if (SelfHealingService.shouldVerify({
+              confidence: healConfidence,
+              escalated: healingResult.escalated,
+              visionUsed: healingResult.visionUsed,
+              hasCoordinates: !!healingResult.coordinates,
+            })) {
+              logger.info('[COMMAND_EXECUTOR] Running verification on intent-healed selector', {
+                stepId,
+                confidence: healConfidence,
+                escalated: healingResult.escalated,
+              });
+
+              const verification = await SelfHealingService.verifySelectedElement({
+                page: this.page,
+                selector: healedSelector,
+                intent: intentMeta?.intentDescription || command.description || '',
+                actionType: actionType,
+                confidence: healConfidence,
+              });
+
+              healingResult.verified = verification.verified;
+              healingResult.verificationConfidence = verification.confidence;
+
+              if (!verification.verified) {
+                logger.warn('[COMMAND_EXECUTOR] Verification rejected intent-healed selector', {
+                  stepId,
+                  reason: verification.reason,
+                  confidence: verification.confidence,
+                });
+                // Don't return this locator — fall through to error handling below
+              }
+            }
+
+            // If verification was run and rejected, skip this result
+            if (healingResult.verified === false) {
+              logger.warn('[COMMAND_EXECUTOR] Skipping rejected healed selector', { stepId });
+            } else {
             // Apply iframe context if needed
             const locator = iframeSelector
-              ? this.page.frameLocator(iframeSelector).locator(healingResult.newSelector)
-              : getLocator(this.page, healingResult.newSelector);
+              ? this.page.frameLocator(iframeSelector).locator(healedSelector)
+              : getLocator(this.page, healedSelector);
 
             await locator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
 
@@ -2662,6 +2728,7 @@ export class CommandExecutor {
               resolutionPath: 'self_heal',
               needsReview,
               flaky,
+              verified: healingResult.verified,
             });
 
             // V2: Update compiled in DB if high-confidence heal (≥0.9)
@@ -2670,7 +2737,7 @@ export class CommandExecutor {
               this.persistHealedCompiled({
                 intentTestCaseId: intentMeta.intentTestCaseId,
                 stepId: intentMeta.stepId,
-                newSelector: healingResult.newSelector,
+                newSelector: healedSelector,
                 healConfidence,
                 pageUrl: this.page.url(),
                 existingCompiled: intentMeta.compiled, // Pass existing for merging
@@ -2683,6 +2750,7 @@ export class CommandExecutor {
             }
 
             return { locator, runtimeMeta };
+            }
           } else {
             // GUARD RAILS: Low confidence - block auto-healing entirely
             // Don't auto-update compiled/evidence when semantic match is low
@@ -2919,8 +2987,8 @@ export class CommandExecutor {
         error: errorMessage,
       });
 
-      // Attempt self-healing
-      const healingResult = await SelfHealingService.healSelector({
+      // Attempt self-healing: fast mode first
+      let healingResult = await SelfHealingService.healSelector({
         oldSelector: context.selector,
         intent: context.intent,
         page: this.page,
@@ -2930,11 +2998,33 @@ export class CommandExecutor {
           projectId: this.metadata.projectId,
           userId: this.metadata.userId,
         },
-        mode: 'fast', // Use fast mode for during-test healing
+        mode: 'fast',
       });
 
-      if (!healingResult.success || !healingResult.newSelector) {
-        logger.error('[COMMAND_EXECUTOR] Self-healing failed', {
+      // ── Phase 1: Escalate to accurate mode (screenshot + vision) if fast fails ──
+      if (!healingResult.success || (!healingResult.newSelector && !healingResult.coordinates)) {
+        logger.info('[COMMAND_EXECUTOR] Fast healing failed, escalating to accurate mode (vision)', {
+          oldSelector: context.selector,
+          intent: context.intent,
+        });
+
+        healingResult = await SelfHealingService.healSelector({
+          oldSelector: context.selector,
+          intent: context.intent,
+          page: this.page,
+          errorMessage,
+          metadata: {
+            url: this.metadata.url || this.page.url(),
+            projectId: this.metadata.projectId,
+            userId: this.metadata.userId,
+          },
+          mode: 'accurate', // Screenshot + Gemini Vision
+        });
+        healingResult.escalated = true;
+      }
+
+      if (!healingResult.success || (!healingResult.newSelector && !healingResult.coordinates)) {
+        logger.error('[COMMAND_EXECUTOR] Self-healing failed (fast + accurate)', {
           oldSelector: context.selector,
           suggestion: healingResult.suggestion,
         });
@@ -2964,25 +3054,102 @@ export class CommandExecutor {
           );
         }
 
+        // ── Phase 1: Coordinate-based click (vision fallback) ──────────
+        if (healingResult.coordinates && !healingResult.newSelector) {
+          const { x, y } = healingResult.coordinates;
+          logger.info('[COMMAND_EXECUTOR] Using coordinate-based click from vision', {
+            x, y,
+            action: context.action,
+            confidence: healingResult.diff.confidence,
+            escalated: healingResult.escalated,
+          });
+
+          if (context.action === 'click' || context.action === 'tap') {
+            await this.page.mouse.click(x, y);
+          } else {
+            // For non-click actions with coordinates, click first to focus, then act
+            await this.page.mouse.click(x, y);
+            if (context.action === 'type' && context.value) {
+              await this.page.keyboard.type(String(context.value));
+            }
+          }
+
+          logger.info('[COMMAND_EXECUTOR] Coordinate-based action succeeded', {
+            x, y, action: context.action,
+          });
+          return;
+        }
+
         logger.info('[COMMAND_EXECUTOR] Auto-applying healed selector', {
           newSelector: healingResult.newSelector,
           whatChanged: healingResult.diff.what_changed,
           action: context.action,
           confidence: healingResult.diff.confidence,
           threshold: this.selfHealingConfidenceThreshold,
+          escalated: healingResult.escalated,
+          visionUsed: healingResult.visionUsed,
         });
 
+        // ── Phase 8: Post-selection verification agent ──────────────────
+        // Verify the healed element is correct before executing the action.
+        // Only runs in "grey zone" (0.70–0.90 confidence) or when escalated.
+        // Fail-open: verification errors don't block execution.
+        if (healingResult.newSelector && SelfHealingService.shouldVerify({
+          confidence: healConfidence,
+          escalated: healingResult.escalated,
+          visionUsed: healingResult.visionUsed,
+          hasCoordinates: !!healingResult.coordinates,
+        })) {
+          logger.info('[COMMAND_EXECUTOR] Running post-selection verification', {
+            confidence: healConfidence,
+            escalated: healingResult.escalated,
+            selector: healingResult.newSelector.slice(0, 80),
+          });
+
+          const verification = await SelfHealingService.verifySelectedElement({
+            page: this.page,
+            selector: healingResult.newSelector,
+            intent: context.intent,
+            actionType: context.action,
+            confidence: healConfidence,
+          });
+
+          healingResult.verified = verification.verified;
+          healingResult.verificationConfidence = verification.confidence;
+
+          if (!verification.verified) {
+            logger.warn('[COMMAND_EXECUTOR] Verification rejected healed selector', {
+              reason: verification.reason,
+              confidence: verification.confidence,
+              selector: healingResult.newSelector?.slice(0, 80),
+            });
+            // Verification rejected → re-throw original error (don't execute wrong action)
+            throw error;
+          }
+
+          logger.info('[COMMAND_EXECUTOR] Verification confirmed healed selector', {
+            confidence: verification.confidence,
+            reason: verification.reason,
+          });
+        }
+
         // Apply healed selector according to action type
+        // Phase 3: Pass iframe context if element was found in an iframe
         await this.applyHealedSelector(
-          healingResult.newSelector,
+          healingResult.newSelector!,
           context.action,
           context.value,
-          context.timeout
+          context.timeout,
+          healingResult.iframeContext
         );
 
         logger.info('[COMMAND_EXECUTOR] Healed selector worked successfully', {
           newSelector: healingResult.newSelector,
           action: context.action,
+          escalated: healingResult.escalated,
+          visionUsed: healingResult.visionUsed,
+          verified: healingResult.verified,
+          inIframe: !!healingResult.iframeContext,
         });
       } else {
         // Low confidence - log suggestion but don't auto-apply
@@ -3011,10 +3178,23 @@ export class CommandExecutor {
     selector: string,
     actionType: string,
     value: any,
-    timeout?: number
+    timeout?: number,
+    /** Phase 3: If element is in an iframe, pass iframe context for frame locator */
+    iframeContext?: { frameName?: string; frameUrl?: string }
   ): Promise<void> {
+    // Phase 3: If iframe context, use frame locator
+    const targetPage = iframeContext
+      ? (() => {
+          const frame = this.page.frames().find(f =>
+            (iframeContext.frameName && f.name() === iframeContext.frameName) ||
+            (iframeContext.frameUrl && f.url() === iframeContext.frameUrl)
+          );
+          return frame || this.page;
+        })()
+      : this.page;
+
     // ✅ FIX 3: Dry-run validation before applying healed selector
-    const validation = await validateAndGetLocator(this.page, selector, {
+    const validation = await validateAndGetLocator(targetPage as any, selector, {
       actionType: actionType as any,
       timeout: timeout || 2000,
     });

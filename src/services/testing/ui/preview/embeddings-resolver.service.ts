@@ -18,6 +18,8 @@
 
 import { generateEmbedding, generateEmbeddings, cosineSimilarity } from '@/services/ai/core/embedding.service';
 import { generateText } from '@/services/ai/core/ai-provider.service';
+import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import {
     disambiguateWithLLM,
@@ -776,9 +778,14 @@ export function buildCandidateText(node: InteractiveNode): string {
   const parts: string[] = [];
 
   // Container context FIRST (hierarchy awareness)
-  if (node.containerTitles && node.containerTitles.length > 0) {
-    const containerPath = node.containerTitles.slice(0, 2).join(' > ');
-    parts.push(`[${containerPath}]`);
+  // Phase 7: Include landmark role for richer context
+  if (node.nearestLandmark || (node.containerTitles && node.containerTitles.length > 0)) {
+    const segments: string[] = [];
+    if (node.nearestLandmark) segments.push(node.nearestLandmark);
+    if (node.containerTitles && node.containerTitles.length > 0) {
+      segments.push(...node.containerTitles.slice(0, 2));
+    }
+    parts.push(`[${segments.join(' > ')}]`);
   }
 
   // Primary labels (most semantic) - mutually exclusive
@@ -855,6 +862,193 @@ export function sanitizeIntent(step: IntentStep): string {
  */
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 2: WEIGHTED COMPOSITE SCORING
+// Replaces raw cosine similarity with multi-signal composite score:
+//   semantic (0.5) + actionAffinity (0.2) + spatial (0.15) + formContext (0.15)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Composite score weights */
+const W_SEMANTIC = 0.50;
+const W_ACTION   = 0.20;
+const W_SPATIAL  = 0.15;
+const W_FORM     = 0.15;
+
+/**
+ * Compute action affinity — how well the element type matches the intended action.
+ * A <button> scores higher for a click action than a <div>.
+ */
+function computeActionAffinity(node: InteractiveNode, actionType?: string): number {
+  if (!actionType) return 0.5; // No action context — neutral
+
+  const tag = node.tag?.toLowerCase() || '';
+  const role = node.role?.toLowerCase() || '';
+
+  switch (actionType) {
+    case 'click':
+    case 'tap':
+      if (tag === 'button' || tag === 'a' || role === 'button' || role === 'link' || role === 'menuitem' || role === 'tab') return 1.0;
+      if (role === 'checkbox' || role === 'radio' || role === 'switch') return 0.9;
+      if (tag === 'input' && (node.type === 'submit' || node.type === 'button')) return 0.9;
+      if (tag === 'summary') return 0.85;
+      if (tag === 'div' && (role === 'button' || node.ariaLabel)) return 0.8;
+      // Phase 4: Framework-clickable elements get a boost
+      if (node.frameworkClickable) return 0.75;
+      return 0.5;
+
+    case 'type':
+    case 'fill':
+      if (tag === 'input' && (!node.type || ['text', 'email', 'password', 'search', 'tel', 'url', 'number'].includes(node.type))) return 1.0;
+      if (tag === 'textarea') return 1.0;
+      if (role === 'textbox' || role === 'searchbox') return 0.9;
+      if (tag === 'div' && role === 'textbox') return 0.7;
+      return 0.3;
+
+    case 'select':
+    case 'selectOption':
+      if (tag === 'select') return 1.0;
+      if (role === 'combobox' || role === 'listbox') return 0.9;
+      if (tag === 'button' && node.ariaExpanded !== undefined) return 0.7;
+      return 0.4;
+
+    case 'check':
+    case 'uncheck':
+    case 'toggle':
+      if (tag === 'input' && (node.type === 'checkbox' || node.type === 'radio')) return 1.0;
+      if (role === 'checkbox' || role === 'radio' || role === 'switch') return 0.95;
+      return 0.3;
+
+    case 'hover':
+      return 0.6; // Most elements can be hovered
+
+    default:
+      return 0.5;
+  }
+}
+
+/**
+ * Extract spatial hint from intent text.
+ * Detects patterns like "next to", "below", "near", "above" + target description.
+ */
+function extractSpatialHint(intentText: string): { direction?: string; target?: string } | null {
+  const lower = intentText.toLowerCase();
+  const patterns = [
+    /(?:next to|beside|adjacent to)\s+(?:the\s+)?(.+?)(?:\s+button|\s+field|\s+input)?$/i,
+    /(?:below|under|beneath)\s+(?:the\s+)?(.+?)(?:\s+button|\s+field|\s+input)?$/i,
+    /(?:above|over|on top of)\s+(?:the\s+)?(.+?)(?:\s+button|\s+field|\s+input)?$/i,
+    /(?:near|close to)\s+(?:the\s+)?(.+?)(?:\s+button|\s+field|\s+input)?$/i,
+    /(?:to the (?:right|left) of)\s+(?:the\s+)?(.+?)(?:\s+button|\s+field|\s+input)?$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = lower.match(pattern);
+    if (match) {
+      return {
+        direction: match[0].split(/\s+/)[0], // "next", "below", etc.
+        target: match[1].trim(),
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Compute spatial proximity between two nodes based on bounding boxes.
+ * Returns 1.0 for same spot, 0.0 for max distance.
+ */
+function computeSpatialProximity(
+  candidate: InteractiveNode,
+  referenceNode: InteractiveNode | undefined,
+  viewportDiagonal: number
+): number {
+  if (!referenceNode || !candidate.boundingBox || !referenceNode.boundingBox) return 0.5;
+
+  const cb = candidate.boundingBox;
+  const rb = referenceNode.boundingBox;
+
+  // Center-to-center distance
+  const dx = (cb.x + cb.width / 2) - (rb.x + rb.width / 2);
+  const dy = (cb.y + cb.height / 2) - (rb.y + rb.height / 2);
+  const dist = Math.sqrt(dx * dx + dy * dy);
+
+  // Normalize by viewport diagonal
+  const normalizedDist = Math.min(dist / viewportDiagonal, 1);
+
+  return 1.0 - normalizedDist;
+}
+
+/**
+ * Compute form context — whether the candidate shares a form/fieldset with recently interacted elements.
+ */
+function computeFormContext(
+  node: InteractiveNode,
+  allNodes: InteractiveNode[],
+  recentlyInteractedRefs?: string[]
+): number {
+  if (!recentlyInteractedRefs || recentlyInteractedRefs.length === 0) return 0.5;
+
+  // Check if candidate shares container titles with recently interacted nodes
+  if (!node.containerTitles || node.containerTitles.length === 0) return 0.4;
+
+  const candidateContainers = new Set(node.containerTitles);
+
+  // Find recently interacted nodes
+  const recentNodes = allNodes.filter(n => n.ref && recentlyInteractedRefs.includes(n.ref));
+
+  let bestOverlap = 0;
+  for (const recent of recentNodes) {
+    if (!recent.containerTitles) continue;
+    // Count shared container titles
+    const overlap = recent.containerTitles.filter(t => candidateContainers.has(t)).length;
+    const maxTitles = Math.max(node.containerTitles.length, recent.containerTitles.length);
+    if (maxTitles > 0) {
+      bestOverlap = Math.max(bestOverlap, overlap / maxTitles);
+    }
+  }
+
+  return 0.4 + (bestOverlap * 0.6); // Scale from 0.4 (no match) to 1.0 (perfect match)
+}
+
+/**
+ * Compute composite score for a candidate.
+ * Weights: semantic(0.5) + actionAffinity(0.2) + spatial(0.15) + formContext(0.15)
+ */
+export function computeCompositeScore(params: {
+  semanticSimilarity: number;
+  node: InteractiveNode;
+  intentText: string;
+  actionType?: string;
+  spatialReferenceNode?: InteractiveNode;
+  viewportDiagonal?: number;
+  allNodes?: InteractiveNode[];
+  recentlyInteractedRefs?: string[];
+}): { score: number; breakdown: { semantic: number; action: number; spatial: number; form: number } } {
+  const {
+    semanticSimilarity,
+    node,
+    actionType,
+    spatialReferenceNode,
+    viewportDiagonal = 2200, // Default viewport diagonal ~1920x1080
+    allNodes = [],
+    recentlyInteractedRefs,
+  } = params;
+
+  const semantic = semanticSimilarity;
+  const action = computeActionAffinity(node, actionType);
+  const spatial = spatialReferenceNode
+    ? computeSpatialProximity(node, spatialReferenceNode, viewportDiagonal)
+    : 0.5;
+  const form = computeFormContext(node, allNodes, recentlyInteractedRefs);
+
+  const score = (semantic * W_SEMANTIC) + (action * W_ACTION) + (spatial * W_SPATIAL) + (form * W_FORM);
+
+  return {
+    score,
+    breakdown: { semantic, action, spatial, form },
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1277,9 +1471,9 @@ function applyDecisionPolicy(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * V6: Last-resort rescue when deterministic rules excluded ALL elements.
- * Calls Gemini Flash (task:'fast') with a 3s timeout to pick the best match
- * from excluded-but-visible nodes. Only used when allowedCount === 0.
+ * V7 (Phase 6): Vision-enhanced rescue when deterministic rules excluded ALL elements.
+ * When screenshot is available, sends it to Gemini 2.0 Flash Vision for visual identification.
+ * Falls back to text-only Gemini Flash when no screenshot is available.
  *
  * Uses a high-quality prompt with action-type semantics and multilingual awareness,
  * matching the quality bar of the LLM disambiguation service.
@@ -1289,8 +1483,12 @@ async function rescueWithGeminiFlash(params: {
   actionType: IntentActionType;
   excludedNodes: InteractiveNode[];
   pageUrl: string;
-}): Promise<{ ref: string; confidence: number; reason: string } | null> {
-  const { intentText, actionType, excludedNodes, pageUrl } = params;
+  /** Phase 6: Optional screenshot for vision-enhanced rescue */
+  screenshot?: string;
+  /** Phase 6: Optional viewport for coordinate-based results */
+  viewport?: { width: number; height: number };
+}): Promise<{ ref: string; confidence: number; reason: string; boundingBox?: { x: number; y: number; width: number; height: number } } | null> {
+  const { intentText, actionType, excludedNodes, pageUrl, screenshot, viewport } = params;
 
   const rescueCandidates = excludedNodes
     .filter(n => n.ref && n.isVisible !== false && !n.isDisabled)
@@ -1345,28 +1543,57 @@ ${candidateList}
 Select the single best matching element. If unsure, return ref: null.`;
 
   try {
-    const response = await generateText({
-      prompt: `${systemPrompt}\n\n${userPrompt}`,
-      task: 'fast',
-      temperature: 0,
-      maxTokens: 100,
-      timeout: 3000,
-    });
+    let responseContent: string;
 
-    const jsonMatch = response.content.match(/\{[\s\S]*?\}/);
+    // Phase 6: Use vision when screenshot is available for much better accuracy
+    if (screenshot) {
+      const visionPrompt = `${systemPrompt}\n\n${userPrompt}\n\nIMPORTANT: Look at the screenshot to visually identify the target element. If the element is visible in the screenshot but NOT in the candidate list, return ref as null and provide bounding box coordinates (x, y, width, height in pixels).\n\nJSON format with optional boundingBox: {"ref":"eXX","confidence":0.0-1.0,"reason":"brief","boundingBox":{"x":0,"y":0,"width":0,"height":0}}`;
+
+      const visionResponse = await generateTextWithGeminiVision({
+        prompt: visionPrompt,
+        imageBase64: screenshot,
+        mimeType: 'image/png',
+        model: AI_TASK_MODELS.visionElementResolution as any,
+        temperature: 0,
+        maxTokens: 200,
+        timeout: 6000,
+      });
+      responseContent = visionResponse.content;
+
+      logger.debug('[EMBEDDINGS_RESOLVER] Vision-enhanced rescue response', {
+        responsePreview: responseContent.slice(0, 150),
+      });
+    } else {
+      // Fallback: text-only rescue
+      const response = await generateText({
+        prompt: `${systemPrompt}\n\n${userPrompt}`,
+        task: 'fast',
+        temperature: 0,
+        maxTokens: 100,
+        timeout: 3000,
+      });
+      responseContent = response.content;
+    }
+
+    const jsonMatch = responseContent.match(/\{[\s\S]*?\}/);
     if (!jsonMatch) return null;
 
     const parsed = JSON.parse(jsonMatch[0]);
 
-    // ref must be a non-empty string (null or absent = no match)
-    if (!parsed.ref || typeof parsed.ref !== 'string') return null;
+    // ref must be a non-empty string (null or absent = no match) OR have bounding box
+    if ((!parsed.ref || typeof parsed.ref !== 'string') && !parsed.boundingBox) return null;
 
-    const validRefs = new Set(rescueCandidates.map(n => n.ref));
-    if (!validRefs.has(parsed.ref)) {
-      logger.warn('[EMBEDDINGS_RESOLVER] Gemini Flash rescue: hallucinated ref rejected', {
-        ref: parsed.ref,
-      });
-      return null;
+    // Validate ref against candidate list if present
+    if (parsed.ref && typeof parsed.ref === 'string') {
+      const validRefs = new Set(rescueCandidates.map(n => n.ref));
+      if (!validRefs.has(parsed.ref)) {
+        logger.warn('[EMBEDDINGS_RESOLVER] Gemini rescue: hallucinated ref rejected', {
+          ref: parsed.ref,
+        });
+        // If bounding box is present, still return it
+        if (!parsed.boundingBox) return null;
+        parsed.ref = null;
+      }
     }
 
     // Handle confidence as number or numeric string (e.g., "0.85")
@@ -1380,13 +1607,15 @@ Select the single best matching element. If unsure, return ref: null.`;
     if (confidence < 0.7) return null;
 
     return {
-      ref: parsed.ref,
+      ref: parsed.ref || '',
       confidence,
-      reason: typeof parsed.reason === 'string' ? parsed.reason.slice(0, 200) : 'Gemini Flash rescue',
+      reason: typeof parsed.reason === 'string' ? parsed.reason.slice(0, 200) : (screenshot ? 'Vision rescue' : 'Gemini Flash rescue'),
+      boundingBox: parsed.boundingBox || undefined,
     };
   } catch (error) {
-    logger.warn('[EMBEDDINGS_RESOLVER] Gemini Flash rescue failed', {
+    logger.warn('[EMBEDDINGS_RESOLVER] Gemini rescue failed', {
       error: error instanceof Error ? error.message : String(error),
+      usedVision: !!screenshot,
     });
     return null;
   }
@@ -1421,15 +1650,18 @@ export async function resolveWithEmbeddings(params: {
   includeAlternatives?: boolean;
   /** When true, use LLM to disambiguate between multiple candidates (default: true for aggressive mode) */
   enableLLMDisambiguation?: boolean;
+  /** Phase 6: Optional screenshot for vision-enhanced rescue (base64 PNG) */
+  screenshot?: string;
 }): Promise<LintResult> {
-  const { 
-    previewSessionId, 
-    stepDraft, 
-    domNodes, 
-    pageUrl, 
+  const {
+    previewSessionId,
+    stepDraft,
+    domNodes,
+    pageUrl,
     disableCaching = false,
     includeAlternatives = false,
     enableLLMDisambiguation = true, // Aggressive mode: ON by default
+    screenshot,
   } = params;
   const startTime = Date.now();
 
@@ -1531,6 +1763,7 @@ export async function resolveWithEmbeddings(params: {
       actionType: stepDraft.type,
       excludedNodes,
       pageUrl,
+      screenshot, // Phase 6: Pass screenshot for vision-enhanced rescue
     });
 
     if (rescueResult) {
@@ -1693,6 +1926,43 @@ export async function resolveWithEmbeddings(params: {
         similarity: 0.5,
       }));
     }
+  }
+
+  // Step 6.5: Phase 2 — Apply composite scoring (re-rank by weighted score)
+  // Weights: semantic(0.5) + actionAffinity(0.2) + spatial(0.15) + formContext(0.15)
+  {
+    // Find spatial reference node (if intent contains spatial hints)
+    const spatialHint = extractSpatialHint(intentText);
+    let spatialRef: InteractiveNode | undefined;
+    if (spatialHint?.target) {
+      // Try to find the reference node by text/label match
+      const targetLower = spatialHint.target.toLowerCase();
+      spatialRef = domNodes.find(n =>
+        (n.text?.toLowerCase().includes(targetLower)) ||
+        (n.labelText?.toLowerCase().includes(targetLower)) ||
+        (n.ariaLabel?.toLowerCase().includes(targetLower))
+      );
+    }
+
+    // Compute viewport diagonal for spatial normalization
+    const vp = 2200; // ~sqrt(1920^2 + 1080^2)
+
+    for (const candidate of ranked) {
+      const composite = computeCompositeScore({
+        semanticSimilarity: candidate.similarity,
+        node: candidate.node,
+        intentText,
+        actionType: stepDraft.type,
+        spatialReferenceNode: spatialRef,
+        viewportDiagonal: vp,
+        allNodes: domNodes,
+      });
+      // Replace raw similarity with composite score
+      candidate.similarity = composite.score;
+    }
+
+    // Re-sort by composite score
+    ranked.sort((a, b) => b.similarity - a.similarity);
   }
 
   // Step 7: Apply count-based decision policy

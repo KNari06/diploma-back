@@ -113,6 +113,8 @@ export interface SelectorResolveResponse {
     totalDuration: number; // Total time taken (ms)
     aiDuration?: number; // AI processing time (ms)
     cacheHit: boolean; // Was result from cache
+    /** True if Gemini Vision was used for resolution */
+    visionUsed?: boolean;
   };
 }
 
@@ -159,6 +161,29 @@ export interface SelfHealingResult {
   };
   suggestion: string; // Human-readable suggestion
   autoApplied: boolean; // Was auto-healing applied
+
+  // ── Phase 1: Vision escalation ──────────────────────────────────────
+  /** True if fast mode failed and healing was retried with accurate (screenshot) mode */
+  escalated?: boolean;
+  /** True if vision AI (Gemini multimodal) was used to resolve the element */
+  visionUsed?: boolean;
+
+  // ── Phase 3: Iframe support ─────────────────────────────────────────
+  /** Iframe context if element was found inside an iframe */
+  iframeContext?: {
+    frameName?: string;
+    frameUrl?: string;
+  };
+
+  // ── Phase 6: Coordinate-based fallback ──────────────────────────────
+  /** Pixel coordinates for coordinate-based clicking (last resort when no selector works) */
+  coordinates?: { x: number; y: number };
+
+  // ── Phase 8: Verification ───────────────────────────────────────────
+  /** Whether the healed selector was verified by the visual verification agent */
+  verified?: boolean;
+  /** Confidence from the verification agent (0.0-1.0) */
+  verificationConfidence?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

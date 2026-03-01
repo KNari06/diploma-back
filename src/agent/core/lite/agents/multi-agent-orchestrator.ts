@@ -392,6 +392,7 @@ export class MultiAgentOrchestrator {
         workingMemory: LITE_ENGINE_FLAGS.enableWorkingMemory ? this.workingMemory : undefined,
         hasCredentials: input.hasCredentials,
         currentUrl: input.url,
+        transitionSummary: input.transitionSummary,
         // Manus parity: Observer analysis results
         tableContext: observation.tableAnalysis,
         listContext: observation.listAnalysis,
@@ -788,6 +789,7 @@ export class MultiAgentOrchestrator {
                   criticFeedback: `${verdict.riskAssessment}. ${verdict.failureRisk}`,
                   hasCredentials: input.hasCredentials,
                   currentUrl: input.url,
+                  transitionSummary: input.transitionSummary,
                   // Manus parity: Observer analysis results
                   tableContext: observation.tableAnalysis,
                   listContext: observation.listAnalysis,

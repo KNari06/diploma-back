@@ -90,6 +90,8 @@ export class LitePromptBuilder {
     lastAction?: string;
     /** ✅ NEW: Goal-Oriented Summary from HybridSemanticWeightCalculator (Secret Sauce) */
     goalOrientedSummary?: string;
+    /** ✅ NEW: Transition summary from previous action (for done detection) */
+    transitionSummary?: string;
     /** ✅ NEW: Vision hints from GPT-4o Vision when DOM is weak */
     visionHints?: VisionHints;
     /** ✅ TASK 9: Form focus hint with refs of goal-relevant form fields */
@@ -220,6 +222,16 @@ Use this summary to understand what's relevant to your goal. Key changes are hig
 `
       : '';
 
+    // ✅ NEW: Goal completion transition section (signals from deterministic evaluator)
+    const transitionSummarySection = params.transitionSummary
+      ? `
+✅ GOAL COMPLETION SIGNALS:
+${params.transitionSummary}
+If these changes indicate the GOAL is already achieved, respond with "done": true immediately.
+Do not continue acting once success is visible.
+`
+      : '';
+
     // ✅ TASK 9: Form focus hint section
     const formFocusSection = params.formFocusHint
       ? `
@@ -308,6 +320,11 @@ ${params.formFocusHint}
     If intermediate step detected, continue with the flow (fill verification code, complete profile, etc.).`);
     }
 
+    // Explicit done rule for all goal types whenever transition data is available.
+    if (params.transitionSummary) {
+      conditionalRules.push(`17. ✅ CRITICAL DONE CHECK: After ANY action, first evaluate if the goal is already complete. If URL transitioned from goal-related page to a success page and success indicators are visible (dashboard, welcome text, user menu, confirmation), you MUST return {"done": true}. Do not continue acting after success.`);
+    }
+
     const allRules = conditionalRules.length > 0
       ? `${coreRules}\n${conditionalRules.join('\n')}`
       : coreRules;
@@ -328,7 +345,7 @@ GOAL: ${params.goal}
 ${skillsSection}
 CURRENT PAGE:
 ${snapshot}
-${taskPlanSection}${goalOrientedSummarySection}${formFocusSection}${auditedDriftSection || stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${visionHintsSection}${modalDismissSection}${validationErrorSection}${failedActionsSection}
+${taskPlanSection}${goalOrientedSummarySection}${transitionSummarySection}${formFocusSection}${auditedDriftSection || stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${visionHintsSection}${modalDismissSection}${validationErrorSection}${failedActionsSection}
 HISTORY:
 ${params.history}
 

@@ -98,6 +98,44 @@ const EXTRACT_SCRIPT = `
   }
 
   var elements = collectFromRoot(document);
+
+  // Phase 4: Second pass — find framework-clickable elements not caught by CSS selectors
+  // Detect React/Vue/Angular event bindings on non-interactive elements
+  function detectFrameworkClickable(el) {
+    // React: __reactFiber$ or __reactInternalInstance$ or __reactEvents$
+    var keys = Object.keys(el);
+    for (var k = 0; k < keys.length; k++) {
+      if (keys[k].startsWith('__reactFiber$') || keys[k].startsWith('__reactInternalInstance$') || keys[k].startsWith('__reactEvents$')) return 'react';
+    }
+    // Vue: __vue__ or __vueParentComponent
+    if (el.__vue__ || el.__vueParentComponent) return 'vue';
+    // Angular: __ngContext__ or _ngHost
+    if (el.__ngContext__ || el._ngHost) return 'angular';
+    return null;
+  }
+
+  // Collect framework-clickable divs/spans that have cursor:pointer and non-zero size
+  var existingSet = new Set(elements);
+  var candidates = document.querySelectorAll('div, span, li, td, th, label, p');
+  for (var c = 0; c < Math.min(candidates.length, 2000); c++) {
+    var el = candidates[c];
+    if (existingSet.has(el)) continue; // Already collected
+    if (!el.offsetWidth && !el.offsetHeight) continue; // Not visible
+
+    var framework = detectFrameworkClickable(el);
+    var computedStyle = framework ? null : window.getComputedStyle(el);
+    var hasCursorPointer = computedStyle ? computedStyle.cursor === 'pointer' : false;
+
+    if (framework || hasCursorPointer) {
+      // Also require non-trivial size (at least 10x10px)
+      var rect = el.getBoundingClientRect();
+      if (rect.width >= 10 && rect.height >= 10) {
+        elements.push(el);
+        existingSet.add(el);
+      }
+    }
+  }
+
   const results = [];
 
   // Generate unique ref for each element
@@ -110,6 +148,9 @@ const EXTRACT_SCRIPT = `
     const isVisible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
     const isDisabled = el.hasAttribute('disabled') || (el.getAttribute('aria-disabled') || '').replace(/["']/g, '').trim() === 'true';
     if (!isVisible && isDisabled) continue;
+
+    // Phase 4: Detect framework event bindings
+    const frameworkClickable = detectFrameworkClickable(el);
 
     // Inject temporary ref
     const ref = 'bg-' + refCounter++;
@@ -152,21 +193,51 @@ const EXTRACT_SCRIPT = `
       if (parentLabel) labelText = parentLabel.textContent?.trim() || '';
     }
 
-    // Get container titles (form legend, fieldset legend, section heading)
+    // Get container titles (form legend, fieldset legend, section heading, ARIA groups)
+    // Phase 7: Expanded container detection — depth 8, semantic containers, landmarks
+    const LANDMARK_ROLES = ['banner', 'navigation', 'main', 'complementary', 'contentinfo', 'search', 'form', 'region'];
+    const SEMANTIC_TAGS = ['FIELDSET', 'FORM', 'SECTION', 'ARTICLE', 'NAV', 'ASIDE', 'DIALOG', 'HEADER', 'FOOTER', 'MAIN'];
+
     const containerTitles = [];
+    let nearestLandmark = '';
     let parent = el.parentElement;
     let depth = 0;
-    while (parent && depth < 5) {
-      if (parent.tagName === 'FIELDSET') {
-        const legend = parent.querySelector('legend');
-        if (legend) containerTitles.push(legend.textContent?.trim());
-      } else if (parent.tagName === 'FORM') {
-        const heading = parent.querySelector('h1, h2, h3, h4, h5, h6');
-        if (heading) containerTitles.push(heading.textContent?.trim());
-      } else if (['SECTION', 'ARTICLE', 'NAV', 'ASIDE'].includes(parent.tagName)) {
-        const heading = parent.querySelector('h1, h2, h3, h4, h5, h6');
-        if (heading) containerTitles.push(heading.textContent?.trim());
+    while (parent && depth < 8) {
+      const parentRole = (parent.getAttribute('role') || '').toLowerCase();
+      const parentAriaLabel = parent.getAttribute('aria-label');
+      const parentTag = parent.tagName;
+
+      // Track nearest landmark role
+      if (!nearestLandmark) {
+        // Explicit ARIA landmark role
+        if (parentRole && LANDMARK_ROLES.includes(parentRole)) {
+          nearestLandmark = parentRole;
+        }
+        // Implicit landmark from semantic HTML tags
+        else if (parentTag === 'NAV') nearestLandmark = 'navigation';
+        else if (parentTag === 'MAIN') nearestLandmark = 'main';
+        else if (parentTag === 'HEADER') nearestLandmark = 'banner';
+        else if (parentTag === 'FOOTER') nearestLandmark = 'contentinfo';
+        else if (parentTag === 'ASIDE') nearestLandmark = 'complementary';
       }
+
+      // Extract container title from semantic containers
+      if (parentTag === 'FIELDSET') {
+        const legend = parent.querySelector('legend');
+        if (legend?.textContent?.trim()) containerTitles.push(legend.textContent.trim());
+      } else if (SEMANTIC_TAGS.includes(parentTag) || (parentRole && ['group', 'region', 'form', 'navigation', 'banner', 'main', 'complementary', 'search'].includes(parentRole))) {
+        // Try aria-label first (most specific for ARIA containers)
+        if (parentAriaLabel?.trim()) {
+          containerTitles.push(parentAriaLabel.trim());
+        } else {
+          // Fall back to heading text
+          const heading = parent.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6');
+          if (heading?.textContent?.trim()) containerTitles.push(heading.textContent.trim());
+        }
+      }
+      // Skip plain <div> without role/aria-label (smart filter)
+      // Only extract from divs that have semantic meaning
+
       parent = parent.parentElement;
       depth++;
     }
@@ -206,8 +277,11 @@ const EXTRACT_SCRIPT = `
       invalid: (el.getAttribute('aria-invalid') || '').replace(/["']/g, '').trim() === 'true' || el.matches(':invalid'),
       hasValue: !!(el.value && el.value.length > 0),
 
-      // Container info
-      containerTitles: containerTitles.filter(Boolean).slice(0, 3),
+      // Container info (Phase 7: expanded detection)
+      containerTitles: containerTitles.filter(Boolean).slice(0, 5),
+      nearestLandmark: nearestLandmark || undefined,
+      // Phase 4: Framework event binding detection
+      frameworkClickable: frameworkClickable || undefined,
     };
 
     results.push(node);
