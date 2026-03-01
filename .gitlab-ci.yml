@@ -174,3 +174,61 @@ deploy:worker:
     - echo "✅ Worker deployed"
   environment:
     name: production/worker
+
+# ─────────────────────────────────────────────────────────────────
+# DEV deploy to VM via shell runner (does not affect production jobs)
+# Runner requirements:
+#   - executor: shell
+#   - tags: qiat-dev-runner
+#   - docker installed on VM
+# Optional CI/CD variables:
+#   BACKEND_ENV_FILE      - absolute path to .env on VM (default: /opt/qait/dev/backend/.env)
+#   BACKEND_CONTAINER_PORT - exposed API port on VM (default: 3000)
+# ─────────────────────────────────────────────────────────────────
+deploy:dev:vm:
+  stage: deploy
+  tags:
+    - qiat-dev-runner
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "develop"'
+  variables:
+    BACKEND_ENV_FILE: "/opt/qait/dev/backend/.env"
+    BACKEND_CONTAINER_PORT: "3000"
+  script:
+    - echo "🚀 Building backend image for VM..."
+    - docker build --target runner -t "qait-backend:dev-${CI_COMMIT_SHORT_SHA}" -t "qait-backend:dev-latest" .
+    - echo "🔎 Checking env file..."
+    - |
+      if [ ! -f "$BACKEND_ENV_FILE" ]; then
+        echo "❌ BACKEND_ENV_FILE not found: $BACKEND_ENV_FILE"
+        echo "Create env file on VM or override BACKEND_ENV_FILE in GitLab variables."
+        exit 1
+      fi
+    - docker network create qait-dev >/dev/null 2>&1 || true
+    - echo "🧹 Replacing old API/Worker containers..."
+    - docker rm -f qait-backend-dev qait-worker-dev >/dev/null 2>&1 || true
+    - |
+      docker run -d \
+        --name qait-backend-dev \
+        --restart unless-stopped \
+        --network qait-dev \
+        --add-host host.docker.internal:host-gateway \
+        --env-file "$BACKEND_ENV_FILE" \
+        -e QUEUE_PREFIX=qait-dev \
+        -p "${BACKEND_CONTAINER_PORT}:3000" \
+        "qait-backend:dev-${CI_COMMIT_SHORT_SHA}" \
+        node -r tsconfig-paths/register dist/index.js
+    - |
+      docker run -d \
+        --name qait-worker-dev \
+        --restart unless-stopped \
+        --network qait-dev \
+        --add-host host.docker.internal:host-gateway \
+        --env-file "$BACKEND_ENV_FILE" \
+        -e QUEUE_PREFIX=qait-dev \
+        "qait-backend:dev-${CI_COMMIT_SHORT_SHA}" \
+        node -r tsconfig-paths/register dist/worker/index.js
+    - echo "✅ Dev backend+worker deployed on VM"
+    - docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "qait-backend-dev|qait-worker-dev"
+  environment:
+    name: development/backend-vm
