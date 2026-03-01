@@ -5,7 +5,7 @@ import { AIUsageTracker, calculateGeminiCost } from '../tracking/ai-usage-tracke
 
 /**
  * Gemini AI Service
- * Fast, multilingual text generation using Google Gemini 1.5 Flash
+ * Fast, multilingual text generation using Google Gemini 2.5 Flash
  */
 
 let genAI: GoogleGenerativeAI | null = null;
@@ -42,14 +42,14 @@ export interface GeminiResponse {
  */
 export async function generateTextWithGemini(params: {
   prompt: string;
-  model?: 'gemini-1.5-flash-latest' | 'gemini-1.5-pro' | 'gemini-2.0-flash-exp';
+  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
 }): Promise<GeminiResponse> {
   const {
     prompt,
-    model = 'gemini-1.5-flash-latest',
+    model = 'gemini-2.5-flash',
     temperature = 0,
     maxTokens = 100,
     timeout = 5000,
@@ -122,14 +122,14 @@ export async function generateTextWithGemini(params: {
  */
 export async function getChatCompletionWithGemini(params: {
   messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
-  model?: 'gemini-1.5-flash-latest' | 'gemini-1.5-pro' | 'gemini-2.0-flash-exp';
+  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
 }): Promise<GeminiResponse> {
   const {
     messages,
-    model = 'gemini-1.5-flash-latest',
+    model = 'gemini-2.5-flash',
     temperature = 0,
     maxTokens = 1000,
     timeout = 10000,
@@ -239,7 +239,7 @@ export async function generateTextWithGeminiVision(params: {
   prompt: string;
   imageBase64: string;
   mimeType?: 'image/png' | 'image/jpeg';
-  model?: 'gemini-1.5-flash-latest' | 'gemini-1.5-pro' | 'gemini-2.0-flash-exp';
+  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;

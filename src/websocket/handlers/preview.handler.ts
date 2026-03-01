@@ -1222,11 +1222,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const description = RecordingCaptureService.buildDescription(actionType, preClickElement!);
               const bindingHints = RecordingCaptureService.buildBindingHints(preClickElement!);
 
+              const currentPage = sessionService.getPage(previewSessionId, ensuredUserId);
               const step: PreviewIntentStep = {
                 id: `rec_${Date.now().toString(36)}`,
                 type: actionType,
                 description,
                 bindingHints: Object.keys(bindingHints).length > 0 ? bindingHints : undefined,
+                evidence: preClickElement!.ref ? {
+                  lastSuccessRef: preClickElement!.ref,
+                  confidence: 1.0,
+                  pageUrl: currentPage?.url(),
+                } : undefined,
               };
 
               // V10: Click breaks scroll merge context
@@ -1610,8 +1616,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   elementLabel: RecordingCaptureService.getElementLabel(focusedEl),
                   lastCharAt: Date.now(),
                   bindingHints: focusedEl ? RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, string> : undefined,
-                  // V10 Fix #1: Track multiline state so Shift+Enter can append \n
                   isMultiline: focusedEl?.isMultiline,
+                  pageUrl: page?.url(),
                 };
               } else {
                 buffer.text += data.text;
@@ -1810,6 +1816,71 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 }
                 // Don't flush, don't emit press step — the \n is part of the typed text
                 return;
+              }
+
+              // Backspace/Delete while typing: edit the buffer instead of emitting a separate press step.
+              // This ensures the recorded type step reflects the final corrected text, not the raw keystrokes.
+              if (data.key === 'Backspace' || data.key === 'Delete') {
+                const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, ensuredUserId);
+
+                if (buffer && buffer.text.length > 0) {
+                  // Case 1: Active buffer with text — remove last char from current buffer batch
+                  buffer.text = buffer.text.slice(0, -1);
+                  buffer.lastCharAt = Date.now();
+                  sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, buffer);
+
+                  // If we have a previously emitted step for same element, update it with corrected merge
+                  const sameElement = lastTypeStep
+                    && buffer.elementRef
+                    && lastTypeStep.elementRef === buffer.elementRef;
+
+                  if (sameElement && lastTypeStep) {
+                    const mergedValue = lastTypeStep.value + buffer.text;
+                    const mergedStep = RecordingCaptureService.flushTypingBuffer({
+                      ...buffer, text: mergedValue,
+                    });
+                    if (mergedStep) {
+                      mergedStep.id = lastTypeStep.id;
+                      socket.nsp.to(room).emit('preview:recording:step:update', {
+                        previewSessionId, step: mergedStep, timestamp: new Date().toISOString(),
+                      });
+                    }
+                  }
+                  return; // Absorbed into buffer edit
+                }
+
+                if (lastTypeStep && lastTypeStep.value.length > 0) {
+                  // Case 2: Buffer is empty/null (debounce already flushed) — trim the lastTypeStep value directly
+                  const trimmedValue = lastTypeStep.value.slice(0, -1);
+                  sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, {
+                    ...lastTypeStep,
+                    value: trimmedValue,
+                  });
+
+                  if (trimmedValue.length > 0) {
+                    const updatedStep = RecordingCaptureService.flushTypingBuffer({
+                      text: trimmedValue,
+                      elementLabel: '',
+                      elementRef: lastTypeStep.elementRef,
+                      lastCharAt: Date.now(),
+                    });
+                    if (updatedStep) {
+                      updatedStep.id = lastTypeStep.id;
+                      socket.nsp.to(room).emit('preview:recording:step:update', {
+                        previewSessionId, step: updatedStep, timestamp: new Date().toISOString(),
+                      });
+                    }
+                  } else {
+                    // All text deleted — remove the step entirely
+                    socket.nsp.to(room).emit('preview:recording:step:remove', {
+                      previewSessionId, stepId: lastTypeStep.id, timestamp: new Date().toISOString(),
+                    });
+                    sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, null);
+                  }
+                  return; // Absorbed into lastTypeStep edit
+                }
+
+                // No buffer and no lastTypeStep — fall through to emit "Press Backspace" as normal
               }
 
               // Flush typing buffer if Enter/Tab triggers it
@@ -2351,7 +2422,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:run:start', async (data) => {
     try {
       const userId = getUserId(socket);
-      const { previewSessionId, intentTestCaseId } = data;
+      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl } = data;
 
       // Validate input
       if (!previewSessionId || !intentTestCaseId) {
@@ -2469,7 +2540,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       // Start run (async, emits progress via WebSocket)
-      PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId).catch((error) => {
+      // If inline steps are provided (Apply All flow), save them first and use directly.
+      const runOptions = (Array.isArray(inlineSteps) && inlineSteps.length > 0)
+        ? { inlineSteps, startUrl: inlineStartUrl }
+        : undefined;
+      PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId, runOptions).catch((error) => {
         logger.error('[WebSocket] Preview run failed', {
           previewSessionId,
           intentTestCaseId,

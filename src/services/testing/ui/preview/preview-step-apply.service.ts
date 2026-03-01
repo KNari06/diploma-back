@@ -608,7 +608,7 @@ async function executeAction(
     // Build selector (unless we have a pre-resolved locator from compiled plan)
     const selector = preResolvedLocator ? '' : buildSelector(step, candidate);
 
-    if (!selector && !preResolvedLocator && step.type !== 'navigate' && step.type !== 'wait') {
+    if (!selector && !preResolvedLocator && !['navigate', 'wait', 'scroll', 'press'].includes(step.type)) {
       return { success: false, error: 'No valid selector for element', urlChanged: false };
     }
 
@@ -721,9 +721,13 @@ async function executeAction(
       }
 
       case 'press': {
-        if (!locator) throw new Error('No selector for press action');
         const key = step.value || 'Enter';
-        await locator.press(key, { timeout });
+        if (locator) {
+          await locator.press(key, { timeout });
+        } else {
+          // Page-level press fallback (Escape, Tab, F5, shortcuts, etc.)
+          await page.keyboard.press(key);
+        }
         break;
       }
 
@@ -958,8 +962,9 @@ export class PreviewStepApplyService {
         };
       }
 
-      // Handle non-targeting actions (navigate, wait)
-      if (['navigate', 'wait'].includes(stepDraft.type)) {
+      // Handle non-targeting actions (navigate, wait, scroll)
+      // Scroll is page-level: uses step.value (deltaY) without targeting a DOM element
+      if (['navigate', 'wait', 'scroll'].includes(stepDraft.type)) {
         // V5: Capture URL BEFORE action for accurate compiled context
         // This is important for auto-wait-for-url injection which compares adjacent pageUrls
         const urlBeforeAction = page.url();

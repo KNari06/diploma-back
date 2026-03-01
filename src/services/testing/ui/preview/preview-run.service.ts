@@ -39,11 +39,19 @@ export class PreviewRunService {
    * @param previewSessionId - Preview session ID (must be active)
    * @param intentTestCaseId - Test case ID to load steps from
    * @param userId - User ID for ownership verification
+   * @param options.inlineSteps - If provided, save these steps to DB first and use them directly
+   *   (avoids the load-from-DB round-trip). Used by "Apply All" to save + run in one call.
+   * @param options.startUrl - Override startUrl (used when inlineSteps are provided and
+   *   the test case may not have a startUrl yet).
    */
   static async runSavedSteps(
     previewSessionId: string,
     intentTestCaseId: string,
-    userId: string
+    userId: string,
+    options?: {
+      inlineSteps?: IntentStep[];
+      startUrl?: string;
+    },
   ): Promise<void> {
     // 1. Check if already running
     if (activeRuns.has(previewSessionId)) {
@@ -83,27 +91,54 @@ export class PreviewRunService {
     const rootSpanId = traceWriter.getRootSpanId();
 
     try {
-      // 4. Load saved steps from DB
-      const testCase = await IntentTestCaseService.getById(intentTestCaseId, userId);
-      if (!testCase || !testCase.stepsJson) {
-        throw new Error('Test case not found or has no saved steps');
+      // 4. Load or save+use inline steps
+      let startUrl: string | undefined;
+
+      if (options?.inlineSteps && options.inlineSteps.length > 0) {
+        // "Apply All" path: save inline steps to DB first, then use them directly.
+        // This avoids a double round-trip (save → load) and keeps the flow atomic.
+        const patch: Record<string, unknown> = { steps: options.inlineSteps };
+        if (options.startUrl) {
+          patch.url = options.startUrl;
+          patch.startUrl = options.startUrl;
+        }
+        await IntentTestCaseService.update({
+          id: intentTestCaseId,
+          userId,
+          ...patch,
+        });
+        savedSteps = options.inlineSteps;
+        startUrl = options.startUrl;
+        logger.info('[PreviewRun] Saved inline steps to DB before run', {
+          previewSessionId, intentTestCaseId, stepCount: savedSteps.length,
+        });
       }
 
-      savedSteps = testCase.stepsJson;
+      // Standard path (or inline without startUrl): load from DB
+      if (!savedSteps || !startUrl) {
+        const testCase = await IntentTestCaseService.getById(intentTestCaseId, userId);
+        if (!savedSteps) {
+          if (!testCase || !testCase.stepsJson) {
+            throw new Error('Test case not found or has no saved steps');
+          }
+          savedSteps = testCase.stepsJson;
+        }
+        if (!startUrl) {
+          startUrl = testCase?.startUrl || testCase?.url || undefined;
+        }
+      }
+
       if (savedSteps.length === 0) {
         throw new Error('No steps to run');
+      }
+      if (!startUrl) {
+        throw new Error('Test case has no startUrl or url');
       }
 
       // 5. Get session page
       const session = sessionService.getSession(previewSessionId);
       if (!session?.page) {
         throw new Error('Session has no active page');
-      }
-
-      // 6. Get startUrl for initial navigation
-      const startUrl = testCase.startUrl || testCase.url;
-      if (!startUrl) {
-        throw new Error('Test case has no startUrl or url');
       }
 
       logger.info('[PreviewRun] Starting run', {
@@ -334,7 +369,7 @@ export class PreviewRunService {
               },
             });
 
-            // Emit pass
+            // Emit pass (include appliedStep so frontend can enrich the UI step)
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: i,
@@ -343,6 +378,7 @@ export class PreviewRunService {
               action: step.type,
               description: step.description,
               timestamp: new Date().toISOString(),
+              ...(result.appliedStep ? { appliedStep: result.appliedStep } : {}),
             });
             passedSteps++;
 

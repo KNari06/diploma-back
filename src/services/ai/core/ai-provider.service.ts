@@ -77,7 +77,7 @@ function getProviderForTask(task: AITask, override?: AIProvider): AIProvider {
  */
 function getDefaultModel(provider: AIProvider, task: AITask): string {
   if (provider === 'gemini') {
-    return task === 'fast' ? 'gemini-1.5-flash-latest' : 'gemini-1.5-pro';
+    return task === 'fast' ? 'gemini-2.5-flash' : 'gemini-2.5-pro';
   } else {
     return task === 'fast' ? AI_MODELS.fast : AI_MODELS.smart;
   }

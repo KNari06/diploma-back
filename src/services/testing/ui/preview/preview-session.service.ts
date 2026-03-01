@@ -88,6 +88,8 @@ interface InternalSession extends PreviewSession {
     bindingHints?: Record<string, string>;
     /** V10: True if the focused element is multiline (textarea, contenteditable) */
     isMultiline?: boolean;
+    /** URL where typing started (guards against cross-page ref collision) */
+    pageUrl?: string;
   } | null;
   recordingLastUrl: string;
   /** V10: Drag state tracked between mouse:down and mouse:up */

@@ -429,8 +429,8 @@ export class IntentStepLintService {
 
       const domNodes = snapshot.domNodes ?? [];
 
-      // Non-targeting actions (navigate, wait, wait_for, ai_check)
-      if (['navigate', 'wait', 'wait_for', 'ai_check'].includes(stepDraft.type)) {
+      // Non-targeting actions — page-level steps that don't target a specific DOM element
+      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -723,7 +723,7 @@ export class IntentStepLintService {
     });
 
     // Non-targeting actions don't need element resolution
-    if (['navigate', 'wait', 'wait_for', 'ai_check'].includes(stepDraft.type)) {
+    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -761,17 +761,19 @@ export class IntentStepLintService {
 
       // P2 FIX: URL validation - bypass cache if page URL changed significantly
       // This prevents reusing evidence from page A on page B (common in SPAs)
+      // Check both compiled.context.pageUrl and evidence.pageUrl (from recording)
       let urlMismatch = false;
-      if (stepDraft.compiled?.context?.pageUrl) {
-        const compiledUrl = normalizeUrlForComparison(stepDraft.compiled.context.pageUrl);
+      const evidenceUrl = stepDraft.compiled?.context?.pageUrl || stepDraft.evidence?.pageUrl;
+      if (evidenceUrl) {
+        const normalizedEvidenceUrl = normalizeUrlForComparison(evidenceUrl);
         const currentUrl = normalizeUrlForComparison(snapshot.url);
 
-        if (compiledUrl !== currentUrl) {
+        if (normalizedEvidenceUrl !== currentUrl) {
           urlMismatch = true;
           logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - URL changed', {
             previewSessionId,
             cachedRef,
-            compiledUrl: compiledUrl.slice(0, 80),
+            evidenceUrl: normalizedEvidenceUrl.slice(0, 80),
             currentUrl: currentUrl.slice(0, 80),
           });
         }

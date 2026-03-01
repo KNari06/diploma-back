@@ -59,6 +59,8 @@ export interface RecordingTypingBuffer {
   bindingHints?: Record<string, string>;
   /** True if the focused element is multiline (textarea, contenteditable) */
   isMultiline?: boolean;
+  /** URL where typing started (guards against cross-page ref collision) */
+  pageUrl?: string;
 }
 
 /** Drag state tracked between mouse:down and mouse:up events */
@@ -624,6 +626,7 @@ export class RecordingCaptureService {
       ? `Drag '${fromLabel}' to '${toLabel}'`
       : `Drag '${fromLabel}'`;
 
+    const startRef = dragState.startElement?.ref;
     return {
       id: recStepId(),
       type: 'drag_and_drop',
@@ -635,6 +638,9 @@ export class RecordingCaptureService {
       bindingHints: dragState.startElement
         ? this.buildBindingHints(dragState.startElement) as BindingHints | undefined
         : undefined,
+      ...(startRef && {
+        evidence: { lastSuccessRef: startRef, confidence: 1.0 },
+      }),
     };
   }
 
@@ -662,9 +668,11 @@ export class RecordingCaptureService {
       id: recStepId(),
       type: 'upload',
       description,
-      // Store the first filename as value (for single-file uploads which are most common)
       value: fileNames[0],
       bindingHints: element ? this.buildBindingHints(element) as BindingHints | undefined : undefined,
+      ...(element?.ref && {
+        evidence: { lastSuccessRef: element.ref, confidence: 1.0 },
+      }),
     };
   }
 
@@ -722,6 +730,9 @@ export class RecordingCaptureService {
       bindingHints: buffer.bindingHints as BindingHints | undefined,
       ...(triggeredByEnter && {
         options: { pressEnter: true },
+      }),
+      ...(buffer.elementRef && {
+        evidence: { lastSuccessRef: buffer.elementRef, confidence: 1.0, pageUrl: buffer.pageUrl },
       }),
     };
   }

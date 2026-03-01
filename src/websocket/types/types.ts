@@ -140,6 +140,7 @@ export interface ServerToClientEvents {
   // Preview recording events
   'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:step:update': (data: PreviewRecordingStepPayload) => void;
+  'preview:recording:step:remove': (data: { previewSessionId: string; stepId: string; timestamp: string }) => void;
   'preview:recording:state': (data: PreviewRecordingStatePayload) => void;
 
   // Preview interactive control responses
@@ -855,6 +856,13 @@ export interface PreviewIntentStep {
      */
     disableLookaheadWait?: boolean;
   };
+  /** Cached evidence from recording or prior execution (used as evidence shortcut during apply/run) */
+  evidence?: {
+    lastSuccessRef?: string;
+    confidence?: number;
+    /** URL where this evidence was captured (guards against cross-page ref collision in SPAs) */
+    pageUrl?: string;
+  };
 }
 
 /**
@@ -888,6 +896,12 @@ export interface PreviewStepApplyRequest {
 export interface PreviewRunStartRequest {
   previewSessionId: string;
   intentTestCaseId: string; // Load saved steps from DB
+  /** Optional: inline steps to save-then-run ("Apply All" flow).
+   *  When provided, steps are persisted to the test case first,
+   *  then used directly without a second DB round-trip. */
+  steps?: PreviewIntentStep[];
+  /** Optional: startUrl override (used with inline steps when test case may lack a URL). */
+  startUrl?: string;
 }
 
 /**
