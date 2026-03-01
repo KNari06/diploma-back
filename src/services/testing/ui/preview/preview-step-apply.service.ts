@@ -85,6 +85,63 @@ async function maybeRandomPause(
 }
 
 /**
+ * Convert a wait_for glob pattern to regex string.
+ * Robust parser:
+ * - *  => [^/]* (single segment wildcard)
+ * - ** => .*    (cross-segment wildcard)
+ * - ?  => .     (single-char wildcard)
+ * - \* \? \\ and any escaped char are treated as literals
+ */
+export function globToRegexPatternForWaitFor(glob: string): string {
+  const escapeRegexChar = (char: string): string => {
+    return /[.*+?^${}()|[\]\\]/.test(char) ? `\\${char}` : char;
+  };
+
+  let pattern = '';
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    const next = i + 1 < glob.length ? glob[i + 1] : '';
+
+    // Escaped char: treat next char as literal (including *, ?, \).
+    if (ch === '\\') {
+      if (next) {
+        pattern += escapeRegexChar(next);
+        i++;
+      } else {
+        // Trailing backslash should be matched literally.
+        pattern += '\\\\';
+      }
+      continue;
+    }
+
+    if (ch === '*' && next === '*') {
+      pattern += '.*';
+      i++;
+      continue;
+    }
+    if (ch === '*') {
+      pattern += '[^/]*';
+      continue;
+    }
+    if (ch === '?') {
+      pattern += '.';
+      continue;
+    }
+
+    pattern += escapeRegexChar(ch);
+  }
+
+  return pattern;
+}
+
+/**
+ * Normalize value for "type" action without trimming user input.
+ */
+export function normalizeTypeActionValue(rawValue: string | undefined): string {
+  return rawValue ?? '';
+}
+
+/**
  * V5: Execute wait_for using SPA-safe approach (page.waitForFunction)
  * Works for both full navigations AND SPA client-side routing (React Router, Next.js, etc.)
  *
@@ -150,15 +207,7 @@ async function executeWaitFor(
     }
 
     if (matcher.glob) {
-      // Convert glob to regex (simple conversion)
-      const globToRegex = (glob: string): string => {
-        return glob
-          .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape special chars
-          .replace(/\*\*/g, '.*') // ** → .*
-          .replace(/\*/g, '[^/]*') // * → [^/]*
-          .replace(/\?/g, '.'); // ? → .
-      };
-      const pattern = globToRegex(matcher.glob);
+      const pattern = globToRegexPatternForWaitFor(matcher.glob);
       const flags = caseSensitive ? '' : 'i';
       await page.waitForFunction(
         ({ pattern, flags, negate }: { pattern: string; flags: string; negate: boolean }) => {
@@ -284,19 +333,68 @@ async function verifyActionEffect(
       }
 
       case 'toggle': {
-        // For toggle, we just verify the element is still interactive
-        const isVisible = await locator.isVisible();
-        return isVisible;
+        // V10 Fix #9: Verify actual state change instead of just checking visibility.
+        // Check multiple ARIA attributes that represent toggle state:
+        // aria-pressed (toggle buttons), aria-checked (switch roles), aria-expanded (collapsibles)
+        const pressed = await locator.getAttribute('aria-pressed').catch(() => null);
+        if (pressed !== null) {
+          // aria-pressed exists — a valid state means the toggle registered
+          return pressed === 'true' || pressed === 'mixed';
+        }
+
+        const checked = await locator.getAttribute('aria-checked').catch(() => null);
+        if (checked !== null) {
+          return checked === 'true' || checked === 'mixed';
+        }
+
+        // Fallback: check native checked property (custom toggle wrapping a hidden checkbox)
+        const nativeChecked = await locator.evaluate(
+          (el: any) => el.querySelector('input[type="checkbox"]')?.checked ?? null
+        ).catch(() => null);
+        if (nativeChecked !== null) {
+          return nativeChecked === true;
+        }
+
+        // Last resort: element is at least visible (preserves old behaviour for unknown toggles)
+        return locator.isVisible();
       }
 
       case 'open': {
-        const expanded = await locator.getAttribute('aria-expanded');
-        return expanded === 'true';
+        // V10 Fix #9: Check multiple signals for "open" state, not just aria-expanded
+        const expanded = await locator.getAttribute('aria-expanded').catch(() => null);
+        if (expanded !== null) return expanded === 'true';
+
+        // Some components use aria-hidden on the content panel; check sibling/child patterns
+        const hasVisiblePanel = await locator.evaluate((el: any) => {
+          const id = el.getAttribute('aria-controls');
+          if (id) {
+            const panel = el.ownerDocument.getElementById(id);
+            return panel ? panel.getAttribute('aria-hidden') !== 'true' && panel.offsetHeight > 0 : null;
+          }
+          return null;
+        }).catch(() => null);
+        if (hasVisiblePanel !== null) return hasVisiblePanel;
+
+        // Fallback: assume success if element is visible (cannot determine state)
+        return locator.isVisible();
       }
 
       case 'close': {
-        const expanded = await locator.getAttribute('aria-expanded');
-        return expanded !== 'true';
+        // V10 Fix #9: Mirror of 'open' — verify the target is actually collapsed
+        const expanded = await locator.getAttribute('aria-expanded').catch(() => null);
+        if (expanded !== null) return expanded !== 'true';
+
+        const panelHidden = await locator.evaluate((el: any) => {
+          const id = el.getAttribute('aria-controls');
+          if (id) {
+            const panel = el.ownerDocument.getElementById(id);
+            return panel ? (panel.getAttribute('aria-hidden') === 'true' || panel.offsetHeight === 0) : null;
+          }
+          return null;
+        }).catch(() => null);
+        if (panelHidden !== null) return panelHidden;
+
+        return locator.isVisible();
       }
 
       case 'type': {
@@ -357,7 +455,52 @@ async function ensureStability(
 }
 
 /**
+ * V10 Fix #7: Detect how long a dropdown animation takes to complete.
+ * Polls for new visible ARIA containers (listbox/menu) or role=option elements.
+ * Returns elapsed time + a safety margin so we know how long to wait in each phase.
+ *
+ * Strategy: measure how long it takes for any dropdown-like container to appear
+ * after the trigger click, then add a proportional buffer for animation easing.
+ */
+async function measureDropdownOpenLatency(
+  page: Page,
+  maxWaitMs = 5000,
+  pollIntervalMs = 100,
+): Promise<number> {
+  const start = Date.now();
+  const dropdownSelector = [
+    '[role="listbox"]:visible',
+    '[role="menu"]:visible',
+    '[role="option"]:visible',
+    '[role="menuitem"]:visible',
+    // Common non-ARIA patterns
+    'ul.dropdown-menu:visible',
+    '.MuiMenu-list:visible',
+    '[class*="dropdown"][class*="open"]:visible',
+  ].join(', ');
+
+  try {
+    await page.waitForSelector(dropdownSelector, {
+      state: 'visible',
+      timeout: maxWaitMs,
+    });
+  } catch {
+    // Nothing appeared within max wait — return the full max so callers still try
+    return maxWaitMs;
+  }
+
+  const elapsed = Date.now() - start;
+  // Add 30% buffer for animation easing (at least 200ms, at most 3s extra)
+  const buffer = Math.min(3000, Math.max(200, Math.round(elapsed * 0.3)));
+  return elapsed + buffer;
+}
+
+/**
  * Custom dropdown select: click trigger → find visible option → click option.
+ *
+ * V10 Fix #7: Uses adaptive timeout based on measured dropdown animation latency
+ * instead of hardcoded 2s, so slow-animating dropdowns (Material UI, Ant Design)
+ * are handled automatically.
  *
  * Strategy chain (most precise → broadest):
  * 1. Scoped: find ARIA listbox/menu container, search option inside it
@@ -374,7 +517,18 @@ async function selectFromCustomDropdown(
 ): Promise<void> {
   // Click the trigger to open the dropdown
   await triggerLocator.click({ timeout });
-  await page.waitForTimeout(300);
+
+  // V10 Fix #7: Measure actual dropdown animation latency instead of hardcoding
+  // This adapts to slow animations (Material UI transitions, CSS keyframes, etc.)
+  const animationLatency = await measureDropdownOpenLatency(page);
+  // Per-phase timeout: use animation latency as floor, step timeout as ceiling
+  const phaseTimeout = Math.min(timeout, Math.max(animationLatency, 1500));
+
+  logger.debug('[CUSTOM_DROPDOWN] Animation latency measured', {
+    animationLatency,
+    phaseTimeout,
+    value: value.substring(0, 50),
+  });
 
   // Phase 1: Try scoped search inside a visible ARIA container (listbox/menu)
   // This is the safest approach — avoids clicking same-text elements elsewhere
@@ -390,8 +544,8 @@ async function selectFromCustomDropdown(
 
       // Search for option inside this container
       const scopedOpt = container.first().getByText(value, { exact: true }).first();
-      await scopedOpt.waitFor({ state: 'visible', timeout: 2000 });
-      await scopedOpt.click({ timeout: 2000 });
+      await scopedOpt.waitFor({ state: 'visible', timeout: phaseTimeout });
+      await scopedOpt.click({ timeout: phaseTimeout });
       return;
     } catch {
       // Container exists but option not found inside — try next
@@ -409,8 +563,8 @@ async function selectFromCustomDropdown(
   for (const strategy of roleStrategies) {
     try {
       const opt = strategy.first();
-      await opt.waitFor({ state: 'visible', timeout: 2000 });
-      await opt.click({ timeout: 2000 });
+      await opt.waitFor({ state: 'visible', timeout: phaseTimeout });
+      await opt.click({ timeout: phaseTimeout });
       return;
     } catch {
       // Try next
@@ -427,8 +581,8 @@ async function selectFromCustomDropdown(
   for (const strategy of textStrategies) {
     try {
       const opt = strategy.first();
-      await opt.waitFor({ state: 'visible', timeout: 2000 });
-      await opt.click({ timeout: 2000 });
+      await opt.waitFor({ state: 'visible', timeout: phaseTimeout });
+      await opt.click({ timeout: phaseTimeout });
       return;
     } catch {
       // Try next
@@ -473,7 +627,8 @@ async function executeAction(
     switch (step.type) {
       case 'type': {
         if (!locator) throw new Error('No selector for type action');
-        const value = (step.value || '').trim();
+        // Preserve exact user-entered text (including leading/trailing spaces and newlines).
+        const value = normalizeTypeActionValue(step.value);
         const humanLike = step.options?.humanLike === true;
 
         // Human-like typing: gradual per-character input (instead of instant fill).
@@ -576,11 +731,13 @@ async function executeAction(
         if (locator) {
           await locator.scrollIntoViewIfNeeded({ timeout });
         } else {
-          // Scroll down by 300px
-          await page.evaluate(() => {
-            // @ts-ignore - window is available in browser context
-            (globalThis as any).scrollBy(0, 300);
-          });
+          // V10 Fix #8: Use actual delta from step.value instead of hardcoded 300px
+          // step.value is the accumulated deltaY from recording (positive = down, negative = up)
+          const rawDelta = parseFloat(step.value || '');
+          const deltaY = Number.isFinite(rawDelta) ? rawDelta : 300;
+          await page.evaluate((dy: number) => {
+            (globalThis as any).scrollBy(0, dy);
+          }, deltaY);
         }
         break;
       }
@@ -657,6 +814,52 @@ async function executeAction(
         const isExpanded = await locator.getAttribute('aria-expanded');
         if (isExpanded === 'true') {
           await locator.click({ timeout });
+        }
+        break;
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V10: New interaction types
+      // ═══════════════════════════════════════════════════════════════════════
+      case 'dblclick': {
+        if (!locator) throw new Error('No selector for dblclick action');
+        await locator.dblclick({ timeout });
+        break;
+      }
+
+      case 'contextmenu': {
+        if (!locator) throw new Error('No selector for contextmenu action');
+        await locator.click({ button: 'right', timeout });
+        break;
+      }
+
+      case 'drag_and_drop': {
+        if (!locator) throw new Error('No selector for drag_and_drop source');
+        // step.value is JSON: { from: {x,y}, to: {x,y} }
+        const dragData = (() => {
+          try { return JSON.parse(step.value || ''); } catch { return null; }
+        })();
+
+        if (dragData?.from && dragData?.to) {
+          // Coordinate-based drag (recorded from mouse events)
+          await page.mouse.move(dragData.from.x, dragData.from.y);
+          await page.mouse.down();
+          // Gradual move for realistic drag behaviour
+          const steps = Math.max(5, Math.round(
+            Math.sqrt(
+              Math.pow(dragData.to.x - dragData.from.x, 2) +
+              Math.pow(dragData.to.y - dragData.from.y, 2)
+            ) / 10
+          ));
+          await page.mouse.move(dragData.to.x, dragData.to.y, { steps });
+          await page.mouse.up();
+        } else if (step.options?.dropTarget) {
+          // Element-based drag: drag source locator to a target selector
+          const targetLocator = (getLocatorContext(page, step) as Page | FrameLocator)
+            .locator(step.options.dropTarget);
+          await locator.dragTo(targetLocator, { timeout });
+        } else {
+          throw new Error('drag_and_drop requires coordinate data (value) or a dropTarget option');
         }
         break;
       }

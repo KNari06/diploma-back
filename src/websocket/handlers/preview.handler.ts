@@ -63,6 +63,48 @@ const previewStreamContext = new Map<string, StreamContext>();
 // DOM update interval for preview:page (check every 500ms, emit only on change)
 const DOM_UPDATE_INTERVAL_MS = 500;
 const activeDomUpdateIntervals = new Map<string, NodeJS.Timeout>();
+const activeDomUpdateTicks = new Set<string>();
+
+/**
+ * Acquire per-session DOM tick guard.
+ * Returns true when the current tick is allowed to run.
+ */
+export function acquireDomTickGuard(previewSessionId: string, inFlight: Set<string>): boolean {
+  if (inFlight.has(previewSessionId)) {
+    return false;
+  }
+  inFlight.add(previewSessionId);
+  return true;
+}
+
+/**
+ * Release per-session DOM tick guard.
+ */
+export function releaseDomTickGuard(previewSessionId: string, inFlight: Set<string>): void {
+  inFlight.delete(previewSessionId);
+}
+
+/**
+ * Confirm whether user actually selected file(s) after filechooser opened.
+ * filechooser event fires on dialog open, including cancel path.
+ */
+export async function waitForFileSelectionConfirmation(
+  element: { evaluate: <T>(fn: (el: { files?: { length: number } | null }) => T) => Promise<T> },
+  wait: (ms: number) => Promise<void>,
+  maxAttempts = 15,
+  intervalMs = 100,
+): Promise<boolean> {
+  for (let i = 0; i < maxAttempts; i++) {
+    const hasSelectedFiles = await element
+      .evaluate((el) => (el.files?.length || 0) > 0)
+      .catch(() => false);
+    if (hasSelectedFiles) {
+      return true;
+    }
+    await wait(intervalMs).catch(() => {});
+  }
+  return false;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // V3: Pending clarifications cache
@@ -242,6 +284,9 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
 
     // Start DOM update interval (emit preview:page only on change)
     const domInterval = setInterval(async () => {
+      if (!acquireDomTickGuard(previewSessionId, activeDomUpdateTicks)) {
+        return;
+      }
       try {
         const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
           onlyIfChanged: true, // Only return full data if changed
@@ -274,6 +319,8 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           previewSessionId,
           error: error instanceof Error ? error.message : String(error),
         });
+      } finally {
+        releaseDomTickGuard(previewSessionId, activeDomUpdateTicks);
       }
     }, DOM_UPDATE_INTERVAL_MS);
 
@@ -298,6 +345,7 @@ const stopPreviewStreams = async (previewSessionId: string): Promise<void> => {
     clearInterval(domInterval);
     activeDomUpdateIntervals.delete(previewSessionId);
   }
+  activeDomUpdateTicks.delete(previewSessionId);
 
   // Stop video stream
   try {
@@ -1143,8 +1191,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
               }
 
-              // Build step from pre-click element state
-              const actionType = RecordingCaptureService.inferClickActionType(preClickElement!);
+              // V10: Pass button and clickCount to inferClickActionType for dblclick/right-click support
+              const safeButton = (data.button === 'right' || data.button === 'middle') ? data.button : 'left';
+              const safeClickCount = (data.clickCount === 2) ? 2 : 1;
+              const actionType = RecordingCaptureService.inferClickActionType(preClickElement!, safeClickCount, safeButton);
               const description = RecordingCaptureService.buildDescription(actionType, preClickElement!);
               const bindingHints = RecordingCaptureService.buildBindingHints(preClickElement!);
 
@@ -1235,6 +1285,31 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result.success) {
         emitInputSuccess(socket, previewSessionId, 'down');
+
+        // V10 Fix #4: Recording hook — start drag tracking
+        if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+          setImmediate(async () => {
+            try {
+              const { RecordingCaptureService } = await import(
+                '@/services/testing/ui/preview/recording-capture.service'
+              );
+              const page = sessionService.getPage(previewSessionId, ensuredUserId);
+              const startElement = page
+                ? await RecordingCaptureService.probeForRecording(page, x, y)
+                : null;
+              sessionService.setRecordingDragState(previewSessionId, ensuredUserId, {
+                startX: x,
+                startY: y,
+                startElement,
+                startedAt: Date.now(),
+              });
+            } catch (e) {
+              logger.debug('[RECORDING] Drag start capture failed', {
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          });
+        }
       } else {
         emitInputError(socket, previewSessionId, 'down', result.error || 'Mouse down failed');
       }
@@ -1286,6 +1361,49 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         if (result.needsSnapshot) {
           // Always emit snapshot after mouse up (drag end) so user sees visual feedback
           setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        }
+
+        // V10 Fix #4: Recording hook — detect drag & drop
+        if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+          setImmediate(async () => {
+            try {
+              const dragState = sessionService.getRecordingDragState(previewSessionId, ensuredUserId);
+              // Clear drag state regardless
+              sessionService.setRecordingDragState(previewSessionId, ensuredUserId, null);
+
+              if (!dragState) return; // No drag was started
+
+              const { RecordingCaptureService } = await import(
+                '@/services/testing/ui/preview/recording-capture.service'
+              );
+
+              // Probe drop target
+              const page = sessionService.getPage(previewSessionId, ensuredUserId);
+              const endElement = page
+                ? await RecordingCaptureService.probeForRecording(page, x, y)
+                : null;
+
+              const dragStep = RecordingCaptureService.captureDragAndDrop(
+                dragState,
+                x,
+                y,
+                endElement,
+              );
+
+              if (dragStep) {
+                const room = createRoomName('preview', previewSessionId);
+                socket.nsp.to(room).emit('preview:recording:step', {
+                  previewSessionId,
+                  step: dragStep,
+                  timestamp: new Date().toISOString(),
+                });
+              }
+            } catch (e) {
+              logger.debug('[RECORDING] Drag end capture failed', {
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          });
         }
       } else {
         emitInputError(socket, previewSessionId, 'up', result.error || 'Mouse up failed');
@@ -1344,21 +1462,23 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
           recordingScrollTimers.set(previewSessionId, {
             deltaY: accumulatedDeltaY,
-            timer: setTimeout(() => {
+            timer: setTimeout(async () => {
               try {
                 const finalDeltaY = recordingScrollTimers.get(previewSessionId)?.deltaY ?? accumulatedDeltaY;
                 recordingScrollTimers.delete(previewSessionId);
                 if (finalDeltaY === 0) return;
 
-                const scrollStep: PreviewIntentStep = {
-                  id: `rec_${Date.now().toString(36)}`,
-                  type: 'scroll',
-                  description: finalDeltaY > 0 ? 'Scroll down' : 'Scroll up',
-                };
-                const room = createRoomName('preview', previewSessionId);
-                socket.nsp.to(room).emit('preview:recording:step', {
-                  previewSessionId, step: scrollStep, timestamp: new Date().toISOString(),
-                });
+                // V10 Fix #8: Use captureScroll to record actual delta instead of hardcoded value
+                const { RecordingCaptureService } = await import(
+                  '@/services/testing/ui/preview/recording-capture.service'
+                );
+                const scrollStep = RecordingCaptureService.captureScroll(finalDeltaY);
+                if (scrollStep) {
+                  const room = createRoomName('preview', previewSessionId);
+                  socket.nsp.to(room).emit('preview:recording:step', {
+                    previewSessionId, step: scrollStep, timestamp: new Date().toISOString(),
+                  });
+                }
               } catch (e) {
                 logger.debug('[RECORDING] Scroll capture failed', {
                   error: e instanceof Error ? e.message : String(e),
@@ -1434,6 +1554,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   elementLabel: RecordingCaptureService.getElementLabel(focusedEl),
                   lastCharAt: Date.now(),
                   bindingHints: focusedEl ? RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, string> : undefined,
+                  // V10 Fix #1: Track multiline state so Shift+Enter can append \n
+                  isMultiline: focusedEl?.isMultiline,
                 };
               } else {
                 buffer.text += data.text;
@@ -1523,6 +1645,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
         // V9: Recording hook — flush typing buffer + emit press step
         // V10: When Enter is pressed after typing, merge into single step with pressEnter:true
+        // V10 Fix #1: Shift+Enter in multiline elements appends \n to buffer instead of flushing
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
           setImmediate(async () => {
             try {
@@ -1534,9 +1657,43 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const isEnterKey = data.key === 'Enter';
               let mergedEnterIntoType = false;
 
+              // V10 Fix #1: Detect Shift+Enter in multiline → append \n to buffer
+              const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+              const isMultiline = buffer?.isMultiline ?? false;
+
+              if (RecordingCaptureService.isNewlineInsertion(data.key, data.modifiers, isMultiline)) {
+                // Shift+Enter in textarea/contenteditable = newline character
+                // Append \n to typing buffer instead of flushing
+                if (buffer) {
+                  buffer.text += '\n';
+                  buffer.lastCharAt = Date.now();
+                  sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, buffer);
+
+                  // Reset debounce timer (same as regular typing)
+                  const existingTimer = recordingTypingTimers.get(previewSessionId);
+                  if (existingTimer) clearTimeout(existingTimer);
+                  recordingTypingTimers.set(previewSessionId, setTimeout(async () => {
+                    try {
+                      const currentBuffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+                      if (currentBuffer) {
+                        const step = RecordingCaptureService.flushTypingBuffer(currentBuffer);
+                        if (step) {
+                          socket.nsp.to(room).emit('preview:recording:step', {
+                            previewSessionId, step, timestamp: new Date().toISOString(),
+                          });
+                        }
+                        sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
+                      }
+                    } catch { /* ignore */ }
+                    recordingTypingTimers.delete(previewSessionId);
+                  }, RECORDING_TYPING_DEBOUNCE_MS));
+                }
+                // Don't flush, don't emit press step — the \n is part of the typed text
+                return;
+              }
+
               // Flush typing buffer if Enter/Tab triggers it
-              if (RecordingCaptureService.shouldFlushOnKey(data.key)) {
-                const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+              if (RecordingCaptureService.shouldFlushOnKey(data.key, data.modifiers, isMultiline)) {
                 if (buffer) {
                   // V10: If Enter triggered the flush and there's text in the buffer,
                   // merge type + Enter into a single step with pressEnter: true.
@@ -2108,6 +2265,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               page.off('load', loadHandler);
               delete (page as any).__qai_recording_load_handler;
             }
+            // V10 Fix #5: Remove filechooser handler
+            const fcHandler = (page as any).__qai_recording_filechooser_handler;
+            if (fcHandler) {
+              page.off('filechooser', fcHandler);
+              delete (page as any).__qai_recording_filechooser_handler;
+            }
           } catch { /* page may be closing */ }
         }
 
@@ -2284,6 +2447,66 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             error: e instanceof Error ? e.message : String(e),
           });
         }
+
+        // V10 Fix #5: Listen for filechooser events to record file uploads
+        try {
+          const { RecordingCaptureService: RecCapSvc } = await import(
+            '@/services/testing/ui/preview/recording-capture.service'
+          );
+
+          const fileChooserHandler = async (fileChooser: any) => {
+            try {
+              if (!sessionService.isRecording(previewSessionId, ensuredUserId)) return;
+
+              // Probe the file input element for binding hints
+              let probedEl = null;
+              let hasSelectedFiles = false;
+              try {
+                const element = fileChooser.element();
+                if (element) {
+                  const box = await element.boundingBox().catch(() => null);
+                  if (box) {
+                    probedEl = await RecCapSvc.probeForRecording(page, box.x + box.width / 2, box.y + box.height / 2);
+                  }
+
+                  // Avoid false positives: record upload only if user actually selected files.
+                  // filechooser event fires when dialog opens, including cancel path.
+                  hasSelectedFiles = await waitForFileSelectionConfirmation(
+                    element,
+                    async (ms) => page.waitForTimeout(ms),
+                  );
+                }
+              } catch { /* non-critical */ }
+
+              if (!hasSelectedFiles) {
+                return;
+              }
+
+              // Record confirmed upload interaction.
+              // Actual file path will be configured by user in step editor.
+              const uploadStep = RecCapSvc.captureFileUpload(['(file)'], probedEl);
+              if (uploadStep) {
+                const recordRoom = createRoomName('preview', previewSessionId);
+                socket.nsp.to(recordRoom).emit('preview:recording:step', {
+                  previewSessionId,
+                  step: uploadStep,
+                  timestamp: new Date().toISOString(),
+                });
+              }
+            } catch (fcErr) {
+              logger.debug('[RECORDING] File chooser capture failed', {
+                error: fcErr instanceof Error ? fcErr.message : String(fcErr),
+              });
+            }
+          };
+
+          page.on('filechooser', fileChooserHandler);
+          (page as any).__qai_recording_filechooser_handler = fileChooserHandler;
+        } catch (e) {
+          logger.debug('[RECORDING] File chooser listener setup failed (non-critical)', {
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
       }
 
       // Emit state to all subscribers
@@ -2343,22 +2566,23 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         recordingTypingTimers.delete(previewSessionId);
       }
 
-      // Clear scroll timer and flush
+      // Clear scroll timer and flush (V10 Fix #8: use actual accumulated delta)
       const scrollState = recordingScrollTimers.get(previewSessionId);
       if (scrollState) {
         clearTimeout(scrollState.timer);
         recordingScrollTimers.delete(previewSessionId);
-        // Emit final scroll step
-        const scrollStep: PreviewIntentStep = {
-          id: `rec_${Date.now().toString(36)}`,
-          type: 'scroll',
-          description: scrollState.deltaY > 0 ? 'Scroll down' : 'Scroll up',
-        };
-        socket.nsp.to(room).emit('preview:recording:step', {
-          previewSessionId,
-          step: scrollStep,
-          timestamp: new Date().toISOString(),
-        });
+        // Emit final scroll step using actual captured delta
+        const { RecordingCaptureService: RecCapSvcScroll } = await import(
+          '@/services/testing/ui/preview/recording-capture.service'
+        );
+        const scrollStep = RecCapSvcScroll.captureScroll(scrollState.deltaY);
+        if (scrollStep) {
+          socket.nsp.to(room).emit('preview:recording:step', {
+            previewSessionId,
+            step: scrollStep,
+            timestamp: new Date().toISOString(),
+          });
+        }
       }
 
       // Remove <select> listener and load handler
@@ -2374,6 +2598,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (loadHandler) {
             page.off('load', loadHandler);
             delete (page as any).__qai_recording_load_handler;
+          }
+          // V10 Fix #5: Remove filechooser handler
+          const fcHandler = (page as any).__qai_recording_filechooser_handler;
+          if (fcHandler) {
+            page.off('filechooser', fcHandler);
+            delete (page as any).__qai_recording_filechooser_handler;
           }
         } catch {
           // Page may be closed

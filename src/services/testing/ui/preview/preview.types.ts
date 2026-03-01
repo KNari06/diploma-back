@@ -151,7 +151,11 @@ export type IntentActionType =
   // V5: URL wait (Momentic-like matchers + auto-insert support)
   | 'wait_for'
   // V6: File upload
-  | 'upload';
+  | 'upload'
+  // V10: Advanced interaction types (recording)
+  | 'dblclick'
+  | 'contextmenu'
+  | 'drag_and_drop';
 
 /**
  * Binding hints for element resolution
@@ -382,6 +386,8 @@ export interface StepOptions {
    * Default: 10000. Use lower values for fast SPAs, higher for slow pages.
    */
   lookaheadTimeoutMs?: number;
+  /** V10: CSS selector for drag-and-drop target element */
+  dropTarget?: string;
   /** Upload configuration for upload step (V6) */
   upload?: {
     /** Source type: 'url' (download from public URL) or 'storage' (pre-uploaded file) */

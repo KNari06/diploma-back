@@ -4,11 +4,20 @@
  * into IntentStep objects for the step editor.
  *
  * Stateless utility class — recording state lives in InternalSession.
+ *
+ * V10 changes:
+ * - Fix #1: Shift+Enter in multiline elements appends \n to buffer instead of triggering pressEnter
+ * - Fix #2: Double-click records as 'dblclick' action type
+ * - Fix #3: Right-click records as 'contextmenu' action type
+ * - Fix #4: Drag & Drop captured from mouse:down + mouse:up sequence
+ * - Fix #5: File upload captured via filechooser event
+ * - Fix #6: Iframe-aware probing (tries all frames when main frame returns null)
+ * - Fix #8: Scroll step stores actual accumulated deltaY (not hardcoded)
  */
 
 import { logger } from '@/utils/core/logger';
 import { randomUUID } from 'crypto';
-import type { Page } from 'playwright';
+import type { Frame, Page } from 'playwright';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import type {
   BindingHints,
@@ -36,6 +45,8 @@ export interface ProbedElement {
   ariaExpanded?: boolean;
   ariaPressed?: boolean;
   boundingBox?: ElementBoundingBox;
+  /** True if element accepts multi-line text (textarea, contenteditable) */
+  isMultiline?: boolean;
 }
 
 /** Typing buffer stored on session */
@@ -46,6 +57,20 @@ export interface RecordingTypingBuffer {
   elementLabel: string;
   lastCharAt: number;
   bindingHints?: Record<string, string>;
+  /** True if the focused element is multiline (textarea, contenteditable) */
+  isMultiline?: boolean;
+}
+
+/** Drag state tracked between mouse:down and mouse:up events */
+export interface RecordingDragState {
+  /** Starting X coordinate */
+  startX: number;
+  /** Starting Y coordinate */
+  startY: number;
+  /** Element probed at the drag start point */
+  startElement: ProbedElement | null;
+  /** Timestamp when drag started */
+  startedAt: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -63,6 +88,12 @@ const MEANINGFUL_KEYS = new Set([
 /** Keys that should flush the typing buffer when pressed */
 const FLUSH_TRIGGER_KEYS = new Set(['Enter', 'Tab', 'Escape']);
 
+/**
+ * Minimum pixel distance between mouse:down and mouse:up to be considered a drag.
+ * Anything less is treated as a click (handled by the click handler).
+ */
+const DRAG_DISTANCE_THRESHOLD = 10;
+
 /** Generate a recording step ID */
 function recStepId(): string {
   return `rec_${randomUUID().slice(0, 8)}`;
@@ -72,6 +103,8 @@ function recStepId(): string {
  * In-page probe function body.
  * Runs inside the browser via page.evaluate — all DOM APIs are available there.
  * Extracted as a string to avoid TS errors about DOM types in Node context.
+ *
+ * V10: Added `isMultiline` detection for textarea and contenteditable elements.
  */
 const PROBE_AT_POINT_FN = `
 (function(px, py) {
@@ -106,6 +139,12 @@ const PROBE_AT_POINT_FN = `
   var ae = target.getAttribute('aria-expanded');
   var ap = target.getAttribute('aria-pressed');
 
+  // Detect multiline: textarea, contenteditable, or role=textbox with aria-multiline
+  var isMultiline = tag === 'textarea'
+    || target.getAttribute('contenteditable') === 'true'
+    || target.getAttribute('contenteditable') === ''
+    || (target.getAttribute('role') === 'textbox' && target.getAttribute('aria-multiline') === 'true');
+
   return {
     tag: tag,
     role: target.getAttribute('role') || undefined,
@@ -119,6 +158,7 @@ const PROBE_AT_POINT_FN = `
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
+    isMultiline: isMultiline || undefined,
     boundingBox: {
       x: Math.round(rect.x),
       y: Math.round(rect.y),
@@ -152,6 +192,12 @@ const PROBE_FOCUSED_FN = `
   var ae = target.getAttribute('aria-expanded');
   var ap = target.getAttribute('aria-pressed');
 
+  // Detect multiline: textarea, contenteditable, or role=textbox with aria-multiline
+  var isMultiline = tag === 'textarea'
+    || target.getAttribute('contenteditable') === 'true'
+    || target.getAttribute('contenteditable') === ''
+    || (target.getAttribute('role') === 'textbox' && target.getAttribute('aria-multiline') === 'true');
+
   return {
     tag: tag,
     role: target.getAttribute('role') || undefined,
@@ -165,6 +211,7 @@ const PROBE_FOCUSED_FN = `
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
+    isMultiline: isMultiline || undefined,
     boundingBox: {
       x: Math.round(rect.x),
       y: Math.round(rect.y),
@@ -188,10 +235,18 @@ export class RecordingCaptureService {
   /**
    * Probe element at (x, y) coordinates via page.evaluate.
    * Returns rich element info for recording.
+   *
+   * V10 Fix #6: If main frame returns null (click in iframe), try all child frames.
+   * Translates coordinates from viewport-relative to frame-relative using frame bounding rect.
    */
   static async probeForRecording(page: Page, x: number, y: number): Promise<ProbedElement | null> {
     try {
-      return await page.evaluate(`${PROBE_AT_POINT_FN}(${x}, ${y})`) as ProbedElement | null;
+      // Try main frame first (fast path)
+      const result = await page.evaluate(`${PROBE_AT_POINT_FN}(${x}, ${y})`) as ProbedElement | null;
+      if (result) return result;
+
+      // Main frame returned null — check if click landed on an iframe
+      return await this.probeInChildFrames(page, x, y);
     } catch (error) {
       logger.debug('[RECORDING] Probe at point failed', {
         x, y,
@@ -202,17 +257,97 @@ export class RecordingCaptureService {
   }
 
   /**
+   * Try probing in child frames when main frame probe returns null.
+   * Walks through all iframes on the page, checks if (x, y) is within the
+   * iframe's bounding rect, then probes inside the frame with adjusted coordinates.
+   */
+  private static async probeInChildFrames(page: Page, x: number, y: number): Promise<ProbedElement | null> {
+    try {
+      // Get all iframe elements with their bounding rects
+      const iframeRects = await page.evaluate(`
+        (() => {
+          var iframes = Array.from(document.querySelectorAll('iframe'));
+          return iframes.map(function(iframe, index) {
+            var rect = iframe.getBoundingClientRect();
+            return { index: index, x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+          });
+        })()
+      `) as Array<{ index: number; x: number; y: number; width: number; height: number }>;
+
+      // Find which iframe contains the point
+      for (const rect of iframeRects) {
+        if (x >= rect.x && x <= rect.x + rect.width &&
+            y >= rect.y && y <= rect.y + rect.height) {
+          // Point is inside this iframe — probe only the corresponding top-level child frame.
+          const frame = page.mainFrame().childFrames()[rect.index];
+          if (!frame) {
+            continue;
+          }
+
+          try {
+            // Translate viewport coords to frame-local coords
+            const localX = x - rect.x;
+            const localY = y - rect.y;
+            const probed = await frame.evaluate(
+              `${PROBE_AT_POINT_FN}(${localX}, ${localY})`
+            ) as ProbedElement | null;
+
+            if (probed) {
+              // Adjust boundingBox back to viewport coordinates for highlighting
+              if (probed.boundingBox) {
+                probed.boundingBox.x += Math.round(rect.x);
+                probed.boundingBox.y += Math.round(rect.y);
+              }
+              return probed;
+            }
+          } catch {
+            // Frame may be cross-origin or detached — skip
+          }
+        }
+      }
+    } catch (error) {
+      logger.debug('[RECORDING] Iframe probe failed (non-critical)', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    return null;
+  }
+
+  /**
    * Probe the currently focused element (for typing target detection).
+   *
+   * V10 Fix #6: Also probes focused element in child frames if main frame returns null.
    */
   static async probeFocusedElement(page: Page): Promise<ProbedElement | null> {
     try {
-      return await page.evaluate(`${PROBE_FOCUSED_FN}()`) as ProbedElement | null;
+      const result = await page.evaluate(`${PROBE_FOCUSED_FN}()`) as ProbedElement | null;
+      if (result) return result;
+
+      // Try child frames
+      return await this.probeFocusedInChildFrames(page);
     } catch (error) {
       logger.debug('[RECORDING] Probe focused element failed', {
         error: error instanceof Error ? error.message : String(error),
       });
       return null;
     }
+  }
+
+  /**
+   * Probe focused element in child frames.
+   */
+  private static async probeFocusedInChildFrames(page: Page): Promise<ProbedElement | null> {
+    const childFrames = page.frames().filter(f => f !== page.mainFrame());
+    for (const frame of childFrames) {
+      try {
+        const result = await frame.evaluate(`${PROBE_FOCUSED_FN}()`) as ProbedElement | null;
+        if (result) return result;
+      } catch {
+        // Frame may be cross-origin or detached
+      }
+    }
+    return null;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -247,6 +382,8 @@ export class RecordingCaptureService {
       if (actionType === 'navigate') return `Navigate to ${value || 'page'}`;
       if (actionType === 'scroll') return value || 'Scroll down';
       if (actionType === 'press') return `Press ${value || 'key'}`;
+      if (actionType === 'drag_and_drop') return 'Drag and drop';
+      if (actionType === 'upload') return `Upload file '${value || 'file'}'`;
       return `${actionType} element`;
     }
 
@@ -266,6 +403,10 @@ export class RecordingCaptureService {
     switch (actionType) {
       case 'click':
         return `Click '${shortLabel}'`;
+      case 'dblclick':
+        return `Double-click '${shortLabel}'`;
+      case 'contextmenu':
+        return `Right-click '${shortLabel}'`;
       case 'type':
         return value
           ? `Type '${value.slice(0, 40)}' in '${shortLabel}'`
@@ -290,6 +431,10 @@ export class RecordingCaptureService {
         return value || 'Scroll down';
       case 'navigate':
         return `Navigate to ${value || 'page'}`;
+      case 'drag_and_drop':
+        return `Drag '${shortLabel}'`;
+      case 'upload':
+        return `Upload file to '${shortLabel}'`;
       default:
         return `${actionType} '${shortLabel}'`;
     }
@@ -316,8 +461,24 @@ export class RecordingCaptureService {
   /**
    * Infer the IntentActionType from a raw click event + element state.
    * elementBefore = state at time of click (before the click takes effect).
+   *
+   * V10: Also handles dblclick and contextmenu (right-click) via optional params.
+   *
+   * @param elementBefore - Element state before the click
+   * @param clickCount - 1 for single click, 2 for double click
+   * @param button - 'left', 'right', or 'middle'
    */
-  static inferClickActionType(elementBefore: ProbedElement): IntentActionType {
+  static inferClickActionType(
+    elementBefore: ProbedElement,
+    clickCount = 1,
+    button: 'left' | 'right' | 'middle' = 'left',
+  ): IntentActionType {
+    // Right-click → contextmenu
+    if (button === 'right') return 'contextmenu';
+
+    // Double-click → dblclick
+    if (clickCount >= 2) return 'dblclick';
+
     const tag = elementBefore.tag;
     const type = elementBefore.type;
 
@@ -361,9 +522,39 @@ export class RecordingCaptureService {
 
   /**
    * Check if a key should trigger flushing the typing buffer.
+   *
+   * V10 Fix #1: Shift+Enter in a multiline element should NOT trigger flush.
+   * Instead, it should be treated as a newline character appended to the buffer.
+   *
+   * @param key - The key that was pressed
+   * @param modifiers - Active modifier keys (Shift, Control, etc.)
+   * @param isMultiline - True if the focused element is multiline (textarea/contenteditable)
    */
-  static shouldFlushOnKey(key: string): boolean {
-    return FLUSH_TRIGGER_KEYS.has(key);
+  static shouldFlushOnKey(
+    key: string,
+    modifiers?: string[],
+    isMultiline?: boolean,
+  ): boolean {
+    if (!FLUSH_TRIGGER_KEYS.has(key)) return false;
+
+    // Shift+Enter in a multiline element = newline, NOT flush/submit
+    if (key === 'Enter' && isMultiline && modifiers?.includes('Shift')) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * V10 Fix #1: Check if a key press should insert a newline into the typing buffer.
+   * Shift+Enter in textarea/contenteditable = newline character.
+   */
+  static isNewlineInsertion(
+    key: string,
+    modifiers?: string[],
+    isMultiline?: boolean,
+  ): boolean {
+    return key === 'Enter' && !!isMultiline && !!modifiers?.includes('Shift');
   }
 
   /**
@@ -402,6 +593,98 @@ export class RecordingCaptureService {
       type: 'select',
       description: this.buildDescription('select', { tag: 'select', labelText: label } as ProbedElement, selectedText),
       value: selectedValue,
+    };
+  }
+
+  /**
+   * V10 Fix #4: Capture a drag-and-drop operation as an IntentStep.
+   * Called when mouse:up is detected after mouse:down with sufficient distance.
+   *
+   * @param dragState - The drag start state (from mouse:down)
+   * @param endX - End X coordinate
+   * @param endY - End Y coordinate
+   * @param endElement - Element probed at the drop target
+   */
+  static captureDragAndDrop(
+    dragState: RecordingDragState,
+    endX: number,
+    endY: number,
+    endElement: ProbedElement | null,
+  ): PreviewIntentStep | null {
+    const distance = Math.sqrt(
+      Math.pow(endX - dragState.startX, 2) + Math.pow(endY - dragState.startY, 2),
+    );
+
+    // Below threshold → not a drag (it's a click, handled by click handler)
+    if (distance < DRAG_DISTANCE_THRESHOLD) return null;
+
+    const fromLabel = this.getElementLabel(dragState.startElement);
+    const toLabel = this.getElementLabel(endElement);
+    const description = fromLabel !== toLabel
+      ? `Drag '${fromLabel}' to '${toLabel}'`
+      : `Drag '${fromLabel}'`;
+
+    return {
+      id: recStepId(),
+      type: 'drag_and_drop',
+      description,
+      value: JSON.stringify({
+        from: { x: Math.round(dragState.startX), y: Math.round(dragState.startY) },
+        to: { x: Math.round(endX), y: Math.round(endY) },
+      }),
+      bindingHints: dragState.startElement
+        ? this.buildBindingHints(dragState.startElement) as BindingHints | undefined
+        : undefined,
+    };
+  }
+
+  /**
+   * V10 Fix #5: Capture a file upload (from filechooser event) as an IntentStep.
+   *
+   * @param filePaths - Array of file paths that were selected
+   * @param element - The input element that triggered the file chooser (if probed)
+   */
+  static captureFileUpload(
+    filePaths: string[],
+    element: ProbedElement | null,
+  ): PreviewIntentStep | null {
+    if (!filePaths || filePaths.length === 0) return null;
+
+    // Extract just filenames from paths for display
+    const fileNames = filePaths.map(fp => {
+      const parts = fp.split(/[/\\]/);
+      return parts[parts.length - 1] || fp;
+    });
+
+    const description = this.buildDescription('upload', element, fileNames.join(', '));
+
+    return {
+      id: recStepId(),
+      type: 'upload',
+      description,
+      // Store the first filename as value (for single-file uploads which are most common)
+      value: fileNames[0],
+      bindingHints: element ? this.buildBindingHints(element) as BindingHints | undefined : undefined,
+    };
+  }
+
+  /**
+   * V10 Fix #8: Capture a scroll step with actual delta value.
+   *
+   * @param accumulatedDeltaY - Total pixels scrolled during the debounce window
+   */
+  static captureScroll(accumulatedDeltaY: number): PreviewIntentStep | null {
+    if (accumulatedDeltaY === 0) return null;
+
+    const direction = accumulatedDeltaY > 0 ? 'down' : 'up';
+    const absDelta = Math.abs(Math.round(accumulatedDeltaY));
+
+    return {
+      id: recStepId(),
+      type: 'scroll',
+      description: `Scroll ${direction} ${absDelta}px`,
+      // Store the actual delta as value so replay can use it
+      value: String(Math.round(accumulatedDeltaY)),
     };
   }
 

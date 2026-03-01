@@ -86,8 +86,17 @@ interface InternalSession extends PreviewSession {
     elementLabel: string;
     lastCharAt: number;
     bindingHints?: Record<string, string>;
+    /** V10: True if the focused element is multiline (textarea, contenteditable) */
+    isMultiline?: boolean;
   } | null;
   recordingLastUrl: string;
+  /** V10: Drag state tracked between mouse:down and mouse:up */
+  recordingDragState: {
+    startX: number;
+    startY: number;
+    startElement: any; // ProbedElement from recording-capture.service
+    startedAt: number;
+  } | null;
 }
 
 /**
@@ -330,6 +339,7 @@ export class PreviewSessionService {
           recording: false,
           recordingTypingBuffer: null,
           recordingLastUrl: safeStartUrl,
+          recordingDragState: null,
         };
 
         // Store session
@@ -451,6 +461,7 @@ export class PreviewSessionService {
       session.recording = false;
       session.recordingTypingBuffer = null;
       session.recordingLastUrl = startUrl;
+      session.recordingDragState = null;
 
       // Close old resources after swap (do not break reset if close fails)
       await this.safeCloseBrowserResources(undefined, oldContext, oldPage);
@@ -1190,6 +1201,7 @@ export class PreviewSessionService {
     session.recording = recording;
     if (!recording) {
       session.recordingTypingBuffer = null;
+      session.recordingDragState = null;
     }
     return true;
   }
@@ -1232,6 +1244,22 @@ export class PreviewSessionService {
   setRecordingLastUrl(sessionId: string, userId: string, url: string): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingLastUrl = url;
+  }
+
+  /**
+   * V10: Get recording drag state (for drag & drop detection)
+   */
+  getRecordingDragState(sessionId: string, userId?: string): InternalSession['recordingDragState'] {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingDragState ?? null;
+  }
+
+  /**
+   * V10: Set recording drag state
+   */
+  setRecordingDragState(sessionId: string, userId: string, state: InternalSession['recordingDragState']): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingDragState = state;
   }
 
   /**
