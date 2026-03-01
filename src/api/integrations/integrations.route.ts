@@ -8,6 +8,8 @@ import {
   disconnectIntegration,
   listGitHubRepos,
   listGitHubBranches,
+  listGitLabRepos,
+  listGitLabBranches,
   setupSlack,
   setupTelegram,
 } from './integrations.controller';
@@ -111,6 +113,56 @@ router.get('/github/repos', authenticateUser, listGitHubRepos);
  *         description: Unauthorized
  */
 router.get('/github/repos/:owner/:repo/branches', authenticateUser, listGitHubBranches);
+
+/**
+ * @swagger
+ * /integrations/gitlab/repos:
+ *   get:
+ *     summary: List GitLab projects (repos) for the authenticated user
+ *     tags: [Integrations]
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: per_page
+ *         schema:
+ *           type: integer
+ *           default: 30
+ *         description: Projects per page (max 100)
+ *     responses:
+ *       200:
+ *         description: List of projects
+ *       403:
+ *         description: GitLab not connected
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/gitlab/repos', authenticateUser, listGitLabRepos);
+
+/**
+ * @swagger
+ * /integrations/gitlab/projects/{projectId}/branches:
+ *   get:
+ *     summary: List branches for a GitLab project
+ *     tags: [Integrations]
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: projectId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: GitLab project ID (numeric) or URL-encoded path (e.g. owner%2Frepo)
+ *     responses:
+ *       200:
+ *         description: List of branches
+ *       403:
+ *         description: GitLab not connected
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/gitlab/projects/:projectId/branches', authenticateUser, listGitLabBranches);
 
 /**
  * @swagger
