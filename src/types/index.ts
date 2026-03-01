@@ -855,6 +855,13 @@ export interface IntentResult {
   expectedStatus?: number;
   isRelativePath?: boolean; // True if apiUrl is a relative path without base URL
 
+  // Credentials extracted from user message (GPT-based, any language)
+  credentials?: {
+    login: string;          // Raw login value (email, phone, or username — as provided)
+    loginType: 'email' | 'phone' | 'username' | 'id' | 'other' | (string & {});  // GPT-classified type (allow custom identifiers)
+    password: string;
+  } | null;
+
   // Optional fields (all intents)
   urgency?: 'high' | 'normal' | null; // Detect: "urgent", "ASAP", "critical", "quick"
   userLanguage?: 'en' | 'ru' | 'neutral'; // User's language for localization

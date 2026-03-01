@@ -283,6 +283,19 @@ CRITICAL anti-hallucination rule:
   "yes, give whole data from that test" → general_chat (requesting PAST data, not new test!)
   Keywords alone ("API", "test") do NOT determine intent — always check sentence structure and context first.
 
+--- CREDENTIAL EXTRACTION ---
+
+If the user provides login credentials in their message (ANY language), extract them into the "credentials" field:
+- Look for login/email/username/phone + password pairs in ANY language (English, Russian, Kazakh, etc.)
+- Common patterns: "Логин: admin Пароль: 123", "email: test@mail.com password: secret", "login admin, password qwerty", "with credentials user/pass123"
+- Login keywords (any language): "login", "логин", "email", "username", "пользователь", "user", "phone", "телефон", "номер"
+- Password keywords (any language): "password", "pass", "пароль", "пин", "pin"
+- Classify loginType: if login contains "@" → "email", if login looks like phone number (starts with +, 8, or has 10+ digits) → "phone", if it looks like an explicit ID/identifier (e.g. words like id/iin/bin/account_id) → "id", otherwise → "username"
+- If identifier type is ambiguous but clearly not email/phone, you may use "other" or a specific custom string (e.g. "iin", "account_id")
+- If credentials are found, include "credentials" object in the JSON output
+- If NO credentials found in the message, do NOT include the "credentials" field at all
+- SECURITY: Never invent or guess credentials — only extract what the user explicitly provided
+
 --- JSON FORMAT (STRICT SCHEMA) ---
 
 REQUIRED FIELDS (always include):
@@ -307,7 +320,8 @@ OPTIONAL FIELDS (include if relevant):
   "urgency": "high" | "normal" | null,
   "sourceTestId": string | null,
   "suggestedName": string | null,
-  "savedTestCaseId": string | null
+  "savedTestCaseId": string | null,
+  "credentials": {"login": string, "loginType": "email" | "phone" | "username" | "id" | "other" | string, "password": string} | null
 }
 
 REQUIRED FOR needs_clarification (MUST NOT OMIT):
@@ -409,7 +423,16 @@ Ex27: "найди все flow на repetino.kz"
 → {"intent": "platform_test", "intent_confidence": 0.90, "page": "repetino.kz", "scope": "full", "executionStrategy": "exploration", "rawText": "..."}
 
 Ex28: "discover all test cases on example.com"
-→ {"intent": "platform_test", "intent_confidence": 0.93, "page": "example.com", "scope": "full", "executionStrategy": "exploration", "rawText": "..."}`;
+→ {"intent": "platform_test", "intent_confidence": 0.93, "page": "example.com", "scope": "full", "executionStrategy": "exploration", "rawText": "..."}
+
+Ex29: "Проверь авторизацию на juz40-edu.kz Логин: admin Пароль: qwerty123"
+→ {"intent": "platform_test", "intent_confidence": 0.92, "scope": "auth", "target": "authorization", "page": "juz40-edu.kz", "credentials": {"login": "admin", "loginType": "username", "password": "qwerty123"}, "rawText": "..."}
+
+Ex30: "test login on example.com with email test@mail.com and password secret123"
+→ {"intent": "platform_test", "intent_confidence": 0.90, "scope": "auth", "target": "login", "page": "example.com", "credentials": {"login": "test@mail.com", "loginType": "email", "password": "secret123"}, "rawText": "..."}
+
+Ex31: "проверь вход на сайт repetino.kz, телефон: +77011234567, пароль: mypass"
+→ {"intent": "platform_test", "intent_confidence": 0.90, "scope": "auth", "target": "login", "page": "repetino.kz", "credentials": {"login": "+77011234567", "loginType": "phone", "password": "mypass"}, "rawText": "..."}`;
 
   // Add context if available
   if (context) {

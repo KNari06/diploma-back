@@ -1344,11 +1344,45 @@ function validateIntentResult(parsed: any): IntentResult | null {
     // AI should use needs_clarification only when critical info is truly missing
   }
 
+  // Validate credentials if present
+  if (parsed.credentials) {
+    if (!parsed.credentials.login || !parsed.credentials.password) {
+      logger.warn('[INTENT_PARSER] Invalid credentials structure from GPT, removing', {
+        hasLogin: !!parsed.credentials?.login,
+        hasPassword: !!parsed.credentials?.password,
+      });
+      parsed.credentials = undefined;
+    } else {
+      // Validate and normalize loginType
+      const validLoginTypes = ['email', 'phone', 'username', 'id', 'other'];
+      const rawLoginType = typeof parsed.credentials.loginType === 'string'
+        ? parsed.credentials.loginType.trim().toLowerCase()
+        : '';
+
+      if (!rawLoginType) {
+        // Auto-classify only when loginType is missing.
+        // Keep explicitly provided custom identifiers as-is (e.g. "iin", "account_id").
+        parsed.credentials.loginType = parsed.credentials.login.includes('@') ? 'email' : 'username';
+        logger.debug('[INTENT_PARSER] Auto-classified loginType', {
+          loginType: parsed.credentials.loginType,
+        });
+      } else if (validLoginTypes.includes(rawLoginType)) {
+        parsed.credentials.loginType = rawLoginType as 'email' | 'phone' | 'username' | 'id' | 'other';
+      } else {
+        parsed.credentials.loginType = rawLoginType;
+        logger.debug('[INTENT_PARSER] Preserving custom loginType', {
+          loginType: parsed.credentials.loginType,
+        });
+      }
+    }
+  }
+
   logger.debug('[INTENT_PARSER] Intent result validated successfully', {
     intent: parsed.intent,
     intent_confidence: (parsed as any).intent_confidence,
     hasApiUrl: !!parsed.apiUrl,
     hasPage: !!parsed.page,
+    hasCredentials: !!parsed.credentials,
   });
 
   return parsed as IntentResult;
@@ -1660,6 +1694,16 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
         parsed.clarificationReason = 'Unclear user intent';
       }
     }
+  }
+
+  // Step 5.5: Log credential extraction result (GPT-based, any language)
+  if (parsed.credentials) {
+    logger.info('[INTENT_PARSER] Credentials extracted via GPT', {
+      loginType: parsed.credentials.loginType,
+      hasLogin: !!parsed.credentials.login,
+      hasPassword: !!parsed.credentials.password,
+      // SECURITY: Never log actual credential values
+    });
   }
 
   // Step 6: Add/update metadata with timestamps and processing info
