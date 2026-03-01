@@ -193,7 +193,9 @@ const EXTRACT_SCRIPT = `
       isTopMostAtCenter,
 
       // ARIA state
-      checked: el.hasAttribute('checked') ? true : (el.checked === true ? true : undefined),
+      // ✅ FIX: Use el.checked (runtime property) instead of hasAttribute('checked') (HTML default)
+      // hasAttribute('checked') returns true for initially-checked boxes even after user unchecks them
+      checked: el.checked === true ? true : undefined,
       ariaExpanded: (el.getAttribute('aria-expanded') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-expanded') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
       ariaPressed: (el.getAttribute('aria-pressed') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-pressed') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
       ariaSelected: (el.getAttribute('aria-selected') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-selected') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),

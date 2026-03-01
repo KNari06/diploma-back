@@ -114,6 +114,7 @@ export class ActionExecutor {
         ariaLabel: el.name,
         tag: el.tag,
         type: el.type,
+        role: el.role, // ✅ FIX: Include role for Phase 0 dropdown selection
       });
     });
 
@@ -311,15 +312,27 @@ export class ActionExecutor {
       throw new Error(`Invalid ref format: ${command.ref}`);
     }
 
-    // Validate URL schema
+    // Validate URL schema (supports both absolute and relative URLs)
     if (command.url) {
       try {
+        // Try absolute URL first
         const url = new URL(command.url);
         if (!['http:', 'https:'].includes(url.protocol)) {
           throw new Error(`Invalid URL protocol: ${url.protocol}`);
         }
       } catch {
-        throw new Error(`Invalid URL: ${command.url}`);
+        // ✅ FIX: Try as relative URL with current page as base
+        try {
+          const baseUrl = this.page.url();
+          const url = new URL(command.url, baseUrl);
+          if (!['http:', 'https:'].includes(url.protocol)) {
+            throw new Error(`Invalid URL protocol: ${url.protocol}`);
+          }
+          // Resolve to absolute URL for execution
+          command.url = url.href;
+        } catch {
+          throw new Error(`Invalid URL: ${command.url}`);
+        }
       }
     }
 
@@ -508,12 +521,14 @@ export class ActionExecutor {
 
       case 'press':
         if (!cmd.key) throw new Error('press requires key');
+        // ✅ FIX: keyboard is page-level (not frame-level), always use this.page
         await this.page.keyboard.press(cmd.key);
         break;
 
       case 'goto':
         if (!cmd.url) throw new Error('goto requires url');
-        await this.page.goto(cmd.url, {
+        // ✅ FIX: Use currentContext for iframe support (Frame.goto exists)
+        await this.currentContext.goto(cmd.url, {
           waitUntil: 'domcontentloaded',
           timeout: 30000
         });
@@ -527,7 +542,7 @@ export class ActionExecutor {
 
           // ✅ EXPERT ADVICE: Add offset for sticky headers (100px up)
           // Many sites have sticky nav bars that cover the element after scrollIntoView
-          await this.page.evaluate(() => {
+          await this.currentContext.evaluate(() => {
             const STICKY_HEADER_OFFSET = 100; // pixels to scroll up after element is in view
             // @ts-expect-error - window available in browser context
             window.scrollBy(0, -STICKY_HEADER_OFFSET);
@@ -537,7 +552,8 @@ export class ActionExecutor {
         }
 
         // Otherwise, scroll by amount (default 500px). Clamp to avoid extreme scrolls.
-        await this.page.evaluate(
+        // ✅ FIX: Use currentContext for iframe support
+        await this.currentContext.evaluate(
           ({ dir, amount }) => {
             const clamped = Math.max(50, Math.min(2000, amount));
             // @ts-expect-error - window available in browser context
@@ -868,23 +884,24 @@ export class ActionExecutor {
           }
         : undefined,
       // 2. By aria-label
+      // ✅ FIX: Use currentContext for iframe support
       el.ariaLabel
         ? {
-            locator: this.page.getByLabel(el.ariaLabel),
+            locator: this.currentContext.getByLabel(el.ariaLabel),
             name: 'aria-label',
           }
         : undefined,
       // 3. By text content
       el.text
         ? {
-            locator: this.page.getByText(el.text, { exact: false }).first(),
+            locator: this.currentContext.getByText(el.text, { exact: false }).first(),
             name: 'text',
           }
         : undefined,
       // 4. By role + name
       el.text && roleFromTag(el.tag)
         ? {
-            locator: this.page.getByRole(roleFromTag(el.tag) as any, { name: el.text }),
+            locator: this.currentContext.getByRole(roleFromTag(el.tag) as any, { name: el.text }),
             name: 'role+name',
           }
         : undefined,
@@ -965,8 +982,30 @@ export class ActionExecutor {
         }
         break;
       }
+      // ✅ FIX: Route all shadow DOM action types through ShadowDOMHandler
+      case 'toggle': {
+        const toggled = await ShadowDOMHandler.toggle(this.page, cmd.ref);
+        if (toggled) return { success: true, info: `Shadow DOM: toggled ${cmd.ref}` };
+        break;
+      }
+      case 'clear': {
+        const cleared = await ShadowDOMHandler.clear(this.page, cmd.ref);
+        if (cleared) return { success: true, info: `Shadow DOM: cleared ${cmd.ref}` };
+        break;
+      }
+      case 'setRange': {
+        if (!cmd.value) return { success: false };
+        const ranged = await ShadowDOMHandler.setRange(this.page, cmd.ref, cmd.value);
+        if (ranged) return { success: true, info: `Shadow DOM: setRange ${cmd.ref}` };
+        break;
+      }
+      case 'selectDate': {
+        if (!cmd.value) return { success: false };
+        const dated = await ShadowDOMHandler.selectDate(this.page, cmd.ref, cmd.value);
+        if (dated) return { success: true, info: `Shadow DOM: selectDate ${cmd.ref}` };
+        break;
+      }
       default:
-        // Shadow DOM fallback only supports click and fill for now
         break;
     }
 

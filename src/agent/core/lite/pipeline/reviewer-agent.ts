@@ -328,13 +328,14 @@ export class ReviewerAgent {
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      logger.warn('[REVIEWER] auditDone failed, trusting executor claim', { error: errorMsg });
+      logger.warn('[REVIEWER] auditDone failed, NOT trusting executor claim (conservative)', { error: errorMsg });
 
-      // On auditor failure, trust Executor (conservative fallback)
+      // ✅ FIX: On auditor failure, do NOT trust Executor — conservative means "don't complete"
+      // Previously returned verdict: 'done' which was the OPPOSITE of conservative
       return {
-        verdict: 'done',
-        reason: 'Executor marked goal as achieved (auditor unavailable)',
-        goalAlignment: 1.0,
+        verdict: 'continue',
+        reason: 'Executor marked goal as achieved but auditor unavailable — re-verify next iteration',
+        goalAlignment: 0.5,
       };
     }
   }

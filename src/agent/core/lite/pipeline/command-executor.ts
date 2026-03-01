@@ -173,11 +173,14 @@ export class CommandExecutor {
           const goalCheck = this.integrations.goalDetector.detectHeuristic(goalContext);
           // GoalDetectionResult.progressScore is 0-1, Blackboard expects 0-100
           const progressPct = Math.round((goalCheck.progressScore || 0) * 100);
-          // Monotonic progress: only update if higher than current score.
-          // Prevents oscillation where GoalDetector and Reviewer fight over the value,
-          // which confuses Reviewer fast-paths (e.g., ≥85% threshold flip-flops).
+          // ✅ FIX: Allow score to decrease on significant regression (>30% drop),
+          // but prevent minor oscillation. Previously strictly monotonic, which meant
+          // a false high score (e.g. 85%) would persist even on error pages.
           const currentProgress = this.blackboard.getProgressScore();
           if (progressPct > currentProgress) {
+            this.blackboard.setProgressScore(progressPct);
+          } else if (currentProgress - progressPct > 30) {
+            // Significant regression (e.g. navigated to error page) — allow decrease
             this.blackboard.setProgressScore(progressPct);
           }
           if (progressPct > 0) {

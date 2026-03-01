@@ -557,6 +557,7 @@ export interface ElementInfo {
   ariaLabel?: string;
   tag: string;
   type?: string;
+  role?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -924,6 +924,9 @@ export class LiteEngine {
    * 2. Step limit: 20 iterations max
    */
   async execute(): Promise<LiteTestResult> {
+    // ✅ FIX: Set startTime here (not in runLoop) so timeout results report correct duration
+    this.startTime = Date.now();
+
     // ✅ FIX: Use config.timeout if provided (with minimum 60s validation)
     const timeoutMs = Math.max(this.config.timeout || this.TIMEOUT_MS, 60000);
 
@@ -4673,7 +4676,9 @@ export class LiteEngine {
   private normalizeUrl(url: string): string {
     try {
       const urlObj = new URL(url);
-      return urlObj.origin + urlObj.pathname + urlObj.hash;
+      // ✅ FIX: Removed urlObj.hash — comment says "no query/hash" but code included hash
+      // This was causing "flew away" detection to miss hash-only changes
+      return urlObj.origin + urlObj.pathname;
     } catch {
       return url;
     }

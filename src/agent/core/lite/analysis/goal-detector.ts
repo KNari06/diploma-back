@@ -1370,8 +1370,9 @@ Respond with JSON ONLY.`;
         if (phraseIndex === -1) continue;
 
         // ✅ FIX: Check if phrase is preceded by negation
-        const contextBefore = thoughtLower.slice(Math.max(0, phraseIndex - 15), phraseIndex);
-        const isNegated = negationPatterns.some(neg => contextBefore.endsWith(neg));
+        // ✅ FIX: Use .includes() instead of .endsWith() to catch "not fully completed", "not yet fully done" etc.
+        const contextBefore = thoughtLower.slice(Math.max(0, phraseIndex - 20), phraseIndex);
+        const isNegated = negationPatterns.some(neg => contextBefore.includes(neg));
 
         if (!isNegated) {
           // Cross-check with at least some signals
@@ -1457,8 +1458,9 @@ Respond with JSON ONLY.`;
         if (phraseIndex === -1) continue;
 
         // Check if phrase is preceded by negation
-        const contextBefore = thoughtLower.slice(Math.max(0, phraseIndex - 15), phraseIndex);
-        const isNegated = negationPatterns.some(neg => contextBefore.endsWith(neg));
+        // ✅ FIX: Use .includes() instead of .endsWith() to catch "not fully completed" etc.
+        const contextBefore = thoughtLower.slice(Math.max(0, phraseIndex - 20), phraseIndex);
+        const isNegated = negationPatterns.some(neg => contextBefore.includes(neg));
 
         if (!isNegated) {
           logger.info('[GOAL_DETECTOR] Heuristic accepted done claim with thought phrase', {
