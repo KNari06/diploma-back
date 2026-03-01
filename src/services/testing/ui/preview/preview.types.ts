@@ -216,6 +216,8 @@ export interface StepEvidence {
   evidenceNodeIds?: string[];
   /** Resolution metadata from last successful lint/apply */
   resolutionMeta?: ResolutionMeta;
+  /** URL where this evidence was captured (guards against cross-page ref collision in SPAs) */
+  pageUrl?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
