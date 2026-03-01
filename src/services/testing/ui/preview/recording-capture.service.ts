@@ -413,13 +413,23 @@ export class RecordingCaptureService {
    * Flush the typing buffer into an IntentStep.
    * Returns null if buffer is empty.
    * Rebuilds description with final accumulated text using stored element label.
+   *
+   * @param triggeredByEnter - When true, the flush was triggered by the Enter key.
+   *   In that case, merge type + Enter into a single step with `pressEnter: true`
+   *   instead of creating two separate steps (type + press Enter).
+   *   This avoids double-Enter during replay and keeps the step list clean.
    */
-  static flushTypingBuffer(buffer: RecordingTypingBuffer | null): PreviewIntentStep | null {
+  static flushTypingBuffer(
+    buffer: RecordingTypingBuffer | null,
+    triggeredByEnter = false,
+  ): PreviewIntentStep | null {
     if (!buffer || !buffer.text) return null;
 
     const label = buffer.elementLabel || 'element';
     const textPreview = buffer.text.slice(0, 40);
-    const description = `Type '${textPreview}' in '${label}'`;
+    const description = triggeredByEnter
+      ? `Type '${textPreview}' in '${label}' and press Enter`
+      : `Type '${textPreview}' in '${label}'`;
 
     return {
       id: recStepId(),
@@ -427,6 +437,9 @@ export class RecordingCaptureService {
       description,
       value: buffer.text,
       bindingHints: buffer.bindingHints as BindingHints | undefined,
+      ...(triggeredByEnter && {
+        options: { pressEnter: true },
+      }),
     };
   }
 

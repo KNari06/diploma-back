@@ -43,6 +43,10 @@ export class CommandExecutor {
   private skipCompiledPlan: boolean = false; // Skip Stage 1 on retry attempts
   /** Runtime metadata for each step (keyed by stepId) */
   private stepRuntimeMeta: Map<string, StepRuntimeMeta> = new Map();
+  /** V10: Current command index in executeCommands loop (for next-step lookahead) */
+  private currentCommandIndex?: number;
+  /** V10: Current commands list in executeCommands loop (for next-step lookahead) */
+  private currentCommandsList?: PlaywrightCommand[];
 
   constructor(
     page: Page,
@@ -311,6 +315,56 @@ export class CommandExecutor {
           // This is important for sites that validate input via keyboard events (autocomplete, OTP, etc.)
           if (value === undefined) throw new Error('Value is required for type action');
 
+          // ═══════════════════════════════════════════════════════════════
+          // V10: Smart Enter key decision
+          // Priority:
+          //   1. Explicit pressEnter flag from step options → use it directly (no AI call)
+          //   2. Next step is "press Enter" → skip auto-Enter (next step handles it)
+          //   3. Deterministic fast-path for obvious cases (search, OTP)
+          //   4. AI-powered detection (fallback)
+          // ═══════════════════════════════════════════════════════════════
+          const explicitPressEnter = isIntentCommand && intentCommand.intentMeta?.pressEnter;
+
+          // Check if next command is "press Enter" to avoid double-Enter
+          const nextCommandIndex = this.currentCommandIndex !== undefined ? this.currentCommandIndex + 1 : -1;
+          const nextIsEnterPress = nextCommandIndex >= 0 && this.currentCommandsList
+            ? (() => {
+                const next = this.currentCommandsList[nextCommandIndex];
+                return next && next.action === 'press' && (next.value === 'Enter' || next.value === 'enter');
+              })()
+            : false;
+
+          /**
+           * Decide whether to press Enter after fill.
+           * Returns true/false. Only calls AI as last resort.
+           */
+          const decideEnterAfterType = async (locator: Locator): Promise<boolean> => {
+            // 1. Explicit flag from step options — trust it completely
+            if (explicitPressEnter === true) {
+              logger.debug('[COMMAND_EXECUTOR] pressEnter=true from step options (no AI needed)');
+              return true;
+            }
+            if (explicitPressEnter === false) {
+              return false;
+            }
+
+            // 2. Next step is "press Enter" — skip to avoid double-Enter
+            if (nextIsEnterPress) {
+              logger.debug('[COMMAND_EXECUTOR] Next step is press Enter — skipping auto-Enter');
+              return false;
+            }
+
+            // 3. Deterministic fast-path for obvious cases (no AI call needed)
+            const fastResult = await this.fastEnterDetection(locator);
+            if (fastResult !== null) {
+              logger.debug('[COMMAND_EXECUTOR] Fast-path Enter detection', { shouldPress: fastResult });
+              return fastResult;
+            }
+
+            // 4. AI-powered detection (last resort)
+            return shouldPressEnterAfterFill(locator, this.page, description);
+          };
+
           // ✅ V2: Use intent-based locator resolution for IntentPlaywrightCommand
           if (isIntentCommand && intentCommand.intentMeta) {
             const { locator: intentTypeLocator } = await this.getLocatorForIntentCommand(
@@ -321,8 +375,8 @@ export class CommandExecutor {
             // Use type() to simulate real keyboard events character by character
             await intentTypeLocator.pressSequentially(String(value), { timeout: timeout || 30000 });
 
-            // AI-powered Enter key detection
-            const shouldPressIntent = await shouldPressEnterAfterFill(intentTypeLocator, this.page, description);
+            // V10: Smart Enter decision
+            const shouldPressIntent = await decideEnterAfterType(intentTypeLocator);
             if (shouldPressIntent) {
               await intentTypeLocator.press('Enter', { timeout: timeout || 5000 });
             }
@@ -352,14 +406,10 @@ export class CommandExecutor {
             // Use pressSequentially to simulate real keyboard events
             await typeSmartResult.locator.pressSequentially(String(value), { timeout: timeout || 30000 });
 
-            const shouldPress = await shouldPressEnterAfterFill(
-              typeSmartResult.locator,
-              this.page,
-              description
-            );
-
+            // V10: Smart Enter decision
+            const shouldPress = await decideEnterAfterType(typeSmartResult.locator);
             if (shouldPress) {
-              logger.info('[COMMAND_EXECUTOR] AI decided to press Enter after type', {
+              logger.info('[COMMAND_EXECUTOR] Pressing Enter after type', {
                 selector: selector.substring(0, 50),
               });
               await typeSmartResult.locator.press('Enter', { timeout: timeout || 5000 });
@@ -375,9 +425,9 @@ export class CommandExecutor {
                 const locator = getLocator(this.page, selector);
                 await locator.pressSequentially(String(value), { timeout: timeout || 30000 });
 
-                const shouldPressHealed = await shouldPressEnterAfterFill(locator, this.page, description);
+                const shouldPressHealed = await decideEnterAfterType(locator);
                 if (shouldPressHealed) {
-                  logger.info('[COMMAND_EXECUTOR] AI decided to press Enter after type (self-healing)');
+                  logger.info('[COMMAND_EXECUTOR] Pressing Enter after type (self-healing)');
                   await locator.press('Enter', { timeout: timeout || 5000 });
                 }
               },
@@ -1867,6 +1917,10 @@ export class CommandExecutor {
 
     for (let index = 0; index < commands.length; index++) {
       const command = commands[index];
+
+      // V10: Track current command index and list for Enter-key double-press prevention
+      this.currentCommandIndex = index;
+      this.currentCommandsList = commands;
 
       // Capture URL before executing — used by lookahead to detect SPA navigation
       const urlBeforeStep = this.page.url();
@@ -3584,6 +3638,99 @@ export class CommandExecutor {
     }
 
     // No specific matcher - return
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // V10: DETERMINISTIC ENTER KEY DETECTION (fast-path, no AI call)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Deterministic fast-path for Enter key detection.
+   * Returns:
+   *   true  — definitely press Enter (search field, OTP, single input, etc.)
+   *   false — definitely don't press Enter (form with submit button, multi-line textarea)
+   *   null  — unsure, fall through to AI detection
+   *
+   * Avoids a GPT-4o-mini API call for obvious cases.
+   */
+  private async fastEnterDetection(locator: Locator): Promise<boolean | null> {
+    try {
+      const context = await locator.evaluate((el: any) => {
+        const tag = el.tagName?.toLowerCase() || '';
+        const type = (el.type || '').toLowerCase();
+        const placeholder = (el.placeholder || '').toLowerCase();
+        const name = (el.name || '').toLowerCase();
+        const id = (el.id || '').toLowerCase();
+        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+        const autocomplete = (el.autocomplete || '').toLowerCase();
+        const maxLength = el.maxLength || -1;
+        const role = (el.getAttribute('role') || '').toLowerCase();
+
+        // Multi-line textarea → NEVER press Enter
+        const rows = parseInt(el.getAttribute('rows') || '0', 10);
+        if (tag === 'textarea' && (rows > 1 || role !== 'textbox')) {
+          return { decision: false, reason: 'multi-line-textarea' };
+        }
+
+        // Search keywords (multi-language)
+        const searchTerms = ['search', 'find', 'query', 'filter', 'поиск', 'искать', 'recherche', 'suche', 'buscar'];
+        const allText = `${placeholder} ${name} ${id} ${ariaLabel} ${autocomplete}`;
+        const isSearch = type === 'search' || searchTerms.some(t => allText.includes(t));
+
+        // OTP / verification code
+        const codeTerms = ['code', 'otp', 'pin', 'verification', 'подтверждение', 'код', 'token'];
+        const isCode = (maxLength >= 1 && maxLength <= 10) && codeTerms.some(t => allText.includes(t));
+
+        // Form context
+        const form = el.form || el.closest('form');
+        const hasSubmitBtn = form
+          ? !!form.querySelector('button[type="submit"], input[type="submit"], button:not([type])')
+          : false;
+
+        // Total inputs on page
+        const doc = el.ownerDocument;
+        const totalInputs = doc.querySelectorAll(
+          'input[type="text"], input[type="email"], input[type="search"], input[type="password"], input:not([type]), textarea'
+        ).length;
+
+        // Single input on page (likely search or single-field form)
+        const isSingleInput = totalInputs === 1;
+
+        return {
+          tag, type, isSearch, isCode, hasSubmitBtn, isSingleInput,
+          maxLength, role, rows,
+          decision: null as boolean | null,
+          reason: '',
+        };
+      }).catch(() => null);
+
+      if (!context) return null;
+
+      // Already decided by browser-side evaluation
+      if (context.decision !== null && context.decision !== undefined) {
+        logger.debug('[FAST_ENTER] Browser-side decision', { decision: context.decision, reason: context.reason });
+        return context.decision;
+      }
+
+      // ── Definite YES ──
+      // Search field → always Enter
+      if (context.isSearch) return true;
+
+      // OTP / code field → always Enter
+      if (context.isCode) return true;
+
+      // Single input on page without submit button → Enter
+      if (context.isSingleInput && !context.hasSubmitBtn) return true;
+
+      // ── Definite NO ──
+      // Form with visible submit button → don't press (let user click)
+      if (context.hasSubmitBtn) return false;
+
+      // ── Unsure → let AI decide ──
+      return null;
+    } catch {
+      return null; // Error → fall through to AI
+    }
   }
 
   /**

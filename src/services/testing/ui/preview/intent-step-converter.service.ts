@@ -50,6 +50,8 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     disableLookaheadWait?: boolean;
     /** Override lookahead wait timeout (ms) */
     lookaheadTimeoutMs?: number;
+    /** V10: Press Enter after type action (from step.options.pressEnter) */
+    pressEnter?: boolean;
   };
 }
 
@@ -200,6 +202,11 @@ export function convertIntentStepToCommand(
   switch (step.type) {
     case 'type':
       command.value = step.value || '';
+      // V10: Pass pressEnter flag to intentMeta so executor knows
+      // to press Enter after type without calling AI
+      if (step.options?.pressEnter && command.intentMeta) {
+        command.intentMeta.pressEnter = true;
+      }
       break;
 
     case 'navigate':

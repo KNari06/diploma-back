@@ -1522,6 +1522,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
 
         // V9: Recording hook — flush typing buffer + emit press step
+        // V10: When Enter is pressed after typing, merge into single step with pressEnter:true
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
           setImmediate(async () => {
             try {
@@ -1530,15 +1531,26 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               );
               const room = createRoomName('preview', previewSessionId);
 
+              const isEnterKey = data.key === 'Enter';
+              let mergedEnterIntoType = false;
+
               // Flush typing buffer if Enter/Tab triggers it
               if (RecordingCaptureService.shouldFlushOnKey(data.key)) {
                 const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
                 if (buffer) {
-                  const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
+                  // V10: If Enter triggered the flush and there's text in the buffer,
+                  // merge type + Enter into a single step with pressEnter: true.
+                  // This avoids creating two steps (type + press Enter) and prevents
+                  // double-Enter during replay.
+                  const typingStep = RecordingCaptureService.flushTypingBuffer(
+                    buffer,
+                    isEnterKey, // triggeredByEnter
+                  );
                   if (typingStep) {
                     socket.nsp.to(room).emit('preview:recording:step', {
                       previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
                     });
+                    if (isEnterKey) mergedEnterIntoType = true;
                   }
                   sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
                   const timer = recordingTypingTimers.get(previewSessionId);
@@ -1547,11 +1559,14 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               }
 
               // Emit press step for meaningful keys
-              const pressStep = RecordingCaptureService.capturePress(data.key, data.modifiers);
-              if (pressStep) {
-                socket.nsp.to(room).emit('preview:recording:step', {
-                  previewSessionId, step: pressStep, timestamp: new Date().toISOString(),
-                });
+              // V10: Skip emitting separate "Press Enter" if it was merged into the type step
+              if (!mergedEnterIntoType) {
+                const pressStep = RecordingCaptureService.capturePress(data.key, data.modifiers);
+                if (pressStep) {
+                  socket.nsp.to(room).emit('preview:recording:step', {
+                    previewSessionId, step: pressStep, timestamp: new Date().toISOString(),
+                  });
+                }
               }
             } catch (e) {
               logger.debug('[RECORDING] Press capture failed', {
