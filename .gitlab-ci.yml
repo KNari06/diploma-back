@@ -194,41 +194,64 @@ deploy:dev:vm:
   variables:
     BACKEND_ENV_FILE: "/opt/qait/dev/backend/.env"
     BACKEND_CONTAINER_PORT: "3000"
+    DEV_IMAGE: "qait-backend:dev-${CI_COMMIT_SHORT_SHA}"
+    DEV_IMAGE_LATEST: "qait-backend:dev-latest"
+    DEV_NET: "qait-dev"
+    API_NAME: "qait-backend-dev"
+    WORKER_NAME: "qait-worker-dev"
   script:
-    - echo "🚀 Building backend image for VM..."
-    - docker build --target runner -t "qait-backend:dev-${CI_COMMIT_SHORT_SHA}" -t "qait-backend:dev-latest" .
-    - echo "🔎 Checking env file..."
     - |
+      set -euo pipefail
+
+      echo "🔎 Preflight: docker доступен?"
+      docker info >/dev/null
+
+      echo "🔎 Проверяю env файл: $BACKEND_ENV_FILE"
       if [ ! -f "$BACKEND_ENV_FILE" ]; then
         echo "❌ BACKEND_ENV_FILE not found: $BACKEND_ENV_FILE"
-        echo "Create env file on VM or override BACKEND_ENV_FILE in GitLab variables."
+        echo "Создай файл на VM или переопредели переменную BACKEND_ENV_FILE в GitLab Variables."
         exit 1
       fi
-    - docker network create qait-dev >/dev/null 2>&1 || true
-    - echo "🧹 Replacing old API/Worker containers..."
-    - docker rm -f qait-backend-dev qait-worker-dev >/dev/null 2>&1 || true
-    - |
+
+      echo "🌐 Network: $DEV_NET"
+      docker network create "$DEV_NET" >/dev/null 2>&1 || true
+
+      echo "🔨 Build DEV image (target=runner) → $DEV_IMAGE"
+      # --pull чтобы не зависнуть на старом base image
+      docker build --pull --target runner \
+        -t "$DEV_IMAGE" \
+        -t "$DEV_IMAGE_LATEST" \
+        .
+
+      echo "🧹 Remove old containers"
+      docker rm -f "$API_NAME" "$WORKER_NAME" >/dev/null 2>&1 || true
+
+      echo "🚀 Run API контейнер: $API_NAME (порт ${BACKEND_CONTAINER_PORT}:3000)"
       docker run -d \
-        --name qait-backend-dev \
+        --name "$API_NAME" \
         --restart unless-stopped \
-        --network qait-dev \
+        --network "$DEV_NET" \
         --add-host host.docker.internal:host-gateway \
         --env-file "$BACKEND_ENV_FILE" \
         -e QUEUE_PREFIX=qait-dev \
         -p "${BACKEND_CONTAINER_PORT}:3000" \
-        "qait-backend:dev-${CI_COMMIT_SHORT_SHA}" \
+        "$DEV_IMAGE" \
         node -r tsconfig-paths/register dist/index.js
-    - |
+
+      echo "🚀 Run WORKER контейнер: $WORKER_NAME"
       docker run -d \
-        --name qait-worker-dev \
+        --name "$WORKER_NAME" \
         --restart unless-stopped \
-        --network qait-dev \
+        --network "$DEV_NET" \
         --add-host host.docker.internal:host-gateway \
         --env-file "$BACKEND_ENV_FILE" \
         -e QUEUE_PREFIX=qait-dev \
-        "qait-backend:dev-${CI_COMMIT_SHORT_SHA}" \
+        "$DEV_IMAGE" \
         node -r tsconfig-paths/register dist/worker/index.js
-    - echo "✅ Dev backend+worker deployed on VM"
-    - docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "qait-backend-dev|qait-worker-dev"
+
+      echo "✅ Dev backend+worker deployed on VM"
+      docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" | grep -E "$API_NAME|$WORKER_NAME" || true
+
+      echo "🌍 API URL: http://$(hostname -I | awk '{print $1}'):${BACKEND_CONTAINER_PORT}"
   environment:
     name: development/backend-vm
