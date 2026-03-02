@@ -67,6 +67,17 @@ const SEMANTIC_MIN_THRESHOLD = 0.25;
 const AMBIGUOUS_SIMILARITY_DELTA = 0.05;
 
 /**
+ * Clear winner threshold: when composite score delta exceeds this value,
+ * auto-resolve without LLM disambiguation. This handles cases like:
+ * - "login" matching <button>Log in</button> (affinity 1.0) vs <span>Log in</span> (affinity 0.5)
+ * - The action affinity signal creates a delta of ~0.10 which clearly identifies the right element.
+ *
+ * Minimum top score is also required to avoid auto-resolving on garbage matches.
+ */
+const CLEAR_WINNER_DELTA = 0.08;
+const CLEAR_WINNER_MIN_SCORE = 0.55;
+
+/**
  * Action type to expected element tags mapping (HardAllowed filter)
  * Elements not in this list are excluded for the action
  * P1 FIX: Expanded click to include modern UI patterns (list items, table cells, images, etc.)
@@ -1351,16 +1362,18 @@ interface DecisionResult {
 }
 
 /**
- * V3: Apply count-based decision policy
- * Decision is based on the NUMBER of allowed elements, not similarity scores:
+ * V3+: Apply count-based decision policy with clear winner detection
+ * Decision is based on the NUMBER of allowed elements + composite score signals:
  * - 0 allowed → AI fallback (not_found with needsAiFallback=true)
  * - 1 allowed → resolved
- * - >1 allowed → needs_clarification (embeddings only sort, never decide)
- * 
- * Special case: semantic-zero
- * If allowed > 0 but all have very low semantic match, trigger AI fallback
- * 
- * @param ranked - Candidates ranked by embedding similarity (already filtered to allowed set)
+ * - >1 allowed + clear composite delta → resolved (clear winner)
+ * - >1 allowed + ambiguous → needs_clarification (LLM disambiguation)
+ *
+ * Special cases:
+ * - semantic-zero: allowed > 0 but all low match → AI fallback
+ * - clear winner: composite score delta >= 0.08 → auto-resolve (e.g., <button> vs <span> for click)
+ *
+ * @param ranked - Candidates ranked by composite score (semantic + action affinity + spatial + form)
  * @param allowedCount - Total count of allowed elements (hard + soft)
  * @param shortCircuitRef - If set, single exact match was found (auto-resolve)
  * @param ruleTrace - Rule trace for debugging
@@ -1436,6 +1449,32 @@ function applyDecisionPolicy(
     };
   }
 
+  // Case 3.5: Clear winner — composite score delta is large enough to auto-resolve
+  // This catches cases like "login" matching <button>Log in</button> (action affinity 1.0)
+  // vs <span>Log in</span> (action affinity 0.5). The composite score delta (~0.10)
+  // clearly identifies the correct element without needing LLM disambiguation.
+  if (delta >= CLEAR_WINNER_DELTA && topSim >= CLEAR_WINNER_MIN_SCORE && ranked.length > 0) {
+    logger.info('[EMBEDDINGS_RESOLVER] Clear winner auto-resolved by composite score', {
+      event: 'clear_winner',
+      topSim: topSim.toFixed(3),
+      secondSim: secondSim.toFixed(3),
+      delta: delta.toFixed(3),
+      ref: ranked[0].node.ref,
+      tag: ranked[0].node.tag,
+      role: ranked[0].node.role,
+    });
+
+    return {
+      status: 'resolved',
+      message: 'Element found (clear winner by composite score)',
+      confidence: Math.min(topSim + 0.05, 0.95), // Slight confidence boost for clear wins
+      topSimilarity: topSim,
+      similarityDelta: delta,
+      selectedCandidates: [ranked[0]],
+      ruleTrace,
+    };
+  }
+
   // Case 4: Multiple allowed with good semantic match → needs_clarification
   // Embeddings sorted them, but we don't auto-select.
   // Apply spatial tie-break ordering for very close candidates (delta < threshold).
@@ -1454,7 +1493,7 @@ function applyDecisionPolicy(
   }
 
   const top3 = rankedForSelection.slice(0, 3);
-  
+
   return {
     status: 'needs_clarification',
     message: 'Found multiple matching elements',
