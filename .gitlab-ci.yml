@@ -192,12 +192,10 @@ deploy:dev:vm:
   rules:
     - if: '$CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "develop"'
   variables:
-    DOCKER_HOST: "unix:///var/run/docker.sock"
-    DOCKER_TLS_CERTDIR: ""
-    DOCKER_TLS_VERIFY: "0"
-    DOCKER_CERT_PATH: ""
+    # Use repo .env by default; override in GitLab variables if needed
     BACKEND_ENV_FILE: "$CI_PROJECT_DIR/.env"
     BACKEND_CONTAINER_PORT: "3000"
+
     DEV_IMAGE: "qait-backend:dev-${CI_COMMIT_SHORT_SHA}"
     DEV_IMAGE_LATEST: "qait-backend:dev-latest"
     DEV_NET: "qait-dev"
@@ -207,30 +205,29 @@ deploy:dev:vm:
     - |
       set -euo pipefail
 
+      # Force LOCAL docker on VM (shell runner), ignore global dind variables
+      unset DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_TLS_CERTDIR
+      export DOCKER_HOST="unix:///var/run/docker.sock"
+
       echo "🔎 Preflight: docker доступен?"
       docker info >/dev/null
 
       echo "🔎 Проверяю env файл: $BACKEND_ENV_FILE"
       if [ ! -f "$BACKEND_ENV_FILE" ]; then
         echo "❌ BACKEND_ENV_FILE not found: $BACKEND_ENV_FILE"
-        echo "Создай файл на VM или переопредели переменную BACKEND_ENV_FILE в GitLab Variables."
+        echo "Создай .env в репо или переопредели BACKEND_ENV_FILE."
         exit 1
       fi
 
-      echo "🌐 Network: $DEV_NET"
       docker network create "$DEV_NET" >/dev/null 2>&1 || true
 
       echo "🔨 Build DEV image (target=runner) → $DEV_IMAGE"
-      # --pull чтобы не зависнуть на старом base image
-      docker build --pull --target runner \
-        -t "$DEV_IMAGE" \
-        -t "$DEV_IMAGE_LATEST" \
-        .
+      docker build --pull --target runner -t "$DEV_IMAGE" -t "$DEV_IMAGE_LATEST" .
 
       echo "🧹 Remove old containers"
       docker rm -f "$API_NAME" "$WORKER_NAME" >/dev/null 2>&1 || true
 
-      echo "🚀 Run API контейнер: $API_NAME (порт ${BACKEND_CONTAINER_PORT}:3000)"
+      echo "🚀 Run API: ${API_NAME} (порт ${BACKEND_CONTAINER_PORT}:3000)"
       docker run -d \
         --name "$API_NAME" \
         --restart unless-stopped \
@@ -242,7 +239,7 @@ deploy:dev:vm:
         "$DEV_IMAGE" \
         node -r tsconfig-paths/register dist/index.js
 
-      echo "🚀 Run WORKER контейнер: $WORKER_NAME"
+      echo "🚀 Run WORKER: ${WORKER_NAME}"
       docker run -d \
         --name "$WORKER_NAME" \
         --restart unless-stopped \
@@ -255,7 +252,6 @@ deploy:dev:vm:
 
       echo "✅ Dev backend+worker deployed on VM"
       docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" | grep -E "$API_NAME|$WORKER_NAME" || true
-
       echo "🌍 API URL: http://$(hostname -I | awk '{print $1}'):${BACKEND_CONTAINER_PORT}"
   environment:
     name: development/backend-vm
