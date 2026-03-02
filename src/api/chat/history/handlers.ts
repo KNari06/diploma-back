@@ -4,6 +4,9 @@ import { WorkspaceAccessService } from '@/services/core/workspace-access.service
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { logger } from '@/utils/core/logger';
 
+/** Normalize DB role ('ai') to API role ('assistant') */
+const normalizeRole = (role: string) => role === 'ai' ? 'assistant' : role;
+
 /**
  * Get current chat history (latest session)
  */
@@ -77,7 +80,7 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
       success: true,
       data: {
         session,
-        messages: sortedMessages,
+        messages: sortedMessages.map(m => ({ ...m, role: normalizeRole(m.role) })),
         pagination: {
           limit,
           offset,
@@ -127,13 +130,16 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
-    const processedSessions = (sessions || []).map((session: any) => ({
-      id: session.id,
-      title: session.title,
-      created_at: session.created_at,
-      message_count: session.chat_messages?.length || 0,
-      last_message: session.chat_messages?.[0] || null,
-    }));
+    const processedSessions = (sessions || []).map((session: any) => {
+      const lastMsg = session.chat_messages?.[0];
+      return {
+        id: session.id,
+        title: session.title,
+        created_at: session.created_at,
+        message_count: session.chat_messages?.length || 0,
+        last_message: lastMsg ? { ...lastMsg, role: normalizeRole(lastMsg.role) } : null,
+      };
+    });
 
     res.json({
       success: true,
@@ -226,7 +232,7 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
       success: true,
       data: {
         session,
-        messages: sortedMessages,
+        messages: sortedMessages.map(m => ({ ...m, role: normalizeRole(m.role) })),
       },
     };
 

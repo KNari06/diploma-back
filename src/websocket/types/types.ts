@@ -615,6 +615,7 @@ export interface ChatMessagePayload {
   messageId: string;
   role: 'user' | 'assistant';
   content: string;
+  metadata?: Record<string, unknown>;
   timestamp: string;
 }
 

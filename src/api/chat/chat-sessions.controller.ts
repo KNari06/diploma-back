@@ -263,9 +263,14 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
       sessionId, userId, messageCount: sortedMessages.length,
     });
 
+    const normalizedMessages = sortedMessages.map(m => ({
+      ...m,
+      role: m.role === 'ai' ? 'assistant' : m.role,
+    }));
+
     const response: any = {
       success: true,
-      data: { session, messages: sortedMessages },
+      data: { session, messages: normalizedMessages },
     };
 
     if (usePagination && totalCount !== undefined && limit !== undefined && offset !== undefined) {
