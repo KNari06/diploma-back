@@ -11,7 +11,10 @@ export interface ClientToServerEvents {
   // Subscriptions
   'subscribe:test': (data: { testId: string }) => void;
   'unsubscribe:test': (data: { testId: string }) => void;
-  'subscribe:chat': (data: { sessionId: string }) => void;
+  'subscribe:chat': (
+    data: { sessionId: string },
+    callback?: (response: { ok: boolean; error?: string }) => void,
+  ) => void;
   'unsubscribe:chat': (data: { sessionId: string }) => void;
 
   // Preview subscriptions

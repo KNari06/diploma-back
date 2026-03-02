@@ -285,7 +285,7 @@ export const debugChatData = async (req: Request, res: Response): Promise<void> 
         userId,
         workspaceId,
         sessions: sessions || [],
-        messages: messages || [],
+        messages: (messages || []).map(m => ({ ...m, role: normalizeRole(m.role) })),
         errors: {
           sessions: sessionsError?.message,
           messages: messagesError?.message,

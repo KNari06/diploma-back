@@ -456,7 +456,12 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
 
   // Subscribe to chat updates
   // ✅ FIX: Added async ownership verification to prevent cross-user event leakage
-  socket.on('subscribe:chat', async ({ sessionId }) => {
+  socket.on('subscribe:chat', async ({ sessionId }, callback) => {
+    // Helper: ack callback (backward-compatible — old clients don't pass callback)
+    const ack = (response: { ok: boolean; error?: string }) => {
+      if (typeof callback === 'function') callback(response);
+    };
+
     try {
       // Validate input
       if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
@@ -470,6 +475,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           message: 'Invalid sessionId provided',
           timestamp: new Date().toISOString(),
         });
+        ack({ ok: false, error: 'Invalid sessionId provided' });
         return;
       }
 
@@ -480,6 +486,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           userId: userId || 'anonymous',
           sessionId,
         });
+        ack({ ok: false, error: 'Socket disconnected' });
         return;
       }
 
@@ -490,6 +497,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           message: 'Authentication required',
           timestamp: new Date().toISOString(),
         });
+        ack({ ok: false, error: 'Authentication required' });
         return;
       }
 
@@ -514,6 +522,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
             message: 'Authorization check failed',
             timestamp: new Date().toISOString(),
           });
+          ack({ ok: false, error: 'Authorization check failed' });
           return;
         }
 
@@ -528,6 +537,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
             message: 'Chat session not found',
             timestamp: new Date().toISOString(),
           });
+          ack({ ok: false, error: 'Chat session not found' });
           return;
         }
 
@@ -542,6 +552,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
             message: 'You do not have access to this chat session',
             timestamp: new Date().toISOString(),
           });
+          ack({ ok: false, error: 'You do not have access to this chat session' });
           return;
         }
 
@@ -558,6 +569,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
             message: 'You do not have access to this chat session',
             timestamp: new Date().toISOString(),
           });
+          ack({ ok: false, error: 'You do not have access to this chat session' });
           return;
         }
       } catch (verifyError) {
@@ -572,6 +584,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           message: 'Authorization check failed',
           timestamp: new Date().toISOString(),
         });
+        ack({ ok: false, error: 'Authorization check failed' });
         return;
       }
 
@@ -582,6 +595,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           timestamp: new Date().toISOString(),
         };
         socket.emit('error', errorPayload);
+        ack({ ok: false, error: 'Maximum subscription limit reached' });
         return;
       }
 
@@ -590,12 +604,17 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
 
       // Idempotent subscribe: don't double-count if already joined
       if (rooms.has(room)) {
+        ack({ ok: true });
         return;
       }
 
       socket.join(room);
       rooms.add(room);
       incrementSubscriptions(socket.id);
+
+      // ✅ ACK immediately after join — before welcome message fetch
+      // This unblocks the frontend to send HTTP POST /api/v1/chat
+      ack({ ok: true });
 
       // Emit welcome message if chat is empty (first time open)
       try {
@@ -632,13 +651,6 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           error: welcomeError instanceof Error ? welcomeError.message : String(welcomeError),
         });
       }
-
-      // logger.info('[WebSocket] Subscribed to chat', {
-      //   socketId: socket.id,
-      //   userId: userId || 'anonymous',
-      //   sessionId,
-      //   room,
-      // });
     } catch (error) {
       logger.error('[WebSocket] Error in subscribe:chat', {
         socketId: socket.id,
@@ -651,6 +663,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         message: 'Failed to subscribe to chat updates',
         timestamp: new Date().toISOString(),
       });
+      ack({ ok: false, error: 'Failed to subscribe to chat updates' });
     }
   });
 
