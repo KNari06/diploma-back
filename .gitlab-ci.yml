@@ -192,7 +192,11 @@ deploy:dev:vm:
   rules:
     - if: '$CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "develop"'
   variables:
-    BACKEND_ENV_FILE: "/opt/qait/dev/backend/.env"
+    DOCKER_HOST: "unix:///var/run/docker.sock"
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_TLS_VERIFY: "0"
+    DOCKER_CERT_PATH: ""
+    BACKEND_ENV_FILE: "$CI_PROJECT_DIR/.env"
     BACKEND_CONTAINER_PORT: "3000"
     DEV_IMAGE: "qait-backend:dev-${CI_COMMIT_SHORT_SHA}"
     DEV_IMAGE_LATEST: "qait-backend:dev-latest"
