@@ -111,6 +111,9 @@ interface InternalSession extends PreviewSession {
     totalDelta: number;
     emittedAt: number;
   } | null;
+
+  /** V11: Callback invoked when session switches to a new page (popup/navigation) */
+  onPageSwitch?: (newPage: Page, previousUrl: string) => void;
 }
 
 /**
@@ -365,6 +368,15 @@ export class PreviewSessionService {
         // Auto-dismiss native dialogs (alert/confirm/prompt/beforeunload)
         this.attachDialogHandler(page, sessionId);
 
+        // Handle popup / new tab detection
+        this.attachPopupHandler(context, sessionId);
+
+        // Handle page crash (renderer process OOM, infinite loop, etc.)
+        this.attachCrashHandler(page, sessionId);
+
+        // Handle download attempts (headless can't download — notify frontend)
+        this.attachPageDownloadHandler(page, sessionId);
+
         logger.info('[PREVIEW_SESSION] Session started', {
           sessionId,
           url: page.url(),
@@ -462,6 +474,11 @@ export class PreviewSessionService {
 
       // Auto-dismiss native dialogs on the new page
       this.attachDialogHandler(newPage, sessionId);
+
+      // Re-attach handlers on new context/page
+      this.attachPopupHandler(newContext, sessionId);
+      this.attachCrashHandler(newPage, sessionId);
+      this.attachPageDownloadHandler(newPage, sessionId);
 
       // Reset internal timers/state to avoid throttling weirdness after reset
       session.lastSnapshotEmit = 0;
@@ -1363,6 +1380,195 @@ export class PreviewSessionService {
           previewSessionId,
           error: error instanceof Error ? error.message : String(error),
         });
+      }
+    });
+  }
+
+  /**
+   * Handle new pages (popups, target="_blank" links, window.open).
+   * When a new page is created in the BrowserContext, auto-switch the session
+   * to the new page so the preview doesn't freeze on the old (backgrounded) page.
+   *
+   * Strategy:
+   * - Wait for new page to reach domcontentloaded (max 10s)
+   * - Close the OLD page (we only support one active page)
+   * - Swap session.page to the new page
+   * - Re-attach dialog handler
+   * - Invoke onPageSwitch callback (registered by WS handler to restart video stream)
+   * - Notify frontend of page switch
+   */
+  private attachPopupHandler(context: BrowserContext, previewSessionId: string): void {
+    context.on('page', async (newPage: Page) => {
+      const session = this.sessions.get(previewSessionId);
+      if (!session) return;
+
+      const oldUrl = session.page.url();
+
+      try {
+        // Wait for new page to load (best-effort, don't block forever)
+        await newPage.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+
+        let newUrl = newPage.url();
+
+        // Guard: some sites open about:blank, then inject content via document.write().
+        // Wait a bit more to see if it navigates away from about:blank.
+        if (newUrl === 'about:blank') {
+          await new Promise(r => setTimeout(r, 2000));
+          await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+          newUrl = newPage.url();
+
+          // Still blank → close popup and keep old page
+          if (newUrl === 'about:blank') {
+            logger.info('[PREVIEW_SESSION] Popup stayed at about:blank — closing it', { previewSessionId });
+            await newPage.close().catch(() => {});
+            return;
+          }
+        }
+
+        logger.info('[PREVIEW_SESSION] Popup/new tab detected — switching', {
+          previewSessionId,
+          oldUrl,
+          newUrl,
+        });
+
+        // Close old page (best-effort, don't fail if already closed)
+        const oldPage = session.page;
+        try {
+          await oldPage.close().catch(() => {});
+        } catch {
+          // Already closed — fine
+        }
+
+        // Swap to new page
+        session.page = newPage;
+
+        // Attach handlers to new page
+        this.attachDialogHandler(newPage, previewSessionId);
+        this.attachCrashHandler(newPage, previewSessionId);
+        this.attachPageDownloadHandler(newPage, previewSessionId);
+
+        // Reset snapshot state so next getSnapshot() forces a fresh collect
+        session.lastSnapshotEmit = 0;
+        session.lastPageSignature = '';
+
+        // Update recording URL baseline if recording
+        if (session.recording) {
+          session.recordingLastUrl = newUrl;
+        }
+
+        // Invoke page switch callback (WS handler uses this to restart video/devtools)
+        if (session.onPageSwitch) {
+          try {
+            session.onPageSwitch(newPage, oldUrl);
+          } catch (cbError) {
+            logger.warn('[PREVIEW_SESSION] onPageSwitch callback error', {
+              previewSessionId,
+              error: cbError instanceof Error ? cbError.message : String(cbError),
+            });
+          }
+        }
+
+        // Notify frontend about page switch
+        try {
+          webSocketService.emitToRoom('preview', previewSessionId, 'preview:page:navigated', {
+            previewSessionId,
+            url: newUrl,
+            previousUrl: oldUrl,
+            reason: 'popup',
+            timestamp: new Date().toISOString(),
+          });
+        } catch {
+          // Non-critical
+        }
+      } catch (error) {
+        logger.warn('[PREVIEW_SESSION] Popup handler error', {
+          previewSessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+
+        // If we can't switch, close the popup to avoid orphaned pages
+        try {
+          if (!newPage.isClosed()) {
+            await newPage.close().catch(() => {});
+          }
+        } catch {
+          // Best effort
+        }
+      }
+    });
+  }
+
+  /**
+   * V11: Register a callback for page switch events (popup/new tab).
+   * The websocket handler uses this to restart video stream + devtools on the new page.
+   */
+  setOnPageSwitch(sessionId: string, userId: string, callback: (newPage: Page, previousUrl: string) => void): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) {
+      session.onPageSwitch = callback;
+    }
+  }
+
+  /**
+   * Handle page crash (renderer process OOM, infinite loop, GPU crash, etc.)
+   * Without this, the session stays in the map with a dead page reference and
+   * all subsequent operations fail silently or with cryptic CDP errors.
+   */
+  private attachCrashHandler(page: Page, previewSessionId: string): void {
+    page.once('crash', () => {
+      logger.error('[PREVIEW_SESSION] Page crashed — cleaning up session', { previewSessionId });
+
+      // Notify frontend
+      try {
+        webSocketService.emitToRoom('preview', previewSessionId, 'preview:error' as any, {
+          previewSessionId,
+          error: 'Page crashed. Please reload the preview.',
+          code: 'PAGE_CRASH',
+          timestamp: new Date().toISOString(),
+        });
+      } catch {
+        // Non-critical
+      }
+
+      // Destroy entire session (browser process is likely unstable)
+      this.stopSession(previewSessionId).catch(() => {});
+    });
+  }
+
+  /**
+   * Handle download attempts in headless preview.
+   * Headless Chromium can't actually save files — cancel the download and notify frontend.
+   * Called on each page (session start, reset, popup switch).
+   */
+  private attachPageDownloadHandler(page: Page, previewSessionId: string): void {
+    page.on('download', async (download) => {
+      const url = download.url();
+      const suggestedFilename = download.suggestedFilename();
+
+      logger.info('[PREVIEW_SESSION] Download intercepted (preview mode — cancelled)', {
+        previewSessionId,
+        url: url.slice(0, 200),
+        filename: suggestedFilename,
+      });
+
+      // Cancel the download
+      try {
+        await download.cancel();
+      } catch {
+        // May already be cancelled
+      }
+
+      // Notify frontend
+      try {
+        webSocketService.emitToRoom('preview', previewSessionId, 'preview:download' as any, {
+          previewSessionId,
+          url: url.slice(0, 500),
+          filename: suggestedFilename,
+          message: 'File download is not supported in preview mode.',
+          timestamp: new Date().toISOString(),
+        });
+      } catch {
+        // Non-critical
       }
     });
   }

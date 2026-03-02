@@ -82,6 +82,7 @@ export class PreviewVideoStreamService {
   private frameHandler: ((params: any) => void) | null = null;
   private page: Page | null = null;
   private pageCloseHandler: (() => void) | null = null;
+  private pageLoadHandler: (() => void) | null = null;
 
   // Stats interval
   private statsInterval: NodeJS.Timeout | null = null;
@@ -113,6 +114,18 @@ export class PreviewVideoStreamService {
         this.stop().catch(() => {});
       };
       page.once('close', this.pageCloseHandler);
+
+      // V11: After same-page navigation, CDP screencast may lag or emit stale frames.
+      // Inject a fresh screenshot-based frame after the page finishes loading.
+      this.pageLoadHandler = () => {
+        // Small delay to let the paint settle after load
+        setTimeout(() => {
+          if (this.isStreaming && !this.isStopped && !this.cdpSessionClosed) {
+            this.injectFrame().catch(() => {});
+          }
+        }, 300);
+      };
+      page.on('load', this.pageLoadHandler);
 
       // Create CDP session
       const context = page.context();
@@ -418,6 +431,16 @@ export class PreviewVideoStreamService {
         // Ignore
       }
       this.pageCloseHandler = null;
+    }
+
+    // Remove page load listener
+    if (this.page && this.pageLoadHandler) {
+      try {
+        this.page.off('load', this.pageLoadHandler);
+      } catch {
+        // Ignore
+      }
+      this.pageLoadHandler = null;
     }
 
     // Remove CDP listener

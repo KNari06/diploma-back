@@ -137,6 +137,9 @@ export interface ServerToClientEvents {
   // Preview dialog events (native alert/confirm/prompt auto-dismissed)
   'preview:dialog': (data: PreviewDialogPayload) => void;
 
+  // Preview page switch events (popup/new tab auto-switch)
+  'preview:page:navigated': (data: { previewSessionId: string; url: string; previousUrl: string; reason: string; timestamp: string }) => void;
+
   // Preview recording events
   'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:step:update': (data: PreviewRecordingStepPayload) => void;

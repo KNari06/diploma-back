@@ -8,6 +8,7 @@ import type { IntentStep, IntentActionType } from '@/services/testing/ui/preview
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { createRoomName, type PreviewPagePayload, type ChatMessagePayload } from '@/websocket/types/types';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { handleGeneralChat } from '../general/handler';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 
@@ -77,6 +78,10 @@ export async function handleEditorAction(
   });
 
   try {
+    // Editor trace: log AI action request
+    const eaTrace = EditorTraceService.get(previewSessionId);
+    if (eaTrace) eaTrace.writeEditorActionRequest({ message: message.slice(0, 500), previewSessionId });
+
     // Step 1: Get page context for AI action extraction
     const pageContext = await getPageContext(previewSessionId, userId);
     if (!pageContext) {
@@ -88,6 +93,10 @@ export async function handleEditorAction(
 
     // Step 2: Extract action from user message using AI
     const extracted = await extractActionWithAI(message, pageContext.domSummary, abortSignal);
+
+    // Editor trace: log AI extraction result
+    if (eaTrace) eaTrace.writeEditorActionExtract(extracted);
+
     if (!extracted) {
       logger.info('[EDITOR_ACTION] AI could not extract action, falling back to general_chat', {
         previewSessionId,
@@ -119,6 +128,11 @@ export async function handleEditorAction(
       previewSessionId,
       stepDraft,
       userId,
+    });
+
+    // Editor trace: log apply result
+    if (eaTrace) eaTrace.writeEditorActionResult({
+      success: result.success, error: result.error, actionType, stepId,
     });
 
     // Step 5: Build response message
@@ -196,6 +210,11 @@ export async function handleEditorAction(
       error: error instanceof Error ? error.message : String(error),
       previewSessionId,
       userId,
+    });
+    // Editor trace: log unexpected error
+    const errTrace = EditorTraceService.get(previewSessionId);
+    if (errTrace) errTrace.writeError('editor_action_error', {
+      error: error instanceof Error ? error.message : String(error),
     });
     return fallbackToGeneralChat(req, res, params);
   }
