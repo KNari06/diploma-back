@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { IntegrationTokenService, type IntegrationProvider } from '@/services/api/integration-token.service';
 import { getGitHubToken, listUserRepos, listBranches } from '@/services/api/github.service';
+import { getGitLabToken, listUserProjects, listBranches as listGitLabBranchesApi } from '@/services/api/gitlab.service';
 import { logger } from '@/utils/core/logger';
 import { env } from '@/config/environment/env';
 
@@ -213,6 +214,21 @@ export async function startAuthorization(req: Request, res: Response): Promise<v
         authUrl = buildNotionAuthUrl(userId, workspaceId);
         break;
 
+      case 'gitlab': {
+        const gitlabClientId = env.GITLAB_CLIENT_ID;
+        if (!gitlabClientId?.trim()) {
+          res.status(503).json({
+            success: false,
+            error: 'GitLab integration not configured',
+            message: 'GITLAB_CLIENT_ID is not set on the server. Ask the administrator to configure GitLab OAuth.',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+        authUrl = buildGitLabAuthUrl(userId, workspaceId);
+        break;
+      }
+
       case 'jira':
         // Jira OAuth is already implemented in jira.service.ts
         if (wantsJson) {
@@ -318,6 +334,10 @@ export async function handleCallback(req: Request, res: Response): Promise<void>
 
       case 'notion':
         await handleNotionCallback(userId, workspaceId, code);
+        break;
+
+      case 'gitlab':
+        await handleGitLabCallback(userId, workspaceId, code);
         break;
 
       case 'jira':
@@ -498,6 +518,117 @@ export async function listGitHubBranches(req: Request, res: Response): Promise<v
   }
 }
 
+/**
+ * Get user ID for GitLab (for API routes that need auth)
+ */
+function getUserIdForGitLab(req: Request): string | null {
+  return (req as any).user?.id ?? null;
+}
+
+/**
+ * List GitLab projects (repos) for the authenticated user.
+ * GET /api/v1/integrations/gitlab/repos?per_page=30
+ */
+export async function listGitLabRepos(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = getUserIdForGitLab(req);
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'User ID not found',
+      });
+      return;
+    }
+
+    const token = await getGitLabToken(userId);
+    if (!token?.access_token) {
+      res.status(403).json({
+        success: false,
+        error: 'GitLab not connected',
+        message: 'Connect GitLab in integrations first',
+      });
+      return;
+    }
+
+    const perPage = Math.min(Number(req.query.per_page) || 30, 100);
+    const projects = await listUserProjects(token.access_token, perPage);
+
+    res.json({
+      success: true,
+      data: projects,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[INTEGRATIONS] List GitLab repos error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error instanceof Error ? error.message : 'Failed to list GitLab repos',
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
+/**
+ * List GitLab branches for a project.
+ * GET /api/v1/integrations/gitlab/projects/:projectId/branches
+ * projectId can be numeric id or URL-encoded path (e.g. owner%2Frepo)
+ */
+export async function listGitLabBranches(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = getUserIdForGitLab(req);
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'User ID not found',
+      });
+      return;
+    }
+
+    const token = await getGitLabToken(userId);
+    if (!token?.access_token) {
+      res.status(403).json({
+        success: false,
+        error: 'GitLab not connected',
+        message: 'Connect GitLab in integrations first',
+      });
+      return;
+    }
+
+    const { projectId } = req.params;
+    if (!projectId) {
+      res.status(400).json({
+        success: false,
+        error: 'Bad request',
+        message: 'projectId is required',
+      });
+      return;
+    }
+
+    const branches = await listGitLabBranchesApi(token.access_token, projectId);
+
+    res.json({
+      success: true,
+      data: branches,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[INTEGRATIONS] List GitLab branches error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error instanceof Error ? error.message : 'Failed to list GitLab branches',
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Helper Functions
 // ═══════════════════════════════════════════════════════════════════════════
@@ -522,6 +653,29 @@ function buildGitHubAuthUrl(userId: string, workspaceId?: string): string {
   });
 
   return `https://github.com/login/oauth/authorize?${params.toString()}`;
+}
+
+/**
+ * Build GitLab OAuth URL (gitlab.com)
+ */
+function buildGitLabAuthUrl(userId: string, workspaceId?: string): string {
+  const clientId = env.GITLAB_CLIENT_ID;
+  if (!clientId) {
+    throw new Error('GITLAB_CLIENT_ID not configured');
+  }
+
+  const callbackUrl = `${env.BACKEND_URL || `http://localhost:${env.PORT}`}/api/${env.API_VERSION}/integrations/gitlab/callback`;
+  const state = encodeState(userId, workspaceId);
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: callbackUrl,
+    response_type: 'code',
+    scope: 'read_api read_repository',
+    state,
+  });
+
+  return `https://gitlab.com/oauth/authorize?${params.toString()}`;
 }
 
 /**
@@ -618,6 +772,80 @@ async function handleGitHubCallback(userId: string, workspaceId: string | undefi
     external_id: userData.login,
     external_url: userData.html_url,
     metadata: { username: userData.login, name: userData.name },
+  });
+}
+
+/**
+ * Handle GitLab callback (gitlab.com OAuth)
+ */
+async function handleGitLabCallback(userId: string, workspaceId: string | undefined, code: string): Promise<void> {
+  const clientId = env.GITLAB_CLIENT_ID;
+  const clientSecret = env.GITLAB_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error('GitLab OAuth credentials not configured');
+  }
+
+  const callbackUrl = `${env.BACKEND_URL || `http://localhost:${env.PORT}`}/api/${env.API_VERSION}/integrations/gitlab/callback`;
+
+  const tokenParams = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    code,
+    grant_type: 'authorization_code',
+    redirect_uri: callbackUrl,
+  });
+
+  const tokenResponse = await fetch('https://gitlab.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: tokenParams.toString(),
+  });
+
+  if (!tokenResponse.ok) {
+    const text = await tokenResponse.text();
+    throw new Error(`GitLab token exchange failed: ${tokenResponse.status} ${text}`);
+  }
+
+  const tokenData = (await tokenResponse.json()) as {
+    access_token?: string;
+    token_type?: string;
+    expires_in?: number;
+    refresh_token?: string;
+    scope?: string;
+    error?: string;
+    error_description?: string;
+  };
+
+  if (tokenData.error || !tokenData.access_token) {
+    const msg = tokenData.error_description || tokenData.error || 'No access_token in GitLab response';
+    throw new Error(`GitLab token exchange failed: ${msg}`);
+  }
+
+  const userResponse = await fetch('https://gitlab.com/api/v4/user', {
+    headers: {
+      Authorization: `Bearer ${tokenData.access_token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!userResponse.ok) {
+    throw new Error(`GitLab user fetch failed: ${userResponse.status} ${await userResponse.text().catch(() => '')}`);
+  }
+
+  const userData = (await userResponse.json()) as {
+    username: string;
+    web_url: string;
+    name: string;
+  };
+
+  await IntegrationTokenService.saveToken(userId, workspaceId, 'gitlab', {
+    access_token: tokenData.access_token,
+    scope: tokenData.scope,
+    token_type: tokenData.token_type,
+    external_id: userData.username,
+    external_url: userData.web_url,
+    metadata: { username: userData.username, name: userData.name },
   });
 }
 

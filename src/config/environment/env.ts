@@ -149,6 +149,10 @@ const envSchema = z.object({
   GITHUB_CLIENT_ID: z.string().optional(),
   GITHUB_CLIENT_SECRET: z.string().optional(),
 
+  // GitLab OAuth (gitlab.com)
+  GITLAB_CLIENT_ID: z.string().optional(),
+  GITLAB_CLIENT_SECRET: z.string().optional(),
+
   // Notion OAuth
   NOTION_CLIENT_ID: z.string().optional(),
   NOTION_CLIENT_SECRET: z.string().optional(),

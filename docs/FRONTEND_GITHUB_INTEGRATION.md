@@ -1,88 +1,208 @@
-# Frontend — интеграция GitHub (OAuth и API репозиториев/веток/CI)
+# GitHub и GitLab Integration — выбор репозитория и ветки (Frontend)
 
-Документ описывает, как на фронтенде подключить GitHub через OAuth и использовать API для списка репозиториев, веток, статуса коммита и GitHub Actions.
+Документ описывает, как на фронтенде подключить **GitHub** или **GitLab** через OAuth и дать пользователю выбрать репозиторий и ветку (например, для регрессионного плана). Эндпоинты и сценарий для GitLab аналогичны GitHub (см. раздел 8).
 
 ---
 
 ## 1. Базовый URL и авторизация
 
-- **Базовый URL API:** `{BACKEND_URL}/api/v1/integrations`  
-  Пример: `https://api.qait.dev/api/v1/integrations` или `http://localhost:3000/api/v1/integrations`.
-- Все запросы к эндпоинтам интеграций (в т.ч. GitHub) выполняются с заголовком:
+- **Базовый URL:** `{BACKEND_URL}/api/v1/integrations`  
+  Примеры: `https://api.qait.dev/api/v1/integrations`, `http://localhost:3000/api/v1/integrations`.
+
+- **Авторизация:** во всех запросах передавать заголовок:
   ```http
   Authorization: Bearer <access_token>
   ```
-  где `access_token` — JWT (или иной токен авторизации пользователя в вашем приложении).
+  где `access_token` — JWT пользователя в вашем приложении.
 
 ---
 
 ## 2. Подключение GitHub (OAuth)
 
-- **Не делать** обычный `fetch()` на `/authorize` без параметра ниже: ответ 302 ведёт на GitHub, fetch следует редиректу и получает CORS-ошибку.
-- **Рекомендуемый вариант (для кнопки «Connect»):**
-  1. Вызвать: `GET /api/v1/integrations/github/authorize?return_url=1` (и при необходимости `&workspace_id=...`) с заголовком `Authorization: Bearer <access_token>`.
-  2. Бэкенд вернёт **200** и JSON: `{ "success": true, "redirect_url": "https://github.com/login/oauth/authorize?..." }`.
-  3. Выполнить переход: `window.location.href = data.redirect_url`. Пользователь уйдёт на GitHub, после авторизации — на callback бэкенда, затем редирект на фронт (например `FRONTEND_URL/integrations?provider=github&status=success`).
+Чтобы пользователь мог выбрать репо и ветку, сначала нужно подключить его GitHub-аккаунт.
 
-**Альтернатива без fetch:** открыть в текущем окне ссылку  
-`GET /api/v1/integrations/github/authorize?workspace_id=...` (тот же URL в `window.location.href`). Бэкенд ответит 302 и браузер сам перейдёт на GitHub. При этом запрос должен идти с куками/сессией, если авторизация по кукам; при Bearer — так не получится, поэтому предпочтителен вариант с `return_url=1` и fetch.
+**Рекомендуемый способ (кнопка «Подключить GitHub»):**
+
+1. Вызвать с фронта:
+   ```http
+   GET /api/v1/integrations/github/authorize?return_url=1
+   ```
+   Опционально: `&workspace_id=<uuid>` — если интеграции привязаны к workspace.  
+   Заголовок: `Authorization: Bearer <access_token>`.
+
+2. Бэкенд вернёт **200** и JSON:
+   ```json
+   {
+     "success": true,
+     "redirect_url": "https://github.com/login/oauth/authorize?...",
+     "message": "Redirect user to redirect_url to complete OAuth.",
+     "timestamp": "..."
+   }
+   ```
+
+3. Выполнить переход на страницу GitHub:
+   ```js
+   window.location.href = data.redirect_url;
+   ```
+
+4. После авторизации на GitHub пользователь попадёт на callback бэкенда, затем редирект на фронт:
+   - Успех: `{FRONTEND_URL}/integrations?provider=github&status=success`
+   - Ошибка: `{FRONTEND_URL}/integrations?status=error&message=...`
+
+**Важно:** не вызывать `/authorize` через `fetch()` без `return_url=1` — иначе бэкенд ответит 302 на GitHub, и при следовании редиректу будет CORS-ошибка. Используйте `return_url=1` и переход по `redirect_url` в текущем окне.
 
 ---
 
-## 3. Проверка подключения GitHub
+## 3. Проверка, подключён ли GitHub
 
-- Эндпоинт: `GET /api/v1/integrations?workspace_id=...` (с заголовком `Authorization: Bearer <access_token>`).
-- В ответе в списке интеграций искать элемент с `provider === 'github'`.
-- Если такой есть — GitHub подключён, можно вызывать эндпоинты репозиториев/веток/статуса/Actions.
+Перед показом выбора репо/ветки проверьте, что GitHub уже подключён.
 
----
+**Запрос:**
+```http
+GET /api/v1/integrations?workspace_id=<uuid>
+Authorization: Bearer <access_token>
+```
 
-## 4. Эндпоинты GitHub API
-
-Все запросы — с заголовком `Authorization: Bearer <access_token>` (ваш JWT).
-
-| Метод | Путь | Описание |
-|-------|------|----------|
-| GET | `/api/v1/integrations/github/repos?per_page=30` | Список репозиториев пользователя |
-| GET | `/api/v1/integrations/github/repos/:owner/:repo/branches?per_page=30` | Список веток репозитория |
-| GET | `/api/v1/integrations/github/repos/:owner/:repo/commits/:ref/status` | Статус коммита и check runs (CI/CD) |
-| GET | `/api/v1/integrations/github/repos/:owner/:repo/actions/runs?per_page=20&branch=&status=` | Запуски workflow GitHub Actions |
-
-- **owner** — логин владельца репозитория (например `octocat`).
-- **repo** — имя репозитория (например `Hello-World`).
-- **ref** — ветка (например `main`) или SHA коммита.
-- **per_page** — опционально, по умолчанию для repos/branches 30, для runs 20; максимум 100.
-- **branch** — опционально, фильтр по ветке для Actions runs.
-- **status** — опционально, фильтр по статусу (например `completed`, `in_progress`) для Actions runs.
-
-Успешный ответ имеет вид:
+**Ответ (успех):**
 ```json
 {
   "success": true,
-  "data": { ... },
-  "timestamp": "2025-02-21T12:00:00.000Z"
+  "integrations": [
+    { "id": "...", "provider": "github", "external_id": "octocat", ... },
+    ...
+  ],
+  "timestamp": "..."
 }
 ```
 
+Если в массиве `integrations` есть элемент с `provider === 'github'` — можно вызывать эндпоинты списка репозиториев и веток. Если нет — показать кнопку «Подключить GitHub» (п. 2).
+
 ---
 
-## 5. Коды ошибок
+## 4. Список репозиториев
+
+**Запрос:**
+```http
+GET /api/v1/integrations/github/repos?per_page=30
+Authorization: Bearer <access_token>
+```
+
+- `per_page` — опционально (по умолчанию 30, максимум 100).
+
+**Ответ (успех):**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 12345,
+      "name": "my-repo",
+      "full_name": "owner/my-repo",
+      "description": "...",
+      "html_url": "https://github.com/owner/my-repo",
+      "default_branch": "main",
+      "private": false,
+      "language": "TypeScript",
+      "stargazers_count": 0,
+      "forks_count": 0
+    }
+  ],
+  "timestamp": "..."
+}
+```
+
+Для выбора репо в UI достаточно: `name`, `full_name`, `html_url`, `default_branch`. Поле `html_url` пригодится, если позже будете сохранять выбранный репо в настройках плана (см. п. 7).
+
+---
+
+## 5. Список веток репозитория
+
+После выбора репозитория запросите ветки. **owner** и **repo** берите из выбранного репо: из `full_name` это `owner` и `repo`, либо из `html_url` (`https://github.com/owner/repo`).
+
+**Запрос:**
+```http
+GET /api/v1/integrations/github/repos/:owner/:repo/branches
+Authorization: Bearer <access_token>
+```
+
+Пример: для репо `https://github.com/octocat/Hello-World`:
+```http
+GET /api/v1/integrations/github/repos/octocat/Hello-World/branches
+```
+
+**Ответ (успех):**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "name": "main",
+      "commit": { "sha": "abc123...", "url": "https://api.github.com/..." },
+      "protected": false
+    }
+  ],
+  "timestamp": "..."
+}
+```
+
+В UI для выпадающего списка веток достаточно полей `name` (и при необходимости `commit.sha`).
+
+---
+
+## 6. Коды ошибок
 
 | Код | Значение |
 |-----|----------|
-| **401 Unauthorized** | Нет или невалидный Bearer-токен; пользователь не авторизован. |
-| **403** | GitHub не подключён. В теле ответа обычно `error: 'GitHub not connected'` и `message` с подсказкой подключить аккаунт в разделе «Интеграции». |
-| **404** | Репозиторий или ветка не найдены (в т.ч. нет доступа). |
-| **500** | Внутренняя ошибка; в теле ответа поле `message` может содержать текст от GitHub API или сервера — показывать пользователю при необходимости. |
+| **401** | Нет или невалидный Bearer-токен. Показать повторный вход. |
+| **403** | GitHub не подключён. В теле: `error: 'GitHub not connected'`, `message` с подсказкой. Показать кнопку «Подключить GitHub». |
+| **500** | Внутренняя ошибка или ошибка GitHub API. В теле есть `message` — при необходимости показать пользователю. |
+
+При 404 от GitHub (репо/ветка не найдены или нет доступа) бэкенд может вернуть 500 с текстом ошибки в `message`.
 
 ---
 
-## 6. Связь с регрессией и webhook
+## 7. Использование выбранного репо и ветки (регрессия по webhook)
 
-- Список репозиториев (`GET .../github/repos`) и веток (`GET .../github/repos/:owner/:repo/branches`) используется в UI регрессионного плана: выбор репо и ветки для автоматического запуска по webhook.
-- При сохранении плана с выбранным репозиторием фронт должен отправлять в `PATCH /api/v1/regression-plans/:planId` в `automationConfig.gitTriggers`:
-  - **repositoryUrl** — полный URL репо (например `html_url` из ответа `/github/repos`: `https://github.com/owner/repo`).
-  - **branch** — выбранная ветка (например `main`).
-  - **webhookSecret** — секрет для webhook в GitHub (если пользователь его ввёл); бэкенд создаст или найдёт git-integration и привяжет план.
-  - Либо **integrationId** — ID уже существующей git-integration (из `GET /api/v1/git-integrations?projectId=...`).
-- Чтобы по push в репо реально запускалась регрессия, в GitHub в настройках репозитория должен быть добавлен webhook на `{BACKEND_URL}/api/v1/git-integrations/webhook` с тем же секретом. Подробнее см. [GIT_WEBHOOK_REGRESSION_SETUP.md](./GIT_WEBHOOK_REGRESSION_SETUP.md).
+Если нужно сохранить выбранные репозиторий и ветку в регрессионном плане (автозапуск по push):
+
+1. **Git-интеграция создаётся отдельно** — через `POST /api/v1/git-integrations` (projectId, provider, repositoryUrl, webhookSecret, events). Пользователь сначала создаёт интеграцию и добавляет webhook в настройках репо в GitHub на `{BACKEND_URL}/api/v1/git-integrations/webhook`.
+
+2. **При сохранении плана** передайте в `PATCH /api/v1/regression-plans/:planId` в теле:
+   ```json
+   {
+     "automationConfig": {
+       "gitTriggers": {
+         "enabled": true,
+         "triggerTypes": ["push"],
+         "branch": "main",
+         "repositoryUrl": "https://github.com/owner/repo"
+       }
+     }
+   }
+   ```
+   Либо укажите уже существующую интеграцию: `"integrationId": "<uuid>"` (UUID из `GET /api/v1/git-integrations?projectId=...`).
+
+Бэкенд привязывает план к уже созданной git-интеграции по `repositoryUrl` или по `integrationId`; он не создаёт интеграцию из тела PATCH. Подробнее по настройке webhook: [GIT_WEBHOOK_REGRESSION_SETUP.md](./GIT_WEBHOOK_REGRESSION_SETUP.md).
+
+---
+
+## Краткий сценарий для UI «Выбор репо и ветки»
+
+1. `GET /api/v1/integrations?workspace_id=...` → есть ли `provider === 'github'`?
+2. Если нет → кнопка «Подключить GitHub» → `GET .../github/authorize?return_url=1` → `window.location.href = data.redirect_url` → после редиректа снова п. 1.
+3. `GET .../github/repos?per_page=30` → выпадающий список репозиториев (например, `full_name` или `name`).
+4. После выбора репо → `GET .../github/repos/:owner/:repo/branches` → выпадающий список веток (`name`).
+5. Сохранить выбранные `repositoryUrl` (или `html_url` репо) и `branch` у себя или в `automationConfig.gitTriggers` плана (п. 7).
+
+---
+
+## 8. GitLab (аналогично GitHub)
+
+Для GitLab (gitlab.com) используется тот же базовый URL и заголовок `Authorization: Bearer <access_token>`.
+
+- **Подключение:** `GET /api/v1/integrations/gitlab/authorize?return_url=1` → ответ 200 с `redirect_url` → `window.location.href = data.redirect_url`. После OAuth редирект на `{FRONTEND_URL}/integrations?provider=gitlab&status=success`.
+- **Проверка:** в `GET /api/v1/integrations?workspace_id=...` искать элемент с `provider === 'gitlab'`.
+- **Список проектов (репо):** `GET /api/v1/integrations/gitlab/repos?per_page=30`. В ответе `data` — массив объектов с полями: `id`, `name`, `path_with_namespace`, `description`, `web_url`, `default_branch`, `visibility`. Для выбора репо и сохранения в плане используйте `web_url` (аналог `html_url` у GitHub).
+- **Список веток:** `GET /api/v1/integrations/gitlab/projects/:projectId/branches`. Параметр `projectId` — числовой ID проекта из списка репо (поле `id`) либо URL-encoded path (например `owner%2Frepo`). В ответе `data` — массив с полями `name`, `merged`, `protected`, `default`, `commit`.
+- **Ошибки:** 401/403 (GitLab not connected)/500 — как у GitHub.
+- **Регрессия по webhook:** создание git-интеграции через `POST /api/v1/git-integrations` с `provider: "gitlab"`, `repositoryUrl` (например `web_url` из списка репо). В плане в `automationConfig.gitTriggers` передать `repositoryUrl` и `branch` (или `integrationId`). Webhook в GitLab настраивается на `{BACKEND_URL}/api/v1/git-integrations/webhook` (Secret — тот же, что в интеграции). Подробнее: [GIT_WEBHOOK_REGRESSION_SETUP.md](./GIT_WEBHOOK_REGRESSION_SETUP.md).
