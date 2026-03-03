@@ -257,9 +257,10 @@ export class SubAgentPipeline {
         });
 
         routerResult.classification = 'single_tool';
-        // Don't guess the category — give ALL registered categories.
-        // The executor LLM will pick the right tools from the full set.
-        routerResult.toolCategories = getValidCategories();
+        // Don't guess the category — give all AVAILABLE categories.
+        // The executor LLM will pick the right tools from the available set.
+        const availToolNames = new Set(input.availableTools.map(t => t.function.name));
+        routerResult.toolCategories = getValidCategories(availToolNames);
         routerResult.confidence = 0.7;
         metrics.routerClassification = 'single_tool (guardrail)';
 
@@ -441,10 +442,12 @@ export class SubAgentPipeline {
         toolCategories: routerResult.toolCategories,
       });
       const plannerStart = Date.now();
+      const plannerToolNames = new Set(input.availableTools.map(t => t.function.name));
       const planResult = await createPlan(
         input.userMessage,
         routerResult.toolCategories,
-        input.abortSignal
+        input.abortSignal,
+        plannerToolNames
       );
       metrics.plannerMs = Date.now() - plannerStart;
 

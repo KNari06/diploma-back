@@ -359,6 +359,37 @@ export async function handleGeneralChat(
   // 8. Current user message
 
   // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2.7.1: AUTO-RESOLVE PROJECT ID (needed for QA tools availability)
+  // ═══════════════════════════════════════════════════════════════════════
+  // QA skill requires projectId to be available. If not provided in context,
+  // resolve it from the chat session or workspace's default project.
+  if (!projectId && workspaceId) {
+    try {
+      // Try 1: Get projectId from chat session (linked when user ran tests in this session)
+      if (chatSessionId) {
+        const sessionWithProject = await ChatService.getSessionWithProject(chatSessionId, userId);
+        if (sessionWithProject?.project_id) {
+          projectId = sessionWithProject.project_id;
+          logger.debug('[GENERAL_CHAT] Resolved projectId from chat session', { projectId });
+        }
+      }
+      // Try 2: Get default project for workspace (first created project)
+      if (!projectId) {
+        const { ProjectContextService } = await import('@/services/utils/project-context.service');
+        const defaultProject = await ProjectContextService.getDefaultProject(workspaceId, userId);
+        if (defaultProject) {
+          projectId = defaultProject.id;
+          logger.debug('[GENERAL_CHAT] Resolved projectId from default workspace project', { projectId });
+        }
+      }
+    } catch (projectError) {
+      logger.warn('[GENERAL_CHAT] Failed to auto-resolve projectId, continuing without it', {
+        error: projectError instanceof Error ? projectError.message : String(projectError),
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // STEP 2.8: COLLECT AVAILABLE TOOLS (SKILLS + MEMORY)
   // ═══════════════════════════════════════════════════════════════════════
   let availableTools: any[] = [];
