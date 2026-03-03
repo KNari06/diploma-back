@@ -162,7 +162,7 @@ describe('step-readiness.service', () => {
       const result = await waitForStepReadiness(mockPage, step);
 
       expect(result.ready).toBe(true);
-      expect(result.skipReason).toContain('No fast locator available');
+      expect(result.skipReason).toContain('No locator');
     });
   });
 
@@ -181,7 +181,7 @@ describe('step-readiness.service', () => {
         description: 'Click submit button',
         compiled: {
           locatorPlan: [
-            { strategy: 'ref', value: '[data-agent-ref="btn-submit"]', confidence: 0.95 },
+            { strategy: 'label', value: 'Submit', confidence: 0.95 },
           ],
           action: { type: 'click' },
           context: { pageUrl: 'https://example.com', compiledAt: new Date().toISOString() },
@@ -206,7 +206,7 @@ describe('step-readiness.service', () => {
         description: 'Assert element visible',
         compiled: {
           locatorPlan: [
-            { strategy: 'ref', value: '[data-agent-ref="header"]', confidence: 0.9 },
+            { strategy: 'testId', value: 'header', confidence: 0.9 },
           ],
           action: { type: 'assert' },
           context: { pageUrl: 'https://example.com', compiledAt: new Date().toISOString() },
@@ -230,7 +230,7 @@ describe('step-readiness.service', () => {
         value: 'Enter',
         compiled: {
           locatorPlan: [
-            { strategy: 'ref', value: '[data-agent-ref="input"]', confidence: 0.9 },
+            { strategy: 'css', value: 'input#search', confidence: 0.9 },
           ],
           action: { type: 'press', value: 'Enter' },
           context: { pageUrl: 'https://example.com', compiledAt: new Date().toISOString() },
@@ -262,7 +262,7 @@ describe('step-readiness.service', () => {
         description: 'Click button',
         compiled: {
           locatorPlan: [
-            { strategy: 'ref', value: '[data-agent-ref="btn"]', confidence: 0.9 },
+            { strategy: 'placeholder', value: 'Search...', confidence: 0.9 },
           ],
           action: { type: 'click' },
           context: { pageUrl: 'https://example.com', compiledAt: new Date().toISOString() },
@@ -304,7 +304,7 @@ describe('step-readiness.service', () => {
         value: 'hello',
         compiled: {
           locatorPlan: [
-            { strategy: 'ref', value: '[data-agent-ref="input"]', confidence: 0.9 },
+            { strategy: 'label', value: 'Email', confidence: 0.9 },
           ],
           action: { type: 'type', value: 'hello' },
           context: { pageUrl: 'https://example.com', compiledAt: new Date().toISOString() },
@@ -328,7 +328,7 @@ describe('step-readiness.service', () => {
   // ─────────────────────────────────────────────────────────────────────────
 
   describe('waitForStepReadiness - locator strategies', () => {
-    it('should use ref strategy from compiled plan', async () => {
+    it('should use css strategy from compiled plan', async () => {
       mockLocator.isVisible.mockResolvedValue(true);
       mockLocator.isEnabled.mockResolvedValue(true);
 
@@ -338,7 +338,7 @@ describe('step-readiness.service', () => {
         description: 'Click button',
         compiled: {
           locatorPlan: [
-            { strategy: 'ref', value: '[data-agent-ref="btn-123"]', confidence: 0.95 },
+            { strategy: 'css', value: 'button.submit-btn', confidence: 0.95 },
           ],
           action: { type: 'click' },
           context: { pageUrl: 'https://example.com', compiledAt: new Date().toISOString() },
@@ -347,7 +347,7 @@ describe('step-readiness.service', () => {
 
       await waitForStepReadiness(mockPage, step);
 
-      expect(mockPage.locator).toHaveBeenCalledWith('[data-agent-ref="btn-123"]');
+      expect(mockPage.locator).toHaveBeenCalledWith('button.submit-btn');
     });
 
     it('should use role strategy from compiled plan', async () => {
@@ -409,7 +409,7 @@ describe('step-readiness.service', () => {
         description: 'Click button',
         compiled: {
           locatorPlan: [
-            { strategy: 'ref', value: '[data-agent-ref="btn"]', confidence: 0.9 },
+            { strategy: 'label', value: 'Submit', confidence: 0.9 },
           ],
           action: { type: 'click' },
           context: { pageUrl: 'https://example.com', compiledAt: new Date().toISOString() },
