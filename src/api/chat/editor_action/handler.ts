@@ -374,6 +374,7 @@ function fallbackToGeneralChat(
     userId: string;
     chatSessionId?: string;
     context?: any;
+    workspace_id?: string;
     abortSignal?: AbortSignal;
     mode?: 'lite' | 'pro' | 'editor';
   }
@@ -383,6 +384,7 @@ function fallbackToGeneralChat(
     userId: params.userId,
     chatSessionId: params.chatSessionId,
     context: params.context,
+    workspace_id: params.workspace_id,
     abortSignal: params.abortSignal,
     mode: params.mode,
   });

@@ -68,6 +68,8 @@ EDGE CASES:
 - "Show my test cases" → single_tool (qa_read)
 - "Create a test and send notification" → multi_tool only if test + notification are different categories
 - If user asks to explain or summarize data already visible in conversation → simple_chat (re-fetch NOT needed)
+- Any request for QA data (test cases, results, bugs, analytics, coverage) in ANY language → single_tool (qa_read) — NEVER simple_chat
+- Quantitative questions about test metrics → single_tool (qa_read) — always requires tool call
 - Ambiguous request with no clear tool target → single_tool with best-guess category (confidence 0.6)
 - NEVER classify integration/setup requests as simple_chat — always use single_tool
 

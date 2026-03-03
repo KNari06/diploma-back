@@ -38,6 +38,7 @@ export async function handleGeneralChat(
     userId: string;
     chatSessionId?: string;
     context?: any;
+    workspace_id?: string; // Workspace ID from validated route params (primary source)
     userLanguage?: 'en' | 'ru' | 'neutral'; // Language from intent parser (avoid re-detection)
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
@@ -45,7 +46,7 @@ export async function handleGeneralChat(
     attachments?: ChatAttachment[]; // File attachments (images + documents)
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context: rawContext, abortSignal, logger: functionLogger, mode, attachments } = params;
+  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments } = params;
 
   // Normalize context: parse JSON string into object if needed (frontend may send stringified JSON)
   let context: any = rawContext;
@@ -248,7 +249,7 @@ export async function handleGeneralChat(
   // Non-fatal: continues without KB on error.
 
   let kbContext = '';
-  const projectId = typeof context === 'object' ? context?.projectId : undefined;
+  let projectId = typeof context === 'object' ? context?.projectId : undefined;
 
   try {
     const kbResults = await searchKB(message, projectId, {
@@ -289,9 +290,10 @@ export async function handleGeneralChat(
   // STEP 2.6: LOAD WORKSPACE MEMORY (PERSISTENT SEMANTIC MEMORY)
   // ═══════════════════════════════════════════════════════════════════════
   let workspaceMemory = '';
-  const workspaceId = typeof context === 'object' && context !== null && !Array.isArray(context)
-    ? context?.workspaceId || context?.workspace_id
-    : undefined;
+  const workspaceId = paramWorkspaceId
+    || (typeof context === 'object' && context !== null && !Array.isArray(context)
+      ? context?.workspaceId || context?.workspace_id
+      : undefined);
 
   if (workspaceId) {
     try {
@@ -355,6 +357,37 @@ export async function handleGeneralChat(
   // 6. Additional context (legacy)
   // 7. Conversation history (recent messages)
   // 8. Current user message
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 2.7.1: AUTO-RESOLVE PROJECT ID (needed for QA tools availability)
+  // ═══════════════════════════════════════════════════════════════════════
+  // QA skill requires projectId to be available. If not provided in context,
+  // resolve it from the chat session or workspace's default project.
+  if (!projectId && workspaceId) {
+    try {
+      // Try 1: Get projectId from chat session (linked when user ran tests in this session)
+      if (chatSessionId) {
+        const sessionWithProject = await ChatService.getSessionWithProject(chatSessionId, userId);
+        if (sessionWithProject?.project_id) {
+          projectId = sessionWithProject.project_id;
+          logger.debug('[GENERAL_CHAT] Resolved projectId from chat session', { projectId });
+        }
+      }
+      // Try 2: Get default project for workspace (first created project)
+      if (!projectId) {
+        const { ProjectContextService } = await import('@/services/utils/project-context.service');
+        const defaultProject = await ProjectContextService.getDefaultProject(workspaceId, userId);
+        if (defaultProject) {
+          projectId = defaultProject.id;
+          logger.debug('[GENERAL_CHAT] Resolved projectId from default workspace project', { projectId });
+        }
+      }
+    } catch (projectError) {
+      logger.warn('[GENERAL_CHAT] Failed to auto-resolve projectId, continuing without it', {
+        error: projectError instanceof Error ? projectError.message : String(projectError),
+      });
+    }
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 2.8: COLLECT AVAILABLE TOOLS (SKILLS + MEMORY)

@@ -78,7 +78,8 @@ export function identifyParallelGroups(steps: PlanStep[]): number[][] {
 export async function createPlan(
   userMessage: string,
   toolCategories: ToolCategory[],
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  availableToolNames?: Set<string>
 ): Promise<PlannerResult | null> {
   const startMs = Date.now();
 
@@ -118,7 +119,7 @@ export async function createPlan(
     const parsed = JSON.parse(cleanContent);
 
     // Validate and sanitize LLM-generated plan steps
-    const validCategories = getValidCategories();
+    const validCategories = getValidCategories(availableToolNames);
     const defaultCategory = toolCategories[0] || validCategories[0] || 'memory';
 
     /**

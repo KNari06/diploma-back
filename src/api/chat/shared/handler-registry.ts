@@ -107,6 +107,7 @@ const handleGeneralChat: IntentHandler = async (req, res, params) => {
     userId: params.userId,
     chatSessionId: params.chatSessionId,
     context: params.context,
+    workspace_id: params.workspace_id,
     userLanguage: params.parsedIntent?.userLanguage,
     abortSignal: params.abortSignal,
     mode: params.mode,

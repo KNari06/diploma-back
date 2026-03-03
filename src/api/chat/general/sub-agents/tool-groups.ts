@@ -154,8 +154,17 @@ export function getToolGroupSummary(availableToolNames: Set<string>): string {
 }
 
 /**
- * Get all valid category names (for router validation).
+ * Get valid category names filtered by actually available tools.
+ * If availableToolNames is provided, only returns categories that have at least one available tool.
+ * Without it, returns all registered categories (backward compat).
  */
-export function getValidCategories(): string[] {
-  return buildToolGroups().map(g => g.category);
+export function getValidCategories(availableToolNames?: Set<string>): string[] {
+  const groups = buildToolGroups();
+  if (!availableToolNames) {
+    return groups.map(g => g.category);
+  }
+  // Only return categories that have at least one tool in the available set
+  return groups
+    .filter(g => g.toolNames.some(name => availableToolNames.has(name)))
+    .map(g => g.category);
 }

@@ -59,7 +59,8 @@ export async function classifyRequest(
 
     if (!response || !response.content) {
       logger.warn('[ROUTER_AGENT] Timeout or empty response, defaulting to single_tool');
-      const defaultCategory = getValidCategories().find(c => c.endsWith('_read')) || getValidCategories()[0] || 'memory';
+      const availableCategories = getValidCategories(availableToolNames);
+      const defaultCategory = availableCategories.find(c => c.endsWith('_read')) || availableCategories[0] || 'memory';
       return {
         classification: 'single_tool',
         confidence: 0.5,
@@ -78,8 +79,8 @@ export async function classifyRequest(
       ? parsed.classification
       : 'single_tool';
 
-    // Dynamic validation: accept any category that exists in the registry
-    const validCategories = getValidCategories();
+    // Dynamic validation: only accept categories that have actually available tools
+    const validCategories = getValidCategories(availableToolNames);
     const toolCategories = (parsed.toolCategories || []).filter(
       (cat: string) => validCategories.includes(cat)
     ) as ToolCategory[];
@@ -106,7 +107,8 @@ export async function classifyRequest(
 
     // Ensure single_tool/multi_tool paths have at least one category
     if (result.classification !== 'simple_chat' && result.toolCategories.length === 0) {
-      const defaultCategory = validCategories.find(c => c.endsWith('_read')) || validCategories[0] || 'memory';
+      const availableCategories = getValidCategories(availableToolNames);
+      const defaultCategory = availableCategories.find(c => c.endsWith('_read')) || availableCategories[0] || 'memory';
       result.toolCategories = [defaultCategory];
       result.reasoning += ` (added default ${defaultCategory})`;
     }
@@ -127,7 +129,7 @@ export async function classifyRequest(
     });
 
     // Safe fallback: treat as single_tool with first available read category
-    const fallbackCategories = getValidCategories();
+    const fallbackCategories = getValidCategories(availableToolNames);
     const fallbackCategory = fallbackCategories.find(c => c.endsWith('_read')) || fallbackCategories[0] || 'memory';
     return {
       classification: 'single_tool',

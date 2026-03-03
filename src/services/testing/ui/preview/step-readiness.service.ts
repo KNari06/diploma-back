@@ -315,48 +315,60 @@ async function blindSettle(page: Page, domStableThresholdMs: number): Promise<vo
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Build a fast locator from step's compiled plan or evidence.
- * Returns null if no fast locator can be built.
+ * Build fast locators from step's compiled plan or evidence.
+ * Returns ALL non-ref locators from the compiled plan so the retry loop
+ * can try each one (instead of only the first, which may not match).
  */
-function buildFastLocator(page: Page, step: IntentStep): Locator | null {
+function buildFastLocators(page: Page, step: IntentStep): Locator[] {
+  const locators: Locator[] = [];
+
   // Priority 1: Use compiled locatorPlan if available
   // Skip ref strategy — data-agent-ref attributes don't exist during background replay
   if (step.compiled?.locatorPlan && step.compiled.locatorPlan.length > 0) {
-    const stableEntry = step.compiled.locatorPlan.find(e => e.strategy !== 'ref');
-    if (!stableEntry) return null; // Only ref strategies — can't build fast locator
+    const stableEntries = step.compiled.locatorPlan.filter(e => e.strategy !== 'ref');
 
-    try {
-      switch (stableEntry.strategy) {
-        case 'role':
-          return page
-            .getByRole(stableEntry.roleName as any, { name: stableEntry.value })
-            .first();
+    for (const entry of stableEntries) {
+      try {
+        let locator: Locator | null = null;
+        switch (entry.strategy) {
+          case 'role':
+            locator = page
+              .getByRole(entry.roleName as any, { name: entry.value })
+              .first();
+            break;
 
-        case 'label':
-          return page.getByLabel(stableEntry.value).first();
+          case 'label':
+            locator = page.getByLabel(entry.value).first();
+            break;
 
-        case 'testId':
-          return page.getByTestId(stableEntry.value).first();
+          case 'testId':
+            locator = page.getByTestId(entry.value).first();
+            break;
 
-        case 'placeholder':
-          return page.getByPlaceholder(stableEntry.value).first();
+          case 'placeholder':
+            locator = page.getByPlaceholder(entry.value).first();
+            break;
 
-        case 'css':
-          return page.locator(stableEntry.value).first();
+          case 'css':
+            locator = page.locator(entry.value).first();
+            break;
 
-        default:
-          logger.debug('[STEP_READINESS] Unknown locator strategy', {
-            strategy: stableEntry.strategy,
-          });
-          return null;
+          default:
+            logger.debug('[STEP_READINESS] Unknown locator strategy', {
+              strategy: entry.strategy,
+            });
+            break;
+        }
+        if (locator) locators.push(locator);
+      } catch (error) {
+        logger.debug('[STEP_READINESS] Failed to build locator from compiled plan', {
+          strategy: entry.strategy,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
-    } catch (error) {
-      logger.debug('[STEP_READINESS] Failed to build locator from compiled plan', {
-        strategy: stableEntry.strategy,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return null;
     }
+
+    if (locators.length > 0) return locators;
   }
 
   // Priority 2: Fallback to evidence.lastSuccessRef
@@ -365,20 +377,19 @@ function buildFastLocator(page: Page, step: IntentStep): Locator | null {
     const ref = step.evidence.lastSuccessRef;
     // data-agent-ref values (e.g. "e6", "bg-1") don't exist during replay — skip
     if (/^(e\d+|s\d+|bg-\d+)$/.test(ref)) {
-      return null;
+      return locators;
     }
     try {
       const escapedRef = ref.replace(/"/g, '\\"');
-      return page.locator(`[data-agent-ref="${escapedRef}"]`).first();
+      locators.push(page.locator(`[data-agent-ref="${escapedRef}"]`).first());
     } catch (error) {
       logger.debug('[STEP_READINESS] Failed to build locator from evidence', {
         error: error instanceof Error ? error.message : String(error),
       });
-      return null;
     }
   }
 
-  return null;
+  return locators;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -388,8 +399,9 @@ function buildFastLocator(page: Page, step: IntentStep): Locator | null {
 /**
  * Check if element meets preconditions for action type.
  * Uses ONLY fast Playwright checks — no embeddings or AI.
+ * Playwright's isVisible()/isEnabled()/count() are non-waiting and return instantly.
  */
-async function checkPreconditions(
+async function checkPreconditionsSingle(
   locator: Locator,
   actionType: IntentActionType
 ): Promise<boolean> {
@@ -420,6 +432,23 @@ async function checkPreconditions(
     });
     return false;
   }
+}
+
+/**
+ * Check preconditions across multiple locators.
+ * Returns true if ANY locator satisfies the preconditions.
+ * This avoids the problem of a single mismatched locator (e.g. label vs placeholder)
+ * causing the entire lookahead to fail and trigger expensive settle retries.
+ */
+async function checkPreconditions(
+  locators: Locator[],
+  actionType: IntentActionType
+): Promise<boolean> {
+  // Check all locators in parallel (isVisible/isEnabled are instant)
+  const results = await Promise.all(
+    locators.map(loc => checkPreconditionsSingle(loc, actionType))
+  );
+  return results.some(r => r);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -509,13 +538,13 @@ export async function waitForStepReadiness(
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Phase 2: Build fast locator
+  // Phase 2: Build fast locators (all non-ref strategies)
   // If none available → blind settle instead of skipping
   // ─────────────────────────────────────────────────────────────────────────
 
-  const locator = buildFastLocator(page, nextStep);
+  const locators = buildFastLocators(page, nextStep);
 
-  if (!locator) {
+  if (locators.length === 0) {
     logger.debug('[STEP_READINESS] No fast locator — applying blind settle', {
       stepId: nextStep.id,
       hasCompiled: !!nextStep.compiled,
@@ -536,6 +565,7 @@ export async function waitForStepReadiness(
 
   // ─────────────────────────────────────────────────────────────────────────
   // Phase 3: Retry loop with dynamic settle
+  // Checks ALL locators (not just the first) — if any matches, element is ready.
   // ─────────────────────────────────────────────────────────────────────────
 
   logger.debug('[STEP_READINESS] Starting lookahead wait', {
@@ -545,6 +575,7 @@ export async function waitForStepReadiness(
     domStableThresholdMs,
     maxWaitMs,
     navigationDetected,
+    locatorCount: locators.length,
   });
 
   let attempt = 0;
@@ -563,7 +594,7 @@ export async function waitForStepReadiness(
       break;
     }
 
-    ready = await checkPreconditions(locator, nextStep.type);
+    ready = await checkPreconditions(locators, nextStep.type);
 
     if (ready) {
       const waited = Date.now() - startTime;
