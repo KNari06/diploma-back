@@ -106,6 +106,19 @@ async function getWorkspaceChatInternal(
     .eq('session_id', session.id)
     .not('metadata->>type', 'eq', 'welcome');
 
+  // For empty chats, include the welcome message so the frontend can display it
+  // without needing a separate getChatSessionById call or WebSocket race
+  let welcomeMessage: { id: string; role: string; content: string; metadata: any; created_at: string } | null = null;
+  if ((messageCount || 0) === 0) {
+    const { data: welcome } = await supabaseAdmin
+      .from('chat_messages')
+      .select('id, role, content, metadata, created_at')
+      .eq('session_id', session.id)
+      .eq('metadata->>type', 'welcome')
+      .maybeSingle();
+    welcomeMessage = welcome;
+  }
+
   logger.info('[CHAT_SESSIONS] Workspace chat retrieved', {
     userId,
     workspaceId,
@@ -120,6 +133,15 @@ async function getWorkspaceChatInternal(
         ...session,
         message_count: messageCount || 0,
       },
+      ...(welcomeMessage ? {
+        messages: [{
+          id: welcomeMessage.id,
+          role: 'assistant',
+          content: welcomeMessage.content,
+          metadata: welcomeMessage.metadata,
+          created_at: welcomeMessage.created_at,
+        }],
+      } : {}),
     },
   });
 }
