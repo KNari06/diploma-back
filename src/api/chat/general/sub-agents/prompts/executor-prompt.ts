@@ -45,7 +45,15 @@ COMMON TOOL CHAINS (call both when the user needs full picture):
 - "Show test results" → qa_list_test_executions first, then qa_get_test_results for a specific execution if needed
 - "Analyze failures" → qa_list_test_executions (to find failed runs) → qa_analyze_failure (for root cause)
 - "Dashboard / overview" → qa_get_full_dashboard (single call covers most data)
-- When qa_get_test_case returns testType: use it (ui/api/mixed) — do NOT guess the test method`;
+- When qa_get_test_case returns testType: use it (ui/api/mixed) — do NOT guess the test method
+
+CRITICAL — DATA INTEGRITY (ANTI-HALLUCINATION):
+- When the user asks about QA data (test cases, test steps, results, executions, analytics, bugs, coverage, fixtures, modules, flows, schedules, regression plans, reports, deployments, flaky tests, recommendations) — you MUST call the appropriate qa_* tool. NEVER answer from memory or imagination.
+- NEVER invent test case names, IDs, statuses, pass rates, durations, error messages, or any QA metrics.
+- If you are unsure which tool to call — call qa_get_full_dashboard as the safe default.
+- If a tool returns empty results or zero items — that IS the correct answer. Say "no data found." Do NOT fabricate data to fill the gap.
+- If no QA tools are available in your tool list — say "I don't have access to QA data tools right now" instead of guessing.
+- You were given tools for a reason — USE THEM. Do not skip tool calls and answer with text when the user is asking for data.`;
 
   if (userGoal) {
     prompt += `\n\nUSER'S GOAL: "${userGoal}"

@@ -38,6 +38,7 @@ export async function handleGeneralChat(
     userId: string;
     chatSessionId?: string;
     context?: any;
+    workspace_id?: string; // Workspace ID from validated route params (primary source)
     userLanguage?: 'en' | 'ru' | 'neutral'; // Language from intent parser (avoid re-detection)
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
@@ -45,7 +46,7 @@ export async function handleGeneralChat(
     attachments?: ChatAttachment[]; // File attachments (images + documents)
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context: rawContext, abortSignal, logger: functionLogger, mode, attachments } = params;
+  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments } = params;
 
   // Normalize context: parse JSON string into object if needed (frontend may send stringified JSON)
   let context: any = rawContext;
@@ -248,7 +249,7 @@ export async function handleGeneralChat(
   // Non-fatal: continues without KB on error.
 
   let kbContext = '';
-  const projectId = typeof context === 'object' ? context?.projectId : undefined;
+  let projectId = typeof context === 'object' ? context?.projectId : undefined;
 
   try {
     const kbResults = await searchKB(message, projectId, {
@@ -289,9 +290,10 @@ export async function handleGeneralChat(
   // STEP 2.6: LOAD WORKSPACE MEMORY (PERSISTENT SEMANTIC MEMORY)
   // ═══════════════════════════════════════════════════════════════════════
   let workspaceMemory = '';
-  const workspaceId = typeof context === 'object' && context !== null && !Array.isArray(context)
-    ? context?.workspaceId || context?.workspace_id
-    : undefined;
+  const workspaceId = paramWorkspaceId
+    || (typeof context === 'object' && context !== null && !Array.isArray(context)
+      ? context?.workspaceId || context?.workspace_id
+      : undefined);
 
   if (workspaceId) {
     try {

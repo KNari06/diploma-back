@@ -178,7 +178,10 @@ export async function parseUserIntent(
     }
 
     // Step 5: Calculate confidence and decide next steps
-    const confidence = calculateConfidence(intentResult, trimmedMessage);
+    // Prefer GPT's intent_confidence (set in finalizeIntentResult) over heuristic calculation
+    const confidence = (intentResult.confidence !== undefined && intentResult.confidence !== null)
+      ? intentResult.confidence
+      : calculateConfidence(intentResult, trimmedMessage);
 
     // Step 6: Check if intent is complete (has required fields)
     // This check happens BEFORE confidence handling to ensure incomplete intents
@@ -2073,21 +2076,13 @@ export function calculateConfidence(intentResult: IntentResult, message: string)
     }
   }
 
-  // General chat confidence boosters
+  // General chat confidence boosters (language-neutral checks only)
   if (intentResult.intent === 'general_chat') {
-    const lowerMessage = trimmedMessage.toLowerCase();
-
-    // Check if message is a question
+    // Check if message is a question (? works across all languages)
     if (trimmedMessage.includes('?')) confidence += 0.2;
 
     // Check if message has no URL (less likely to be testing request)
     if (!trimmedMessage.match(/https?:\/\//)) confidence += 0.1;
-
-    // Check for common greeting/help words
-    const helpWords = ['what', 'how', 'help', 'explain', 'tell', 'show', 'hi', 'hello', 'thanks', 'why', 'did', 'have'];
-    if (helpWords.some(word => lowerMessage.includes(word))) {
-      confidence += 0.1;
-    }
   }
 
   // Message length adjustments (applies to all intents except needs_clarification)
