@@ -152,7 +152,7 @@ async function resolveRunId(
     .select('id, plan_id')
     .eq('user_id', userId)
     .in('plan_id', planIds)
-    .order('created_at', { ascending: false })
+    .order('started_at', { ascending: false })
     .limit(1)
     .maybeSingle();
 
@@ -4469,9 +4469,9 @@ export async function handleGetLastRuns(
 
     let query = supabaseAdmin
       .from('regression_runs')
-      .select('id, plan_id, trigger, status, summary, started_at, completed_at, created_at')
+      .select('id, plan_id, trigger, status, summary, started_at, completed_at')
       .eq('project_id', projectId)
-      .order('created_at', { ascending: false })
+      .order('started_at', { ascending: false })
       .limit(limit);
 
     if (planId) {

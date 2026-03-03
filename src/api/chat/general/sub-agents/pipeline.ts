@@ -368,10 +368,60 @@ export class SubAgentPipeline {
           metrics.reviewerVerdict = singleReviewResult.verdict;
           blackboard.setReviewResult(singleReviewResult);
 
+          // Retry: reviewer says tool failed — re-execute once
+          if (
+            singleReviewResult.verdict === 'needs_retry' &&
+            metrics.retryCount < SUB_AGENT_CONFIG.maxReviewRetries &&
+            !input.abortSignal?.aborted
+          ) {
+            metrics.retryCount++;
+            logger.info('[SUB_AGENT_PIPELINE] Single-tool reviewer requested retry', {
+              retryCount: metrics.retryCount,
+              failedTools: executorResult.toolResults.filter(r => !r.result.success).map(r => r.toolName),
+            });
+
+            this.emitStep('agent_executing_tool', 'Re-executing tool...', PROGRESS.PIPELINE_TOOL_BASE + 5);
+
+            const retryStart = Date.now();
+            const retryResult = await executeTools(
+              input.userMessage,
+              contextMessages,
+              filteredTools,
+              this.context,
+              undefined,
+              input.abortSignal,
+              input.userContent,
+              blackboard
+            );
+
+            // Merge retry results
+            executorResult.toolResults.push(...retryResult.toolResults);
+            executorResult.toolRounds += retryResult.toolRounds;
+            metrics.executorMs += Date.now() - retryStart;
+            metrics.toolsExecuted.push(...retryResult.toolResults.map(r => r.toolName));
+
+            // Update blackboard
+            blackboard.setExecutionResults({
+              stepResults: new Map(),
+              ungroupedResults: executorResult.toolResults,
+              assistantContent: retryResult.assistantContent || executorResult.assistantContent,
+              totalToolRounds: executorResult.toolRounds,
+              subExecutorIds: [],
+            });
+
+            // Re-run reviewer on updated results
+            const retryReviewStart = Date.now();
+            const retryReviewResult = await reviewExecution(blackboard, input.abortSignal);
+            metrics.reviewerMs += Date.now() - retryReviewStart;
+            metrics.reviewerVerdict = retryReviewResult.verdict;
+            blackboard.setReviewResult(retryReviewResult);
+          }
+
           // Level 2 clarification: reviewer says results are ambiguous — ask user
-          if (singleReviewResult.verdict === 'needs_clarification' && singleReviewResult.clarificationNeeded) {
+          const finalSingleReview = blackboard.getReviewResult();
+          if (finalSingleReview?.verdict === 'needs_clarification' && finalSingleReview.clarificationNeeded) {
             logger.info('[SUB_AGENT_PIPELINE] Reviewer requested clarification (single_tool)', {
-              clarificationNeeded: singleReviewResult.clarificationNeeded,
+              clarificationNeeded: finalSingleReview.clarificationNeeded,
             });
 
             this.emitStep('agent_formatting', 'Composing a question...', PROGRESS.PIPELINE_FORMATTING);
@@ -391,7 +441,7 @@ export class SubAgentPipeline {
 
             return {
               success: true,
-              content: clarifyResponse.content || singleReviewResult.clarificationNeeded,
+              content: clarifyResponse.content || finalSingleReview.clarificationNeeded,
               path: 'single_tool',
               metrics,
               needsClarification: true,
