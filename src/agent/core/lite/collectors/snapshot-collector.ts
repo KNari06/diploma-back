@@ -173,7 +173,76 @@ export class SnapshotCollector {
           }
 
           // ═══════════════════════════════════════════════════════════════
-          // FALLBACK: When Layer 2 is disabled, use legacy coverage heuristic
+          // UNIVERSAL FALLBACK: Detect non-ARIA popups via position + z-index + coverage
+          // Many custom popups (Vue/React/Angular) don't set role="dialog".
+          // Catch them via physical signals: fixed/absolute + high z-index + meaningful size.
+          // This runs regardless of Layer 2 flag — Step Editor needs it always.
+          // ═══════════════════════════════════════════════════════════════
+          const positionalModals = Array.from(document.querySelectorAll(__mc.positionalSelector));
+          let bestPositional: Element | null = null;
+          let highestPositionalZ = -1;
+          // @ts-expect-error - window available in browser context
+          const vpW2 = window.innerWidth;
+          // @ts-expect-error - window available in browser context
+          const vpH2 = window.innerHeight;
+          const viewportArea2 = vpW2 * vpH2;
+
+          for (const el of positionalModals) {
+            const elStyle = window.getComputedStyle(el);
+            if (elStyle.display === 'none' || elStyle.visibility === 'hidden') continue;
+            if (parseFloat(elStyle.opacity) < 0.1) continue;
+            if (elStyle.position !== 'fixed' && elStyle.position !== 'absolute') continue;
+
+            const zIdx = parseInt(elStyle.zIndex, 10);
+            if (isNaN(zIdx) || zIdx < 10) continue; // Must have meaningful z-index
+
+            const elRect = el.getBoundingClientRect();
+            const elArea = elRect.width * elRect.height;
+            const coverage = viewportArea2 > 0 ? elArea / viewportArea2 : 0;
+
+            // Must be meaningful size (>10% viewport) with interactive content or many children
+            if (coverage < 0.1) continue;
+
+            // ── Q5 FIX: Exclude structural navigation elements (sidebars, headers, footers) ──
+            // Sidebars: flush to left/right edge + tall (>70% viewport height)
+            const isFlushLeft = elRect.left <= 5;
+            const isFlushRight = elRect.right >= vpW2 - 5;
+            const isFlushTop = elRect.top <= 5;
+            const isFlushBottom = elRect.bottom >= vpH2 - 5;
+            const isTall = elRect.height > vpH2 * 0.7;
+            const isWide = elRect.width > vpW2 * 0.7;
+            const isNarrowVertical = elRect.width < vpW2 * 0.35; // Sidebar: <35% viewport width
+            const isNarrowHorizontal = elRect.height < vpH2 * 0.2; // Header/footer: <20% viewport height
+
+            // Sidebar: narrow + tall + flush to left or right edge → navigation, not popup
+            if (isNarrowVertical && isTall && (isFlushLeft || isFlushRight)) continue;
+            // Header: narrow horizontal + flush to top → sticky header, not popup
+            if (isNarrowHorizontal && isWide && isFlushTop) continue;
+            // Footer/banner: narrow horizontal + flush to bottom → sticky footer/cookie, not popup
+            if (isNarrowHorizontal && isWide && isFlushBottom) continue;
+            // Full-screen overlay (coverage >90%) is likely a backdrop, not a popup container
+            if (coverage > 0.9) continue;
+
+            const hasInteractive = el.querySelector(__mc.interactiveSelector) !== null;
+            const childCount = el.querySelectorAll('*').length;
+            if (!hasInteractive && childCount < 5) continue;
+
+            if (zIdx > highestPositionalZ) {
+              highestPositionalZ = zIdx;
+              bestPositional = el;
+            }
+          }
+
+          if (bestPositional) {
+            const existingRef = bestPositional.getAttribute('data-agent-ref');
+            if (existingRef) return existingRef;
+            const newRef = `e${win.__agentRefCounter++}`;
+            bestPositional.setAttribute('data-agent-ref', newRef);
+            return newRef;
+          }
+
+          // ═══════════════════════════════════════════════════════════════
+          // LEGACY FALLBACK: When Layer 2 is disabled, use legacy coverage heuristic
           // to avoid missing modals that don't have ARIA roles.
           // When Layer 2 is enabled, ambiguous elements are collected as
           // ObstacleFacts and classified by the Observer LLM instead.
@@ -658,6 +727,9 @@ export class SnapshotCollector {
           // ✅ FIX: Drag-and-drop targets
           '[draggable="true"]',
 
+          // ── List/nav items (dropdown suggestions, nav lists, autocomplete) ──
+          'li',
+
           // ── Semantic HTML elements ──
           'canvas', // L5: Include canvas for vision escalation trigger
           'h1', 'h2', 'h3', // GoalDetector/GoalExpander/SemanticWeight
@@ -687,6 +759,157 @@ export class SnapshotCollector {
 
         // P1: Guard against circular references in shadow host chain
         const visitedShadowHosts = new WeakSet<Element>();
+
+        /**
+         * Secondary pass: Collect framework-bound interactive elements globally.
+         * Finds elements with React/Vue/Angular event bindings or cursor:pointer
+         * that aren't caught by the standard interactiveSelectors whitelist.
+         *
+         * Scans container (document.body), capped at MAX_SECONDARY_ELEMENTS.
+         * Returns Set of added elements for overlay-aware isInsideModal logic.
+         */
+        const MAX_SECONDARY_ELEMENTS = 120; // Cap to prevent flooding from global scan
+
+        const collectFrameworkInteractiveElements = (
+          container: Element,
+          alreadyCollected: Set<Element>,
+          collected: Element[]
+        ): Set<Element> => {
+          const addedElements = new Set<Element>();
+          const candidates = container.querySelectorAll('*');
+          let added = 0;
+          for (const el of candidates) {
+            // Q2 FIX: Hard cap on secondary pass elements
+            if (added >= MAX_SECONDARY_ELEMENTS) break;
+
+            // Q3 FIX: Skip the container element itself — it's a wrapper, not a clickable target
+            if (el === container) continue;
+
+            // Skip if already collected by primary pass
+            if (alreadyCollected.has(el)) continue;
+
+            // Skip non-visible elements early
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            if (parseFloat(style.opacity) < 0.1) continue;
+
+            // Skip elements too small to be interactive
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 10 || rect.height < 10) continue;
+
+            // Skip structural/container elements that are too large (likely wrappers, not clickables)
+            if (rect.width > 600 && rect.height > 600) continue;
+
+            // ── Tier 1: Framework event bindings (high confidence) ──
+            let hasFrameworkBinding = false;
+            try {
+              const keys = Object.keys(el);
+              for (let k = 0; k < keys.length; k++) {
+                const key = keys[k];
+                if (
+                  key.startsWith('__reactFiber$') ||
+                  key.startsWith('__reactInternalInstance$') ||
+                  key.startsWith('__reactEvents$') ||
+                  key.startsWith('__reactProps$')
+                ) {
+                  // React: check if the fiber/props has an onClick handler
+                  try {
+                    const propsKey = keys.find(pk => pk.startsWith('__reactProps$'));
+                    if (propsKey) {
+                      const props = (el as any)[propsKey];
+                      if (props && (props.onClick || props.onChange || props.onMouseDown)) {
+                        hasFrameworkBinding = true;
+                      }
+                    } else {
+                      // Has React fiber but can't confirm onClick — include conservatively
+                      hasFrameworkBinding = true;
+                    }
+                  } catch {
+                    hasFrameworkBinding = true;
+                  }
+                  break;
+                }
+              }
+              if (!hasFrameworkBinding) {
+                // Vue 2: __vue__ instance — require click/input/change listener
+                // @ts-expect-error - Vue internals
+                const vueInstance = (el as any).__vue__;
+                if (vueInstance) {
+                  const listeners = vueInstance.$listeners || {};
+                  if (listeners.click || listeners.input || listeners.change) {
+                    hasFrameworkBinding = true;
+                  }
+                }
+                // Vue 3: __vueParentComponent — require onClick/onInput/onChange prop
+                if (!hasFrameworkBinding) {
+                  // @ts-expect-error - Vue internals
+                  const vue3Component = (el as any).__vueParentComponent;
+                  if (vue3Component) {
+                    const vnode = vue3Component.vnode;
+                    const vProps = vnode && vnode.props;
+                    if (vProps && (vProps.onClick || vProps.onInput || vProps.onChange)) {
+                      hasFrameworkBinding = true;
+                    }
+                  }
+                }
+              }
+              if (!hasFrameworkBinding) {
+                // Angular: __ngContext__ or _ngHost — require interactive signal
+                // @ts-expect-error - Angular internals
+                if ((el as any).__ngContext__ || (el as any)._ngHost) {
+                  const tag = el.tagName.toLowerCase();
+                  const role = (el.getAttribute('role') || '').toLowerCase();
+                  const hasTabindex = el.hasAttribute('tabindex');
+                  const hasOnclick = el.hasAttribute('onclick');
+                  const interactiveRoles = ['button', 'link', 'tab', 'menuitem', 'option', 'switch', 'checkbox', 'radio'];
+                  const cls = (el.getAttribute('class') || '').toLowerCase();
+                  const hasInteractiveClass = /btn|button|click|link/.test(cls);
+                  if (hasTabindex || hasOnclick || interactiveRoles.includes(role) || hasInteractiveClass || tag === 'button' || tag === 'a') {
+                    hasFrameworkBinding = true;
+                  }
+                }
+              }
+            } catch { /* ignore */ }
+
+            // ── Tier 2: cursor:pointer heuristic (lower confidence, stricter checks) ──
+            // Q2 FIX: Only use cursor:pointer for LEAF-like elements to avoid wrapper divs.
+            // Must be: cursor:pointer + has OWN direct text (not just inherited) + no child elements with cursor:pointer
+            if (!hasFrameworkBinding && style.cursor === 'pointer') {
+              // Check for direct text content (not inherited from children)
+              let hasOwnText = false;
+              for (const child of el.childNodes) {
+                if (child.nodeType === 3 /* TEXT_NODE */ && (child.textContent || '').trim().length > 0) {
+                  hasOwnText = true;
+                  break;
+                }
+              }
+              // Fallback: if no direct TEXT_NODE, check total textContent for short elements
+              if (!hasOwnText) {
+                const totalText = (el.textContent || '').trim();
+                if (totalText.length > 0 && totalText.length < 100) {
+                  hasOwnText = true;
+                }
+              }
+              // Leaf-check: no child elements that are also cursor:pointer (avoid parent+child duplication)
+              const hasClickableChildren = hasOwnText && el.querySelector(':scope > [style*="cursor"], :scope > [role]') === null;
+              if (hasOwnText && hasClickableChildren) {
+                const text = (el.textContent || '').trim();
+                if (text.length > 0 && text.length < 200) {
+                  hasFrameworkBinding = true;
+                }
+              }
+            }
+
+            if (hasFrameworkBinding) {
+              collected.push(el);
+              alreadyCollected.add(el);
+              addedElements.add(el);
+              elementShadowDepth.set(el, 0);
+              added++;
+            }
+          }
+          return addedElements;
+        };
 
         /**
          * Recursively collect elements from a root (document or shadow root)
@@ -763,6 +986,18 @@ export class SnapshotCollector {
 
         // activeModalElement is already computed above via detectActiveModal + activeModalRef.
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // SECONDARY PASS: Framework-bound interactive elements (GLOBAL scan)
+        // Custom components (Vue @click, React onClick, Angular (click)) and
+        // cursor:pointer leaf elements that aren't caught by querySelectorAll.
+        // Scans entire document.body — capped at MAX_SECONDARY_ELEMENTS (60).
+        // ═══════════════════════════════════════════════════════════════════════
+        const secondaryPassElements = collectFrameworkInteractiveElements(
+          document.body,
+          seenElements,
+          uniqueElements
+        );
+
         // ✅ FIX BUG 5: Track refs used in THIS snapshot pass to prevent duplicates
         // When two elements produce the same fingerprint (e.g. repeated UI cards),
         // the fingerprint map would restore the same ref → duplicate data-agent-ref.
@@ -794,7 +1029,9 @@ export class SnapshotCollector {
             // filtered out by elementFromPoint — the user interacts with the popup, not the background.
             // This mirrors real user behavior: when a popup is open, you see and click its elements.
             // ═══════════════════════════════════════════════════════════════
-            const isInsideModal = activeModalElement ? activeModalElement.contains(el) : false;
+            const isInsideModal = activeModalElement
+              ? activeModalElement.contains(el)
+              : false;
 
             // Universal visibility check via elementFromPoint.
             // The browser tells us exactly what the user sees at the element's center pixel.
@@ -826,9 +1063,8 @@ export class SnapshotCollector {
                   // Also check if the hit element itself is inside the same modal (sibling layers within popup).
                   const hitIsInsideSameModal = isInsideModal && activeModalElement && activeModalElement.contains(hitTestTopEl);
 
-                  if (!isShadowHostMatch && !isInsideModal && !hitIsInsideSameModal) {
-                    return;
-                  }
+                  // Don't return — let element continue with isTopMostAtCenter=false.
+                  // buildAllowedSets handles soft penalty (no modal) / hard exclude (modal present).
                 }
               } catch {
                 // elementFromPoint can fail in edge cases — don't skip

@@ -11,6 +11,7 @@ export interface GitIntegrationRow {
   provider: GitProvider;
   repository_url: string;
   webhook_secret: string;
+  plan_id: string | null;
   events: GitEvent[];
   enabled: boolean;
   created_at: string;
@@ -32,6 +33,7 @@ export interface UpdateGitIntegrationParams {
   webhookSecret?: string;
   events?: GitEvent[];
   enabled?: boolean;
+  planId?: string | null;
 }
 
 export class GitIntegrationService {
@@ -111,7 +113,7 @@ export class GitIntegrationService {
   }
 
   static async updateIntegration(params: UpdateGitIntegrationParams): Promise<GitIntegrationRow> {
-    const { integrationId, userId, webhookSecret, events, enabled } = params;
+    const { integrationId, userId, webhookSecret, events, enabled, planId } = params;
 
     await this.getIntegration(integrationId, userId);
 
@@ -119,6 +121,7 @@ export class GitIntegrationService {
     if (webhookSecret !== undefined) updateData.webhook_secret = webhookSecret;
     if (events !== undefined) updateData.events = this.validateEvents(events);
     if (enabled !== undefined) updateData.enabled = enabled;
+    if (planId !== undefined) updateData.plan_id = planId;
 
     const { data, error } = await supabaseAdmin
       .from('git_integrations')

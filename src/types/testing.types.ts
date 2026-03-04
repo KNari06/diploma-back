@@ -516,7 +516,7 @@ export type AutomationBrowser = 'chrome' | 'firefox' | 'safari' | 'edge';
 /**
  * Git trigger types
  */
-export type GitTriggerType = 'merge_to_main' | 'pr_opened' | 'release';
+export type GitTriggerType = 'merge_to_main' | 'pr_opened' | 'release' | 'push_to_branch';
 
 /**
  * Schedule configuration for plan automation

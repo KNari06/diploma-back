@@ -125,6 +125,20 @@ export class GitWebhookService {
 
     const integration = await GitIntegrationService.findByProviderAndRepositoryUrl(provider, repositoryUrlRaw);
 
+    // Validate signature/token BEFORE persisting (prevents audit trail poisoning)
+    if (integration) {
+      if (provider === 'github') {
+        if (!signature || !this.verifyGitHubSignature(rawBody, signature, integration.webhook_secret)) {
+          throw new Error('Invalid GitHub webhook signature');
+        }
+      } else {
+        // For GitLab we store token in `signature` field for audit (header value)
+        if (!signature || !this.verifyGitLabToken(signature, integration.webhook_secret)) {
+          throw new Error('Invalid GitLab webhook token');
+        }
+      }
+    }
+
     // Persist delivery (even if integration not found) for audit
     const repositoryUrlNormalized = integration?.repository_url || this.normalizeRepositoryUrl(repositoryUrlRaw, provider);
 
@@ -150,20 +164,6 @@ export class GitWebhookService {
       });
       await this.updateDeliveryStatus(provider, deliveryId, { status: 'ignored', error: 'integration_not_found' });
       return { queued: false, ignored: true, reason: 'integration_not_found' };
-    }
-
-    // Validate signature/token
-    if (provider === 'github') {
-      if (!signature || !this.verifyGitHubSignature(rawBody, signature, integration.webhook_secret)) {
-        await this.updateDeliveryStatus(provider, deliveryId, { status: 'failed', error: 'invalid_signature' });
-        throw new Error('Invalid GitHub webhook signature');
-      }
-    } else {
-      // For GitLab we store token in `signature` field for audit (header value)
-      if (!signature || !this.verifyGitLabToken(signature, integration.webhook_secret)) {
-        await this.updateDeliveryStatus(provider, deliveryId, { status: 'failed', error: 'invalid_token' });
-        throw new Error('Invalid GitLab webhook token');
-      }
     }
 
     // Enqueue for async processing
