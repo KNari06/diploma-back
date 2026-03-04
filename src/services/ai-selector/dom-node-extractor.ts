@@ -93,15 +93,51 @@ export class DOMNodeExtractor {
           const interactiveTags = ['a', 'button', 'input', 'select', 'textarea'];
           if (interactiveTags.includes(tag)) return true;
 
-          // Interactive roles
-          const interactiveRoles = ['button', 'link', 'checkbox', 'radio', 'textbox'];
+          // Interactive roles (expanded: include all ARIA widget roles)
+          const interactiveRoles = [
+            'button', 'link', 'checkbox', 'radio', 'textbox', 'searchbox',
+            'combobox', 'listbox', 'option', 'menuitem', 'menuitemcheckbox',
+            'menuitemradio', 'tab', 'switch', 'slider', 'spinbutton',
+            'treeitem', 'gridcell',
+          ];
           if (role && interactiveRoles.includes(role)) return true;
 
-          // Elements with click handlers
+          // contenteditable — editable regions (rich text editors, inline editors)
+          const contenteditable = element.getAttribute('contenteditable');
+          if (contenteditable === 'true' || contenteditable === '') return true;
+
+          // tabindex >= 0 — explicitly focusable (developer-declared interactive)
+          const tabindex = element.getAttribute('tabindex');
+          if (tabindex !== null && parseInt(tabindex, 10) >= 0) return true;
+
+          // aria-expanded / aria-haspopup — dropdown/disclosure triggers
+          if (element.hasAttribute('aria-expanded') || element.hasAttribute('aria-haspopup')) return true;
+
+          // Elements with click handlers (inline)
           // @ts-ignore
           if (element.onclick || element.hasAttribute('onclick')) return true;
 
-          // Clickable elements
+          // Phase 4: Framework event bindings (React/Vue/Angular synthetic events)
+          // These elements appear non-interactive by DOM attributes but have JS event handlers
+          try {
+            const keys = Object.keys(element);
+            for (let k = 0; k < keys.length; k++) {
+              const key = keys[k];
+              if (
+                key.startsWith('__reactFiber$') ||
+                key.startsWith('__reactInternalInstance$') ||
+                key.startsWith('__reactEvents$')
+              ) return true;
+            }
+            // @ts-ignore - browser context
+            if (element.__vue__ || element.__vueParentComponent) return true;
+            // @ts-ignore - browser context
+            if (element.__ngContext__ || element._ngHost) return true;
+          } catch (_) {
+            // Ignore access errors (cross-origin, frozen objects)
+          }
+
+          // Clickable by CSS cursor (last resort — catches CSS-driven custom buttons)
           // @ts-ignore
           if (window.getComputedStyle(element).cursor === 'pointer') return true;
 

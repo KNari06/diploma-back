@@ -141,6 +141,8 @@ export class LiteEngine {
   private lastConsoleErrors: string[] = [];
   private lastNetworkErrors: import('./collectors/network-tracker').NetworkError[] = [];
   private lastValidationErrors: import('./lite-types').NetworkValidationError[] = [];
+  /** Layer 3: Blocker info from previous iteration's failed click */
+  private lastBlockerInfo: import('./lite-types').BlockerInfo | undefined = undefined;
   // Store previous snapshot for state drift auditor (lost-field detection needs real elements)
   private lastSnapshotForAuditor: LiteSnapshot | null = null;
   // Manus-style: Store last expectedOutcome for expectation validation loop
@@ -2619,6 +2621,10 @@ export class LiteEngine {
             transientState: snapshotBefore.transientState,
             pageMetadata: snapshotBefore.metadata,
             pageStructure: snapshotBefore.pageStructure,
+            // Layer 2: Obstacle facts for LLM classification
+            obstacleFacts: snapshotBefore.obstacleFacts,
+            // Layer 3: Blocker info from previous iteration's failed click
+            lastBlockerInfo: this.lastBlockerInfo,
             // Goal URL for wrong-page detection and recovery
             goalUrl: this.config.url,
             // Consecutive critic rejections for stuck detection in orchestrator
@@ -3210,6 +3216,9 @@ export class LiteEngine {
 
         // ✅ NEW (Lite Autonomy v3): Store modal dismiss info for next iteration's prompt
         this.lastModalDismissInfo = execResult.modalDismissInfo || null;
+
+        // Layer 3: Store blocker info for next iteration's Critic
+        this.lastBlockerInfo = execResult.blockerInfo || undefined;
 
         // ✅ FIX P2: Handle validation error modal (rollback) with timeout
         if (execResult.modalDismissInfo?.modalType === 'validation') {

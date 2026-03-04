@@ -357,6 +357,34 @@ export class CriticAgent {
       });
     }
 
+    // Policy 8: Blocker-aware action blocking (Layer 3 feedback)
+    // If previous iteration's click was blocked and recovery failed,
+    // warn (not block) if the same element is being retried without addressing the blocker.
+    if (input.lastBlockerInfo && input.proposedCommand.ref === input.lastBlockerInfo.targetRef) {
+      const blocker = input.lastBlockerInfo;
+      const recoveryHints: Record<string, string> = {
+        modal: 'Dismiss the modal first (Escape or close button)',
+        drawer: 'Close the drawer first (Escape or close button)',
+        cookie_consent: 'Accept or dismiss the cookie banner first',
+        chat_widget: 'Close the chat widget first',
+        toast: 'Wait for the notification to disappear',
+        sticky_header: 'Scroll element to center of viewport to avoid sticky header',
+        sticky_footer: 'Scroll element to center of viewport to avoid sticky footer',
+        loading_overlay: 'Wait for loading to complete',
+        dropdown: 'Click away to close the open dropdown first',
+        tooltip: 'Move away to dismiss the tooltip first',
+        onboarding: 'Dismiss the onboarding tour overlay first',
+        paywall: 'Navigate away — element is behind a paywall/login wall',
+        unknown: 'Dismiss the overlapping element first (try Escape)',
+      };
+      const hint = recoveryHints[blocker.hintType || 'unknown'] || 'Dismiss the blocking element first';
+      violations.push({
+        type: 'unsafe_action',
+        description: `Element ${blocker.targetRef} was blocked by ${blocker.hintType || 'unknown'} (${blocker.blockerTag}.${blocker.blockerClass.slice(0, 40)} "${blocker.blockerText.slice(0, 40)}"). ${hint}.`,
+        severity: 'warn',
+      });
+    }
+
     return violations;
   }
 

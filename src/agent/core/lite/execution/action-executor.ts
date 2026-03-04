@@ -6,16 +6,28 @@
 
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
 import { logger } from '@/utils/core/logger';
+import {
+  MODAL_OVERLAY_SELECTORS,
+  POSITIONAL_CANDIDATES_SELECTOR,
+  INTERACTIVE_CHILDREN_SELECTOR,
+  MODAL_CLASS_REGEX,
+  IRON_CLAD_MODAL_SELECTORS,
+  CLOSE_BUTTON_SELECTOR,
+  LAYER3_FALLBACK_PATTERNS,
+} from '@/agent/utils/selectors/modal-detection';
+import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import type { Locator, Page } from 'playwright';
 import { VisualAnchorManager } from '../analysis/visual-anchor-manager';
 import { ShadowDOMHandler } from './shadow-dom-handler';
 import type {
   AICommand,
+  BlockerInfo,
   ElementInfo,
   ExecutionResult,
   LiteElement,
   LiteSnapshot,
   ModalDismissInfo,
+  ObstacleType,
   VisualSignature,
 } from '../lite-types';
 
@@ -275,6 +287,7 @@ export class ActionExecutor {
             fallbackInfo: fallback.info,
             modalDismissInfo: fallback.modalDismissInfo,
             usedForceClick: fallback.usedForceClick,
+            blockerInfo: fallback.blockerInfo,
           };
         }
       }
@@ -704,6 +717,7 @@ export class ActionExecutor {
     info?: string;
     usedForceClick?: boolean;
     modalDismissInfo?: ModalDismissInfo;
+    blockerInfo?: BlockerInfo;
   }> {
     // ═══════════════════════════════════════════════════════════════════════
     // FALLBACK 1: Visual Anchor (spatial signature)
@@ -820,6 +834,7 @@ export class ActionExecutor {
               success: true,
               info: `Visual Anchor: ref ${cmd.ref} → ${foundElement.ref} (confidence: ${confidence.toFixed(2)})`,
               usedForceClick: result.usedForceClick,
+              blockerInfo: result.blockerInfo,
               modalDismissInfo,
             };
           } catch (visualAnchorError) {
@@ -927,6 +942,7 @@ export class ActionExecutor {
             success: true,
             info: `Ref ${cmd.ref} stale, found by ${strategy.name}: "${el.text?.slice(0, 30)}"`,
             usedForceClick: result.usedForceClick,
+            blockerInfo: result.blockerInfo,
             modalDismissInfo,
           };
         }
@@ -1025,13 +1041,20 @@ export class ActionExecutor {
     cmd: AICommand,
     locator: Locator,
     options?: ExecuteOptions
-  ): Promise<{ usedForceClick: boolean }> {
+  ): Promise<{ usedForceClick: boolean; blockerInfo?: BlockerInfo }> {
     let usedForceClick = false;
+    let blockerInfo: BlockerInfo | undefined;
 
     switch (cmd.action) {
-      case 'click':
-        usedForceClick = await this.stagedClickWithSelfHealing(locator, options);
+      case 'click': {
+        const clickResult = await this.stagedClickWithSelfHealing(locator, {
+          ...options,
+          targetRef: cmd.ref,
+        });
+        usedForceClick = clickResult.usedForce;
+        blockerInfo = clickResult.blockerInfo;
         break;
+      }
       case 'fill':
         if (cmd.value) {
           try {
@@ -1154,7 +1177,7 @@ export class ActionExecutor {
         throw new Error(`Fallback not supported for action: ${cmd.action}`);
     }
 
-    return { usedForceClick };
+    return { usedForceClick, blockerInfo };
   }
 
   /**
@@ -1271,17 +1294,18 @@ export class ActionExecutor {
   }
 
   /**
-   * Staged click with self-healing (Lite Autonomy v3)
-   * Tries multiple strategies before falling back to force click
+   * Staged click with self-healing (Lite Autonomy v3 + Layer 3 Obstacle Intelligence)
+   * Tries multiple strategies before falling back to force click.
+   * Returns { usedForce, blockerInfo } for Layer 3 feedback to Critic.
    */
   private async stagedClickWithSelfHealing(
     locator: Locator,
-    options?: ExecuteOptions
-  ): Promise<boolean> {
+    options?: ExecuteOptions & { targetRef?: string }
+  ): Promise<{ usedForce: boolean; blockerInfo?: BlockerInfo }> {
     // Stage 1: Normal click
     try {
       await locator.click({ timeout: this.FALLBACK_TIMEOUT });
-      return false; // No force needed
+      return { usedForce: false }; // No force needed
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
 
@@ -1295,21 +1319,53 @@ export class ActionExecutor {
       });
     }
 
-    // Stage 2: Try to dismiss modal if present
+    // ═══════════════════════════════════════════════════════════════════════
+    // Stage 2 (NEW): Layer 3 — Identify exact blocker & type-specific recovery
+    // ═══════════════════════════════════════════════════════════════════════
+    let blockerInfo: BlockerInfo | undefined;
+    if (LITE_ENGINE_FLAGS.enableLayer3BlockerDetection && options?.targetRef) {
+      const blocker = await this.identifyBlocker(options.targetRef);
+      if (blocker) {
+        blockerInfo = blocker as BlockerInfo;
+        logger.info('[ACTION_EXECUTOR] Layer 3: Blocker identified', {
+          type: blocker.hintType,
+          recovery: blocker.suggestedRecovery,
+          blockerTag: blocker.blockerTag,
+          blockerClass: blocker.blockerClass.slice(0, 50),
+        });
+
+        // Attempt type-specific recovery
+        const recovered = await this.attemptBlockerRecovery(blocker as BlockerInfo);
+        if (recovered) {
+          try {
+            await locator.click({ timeout: this.FALLBACK_TIMEOUT });
+            logger.info('[ACTION_EXECUTOR] Layer 3 recovery succeeded', {
+              type: blocker.hintType,
+              recovery: blocker.suggestedRecovery,
+            });
+            return { usedForce: false, blockerInfo };
+          } catch {
+            // Recovery didn't fully work, continue to next stage
+          }
+        }
+      }
+    }
+
+    // Stage 3: Try to dismiss modal if present (existing behavior)
     if (options?.modalKeywords) {
       const dismissResult = await this.handleUnexpectedModal(options.modalKeywords);
       if (dismissResult.dismissed) {
         logger.info('[ACTION_EXECUTOR] Modal dismissed, retrying click');
         try {
           await locator.click({ timeout: this.FALLBACK_TIMEOUT });
-          return false;
+          return { usedForce: false, blockerInfo };
         } catch {
           // Continue to next stage
         }
       }
     }
 
-    // Stage 3: Try scroll offset (for sticky headers)
+    // Stage 4: Try scroll offset (for sticky headers)
     try {
       await locator.evaluate(() => {
         // @ts-expect-error - window available in browser context
@@ -1318,25 +1374,25 @@ export class ActionExecutor {
       await this.page.waitForTimeout(200);
       await locator.click({ timeout: this.FALLBACK_TIMEOUT });
       logger.info('[ACTION_EXECUTOR] Click successful after scroll offset');
-      return false;
+      return { usedForce: false, blockerInfo };
     } catch {
       // Continue to next stage
     }
 
-    // Stage 4: Brief wait (for transient overlays)
+    // Stage 5: Brief wait (for transient overlays)
     try {
       await this.page.waitForTimeout(1000);
       await locator.click({ timeout: this.FALLBACK_TIMEOUT });
       logger.info('[ACTION_EXECUTOR] Click successful after brief wait');
-      return false;
+      return { usedForce: false, blockerInfo };
     } catch {
       // Continue to force click
     }
 
-    // Stage 5: Force click (last resort)
+    // Stage 6: Force click (last resort)
     logger.warn('[ACTION_EXECUTOR] All self-healing attempts failed, using force click');
     await locator.click({ timeout: this.FALLBACK_TIMEOUT, force: true });
-    return true; // Force was used
+    return { usedForce: true, blockerInfo };
   }
 
   /**
@@ -1354,6 +1410,189 @@ export class ActionExecutor {
 
     const msgLower = msg.toLowerCase();
     return interceptedIndicators.some((indicator) => msgLower.includes(indicator));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // LAYER 3: REACTIVE BLOCKER DETECTION
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Layer 3: Identify the exact element blocking a click via elementFromPoint.
+   * Called after "intercepts pointer events" error to determine WHAT is blocking
+   * and HOW to recover (scroll, dismiss, wait, etc.).
+   */
+  private async identifyBlocker(targetRef: string): Promise<BlockerInfo | null> {
+    // Minimal Layer 3 fallback patterns — only 3 types where recovery differs from default.
+    // All other classification is done by LLM (Layer 2 Observer Agent).
+    const fallbackPatterns = Object.fromEntries(
+      Object.entries(LAYER3_FALLBACK_PATTERNS).map(([k, v]) => [k, v.source])
+    );
+
+    try {
+      return await this.currentContext.evaluate(
+        ({ targetRef, fallbackPatterns }) => {
+          const target = document.querySelector(`[data-agent-ref="${targetRef}"]`);
+          if (!target) return null;
+
+          const rect = target.getBoundingClientRect();
+          const cx = rect.left + rect.width / 2;
+          const cy = rect.top + rect.height / 2;
+
+          // @ts-expect-error
+          if (cx < 0 || cx > window.innerWidth || cy < 0 || cy > window.innerHeight) {
+            return null; // Target out of viewport
+          }
+
+          const topEl = document.elementFromPoint(cx, cy);
+          if (!topEl) return null;
+
+          // Check if top element IS the target or contains/is contained by target
+          if (topEl === target || target.contains(topEl) || topEl.contains(target)) {
+            return null; // Not blocked
+          }
+
+          // It's a blocker — gather info
+          const blockerTag = topEl.tagName.toLowerCase();
+          const blockerClass = (topEl.getAttribute('class') || '').slice(0, 200);
+          const blockerText = (topEl.textContent || '').trim().slice(0, 100);
+          const blockerRef = topEl.getAttribute('data-agent-ref') || undefined;
+          const blockerRole = (topEl.getAttribute('role') || '').replace(/["']/g, '').trim();
+          const blockerAriaModal = (topEl.getAttribute('aria-modal') || '').replace(/["']/g, '').trim() === 'true';
+          const style = window.getComputedStyle(topEl);
+          const position = style.position;
+
+          // Classify blocker type — minimal reactive fallback
+          // ARIA + geometry + 3 key patterns only. LLM handles the rest.
+          let hintType: string = 'unknown';
+
+          // 1. ARIA modal signals
+          if (blockerRole === 'dialog' || blockerRole === 'alertdialog' || blockerAriaModal) {
+            hintType = 'modal';
+          }
+          // 2. Minimal fallback patterns (cookie, toast, loading — recovery differs from default)
+          else {
+            const idStr = (topEl.getAttribute('id') || '').toLowerCase();
+            const combined = blockerClass.toLowerCase() + ' ' + idStr;
+            for (const [type, source] of Object.entries(fallbackPatterns)) {
+              if (new RegExp(source, 'i').test(combined)) {
+                hintType = type;
+                break;
+              }
+            }
+          }
+          // 3. Position heuristics for sticky headers/footers
+          if (hintType === 'unknown') {
+            const bRect = topEl.getBoundingClientRect();
+            // @ts-expect-error
+            const vpH = window.innerHeight;
+            if ((position === 'sticky' || position === 'fixed') && bRect.top <= 5 && bRect.height < 120) {
+              hintType = 'sticky_header';
+            } else if ((position === 'sticky' || position === 'fixed') && bRect.bottom >= vpH - 5 && bRect.height < 120) {
+              hintType = 'sticky_footer';
+            }
+          }
+
+          // Map hintType to recovery action — only types that can be produced
+          const recoveryMap: Record<string, string> = {
+            modal: 'dismiss_escape',
+            cookie_consent: 'dismiss_button',
+            toast: 'wait',
+            sticky_header: 'scroll_around',
+            sticky_footer: 'scroll_around',
+            loading_overlay: 'wait',
+            unknown: 'dismiss_escape',
+          };
+
+          return {
+            blockerRef,
+            blockerTag,
+            blockerClass,
+            blockerText,
+            targetRef,
+            point: { x: Math.round(cx), y: Math.round(cy) },
+            hintType,
+            suggestedRecovery: recoveryMap[hintType] || 'dismiss_escape',
+          };
+        },
+        { targetRef, fallbackPatterns },
+      );
+    } catch (err) {
+      logger.debug('[ACTION_EXECUTOR] identifyBlocker error', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Layer 3: Attempt recovery based on blocker type.
+   * Returns true if recovery succeeded and click should be retried.
+   */
+  private async attemptBlockerRecovery(blocker: BlockerInfo): Promise<boolean> {
+    const recovery = blocker.suggestedRecovery;
+
+    try {
+      switch (recovery) {
+        case 'dismiss_escape': {
+          await this.currentContext.keyboard.press('Escape');
+          await this.page.waitForTimeout(300);
+          return true;
+        }
+        case 'dismiss_button': {
+          // Try to find and click a close button within the blocker
+          if (blocker.blockerRef) {
+            const blocker_el = this.currentContext.locator(`[data-agent-ref="${blocker.blockerRef}"]`);
+            try {
+              const closeBtn = blocker_el.locator(CLOSE_BUTTON_SELECTOR).first();
+              await closeBtn.click({ timeout: 2000 });
+              await this.page.waitForTimeout(300);
+              return true;
+            } catch {
+              // Fallback: try Escape
+              await this.currentContext.keyboard.press('Escape');
+              await this.page.waitForTimeout(300);
+              return true;
+            }
+          }
+          await this.currentContext.keyboard.press('Escape');
+          await this.page.waitForTimeout(300);
+          return true;
+        }
+        case 'scroll_around': {
+          // Scroll element further into center to avoid sticky header/footer
+          await this.currentContext.evaluate(() => {
+            // @ts-expect-error
+            window.scrollBy(0, -150);
+          });
+          await this.page.waitForTimeout(200);
+          return true;
+        }
+        case 'wait': {
+          await this.page.waitForTimeout(2000);
+          return true;
+        }
+        case 'click_away': {
+          // Click an empty area to dismiss dropdown/tooltip
+          await this.currentContext.evaluate(() => {
+            // @ts-expect-error
+            const emptyArea = document.elementFromPoint(10, window.innerHeight / 2);
+            if (emptyArea) {
+              (emptyArea as HTMLElement).click();
+            }
+          });
+          await this.page.waitForTimeout(300);
+          return true;
+        }
+        default:
+          return false;
+      }
+    } catch (err) {
+      logger.debug('[ACTION_EXECUTOR] blocker recovery failed', {
+        recovery,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
   }
 
   /**
@@ -1549,44 +1788,114 @@ export class ActionExecutor {
   }
 
   /**
-   * Detect active modal and get its text content
+   * Detect active modal and get its text content.
+   * Refactored: Uses iron-clad ARIA/spec selectors first (zero false positives),
+   * falls back to legacy heuristic only when Layer 2 is disabled.
    */
   private async detectActiveModalWithText(): Promise<{
     hasModal: boolean;
     ref?: string;
     text?: string;
   }> {
-    return await this.page.evaluate(() => {
-      // Find potential modals
-      const potentialModals = Array.from(document.querySelectorAll('*')).filter((el: Element) => {
+    const __mc = {
+      ironCladSelectors: IRON_CLAD_MODAL_SELECTORS,
+      enableLayer2: LITE_ENGINE_FLAGS.enableLayer2ObstacleClassification,
+      // Legacy fallback constants (only used when Layer 2 disabled)
+      overlaySelectors: MODAL_OVERLAY_SELECTORS,
+      positionalSelector: POSITIONAL_CANDIDATES_SELECTOR,
+      interactiveSelector: INTERACTIVE_CHILDREN_SELECTOR,
+      classRegexSource: MODAL_CLASS_REGEX.source,
+    };
+
+    return await this.page.evaluate((__mc) => {
+      // ═══════════════════════════════════════════════════════════════════════
+      // Phase 0: Native dialog[open] — always checked first
+      // ═══════════════════════════════════════════════════════════════════════
+      const nativeDialog = document.querySelector('dialog[open]');
+      if (nativeDialog) {
+        const style = window.getComputedStyle(nativeDialog);
+        if (style.display !== 'none' && style.visibility !== 'hidden') {
+          const ref = nativeDialog.getAttribute('data-agent-ref') || undefined;
+          const text = nativeDialog.textContent?.trim().slice(0, 500) || '';
+          return { hasModal: true, ref, text };
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // Phase 1: Iron-clad ARIA/spec selectors — zero false positives
+      // ═══════════════════════════════════════════════════════════════════════
+      const ironCladMatches = Array.from(
+        document.querySelectorAll(__mc.ironCladSelectors)
+      ).filter((el) => {
         const style = window.getComputedStyle(el);
-        if (style.position !== 'fixed' && style.position !== 'absolute') return false;
-        if (style.display === 'none' || style.visibility === 'hidden') return false;
-        if (parseFloat(style.opacity) < 0.1) return false;
+        return (
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          parseFloat(style.opacity) >= 0.1
+        );
+      });
+
+      if (ironCladMatches.length > 0) {
+        // Pick highest z-index among iron-clad matches
+        let bestModal = ironCladMatches[0];
+        let bestZ = parseInt(window.getComputedStyle(bestModal).zIndex, 10) || 0;
+        for (let i = 1; i < ironCladMatches.length; i++) {
+          const z = parseInt(window.getComputedStyle(ironCladMatches[i]).zIndex, 10) || 0;
+          if (z > bestZ) {
+            bestZ = z;
+            bestModal = ironCladMatches[i];
+          }
+        }
+        const ref = bestModal.getAttribute('data-agent-ref') || undefined;
+        const text = bestModal.textContent?.trim().slice(0, 500) || '';
+        return { hasModal: true, ref, text };
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // Phase 2: Legacy heuristic fallback (only when Layer 2 is disabled)
+      // When Layer 2 is enabled, the Observer handles classification
+      // ═══════════════════════════════════════════════════════════════════════
+      if (__mc.enableLayer2) {
+        return { hasModal: false };
+      }
+
+      // Legacy: Two-pass approach with coverage heuristics
+      const targetedModals = Array.from(document.querySelectorAll(__mc.overlaySelectors));
+      const positionalCandidates = Array.from(document.querySelectorAll(__mc.positionalSelector));
+
+      const seen = new WeakSet<Element>();
+      const potentialModals: Element[] = [];
+      for (const el of [...targetedModals, ...positionalCandidates]) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+
+        const style = window.getComputedStyle(el);
+        if (style.position !== 'fixed' && style.position !== 'absolute') continue;
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        if (parseFloat(style.opacity) < 0.1) continue;
 
         const zIndex = parseInt(style.zIndex, 10);
-        if (isNaN(zIndex) || zIndex < 1) return false;
+        if (isNaN(zIndex) || zIndex < 1) continue;
 
-        return true;
-      });
+        potentialModals.push(el);
+      }
 
       if (potentialModals.length === 0) return { hasModal: false };
 
-      // Find highest z-index modal
       let bestModal: Element | null = null;
       let highestZIndex = 0;
+
+      // @ts-expect-error
+      const viewportArea = window.innerWidth * window.innerHeight;
+      const popupRegex = new RegExp(__mc.classRegexSource, 'i');
 
       for (const modal of potentialModals) {
         const style = window.getComputedStyle(modal);
         const zIndex = parseInt(style.zIndex, 10);
         const rect = modal.getBoundingClientRect();
-
-        // @ts-expect-error
-        const viewportArea = window.innerWidth * window.innerHeight;
         const modalArea = rect.width * rect.height;
-        const coverage = modalArea / viewportArea;
+        const coverage = viewportArea > 0 ? modalArea / viewportArea : 0;
 
-        // ✅ FIX: Strip escaped quotes from role (Angular outputs role="\"dialog\"")
         const modalRoleRaw = (modal.getAttribute('role') || '').replace(/["']/g, '').trim();
         const hasModalRole = modalRoleRaw === 'dialog' ||
                              (modal.getAttribute('aria-modal') || '').replace(/["']/g, '').trim() === 'true' ||
@@ -1594,7 +1903,15 @@ export class ActionExecutor {
                              modal.classList.contains('overlay') ||
                              modal.classList.contains('popup');
 
-        const isModal = (hasModalRole && coverage > 0.1) || coverage > 0.3;
+        const classStr = (modal.getAttribute('class') || '').toLowerCase();
+        const hasPopupClass = popupRegex.test(classStr);
+        const hasInteractiveChildren = modal.querySelector(__mc.interactiveSelector) !== null;
+
+        const isModal =
+          (hasModalRole && coverage > 0.1) ||
+          coverage > 0.3 ||
+          (hasPopupClass && hasInteractiveChildren && coverage > 0.1) ||
+          (hasInteractiveChildren && zIndex > 10 && coverage > 0.15);
 
         if (isModal && zIndex > highestZIndex) {
           highestZIndex = zIndex;
@@ -1608,7 +1925,7 @@ export class ActionExecutor {
       const text = bestModal.textContent?.trim().slice(0, 500) || '';
 
       return { hasModal: true, ref, text };
-    });
+    }, __mc);
   }
 
   /**
@@ -1778,48 +2095,117 @@ export class ActionExecutor {
     logger.debug('[ACTION_EXECUTOR] Starting modal polling');
 
     while (Date.now() - startTime < MAX_WAIT_TIME) {
-      // Check for modal in current page state
-      const currentModalState = await this.page.evaluate(() => {
-        // Find potential overlay/modal containers
-        const potentialModals = Array.from(document.querySelectorAll('*')).filter((el: Element) => {
+      // Check for modal in current page state using iron-clad selectors
+      const __mc2 = {
+        ironCladSelectors: IRON_CLAD_MODAL_SELECTORS,
+        enableLayer2: LITE_ENGINE_FLAGS.enableLayer2ObstacleClassification,
+        // Legacy fallback constants (only used when Layer 2 disabled)
+        overlaySelectors: MODAL_OVERLAY_SELECTORS,
+        positionalSelector: POSITIONAL_CANDIDATES_SELECTOR,
+        interactiveSelector: INTERACTIVE_CHILDREN_SELECTOR,
+        classRegexSource: MODAL_CLASS_REGEX.source,
+      };
+
+      const currentModalState = await this.page.evaluate((__mc) => {
+        // Phase 0: Native dialog[open]
+        const nativeDialog = document.querySelector('dialog[open]');
+        if (nativeDialog) {
+          const style = window.getComputedStyle(nativeDialog);
+          if (style.display !== 'none' && style.visibility !== 'hidden') {
+            const rect = nativeDialog.getBoundingClientRect();
+            return {
+              ref: nativeDialog.getAttribute('data-agent-ref') || 'modal-detected',
+              rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            };
+          }
+        }
+
+        // Phase 1: Iron-clad ARIA/spec selectors
+        const ironCladMatches = Array.from(
+          document.querySelectorAll(__mc.ironCladSelectors)
+        ).filter((el) => {
           const style = window.getComputedStyle(el);
-          const position = style.position;
-
-          if (position !== 'fixed' && position !== 'absolute') return false;
-          if (style.display === 'none' || style.visibility === 'hidden') return false;
-          if (parseFloat(style.opacity) < 0.1) return false;
-
-          // ✅ FIX: Use same z-index threshold as SnapshotCollector (zIndex >= 1)
-          const zIndex = parseInt(style.zIndex, 10);
-          if (isNaN(zIndex) || zIndex < 1) return false;
-
-          return true;
+          return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            parseFloat(style.opacity) >= 0.1
+          );
         });
+
+        if (ironCladMatches.length > 0) {
+          let bestModal = ironCladMatches[0];
+          let bestZ = parseInt(window.getComputedStyle(bestModal).zIndex, 10) || 0;
+          for (let i = 1; i < ironCladMatches.length; i++) {
+            const z = parseInt(window.getComputedStyle(ironCladMatches[i]).zIndex, 10) || 0;
+            if (z > bestZ) {
+              bestZ = z;
+              bestModal = ironCladMatches[i];
+            }
+          }
+          const rect = bestModal.getBoundingClientRect();
+          return {
+            ref: bestModal.getAttribute('data-agent-ref') || 'modal-detected',
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          };
+        }
+
+        // Phase 2: Legacy heuristic fallback (only when Layer 2 is disabled)
+        if (__mc.enableLayer2) {
+          return { ref: null, rect: null };
+        }
+
+        // Legacy: Two-pass approach
+        const targetedModals = Array.from(document.querySelectorAll(__mc.overlaySelectors));
+        const positionalCandidates = Array.from(document.querySelectorAll(__mc.positionalSelector));
+
+        const seen = new WeakSet();
+        const potentialModals: Element[] = [];
+        for (const el of [...targetedModals, ...positionalCandidates]) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+
+          const style = window.getComputedStyle(el);
+          if (style.position !== 'fixed' && style.position !== 'absolute') continue;
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          if (parseFloat(style.opacity) < 0.1) continue;
+
+          const zIndex = parseInt(style.zIndex, 10);
+          if (isNaN(zIndex) || zIndex < 1) continue;
+
+          potentialModals.push(el);
+        }
 
         if (potentialModals.length === 0) return { ref: null, rect: null };
 
-        // Find highest z-index modal
         let bestModal: Element | null = null;
         let highestZIndex = 0;
+
+        // @ts-expect-error - window available in browser context
+        const viewportArea = window.innerWidth * window.innerHeight;
+        const popupRegex = new RegExp(__mc.classRegexSource, 'i');
 
         for (const modal of potentialModals) {
           const style = window.getComputedStyle(modal);
           const zIndex = parseInt(style.zIndex, 10);
           const rect = modal.getBoundingClientRect();
-
-          // @ts-expect-error - window available in browser context
-          const viewportArea = window.innerWidth * window.innerHeight;
           const modalArea = rect.width * rect.height;
-          const coverage = modalArea / viewportArea;
+          const coverage = viewportArea > 0 ? modalArea / viewportArea : 0;
 
-          // ✅ FIX: Strip escaped quotes from role (Angular outputs role="\"dialog\"")
           const modalRoleRaw2 = (modal.getAttribute('role') || '').replace(/["']/g, '').trim();
           const hasModalRole = modalRoleRaw2 === 'dialog' ||
                                (modal.getAttribute('aria-modal') || '').replace(/["']/g, '').trim() === 'true' ||
                                modal.classList.contains('modal') ||
                                modal.classList.contains('overlay');
 
-          const isModal = (hasModalRole && coverage > 0.2) || coverage > 0.4;
+          const classStr = (modal.getAttribute('class') || '').toLowerCase();
+          const hasPopupClass = popupRegex.test(classStr);
+          const hasInteractiveChildren = modal.querySelector(__mc.interactiveSelector) !== null;
+
+          const isModal =
+            (hasModalRole && coverage > 0.2) ||
+            coverage > 0.4 ||
+            (hasPopupClass && hasInteractiveChildren && coverage > 0.1) ||
+            (hasInteractiveChildren && zIndex > 10 && coverage > 0.15);
 
           if (isModal && zIndex > highestZIndex) {
             highestZIndex = zIndex;
@@ -1836,7 +2222,7 @@ export class ActionExecutor {
         }
 
         return { ref: null, rect: null };
-      });
+      }, __mc2);
 
       // Check if modal appeared
       if (currentModalState.ref && !lastModalState.ref) {

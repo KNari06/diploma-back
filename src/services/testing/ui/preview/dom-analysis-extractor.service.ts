@@ -123,6 +123,23 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.isInsideActiveModal = true;
   }
 
+  // Phase 4: Propagate custom component interactivity signals
+  if (element.frameworkClickable) {
+    node.frameworkClickable = element.frameworkClickable;
+  }
+  if (element.isContentEditable) {
+    node.isContentEditable = true;
+  }
+  if (element.tabIndex !== undefined) {
+    node.tabIndex = element.tabIndex;
+  }
+  if (element.hasOnclick) {
+    node.hasOnclick = true;
+  }
+  if (element.hasAriaHaspopup) {
+    node.hasAriaHaspopup = true;
+  }
+
   // Add context as container hints (legacy compatibility)
   if (element.context) {
     // Parse context string like "inside: Form 'Login'"

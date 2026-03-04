@@ -7,8 +7,16 @@
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
+import {
+  MODAL_OVERLAY_SELECTORS,
+  POSITIONAL_CANDIDATES_SELECTOR,
+  INTERACTIVE_CHILDREN_SELECTOR,
+  MODAL_CLASS_REGEX,
+  IRON_CLAD_MODAL_SELECTORS,
+  CLOSE_BUTTON_SELECTOR,
+} from '@/agent/utils/selectors/modal-detection';
 import type { Page } from 'playwright';
-import type { LiteElement, LiteSnapshot } from '../lite-types';
+import type { LiteElement, LiteSnapshot, ObstacleFact } from '../lite-types';
 import { VisualStability } from './visual-stability';
 
 export class SnapshotCollector {
@@ -36,9 +44,22 @@ export class SnapshotCollector {
         }
       });
 
+      // Modal detection constants (passed into browser context)
+      const __modalConsts = {
+        overlaySelectors: MODAL_OVERLAY_SELECTORS,
+        positionalSelector: POSITIONAL_CANDIDATES_SELECTOR,
+        interactiveSelector: INTERACTIVE_CHILDREN_SELECTOR,
+        classRegexSource: MODAL_CLASS_REGEX.source,
+        // Layer 1: Iron-clad modal selectors (zero false positives)
+        ironCladSelectors: IRON_CLAD_MODAL_SELECTORS,
+        closeButtonSelector: CLOSE_BUTTON_SELECTOR,
+        // Feature flags
+        enableLayer2: LITE_ENGINE_FLAGS.enableLayer2ObstacleClassification,
+      };
+
       // Collect snapshot in page context
       // @ts-expect-error - DOM types available in browser context
-      const snapshot = await page.evaluate(() => {
+      const snapshot = await page.evaluate((__mc) => {
         const elements: any[] = [];
         // Keep stable refs across snapshots to enable meaningful diffs.
         // Use monotonic counter stored on window to avoid reassigning refs every time.
@@ -101,11 +122,15 @@ export class SnapshotCollector {
 
         /**
          * Detect active modal/overlay
-         * Visual detection: position fixed/absolute + viewport coverage + z-index
-         * Returns ref of modal container if found
+         *
+         * Layer 1 (iron-clad): Uses only ARIA/spec signals with zero false positive risk.
+         * When Layer 2 is disabled (feature flag off), falls back to the legacy 4-rule
+         * coverage heuristic for backward compatibility.
+         *
+         * Returns ref of modal container if found.
          */
         const detectActiveModal = (): string | undefined => {
-          // ✅ FIX: Check for native <dialog> elements first (showModal() uses ::backdrop, not position:fixed)
+          // Phase 0: Check for native <dialog> elements first (showModal() uses ::backdrop, not position:fixed)
           const openDialogs = Array.from(document.querySelectorAll('dialog[open]'));
           for (const dialog of openDialogs) {
             const style = window.getComputedStyle(dialog);
@@ -118,125 +143,103 @@ export class SnapshotCollector {
             return newRef;
           }
 
-          // ✅ PERF FIX: Use targeted selectors instead of querySelectorAll('*')
-          // Only check elements that are likely to be overlays (positioned with z-index)
-          const overlaySelectors = [
-            '[role="dialog"]', '[aria-modal="true"]',
-            '.modal', '.overlay', '.popup', '.drawer',
-            '[class*="modal"]', '[class*="overlay"]', '[class*="popup"]',
-            '[class*="dialog"]', '[class*="backdrop"]',
-            // ✅ FIX: Catch more custom popup patterns used by modern frameworks
-            '[class*="dropdown"]', '[class*="popover"]', '[class*="sheet"]',
-            '[class*="lightbox"]', '[class*="flyout"]',
-            '[role="alertdialog"]', '[role="menu"]',
-          ].join(', ');
+          // ═══════════════════════════════════════════════════════════════
+          // LAYER 1: Iron-clad selectors — zero false positives
+          // Only matches: [role="dialog"], [role="alertdialog"], [aria-modal="true"],
+          // dialog[open], Radix/Headless/Reach dialog roles, .swal2-container
+          // ═══════════════════════════════════════════════════════════════
+          const ironCladMatches = Array.from(document.querySelectorAll(__mc.ironCladSelectors));
+          let bestIronClad: Element | null = null;
+          let highestIronCladZ = -1;
 
-          // Collect from targeted selectors + all fixed/absolute positioned elements
-          // Use a two-pass approach: first targeted (cheap), then positional (more expensive but limited)
-          const targetedModals = Array.from(document.querySelectorAll(overlaySelectors));
-
-          // Second pass: fixed/absolute elements with z-index (limited to direct body children + common containers)
-          const positionalCandidates = Array.from(document.querySelectorAll(
-            'body > *, body > * > *, [style*="position: fixed"], [style*="position:fixed"], [style*="position: absolute"], [style*="position:absolute"]'
-          ));
-
-          // Merge and deduplicate
-          const seen = new WeakSet<Element>();
-          const potentialModals: Element[] = [];
-          for (const el of [...targetedModals, ...positionalCandidates]) {
-            if (seen.has(el)) continue;
-            seen.add(el);
-
+          for (const el of ironCladMatches) {
             const style = window.getComputedStyle(el);
-            const position = style.position;
-
-            // Must be fixed or absolute
-            if (position !== 'fixed' && position !== 'absolute') continue;
-
-            // Must be visible
             if (style.display === 'none' || style.visibility === 'hidden') continue;
             if (parseFloat(style.opacity) < 0.1) continue;
 
-            // Get z-index (must be present, allow any positive value)
-            const zIndex = parseInt(style.zIndex, 10);
-            if (isNaN(zIndex) || zIndex < 1) continue;
-
-            potentialModals.push(el);
-          }
-
-          if (potentialModals.length === 0) return undefined;
-
-          // ✅ FIX: Find modal with highest RELATIVE z-index among all potential modals
-          // This works even if site uses low z-index values (10, 20, 50)
-          let bestModal: Element | null = null;
-          let highestZIndex = -1;
-
-          // @ts-expect-error - window available in browser context
-          const vpW = window.innerWidth;
-          // @ts-expect-error - window available in browser context
-          const vpH = window.innerHeight;
-          const viewportArea = vpW * vpH;
-
-          for (const modal of potentialModals) {
-            const style = window.getComputedStyle(modal);
-            const zIndex = parseInt(style.zIndex, 10);
-            const rect = modal.getBoundingClientRect();
-
-            // Calculate viewport coverage
-            const modalArea = rect.width * rect.height;
-            const coverage = viewportArea > 0 ? modalArea / viewportArea : 0;
-
-            // Check for modal indicators
-            // ✅ FIX: Strip escaped quotes from role attribute (Angular outputs role="\"dialog\"")
-            const modalRole = (modal.getAttribute('role') || '').replace(/["']/g, '').trim();
-            const classStr = (modal.getAttribute('class') || '').toLowerCase();
-            const hasModalRole = modalRole === 'dialog' ||
-              modalRole === 'alertdialog' ||
-              getCleanAttr(modal, 'aria-modal') === 'true' ||
-              modal.classList.contains('modal') ||
-              modal.classList.contains('overlay') ||
-              modal.classList.contains('popup');
-
-            // ✅ FIX: Detect custom popups via class name patterns
-            // Many frameworks use class names like "popover", "dropdown-menu", "sheet", "flyout"
-            const hasPopupClass = /modal|overlay|popup|popover|dialog|drawer|sheet|lightbox|flyout/i.test(classStr);
-
-            // ✅ FIX: Check if element has interactive children (real popup content, not just a backdrop)
-            // A popup with buttons/inputs inside is more likely to be the actual modal content
-            const hasInteractiveChildren = modal.querySelector(
-              'button, a, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="checkbox"], [role="radio"], [tabindex]:not([tabindex="-1"])'
-            ) !== null;
-
-            // Accept if:
-            // 1. Has modal role/class AND covers >20% viewport, OR
-            // 2. Covers >40% viewport with any z-index, OR
-            // 3. ✅ NEW: Has popup-like class + interactive children + covers >10% viewport
-            //    (catches custom popups like selection dialogs, drawers with forms, etc.)
-            // 4. ✅ NEW: Has interactive children + high z-index (>10) + covers >15% viewport
-            //    (catches popups without any standard class names)
-            const isModal =
-              (hasModalRole && coverage > 0.2) ||
-              coverage > 0.4 ||
-              (hasPopupClass && hasInteractiveChildren && coverage > 0.1) ||
-              (hasInteractiveChildren && zIndex > 10 && coverage > 0.15);
-
-            // ✅ FIX: Pick modal with highest z-index (relative comparison)
-            if (isModal && zIndex > highestZIndex) {
-              highestZIndex = zIndex;
-              bestModal = modal;
+            const zIndex = parseInt(style.zIndex, 10) || 0;
+            if (zIndex > highestIronCladZ) {
+              highestIronCladZ = zIndex;
+              bestIronClad = el;
             }
           }
 
-          if (bestModal) {
-            // Assign ref to modal if not already present
-            const existingRef = bestModal.getAttribute('data-agent-ref');
-            if (existingRef) {
-              return existingRef;
-            }
-
+          if (bestIronClad) {
+            const existingRef = bestIronClad.getAttribute('data-agent-ref');
+            if (existingRef) return existingRef;
             const newRef = `e${win.__agentRefCounter++}`;
-            bestModal.setAttribute('data-agent-ref', newRef);
+            bestIronClad.setAttribute('data-agent-ref', newRef);
             return newRef;
+          }
+
+          // ═══════════════════════════════════════════════════════════════
+          // FALLBACK: When Layer 2 is disabled, use legacy coverage heuristic
+          // to avoid missing modals that don't have ARIA roles.
+          // When Layer 2 is enabled, ambiguous elements are collected as
+          // ObstacleFacts and classified by the Observer LLM instead.
+          // ═══════════════════════════════════════════════════════════════
+          if (!__mc.enableLayer2) {
+            // Legacy 4-rule heuristic (kept for backward compatibility)
+            const targetedModals = Array.from(document.querySelectorAll(__mc.overlaySelectors));
+            const positionalCandidates = Array.from(document.querySelectorAll(__mc.positionalSelector));
+            const seen = new WeakSet<Element>();
+            const potentialModals: Element[] = [];
+            for (const el of [...targetedModals, ...positionalCandidates]) {
+              if (seen.has(el)) continue;
+              seen.add(el);
+              const style = window.getComputedStyle(el);
+              if (style.position !== 'fixed' && style.position !== 'absolute') continue;
+              if (style.display === 'none' || style.visibility === 'hidden') continue;
+              if (parseFloat(style.opacity) < 0.1) continue;
+              const zIndex = parseInt(style.zIndex, 10);
+              if (isNaN(zIndex) || zIndex < 1) continue;
+              potentialModals.push(el);
+            }
+
+            if (potentialModals.length === 0) return undefined;
+
+            let bestModal: Element | null = null;
+            let highestZIndex = -1;
+            // @ts-expect-error - window available in browser context
+            const vpW = window.innerWidth;
+            // @ts-expect-error - window available in browser context
+            const vpH = window.innerHeight;
+            const viewportArea = vpW * vpH;
+
+            for (const modal of potentialModals) {
+              const style = window.getComputedStyle(modal);
+              const zIndex = parseInt(style.zIndex, 10);
+              const rect = modal.getBoundingClientRect();
+              const modalArea = rect.width * rect.height;
+              const coverage = viewportArea > 0 ? modalArea / viewportArea : 0;
+              const modalRole = (modal.getAttribute('role') || '').replace(/["']/g, '').trim();
+              const classStr = (modal.getAttribute('class') || '').toLowerCase();
+              const hasModalRole = modalRole === 'dialog' ||
+                modalRole === 'alertdialog' ||
+                getCleanAttr(modal, 'aria-modal') === 'true' ||
+                modal.classList.contains('modal') ||
+                modal.classList.contains('overlay') ||
+                modal.classList.contains('popup');
+              const hasPopupClass = new RegExp(__mc.classRegexSource, 'i').test(classStr);
+              const hasInteractiveChildren = modal.querySelector(__mc.interactiveSelector) !== null;
+              const isModal =
+                (hasModalRole && coverage > 0.2) ||
+                coverage > 0.4 ||
+                (hasPopupClass && hasInteractiveChildren && coverage > 0.1) ||
+                (hasInteractiveChildren && zIndex > 10 && coverage > 0.15);
+              if (isModal && zIndex > highestZIndex) {
+                highestZIndex = zIndex;
+                bestModal = modal;
+              }
+            }
+
+            if (bestModal) {
+              const existingRef = bestModal.getAttribute('data-agent-ref');
+              if (existingRef) return existingRef;
+              const newRef = `e${win.__agentRefCounter++}`;
+              bestModal.setAttribute('data-agent-ref', newRef);
+              return newRef;
+            }
           }
 
           return undefined;
@@ -352,6 +355,130 @@ export class SnapshotCollector {
 
         // Detect transient state
         const transientState = detectTransientState();
+
+        // ═══════════════════════════════════════════════════════════════
+        // LAYER 2: Collect ObstacleFacts for LLM classification
+        // Runs when enableLayer2 is true. Collects structured facts about
+        // ALL positioned elements (modals, cookie banners, chat widgets,
+        // sticky headers, toast notifications, etc.) for the Observer to classify.
+        // ═══════════════════════════════════════════════════════════════
+        const collectObstacleFacts = (): any[] => {
+          if (!__mc.enableLayer2) return [];
+
+          // @ts-expect-error - window available in browser context
+          const vpW = window.innerWidth;
+          // @ts-expect-error - window available in browser context
+          const vpH = window.innerHeight;
+          const viewportArea = vpW * vpH;
+          if (viewportArea === 0) return [];
+
+          // Gather candidates: positional elements + iron-clad modal matches
+          // POSITIONAL_CANDIDATES_SELECTOR catches ALL positioned elements
+          // (cookie banners, chat widgets, toasts are ALL position:fixed/absolute).
+          // No need for dismissible selectors — LLM classifies from raw data.
+          const positionalCandidates = Array.from(document.querySelectorAll(__mc.positionalSelector));
+          const ironCladMatches = Array.from(document.querySelectorAll(__mc.ironCladSelectors));
+
+          // Dedup
+          const seen = new WeakSet<Element>();
+          const candidates: Element[] = [];
+          for (const el of [...ironCladMatches, ...positionalCandidates]) {
+            if (seen.has(el)) continue;
+            seen.add(el);
+            candidates.push(el);
+          }
+
+          const facts: any[] = [];
+
+          for (const el of candidates) {
+            const style = window.getComputedStyle(el);
+            const position = style.position;
+
+            // Must be fixed, absolute, or sticky (positioned elements only)
+            if (position !== 'fixed' && position !== 'absolute' && position !== 'sticky') continue;
+
+            // Must be visible
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            if (parseFloat(style.opacity) < 0.1) continue;
+
+            // Get z-index (allow sticky with z-index 0)
+            const zIndex = parseInt(style.zIndex, 10);
+            if (isNaN(zIndex)) continue;
+            if (position !== 'sticky' && zIndex < 1) continue;
+
+            // Calculate viewport coverage
+            const rect = el.getBoundingClientRect();
+            const area = rect.width * rect.height;
+            const coverage = area / viewportArea;
+
+            // Skip tiny elements (floating icons, small badges)
+            if (coverage < 0.03) continue;
+
+            // Get element info — raw facts for LLM classification
+            const tag = el.tagName.toLowerCase();
+            const className = (el.getAttribute('class') || '').slice(0, 200);
+            const textPreview = (el.textContent || '').trim().slice(0, 200);
+            const idAttr = (el.getAttribute('id') || '').slice(0, 100);
+            const role = (el.getAttribute('role') || '').replace(/["']/g, '').trim() || undefined;
+            const ariaModal = (el.getAttribute('aria-modal') || '').replace(/["']/g, '').trim() === 'true' || undefined;
+
+            // Check for close button and interactive children
+            const hasCloseButton = el.querySelector(__mc.closeButtonSelector) !== null;
+            const hasInteractiveChildren = el.querySelector(__mc.interactiveSelector) !== null;
+
+            // Assign ref if not already present
+            let ref = el.getAttribute('data-agent-ref');
+            if (!ref) {
+              ref = `e${win.__agentRefCounter++}`;
+              el.setAttribute('data-agent-ref', ref);
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // hintType: ONLY W3C spec signals + geometry (zero regex)
+            // All other classification is 100% LLM (Observer Agent Layer 2)
+            // ═══════════════════════════════════════════════════════════
+            let hintType = 'unknown';
+
+            // W3C ARIA spec signals (zero false positives)
+            if (role === 'dialog' || role === 'alertdialog' || ariaModal) {
+              hintType = 'modal';
+            }
+            // Physical layout signals (geometry, not class names)
+            else if ((position === 'sticky' || position === 'fixed') && rect.top <= 5 && rect.height < 120) {
+              hintType = 'sticky_header';
+            } else if ((position === 'sticky' || position === 'fixed') && rect.bottom >= vpH - 5 && rect.height < 120) {
+              hintType = 'sticky_footer';
+            }
+
+            facts.push({
+              ref,
+              tag,
+              position,
+              zIndex,
+              coverage: Math.round(coverage * 1000) / 1000, // 3 decimal places
+              className,
+              textPreview,
+              id: idAttr || undefined,
+              hasCloseButton,
+              hasInteractiveChildren,
+              role,
+              ariaModal,
+              rect: {
+                top: Math.round(rect.top),
+                left: Math.round(rect.left),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+              },
+              hintType,
+            });
+          }
+
+          // Sort by z-index descending, take top 8
+          facts.sort((a: any, b: any) => b.zIndex - a.zIndex);
+          return facts.slice(0, 8);
+        };
+
+        const obstacleFacts = collectObstacleFacts();
 
         // ✅ FIX: Cache modal element for efficient lookup
         const activeModalElement = activeModalRef
@@ -930,6 +1057,27 @@ export class SnapshotCollector {
               parentRefChain: parentRefChain.length > 0 ? parentRefChain : undefined,
               containerRef,
               containerTitles: containerTitles.length > 0 ? containerTitles : undefined,
+
+              // Phase 4: Custom component interactivity signals
+              // Detect framework event bindings (React/Vue/Angular synthetic events)
+              frameworkClickable: (() => {
+                try {
+                  const keys = Object.keys(el);
+                  for (let k = 0; k < keys.length; k++) {
+                    const key = keys[k];
+                    if (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$') || key.startsWith('__reactEvents$')) return 'react' as const;
+                  }
+                  // @ts-expect-error - Vue internals
+                  if ((el as any).__vue__ || (el as any).__vueParentComponent) return 'vue' as const;
+                  // @ts-expect-error - Angular internals
+                  if ((el as any).__ngContext__ || (el as any)._ngHost) return 'angular' as const;
+                } catch { /* ignore */ }
+                return undefined;
+              })(),
+              isContentEditable: (el.getAttribute('contenteditable') === 'true' || el.getAttribute('contenteditable') === '') || undefined,
+              tabIndex: el.getAttribute('tabindex') !== null ? parseInt(el.getAttribute('tabindex') as string, 10) : undefined,
+              hasOnclick: el.hasAttribute('onclick') || undefined,
+              hasAriaHaspopup: el.hasAttribute('aria-haspopup') || undefined,
             });
           } catch (err) {
             // Skip element if any error
@@ -1249,13 +1397,14 @@ export class SnapshotCollector {
           elements,
           timestamp: Date.now(),
           activeModalRef, // Include detected modal ref
+          obstacleFacts: obstacleFacts.length > 0 ? obstacleFacts : undefined, // Layer 2: positioned element facts for LLM
           transientState, // Include transient state info (loading indicators)
           pageTextForExtraction, // For credential extraction only
           metadata, // P0: Visual content metadata for proactive vision detection
           pageStructure, // Manus: Tables, lists, pagination detection
           pageAlerts: pageAlerts.length > 0 ? pageAlerts.slice(0, 5) : undefined, // Max 5 alerts
         };
-      });
+      }, __modalConsts);
 
       // logger.debug('[SNAPSHOT_COLLECTOR] Collected snapshot', {
       //   url: snapshot.url,

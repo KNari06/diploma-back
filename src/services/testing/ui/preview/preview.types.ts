@@ -107,6 +107,14 @@ export interface InteractiveNode {
   nearestLandmark?: string;
   /** Phase 4: Framework event binding detected (React/Vue/Angular) */
   frameworkClickable?: 'react' | 'vue' | 'angular';
+  /** Phase 4: Element has contenteditable="true" (rich text editor, inline text field) */
+  isContentEditable?: boolean;
+  /** Phase 4: Element has tabindex >= 0 (explicitly keyboard-focusable) */
+  tabIndex?: number;
+  /** Phase 4: Element has onclick attribute or inline click handler */
+  hasOnclick?: boolean;
+  /** Phase 4: Element has aria-haspopup attribute (popup trigger) */
+  hasAriaHaspopup?: boolean;
 }
 
 /**

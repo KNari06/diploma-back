@@ -515,8 +515,31 @@ export function buildAllowedSets(
         const isSelectSoftTag = actionType === 'select' && !tagMatches && !roleMatches
           && SELECT_SOFT_TAGS.has(node.tag.toLowerCase());
 
+        // Phase 4: Soft-allow framework-clickable elements for click action.
+        // React/Vue/Angular elements with synthetic events look non-interactive by tag alone.
+        // Also soft-allow any element with onclick, tabindex >= 0, or aria-expanded/aria-haspopup.
+        const hasClickSignal =
+          actionType === 'click' &&
+          !tagMatches &&
+          !roleMatches &&
+          (
+            !!node.frameworkClickable ||
+            !!node.hasOnclick ||
+            (node.tabIndex !== undefined && node.tabIndex >= 0) ||
+            node.ariaExpanded !== undefined ||
+            node.hasAriaHaspopup
+          );
+
+        // Phase 4: Soft-allow contenteditable elements for type action.
+        const isContentEditable =
+          actionType === 'type' &&
+          !tagMatches &&
+          !isNonStandardTextbox &&
+          !roleMatches &&
+          !!node.isContentEditable;
+
         // Exception: allow non-standard textbox components for type as SoftAllowed.
-        if (!tagMatches && !isNonStandardTextbox && !roleMatches && !isSelectSoftTag) {
+        if (!tagMatches && !isNonStandardTextbox && !roleMatches && !isSelectSoftTag && !hasClickSignal && !isContentEditable) {
           excluded = true;
           nodeRules.push({
             ruleId: 'tag.incompatible',
@@ -562,6 +585,27 @@ export function buildAllowedSets(
             version: 'v1',
             action: 'penalize',
             evidence: `tag=${node.tag} soft-allowed as potential custom dropdown trigger for select (no ARIA role)`,
+            affectedRefs: [node.ref],
+          });
+        } else if (hasClickSignal) {
+          // Phase 4: Framework-bound or explicitly interactive custom element.
+          // No standard ARIA role or interactive tag, but has a JS click signal.
+          isSoft = true;
+          nodeRules.push({
+            ruleId: 'structure.framework_clickable',
+            version: 'v4',
+            action: 'penalize',
+            evidence: `tag=${node.tag} soft-allowed for click: frameworkClickable=${node.frameworkClickable || false}, onclick=${!!node.hasOnclick}, tabIndex=${node.tabIndex}, ariaExpanded=${node.ariaExpanded}, ariaHaspopup=${!!node.hasAriaHaspopup}`,
+            affectedRefs: [node.ref],
+          });
+        } else if (isContentEditable) {
+          // Phase 4: contenteditable region (rich text editor, inline text field).
+          isSoft = true;
+          nodeRules.push({
+            ruleId: 'structure.contenteditable',
+            version: 'v4',
+            action: 'penalize',
+            evidence: `tag=${node.tag} with contenteditable soft-allowed for type/fill action`,
             affectedRefs: [node.ref],
           });
         }
@@ -859,6 +903,14 @@ export function buildCandidateText(node: InteractiveNode): string {
   // Test ID (useful for disambiguation)
   if (node.testIdAttr) {
     parts.push(`testid: ${node.testIdAttr}`);
+  }
+
+  // Phase 4: Custom component signals (rich text editor, framework buttons)
+  if (node.isContentEditable) {
+    parts.push('editable');
+  }
+  if (node.frameworkClickable) {
+    parts.push('interactive');
   }
 
   // Tag/role/type (last, for disambiguation)

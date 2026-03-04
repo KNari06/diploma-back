@@ -98,6 +98,17 @@ export const LITE_ENGINE_FLAGS = {
   enableShadowDOMCrosscheck: true,
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // OBSTACLE DETECTION (3-Layer Universal)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable Layer 2: Collect ObstacleFacts and pass to Observer for LLM classification.
+   *  When false, falls back to the old 4-rule coverage heuristic for modal detection. */
+  enableLayer2ObstacleClassification: true,
+
+  /** Enable Layer 3: Identify exact blocker via elementFromPoint after click failure.
+   *  Provides type-specific recovery (scroll, dismiss, wait) instead of blind force click. */
+  enableLayer3BlockerDetection: true,
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // SHADOW DOM SUPPORT (P1 Feature)
   // ═══════════════════════════════════════════════════════════════════════════
   /** Enable full Shadow DOM traversal in snapshot collector */

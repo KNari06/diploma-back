@@ -95,6 +95,20 @@ export interface LiteElement {
   containerRef?: string;
   /** Titles of key containers (form legend, fieldset legend, section heading) */
   containerTitles?: string[];
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 4: Custom component interactivity signals
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Framework event binding detected (React/Vue/Angular synthetic events) */
+  frameworkClickable?: 'react' | 'vue' | 'angular';
+  /** Element has contenteditable="true" (rich text editor, inline text field) */
+  isContentEditable?: boolean;
+  /** Element has tabindex >= 0 (explicitly keyboard-focusable) */
+  tabIndex?: number;
+  /** Element has onclick attribute or inline click handler */
+  hasOnclick?: boolean;
+  /** Element has aria-haspopup attribute (popup trigger) */
+  hasAriaHaspopup?: boolean;
 }
 
 /**
@@ -183,6 +197,8 @@ export interface LiteSnapshot {
   elements: LiteElement[];
   timestamp: number;
   activeModalRef?: string; // Ref of active modal container (if detected)
+  /** Structured facts about positioned elements for LLM obstacle classification (Layer 2) */
+  obstacleFacts?: ObstacleFact[];
   /** Transient state info (loading indicators) - NEW: Lite Autonomy v3 */
   transientState?: TransientStateInfo;
   /** Truncated page text for credential extraction only (never sent to LLM/logs) */
@@ -331,6 +347,94 @@ export interface ExecutionResult {
   modalDismissInfo?: ModalDismissInfo;
   /** Whether force click was used (for QA tracking) */
   usedForceClick?: boolean;
+  /** Layer 3: Exact blocker identified after click interception */
+  blockerInfo?: BlockerInfo;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIVERSAL OBSTACLE INTELLIGENCE (3-Layer)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Obstacle type classification — covers ALL UI blockers, not just modals.
+ * Used by Layer 1 (deterministic hints), Layer 2 (LLM classification),
+ * and Layer 3 (reactive blocker detection).
+ */
+export type ObstacleType =
+  | 'modal'              // Dialog, alertdialog, aria-modal (blocking, must dismiss)
+  | 'cookie_consent'     // GDPR/CCPA banners (blocking, auto-dismissible)
+  | 'chat_widget'        // Intercom/Drift/Zendesk (persistent, usually non-blocking)
+  | 'toast'              // Notification toasts (transient, wait or dismiss)
+  | 'sticky_header'      // Fixed headers/navbars (permanent, scroll around)
+  | 'sticky_footer'      // Fixed footers/cookie bars (permanent, scroll around)
+  | 'loading_overlay'    // Spinners, progress bars (transient, wait)
+  | 'dropdown'           // Open dropdown/menu (dismissible with Escape/click-away)
+  | 'tooltip'            // Tooltip/popover (transient, moves on hover)
+  | 'drawer'             // Side drawer/panel (blocking, dismiss with close/Escape)
+  | 'onboarding'         // Welcome tour/walkthrough (dismissible)
+  | 'paywall'            // Login wall/paywall (blocking, needs auth/payment)
+  | 'unknown';           // Unclassified positioned element
+
+/**
+ * Layer 2: Structured facts about positioned elements for LLM classification.
+ * Collected by snapshot-collector, passed to Observer for intelligent classification.
+ * Covers ALL positioned elements — modals, cookie banners, chat widgets,
+ * sticky headers, toast notifications, loading overlays, dropdowns, tooltips, etc.
+ */
+export interface ObstacleFact {
+  /** Element ref (e.g. "e42") */
+  ref: string;
+  /** HTML tag name */
+  tag: string;
+  /** CSS position property */
+  position: 'fixed' | 'absolute' | 'sticky';
+  /** Computed z-index */
+  zIndex: number;
+  /** Viewport coverage ratio (0-1) */
+  coverage: number;
+  /** CSS class names (first 200 chars) */
+  className: string;
+  /** Inner text preview (first 200 chars) */
+  textPreview: string;
+  /** HTML id attribute (first 100 chars) */
+  id?: string;
+  /** Whether element contains a close/dismiss button */
+  hasCloseButton: boolean;
+  /** Whether element contains interactive children (buttons, inputs, links) */
+  hasInteractiveChildren: boolean;
+  /** ARIA role if present */
+  role?: string;
+  /** aria-modal="true" if present */
+  ariaModal?: boolean;
+  /** Bounding rect in viewport coordinates */
+  rect: { top: number; left: number; width: number; height: number };
+  /** Deterministic pre-classification hint (may be wrong for ambiguous elements) */
+  hintType?: ObstacleType;
+  /** Refs of elements that this obstacle is visually covering */
+  coveredRefs?: string[];
+}
+
+/**
+ * Layer 3: Exact blocker identified via elementFromPoint after click interception.
+ * Provides precise identity of what blocked a click, enabling type-specific recovery.
+ */
+export interface BlockerInfo {
+  /** Ref of the blocking element (if it has data-agent-ref) */
+  blockerRef?: string;
+  /** HTML tag of the blocker */
+  blockerTag: string;
+  /** CSS class of the blocker (first 200 chars) */
+  blockerClass: string;
+  /** Text content preview of the blocker (first 100 chars) */
+  blockerText: string;
+  /** Ref of the target element that was blocked */
+  targetRef: string;
+  /** Coordinates where the click was attempted */
+  point: { x: number; y: number };
+  /** Deterministic guess of blocker type */
+  hintType?: ObstacleType;
+  /** Suggested recovery action based on blocker type */
+  suggestedRecovery?: 'dismiss_escape' | 'dismiss_button' | 'scroll_around' | 'wait' | 'click_away' | 'navigate_back';
 }
 
 /**
