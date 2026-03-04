@@ -125,6 +125,10 @@ export class SnapshotCollector {
             '.modal', '.overlay', '.popup', '.drawer',
             '[class*="modal"]', '[class*="overlay"]', '[class*="popup"]',
             '[class*="dialog"]', '[class*="backdrop"]',
+            // ✅ FIX: Catch more custom popup patterns used by modern frameworks
+            '[class*="dropdown"]', '[class*="popover"]', '[class*="sheet"]',
+            '[class*="lightbox"]', '[class*="flyout"]',
+            '[role="alertdialog"]', '[role="menu"]',
           ].join(', ');
 
           // Collect from targeted selectors + all fixed/absolute positioned elements
@@ -167,30 +171,54 @@ export class SnapshotCollector {
           let bestModal: Element | null = null;
           let highestZIndex = -1;
 
+          // @ts-expect-error - window available in browser context
+          const vpW = window.innerWidth;
+          // @ts-expect-error - window available in browser context
+          const vpH = window.innerHeight;
+          const viewportArea = vpW * vpH;
+
           for (const modal of potentialModals) {
             const style = window.getComputedStyle(modal);
             const zIndex = parseInt(style.zIndex, 10);
             const rect = modal.getBoundingClientRect();
 
             // Calculate viewport coverage
-            // @ts-expect-error - window available in browser context
-            const viewportArea = window.innerWidth * window.innerHeight;
             const modalArea = rect.width * rect.height;
-            const coverage = modalArea / viewportArea;
+            const coverage = viewportArea > 0 ? modalArea / viewportArea : 0;
 
             // Check for modal indicators
             // ✅ FIX: Strip escaped quotes from role attribute (Angular outputs role="\"dialog\"")
             const modalRole = (modal.getAttribute('role') || '').replace(/["']/g, '').trim();
+            const classStr = (modal.getAttribute('class') || '').toLowerCase();
             const hasModalRole = modalRole === 'dialog' ||
+              modalRole === 'alertdialog' ||
               getCleanAttr(modal, 'aria-modal') === 'true' ||
               modal.classList.contains('modal') ||
               modal.classList.contains('overlay') ||
               modal.classList.contains('popup');
 
+            // ✅ FIX: Detect custom popups via class name patterns
+            // Many frameworks use class names like "popover", "dropdown-menu", "sheet", "flyout"
+            const hasPopupClass = /modal|overlay|popup|popover|dialog|drawer|sheet|lightbox|flyout/i.test(classStr);
+
+            // ✅ FIX: Check if element has interactive children (real popup content, not just a backdrop)
+            // A popup with buttons/inputs inside is more likely to be the actual modal content
+            const hasInteractiveChildren = modal.querySelector(
+              'button, a, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="checkbox"], [role="radio"], [tabindex]:not([tabindex="-1"])'
+            ) !== null;
+
             // Accept if:
             // 1. Has modal role/class AND covers >20% viewport, OR
-            // 2. Covers >40% viewport with any z-index
-            const isModal = (hasModalRole && coverage > 0.2) || coverage > 0.4;
+            // 2. Covers >40% viewport with any z-index, OR
+            // 3. ✅ NEW: Has popup-like class + interactive children + covers >10% viewport
+            //    (catches custom popups like selection dialogs, drawers with forms, etc.)
+            // 4. ✅ NEW: Has interactive children + high z-index (>10) + covers >15% viewport
+            //    (catches popups without any standard class names)
+            const isModal =
+              (hasModalRole && coverage > 0.2) ||
+              coverage > 0.4 ||
+              (hasPopupClass && hasInteractiveChildren && coverage > 0.1) ||
+              (hasInteractiveChildren && zIndex > 10 && coverage > 0.15);
 
             // ✅ FIX: Pick modal with highest z-index (relative comparison)
             if (isModal && zIndex > highestZIndex) {
@@ -633,13 +661,23 @@ export class SnapshotCollector {
             const vh = window.innerHeight;
             if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) return;
 
+            // ═══════════════════════════════════════════════════════════════
+            // LAYER-AWARE VISIBILITY: Check if element is inside active modal/overlay FIRST.
+            // Elements inside the topmost layer (popup/dialog/overlay) should NEVER be
+            // filtered out by elementFromPoint — the user interacts with the popup, not the background.
+            // This mirrors real user behavior: when a popup is open, you see and click its elements.
+            // ═══════════════════════════════════════════════════════════════
+            const isInsideModal = activeModalElement ? activeModalElement.contains(el) : false;
+
             // Universal visibility check via elementFromPoint.
             // The browser tells us exactly what the user sees at the element's center pixel.
             // If the topmost element there is unrelated (neither itself, nor a descendant,
             // nor an ancestor), then this element is visually covered by something —
-            // overlay, popup, dropdown, sticky header, toast, etc. Skip it.
-            // We cache the result to avoid calling elementFromPoint twice per element
-            // (this same data is also used for `isTopMostAtCenter` below).
+            // overlay, popup, dropdown, sticky header, toast, etc.
+            // ✅ FIX: SKIP hit test for elements inside active modal/popup/overlay.
+            // Popups often have backdrops or layered structure where elementFromPoint
+            // returns the backdrop instead of the button inside the popup — causing
+            // legitimate interactive elements to be lost from the snapshot entirely.
             const cx = rect.left + rect.width / 2;
             const cy = rect.top + rect.height / 2;
             // @ts-expect-error - window available in browser context
@@ -655,7 +693,13 @@ export class SnapshotCollector {
                   // which won't match ancestor/descendant checks above.
                   // Check if the hit element is the shadow host that contains our element.
                   const elRoot = el.getRootNode();
-                  if (!(elRoot instanceof ShadowRoot && elRoot.host === hitTestTopEl)) {
+                  const isShadowHostMatch = elRoot instanceof ShadowRoot && elRoot.host === hitTestTopEl;
+
+                  // ✅ FIX: Don't filter out elements that are inside the active modal/popup.
+                  // Also check if the hit element itself is inside the same modal (sibling layers within popup).
+                  const hitIsInsideSameModal = isInsideModal && activeModalElement && activeModalElement.contains(hitTestTopEl);
+
+                  if (!isShadowHostMatch && !isInsideModal && !hitIsInsideSameModal) {
                     return;
                   }
                 }
@@ -711,10 +755,8 @@ export class SnapshotCollector {
             const input = el as any;
             const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';
 
-            // ✅ FIX: Check if element is inside active modal
-            const isInsideActiveModal = activeModalElement
-              ? activeModalElement.contains(el)
-              : false;
+            // ✅ FIX: Reuse early modal check (computed before hit test above)
+            const isInsideActiveModal = isInsideModal;
 
             // ✅ P1: Detect slotted content (light DOM content rendered in shadow DOM slot)
             // @ts-expect-error - assignedSlot is available on HTMLElement

@@ -2215,13 +2215,34 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         emitPageActionResult(socket, previewSessionId, 'reset', true);
         setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
 
-        // Inject a fresh screenshot frame after reset
+        // Restart video + devtools streams on the new page (old stream died with old page)
         setImmediate(async () => {
           try {
-            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
-            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
-          } catch {
-            // Non-critical
+            const { getPreviewVideoStreamRegistry, getPreviewDevToolsRegistry, getPreviewSessionService: getSvc } =
+              await import('@/services/testing/ui/preview');
+            const videoReg = getPreviewVideoStreamRegistry();
+            const devtoolsReg = getPreviewDevToolsRegistry();
+            const svc = getSvc();
+            const newPage = svc.getPage(previewSessionId, ensuredUserId);
+
+            if (!newPage) return;
+
+            const room = createRoomName('preview', previewSessionId);
+
+            // Stop old (already dead) stream, then start fresh on new page
+            await videoReg.stopStream(previewSessionId);
+            await videoReg.startStream(previewSessionId, ensuredUserId, room, newPage, socket.nsp);
+
+            // Restart devtools collectors on new page
+            devtoolsReg.stop(previewSessionId);
+            devtoolsReg.start(previewSessionId, room, newPage, socket.nsp);
+
+            logger.info('[PREVIEW_STREAM] Streams restarted after reset', { previewSessionId });
+          } catch (restartError) {
+            logger.warn('[PREVIEW_STREAM] Failed to restart streams after reset', {
+              previewSessionId,
+              error: restartError instanceof Error ? restartError.message : String(restartError),
+            });
           }
         });
 

@@ -118,6 +118,11 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.isTopMostAtCenter = element.isTopMostAtCenter;
   }
 
+  // Add isInsideActiveModal if available
+  if (element.isInsideActiveModal) {
+    node.isInsideActiveModal = true;
+  }
+
   // Add context as container hints (legacy compatibility)
   if (element.context) {
     // Parse context string like "inside: Form 'Login'"

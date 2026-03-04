@@ -339,6 +339,12 @@ export function buildAllowedSets(
           n.ariaLabel?.toLowerCase().includes('dialog'))))
   );
 
+  // ✅ FIX: Also detect modal presence via isInsideActiveModal flag from snapshot collector.
+  // Snapshot collector has a broader modal detection (covers custom popups, drawers, overlays)
+  // than the role-based check above. If ANY node has isInsideActiveModal=true,
+  // the snapshot collector detected an active modal/popup layer.
+  const hasModalFlaggedElements = nodes.some(n => n.isInsideActiveModal === true);
+
   // Position-aware: only treat as blocking modal if it covers significant viewport area
   // Cookie banners are typically small (< 30% viewport area) and positioned at edges
   let hasVisibleModal = false;
@@ -374,6 +380,19 @@ export function buildAllowedSets(
       // No bounding box info — fall back to treating it as blocking
       hasVisibleModal = true;
     }
+  } else if (hasModalFlaggedElements) {
+    // ✅ FIX: Snapshot collector detected an active modal/popup (broader detection)
+    // even though no node matched the role-based check above.
+    // Trust the snapshot collector's judgment — it uses z-index, positioning, coverage,
+    // and class-name heuristics to detect custom popups/overlays/drawers.
+    hasVisibleModal = true;
+    ruleTrace.push({
+      ruleId: 'modal.detected_via_snapshot',
+      version: 'v2',
+      action: 'exclude',
+      evidence: 'Modal/popup detected by snapshot collector (isInsideActiveModal flag present on nodes)',
+      affectedRefs: [],
+    });
   }
 
   if (hasVisibleModal) {
@@ -554,17 +573,23 @@ export function buildAllowedSets(
     // ═══════════════════════════════════════════════════════════════════════
 
     if (!excluded) {
-      // P1 CRITICAL: When modal is present, covered elements must be HARD excluded
-      // Otherwise, soft penalty only
+      // ✅ FIX: Layer-aware coverage logic.
+      // Elements INSIDE the active modal/popup are NEVER excluded for isTopMostAtCenter,
+      // because the user interacts with the popup layer, not the background.
+      // Elements OUTSIDE the modal with isTopMostAtCenter=false are background → exclude.
       if (node.isTopMostAtCenter === false) {
-        if (hasVisibleModal) {
-          // HARD exclude: element is behind modal layer
+        if (node.isInsideActiveModal) {
+          // Element is inside the popup/modal — keep it regardless of hit test.
+          // Popup backdrops can cause false negatives in elementFromPoint.
+          // No penalty: this is the active layer the user sees.
+        } else if (hasVisibleModal) {
+          // HARD exclude: element is behind modal layer (not inside it)
           excluded = true;
           nodeRules.push({
             ruleId: 'modal.background_element',
-            version: 'v1',
+            version: 'v2',
             action: 'exclude',
-            evidence: 'isTopMostAtCenter=false with modal present',
+            evidence: 'isTopMostAtCenter=false, not inside modal, modal present',
             affectedRefs: [node.ref],
           });
         } else {
@@ -637,11 +662,16 @@ export function buildAllowedSets(
   }
 
   // Log rule trace summary
+  const modalElementCount = hasVisibleModal
+    ? [...hardAllowed, ...softAllowed].filter(n => n.isInsideActiveModal).length
+    : 0;
   logger.debug('[EMBEDDINGS_RESOLVER] Built allowed sets', {
     hardAllowedCount: hardAllowed.length,
     softAllowedCount: softAllowed.length,
     rulesApplied: ruleTrace.length,
     shortCircuitRef,
+    hasVisibleModal,
+    modalElementCount,
   });
   
   return { hardAllowed, softAllowed, ruleTrace, shortCircuitRef };

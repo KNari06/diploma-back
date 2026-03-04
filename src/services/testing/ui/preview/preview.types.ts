@@ -63,6 +63,8 @@ export interface InteractiveNode {
   };
   /** True if element is topmost at its center (not covered by overlay) */
   isTopMostAtCenter?: boolean;
+  /** True if element is inside the active modal/popup/overlay layer */
+  isInsideActiveModal?: boolean;
   /** True if id looks like a dynamic GUID/random string */
   isDynamicId?: boolean;
 
