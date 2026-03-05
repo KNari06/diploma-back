@@ -643,63 +643,57 @@ export async function handlePlatformTest(
 
     // ═══════════════════════════════════════════════════════════════════════
     // EXPLORATION BRANCH — autonomous BFS discovery + multi-flow execution
+    // Requires explicit user confirmation before starting (expensive operation)
     // ═══════════════════════════════════════════════════════════════════════
     if (executionStrategy === 'exploration') {
-      const explorationId = `expl-${Date.now()}-${userId.slice(0, 8)}`;
-
-      logger.info('[PLATFORM_TEST] Dispatching exploration to queue', {
-        explorationId,
-        url: extractedUrl,
+      // Store pending exploration in Redis for confirmation flow
+      const pendingKey = `pending_exploration:${chatSessionId || userId}`;
+      const pendingData = JSON.stringify({
+        entryUrl: extractedUrl.trim(),
+        projectId: project_id,
         userId,
-        project_id,
+        chatSessionId,
+        workspaceId: workspace_id,
+        scopeHint: parsedIntent?.target || parsedIntent?.scope || undefined,
+        credentials: finalCredentials || undefined,
       });
+      await redisConnection.set(pendingKey, pendingData, 'EX', 600); // 10 min TTL
 
-      try {
-        await QueueManager.addExplorationJob({
-          explorationId,
-          entryUrl: extractedUrl.trim(),
-          projectId: project_id,
-          userId,
-          chatSessionId,
-          workspaceId: workspace_id,
-          scopeHint: parsedIntent?.target || parsedIntent?.scope || undefined,
-          credentials: finalCredentials || undefined,
-          maxConcurrency: 5,
-        });
+      const confirmationMessage =
+        `**Site Exploration** — **${extractedUrl}**\n\n` +
+        `This will autonomously explore the entire site, discover all pages, and generate test cases for every flow found.\n\n` +
+        `**Please note:**\n` +
+        `- Uses **significantly more credits** than a single test (5-20x depending on site size)\n` +
+        `- Takes **10-15 minutes** to complete\n` +
+        `- Explores up to 10 pages and 20 flows\n\n` +
+        `Do you want to proceed? Reply **yes** to start or **no** to cancel.`;
 
-        // Save user message to chat
-        if (chatSessionId) {
-          ChatService.saveChatMessages(chatSessionId, [
-            { role: 'user', content: message },
-            {
-              role: 'ai',
-              content: `Starting exploration of **${extractedUrl}**... I'll notify you when test cases are discovered.`,
-              metadata: { explorationId, mode: 'exploration', url: extractedUrl },
-            },
-          ]).catch(() => {});
-        }
-
-        // Release lock — job runs in worker
-        if (lockAcquired && chatSessionId) {
-          await releaseChatTestLock(chatSessionId);
-          lockAcquired = false;
-        }
-
-        res.json({
-          success: true,
-          reply: `Exploration started for **${extractedUrl}**. I'll notify you when test cases are discovered.`,
-          mode: 'exploration',
-          explorationId,
-          timestamp: new Date().toISOString(),
-          sessionId: chatSessionId,
-        });
-        return;
-      } catch (explorationError) {
-        logger.error('[PLATFORM_TEST] Failed to queue exploration, falling back to standard', {
-          error: explorationError instanceof Error ? explorationError.message : String(explorationError),
-        });
-        // Fallback: continue to standard run below
+      // Save messages
+      if (chatSessionId) {
+        ChatService.saveChatMessages(chatSessionId, [
+          { role: 'user', content: message },
+          {
+            role: 'ai',
+            content: confirmationMessage,
+            metadata: { mode: 'exploration_confirmation', url: extractedUrl },
+          },
+        ]).catch(() => {});
       }
+
+      // Release lock
+      if (lockAcquired && chatSessionId) {
+        await releaseChatTestLock(chatSessionId);
+        lockAcquired = false;
+      }
+
+      res.json({
+        success: true,
+        reply: confirmationMessage,
+        mode: 'exploration_confirmation',
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+      return;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
