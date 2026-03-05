@@ -1,9 +1,11 @@
+import { requireAuth, requireAdmin } from '@/middleware/auth.middleware';
 import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import {
   completeOAuthHandler,
   getOAuthUrlHandler,
+  getPendingUsers,
   login,
   logout,
   me,
@@ -13,6 +15,7 @@ import {
   sendMagicLink,
   signup,
   updateProfile,
+  updateUserStatus,
 } from './auth.controller';
 
 const router = Router();
@@ -696,5 +699,22 @@ router.put('/profile', asyncHandler(async (req: Request, res: Response) => {
     handleValidationError(error);
   }
 }));
+
+// ============================================================================
+// ADMIN: User approval management
+// ============================================================================
+
+/**
+ * GET /auth/users/pending
+ * List users pending approval (admin only)
+ */
+router.get('/users/pending', requireAuth, requireAdmin, asyncHandler(getPendingUsers));
+
+/**
+ * PATCH /auth/users/:userId/status
+ * Update user approval status (admin only)
+ * Body: { status: 'approved' | 'rejected' | 'pending_approval' }
+ */
+router.patch('/users/:userId/status', requireAuth, requireAdmin, asyncHandler(updateUserStatus));
 
 export default router;

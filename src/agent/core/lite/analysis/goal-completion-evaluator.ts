@@ -1,6 +1,6 @@
 /**
  * GoalCompletionEvaluator
- * AI-based post-action evaluator that asks gpt-4o-mini whether the user goal
+ * AI-based post-action evaluator that asks the AI whether the user goal
  * has been achieved by comparing BEFORE vs AFTER page state.
  *
  * Deterministic heuristics (URL transition, success keywords, form disappearance)
@@ -15,9 +15,10 @@
 import { logger } from '@/utils/core/logger';
 import type { GoalCompletionResult, LiteSnapshot, StateDiff } from '../lite-types';
 import { LitePromptBuilder } from '../prompt/lite-prompt-builder';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 
 const EVALUATOR_TIMEOUT_MS = 8000;
-const EVALUATOR_MODEL = 'gpt-4o-mini';
+const EVALUATOR_MODEL = AI_TASK_MODELS.goalDetection;
 const EVALUATOR_MAX_TOKENS = 350;
 
 export class GoalCompletionEvaluator {

@@ -7,12 +7,16 @@
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { v4 as uuidv4 } from 'uuid';
+import Redis from 'ioredis';
+import { connection } from '@/config/infrastructure/queues';
+
+export type ClarificationType = 'url' | 'credentials' | 'test_data' | 'payment_approval' | 'captcha_solve' | '2fa_code';
 
 export interface ClarificationRequest {
   testId: string;
   questionId: string;
   question: string;
-  type: 'url' | 'credentials' | 'test_data' | 'payment_approval';
+  type: ClarificationType;
   required: boolean;
   options?: string[];
   timeout?: number;
@@ -34,7 +38,7 @@ export class ClarificationService {
     testId: string;
     userId?: string;
     question: string;
-    type: 'url' | 'credentials' | 'test_data' | 'payment_approval';
+    type: ClarificationType;
     required?: boolean;
     options?: string[];
     timeout?: number;
@@ -229,5 +233,98 @@ export class ClarificationService {
       }
     });
     return count;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // REDIS-BASED CLARIFICATION (for worker process / exploration)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  private static redisClient: Redis | null = null;
+
+  private static getRedisClient(): Redis {
+    if (!this.redisClient) {
+      this.redisClient = new Redis(connection as any);
+    }
+    return this.redisClient;
+  }
+
+  /**
+   * Request clarification from user via Redis (for worker process).
+   * Used by exploration FlowRunner when captcha/2FA is encountered.
+   * Emits via WebSocket (Redis Pub/Sub fallback) and polls Redis for answer.
+   */
+  static async requestClarificationViaRedis(params: {
+    explorationId: string;
+    chatSessionId: string;
+    question: string;
+    type: 'captcha_solve' | '2fa_code';
+    timeout?: number;
+  }): Promise<string | null> {
+    const questionId = uuidv4();
+    const redisKey = `exploration:clarification:${questionId}`;
+    const timeout = params.timeout || 120_000; // 2 min for captcha
+
+    logger.info('[CLARIFICATION_SERVICE] Requesting clarification via Redis', {
+      explorationId: params.explorationId,
+      questionId,
+      type: params.type,
+      timeout,
+    });
+
+    // Emit clarification request via WebSocket (uses Redis Pub/Sub fallback in worker)
+    webSocketService.emitExplorationClarification({
+      explorationId: params.explorationId,
+      questionId,
+      question: params.question,
+      type: params.type,
+      timeout,
+      chatSessionId: params.chatSessionId,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Poll Redis for answer (worker can't receive WebSocket events directly)
+    const pollInterval = 2000;
+    const maxPolls = Math.ceil(timeout / pollInterval);
+    const redis = this.getRedisClient();
+
+    for (let i = 0; i < maxPolls; i++) {
+      await new Promise(r => setTimeout(r, pollInterval));
+      try {
+        const answer = await redis.get(redisKey);
+        if (answer) {
+          await redis.del(redisKey);
+          logger.info('[CLARIFICATION_SERVICE] Received Redis clarification answer', {
+            questionId,
+            explorationId: params.explorationId,
+          });
+          return answer;
+        }
+      } catch (error) {
+        logger.warn('[CLARIFICATION_SERVICE] Redis poll error', {
+          questionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    logger.warn('[CLARIFICATION_SERVICE] Redis clarification timed out', {
+      questionId,
+      explorationId: params.explorationId,
+    });
+    return null; // Timeout
+  }
+
+  /**
+   * Handle exploration clarification response (called from API/WebSocket handler).
+   * Stores answer in Redis so worker process can pick it up via polling.
+   */
+  static async handleExplorationClarificationResponse(questionId: string, answer: string): Promise<void> {
+    const redisKey = `exploration:clarification:${questionId}`;
+    const redis = this.getRedisClient();
+    await redis.set(redisKey, answer, 'EX', 300); // 5 min TTL
+
+    logger.info('[CLARIFICATION_SERVICE] Stored exploration clarification response in Redis', {
+      questionId,
+    });
   }
 }

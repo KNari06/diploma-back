@@ -24,14 +24,14 @@ import { env } from '@/config/environment/env';
  * Every AI call should use one of these instead of a hardcoded string.
  */
 export const AI_MODELS = {
-  /** High-quality model for complex reasoning, auditing, vision. Default: gpt-4o */
-  smart: env.OPENAI_MODEL || 'gpt-4o',
+  /** High-quality model for complex reasoning, auditing, vision. Default: gpt-4.1 */
+  smart: env.OPENAI_MODEL || 'gpt-4.1',
 
-  /** Fast/cheap model for classification, extraction, disambiguation. Default: gpt-4o-mini */
-  fast: env.OPENAI_MODEL_FAST || 'gpt-4o-mini',
+  /** Fast/cheap model for classification, extraction, disambiguation. Default: gemini-2.5-flash-lite */
+  fast: env.OPENAI_MODEL_FAST || 'gemini-2.5-flash-lite',
 
-  /** Vision-capable model for screenshot analysis. Default: gpt-4o */
-  vision: env.OPENAI_MODEL || 'gpt-4o',
+  /** Vision-capable model for screenshot analysis. Default: gpt-4.1 */
+  vision: env.OPENAI_MODEL || 'gpt-4.1',
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -82,6 +82,8 @@ export const AI_TASK_MODELS = {
   targetAudit: AI_MODELS.fast,
   /** Task plan building */
   taskPlanning: AI_MODELS.fast,
+  /** Pre-LLM snapshot pruner (fast context-aware element filter) */
+  snapshotPruning: AI_MODELS.fast,
 
   // ── Analysis ───────────────────────────────────────────────────────────
   /** Page analysis with vision */

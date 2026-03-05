@@ -19,6 +19,7 @@
 import { generateEmbedding, generateEmbeddings, cosineSimilarity } from '@/services/ai/core/embedding.service';
 import { generateText } from '@/services/ai/core/ai-provider.service';
 import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import {
@@ -93,7 +94,7 @@ const ACTION_TO_TAGS: Record<string, string[]> = {
   close: ['button', 'div', 'summary', 'details'],
   hover: ['button', 'a', 'div', 'span', 'img'],
   scroll: ['div', 'section', 'main', 'body', 'html'],
-  press: ['input', 'textarea', 'button'],
+  press: ['input', 'textarea', 'button', 'div', 'span'], // FIX #4: contenteditable + role=textbox divs
 };
 
 /**
@@ -266,8 +267,10 @@ function isFillCompatibleTextField(node: InteractiveNode): boolean {
   }
 
   // Non-standard textbox components (best-effort support).
-  // Note: we don't have a dedicated `contenteditable` flag in InteractiveNode.
   if (node.tag === 'div' && node.role === 'textbox') return true;
+
+  // FIX #8: contenteditable elements are type-compatible regardless of tag
+  if (node.isContentEditable) return true;
 
   return false;
 }
@@ -339,6 +342,12 @@ export function buildAllowedSets(
           n.ariaLabel?.toLowerCase().includes('dialog'))))
   );
 
+  // ✅ FIX: Also detect modal presence via isInsideActiveModal flag from snapshot collector.
+  // Snapshot collector has a broader modal detection (covers custom popups, drawers, overlays)
+  // than the role-based check above. If ANY node has isInsideActiveModal=true,
+  // the snapshot collector detected an active modal/popup layer.
+  const hasModalFlaggedElements = nodes.some(n => n.isInsideActiveModal === true);
+
   // Position-aware: only treat as blocking modal if it covers significant viewport area
   // Cookie banners are typically small (< 30% viewport area) and positioned at edges
   let hasVisibleModal = false;
@@ -374,6 +383,19 @@ export function buildAllowedSets(
       // No bounding box info — fall back to treating it as blocking
       hasVisibleModal = true;
     }
+  } else if (hasModalFlaggedElements) {
+    // ✅ FIX: Snapshot collector detected an active modal/popup (broader detection)
+    // even though no node matched the role-based check above.
+    // Trust the snapshot collector's judgment — it uses z-index, positioning, coverage,
+    // and class-name heuristics to detect custom popups/overlays/drawers.
+    hasVisibleModal = true;
+    ruleTrace.push({
+      ruleId: 'modal.detected_via_snapshot',
+      version: 'v2',
+      action: 'exclude',
+      evidence: 'Modal/popup detected by snapshot collector (isInsideActiveModal flag present on nodes)',
+      affectedRefs: [],
+    });
   }
 
   if (hasVisibleModal) {
@@ -484,9 +506,14 @@ export function buildAllowedSets(
         // P1 FIX: Role-based allowlist for click actions
         // Elements with interactive ARIA roles should be allowed regardless of tag
         // For select: also allow elements with aria-expanded (dropdown triggers without explicit ARIA role)
-        const isDropdownLike = actionType === 'select' && node.ariaExpanded !== undefined;
+        // FIX #5: Also check aria-haspopup for dropdown triggers without aria-expanded
+        const isDropdownLike = actionType === 'select' && (
+          node.ariaExpanded !== undefined || node.hasAriaHaspopup
+        );
         const roleMatches =
           (actionType === 'click' && node.role && CLICK_ALLOWED_ROLES.has(node.role)) ||
+          // FIX #3: hover uses same interactive roles as click
+          (actionType === 'hover' && node.role && CLICK_ALLOWED_ROLES.has(node.role)) ||
           (actionType === 'select' && (
             (node.role && SELECT_ALLOWED_ROLES.has(node.role)) || isDropdownLike
           ));
@@ -496,8 +523,31 @@ export function buildAllowedSets(
         const isSelectSoftTag = actionType === 'select' && !tagMatches && !roleMatches
           && SELECT_SOFT_TAGS.has(node.tag.toLowerCase());
 
+        // Phase 4: Soft-allow framework-clickable elements for click action.
+        // React/Vue/Angular elements with synthetic events look non-interactive by tag alone.
+        // Also soft-allow any element with onclick, tabindex >= 0, or aria-expanded/aria-haspopup.
+        const hasClickSignal =
+          actionType === 'click' &&
+          !tagMatches &&
+          !roleMatches &&
+          (
+            !!node.frameworkClickable ||
+            !!node.hasOnclick ||
+            (node.tabIndex !== undefined && node.tabIndex >= 0) ||
+            node.ariaExpanded !== undefined ||
+            node.hasAriaHaspopup
+          );
+
+        // Phase 4: Soft-allow contenteditable elements for type action.
+        const isContentEditable =
+          actionType === 'type' &&
+          !tagMatches &&
+          !isNonStandardTextbox &&
+          !roleMatches &&
+          !!node.isContentEditable;
+
         // Exception: allow non-standard textbox components for type as SoftAllowed.
-        if (!tagMatches && !isNonStandardTextbox && !roleMatches && !isSelectSoftTag) {
+        if (!tagMatches && !isNonStandardTextbox && !roleMatches && !isSelectSoftTag && !hasClickSignal && !isContentEditable) {
           excluded = true;
           nodeRules.push({
             ruleId: 'tag.incompatible',
@@ -545,6 +595,27 @@ export function buildAllowedSets(
             evidence: `tag=${node.tag} soft-allowed as potential custom dropdown trigger for select (no ARIA role)`,
             affectedRefs: [node.ref],
           });
+        } else if (hasClickSignal) {
+          // Phase 4: Framework-bound or explicitly interactive custom element.
+          // No standard ARIA role or interactive tag, but has a JS click signal.
+          isSoft = true;
+          nodeRules.push({
+            ruleId: 'structure.framework_clickable',
+            version: 'v4',
+            action: 'penalize',
+            evidence: `tag=${node.tag} soft-allowed for click: frameworkClickable=${node.frameworkClickable || false}, onclick=${!!node.hasOnclick}, tabIndex=${node.tabIndex}, ariaExpanded=${node.ariaExpanded}, ariaHaspopup=${!!node.hasAriaHaspopup}`,
+            affectedRefs: [node.ref],
+          });
+        } else if (isContentEditable) {
+          // Phase 4: contenteditable region (rich text editor, inline text field).
+          isSoft = true;
+          nodeRules.push({
+            ruleId: 'structure.contenteditable',
+            version: 'v4',
+            action: 'penalize',
+            evidence: `tag=${node.tag} with contenteditable soft-allowed for type/fill action`,
+            affectedRefs: [node.ref],
+          });
         }
       }
     }
@@ -554,17 +625,23 @@ export function buildAllowedSets(
     // ═══════════════════════════════════════════════════════════════════════
 
     if (!excluded) {
-      // P1 CRITICAL: When modal is present, covered elements must be HARD excluded
-      // Otherwise, soft penalty only
+      // ✅ FIX: Layer-aware coverage logic.
+      // Elements INSIDE the active modal/popup are NEVER excluded for isTopMostAtCenter,
+      // because the user interacts with the popup layer, not the background.
+      // Elements OUTSIDE the modal with isTopMostAtCenter=false are background → exclude.
       if (node.isTopMostAtCenter === false) {
-        if (hasVisibleModal) {
-          // HARD exclude: element is behind modal layer
+        if (node.isInsideActiveModal) {
+          // Element is inside the popup/modal — keep it regardless of hit test.
+          // Popup backdrops can cause false negatives in elementFromPoint.
+          // No penalty: this is the active layer the user sees.
+        } else if (hasVisibleModal) {
+          // HARD exclude: element is behind modal layer (not inside it)
           excluded = true;
           nodeRules.push({
             ruleId: 'modal.background_element',
-            version: 'v1',
+            version: 'v2',
             action: 'exclude',
-            evidence: 'isTopMostAtCenter=false with modal present',
+            evidence: 'isTopMostAtCenter=false, not inside modal, modal present',
             affectedRefs: [node.ref],
           });
         } else {
@@ -611,6 +688,38 @@ export function buildAllowedSets(
       });
     }
     
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEXT-MATCH RESCUE: If user typed text that is visibly present on the
+    // element, it MUST reach the LLM — the user can only type what they see.
+    // This rescues elements excluded by tag.incompatible, visibility.covered,
+    // or other structural rules that don't account for visible text matching.
+    // ═══════════════════════════════════════════════════════════════════════
+    if (excluded && node.isVisible !== false && intentText.length > 0) {
+      const intentLower = intentText.toLowerCase();
+      const visibleTexts = [
+        node.text,
+        node.labelText,
+        node.ariaLabel,
+        node.placeholder,
+      ].filter(Boolean).map(t => t!.toLowerCase());
+
+      const hasTextMatch = visibleTexts.some(t =>
+        t.includes(intentLower) || intentLower.includes(t)
+      );
+
+      if (hasTextMatch) {
+        excluded = false;
+        isSoft = true;
+        nodeRules.push({
+          ruleId: 'rescue.visible_text_match',
+          version: 'v1',
+          action: 'penalize',
+          evidence: `Element excluded by [${nodeRules.map(r => r.ruleId).join(', ')}] but contains user-visible text matching intent "${intentText}"`,
+          affectedRefs: [node.ref],
+        });
+      }
+    }
+
     // Add to appropriate set
     if (!excluded) {
       if (isSoft) {
@@ -619,7 +728,7 @@ export function buildAllowedSets(
         hardAllowed.push(node);
       }
     }
-    
+
     // Add all rules for this node to trace
     ruleTrace.push(...nodeRules);
   }
@@ -637,11 +746,16 @@ export function buildAllowedSets(
   }
 
   // Log rule trace summary
+  const modalElementCount = hasVisibleModal
+    ? [...hardAllowed, ...softAllowed].filter(n => n.isInsideActiveModal).length
+    : 0;
   logger.debug('[EMBEDDINGS_RESOLVER] Built allowed sets', {
     hardAllowedCount: hardAllowed.length,
     softAllowedCount: softAllowed.length,
     rulesApplied: ruleTrace.length,
     shortCircuitRef,
+    hasVisibleModal,
+    modalElementCount,
   });
   
   return { hardAllowed, softAllowed, ruleTrace, shortCircuitRef };
@@ -829,6 +943,14 @@ export function buildCandidateText(node: InteractiveNode): string {
   // Test ID (useful for disambiguation)
   if (node.testIdAttr) {
     parts.push(`testid: ${node.testIdAttr}`);
+  }
+
+  // Phase 4: Custom component signals (rich text editor, framework buttons)
+  if (node.isContentEditable) {
+    parts.push('editable');
+  }
+  if (node.frameworkClickable) {
+    parts.push('interactive');
   }
 
   // Tag/role/type (last, for disambiguation)
@@ -1661,6 +1783,252 @@ Select the single best matching element. If unsure, return ref: null.`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// LLM-FIRST ELEMENT SELECTION (replaces embedding ranking for primary path)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** LLM element selection timeout */
+const LLM_SELECT_TIMEOUT_MS = 7000;
+
+/** LLM element selection circuit breaker */
+let llmSelectFailures = 0;
+let llmSelectBreakerOpenUntil = 0;
+const LLM_SELECT_BREAKER_THRESHOLD = 3;
+const LLM_SELECT_BREAKER_COOLDOWN_MS = 60000;
+
+function isLlmSelectBreakerOpen(): boolean {
+  if (llmSelectFailures < LLM_SELECT_BREAKER_THRESHOLD) return false;
+  if (Date.now() > llmSelectBreakerOpenUntil) {
+    llmSelectFailures = 0;
+    return false;
+  }
+  return true;
+}
+
+function recordLlmSelectFailure(): void {
+  llmSelectFailures++;
+  if (llmSelectFailures >= LLM_SELECT_BREAKER_THRESHOLD) {
+    llmSelectBreakerOpenUntil = Date.now() + LLM_SELECT_BREAKER_COOLDOWN_MS;
+  }
+}
+
+function recordLlmSelectSuccess(): void {
+  llmSelectFailures = 0;
+}
+
+/** LLM selection result cache */
+const llmSelectCache = new Map<string, { result: LlmSelectResult; createdAt: number }>();
+const LLM_SELECT_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const LLM_SELECT_CACHE_MAX_SIZE = 100;
+
+interface LlmSelectResult {
+  status: 'resolved' | 'needs_clarification' | 'not_found';
+  selectedRef: string | null;
+  confidence: number;
+  reason: string;
+  alternativeRefs?: string[];
+  latencyMs: number;
+  cacheHit: boolean;
+}
+
+const LLM_SELECT_SYSTEM_PROMPT = `You are an AI element selector for a browser testing tool.
+
+TASK: Given a user's intent (ANY language) and a list of candidate UI elements, select the SINGLE best matching element.
+
+RULES:
+1. Match semantically, not literally. Cross-language matching is critical:
+   - "войти" = "sign in" = "登录" = "iniciar sesión"
+   - "поиск" = "search" = "搜索" = "buscar"
+   - "корзина" = "cart" = "购物车" = "carrito"
+2. Use action-type semantics:
+   - click: prefer buttons, links, interactive elements
+   - type: prefer inputs, textareas, editable fields
+   - select: prefer dropdowns, select elements, listboxes
+   - check/uncheck/toggle: prefer checkboxes, radios, switches
+   - hover: prefer any interactive element
+3. Consider: label text, aria-label, placeholder, visible text, container context
+4. If 2+ elements are equally valid, return alternatives (not a single pick)
+5. ONLY use refs from the provided list — never invent refs
+6. Respond ONLY with valid JSON, no markdown
+
+OUTPUT FORMAT:
+{"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
+
+If ambiguous (2+ equally valid):
+{"ref":null,"confidence":0,"alternatives":["e1","e5"],"reason":"..."}
+
+If nothing matches:
+{"ref":null,"confidence":0,"reason":"no matching element"}`;
+
+/**
+ * LLM-first element selection: replaces embedding ranking + composite scoring + decision policy.
+ * Uses gemini-2.5-flash-lite to directly select the best matching element from candidates.
+ * Supports multilingual intent matching natively.
+ */
+async function selectElementWithLLM(params: {
+  intentText: string;
+  actionType: IntentActionType;
+  candidates: Array<{ node: InteractiveNode; candidateText: string }>;
+  pageUrl: string;
+  pageSignature: string;
+}): Promise<LlmSelectResult> {
+  const { intentText, actionType, candidates, pageUrl, pageSignature } = params;
+  const startTime = Date.now();
+
+  // Check cache
+  const cacheKey = `${pageSignature}|${actionType}|${computeTextHash(intentText)}|${candidates.slice(0, 5).map(c => c.node.ref).join(',')}`;
+  const cached = llmSelectCache.get(cacheKey);
+  if (cached && (Date.now() - cached.createdAt) < LLM_SELECT_CACHE_TTL_MS) {
+    return { ...cached.result, cacheHit: true, latencyMs: Date.now() - startTime };
+  }
+
+  // Build candidate list for prompt
+  const candidateList = candidates
+    .map((c, i) => {
+      return `${i + 1}. ref="${c.node.ref}" <${c.node.tag}> ${c.candidateText}`;
+    })
+    .join('\n');
+
+  const userPrompt = `INTENT: "${intentText}"
+ACTION: ${actionType}
+PAGE: ${pageUrl}
+
+ELEMENTS (${candidates.length}):
+${candidateList}
+
+Select the single best matching element.`;
+
+  // Call LLM with timeout
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), LLM_SELECT_TIMEOUT_MS);
+
+  try {
+    const response = await getChatCompletionWithMessages(
+      [
+        { role: 'system', content: LLM_SELECT_SYSTEM_PROMPT },
+        { role: 'user', content: userPrompt },
+      ],
+      {
+        model: AI_TASK_MODELS.disambiguation, // gemini-2.5-flash-lite
+        temperature: 0.1,
+        max_tokens: 200,
+        response_format: { type: 'json_object' },
+        abortSignal: controller.signal,
+      }
+    );
+
+    clearTimeout(timeoutId);
+
+    // Parse response
+    const content = response?.content || '';
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      logger.warn('[LLM_SELECT] No JSON in response', { preview: content.slice(0, 200) });
+      throw new Error('No JSON in LLM response');
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as {
+      ref?: string | null;
+      confidence?: number;
+      reason?: string;
+      alternatives?: string[];
+    };
+
+    // Validate ref against candidate list
+    const validRefs = new Set(candidates.map(c => c.node.ref));
+
+    let result: LlmSelectResult;
+
+    if (parsed.ref && validRefs.has(parsed.ref)) {
+      // Single element selected
+      result = {
+        status: 'resolved',
+        selectedRef: parsed.ref,
+        confidence: Math.min(1, Math.max(0, parsed.confidence ?? 0.8)),
+        reason: (parsed.reason || '').slice(0, 200),
+        latencyMs: Date.now() - startTime,
+        cacheHit: false,
+      };
+    } else if (parsed.alternatives && Array.isArray(parsed.alternatives) && parsed.alternatives.length > 0) {
+      // Ambiguous — multiple valid options
+      const validAlts = parsed.alternatives.filter(r => validRefs.has(r));
+      if (validAlts.length > 0) {
+        result = {
+          status: 'needs_clarification',
+          selectedRef: null,
+          confidence: 0,
+          reason: (parsed.reason || '').slice(0, 200),
+          alternativeRefs: validAlts,
+          latencyMs: Date.now() - startTime,
+          cacheHit: false,
+        };
+      } else {
+        result = {
+          status: 'not_found',
+          selectedRef: null,
+          confidence: 0,
+          reason: 'LLM suggested alternatives with invalid refs',
+          latencyMs: Date.now() - startTime,
+          cacheHit: false,
+        };
+      }
+    } else {
+      // Nothing matches or invalid ref
+      result = {
+        status: parsed.ref === null ? 'not_found' : 'not_found',
+        selectedRef: null,
+        confidence: 0,
+        reason: (parsed.reason || 'no matching element').slice(0, 200),
+        latencyMs: Date.now() - startTime,
+        cacheHit: false,
+      };
+    }
+
+    // Cache result
+    if (llmSelectCache.size >= LLM_SELECT_CACHE_MAX_SIZE) {
+      const now = Date.now();
+      for (const [k, v] of llmSelectCache) {
+        if (now - v.createdAt > LLM_SELECT_CACHE_TTL_MS) llmSelectCache.delete(k);
+      }
+      if (llmSelectCache.size >= LLM_SELECT_CACHE_MAX_SIZE) {
+        const oldest = Array.from(llmSelectCache.entries())
+          .sort((a, b) => a[1].createdAt - b[1].createdAt);
+        for (const [k] of oldest.slice(0, Math.floor(LLM_SELECT_CACHE_MAX_SIZE / 4))) {
+          llmSelectCache.delete(k);
+        }
+      }
+    }
+    llmSelectCache.set(cacheKey, { result, createdAt: Date.now() });
+
+    recordLlmSelectSuccess();
+
+    logger.info('[LLM_SELECT] Element selection complete', {
+      event: 'llm_select_complete',
+      status: result.status,
+      selectedRef: result.selectedRef,
+      confidence: result.confidence,
+      latencyMs: result.latencyMs,
+      candidateCount: candidates.length,
+      actionType,
+    });
+
+    return result;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    recordLlmSelectFailure();
+
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logger.warn('[LLM_SELECT] Failed', {
+      event: 'llm_select_failed',
+      error: errorMsg,
+      candidateCount: candidates.length,
+      latencyMs: Date.now() - startTime,
+    });
+
+    throw error;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // MAIN RESOLVER
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1895,40 +2263,178 @@ export async function resolveWithEmbeddings(params: {
     };
   }
 
-  // Step 6: Multiple allowed elements → use embeddings to rank, then decide
-  // Build candidate texts for embedding
-  const candidatesToEmbed: Array<{ node: InteractiveNode; candidateText: string }> = [];
+  // Step 6: Multiple allowed elements → LLM-first selection with embeddings fallback
+  // Build candidate texts (shared between LLM and embeddings paths)
+  const candidatesToProcess: Array<{ node: InteractiveNode; candidateText: string }> = [];
   for (const node of allAllowed.slice(0, MAX_CANDIDATES_TO_EMBED)) {
     const candidateText = buildCandidateText(node);
-    candidatesToEmbed.push({ node, candidateText });
+    candidatesToProcess.push({ node, candidateText });
   }
 
   // Compute page signature for cache
   const pageSignature = computePageSignature(pageUrl, domNodes);
 
-  // Rank by embeddings
-  let ranked: RankedCandidate[];
   let cacheHit = false;
   let embeddingsLatencyMs = 0;
   let degradedMode = false;
   let degradedReason: string | undefined;
+  let llmSelectUsed = false;
+  let llmSelectLatencyMs = 0;
 
-  // Check circuit breaker
+  // ── PRIMARY PATH: LLM-based element selection ──
+  // gemini-2.5-flash-lite natively handles multilingual matching, context understanding,
+  // and disambiguation in a single call. Replaces: embeddings + composite scoring + decision policy + disambiguation.
+  if (!isLlmSelectBreakerOpen()) {
+    try {
+      const llmResult = await selectElementWithLLM({
+        intentText,
+        actionType: stepDraft.type,
+        candidates: candidatesToProcess,
+        pageUrl,
+        pageSignature,
+      });
+
+      llmSelectUsed = true;
+      llmSelectLatencyMs = llmResult.latencyMs;
+      cacheHit = llmResult.cacheHit;
+
+      if (llmResult.status === 'resolved' && llmResult.selectedRef) {
+        // LLM selected a single element
+        const selectedNode = candidatesToProcess.find(c => c.node.ref === llmResult.selectedRef);
+        if (selectedNode) {
+          const lintCandidate: LintCandidate = {
+            ref: selectedNode.node.ref,
+            label: selectedNode.node.labelText || selectedNode.node.ariaLabel || selectedNode.node.text || selectedNode.node.placeholder || `<${selectedNode.node.tag}>`,
+            reason: `AI match: ${llmResult.reason}`,
+            confidence: llmResult.confidence,
+            boundingBox: selectedNode.node.boundingBox,
+            node: selectedNode.node,
+          };
+
+          const totalLatencyMs = Date.now() - startTime;
+          logger.info('[EMBEDDINGS_RESOLVER] LLM-first resolution complete', {
+            event: 'lint_decision',
+            previewSessionId,
+            stepType: stepDraft.type,
+            status: 'resolved',
+            selectedRef: llmResult.selectedRef,
+            confidence: llmResult.confidence,
+            allowedCount,
+            llmSelectUsed: true,
+            llmSelectLatencyMs,
+            totalLatencyMs,
+            cacheHit,
+          });
+
+          return {
+            status: 'resolved',
+            message: 'Element found by AI',
+            confidence: llmResult.confidence,
+            candidates: [lintCandidate],
+            highlight: [{
+              ref: selectedNode.node.ref,
+              boundingBox: selectedNode.node.boundingBox,
+              type: 'success',
+            }],
+            cacheHit,
+            embeddingsLatencyMs: 0,
+            degradedMode: false,
+            llmDisambiguationUsed: true,
+          };
+        }
+      } else if (llmResult.status === 'needs_clarification' && llmResult.alternativeRefs?.length) {
+        // LLM found multiple equally valid options
+        const altCandidates = llmResult.alternativeRefs
+          .map(ref => candidatesToProcess.find(c => c.node.ref === ref))
+          .filter((c): c is { node: InteractiveNode; candidateText: string } => !!c);
+
+        if (altCandidates.length > 0) {
+          const lintCandidates: LintCandidate[] = altCandidates.map(c => ({
+            ref: c.node.ref,
+            label: c.node.labelText || c.node.ariaLabel || c.node.text || c.node.placeholder || `<${c.node.tag}>`,
+            reason: `AI: ${llmResult.reason}`,
+            confidence: 0.5,
+            boundingBox: c.node.boundingBox,
+            node: c.node,
+          }));
+
+          const highlight = includeAlternatives
+            ? altCandidates.map(c => ({
+                ref: c.node.ref,
+                boundingBox: c.node.boundingBox,
+                type: 'warning' as const,
+              }))
+            : [];
+
+          const totalLatencyMs = Date.now() - startTime;
+          logger.info('[EMBEDDINGS_RESOLVER] LLM-first needs_clarification', {
+            event: 'lint_decision',
+            previewSessionId,
+            stepType: stepDraft.type,
+            status: 'needs_clarification',
+            alternatives: llmResult.alternativeRefs,
+            allowedCount,
+            llmSelectUsed: true,
+            llmSelectLatencyMs,
+            totalLatencyMs,
+            cacheHit,
+          });
+
+          return {
+            status: 'needs_clarification',
+            message: llmResult.reason || 'Multiple matching elements',
+            confidence: 0,
+            candidates: includeAlternatives ? lintCandidates : [],
+            highlight,
+            cacheHit,
+            embeddingsLatencyMs: 0,
+            degradedMode: false,
+            llmDisambiguationUsed: true,
+          };
+        }
+      }
+
+      // LLM returned not_found — fall through to embeddings fallback for rescue attempt
+      if (llmResult.status === 'not_found') {
+        logger.info('[EMBEDDINGS_RESOLVER] LLM-first not_found, trying embeddings fallback', {
+          previewSessionId,
+          reason: llmResult.reason,
+        });
+        // Fall through to embeddings path below
+      }
+
+    } catch (llmError) {
+      const llmErrorMsg = llmError instanceof Error ? llmError.message : String(llmError);
+      logger.warn('[EMBEDDINGS_RESOLVER] LLM-first selection failed, falling back to embeddings', {
+        previewSessionId,
+        error: llmErrorMsg,
+      });
+      // Fall through to embeddings fallback
+    }
+  } else {
+    logger.debug('[EMBEDDINGS_RESOLVER] LLM select circuit breaker open, using embeddings', {
+      previewSessionId,
+    });
+  }
+
+  // ── FALLBACK PATH: Embedding-based ranking (original pipeline) ──
+  // Used when: LLM circuit breaker open, LLM timeout/error, LLM returned not_found
+  let ranked: RankedCandidate[];
+
   if (isCircuitBreakerOpen()) {
     degradedMode = true;
     degradedReason = 'circuit_breaker_open';
-    logger.warn('[EMBEDDINGS_RESOLVER] Circuit breaker is open, skipping embeddings');
-    // Fallback: use candidates in original order
-    ranked = candidatesToEmbed.map(c => ({
+    logger.warn('[EMBEDDINGS_RESOLVER] Embeddings circuit breaker is open');
+    ranked = candidatesToProcess.map(c => ({
       node: c.node,
       candidateText: c.candidateText,
-      similarity: 0.5, // Default similarity when embeddings unavailable
+      similarity: 0.5,
     }));
   } else {
     try {
       const rankResult = await rankCandidatesByEmbedding({
         intentText,
-        candidates: candidatesToEmbed,
+        candidates: candidatesToProcess,
         previewSessionId,
         pageSignature,
         disableCaching,
@@ -1937,7 +2443,6 @@ export async function resolveWithEmbeddings(params: {
       ranked = rankResult.ranked;
       cacheHit = rankResult.cacheHit;
       embeddingsLatencyMs = rankResult.latencyMs;
-
       recordEmbeddingSuccess();
     } catch (error) {
       recordEmbeddingFailure();
@@ -1958,8 +2463,7 @@ export async function resolveWithEmbeddings(params: {
         degradedReason,
       });
 
-      // Fallback: use candidates in original order
-      ranked = candidatesToEmbed.map(c => ({
+      ranked = candidatesToProcess.map(c => ({
         node: c.node,
         candidateText: c.candidateText,
         similarity: 0.5,
@@ -1967,14 +2471,11 @@ export async function resolveWithEmbeddings(params: {
     }
   }
 
-  // Step 6.5: Phase 2 — Apply composite scoring (re-rank by weighted score)
-  // Weights: semantic(0.5) + actionAffinity(0.2) + spatial(0.15) + formContext(0.15)
+  // Step 6.5: Composite scoring (re-rank by weighted score)
   {
-    // Find spatial reference node (if intent contains spatial hints)
     const spatialHint = extractSpatialHint(intentText);
     let spatialRef: InteractiveNode | undefined;
     if (spatialHint?.target) {
-      // Try to find the reference node by text/label match
       const targetLower = spatialHint.target.toLowerCase();
       spatialRef = domNodes.find(n =>
         (n.text?.toLowerCase().includes(targetLower)) ||
@@ -1983,9 +2484,7 @@ export async function resolveWithEmbeddings(params: {
       );
     }
 
-    // Compute viewport diagonal for spatial normalization
-    const vp = 2200; // ~sqrt(1920^2 + 1080^2)
-
+    const vp = 2200;
     for (const candidate of ranked) {
       const composite = computeCompositeScore({
         semanticSimilarity: candidate.similarity,
@@ -1996,27 +2495,24 @@ export async function resolveWithEmbeddings(params: {
         viewportDiagonal: vp,
         allNodes: domNodes,
       });
-      // Replace raw similarity with composite score
       candidate.similarity = composite.score;
     }
-
-    // Re-sort by composite score
     ranked.sort((a, b) => b.similarity - a.similarity);
   }
 
-  // Step 7: Apply count-based decision policy
+  // Step 7: Decision policy
   let decision = applyDecisionPolicy(ranked, allowedCount, undefined, ruleTrace);
 
-  // Step 7.5: LLM disambiguation for needs_clarification cases
-  // V4: If multiple candidates with good similarity, try LLM to auto-select
+  // Step 7.5: LLM disambiguation (only if LLM-first wasn't already used)
   let llmDisambiguationResult: DisambiguationResult | undefined;
   if (
     enableLLMDisambiguation &&
+    !llmSelectUsed && // Skip if LLM-first was already attempted
     decision.status === 'needs_clarification' &&
-    !degradedMode && // Don't call LLM if embeddings already failed
+    !degradedMode &&
     ranked.length >= 2
   ) {
-    const topK = ranked.slice(0, 5); // Use top 5 candidates for LLM
+    const topK = ranked.slice(0, 5);
     const disambiguationCandidates = topK.map(r => nodeToDisambiguationCandidate(r.node));
 
     llmDisambiguationResult = await disambiguateWithLLM({
@@ -2028,7 +2524,6 @@ export async function resolveWithEmbeddings(params: {
       pageSignature,
     });
 
-    // If LLM successfully selected a ref with high confidence, override decision
     if (llmDisambiguationResult.selectedRef && !llmDisambiguationResult.skipped) {
       const selectedCandidate = ranked.find(r => r.node.ref === llmDisambiguationResult!.selectedRef);
       if (selectedCandidate) {
@@ -2041,32 +2536,13 @@ export async function resolveWithEmbeddings(params: {
           selectedCandidates: [selectedCandidate],
           ruleTrace,
         };
-
-        logger.info('[EMBEDDINGS_RESOLVER] LLM disambiguation resolved', {
-          event: 'llm_disambiguation_resolved',
-          previewSessionId,
-          selectedRef: llmDisambiguationResult.selectedRef,
-          confidence: llmDisambiguationResult.confidence,
-          llmLatencyMs: llmDisambiguationResult.latencyMs,
-          reason: llmDisambiguationResult.reason.slice(0, 100),
-        });
       }
-    } else if (!llmDisambiguationResult.skipped) {
-      // LLM was called but couldn't decide (low confidence or null ref)
-      logger.info('[EMBEDDINGS_RESOLVER] LLM disambiguation inconclusive', {
-        event: 'llm_disambiguation_inconclusive',
-        previewSessionId,
-        confidence: llmDisambiguationResult.confidence,
-        llmLatencyMs: llmDisambiguationResult.latencyMs,
-        reason: llmDisambiguationResult.reason.slice(0, 100),
-      });
     }
   }
 
   // Step 8: Build lint candidates
-  // V3: For needs_clarification, only include candidates if includeAlternatives=true
-  const shouldIncludeCandidates = 
-    decision.status === 'resolved' || 
+  const shouldIncludeCandidates =
+    decision.status === 'resolved' ||
     decision.status === 'not_found' ||
     includeAlternatives;
 
@@ -2081,8 +2557,6 @@ export async function resolveWithEmbeddings(params: {
       }))
     : [];
 
-  // Build highlight
-  // V3: For needs_clarification without includeAlternatives, don't highlight
   const highlight = shouldIncludeCandidates
     ? decision.selectedCandidates.map((r, idx) => ({
         ref: r.node.ref,
@@ -2093,8 +2567,7 @@ export async function resolveWithEmbeddings(params: {
 
   const totalLatencyMs = Date.now() - startTime;
 
-  // Log decision metrics
-  logger.info('[EMBEDDINGS_RESOLVER] Resolution complete', {
+  logger.info('[EMBEDDINGS_RESOLVER] Resolution complete (fallback path)', {
     event: 'lint_decision',
     previewSessionId,
     stepType: stepDraft.type,
@@ -2107,13 +2580,9 @@ export async function resolveWithEmbeddings(params: {
     totalLatencyMs,
     candidateCount: ranked.length,
     degradedMode,
-    includeAlternatives,
-    // LLM disambiguation metrics
-    llmDisambiguationEnabled: enableLLMDisambiguation,
+    llmSelectUsed,
+    llmSelectLatencyMs,
     llmDisambiguationRan: !!llmDisambiguationResult && !llmDisambiguationResult.skipped,
-    llmDisambiguationResolved: llmDisambiguationResult?.selectedRef !== null && llmDisambiguationResult?.selectedRef !== undefined,
-    llmDisambiguationLatencyMs: llmDisambiguationResult?.latencyMs,
-    llmDisambiguationCacheHit: llmDisambiguationResult?.cacheHit,
   });
 
   return {
@@ -2129,8 +2598,7 @@ export async function resolveWithEmbeddings(params: {
     degradedMode,
     degradedReason,
     needsAiFallback: decision.needsAiFallback,
-    // LLM disambiguation info (if used)
-    llmDisambiguationUsed: llmDisambiguationResult?.selectedRef !== null && llmDisambiguationResult?.selectedRef !== undefined,
+    llmDisambiguationUsed: llmSelectUsed || (llmDisambiguationResult?.selectedRef !== null && llmDisambiguationResult?.selectedRef !== undefined),
   };
 }
 

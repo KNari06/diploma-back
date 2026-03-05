@@ -14,6 +14,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { logger } from '@/utils/core/logger';
 import type { LiteElement } from '../lite-types';
 import type { FunnelPhase } from './funnel-analyzer';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -184,7 +185,7 @@ Rules:
           { role: 'user', content: userPrompt },
         ],
         {
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.goalDetection,
           temperature: 0,
           response_format: { type: 'json_object' },
           max_tokens: 400,
@@ -245,7 +246,7 @@ Return JSON:
           { role: 'user', content: userPrompt },
         ],
         {
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.goalDetection,
           temperature: 0,
           response_format: { type: 'json_object' },
           max_tokens: 300,

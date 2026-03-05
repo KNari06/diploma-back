@@ -9,8 +9,13 @@
  * - Returns actionable follow-up steps
  */
 
-import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
+import { AICostManager, type AIModel } from '@/services/ai/cost/ai-cost-manager.service';
 import { logger } from '@/utils/core/logger';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
+import {
+  MODAL_OVERLAY_SELECTORS,
+  POSITIONAL_CANDIDATES_SELECTOR,
+} from '@/agent/utils/selectors/modal-detection';
 import OpenAI from 'openai';
 import { Page } from 'playwright';
 import { DynamicAction } from '../types/intelligent-testing.types';
@@ -168,7 +173,11 @@ export class PostActionAnalyzer {
    */
   static async captureSnapshot(page: Page): Promise<DOMSnapshot> {
     try {
-      const snapshot = await page.evaluate(() => {
+      const __modalConsts = {
+          overlaySelectors: MODAL_OVERLAY_SELECTORS,
+          positionalSelector: POSITIONAL_CANDIDATES_SELECTOR,
+        };
+      const snapshot = await page.evaluate((__mc) => {
         const result: any = {
           visibleElements: [],
           modals: [],
@@ -217,26 +226,37 @@ export class PostActionAnalyzer {
           });
         }
 
-        // Collect modals/popups
-        const modalSelectors = [
-          '[role="dialog"]', '[role="alertdialog"]', '.modal', '.popup',
-          '[class*="modal"]', '[class*="dialog"]', '[class*="overlay"]',
-        ];
-        for (const selector of modalSelectors) {
+        // Collect modals/popups — two-pass: targeted selectors + positional fallback
+        // @ts-expect-error - browser context
+        const targetedModals = Array.from(document.querySelectorAll(__mc.overlaySelectors));
+        // @ts-expect-error - browser context
+        const positionalCandidates = Array.from(document.querySelectorAll(__mc.positionalSelector));
+
+        // WeakSet for O(1) membership check — Array.includes() is unreliable for DOM nodes
+        const targetedSet = new WeakSet(targetedModals as any[]);
+        const seen = new WeakSet();
+        for (const modal of [...targetedModals, ...positionalCandidates] as any[]) {
+          if (seen.has(modal)) continue;
+          seen.add(modal);
+
           // @ts-expect-error - browser context
-          const modals = document.querySelectorAll(selector);
-          modals.forEach((modal: any) => {
-            // @ts-expect-error - browser context
-            const style = window.getComputedStyle(modal);
-            if (style.display !== 'none' && style.visibility !== 'hidden') {
-              const closeBtn = modal.querySelector('[class*="close"], [aria-label*="close"], button');
-              result.modals.push({
-                type: 'other',
-                text: modal.textContent?.trim().substring(0, 200) || '',
-                hasCloseButton: !!closeBtn,
-                closeSelector: closeBtn ? (closeBtn.id ? `#${closeBtn.id}` : null) : null,
-              });
-            }
+          const style = window.getComputedStyle(modal);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          if (parseFloat(style.opacity) < 0.1) continue;
+
+          const position = style.position;
+          const isPositioned = position === 'fixed' || position === 'absolute';
+          const zIndex = parseInt(style.zIndex, 10);
+
+          // For positional candidates (not from targeted pass), require fixed/absolute + z-index
+          if (!targetedSet.has(modal) && (!isPositioned || isNaN(zIndex) || zIndex < 1)) continue;
+
+          const closeBtn = modal.querySelector('[class*="close"], [aria-label*="close"], button');
+          result.modals.push({
+            type: 'other',
+            text: modal.textContent?.trim().substring(0, 200) || '',
+            hasCloseButton: !!closeBtn,
+            closeSelector: closeBtn ? (closeBtn.id ? `#${closeBtn.id}` : null) : null,
           });
         }
 
@@ -271,7 +291,7 @@ export class PostActionAnalyzer {
         });
 
         return result;
-      });
+      }, __modalConsts);
 
       return snapshot;
     } catch (error) {
@@ -442,7 +462,7 @@ RULES:
 - If the executed action was a click and succeeded, do NOT suggest clicking the same button/element again`;
 
       const response = await getOpenAIClient().chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.actionAnalysis,
         messages: [
           { role: 'system', content: 'You are a QA automation expert. Respond with valid JSON only.' },
           { role: 'user', content: prompt },
@@ -461,7 +481,7 @@ RULES:
       if (costManager) {
         costManager.recordOperation({
           operation: 'post_action_analysis',
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.actionAnalysis as AIModel,
           inputTokens: response.usage?.prompt_tokens || 0,
           outputTokens: response.usage?.completion_tokens || 0,
         });

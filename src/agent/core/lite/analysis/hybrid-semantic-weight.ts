@@ -24,6 +24,7 @@ import { logger } from '@/utils/core/logger';
 import type { LiteElement, ProgressSentiment, StateDiff } from '../lite-types';
 import { FunnelAnalyzer, FunnelPhase } from './funnel-analyzer';
 import type { ExpandedGoal } from './goal-expander';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -1203,7 +1204,7 @@ export class HybridSemanticWeightCalculator {
 
   /**
    * Batch AI audit for gray zone elements
-   * Uses gpt-4o-mini for fast classification
+   * Uses gemini-2.5-flash-lite for fast classification
    */
   private async batchAudit(elements: LiteElement[]): Promise<AIAuditResult[]> {
     if (elements.length === 0) return [];
@@ -1214,7 +1215,7 @@ export class HybridSemanticWeightCalculator {
       const response = await getChatCompletionWithMessages(
         [{ role: 'user', content: prompt }],
         {
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.semanticWeight,
           temperature: 0,
           response_format: { type: 'json_object' },
           max_tokens: 400,

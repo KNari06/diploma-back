@@ -33,16 +33,23 @@
 import type { Browser, BrowserContext } from 'playwright';
 import { logger } from '@/utils/core/logger';
 
-import type { ExplorationConfig, ExplorationResult } from './types';
-import { DEFAULT_EXPLORATION_BUDGET, DEFAULT_MAX_CONCURRENCY } from './types';
+import type { ExplorationConfig, ExplorationResult, ExplorationProgressCallback, ExplorationCheckpoint } from './types';
+import { DEFAULT_EXPLORATION_BUDGET, DEFAULT_MAX_CONCURRENCY, DESKTOP_USER_AGENT } from './types';
 import { BudgetTracker } from './budget-tracker';
+import { RateLimiter } from './rate-limiter';
+import { ExplorationTree } from './exploration-tree';
 import { SurveyAgent } from './survey-agent';
 import { FlowQueue } from './flow-queue';
 import { FlowRunner } from './flow-runner';
 import { TestCaseBuilder } from './test-case-builder';
+import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
+
+/** Save checkpoint every N completed flows */
+const CHECKPOINT_EVERY_N_FLOWS = 3;
 
 export class ExplorationEngine {
   private readonly config: ExplorationConfig;
+  private readonly onProgress?: ExplorationProgressCallback;
 
   constructor(
     private readonly browser: Browser,
@@ -54,6 +61,26 @@ export class ExplorationEngine {
       budget: { ...DEFAULT_EXPLORATION_BUDGET, ...config.budget },
       maxConcurrency: config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
     };
+    this.onProgress = config.onProgress;
+  }
+
+  private emitProgress(
+    phase: 'survey' | 'flow' | 'complete',
+    event: 'page_discovered' | 'survey_complete' | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found',
+    data: Record<string, any>,
+    progressPercent: number,
+  ): void {
+    if (!this.onProgress) return;
+    try {
+      this.onProgress({
+        explorationId: this.config.explorationId,
+        phase,
+        event,
+        data,
+        progressPercent: Math.min(100, Math.max(0, Math.round(progressPercent))),
+        timestamp: Date.now(),
+      });
+    } catch { /* never let progress reporting crash exploration */ }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -66,6 +93,7 @@ export class ExplorationEngine {
   async run(): Promise<ExplorationResult> {
     const startTime = Date.now();
     const budget = new BudgetTracker(this.config.budget);
+    const rateLimiter = new RateLimiter(this.config.rateLimiting, budget);
 
     logger.info('[EXPLORATION] Starting autonomous exploration', {
       explorationId: this.config.explorationId,
@@ -85,12 +113,13 @@ export class ExplorationEngine {
     const surveyContext = await this.browser.newContext({
       viewport: { width: 1280, height: 720 },
       ignoreHTTPSErrors: true,
+      userAgent: DESKTOP_USER_AGENT,
     });
 
     let tree;
     try {
       const surveyPage = await surveyContext.newPage();
-      const surveyAgent = new SurveyAgent(surveyPage, this.config, budget);
+      const surveyAgent = new SurveyAgent(surveyPage, this.config, budget, rateLimiter);
       tree = await surveyAgent.survey();
       await surveyPage.close();
     } finally {
@@ -99,16 +128,31 @@ export class ExplorationEngine {
 
     const allEntryPoints = tree.getAllEntryPoints();
 
+    this.emitProgress('survey', 'survey_complete', {
+      pagesVisited: tree.getNodeCount(),
+      entryPointsFound: allEntryPoints.length,
+    }, 30);
+
     logger.info('[EXPLORATION] Phase 1 complete', {
       pagesVisited: tree.getNodeCount(),
       entryPointsFound: allEntryPoints.length,
       timeUsedMs: Date.now() - startTime,
     });
 
+    // Save checkpoint after Phase 1 (most expensive phase)
+    await this.saveCheckpoint({
+      version: 1,
+      phase: 'survey',
+      timestamp: Date.now(),
+      tree: tree.toCheckpoint(),
+      budget: budget.toCheckpoint(),
+    });
+
     // If no entry points found, return early
     if (allEntryPoints.length === 0) {
       logger.warn('[EXPLORATION] No entry points discovered, returning empty result');
       const builder = new TestCaseBuilder();
+      await ExplorationStorageService.clearCheckpoint(this.config.explorationId);
       return builder.build(tree, [], budget, this.config, startTime, []);
     }
 
@@ -130,7 +174,30 @@ export class ExplorationEngine {
 
     logger.info('[EXPLORATION] Phase 2: Starting flow exploration');
 
-    const flowRunner = new FlowRunner(this.browser, this.config, budget);
+    const flowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter);
+
+    // Periodic checkpoint callback: save every N flows
+    let lastCheckpointFlows = 0;
+    flowRunner.setCheckpointCallback(async (completedTasks) => {
+      if (completedTasks.length - lastCheckpointFlows >= CHECKPOINT_EVERY_N_FLOWS) {
+        lastCheckpointFlows = completedTasks.length;
+        await this.saveCheckpoint({
+          version: 1,
+          phase: 'flow',
+          timestamp: Date.now(),
+          tree: tree.toCheckpoint(),
+          budget: budget.toCheckpoint(),
+          queue: queue.toCheckpoint(),
+          flowRunner: {
+            loginCompleted: flowRunner.isLoginCompleted(),
+            knownFlowNames: flowRunner.getKnownFlowNames(),
+            flowsCompleted: completedTasks.length,
+            completedTasks,
+          },
+        });
+      }
+    });
+
     let flowTasks;
 
     try {
@@ -157,6 +224,17 @@ export class ExplorationEngine {
     const builder = new TestCaseBuilder();
     const result = builder.build(tree, flowTasks, budget, this.config, startTime, skippedEntryPoints);
 
+    // Clear checkpoint on successful completion
+    await ExplorationStorageService.clearCheckpoint(this.config.explorationId);
+
+    this.emitProgress('complete', 'survey_complete', {
+      testCases: result.testCases.length,
+      flowsPassed: result.summary.flowsPassed,
+      flowsFailed: result.summary.flowsFailed,
+      flowsBlocked: result.summary.flowsBlocked,
+      totalSteps: result.summary.totalStepsDiscovered,
+    }, 100);
+
     logger.info('[EXPLORATION] Exploration complete', {
       explorationId: this.config.explorationId,
       totalDurationMs: result.durationMs,
@@ -170,5 +248,155 @@ export class ExplorationEngine {
     });
 
     return result;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // RESUME FROM CHECKPOINT
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Resume exploration from a saved checkpoint after crash/stall.
+   * Skips Phase 1 if survey is already done. Resumes Phase 2 from last checkpoint.
+   */
+  static async resumeFromCheckpoint(
+    browser: Browser,
+    config: ExplorationConfig,
+    checkpoint: ExplorationCheckpoint,
+  ): Promise<ExplorationResult> {
+    const engine = new ExplorationEngine(browser, config);
+
+    logger.info('[EXPLORATION] Resuming from checkpoint', {
+      explorationId: config.explorationId,
+      phase: checkpoint.phase,
+      checkpointAge: Date.now() - checkpoint.timestamp,
+    });
+
+    // Restore tree and budget from checkpoint
+    const tree = ExplorationTree.fromCheckpoint(checkpoint.tree);
+    const budget = BudgetTracker.fromCheckpoint(config.budget, checkpoint.budget);
+    const rateLimiter = new RateLimiter(config.rateLimiting, budget);
+
+    // Check if budget is already exhausted (stale checkpoint)
+    if (budget.isExhausted()) {
+      logger.warn('[EXPLORATION] Budget exhausted from checkpoint, building result from partial data');
+      const builder = new TestCaseBuilder();
+      const tasks = checkpoint.flowRunner?.completedTasks || [];
+      return builder.build(tree, tasks, budget, config, checkpoint.budget.startTime, []);
+    }
+
+    const allEntryPoints = tree.getAllEntryPoints();
+
+    if (checkpoint.phase === 'survey') {
+      // Survey completed, need to run Phase 2 from scratch
+      if (allEntryPoints.length === 0) {
+        const builder = new TestCaseBuilder();
+        await ExplorationStorageService.clearCheckpoint(config.explorationId);
+        return builder.build(tree, [], budget, config, checkpoint.budget.startTime, []);
+      }
+
+      const queue = FlowQueue.fromEntryPoints(allEntryPoints);
+      const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter);
+
+      let lastCheckpointFlows = 0;
+      flowRunner.setCheckpointCallback(async (completedTasks) => {
+        if (completedTasks.length - lastCheckpointFlows >= CHECKPOINT_EVERY_N_FLOWS) {
+          lastCheckpointFlows = completedTasks.length;
+          await engine.saveCheckpoint({
+            version: 1,
+            phase: 'flow',
+            timestamp: Date.now(),
+            tree: tree.toCheckpoint(),
+            budget: budget.toCheckpoint(),
+            queue: queue.toCheckpoint(),
+            flowRunner: {
+              loginCompleted: flowRunner.isLoginCompleted(),
+              knownFlowNames: flowRunner.getKnownFlowNames(),
+              flowsCompleted: completedTasks.length,
+              completedTasks,
+            },
+          });
+        }
+      });
+
+      let flowTasks;
+      try {
+        flowTasks = await flowRunner.runAll(queue);
+      } finally {
+        await flowRunner.cleanup();
+      }
+
+      const builder = new TestCaseBuilder();
+      const result = builder.build(tree, flowTasks, budget, config, checkpoint.budget.startTime, queue.remaining());
+      await ExplorationStorageService.clearCheckpoint(config.explorationId);
+      return result;
+    }
+
+    // Phase === 'flow': resume Phase 2 with partial results
+    const queue = checkpoint.queue
+      ? FlowQueue.fromCheckpoint(checkpoint.queue)
+      : FlowQueue.fromEntryPoints(allEntryPoints);
+
+    const previousTasks = checkpoint.flowRunner?.completedTasks || [];
+    const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter);
+
+    // Restore FlowRunner state
+    if (checkpoint.flowRunner) {
+      flowRunner.restoreFromCheckpoint(checkpoint.flowRunner);
+    }
+
+    let lastCheckpointFlows = previousTasks.length;
+    flowRunner.setCheckpointCallback(async (completedTasks) => {
+      if (completedTasks.length - lastCheckpointFlows >= CHECKPOINT_EVERY_N_FLOWS) {
+        lastCheckpointFlows = completedTasks.length;
+        await engine.saveCheckpoint({
+          version: 1,
+          phase: 'flow',
+          timestamp: Date.now(),
+          tree: tree.toCheckpoint(),
+          budget: budget.toCheckpoint(),
+          queue: queue.toCheckpoint(),
+          flowRunner: {
+            loginCompleted: flowRunner.isLoginCompleted(),
+            knownFlowNames: flowRunner.getKnownFlowNames(),
+            flowsCompleted: completedTasks.length,
+            completedTasks,
+          },
+        });
+      }
+    });
+
+    let flowTasks;
+    try {
+      flowTasks = await flowRunner.runAll(queue);
+    } finally {
+      await flowRunner.cleanup();
+    }
+
+    // Merge previous tasks with new ones
+    const allFlowTasks = [...previousTasks, ...flowTasks];
+
+    const builder = new TestCaseBuilder();
+    const result = builder.build(tree, allFlowTasks, budget, config, checkpoint.budget.startTime, queue.remaining());
+    await ExplorationStorageService.clearCheckpoint(config.explorationId);
+    return result;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CHECKPOINT HELPERS
+  // ═══════════════════════════════════════════════════════════════════════
+
+  private async saveCheckpoint(checkpoint: ExplorationCheckpoint): Promise<void> {
+    try {
+      await ExplorationStorageService.saveCheckpoint(this.config.explorationId, checkpoint);
+      logger.debug('[EXPLORATION] Checkpoint saved', {
+        explorationId: this.config.explorationId,
+        phase: checkpoint.phase,
+      });
+    } catch (error) {
+      // Non-critical: log but don't fail exploration
+      logger.warn('[EXPLORATION] Failed to save checkpoint', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 }

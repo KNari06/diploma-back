@@ -27,6 +27,7 @@ export function buildPageClassificationPrompt(params: {
   scopeHint?: string;
   hasCredentials: boolean;
   depth: number;
+  structureSummary?: string;
 }): string {
   const sections: string[] = [];
 
@@ -41,6 +42,10 @@ export function buildPageClassificationPrompt(params: {
 
   if (params.hasCredentials) {
     sections.push(`CREDENTIALS: Available for authentication flows.`);
+  }
+
+  if (params.structureSummary) {
+    sections.push(`PAGE STRUCTURE SUMMARY:\n${params.structureSummary}`);
   }
 
   sections.push(`PAGE STATE (DOM elements):\n${params.formattedSnapshot}`);

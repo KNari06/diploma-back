@@ -5,13 +5,14 @@
  * Not a coordinator — a cynical watchdog that assumes agents WILL get stuck.
  *
  * Tier 1: Deterministic (<5ms, 0 tokens) — state hash, wrong page, forbidden actions
- * Tier 2: AI diagnosis (gpt-4o-mini, ~1s) — ONLY when stuck 5+ iterations
+ * Tier 2: AI diagnosis (gemini-2.5-flash-lite, ~1s) — ONLY when stuck 5+ iterations
  *
  * Produces a Blackboard (shared reactive state) consumed by ALL agents.
  */
 
 import type { MultiAgentInput, SupervisorBlackboard } from './types';
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { LitePromptBuilder } from '../prompt/lite-prompt-builder';
 import { logger } from '@/utils/core/logger';
 
@@ -356,12 +357,12 @@ export class SupervisorAgent {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // Tier 2: Nuclear AI Diagnosis (gpt-4o-mini, only when stuck 5+)
+  // Tier 2: Nuclear AI Diagnosis (gemini-2.5-flash-lite, only when stuck 5+)
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
    * AI diagnosis — called ONLY when Tier 1 is exhausted (5+ interventions).
-   * Uses gpt-4o for a diagnostic call.
+   * Uses gpt-4.1 for a diagnostic call.
    * Returns actionable hint + optional mandatory action override.
    */
   async diagnoseBlocker(
@@ -420,7 +421,7 @@ Valid actions: click, fill, select, press, goto, scroll, hover, wait.`;
       });
 
       const result = await LitePromptBuilder.askJson<Tier2DiagnosticResult>(prompt, {
-        model: 'gpt-4o',
+        model: AI_TASK_MODELS.goalAuditor,
         temperature: 0.0,
         maxTokens: 300,
         timeoutMs: LITE_ENGINE_FLAGS.supervisorTier2TimeoutMs,

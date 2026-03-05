@@ -142,7 +142,7 @@ export async function getIntegration(req: AuthenticatedRequest, res: Response): 
 export async function updateIntegration(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { webhookSecret, events, enabled } = req.body;
+    const { webhookSecret, events, enabled, planId } = req.body;
     const userId = getUserId(req);
 
     const integration = await GitIntegrationService.updateIntegration({
@@ -151,6 +151,7 @@ export async function updateIntegration(req: AuthenticatedRequest, res: Response
       webhookSecret,
       events,
       enabled,
+      planId,
     });
 
     res.json({

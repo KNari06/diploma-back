@@ -5,6 +5,8 @@
  * to ensure tests complete within reasonable time and cost constraints.
  */
 
+import { AI_MODELS } from '@/config/ai/ai-models.config';
+
 export const INTELLIGENT_TEST_LIMITS = {
   /**
    * Maximum execution time for a single intelligent test run
@@ -98,6 +100,17 @@ export const LITE_ENGINE_FLAGS = {
   enableShadowDOMCrosscheck: true,
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // OBSTACLE DETECTION (3-Layer Universal)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable Layer 2: Collect ObstacleFacts and pass to Observer for LLM classification.
+   *  When false, falls back to the old 4-rule coverage heuristic for modal detection. */
+  enableLayer2ObstacleClassification: true,
+
+  /** Enable Layer 3: Identify exact blocker via elementFromPoint after click failure.
+   *  Provides type-specific recovery (scroll, dismiss, wait) instead of blind force click. */
+  enableLayer3BlockerDetection: true,
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // SHADOW DOM SUPPORT (P1 Feature)
   // ═══════════════════════════════════════════════════════════════════════════
   /** Enable full Shadow DOM traversal in snapshot collector */
@@ -148,8 +161,8 @@ export const LITE_ENGINE_FLAGS = {
   // ═══════════════════════════════════════════════════════════════════════════
   // CORE BRAIN MODEL CONFIGURATION
   // ═══════════════════════════════════════════════════════════════════════════
-  /** Model to use for core brain decision making (upgraded from gpt-4o-mini) */
-  coreBrainModel: 'gpt-4o' as const,
+  /** Model to use for core brain decision making */
+  coreBrainModel: AI_MODELS.smart,
 
   /** Maximum tokens for core brain responses */
   coreBrainMaxTokens: 800,
@@ -240,6 +253,20 @@ export const LITE_ENGINE_FLAGS = {
   snapshotMaxElements: 80,
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // SNAPSHOT PRUNER (Pre-LLM Context-Aware Element Filtering)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable Pre-LLM snapshot pruner for context-aware element filtering */
+  enableSnapshotPruning: true,
+  /** Timeout for pruner LLM call (ms). Must be fast (<2s) to not slow iteration. */
+  prunerTimeoutMs: 2000,
+  /** Pruner cache TTL (ms). Longer than ObserverCache because page content changes less often. */
+  prunerCacheTtlMs: 15_000,
+  /** Maximum pruner cache entries */
+  prunerCacheMaxEntries: 10,
+  /** Enable fullPage snapshot collection in main iteration loop (see beyond viewport) */
+  enableFullPageSnapshot: true,
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // SUPERVISOR LAYER (Manus Tiered Escalation)
   // ═══════════════════════════════════════════════════════════════════════════
   /** Enable Supervisor layer */
@@ -254,7 +281,7 @@ export const LITE_ENGINE_FLAGS = {
   supervisorForbiddenActionWindow: 3,
   /** Max element signatures in state hash */
   supervisorStateHashElementCount: 20,
-  /** Enable Tier 2 AI diagnosis (gpt-4o-mini) when Tier 1 exhausted */
+  /** Enable Tier 2 AI diagnosis (gemini-2.5-flash-lite) when Tier 1 exhausted */
   enableSupervisorTier2: true,
   /** Timeout for Tier 2 AI call (ms) */
   supervisorTier2TimeoutMs: 3000,

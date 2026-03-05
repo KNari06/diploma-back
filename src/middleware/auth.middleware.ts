@@ -157,6 +157,56 @@ export const requireAdmin = async (
 };
 
 /**
+ * Middleware to require approved account status
+ * Must be used after requireAuth middleware
+ * Returns 403 if user account is not approved
+ */
+export const requireApproved = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized: Authentication required',
+        message: 'Please authenticate first',
+      });
+      return;
+    }
+
+    if (req.user.status !== 'approved') {
+      logger.debug('[AUTH] Access denied - account not approved', {
+        userId: req.user.id,
+        status: req.user.status,
+        path: req.path,
+      });
+      res.status(403).json({
+        success: false,
+        error: 'Account pending approval',
+        code: 'PENDING_APPROVAL',
+        status: req.user.status || 'pending_approval',
+        message: 'Your account is pending approval. Please wait for an administrator to approve your access.',
+      });
+      return;
+    }
+
+    next();
+  } catch (error) {
+    logger.error('[AUTH] Approval check error', {
+      error: error instanceof Error ? error.message : String(error),
+      path: req.path,
+      method: req.method,
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
+  }
+};
+
+/**
  * Middleware to check credits before expensive operations
  * Must be used after requireAuth middleware
  *

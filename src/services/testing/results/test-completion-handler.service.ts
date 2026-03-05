@@ -60,9 +60,10 @@ export class TestCompletionHandlerService {
       }
 
       // ✅ FIX #8: Get test data with proper field selection (including user_id for notifications)
+      // V11: Include executed_steps so formatter can show step-level failure reasons
       const { data: test, error: testError } = await supabaseAdmin
         .from('tests')
-        .select('id, url, status, browsers, user_id, project_id, created_at, completed_at')
+        .select('id, url, status, browsers, user_id, project_id, created_at, completed_at, executed_steps')
         .eq('id', testId)
         .single();
 

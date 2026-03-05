@@ -1,7 +1,7 @@
 /**
  * Failure Analysis Service
  * Provides AI-powered structured root-cause analysis for failed tests.
- * Uses LLM classification (gpt-4o-mini) with error context from test results
+ * Uses LLM classification (gemini-2.5-flash-lite) with error context from test results
  * and intelligent session data.
  */
 

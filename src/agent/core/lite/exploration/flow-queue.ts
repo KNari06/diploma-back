@@ -12,7 +12,7 @@
  * Async-safe: concurrent sub-agents can enqueue new entry points.
  */
 
-import type { EntryPoint, FlowPriority, FlowComplexity } from './types';
+import type { EntryPoint, FlowPriority, FlowComplexity, QueueCheckpoint } from './types';
 
 /** Priority weights (higher = explore sooner) */
 const PRIORITY_WEIGHT: Record<FlowPriority, number> = {
@@ -118,6 +118,26 @@ export class FlowQueue {
    */
   remaining(): EntryPoint[] {
     return [...this.queue];
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CHECKPOINT / RESUME
+  // ═══════════════════════════════════════════════════════════════════════
+
+  toCheckpoint(): QueueCheckpoint {
+    return {
+      queue: [...this.queue],
+      completed: Array.from(this.completed),
+      allGoals: Array.from(this.allGoals.entries()),
+    };
+  }
+
+  static fromCheckpoint(cp: QueueCheckpoint): FlowQueue {
+    const q = new FlowQueue();
+    q.queue = [...cp.queue];
+    for (const id of cp.completed) q.completed.add(id);
+    for (const [id, goal] of cp.allGoals) q.allGoals.set(id, goal);
+    return q;
   }
 
   // ═══════════════════════════════════════════════════════════════════════

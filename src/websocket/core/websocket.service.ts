@@ -19,6 +19,9 @@ import {
   ChatMessagePayload,
   ChatTestUpdatePayload,
   createRoomName,
+  ExplorationClarificationPayload,
+  ExplorationCompletedPayload,
+  ExplorationProgressPayload,
   ResultErrorPayload,
   ResultReadyPayload,
   ResultScreenshotPayload,
@@ -858,6 +861,54 @@ class WebSocketService {
         this.emitToUser(userId, 'regression:run:progress', payload);
       },
       { userId }
+    );
+  }
+
+  // ============================================================================
+  // EXPLORATION EVENTS
+  // ============================================================================
+
+  public emitExplorationProgress(payload: ExplorationProgressPayload): void {
+    this.emitWithFallback(
+      'exploration:progress',
+      payload,
+      () => {
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'exploration:progress', payload);
+        }
+      },
+      { sessionId: payload.chatSessionId }
+    );
+  }
+
+  public emitExplorationCompleted(payload: ExplorationCompletedPayload): void {
+    this.emitWithFallback(
+      'exploration:completed',
+      payload,
+      () => {
+        logger.info('[WebSocketService] Emitting exploration completed', {
+          explorationId: payload.explorationId,
+          status: payload.status,
+          testCasesCount: payload.testCasesCount,
+        });
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'exploration:completed', payload);
+        }
+      },
+      { sessionId: payload.chatSessionId }
+    );
+  }
+
+  public emitExplorationClarification(payload: ExplorationClarificationPayload): void {
+    this.emitWithFallback(
+      'exploration:clarification:request',
+      payload,
+      () => {
+        if (payload.chatSessionId) {
+          this.emitToChat(payload.chatSessionId, 'exploration:clarification:request', payload);
+        }
+      },
+      { sessionId: payload.chatSessionId }
     );
   }
 

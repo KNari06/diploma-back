@@ -50,6 +50,50 @@ const POST_ACTION_SETTLE_TIMEOUT = 5000; // 5 seconds
 // V2: Action types that support state verification
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
+// V11: Actions that don't target elements — skip modal check
+const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check']);
+
+/**
+ * V11: Detect if a modal/popup/overlay is currently blocking the page.
+ * Uses cached domNodes from session (no extra snapshot collection).
+ * Returns modal info if detected, null otherwise.
+ */
+function detectModalBlockingFromSession(
+  previewSessionId: string,
+  userId: string,
+): { modalRef: string; modalText?: string; boundingBox?: { x: number; y: number; width: number; height: number } } | null {
+  const sessionService = getPreviewSessionService();
+  const session = sessionService.getSession(previewSessionId);
+  if (!session) return null;
+
+  const domNodes = session.pageState?.domNodes;
+  if (!domNodes || domNodes.length === 0) return null;
+
+  // Check if any node is flagged as inside active modal (set by snapshot collector)
+  const hasModalElements = domNodes.some(n => n.isInsideActiveModal === true);
+  if (!hasModalElements) return null;
+
+  // Find the modal container node itself (dialog/alertdialog/or highest z-index positioned element)
+  const modalNode = domNodes.find(n =>
+    n.isVisible &&
+    (n.role === 'dialog' || n.role === 'alertdialog' || n.tag === 'dialog')
+  );
+
+  // Build modal text from elements inside it
+  const modalElements = domNodes.filter(n => n.isInsideActiveModal === true);
+  const modalText = modalElements
+    .map(n => n.text || n.ariaLabel || n.labelText || '')
+    .filter(Boolean)
+    .join(' ')
+    .slice(0, 200);
+
+  return {
+    modalRef: modalNode?.ref || modalElements[0]?.ref || 'unknown',
+    modalText: modalText || undefined,
+    boundingBox: modalNode?.boundingBox || undefined,
+  };
+}
+
 /**
  * Generate a random integer in range [min, max] (inclusive).
  */
@@ -288,6 +332,12 @@ interface ApplyResult {
   stateChange?: {
     before?: Partial<InteractiveNode>;
     after?: Partial<InteractiveNode>;
+  };
+  /** V11: Modal/popup is blocking the target element */
+  modalBlocking?: {
+    modalRef: string;
+    modalText?: string;
+    boundingBox?: { x: number; y: number; width: number; height: number };
   };
 }
 
@@ -1462,6 +1512,28 @@ export class PreviewStepApplyService {
       }
 
       if (lintResult.status === 'not_found' || lintResult.candidates.length === 0) {
+        // ═══════════════════════════════════════════════════════════════════
+        // V11: Modal-aware "not found" — if a modal is open, the target may
+        // be behind it. Inform the user so they can dismiss the modal first.
+        // ═══════════════════════════════════════════════════════════════════
+        const modalInfo = detectModalBlockingFromSession(previewSessionId, userId);
+        if (modalInfo) {
+          logger.info('[PREVIEW_APPLY] Element not found — modal/popup may be blocking', {
+            previewSessionId,
+            modalRef: modalInfo.modalRef,
+            modalText: modalInfo.modalText?.slice(0, 80),
+          });
+          return {
+            success: false,
+            error: 'A popup/modal is currently open and may be blocking the target element. Dismiss it or interact with it first.',
+            highlight: modalInfo.boundingBox ? [{
+              boundingBox: modalInfo.boundingBox,
+              type: 'warning' as const,
+            }] : [],
+            modalBlocking: modalInfo,
+          };
+        }
+
         return {
           success: false,
           error: lintResult.message || 'No matching elements found',
@@ -1469,16 +1541,55 @@ export class PreviewStepApplyService {
         };
       }
 
-      // Try candidates in order
-      const candidatesToTry = lintResult.candidates.slice(0, MAX_ATTEMPTS);
+      // ═══════════════════════════════════════════════════════════════════════
+      // V11: Layer-aware execution — check if modal blocks the target element.
+      // Like a real user: if a popup is open, you interact with its elements.
+      // If your target is behind the popup, you must dismiss it first.
+      // ═══════════════════════════════════════════════════════════════════════
+      const resolvedCandidates = lintResult.candidates.slice(0, MAX_ATTEMPTS);
+      const anyInsideModal = resolvedCandidates.some(c => c.node?.isInsideActiveModal === true);
+      const modalDetected = detectModalBlockingFromSession(previewSessionId, userId);
+
+      if (modalDetected && !anyInsideModal) {
+        // Target element is NOT inside the modal — modal is blocking it.
+        // Don't execute: inform the user.
+        logger.info('[PREVIEW_APPLY] Modal blocking target — candidates are behind popup', {
+          previewSessionId,
+          modalRef: modalDetected.modalRef,
+          candidateRefs: resolvedCandidates.map(c => c.ref).join(', '),
+        });
+        return {
+          success: false,
+          error: 'A popup/modal is blocking the target element. Dismiss it or interact with elements inside the popup first.',
+          highlight: [
+            // Highlight the modal itself as warning
+            ...(modalDetected.boundingBox ? [{
+              boundingBox: modalDetected.boundingBox,
+              type: 'warning' as const,
+            }] : []),
+            // Highlight candidates as error (behind modal)
+            ...resolvedCandidates.map(c => ({
+              ref: c.ref,
+              boundingBox: c.boundingBox,
+              type: 'error' as const,
+            })),
+          ],
+          modalBlocking: modalDetected,
+          attempts: 0,
+        };
+      }
+      // If target IS inside the modal (anyInsideModal=true) or no modal detected,
+      // proceed normally — the user is working with the popup layer.
+
+      // Try candidates in order (reuse resolvedCandidates from modal check above)
       let lastError: string | undefined;
       let attempts = 0;
-      
+
       // V5: Capture URL BEFORE trying candidates for accurate compiled context
       // This URL represents the page state when elements were found by lint
       const urlBeforeAction = page.url();
 
-      for (const candidate of candidatesToTry) {
+      for (const candidate of resolvedCandidates) {
         attempts++;
         logger.debug('[PREVIEW_APPLY] Trying candidate', {
           attempt: attempts,
@@ -1597,7 +1708,7 @@ export class PreviewStepApplyService {
       return {
         success: false,
         error: lastError || 'All candidates failed',
-        highlight: candidatesToTry.map(c => ({
+        highlight: resolvedCandidates.map(c => ({
           ref: c.ref,
           boundingBox: c.boundingBox,
           type: 'error' as const,

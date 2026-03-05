@@ -2034,6 +2034,8 @@ export class RegressionRunService {
               message: meta?.failureExplanation || meta?.failedReason || 'Step failed',
               failedReason: meta?.failedReason,
               screenshot: meta?.bugScreenshotUrl,
+              rootCause: meta?.rootCause,
+              networkVerdict: meta?.networkVerdict,
             } : undefined,
           });
         }

@@ -24,6 +24,32 @@ import type { IntentTestCase, Priority } from '@/types/testing.types';
 // EXPLORATION CONFIG (input)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Progress event emitted during exploration for real-time UI updates */
+export type ExplorationProgressEvent = {
+  explorationId: string;
+  phase: 'survey' | 'flow' | 'complete';
+  event: 'page_discovered' | 'survey_complete' | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found';
+  data: Record<string, any>;
+  progressPercent: number;
+  timestamp: number;
+};
+
+/** Callback for exploration progress reporting */
+export type ExplorationProgressCallback = (event: ExplorationProgressEvent) => void;
+
+export interface RateLimitingConfig {
+  /** Min delay between Playwright navigations (ms). Default: 500 */
+  minDelayBetweenNavigationsMs?: number;
+  /** Min delay between AI API calls (ms). Default: 200 */
+  minDelayBetweenAiCallsMs?: number;
+  /** Max consecutive rate limits per target before degradation. Default: 3 */
+  maxConsecutiveRateLimits?: number;
+  /** Base backoff delay (ms). Default: 5000 */
+  baseBackoffMs?: number;
+  /** Max backoff delay (ms). Default: 30000 */
+  maxBackoffMs?: number;
+}
+
 export interface ExplorationConfig {
   /** Entry URL to start exploring */
   entryUrl: string;
@@ -50,6 +76,10 @@ export interface ExplorationConfig {
   chatSessionId?: string;
   /** Workspace ID for skills context */
   workspaceId?: string;
+  /** Optional callback for real-time progress reporting */
+  onProgress?: ExplorationProgressCallback;
+  /** Rate limiting configuration for external requests */
+  rateLimiting?: RateLimitingConfig;
 }
 
 export interface ExplorationBudget {
@@ -74,6 +104,9 @@ export const DEFAULT_EXPLORATION_BUDGET: ExplorationBudget = {
 };
 
 export const DEFAULT_MAX_CONCURRENCY = 5;
+
+/** Desktop user agent to prevent mobile redirects during exploration */
+export const DESKTOP_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TEST FLOW CATEGORIES
@@ -517,4 +550,57 @@ export interface BudgetUsage {
   flowsRemaining: number;
   pipelineRoundsUsed: number;
   pipelineRoundsRemaining: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CHECKPOINT / RESUME (crash recovery)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface ExplorationCheckpoint {
+  version: 1;
+  phase: 'survey' | 'flow';
+  timestamp: number;
+
+  /** ExplorationTree state */
+  tree: TreeCheckpoint;
+
+  /** BudgetTracker state */
+  budget: BudgetCheckpoint;
+
+  /** FlowQueue state (only if phase === 'flow') */
+  queue?: QueueCheckpoint;
+
+  /** FlowRunner state (only if phase === 'flow') */
+  flowRunner?: FlowRunnerCheckpoint;
+
+  /** Auth state (cached storageState JSON) */
+  authState?: object;
+}
+
+export interface TreeCheckpoint {
+  nodes: ExplorationNode[];
+  visitedUrls: string[];
+  visitedContentHashes: string[];
+  allEntryPoints: Array<[string, EntryPoint]>;
+  nodeIdCounter: number;
+}
+
+export interface BudgetCheckpoint {
+  flowsCompleted: number;
+  pipelineRoundsUsed: number;
+  pagesSurveyed: number;
+  startTime: number;
+}
+
+export interface QueueCheckpoint {
+  queue: EntryPoint[];
+  completed: string[];
+  allGoals: Array<[string, string]>;
+}
+
+export interface FlowRunnerCheckpoint {
+  loginCompleted: boolean;
+  knownFlowNames: string[];
+  flowsCompleted: number;
+  completedTasks: FlowExplorationTask[];
 }

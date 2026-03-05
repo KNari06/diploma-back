@@ -282,6 +282,11 @@ const EXTRACT_SCRIPT = `
       nearestLandmark: nearestLandmark || undefined,
       // Phase 4: Framework event binding detection
       frameworkClickable: frameworkClickable || undefined,
+      // Phase 4: Additional interactivity signals
+      isContentEditable: el.getAttribute('contenteditable') === 'true' || el.getAttribute('contenteditable') === '' || undefined,
+      tabIndex: el.getAttribute('tabindex') !== null ? parseInt(el.getAttribute('tabindex'), 10) : undefined,
+      hasOnclick: el.hasAttribute('onclick') || undefined,
+      hasAriaHaspopup: el.hasAttribute('aria-haspopup') || undefined,
     };
 
     results.push(node);

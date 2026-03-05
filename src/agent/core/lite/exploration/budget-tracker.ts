@@ -9,7 +9,7 @@
  * All sub-agents check budget before starting new work.
  */
 
-import type { ExplorationBudget, BudgetUsage } from './types';
+import type { ExplorationBudget, BudgetUsage, BudgetCheckpoint } from './types';
 
 export class BudgetTracker {
   private readonly startTime: number;
@@ -17,6 +17,7 @@ export class BudgetTracker {
   private pipelineRoundsUsed: number = 0;
   private pagesSurveyed: number = 0;
   private mutexPromise: Promise<void> = Promise.resolve();
+  private degradedTargets: Set<string> = new Set();
 
   constructor(private readonly budget: ExplorationBudget) {
     this.startTime = Date.now();
@@ -99,6 +100,16 @@ export class BudgetTracker {
     });
   }
 
+  async markDegraded(target: string): Promise<void> {
+    await this.withMutex(() => {
+      this.degradedTargets.add(target);
+    });
+  }
+
+  isTargetDegraded(target: string): boolean {
+    return this.degradedTargets.has(target);
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // USAGE REPORT
   // ═══════════════════════════════════════════════════════════════════════
@@ -112,6 +123,29 @@ export class BudgetTracker {
       pipelineRoundsUsed: this.pipelineRoundsUsed,
       pipelineRoundsRemaining: this.remainingPipelineRounds(),
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CHECKPOINT / RESUME
+  // ═══════════════════════════════════════════════════════════════════════
+
+  toCheckpoint(): BudgetCheckpoint {
+    return {
+      flowsCompleted: this.flowsCompleted,
+      pipelineRoundsUsed: this.pipelineRoundsUsed,
+      pagesSurveyed: this.pagesSurveyed,
+      startTime: this.startTime,
+    };
+  }
+
+  static fromCheckpoint(budget: ExplorationBudget, cp: BudgetCheckpoint): BudgetTracker {
+    const tracker = new BudgetTracker(budget);
+    tracker.flowsCompleted = cp.flowsCompleted;
+    tracker.pipelineRoundsUsed = cp.pipelineRoundsUsed;
+    tracker.pagesSurveyed = cp.pagesSurveyed;
+    // Keep startTime from checkpoint so remaining time is calculated correctly
+    (tracker as any).startTime = cp.startTime;
+    return tracker;
   }
 
   // ═══════════════════════════════════════════════════════════════════════

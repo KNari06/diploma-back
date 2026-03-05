@@ -14,6 +14,7 @@ import {
 } from './shared/request-cancellation';
 import { routeToHandler } from './shared/routing';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
+import { handlePendingExplorationConfirmation } from './shared/exploration-confirmation';
 
 // History handlers
 import { debugChatData, getChatHistory, getChatSessions, getCurrentChatHistory } from './history';
@@ -148,6 +149,20 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
 
     // Check if request was cancelled
     checkRequestAbortedWithLogging(abortSignal);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 4.5: CHECK PENDING EXPLORATION CONFIRMATION
+    // If user previously requested exploration and we asked for confirmation,
+    // handle the yes/no response before parsing a new intent.
+    // ═══════════════════════════════════════════════════════════════════════
+    const explorationHandled = await handlePendingExplorationConfirmation(
+      req, res, message, chatSessionId!, userId, workspace_id,
+    );
+    if (explorationHandled) {
+      const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
+      await unregisterActiveRequestWithLogging(chatSessionId, userId);
+      return;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 5: PARSE INTENT (FIX #5)

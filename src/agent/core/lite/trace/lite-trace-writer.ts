@@ -19,8 +19,8 @@
  * - run_start / run_end: Test lifecycle
  * - iteration_start / iteration_end: Each iteration boundary
  * - snapshot: LiteSnapshot + formatted snapshot for AI
- * - ai_prompt / ai_response: Main decision AI (gpt-4o-mini)
- * - ai_auditor_prompt / ai_auditor_response: Goal validation AI (gpt-4o)
+ * - ai_prompt / ai_response: Main decision AI (gemini-2.5-flash-lite)
+ * - ai_auditor_prompt / ai_auditor_response: Goal validation AI (gpt-4.1)
  * - ai_strategy_initialized / ai_strategy_failed: Strategy init
  * - action_execute_start / action_execute_end: Action execution boundaries
  * - action_validation / action_execution_start / action_execution_end / action_fallback / action_modal_check: Detailed action steps

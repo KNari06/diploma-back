@@ -105,6 +105,16 @@ export class GitWebhookJobHandler {
       return planRow?.automation_config;
     })();
 
+    // Check if git triggers are enabled in plan config
+    if (planAutomationConfig?.gitTriggers && planAutomationConfig.gitTriggers.enabled === false) {
+      logger.info('[GIT_WEBHOOK_JOB] Git triggers disabled in plan config', { planId, deliveryId });
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'git_triggers_disabled_in_plan',
+      });
+      return;
+    }
+
     // Determine allowed branches from plan config (falls back to default main/master)
     const allowedBranches = planAutomationConfig?.gitTriggers?.branch
       ? [planAutomationConfig.gitTriggers.branch]
@@ -114,14 +124,22 @@ export class GitWebhookJobHandler {
     const planTriggerTypes = planAutomationConfig?.gitTriggers?.triggerTypes as string[] | undefined;
     if (planTriggerTypes && planTriggerTypes.length > 0) {
       // Map webhook event type to plan trigger type
+      // push → 'push_to_branch', pull_request/merge_request → 'merge_to_main', release → 'release'
       const eventToTriggerMap: Record<string, string> = {
         pull_request: 'merge_to_main',
         merge_request: 'merge_to_main',
-        push: 'merge_to_main',
+        push: 'push_to_branch',
         release: 'release',
       };
       const mappedTrigger = eventToTriggerMap[deliveryEventType];
       if (mappedTrigger && !planTriggerTypes.includes(mappedTrigger)) {
+        logger.info('[GIT_WEBHOOK_JOB] Trigger type not enabled in plan', {
+          deliveryId,
+          planId,
+          deliveryEventType,
+          mappedTrigger,
+          planTriggerTypes,
+        });
         await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
           status: 'ignored',
           error: 'trigger_type_not_enabled',
@@ -139,6 +157,15 @@ export class GitWebhookJobHandler {
     });
 
     if (!decision.trigger) {
+      logger.info('[GIT_WEBHOOK_JOB] Webhook ignored by shouldTrigger', {
+        provider,
+        deliveryId,
+        planId,
+        deliveryEventType,
+        reason: decision.reason,
+        branch: decision.branch,
+        allowedBranches,
+      });
       await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
         status: 'ignored',
         error: decision.reason,

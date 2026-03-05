@@ -32,18 +32,22 @@ import type {
   EntryPoint,
   FlowExplorationTask,
   FlowExplorationStatus,
+  FlowRunnerCheckpoint,
   DiscoveredStep,
   FlowError,
   ErrorClassification,
   BlockerType,
+  ExplorationProgressCallback,
 } from './types';
 import { FlowQueue } from './flow-queue';
 import { BudgetTracker } from './budget-tracker';
 import { StateManager } from './state-manager';
+import { RateLimiter } from './rate-limiter';
 import {
   buildBranchDetectionPrompt,
   parseBranchDetectionResponse,
 } from './prompts';
+import { ClarificationService } from '@/agent/utils/context/clarification.service';
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -73,17 +77,69 @@ class Semaphore {
   }
 }
 
+/** Callback for periodic checkpoint saves during flow execution */
+export type CheckpointCallback = (completedTasks: FlowExplorationTask[]) => Promise<void>;
+
 export class FlowRunner {
   private stateManager: StateManager;
   private loginCompleted: boolean = false;
   private knownFlowNames: string[] = [];
+  private flowsCompleted: number = 0;
+  private totalFlows: number = 0;
+  private checkpointCallback?: CheckpointCallback;
 
   constructor(
     private readonly browser: Browser,
     private readonly config: ExplorationConfig,
     private readonly budget: BudgetTracker,
+    private readonly onProgress?: ExplorationProgressCallback,
+    private readonly rateLimiter?: RateLimiter,
   ) {
     this.stateManager = new StateManager(browser);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CHECKPOINT / RESUME
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setCheckpointCallback(cb: CheckpointCallback): void {
+    this.checkpointCallback = cb;
+  }
+
+  isLoginCompleted(): boolean {
+    return this.loginCompleted;
+  }
+
+  getKnownFlowNames(): string[] {
+    return [...this.knownFlowNames];
+  }
+
+  restoreFromCheckpoint(cp: FlowRunnerCheckpoint): void {
+    this.loginCompleted = cp.loginCompleted;
+    this.knownFlowNames = [...cp.knownFlowNames];
+    this.flowsCompleted = cp.flowsCompleted;
+  }
+
+  private emitProgress(
+    event: 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found',
+    data: Record<string, any>,
+  ): void {
+    if (!this.onProgress) return;
+    // Progress: 30% (survey done) → 95% (flows done). Scale within this range.
+    const flowProgress = this.totalFlows > 0
+      ? (this.flowsCompleted / this.totalFlows)
+      : 0;
+    const progressPercent = 30 + Math.round(flowProgress * 65);
+    try {
+      this.onProgress({
+        explorationId: this.config.explorationId,
+        phase: 'flow',
+        event,
+        data,
+        progressPercent: Math.min(95, progressPercent),
+        timestamp: Date.now(),
+      });
+    } catch { /* never let progress reporting crash exploration */ }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -99,6 +155,9 @@ export class FlowRunner {
     const semaphore = new Semaphore(maxConcurrency);
     const results: FlowExplorationTask[] = [];
     const inFlight: Set<Promise<void>> = new Set();
+
+    this.totalFlows = queue.size() + this.flowsCompleted;
+    // Don't reset flowsCompleted — it may be restored from checkpoint
 
     logger.info('[FLOW_RUNNER] Starting flow exploration', {
       queueSize: queue.size(),
@@ -170,9 +229,16 @@ export class FlowRunner {
     results: FlowExplorationTask[],
     release: () => void,
   ): Promise<void> {
+    this.emitProgress('flow_started', {
+      name: entryPoint.name,
+      category: entryPoint.category,
+      priority: entryPoint.priority,
+    });
+
     try {
       const task = await this.runSingleFlow(entryPoint);
       results.push(task);
+      this.flowsCompleted++;
 
       // Mark as completed for dependency tracking
       if (task.goalAchieved) {
@@ -182,10 +248,39 @@ export class FlowRunner {
       // Enqueue newly discovered branch points
       for (const branch of task.branchPoints) {
         await queue.enqueue(branch);
+        this.totalFlows++;
+      }
+
+      if (task.branchPoints.length > 0) {
+        this.emitProgress('branch_found', {
+          flow: entryPoint.name,
+          branchCount: task.branchPoints.length,
+          branchNames: task.branchPoints.map(b => b.name),
+        });
       }
 
       // Record budget usage
       await this.budget.recordFlowCompletion(task.roundsUsed);
+
+      // Trigger checkpoint callback if configured
+      if (this.checkpointCallback) {
+        try {
+          await this.checkpointCallback(results);
+        } catch { /* never let checkpoint saving crash flow execution */ }
+      }
+
+      // Emit appropriate completion event
+      const progressEvent = task.status === 'blocked' ? 'flow_blocked' as const
+        : task.goalAchieved ? 'flow_completed' as const
+        : 'flow_failed' as const;
+
+      this.emitProgress(progressEvent, {
+        name: entryPoint.name,
+        status: task.status,
+        steps: task.discoveredSteps.length,
+        branches: task.branchPoints.length,
+        goalAchieved: task.goalAchieved,
+      });
 
       logger.info('[FLOW_RUNNER] Flow completed', {
         name: entryPoint.name,
@@ -194,11 +289,17 @@ export class FlowRunner {
         branches: task.branchPoints.length,
       });
     } catch (error) {
+      this.flowsCompleted++;
       logger.error('[FLOW_RUNNER] Flow execution failed', {
         name: entryPoint.name,
         error: error instanceof Error ? error.message : String(error),
       });
       results.push(this.createFailedTask(entryPoint, error));
+
+      this.emitProgress('flow_failed', {
+        name: entryPoint.name,
+        error: error instanceof Error ? error.message : String(error),
+      });
     } finally {
       release();
     }
@@ -233,10 +334,34 @@ export class FlowRunner {
 
       // 2. Navigate to the entry point's source page
       const targetUrl = entryPoint.sourcePageUrl || this.config.entryUrl;
-      await page.goto(targetUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15_000,
-      });
+      if (this.rateLimiter) {
+        const canNavigate = await this.rateLimiter.acquireSlot('navigation');
+        if (!canNavigate) {
+          throw new Error(`Target site degraded, cannot navigate to ${targetUrl}`);
+        }
+      }
+      try {
+        await page.goto(targetUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 15_000,
+        });
+        this.rateLimiter?.recordSuccess('target_site');
+      } catch (navError) {
+        if (this.rateLimiter && RateLimiter.isRateLimitError(navError as Error)) {
+          const result = await this.rateLimiter.recordFailure('target_site', navError as Error);
+          if (result.shouldRetry) {
+            await page.goto(targetUrl, {
+              waitUntil: 'domcontentloaded',
+              timeout: 15_000,
+            });
+            this.rateLimiter.recordSuccess('target_site');
+          } else {
+            throw new Error(`Rate limited navigating to ${targetUrl}`);
+          }
+        } else {
+          throw navError;
+        }
+      }
 
       // 3. Create pipeline integrations
       const actionExecutor = new ActionExecutor(page);
@@ -285,9 +410,9 @@ export class FlowRunner {
       // 8. Track this flow name for branch dedup
       this.knownFlowNames.push(entryPoint.name);
 
-      // 9. Detect branch points on final page
+      // 9. Detect branch points on final page (also for partially-successful flows)
       let branchPoints: EntryPoint[] = [];
-      if (pipelineResult.success) {
+      if (pipelineResult.success || pipelineResult.progressScore > 30) {
         branchPoints = await this.detectBranchPoints(page, entryPoint, this.knownFlowNames);
       }
 
@@ -303,6 +428,80 @@ export class FlowRunner {
         const blockerInfo = this.extractBlockerInfo(pipelineResult.insights);
         blockerType = blockerInfo.type;
         canUserHelp = blockerInfo.canUserHelp;
+
+        // 10a. Request user help for captcha/2FA if possible
+        if (
+          canUserHelp &&
+          (blockerType === 'captcha' || blockerType === '2fa') &&
+          this.config.chatSessionId
+        ) {
+          const clarificationQuestion = blockerType === 'captcha'
+            ? 'A CAPTCHA was encountered during exploration. Please solve it in the browser and click "Done".'
+            : 'A 2FA verification code is required. Please enter the code.';
+
+          const answer = await ClarificationService.requestClarificationViaRedis({
+            explorationId: this.config.explorationId,
+            chatSessionId: this.config.chatSessionId,
+            question: clarificationQuestion,
+            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            timeout: 120_000,
+          });
+
+          if (answer) {
+            // User solved it or provided code → retry the flow from the same page
+            logger.info('[FLOW_RUNNER] User resolved blocker, retrying flow', {
+              name: entryPoint.name,
+              blockerType,
+            });
+
+            try {
+              // If 2FA: type the code the user provided
+              if (blockerType === '2fa' && answer !== 'done') {
+                const codeInputs = await page.$$('input[type="text"], input[type="tel"], input[type="number"]');
+                if (codeInputs.length > 0) {
+                  await codeInputs[0].fill(answer);
+                  await page.keyboard.press('Enter');
+                  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+                }
+              }
+
+              // Stop first tracker before creating a new one for retry
+              networkTracker.stopTracking();
+
+              // Re-run pipeline from current state
+              const retryIntegrations: PipelineIntegrations = {
+                page,
+                actionExecutor: new ActionExecutor(page),
+                networkTracker: new NetworkTracker(page),
+                goalDetector: new GoalDetector(entryPoint.goal, entryPoint.id),
+                browserContext: context,
+              };
+              const retryPipeline = new TestPipeline(retryIntegrations);
+              const retryConfig: PipelineConfig = {
+                url: page.url(),
+                credentials: this.config.credentials,
+                hasCredentials: !!this.config.credentials,
+                testId: entryPoint.id,
+                maxRounds: Math.max(1, Math.min(5, allocatedRounds)),
+                timeoutMs: Math.max(5_000, flowTimeoutMs - (Date.now() - startTime)),
+              };
+              const retryResult = await retryPipeline.run(entryPoint.goal, retryConfig);
+
+              if (retryResult.success) {
+                status = 'completed';
+                blockerType = undefined;
+                canUserHelp = undefined;
+                // Merge steps
+                discoveredSteps.push(...this.extractSteps(retryResult));
+              }
+            } catch (retryError) {
+              logger.warn('[FLOW_RUNNER] Retry after user help failed', {
+                name: entryPoint.name,
+                error: retryError instanceof Error ? retryError.message : String(retryError),
+              });
+            }
+          }
+        }
       } else if (Date.now() - startTime >= flowTimeoutMs) {
         status = 'timeout';
       } else {
@@ -345,13 +544,56 @@ export class FlowRunner {
   private async performLogin(context: BrowserContext): Promise<void> {
     if (!this.config.credentials) return;
 
+    const goals = [
+      'Login with provided credentials',
+      'Find the email or username input field and fill it with credentials, then find the password field and fill it, then click the login or sign in button to submit the form',
+    ];
+
+    for (let attempt = 0; attempt < goals.length; attempt++) {
+      try {
+        const success = await this.tryLoginWithGoal(context, goals[attempt]);
+        if (success) return;
+        logger.warn('[FLOW_RUNNER] Login attempt failed', { attempt, goal: goals[attempt] });
+      } catch (error) {
+        logger.warn('[FLOW_RUNNER] Login attempt error', { attempt, error: String(error) });
+      }
+    }
+
+    logger.warn('[FLOW_RUNNER] All login attempts failed');
+  }
+
+  private async tryLoginWithGoal(context: BrowserContext, goal: string): Promise<boolean> {
     const page = await context.newPage();
 
     try {
-      await page.goto(this.config.entryUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15_000,
-      });
+      if (this.rateLimiter) {
+        const canNavigate = await this.rateLimiter.acquireSlot('navigation');
+        if (!canNavigate) {
+          throw new Error(`Target site degraded, cannot navigate to ${this.config.entryUrl}`);
+        }
+      }
+      try {
+        await page.goto(this.config.entryUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 15_000,
+        });
+        this.rateLimiter?.recordSuccess('target_site');
+      } catch (navError) {
+        if (this.rateLimiter && RateLimiter.isRateLimitError(navError as Error)) {
+          const result = await this.rateLimiter.recordFailure('target_site', navError as Error);
+          if (result.shouldRetry) {
+            await page.goto(this.config.entryUrl, {
+              waitUntil: 'domcontentloaded',
+              timeout: 15_000,
+            });
+            this.rateLimiter.recordSuccess('target_site');
+          } else {
+            throw new Error(`Rate limited navigating to ${this.config.entryUrl}`);
+          }
+        } else {
+          throw navError;
+        }
+      }
 
       const actionExecutor = new ActionExecutor(page);
       const networkTracker = new NetworkTracker(page);
@@ -364,7 +606,7 @@ export class FlowRunner {
       };
 
       const pipeline = new TestPipeline(integrations);
-      const result = await pipeline.run('Login with provided credentials', {
+      const result = await pipeline.run(goal, {
         url: page.url(),
         credentials: this.config.credentials,
         hasCredentials: true,
@@ -373,21 +615,23 @@ export class FlowRunner {
         timeoutMs: 60_000,
       });
 
+      networkTracker.stopTracking();
+      await page.close();
+
       if (result.success) {
         await this.stateManager.saveAuthState(context);
         this.loginCompleted = true;
         logger.info('[FLOW_RUNNER] Login successful, auth state cached');
-      } else {
-        logger.warn('[FLOW_RUNNER] Login failed', { reason: result.reason });
+        return true;
       }
 
-      networkTracker.stopTracking();
-      await page.close();
+      return false;
     } catch (error) {
       logger.error('[FLOW_RUNNER] Login error', {
         error: error instanceof Error ? error.message : String(error),
       });
       await page.close().catch(() => {});
+      return false;
     }
   }
 
@@ -698,6 +942,11 @@ export class FlowRunner {
     completedEntry: EntryPoint,
     existingFlowNames: string[] = [],
   ): Promise<EntryPoint[]> {
+    // Skip if OpenAI is degraded — branch detection is optional enrichment
+    if (this.rateLimiter?.isDegraded('openai')) {
+      return [];
+    }
+
     try {
       const snapshot = await SnapshotCollector.collect(page);
       const formattedSnapshot = SnapshotCollector.format(snapshot);
@@ -709,6 +958,8 @@ export class FlowRunner {
         completedFlowGoal: completedEntry.goal,
         existingFlowNames,
       });
+
+      if (this.rateLimiter) await this.rateLimiter.acquireSlot('ai');
 
       const response = await Promise.race([
         getChatCompletionWithMessages(
@@ -731,6 +982,7 @@ export class FlowRunner {
         ),
       ]);
 
+      this.rateLimiter?.recordSuccess('openai');
       const branches = parseBranchDetectionResponse(response.content);
 
       return branches.map((bp, index) => ({
@@ -740,6 +992,10 @@ export class FlowRunner {
         sourcePageUrl: page.url(),
       }));
     } catch (error) {
+      if (this.rateLimiter && RateLimiter.isRateLimitError(error as Error)) {
+        await this.rateLimiter.recordFailure('openai', error as Error);
+        // No retry — branch detection is optional enrichment
+      }
       logger.warn('[FLOW_RUNNER] Branch detection failed — discovery quality degraded', {
         flow: completedEntry.name,
         error: error instanceof Error ? error.message : String(error),

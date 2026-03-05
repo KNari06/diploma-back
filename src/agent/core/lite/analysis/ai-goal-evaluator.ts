@@ -1,7 +1,7 @@
 /**
  * AIGoalEvaluator
  * AI-powered goal evaluation fallback for when heuristic detection is uncertain.
- * Uses gpt-4o-mini with strict JSON response format.
+ * Uses gemini-2.5-flash-lite with strict JSON response format.
  *
  * Triggers:
  * 1. When AI says done=true but heuristic is uncertain
@@ -14,10 +14,11 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { logger } from '@/utils/core/logger';
 import { checkTestCancelled } from '../../../playwright/utils/test-cancellation-checker';
 import type { GoalContext, GoalEval } from '../lite-types';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 
 // Configuration
 const AI_FALLBACK_TIMEOUT_MS = 12000; // 12 seconds (within 10-15s range)
-const AI_FALLBACK_MODEL = 'gpt-4o-mini'; // Faster/cheaper, sufficient for yes/no + evidence
+const AI_FALLBACK_MODEL = AI_TASK_MODELS.goalDetection; // Faster/cheaper, sufficient for yes/no + evidence
 const MIN_CONFIDENCE_THRESHOLD = 0.5; // Below this, we don't trust the result
 
 /**

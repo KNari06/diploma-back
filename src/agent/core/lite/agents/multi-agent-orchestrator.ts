@@ -21,6 +21,7 @@
 
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
+import { z } from 'zod';
 import { ActorAgent } from './actor-agent';
 import { CriticAgent } from './critic-agent';
 import { ObserverCache } from './observer-cache';
@@ -172,7 +173,7 @@ export class MultiAgentOrchestrator {
     // ═══════════════════════════════════════════════════════════════════════
     // Supervisor Layer — Manus Tiered Escalation
     // Tier 1: Deterministic blackboard (<5ms, 0 tokens)
-    // Tier 2: AI diagnosis (gpt-4o-mini) only when stuck 5+ iterations
+    // Tier 2: AI diagnosis (gemini-2.5-flash-lite) only when stuck 5+ iterations
     // ═══════════════════════════════════════════════════════════════════════
     let blackboard: SupervisorBlackboard | undefined;
 
@@ -331,6 +332,8 @@ export class MultiAgentOrchestrator {
           pageStructure: input.pageStructure,
           // Supervisor: shared recovery context
           blackboard,
+          // Layer 2: Obstacle facts for LLM classification
+          obstacleFacts: input.obstacleFacts,
         });
 
         if (!observation) {
@@ -346,6 +349,71 @@ export class MultiAgentOrchestrator {
         }
       }
       observerMs = Date.now() - observerStart;
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // Layer 2 Post-Processing: Validate & merge classifiedObstacles
+      // Zod validates LLM output — malformed entries are silently dropped.
+      // Makes Strategist aware of ALL obstacles without modifying Strategist code.
+      // ═══════════════════════════════════════════════════════════════════════
+      if (observation.classifiedObstacles?.length) {
+        const ClassifiedObstacleSchema = z.object({
+          ref: z.string(),
+          type: z.string(),
+          isBlocking: z.boolean().default(false),
+          isDismissible: z.boolean().default(false),
+          dismissStrategy: z.string().optional(),
+          affectedArea: z.string().optional(),
+          reason: z.string().default(''),
+        });
+
+        const validObstacles = observation.classifiedObstacles.filter(o => {
+          const result = ClassifiedObstacleSchema.safeParse(o);
+          if (!result.success) {
+            logger.warn('[MULTI_AGENT] Invalid classifiedObstacle from LLM — dropped', {
+              obstacle: o,
+              error: result.error.message,
+            });
+          }
+          return result.success;
+        });
+        observation.classifiedObstacles = validObstacles as typeof observation.classifiedObstacles;
+      }
+
+      if (observation.classifiedObstacles?.length) {
+        for (const classified of observation.classifiedObstacles) {
+          // Add blocking obstacles to the obstacles array
+          if (classified.isBlocking) {
+            const obstacleMsg = `${classified.type}: ${classified.reason}${classified.dismissStrategy ? ` (dismiss: ${classified.dismissStrategy})` : ''}`;
+            if (!observation.obstacles.includes(obstacleMsg)) {
+              observation.obstacles.push(obstacleMsg);
+            }
+          }
+
+          // Set modalInfo if a blocking modal/drawer is classified
+          if (classified.isBlocking && (classified.type === 'modal' || classified.type === 'drawer') && !observation.modalInfo) {
+            observation.modalInfo = `${classified.reason}${classified.dismissStrategy ? ` — ${classified.dismissStrategy}` : ''}`;
+          }
+        }
+
+        logger.debug('[MULTI_AGENT] Layer 2 obstacle classification', {
+          total: observation.classifiedObstacles.length,
+          blocking: observation.classifiedObstacles.filter(o => o.isBlocking).length,
+          types: observation.classifiedObstacles.map(o => o.type),
+        });
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // Layer 2 Post-Processing: Consume pageStateAnalysis
+      // Holistic page state → obstacles array for Strategist awareness
+      // ═══════════════════════════════════════════════════════════════════════
+      if (observation.pageStateAnalysis) {
+        if (observation.pageStateAnalysis.isFlowBlocked && observation.pageStateAnalysis.blockReason) {
+          observation.obstacles.unshift(`FLOW BLOCKED: ${observation.pageStateAnalysis.blockReason}`);
+        }
+        if (observation.pageStateAnalysis.isLoading) {
+          observation.obstacles.push('Page is in loading state — wait before acting');
+        }
+      }
 
       // ═══════════════════════════════════════════════════════════════════════
       // Cognitive: Update Working Memory from Observer
@@ -680,6 +748,8 @@ export class MultiAgentOrchestrator {
           coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
           // Supervisor: shared recovery context
           blackboard,
+          // Layer 3: Last blocker info from previous iteration
+          lastBlockerInfo: input.lastBlockerInfo,
         });
 
         criticMs = Date.now() - criticStart;

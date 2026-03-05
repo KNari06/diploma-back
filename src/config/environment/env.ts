@@ -80,8 +80,8 @@ const envSchema = z.object({
 
   // OpenAI
   OPENAI_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required'),
-  OPENAI_MODEL: z.string().default('gpt-4o'),
-  OPENAI_MODEL_FAST: z.string().default('gpt-4o-mini'),
+  OPENAI_MODEL: z.string().default('gpt-4.1'),
+  OPENAI_MODEL_FAST: z.string().default('gemini-2.5-flash-lite'),
   OPENAI_MAX_TOKENS: z.string().transform(Number).default('4000'),
 
   // Google Gemini
@@ -99,6 +99,13 @@ const envSchema = z.object({
   QUEUE_RETRY_DELAY: z.string().transform(Number).default('5000'),
   // BullMQ prefix (namespace) to avoid cross-environment collisions when sharing Redis
   QUEUE_PREFIX: z.string().min(1).optional(),
+
+  // Dynamic test-run worker scaling
+  TEST_RUN_CONCURRENCY_MIN: z.string().transform(Number).default('2'),
+  TEST_RUN_CONCURRENCY_MAX: z.string().transform(Number).default('20'),
+  SCALE_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  SCALE_CHECK_INTERVAL_MS: z.string().transform(Number).default('15000'),
+  SCALE_MAX_MEMORY_PERCENT: z.string().transform(Number).default('80'),
 
   // Agent
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),

@@ -312,7 +312,7 @@ export class AIUsageTracker {
  * Reuses pricing from ai-cost-manager.service.ts.
  */
 export function calculateOpenAICost(model: string, inputTokens: number, outputTokens: number): number {
-  const pricing = AI_PRICING[model as AIModel] || AI_PRICING['gpt-4o-mini']; // Fallback to mini
+  const pricing = AI_PRICING[model as AIModel] || AI_PRICING['gemini-2.5-flash-lite']; // Fallback to flash-lite
   return inputTokens * pricing.input + outputTokens * pricing.output;
 }
 

@@ -10,6 +10,7 @@ import { TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { GraphBuilder, GraphUpdate } from '@/agent/utils/visualization/graph-builder.service';
 import { TestProgressEmitter } from '@/agent/utils/visualization/progress-emitter';
 import { AdaptiveTimeoutConfig, computeAdaptiveTimeouts, LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Page } from 'playwright';
@@ -39,6 +40,7 @@ import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
 import { PageWatcher } from './execution/page-watcher';
 import { MultiAgentOrchestrator } from './agents/multi-agent-orchestrator';
+import { SnapshotPruner } from './agents/snapshot-pruner';
 import type { MultiAgentInput } from './agents/types';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
@@ -97,7 +99,7 @@ export class LiteEngine {
   private readonly MAX_RATE_LIMIT_BACKOFF_MS = 30000; // 30s max
   private readonly MAX_CONSECUTIVE_RATE_LIMITS = 3; // After 3 → blockedInfo
 
-  // ✅ NEW: Audit cooldown tracking (prevents expensive repeated gpt-4o calls)
+  // ✅ NEW: Audit cooldown tracking (prevents expensive repeated gpt-4.1 calls)
   // Cooldown: 3 iterations after auditor returns isDone=false
   // Bypass: if state hash or URL changes significantly
   private auditCooldownRemaining = 0;
@@ -135,12 +137,16 @@ export class LiteEngine {
 
   // Multi-Agent Brain: Observer → Strategist → Actor orchestrator
   private multiAgentOrchestrator: MultiAgentOrchestrator | null = null;
+  // Pre-LLM Pruner: context-aware element filtering before main LLM
+  private snapshotPruner: SnapshotPruner | null = null;
   // Manus-style: Store previous snapshot for spatial diff
   private previousFormattedSnapshot: string | null = null;
   /** Last iteration's console/network errors for Supervisor blocker detection */
   private lastConsoleErrors: string[] = [];
   private lastNetworkErrors: import('./collectors/network-tracker').NetworkError[] = [];
   private lastValidationErrors: import('./lite-types').NetworkValidationError[] = [];
+  /** Layer 3: Blocker info from previous iteration's failed click */
+  private lastBlockerInfo: import('./lite-types').BlockerInfo | undefined = undefined;
   // Store previous snapshot for state drift auditor (lost-field detection needs real elements)
   private lastSnapshotForAuditor: LiteSnapshot | null = null;
   // Manus-style: Store last expectedOutcome for expectation validation loop
@@ -186,6 +192,11 @@ export class LiteEngine {
     // Multi-Agent Brain: Initialize orchestrator if enabled
     if (LITE_ENGINE_FLAGS.enableMultiAgentBrain) {
       this.multiAgentOrchestrator = new MultiAgentOrchestrator();
+    }
+
+    // Pre-LLM Pruner: Initialize if enabled
+    if (LITE_ENGINE_FLAGS.enableSnapshotPruning) {
+      this.snapshotPruner = new SnapshotPruner();
     }
 
     // WebSocket progress
@@ -1015,6 +1026,7 @@ export class LiteEngine {
     this.downloadApprovalAskedForRefs.clear();
     this.deniedDownloadRefs.clear();
     this.skillsContext = '';
+    this.snapshotPruner?.clear();
   }
 
   /**
@@ -1396,7 +1408,7 @@ export class LiteEngine {
         }
 
         // 2. Collect snapshot BEFORE (with visual stability)
-        let snapshotBefore = await SnapshotCollector.collect(this.page);
+        let snapshotBefore = await SnapshotCollector.collect(this.page, { fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
         const pageErrorsBefore = await ErrorCollector.collectFromPage(this.page);
 
         // 2a. Guard: check if snapshot is too empty (page still loading)
@@ -1408,7 +1420,7 @@ export class LiteEngine {
           });
           await this.page.waitForLoadState('domcontentloaded');
           await this.page.waitForTimeout(2000);
-          snapshotBefore = await SnapshotCollector.collect(this.page);
+          snapshotBefore = await SnapshotCollector.collect(this.page, { fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
         }
 
         // 2b. Guard: stale snapshot after credential fill.
@@ -1436,12 +1448,49 @@ export class LiteEngine {
             } catch {
               // Timeout OK — maybe it's a real login failure
             }
-            snapshotBefore = await SnapshotCollector.collect(this.page);
+            snapshotBefore = await SnapshotCollector.collect(this.page, { fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
           }
         }
 
-        // ✅ NEW: Trace snapshot
-        const formattedSnapshot = SnapshotCollector.format(snapshotBefore);
+        // ✅ Pre-LLM Pruner: context-aware element filtering before format
+        let prunerKeepRefs: Set<string> | undefined;
+        if (this.snapshotPruner) {
+          try {
+            const contentHash = this.state.computeContentHash(snapshotBefore);
+            const prunerResult = await this.snapshotPruner.prune({
+              elements: snapshotBefore.elements,
+              goal: this.config.goal,
+              url: snapshotBefore.url,
+              contentHash,
+              activeModalRef: snapshotBefore.activeModalRef,
+            });
+            if (prunerResult) {
+              prunerKeepRefs = prunerResult.keepRefs;
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'snapshot',
+                eventType: 'pruner_result',
+                spanId: this.traceWriter.generateSpanId(),
+                parentSpanId: iterationSpanId,
+                payload: {
+                  total: snapshotBefore.elements.length,
+                  kept: prunerResult.keepRefs.size,
+                  pruned: snapshotBefore.elements.length - prunerResult.keepRefs.size,
+                  fromCache: prunerResult.fromCache,
+                  durationMs: prunerResult.durationMs,
+                },
+              });
+            }
+          } catch (prunerError) {
+            logger.warn('[LITE_ENGINE] Snapshot pruner failed, using legacy format', {
+              testId: this.config.testId,
+              error: prunerError instanceof Error ? prunerError.message : String(prunerError),
+            });
+          }
+        }
+
+        // Trace snapshot
+        const formattedSnapshot = SnapshotCollector.format(snapshotBefore, prunerKeepRefs);
         this.traceWriter.write({
           iteration: i,
           stage: 'snapshot',
@@ -1956,7 +2005,7 @@ export class LiteEngine {
         // POST-CREDENTIAL-FILL GOAL CHECK
         // When auto-fill completed (state='done') and URL redirected away from auth page,
         // the heuristic often fails because URL/form signals no longer match.
-        // In this case, proactively call auditor (gpt-4o) to verify login success.
+        // In this case, proactively call auditor (gpt-4.1) to verify login success.
         // ═══════════════════════════════════════════════════════════════════════
         if (
           this.credentialFillState === 'done' &&
@@ -2020,7 +2069,7 @@ export class LiteEngine {
                 payload: {
                   trigger: 'post_credential_fill',
                   goalContext: credGoalContext,
-                  model: 'gpt-4o',
+                  model: AI_TASK_MODELS.goalAuditor,
                 },
               });
 
@@ -2139,7 +2188,7 @@ export class LiteEngine {
             });
             // Continue to next iteration without completing
           } else {
-            // Call auditor (gpt-4o) for final validation
+            // Call auditor (gpt-4.1) for final validation
             logger.info('[LITE_ENGINE] Heuristic claims done, calling auditor for validation', {
               testId: this.config.testId,
               progressScore: Math.round(goalCheck.progressScore * 100) + '%',
@@ -2159,7 +2208,7 @@ export class LiteEngine {
                   trigger: 'heuristic_done',
                   goalContext,
                   lastOutcome: this.state.getLastOutcome(),
-                  model: 'gpt-4o', // Auditor uses gpt-4o
+                  model: AI_TASK_MODELS.goalAuditor,
                 },
               });
 
@@ -2619,6 +2668,10 @@ export class LiteEngine {
             transientState: snapshotBefore.transientState,
             pageMetadata: snapshotBefore.metadata,
             pageStructure: snapshotBefore.pageStructure,
+            // Layer 2: Obstacle facts for LLM classification
+            obstacleFacts: snapshotBefore.obstacleFacts,
+            // Layer 3: Blocker info from previous iteration's failed click
+            lastBlockerInfo: this.lastBlockerInfo,
             // Goal URL for wrong-page detection and recovery
             goalUrl: this.config.url,
             // Consecutive critic rejections for stuck detection in orchestrator
@@ -2654,7 +2707,7 @@ export class LiteEngine {
 
         // Check terminal states
         if (decision.done) {
-          // ✅ NEW: Validate AI's done claim with auditor (gpt-4o) with cooldown
+          // ✅ NEW: Validate AI's done claim with auditor (gpt-4.1) with cooldown
           const shouldCallAuditorForAIDone = this.auditCooldownRemaining === 0;
 
           if (!shouldCallAuditorForAIDone) {
@@ -2686,7 +2739,7 @@ export class LiteEngine {
                 trigger: 'ai_done',
                 goalContext,
                 aiThought: decision.thought,
-                model: 'gpt-4o', // Auditor uses gpt-4o
+                model: AI_TASK_MODELS.goalAuditor,
               },
             });
 
@@ -3211,6 +3264,9 @@ export class LiteEngine {
         // ✅ NEW (Lite Autonomy v3): Store modal dismiss info for next iteration's prompt
         this.lastModalDismissInfo = execResult.modalDismissInfo || null;
 
+        // Layer 3: Store blocker info for next iteration's Critic
+        this.lastBlockerInfo = execResult.blockerInfo || undefined;
+
         // ✅ FIX P2: Handle validation error modal (rollback) with timeout
         if (execResult.modalDismissInfo?.modalType === 'validation') {
           try {
@@ -3563,7 +3619,7 @@ export class LiteEngine {
         }
 
         // AI-based post-action goal completion check.
-        // Sends before/after state to gpt-4o-mini which decides if the goal is achieved.
+        // Sends before/after state to gemini-2.5-flash-lite which decides if the goal is achieved.
         if (outcome === 'state_changed' || diff.urlChanged || enrichedDiff.progressSentiment === 'Major Progress') {
           const completionCheck = await withCancellation(
             this.config.testId,
@@ -3755,6 +3811,11 @@ export class LiteEngine {
           if (outcome === 'state_changed' || diff.urlChanged) {
             this.multiAgentOrchestrator.invalidateCache(snapshotBefore.url);
           }
+        }
+
+        // 13b3. Snapshot Pruner: Invalidate cache on state change or URL change
+        if (this.snapshotPruner && (outcome === 'state_changed' || diff.urlChanged)) {
+          this.snapshotPruner.invalidateForUrl(snapshotBefore.url);
         }
 
         // 13c. State Drift Auditor: Record tracking data
@@ -4203,6 +4264,7 @@ export class LiteEngine {
     // ✅ NEW: Clear semantic weight cache and log stats
     const semanticStats = this.semanticWeightCalculator.getStats();
     this.semanticWeightCalculator.clearCache();
+    this.snapshotPruner?.clear();
     logger.info('[LITE_ENGINE] Semantic weight stats', {
       testId: this.config.testId,
       cacheHits: semanticStats.cacheStats.hits,
@@ -4770,6 +4832,7 @@ export class LiteEngine {
     try {
       this.semanticWeightCalculator.clearCache();
       this.state.clearVisualSignatures();
+      this.snapshotPruner?.clear();
     } catch {
       // Best-effort cache clearing
     }

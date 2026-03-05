@@ -46,6 +46,36 @@ export class TestResultsFormatterService {
         }
       }
 
+      // V11: Append step-level failure summary from executed_steps (stored on test, not test_results)
+      if (test.executed_steps && Array.isArray(test.executed_steps) && failedResults.length > 0) {
+        const failedSteps = test.executed_steps.filter(
+          (s: any) => s?.type === 'step_completed' && s?.data?.success === false && s?.data?.runtimeMeta?.failedReason
+        );
+        if (failedSteps.length > 0) {
+          const REASON_LABELS: Record<string, string> = {
+            element_not_found: 'Element missing',
+            unexpected_validation_error: 'Validation error',
+            silent_backend_failure: 'Server error',
+            assertion_failed: 'Assertion failed',
+            timeout: 'Timeout',
+            heal_blocked: 'Low confidence',
+          };
+          details += '\n**Failed steps:**\n';
+          for (const fs of failedSteps.slice(0, 3)) {
+            const meta = fs.data.runtimeMeta;
+            const reason = REASON_LABELS[meta.failedReason] || meta.failedReason;
+            const stepDesc = fs.data.stepDescription || `Step ${fs.data.step}`;
+            details += `⚡ ${stepDesc}: ${reason}\n`;
+            if (meta.failureExplanation) {
+              details += `   ${meta.failureExplanation.slice(0, 150)}\n`;
+            }
+          }
+          if (failedSteps.length > 3) {
+            details += `... and ${failedSteps.length - 3} more failed step(s)\n`;
+          }
+        }
+      }
+
       const footer = failedResults.length > 0
         ? `\n⚠️ ${failedResults.length} browser(s) failed. Check detailed results for more info.`
         : '\n✅ All tests passed successfully!';

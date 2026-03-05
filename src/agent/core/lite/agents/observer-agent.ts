@@ -18,9 +18,9 @@ export class ObserverAgent {
     const prompt = ObserverAgent.buildPrompt(input);
 
     const result = await LitePromptBuilder.askJson<ObserverOutput>(prompt, {
-      model: LITE_ENGINE_FLAGS.coreBrainModel as 'gpt-4o' | 'gpt-4o-mini',
+      model: LITE_ENGINE_FLAGS.coreBrainModel as string,
       temperature: 0.05,
-      maxTokens: 700,
+      maxTokens: 1000,
       timeoutMs: LITE_ENGINE_FLAGS.multiAgentObserverTimeoutMs,
     });
 
@@ -129,6 +129,50 @@ Report obstacles as FIRST priority in your response.
 `
       : '';
 
+    // Layer 2: Obstacle facts section — raw positioned elements for LLM classification
+    const obstacleFactsSection = (() => {
+      if (!input.obstacleFacts || input.obstacleFacts.length === 0) return '';
+      const compact = input.obstacleFacts.map(f => ({
+        ref: f.ref,
+        tag: f.tag,
+        pos: f.position,
+        z: f.zIndex,
+        cov: `${Math.round(f.coverage * 100)}%`,
+        cls: f.className.slice(0, 80),
+        id: f.id?.slice(0, 50) || undefined,
+        text: f.textPreview.slice(0, 80),
+        close: f.hasCloseButton,
+        interactive: f.hasInteractiveChildren,
+        role: f.role || undefined,
+        ariaModal: f.ariaModal || undefined,
+        rect: `${f.rect.width}x${f.rect.height}@(${f.rect.left},${f.rect.top})`,
+      }));
+      return `
+POSITIONED ELEMENTS — classify EACH from raw data (cls, id, text, role, pos, rect):
+${JSON.stringify(compact, null, 1)}
+
+CLASSIFICATION GUIDE:
+- "modal": role="dialog"/"alertdialog", ariaModal=true, OR large coverage (>30%) + interactive + high z-index
+- "cookie_consent": text contains "cookie"/"consent"/"privacy"/"gdpr"/"accept all"; cls/id contains "cookie"/"consent"/"onetrust"/"cookiebot"; typically bottom-positioned banner
+- "chat_widget": cls/id contains "intercom"/"drift"/"crisp"/"zendesk"/"tawk"/"livechat"; bottom-right corner, small coverage (<10%)
+- "toast": very small coverage (<10%), cls contains "toast"/"snack"/"notification"/"Toastify"/"sonner"; transient
+- "sticky_header": pos=fixed/sticky, top≈0, height<120px, full width — permanent, scroll around
+- "sticky_footer": pos=fixed/sticky, bottom≈0, height<120px, full width — permanent, scroll around
+- "loading_overlay": text/cls contains "loading"/"spinner"/"skeleton"/"please wait"; transient, wait
+- "dropdown": cls contains "dropdown"/"select"/"menu"/"combobox"; medium z-index, appeared after click
+- "tooltip": cls contains "tooltip"/"popover"/"tippy"; very small coverage (<5%), transient
+- "drawer": cls contains "drawer"/"sidebar"/"slide-over"/"off-canvas"; side-positioned, large height
+- "onboarding": cls contains "tour"/"walkthrough"/"joyride"/"introjs"/"shepherd"/"onboarding"
+- "paywall": text contains "subscribe"/"premium"/"login to continue"/"sign up to access"
+- "unknown": does not match any pattern — default
+
+For each, report in "classifiedObstacles":
+  ref, type, isBlocking (prevents interaction?), isDismissible, dismissStrategy (be SPECIFIC: "click button ref e42 text 'Accept All'" or "press Escape"), affectedArea, reason
+
+Also report overall "pageStateAnalysis": { isLoading, hasFullViewportOverlay, stackedObstacleCount, isFlowBlocked, blockReason }
+`;
+    })();
+
     return `You are a Page Observer (Manus-style). Analyze the page and score changes by IMPACT.
 
 URL: ${input.url}
@@ -136,7 +180,7 @@ Title: ${input.title}
 ${goalContext}${credentialContext}${recoverySection}
 CURRENT PAGE SNAPSHOT:
 ${input.snapshot}
-${visualDiffSection}${driftSection}${networkSection}${visionSection}${expectationSection}${loadingSection}${metadataSection}${structureSection}
+${visualDiffSection}${driftSection}${networkSection}${visionSection}${expectationSection}${loadingSection}${metadataSection}${structureSection}${obstacleFactsSection}
 Respond with JSON (Manus-style with Impact Scoring):
 {
   "pageType": "login_form | registration_form | dashboard | product_page | error_page | ...",
@@ -178,7 +222,9 @@ Respond with JSON (Manus-style with Impact Scoring):
   "tableAnalysis": { "ref": "e20", "headers": ["Name","Email"], "rowCount": 25, "isSortable": true, "hasPagination": true, "hasBulkActions": true, "hasInlineEditing": false } or null,
   "listAnalysis": { "ref": "l0", "estimatedItems": 50, "hasLoadMore": true, "isVirtualized": false, "scrollDirection": "vertical" } or null,
   "loadingState": { "isLoading": true, "type": "skeleton", "affectedArea": "main table", "ref": "e20" } or null,
-  "overlapInfo": [{"coveredRef": "e15", "coveredBy": "cookie banner"}] or null
+  "overlapInfo": [{"coveredRef": "e15", "coveredBy": "cookie banner"}] or null${input.obstacleFacts?.length ? `,
+  "classifiedObstacles": [{"ref":"e42","type":"cookie_consent","isBlocking":true,"isDismissible":true,"dismissStrategy":"click button ref e45 text 'Accept All'","affectedArea":"bottom 200px","reason":"Cookie consent banner"}],
+  "pageStateAnalysis": {"isLoading":false,"hasFullViewportOverlay":false,"stackedObstacleCount":0,"isFlowBlocked":false}` : ''}
 }
 
 CRITICAL MANUS RULES:
@@ -193,6 +239,8 @@ CRITICAL MANUS RULES:
 9. **Pagination/Scroll Detection**: If PAGINATION or LIST with [HAS_LOAD_MORE] present, include "Click Next/Load More" or "Scroll to discover more" in availableActions.
 10. **Table Analysis**: If TABLE header present, populate tableAnalysis. Note [SELECTABLE] for bulk actions, [SORTABLE] for sort capability.
 11. **Validation Awareness**: [REQUIRED] = must fill, [INVALID] = has validation errors (check errorState), [HAS_VALUE] = already filled — skip unless goal requires changing.
-12. Return ONLY valid JSON`;
+12. **Obstacle Classification**: If POSITIONED ELEMENTS section is present, classify each positioned element from its raw data (cls, id, text, role, ariaModal, pos, rect, coverage). Do NOT rely on any pre-classification. Report blocking obstacles in "obstacles" too.
+13. **Page State Analysis**: Analyze the OVERALL page state: Is the page loading? Is there a full-viewport overlay blocking everything? Are multiple obstacles stacked? Is the user flow completely blocked? Report in "pageStateAnalysis".
+14. Return ONLY valid JSON`;
   }
 }

@@ -84,6 +84,7 @@ export async function signUpWithEmail(
           email: data.user.email || email,
           name: data.user.user_metadata?.name || name?.trim() || email.split('@')[0],
           role: 'user',
+          status: 'pending_approval',
         },
         tokens: {
           access_token: '', // No tokens until email is confirmed
@@ -114,6 +115,7 @@ export async function signUpWithEmail(
         email: data.user.email || email,
         name: data.user.user_metadata?.name || name?.trim() || email.split('@')[0],
         role: 'user',
+        status: 'pending_approval',
       },
       tokens: {
         access_token: data.session.access_token,
@@ -193,12 +195,20 @@ export async function signInWithEmail(
 
     warnIfUnexpectedJwtExpiry(data.session.expires_in);
 
+    // Fetch role and status from public.users
+    const { data: userData } = await supabaseAdmin
+      .from('users')
+      .select('role, name, status')
+      .eq('id', data.user.id)
+      .maybeSingle();
+
     return {
       user: {
         id: data.user.id,
         email: data.user.email || email,
-        name: data.user.user_metadata?.name,
-        role: 'user',
+        name: userData?.name || data.user.user_metadata?.name,
+        role: userData?.role || 'user',
+        status: userData?.status || 'pending_approval',
       },
       tokens: {
         access_token: data.session.access_token,
@@ -526,12 +536,20 @@ export async function exchangeCodeForSession(
         userId: userData.user.id,
       });
 
+      // Fetch role and status from public.users
+      const { data: dbUser } = await supabaseAdmin
+        .from('users')
+        .select('role, name, status')
+        .eq('id', userData.user.id)
+        .maybeSingle();
+
       return {
         user: {
           id: userData.user.id,
           email: userData.user.email || '',
-          name: userData.user.user_metadata?.name || userData.user.email?.split('@')[0] || 'User',
-          role: 'user',
+          name: dbUser?.name || userData.user.user_metadata?.name || userData.user.email?.split('@')[0] || 'User',
+          role: dbUser?.role || 'user',
+          status: dbUser?.status || 'pending_approval',
           avatar: userData.user.user_metadata?.avatar_url,
         },
         tokens: {
@@ -563,12 +581,20 @@ export async function exchangeCodeForSession(
 
       warnIfUnexpectedJwtExpiry(data.session.expires_in);
 
+      // Fetch role and status from public.users
+      const { data: dbUser } = await supabaseAdmin
+        .from('users')
+        .select('role, name, status')
+        .eq('id', data.user.id)
+        .maybeSingle();
+
       return {
         user: {
           id: data.user.id,
           email: data.user.email || '',
-          name: data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
-          role: 'user',
+          name: dbUser?.name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
+          role: dbUser?.role || 'user',
+          status: dbUser?.status || 'pending_approval',
           avatar: data.user.user_metadata?.avatar_url,
         },
         tokens: {
@@ -714,7 +740,7 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
     // Use maybeSingle() to handle case when user not found (trigger may not have run yet)
     const { data: userData, error: dbError } = await supabaseAdmin
       .from('users')
-      .select('role, name')
+      .select('role, name, status')
       .eq('id', data.user.id)
       .maybeSingle();
 
@@ -732,6 +758,7 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
       email: data.user.email || '',
       name: userData?.name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
       role: userData?.role || 'user',
+      status: userData?.status || 'pending_approval',
     };
   } catch (error) {
     // Log error but don't throw - return null to indicate invalid token
@@ -848,6 +875,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
             email: userEmail,
             name: retryUserData.name,
             role: retryUserData.role,
+            status: retryUserData.status || 'pending_approval',
             credits: creditsBalance,
             subscription: retryUserData.subscription,
             created_at: retryUserData.created_at,
@@ -879,6 +907,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
         email: userEmail,
         name: createdUser.name,
         role: createdUser.role,
+        status: createdUser.status || 'pending_approval',
         credits: creditsBalance,
         subscription: createdUser.subscription,
         created_at: createdUser.created_at,
@@ -895,6 +924,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
       email: userEmail,
       name: userData.name,
       role: userData.role || 'user',
+      status: userData.status || 'pending_approval',
       credits: creditsBalance,
       subscription: userData.subscription,
       created_at: userData.created_at,

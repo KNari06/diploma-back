@@ -24,7 +24,7 @@ import { logger } from '@/utils/core/logger';
 import type { ChatCompletionMessageParam } from 'openai/resources';
 
 /** Approximate max tokens before compression triggers */
-const MAX_CONTEXT_TOKENS = 80000; // ~80k tokens (gpt-4o has 128k window)
+const MAX_CONTEXT_TOKENS = 80000; // ~80k tokens (gpt-4.1 has 128k window)
 
 /** How many recent tool rounds to keep fully intact */
 const KEEP_RECENT_ROUNDS = 2;

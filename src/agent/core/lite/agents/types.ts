@@ -3,7 +3,7 @@
  * Shared interfaces for Observer, Strategist, and Actor agents
  */
 
-import type { AICommand, BlacklistedAction, NetworkValidationError, StateDriftAuditResult, VisionHints } from '../lite-types';
+import type { AICommand, BlacklistedAction, BlockerInfo, NetworkValidationError, ObstacleFact, ObstacleType, StateDriftAuditResult, VisionHints } from '../lite-types';
 import type { NetworkError } from '../collectors/network-tracker';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -130,6 +130,31 @@ export interface ObserverOutput {
     coveredRef: string;
     coveredBy: string;
   }> | null;
+
+  /** Layer 2: LLM-classified obstacles from ObstacleFacts */
+  classifiedObstacles?: Array<{
+    ref: string;
+    type: ObstacleType;
+    isBlocking: boolean;
+    isDismissible: boolean;
+    dismissStrategy?: string;
+    affectedArea?: string;
+    reason: string;
+  }>;
+
+  /** LLM holistic page state analysis — overall blocking/loading assessment */
+  pageStateAnalysis?: {
+    /** Whether page is actively loading (skeleton, spinner, progress bar) */
+    isLoading: boolean;
+    /** Whether a full-viewport overlay is blocking all interaction */
+    hasFullViewportOverlay: boolean;
+    /** Number of stacked obstacles detected simultaneously */
+    stackedObstacleCount: number;
+    /** Whether the user flow is completely blocked */
+    isFlowBlocked: boolean;
+    /** Reason why flow is blocked (if isFlowBlocked=true) */
+    blockReason?: string;
+  };
 }
 
 export interface ObserverInput {
@@ -165,6 +190,8 @@ export interface ObserverInput {
   pageStructure?: import('../lite-types').PageStructureMetadata;
   /** Supervisor Blackboard — shared recovery context */
   blackboard?: SupervisorBlackboard;
+  /** Layer 2: Structured facts about positioned elements for obstacle classification */
+  obstacleFacts?: ObstacleFact[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -472,6 +499,8 @@ export interface CriticInput {
   coveredElements?: string[];
   /** Supervisor Blackboard — shared recovery context */
   blackboard?: SupervisorBlackboard;
+  /** Layer 3: Blocker info from previous iteration's failed click */
+  lastBlockerInfo?: BlockerInfo;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -551,6 +580,12 @@ export interface MultiAgentInput {
   recentValidationErrors?: NetworkValidationError[];
   /** Optional callback for emitting real-time thinking steps to the user */
   onThinkingStep?: (phase: string, message: string) => void;
+
+  // Layer 2/3: Universal Obstacle Intelligence
+  /** Structured facts about positioned elements for Observer LLM classification */
+  obstacleFacts?: ObstacleFact[];
+  /** Layer 3: Blocker info from previous iteration's failed click */
+  lastBlockerInfo?: BlockerInfo;
 }
 
 /** Run-level metrics accumulated across all iterations for A/B comparison */

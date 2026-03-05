@@ -15,6 +15,7 @@ import { logger } from '@/utils/core/logger';
 import type { GoalContext, GoalEval, LiteElement, LiteSnapshot, StateDiff } from '../lite-types';
 import { LitePromptBuilder } from '../prompt/lite-prompt-builder';
 import { AIGoalEvaluator } from './ai-goal-evaluator';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 
 /**
  * Result of goal detection (heuristic)
@@ -87,7 +88,7 @@ const MIN_HEURISTIC_CONFIDENCE = 0.5;
 
 /**
  * Result of final auditor validation (Phase 2)
- * Uses gpt-4o for high-accuracy "is done" check
+ * Uses gpt-4.1 for high-accuracy "is done" check
  */
 export interface AuditorResult {
   isDone: boolean;
@@ -412,7 +413,7 @@ Respond with JSON ONLY.`;
         weights?: Partial<GoalWeights>;
         confidenceThreshold?: number;
       }>(prompt, {
-        model: 'gpt-4o-mini', // Fast/cheap for strategy
+        model: AI_TASK_MODELS.goalDetection, // Fast/cheap for strategy
         temperature: 0.1,
         maxTokens: 800, // Increased for new fields
         timeoutMs: 12000,
@@ -1574,11 +1575,11 @@ Respond with JSON ONLY.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // FINAL AUDITOR (Phase 2: gpt-4o for high-accuracy "is done" validation)
+  // FINAL AUDITOR (Phase 2: gpt-4.1 for high-accuracy "is done" validation)
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Final auditor validation using gpt-4o
+   * Final auditor validation using gpt-4.1
    * Called when heuristic claims goal is done to confirm or reject
    * Uses stronger model for higher accuracy ("decides fate of the test")
    *
@@ -1661,7 +1662,7 @@ Respond with JSON ONLY:
 Be STRICT - only set isDone=true if there is clear success evidence.
 Set isBlocked=true ONLY for hard blocks (captcha, 2FA, phone verification).`;
 
-    logger.info('[GOAL_DETECTOR] Calling auditor (gpt-4o)', {
+    logger.info('[GOAL_DETECTOR] Calling auditor (gpt-4.1)', {
       testId: this.testId,
       goal: context.goal.slice(0, 50),
       url: context.page.url,
@@ -1677,7 +1678,7 @@ Set isBlocked=true ONLY for hard blocks (captcha, 2FA, phone verification).`;
         blockedReason?: string;
         canUserHelp?: boolean;
       }>(prompt, {
-        model: 'gpt-4o', // Higher accuracy model for final validation
+        model: AI_TASK_MODELS.goalAuditor, // Higher accuracy model for final validation
         temperature: 0.1,
         maxTokens: 500,
         timeoutMs: 15000,

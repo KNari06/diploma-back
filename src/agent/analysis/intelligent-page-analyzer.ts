@@ -6,10 +6,15 @@
 
 import { buildLogicAnalysisPrompt, buildPageAnalysisPrompt } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { AISelectorEngine } from '@/services/ai-selector/ai-selector-engine.service';
 import { DOMNodeExtractor } from '@/services/ai-selector/dom-node-extractor';
 import { analyzeDOMStructure } from '@/services/testing/ui/autonomous/dom-analyzer.service';
 import { logger } from '@/utils/core/logger';
+import {
+  MODAL_OVERLAY_SELECTORS,
+  POSITIONAL_CANDIDATES_SELECTOR,
+} from '@/agent/utils/selectors/modal-detection';
 import { OpenAI } from 'openai';
 import { Page } from 'playwright';
 import {
@@ -762,12 +767,18 @@ export class IntelligentPageAnalyzer {
    */
   private static async quickModalCheck(page: Page): Promise<number> {
     try {
-      return await page.evaluate(() => {
-        // Quick check: only look for obvious modals
+      return await page.evaluate((selector) => {
+        // Quick check: use full set of targeted modal selectors
         // @ts-ignore - browser context
-        const modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
-        return modals.length;
-      });
+        const modals = document.querySelectorAll(selector);
+        let count = 0;
+        modals.forEach((el: any) => {
+          // @ts-ignore - browser context
+          const style = window.getComputedStyle(el);
+          if (style.display !== 'none' && style.visibility !== 'hidden') count++;
+        });
+        return count;
+      }, MODAL_OVERLAY_SELECTORS);
     } catch (error) {
       logger.debug('[INTELLIGENT_ANALYZER] Quick modal check failed', { error });
       return 0;
@@ -813,12 +824,23 @@ export class IntelligentPageAnalyzer {
         // Pass config values to page.evaluate since it runs in browser context
         const { zIndexThreshold, minModalSize, overlaySizeRatio } = MODAL_DETECTION_CONFIG;
         const modalCount = await page.evaluate((config) => {
+          // Two-pass: targeted selectors + positional candidates
           // @ts-ignore - browser context
-          const allElements = document.querySelectorAll('*');
+          const targetedModals = Array.from(document.querySelectorAll(config.overlaySelectors));
+          // @ts-ignore - browser context
+          const positionalCandidates = Array.from(document.querySelectorAll(config.positionalSelector));
+
+          // @ts-ignore - browser context
+          const viewportWidth = window.innerWidth;
+          // @ts-ignore - browser context
+          const viewportHeight = window.innerHeight;
+
+          const seen = new WeakSet();
           let count = 0;
 
-          for (let i = 0; i < allElements.length; i++) {
-            const el = allElements[i] as any;
+          for (const el of [...targetedModals, ...positionalCandidates] as any[]) {
+            if (seen.has(el)) continue;
+            seen.add(el);
 
             // Skip if not visible
             // @ts-ignore - browser context
@@ -833,11 +855,6 @@ export class IntelligentPageAnalyzer {
             const isFixedOrAbsolute = position === 'fixed' || position === 'absolute';
             const hasHighZIndex = zIndex > config.zIndexThreshold;
 
-            // Check for overlay (large element with background)
-            // @ts-ignore - browser context
-            const viewportWidth = window.innerWidth;
-            // @ts-ignore - browser context
-            const viewportHeight = window.innerHeight;
             // @ts-ignore - browser context
             const hasOverlay = style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
                               // @ts-ignore - browser context
@@ -855,7 +872,6 @@ export class IntelligentPageAnalyzer {
             if (typeof el.className === 'string') {
               className = el.className.toLowerCase();
             } else if (el.className && typeof el.className === 'object') {
-              // Handle DOMTokenList or SVGAnimatedString
               if ('baseVal' in el.className) {
                 className = (el.className.baseVal || '').toLowerCase();
               } else if ('value' in el.className) {
@@ -877,7 +893,7 @@ export class IntelligentPageAnalyzer {
           }
 
           return count;
-        }, { zIndexThreshold, minModalSize, overlaySizeRatio });
+        }, { zIndexThreshold, minModalSize, overlaySizeRatio, overlaySelectors: MODAL_OVERLAY_SELECTORS, positionalSelector: POSITIONAL_CANDIDATES_SELECTOR });
 
         // If modals appeared, wait a bit more for them to fully render
         if (modalCount > lastModalCount) {
@@ -1703,6 +1719,9 @@ export class IntelligentPageAnalyzer {
         maxCloseButtonTextLength: MODAL_DETECTION_CONFIG.maxCloseButtonTextLength,
         cookieActionTokens: MODAL_DETECTION_CONFIG.cookieActionTokens,
         modalTypeKeywords: MODAL_DETECTION_CONFIG.modalTypeKeywords,
+        // Shared modal detection selectors
+        overlaySelectors: MODAL_OVERLAY_SELECTORS,
+        positionalSelector: POSITIONAL_CANDIDATES_SELECTOR,
       };
 
       const detected = await page.evaluate((config) => {
@@ -1851,15 +1870,24 @@ export class IntelligentPageAnalyzer {
           return score;
         };
 
-        // ✅ DYNAMIC: Find modals by behavior, not hardcoded selectors
-        // Strategy: Find elements that behave like modals (high z-index, overlay, fixed/absolute positioning)
+        // ✅ PERF FIX: Two-pass modal detection instead of querySelectorAll('*')
+        // Pass 1: Targeted selectors (cheap), Pass 2: Positional candidates (limited)
+        // @ts-ignore - browser context
+        const targetedModals = Array.from(document.querySelectorAll(config.overlaySelectors));
+        // @ts-ignore - browser context
+        const positionalCandidates = Array.from(document.querySelectorAll(config.positionalSelector));
 
         // @ts-ignore - browser context
-        const allElements = document.querySelectorAll('*');
+        const viewportWidth = window.innerWidth;
+        // @ts-ignore - browser context
+        const viewportHeight = window.innerHeight;
+
+        const seen = new WeakSet();
         const potentialModals: any[] = [];
 
-        for (let i = 0; i < allElements.length; i++) {
-          const el = allElements[i] as any;
+        for (const el of [...targetedModals, ...positionalCandidates] as any[]) {
+          if (seen.has(el)) continue;
+          seen.add(el);
 
           // Skip if not visible
           // @ts-ignore - browser context
@@ -1874,10 +1902,6 @@ export class IntelligentPageAnalyzer {
           const isFixedOrAbsolute = position === 'fixed' || position === 'absolute';
           const hasHighZIndex = zIndex > config.zIndexThreshold;
           // @ts-ignore - browser context
-          const viewportWidth = window.innerWidth;
-          // @ts-ignore - browser context
-          const viewportHeight = window.innerHeight;
-          // @ts-ignore - browser context
           const hasOverlay = style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
                             // @ts-ignore - browser context
                             (el.offsetWidth > viewportWidth * config.overlaySizeRatio ||
@@ -1888,7 +1912,7 @@ export class IntelligentPageAnalyzer {
           const ariaModal = el.getAttribute('aria-modal');
           const hasModalRole = role === 'dialog' || role === 'alertdialog' || ariaModal === 'true';
 
-          // Check for modal-like classes/ids (dynamic, not hardcoded)
+          // Check for modal-like classes/ids
           const className = getElementClassLower(el);
           const id = (el.id || '').toLowerCase();
           const hasModalKeywords = className.includes('modal') || className.includes('popup') ||
@@ -2038,7 +2062,7 @@ export class IntelligentPageAnalyzer {
       const prompt = buildPageAnalysisPrompt({ url, goal, previousContext, domContext });
 
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
+        model: AI_TASK_MODELS.pageAnalysisVision,
         messages: [
           {
             role: 'system',
@@ -2290,7 +2314,7 @@ export class IntelligentPageAnalyzer {
       });
 
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.elementAnalysis,
         messages: [
           {
             role: 'system',

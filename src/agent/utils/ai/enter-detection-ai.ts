@@ -1,6 +1,7 @@
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
+import { MODAL_ANCESTOR_SELECTORS } from '@/agent/utils/selectors/modal-detection';
 import { Locator, Page } from 'playwright';
 
 /**
@@ -33,7 +34,7 @@ interface InputContext {
 async function gatherInputContext(locator: Locator, page: Page): Promise<InputContext | null> {
   const pageUrl = page.url();
   // @ts-expect-error - HTMLElement, HTMLInputElement, HTMLTextAreaElement are browser globals
-  const inputContext = await locator.evaluate((el: HTMLElement) => {
+  const inputContext = await locator.evaluate((el: HTMLElement, modalSelector: string) => {
     // @ts-expect-error - HTMLInputElement, HTMLTextAreaElement are browser globals
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
       // @ts-expect-error - HTMLInputElement is browser global
@@ -50,7 +51,7 @@ async function gatherInputContext(locator: Locator, page: Page): Promise<InputCo
       }
 
       // Get modal/dialog context
-      const isInModal = !!el.closest('[role="dialog"], [role="alertdialog"], .modal, .dialog, [data-modal]');
+      const isInModal = !!el.closest(modalSelector);
 
       return {
         type: input ? input.type : 'textarea',
@@ -69,7 +70,7 @@ async function gatherInputContext(locator: Locator, page: Page): Promise<InputCo
       };
     }
     return null;
-  }).catch(() => null);
+  }, MODAL_ANCESTOR_SELECTORS).catch(() => null);
 
   if (!inputContext) {
     logger.debug('[ENTER_DETECTION] Failed to gather input context', { pageUrl });

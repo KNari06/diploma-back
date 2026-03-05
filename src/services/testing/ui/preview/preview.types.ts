@@ -63,6 +63,8 @@ export interface InteractiveNode {
   };
   /** True if element is topmost at its center (not covered by overlay) */
   isTopMostAtCenter?: boolean;
+  /** True if element is inside the active modal/popup/overlay layer */
+  isInsideActiveModal?: boolean;
   /** True if id looks like a dynamic GUID/random string */
   isDynamicId?: boolean;
 
@@ -105,6 +107,14 @@ export interface InteractiveNode {
   nearestLandmark?: string;
   /** Phase 4: Framework event binding detected (React/Vue/Angular) */
   frameworkClickable?: 'react' | 'vue' | 'angular';
+  /** Phase 4: Element has contenteditable="true" (rich text editor, inline text field) */
+  isContentEditable?: boolean;
+  /** Phase 4: Element has tabindex >= 0 (explicitly keyboard-focusable) */
+  tabIndex?: number;
+  /** Phase 4: Element has onclick attribute or inline click handler */
+  hasOnclick?: boolean;
+  /** Phase 4: Element has aria-haspopup attribute (popup trigger) */
+  hasAriaHaspopup?: boolean;
 }
 
 /**
@@ -430,7 +440,20 @@ export interface IntentStep {
   evidence?: StepEvidence;
   /** Compiled execution plan (generated after successful apply) */
   compiled?: CompiledStepPlan;
+  /**
+   * Expected outcome for this step (V11: negative test support)
+   * - 'success': Step should complete without errors (default)
+   * - 'error': Step is a negative test — expects 4xx / validation error / error toast
+   * Auto-classified from description keywords if not explicitly set.
+   */
+  expectedOutcome?: ExpectedStepOutcome;
 }
+
+/**
+ * Expected outcome classification for a test step.
+ * Used to distinguish negative tests (expected 4xx) from regression bugs (unexpected 4xx).
+ */
+export type ExpectedStepOutcome = 'success' | 'error';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LINT RESULT (from linting engine)
@@ -536,6 +559,7 @@ export type FailedReason =
   | 'heal_blocked'
   | 'timeout'
   | 'silent_backend_failure'
+  | 'unexpected_validation_error'
   | 'unknown';
 
 /**
@@ -557,7 +581,7 @@ export type RootCause = 'backend' | 'ui' | 'logic';
 /**
  * Network verdict classification
  */
-export type NetworkVerdict = 'backend_error' | 'clean' | 'warning';
+export type NetworkVerdict = 'backend_error' | 'clean' | 'warning' | 'expected_error' | 'validation_failure';
 
 /**
  * Runtime metadata for step execution

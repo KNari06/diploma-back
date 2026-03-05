@@ -12,6 +12,7 @@ import { logger } from '@/utils/core/logger';
 import type { AICommand } from '../lite-types';
 import { FunnelPhase } from './funnel-analyzer';
 import type { ExpandedGoal } from './goal-expander';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -170,7 +171,7 @@ RULES:
           { role: 'user', content: userPrompt },
         ],
         {
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.targetAudit,
           temperature: 0,
           response_format: { type: 'json_object' },
           max_tokens: 200,

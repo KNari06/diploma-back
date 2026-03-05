@@ -3,8 +3,8 @@
  * Unified interface for OpenAI, Gemini, and future providers
  *
  * Usage:
- * - Fast tasks (keyword extraction, classification): use 'fast' provider (Gemini Flash or GPT-4o-mini)
- * - Complex tasks (analysis, code generation): use 'smart' provider (GPT-4o or Gemini Pro)
+ * - Fast tasks (keyword extraction, classification): use 'fast' provider (Gemini 2.5 Flash-Lite)
+ * - Complex tasks (analysis, code generation): use 'smart' provider (GPT-4.1 or Gemini Pro)
  *
  * Configuration via env:
  * - AI_PROVIDER_FAST = 'gemini' | 'openai' (default: gemini)
@@ -43,7 +43,7 @@ export interface AIResponse {
 export interface GenerateTextOptions {
   /** Which provider to use (overrides default for task type) */
   provider?: AIProvider;
-  /** Task type: 'fast' (Gemini Flash/GPT-4o-mini) or 'smart' (GPT-4o/Gemini Pro) */
+  /** Task type: 'fast' (Gemini 2.5 Flash-Lite) or 'smart' (GPT-4.1/Gemini Pro) */
   task?: AITask;
   /** Model override (provider-specific) */
   model?: string;
@@ -181,7 +181,7 @@ export async function generateText(params: {
  *     { role: 'system', content: 'You are a test automation expert' },
  *     { role: 'user', content: 'How do I test a login form?' },
  *   ],
- *   task: 'smart', // Uses GPT-4o by default
+ *   task: 'smart', // Uses GPT-4.1 by default
  * });
  */
 export async function generateChatCompletion(params: {

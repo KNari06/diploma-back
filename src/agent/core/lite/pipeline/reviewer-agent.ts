@@ -7,14 +7,14 @@
  * Uses a THREE-phase approach:
  *
  * Phase 0: auditDone() validation (when Executor claims done)
- *   - GoalDetector.auditDone() → gpt-4o final check
+ *   - GoalDetector.auditDone() → gpt-4.1 final check
  *   - Prevents false "done" claims
  *
  * Phase 1: Deterministic fast-paths (0 tokens, <1ms)
  *   - All succeeded + high progress → continue
  *   - All failed → replan
  *
- * Phase 2: AI assessment (gpt-4o-mini, only for ambiguous cases)
+ * Phase 2: AI assessment (gemini-2.5-flash-lite, only for ambiguous cases)
  *   - Reads Blackboard context: plan, execution, snapshot
  *   - Double-blind: doesn't see Planner's reasoning
  *
@@ -47,7 +47,7 @@ const REVIEWER_CONFIG = {
   progressThresholdContinue: 30,
   /** Progress score threshold for fast-approve (done) */
   progressThresholdDone: 85,
-  /** Auditor cooldown: skip gpt-4o calls for N rounds after rejection */
+  /** Auditor cooldown: skip gpt-4.1 calls for N rounds after rejection */
   auditCooldownRounds: 2,
 } as const;
 
@@ -76,7 +76,7 @@ export class ReviewerAgent {
    * Returns: ReviewResult to be written to Blackboard by pipeline
    *
    * @param goalDetector — Optional GoalDetector for auditDone() validation.
-   *   When Executor claims mark_done, this enables gpt-4o double-check.
+   *   When Executor claims mark_done, this enables gpt-4.1 double-check.
    */
   static async review(
     blackboard: TestBlackboard,
@@ -203,7 +203,7 @@ export class ReviewerAgent {
   /**
    * Validate Executor's "done" claim with GoalDetector.auditDone().
    *
-   * This is the gpt-4o double-check that prevents false completions.
+   * This is the gpt-4.1 double-check that prevents false completions.
    * If GoalDetector is not available, falls back to heuristic + AI review.
    *
    * With audit cooldown: after auditor rejects, don't call again for N rounds.
@@ -222,7 +222,7 @@ export class ReviewerAgent {
       };
     }
 
-    // Check cooldown: skip expensive gpt-4o call if recently rejected.
+    // Check cooldown: skip expensive gpt-4.1 call if recently rejected.
     // Decrement cooldown each time it's checked so it eventually expires.
     const currentCooldown = ReviewerAgent.getCooldown(blackboard);
     if (currentCooldown > 0) {
@@ -265,7 +265,7 @@ export class ReviewerAgent {
       : undefined;
 
     try {
-      logger.info('[REVIEWER] Calling auditDone (gpt-4o) to validate done claim', {
+      logger.info('[REVIEWER] Calling auditDone (gpt-4.1) to validate done claim', {
         testId: blackboard.getTestId(),
         url: goalContext.page.url,
         progressScore: blackboard.getProgressScore(),
@@ -308,7 +308,7 @@ export class ReviewerAgent {
         nextStep: auditResult.nextStepIfMissing,
       });
 
-      // Set cooldown to prevent repeated expensive gpt-4o calls
+      // Set cooldown to prevent repeated expensive gpt-4.1 calls
       ReviewerAgent.setCooldown(blackboard, REVIEWER_CONFIG.auditCooldownRounds);
 
       // Force back to executing — Executor needs to keep working
@@ -342,7 +342,7 @@ export class ReviewerAgent {
 
   /**
    * AI-powered review for ambiguous cases.
-   * Uses gpt-4o-mini for cost efficiency.
+   * Uses gemini-2.5-flash-lite for cost efficiency.
    */
   private static async aiReview(blackboard: TestBlackboard): Promise<ReviewResult> {
     const prompt = buildReviewerPrompt(blackboard);

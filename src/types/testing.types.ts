@@ -516,7 +516,7 @@ export type AutomationBrowser = 'chrome' | 'firefox' | 'safari' | 'edge';
 /**
  * Git trigger types
  */
-export type GitTriggerType = 'merge_to_main' | 'pr_opened' | 'release';
+export type GitTriggerType = 'merge_to_main' | 'pr_opened' | 'release' | 'push_to_branch';
 
 /**
  * Schedule configuration for plan automation
@@ -766,6 +766,10 @@ export interface RunReportStep {
     message: string;
     failedReason?: string;
     screenshot?: string;
+    /** V11: Root cause classification ('backend' | 'ui' | 'logic') */
+    rootCause?: string;
+    /** V11: Network verdict ('validation_failure' | 'backend_error' | 'expected_error' | 'clean' | 'warning') */
+    networkVerdict?: string;
   };
 }
 
