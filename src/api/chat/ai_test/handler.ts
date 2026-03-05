@@ -667,6 +667,19 @@ export async function handlePlatformTest(
           credentials: finalCredentials || undefined,
           budget: { ...DEFAULT_EXPLORATION_BUDGET },
           maxConcurrency: 5,
+          onProgress: (event) => {
+            const messages: Record<string, string> = {
+              page_discovered: `Discovered page: ${event.data.url || 'new page'}`,
+              survey_complete: `Survey complete: ${event.data.pagesVisited || 0} pages, ${event.data.entryPointsFound || 0} entry points`,
+              flow_started: `Testing: ${event.data.name || 'flow'}...`,
+              flow_completed: `Completed: ${event.data.name || 'flow'}`,
+              flow_failed: `Failed: ${event.data.name || 'flow'}`,
+              flow_blocked: `Blocked: ${event.data.name || 'flow'}`,
+              branch_found: `Found ${event.data.branchCount || 0} new flows after ${event.data.flow || 'flow'}`,
+            };
+            const message = messages[event.event] || `Exploring... (${event.progressPercent}%)`;
+            emitProcessingStepWithLogging(chatSessionId, 'executing_test', message, event.progressPercent);
+          },
         };
 
         emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Surveying pages...', 60);

@@ -33,8 +33,8 @@
 import type { Browser, BrowserContext } from 'playwright';
 import { logger } from '@/utils/core/logger';
 
-import type { ExplorationConfig, ExplorationResult } from './types';
-import { DEFAULT_EXPLORATION_BUDGET, DEFAULT_MAX_CONCURRENCY } from './types';
+import type { ExplorationConfig, ExplorationResult, ExplorationProgressCallback } from './types';
+import { DEFAULT_EXPLORATION_BUDGET, DEFAULT_MAX_CONCURRENCY, DESKTOP_USER_AGENT } from './types';
 import { BudgetTracker } from './budget-tracker';
 import { SurveyAgent } from './survey-agent';
 import { FlowQueue } from './flow-queue';
@@ -43,6 +43,7 @@ import { TestCaseBuilder } from './test-case-builder';
 
 export class ExplorationEngine {
   private readonly config: ExplorationConfig;
+  private readonly onProgress?: ExplorationProgressCallback;
 
   constructor(
     private readonly browser: Browser,
@@ -54,6 +55,26 @@ export class ExplorationEngine {
       budget: { ...DEFAULT_EXPLORATION_BUDGET, ...config.budget },
       maxConcurrency: config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
     };
+    this.onProgress = config.onProgress;
+  }
+
+  private emitProgress(
+    phase: 'survey' | 'flow' | 'complete',
+    event: 'page_discovered' | 'survey_complete' | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found',
+    data: Record<string, any>,
+    progressPercent: number,
+  ): void {
+    if (!this.onProgress) return;
+    try {
+      this.onProgress({
+        explorationId: this.config.explorationId,
+        phase,
+        event,
+        data,
+        progressPercent: Math.min(100, Math.max(0, Math.round(progressPercent))),
+        timestamp: Date.now(),
+      });
+    } catch { /* never let progress reporting crash exploration */ }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -85,6 +106,7 @@ export class ExplorationEngine {
     const surveyContext = await this.browser.newContext({
       viewport: { width: 1280, height: 720 },
       ignoreHTTPSErrors: true,
+      userAgent: DESKTOP_USER_AGENT,
     });
 
     let tree;
@@ -98,6 +120,11 @@ export class ExplorationEngine {
     }
 
     const allEntryPoints = tree.getAllEntryPoints();
+
+    this.emitProgress('survey', 'survey_complete', {
+      pagesVisited: tree.getNodeCount(),
+      entryPointsFound: allEntryPoints.length,
+    }, 30);
 
     logger.info('[EXPLORATION] Phase 1 complete', {
       pagesVisited: tree.getNodeCount(),
@@ -130,7 +157,7 @@ export class ExplorationEngine {
 
     logger.info('[EXPLORATION] Phase 2: Starting flow exploration');
 
-    const flowRunner = new FlowRunner(this.browser, this.config, budget);
+    const flowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress);
     let flowTasks;
 
     try {
@@ -156,6 +183,14 @@ export class ExplorationEngine {
 
     const builder = new TestCaseBuilder();
     const result = builder.build(tree, flowTasks, budget, this.config, startTime, skippedEntryPoints);
+
+    this.emitProgress('complete', 'survey_complete', {
+      testCases: result.testCases.length,
+      flowsPassed: result.summary.flowsPassed,
+      flowsFailed: result.summary.flowsFailed,
+      flowsBlocked: result.summary.flowsBlocked,
+      totalSteps: result.summary.totalStepsDiscovered,
+    }, 100);
 
     logger.info('[EXPLORATION] Exploration complete', {
       explorationId: this.config.explorationId,

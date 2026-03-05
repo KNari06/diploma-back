@@ -7,6 +7,7 @@ import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from 
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
 import { logger } from '@/utils/core/logger';
 import { Worker } from 'bullmq';
+import { queueMonitor } from './queue-monitor';
 
 // Validate worker configuration
 const getValidatedConcurrency = (): number => {
@@ -38,6 +39,12 @@ const workerOptions = {
   lockDuration: 301000, // ~5 minutes - must exceed Lite Engine timeout (5 min) to prevent stalled restart
   stalledInterval: 90000, // 1.5 minutes - stalled jobs check (increased to reduce false positives)
   maxStalledCount: 2, // Allow 1 stall recovery before permanent fail
+};
+
+// testRunWorker gets its own concurrency — starts at MIN, dynamically scaled by QueueMonitor
+const testRunWorkerOptions = {
+  ...workerOptions,
+  concurrency: env.TEST_RUN_CONCURRENCY_MIN,
 };
 
 // Create workers for each queue
@@ -100,10 +107,15 @@ const testRunWorker = new Worker(
       throw error;
     }
   },
-  workerOptions
+  testRunWorkerOptions
 );
 
 logger.info(`TestRun worker created successfully`);
+
+// Start dynamic concurrency scaling for testRunWorker
+if (env.SCALE_ENABLED) {
+  queueMonitor.start(testRunWorker, testRunQueue);
+}
 
 const testResultWorker = new Worker(
   QUEUE_NAMES.TEST_RESULT,
@@ -345,6 +357,9 @@ const gracefulShutdown = async (signal: string) => {
   }, SHUTDOWN_TIMEOUT);
 
   try {
+    // Stop dynamic scaling monitor first
+    queueMonitor.stop();
+
     // Use Promise.allSettled to ensure all workers close even if one fails
     const closeResults = await Promise.allSettled([
       testRunWorker.close(),

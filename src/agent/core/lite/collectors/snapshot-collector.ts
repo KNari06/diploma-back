@@ -27,7 +27,7 @@ export class SnapshotCollector {
    * @param page - Playwright page instance
    * @returns Snapshot with elements including parent context
    */
-  static async collect(page: Page): Promise<LiteSnapshot> {
+  static async collect(page: Page, options?: { fullPage?: boolean }): Promise<LiteSnapshot> {
     try {
       // Wait for visual stability first
       await VisualStability.waitForStable(page);
@@ -55,6 +55,7 @@ export class SnapshotCollector {
         closeButtonSelector: CLOSE_BUTTON_SELECTOR,
         // Feature flags
         enableLayer2: LITE_ENGINE_FLAGS.enableLayer2ObstacleClassification,
+        fullPage: options?.fullPage ?? false,
       };
 
       // Collect snapshot in page context
@@ -1021,7 +1022,13 @@ export class SnapshotCollector {
             const vw = window.innerWidth;
             // @ts-expect-error - window available in browser context
             const vh = window.innerHeight;
-            if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) return;
+            if (__mc.fullPage) {
+              // fullPage: skip only horizontally off-screen elements
+              if (rect.right < 0 || rect.left > vw) return;
+            } else {
+              // default: skip everything outside viewport
+              if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) return;
+            }
 
             // ═══════════════════════════════════════════════════════════════
             // LAYER-AWARE VISIBILITY: Check if element is inside active modal/overlay FIRST.
@@ -1031,7 +1038,7 @@ export class SnapshotCollector {
             // ═══════════════════════════════════════════════════════════════
             const isInsideModal = activeModalElement
               ? activeModalElement.contains(el)
-              : false;
+              : secondaryPassElements.has(el);
 
             // Universal visibility check via elementFromPoint.
             // The browser tells us exactly what the user sees at the element's center pixel.
@@ -1246,6 +1253,7 @@ export class SnapshotCollector {
               // SECURITY: Never include raw input values in snapshots.
               // Use `hasValue` for state-aware logic (privacy-safe).
               value: undefined,
+              href: el.tagName === 'A' ? (el as HTMLAnchorElement).href || undefined : undefined,
               placeholder: isInput ? input.placeholder : undefined,
               checked: input.checked || undefined,
               disabled: input.disabled || el.hasAttribute('disabled'),

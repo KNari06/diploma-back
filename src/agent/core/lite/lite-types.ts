@@ -109,6 +109,8 @@ export interface LiteElement {
   hasOnclick?: boolean;
   /** Element has aria-haspopup attribute (popup trigger) */
   hasAriaHaspopup?: boolean;
+  /** Resolved href for <a> elements (absolute URL) */
+  href?: string;
 }
 
 /**

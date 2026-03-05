@@ -24,6 +24,19 @@ import type { IntentTestCase, Priority } from '@/types/testing.types';
 // EXPLORATION CONFIG (input)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Progress event emitted during exploration for real-time UI updates */
+export type ExplorationProgressEvent = {
+  explorationId: string;
+  phase: 'survey' | 'flow' | 'complete';
+  event: 'page_discovered' | 'survey_complete' | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found';
+  data: Record<string, any>;
+  progressPercent: number;
+  timestamp: number;
+};
+
+/** Callback for exploration progress reporting */
+export type ExplorationProgressCallback = (event: ExplorationProgressEvent) => void;
+
 export interface ExplorationConfig {
   /** Entry URL to start exploring */
   entryUrl: string;
@@ -50,6 +63,8 @@ export interface ExplorationConfig {
   chatSessionId?: string;
   /** Workspace ID for skills context */
   workspaceId?: string;
+  /** Optional callback for real-time progress reporting */
+  onProgress?: ExplorationProgressCallback;
 }
 
 export interface ExplorationBudget {
@@ -74,6 +89,9 @@ export const DEFAULT_EXPLORATION_BUDGET: ExplorationBudget = {
 };
 
 export const DEFAULT_MAX_CONCURRENCY = 5;
+
+/** Desktop user agent to prevent mobile redirects during exploration */
+export const DESKTOP_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TEST FLOW CATEGORIES

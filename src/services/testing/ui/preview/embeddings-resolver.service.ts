@@ -688,6 +688,38 @@ export function buildAllowedSets(
       });
     }
     
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEXT-MATCH RESCUE: If user typed text that is visibly present on the
+    // element, it MUST reach the LLM — the user can only type what they see.
+    // This rescues elements excluded by tag.incompatible, visibility.covered,
+    // or other structural rules that don't account for visible text matching.
+    // ═══════════════════════════════════════════════════════════════════════
+    if (excluded && node.isVisible !== false && intentText.length > 0) {
+      const intentLower = intentText.toLowerCase();
+      const visibleTexts = [
+        node.text,
+        node.labelText,
+        node.ariaLabel,
+        node.placeholder,
+      ].filter(Boolean).map(t => t!.toLowerCase());
+
+      const hasTextMatch = visibleTexts.some(t =>
+        t.includes(intentLower) || intentLower.includes(t)
+      );
+
+      if (hasTextMatch) {
+        excluded = false;
+        isSoft = true;
+        nodeRules.push({
+          ruleId: 'rescue.visible_text_match',
+          version: 'v1',
+          action: 'penalize',
+          evidence: `Element excluded by [${nodeRules.map(r => r.ruleId).join(', ')}] but contains user-visible text matching intent "${intentText}"`,
+          affectedRefs: [node.ref],
+        });
+      }
+    }
+
     // Add to appropriate set
     if (!excluded) {
       if (isSoft) {
@@ -696,7 +728,7 @@ export function buildAllowedSets(
         hardAllowed.push(node);
       }
     }
-    
+
     // Add all rules for this node to trace
     ruleTrace.push(...nodeRules);
   }

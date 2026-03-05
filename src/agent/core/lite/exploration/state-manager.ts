@@ -13,6 +13,7 @@
 
 import type { Browser, BrowserContext } from 'playwright';
 import { logger } from '@/utils/core/logger';
+import { DESKTOP_USER_AGENT } from './types';
 
 export class StateManager {
   private cachedAuthState: string | null = null;
@@ -33,6 +34,7 @@ export class StateManager {
     const context = await this.browser.newContext({
       viewport: { width: 1280, height: 720 },
       ignoreHTTPSErrors: true,
+      userAgent: DESKTOP_USER_AGENT,
     });
     this.activeContexts.add(context);
     return context;
@@ -49,6 +51,7 @@ export class StateManager {
         const context = await this.browser.newContext({
           viewport: { width: 1280, height: 720 },
           ignoreHTTPSErrors: true,
+          userAgent: DESKTOP_USER_AGENT,
           storageState: this.authStateJson as any,
         });
         this.activeContexts.add(context);

@@ -100,6 +100,13 @@ const envSchema = z.object({
   // BullMQ prefix (namespace) to avoid cross-environment collisions when sharing Redis
   QUEUE_PREFIX: z.string().min(1).optional(),
 
+  // Dynamic test-run worker scaling
+  TEST_RUN_CONCURRENCY_MIN: z.string().transform(Number).default('2'),
+  TEST_RUN_CONCURRENCY_MAX: z.string().transform(Number).default('20'),
+  SCALE_ENABLED: z.string().transform(v => v === 'true').default('true'),
+  SCALE_CHECK_INTERVAL_MS: z.string().transform(Number).default('15000'),
+  SCALE_MAX_MEMORY_PERCENT: z.string().transform(Number).default('80'),
+
   // Agent
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
   AGENT_MAX_RETRIES: z.string().transform(Number).default('3'),

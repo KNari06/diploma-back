@@ -36,6 +36,7 @@ import type {
   FlowError,
   ErrorClassification,
   BlockerType,
+  ExplorationProgressCallback,
 } from './types';
 import { FlowQueue } from './flow-queue';
 import { BudgetTracker } from './budget-tracker';
@@ -77,13 +78,38 @@ export class FlowRunner {
   private stateManager: StateManager;
   private loginCompleted: boolean = false;
   private knownFlowNames: string[] = [];
+  private flowsCompleted: number = 0;
+  private totalFlows: number = 0;
 
   constructor(
     private readonly browser: Browser,
     private readonly config: ExplorationConfig,
     private readonly budget: BudgetTracker,
+    private readonly onProgress?: ExplorationProgressCallback,
   ) {
     this.stateManager = new StateManager(browser);
+  }
+
+  private emitProgress(
+    event: 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found',
+    data: Record<string, any>,
+  ): void {
+    if (!this.onProgress) return;
+    // Progress: 30% (survey done) → 95% (flows done). Scale within this range.
+    const flowProgress = this.totalFlows > 0
+      ? (this.flowsCompleted / this.totalFlows)
+      : 0;
+    const progressPercent = 30 + Math.round(flowProgress * 65);
+    try {
+      this.onProgress({
+        explorationId: this.config.explorationId,
+        phase: 'flow',
+        event,
+        data,
+        progressPercent: Math.min(95, progressPercent),
+        timestamp: Date.now(),
+      });
+    } catch { /* never let progress reporting crash exploration */ }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -99,6 +125,9 @@ export class FlowRunner {
     const semaphore = new Semaphore(maxConcurrency);
     const results: FlowExplorationTask[] = [];
     const inFlight: Set<Promise<void>> = new Set();
+
+    this.totalFlows = queue.size();
+    this.flowsCompleted = 0;
 
     logger.info('[FLOW_RUNNER] Starting flow exploration', {
       queueSize: queue.size(),
@@ -170,9 +199,16 @@ export class FlowRunner {
     results: FlowExplorationTask[],
     release: () => void,
   ): Promise<void> {
+    this.emitProgress('flow_started', {
+      name: entryPoint.name,
+      category: entryPoint.category,
+      priority: entryPoint.priority,
+    });
+
     try {
       const task = await this.runSingleFlow(entryPoint);
       results.push(task);
+      this.flowsCompleted++;
 
       // Mark as completed for dependency tracking
       if (task.goalAchieved) {
@@ -182,10 +218,32 @@ export class FlowRunner {
       // Enqueue newly discovered branch points
       for (const branch of task.branchPoints) {
         await queue.enqueue(branch);
+        this.totalFlows++;
+      }
+
+      if (task.branchPoints.length > 0) {
+        this.emitProgress('branch_found', {
+          flow: entryPoint.name,
+          branchCount: task.branchPoints.length,
+          branchNames: task.branchPoints.map(b => b.name),
+        });
       }
 
       // Record budget usage
       await this.budget.recordFlowCompletion(task.roundsUsed);
+
+      // Emit appropriate completion event
+      const progressEvent = task.status === 'blocked' ? 'flow_blocked' as const
+        : task.goalAchieved ? 'flow_completed' as const
+        : 'flow_failed' as const;
+
+      this.emitProgress(progressEvent, {
+        name: entryPoint.name,
+        status: task.status,
+        steps: task.discoveredSteps.length,
+        branches: task.branchPoints.length,
+        goalAchieved: task.goalAchieved,
+      });
 
       logger.info('[FLOW_RUNNER] Flow completed', {
         name: entryPoint.name,
@@ -194,11 +252,17 @@ export class FlowRunner {
         branches: task.branchPoints.length,
       });
     } catch (error) {
+      this.flowsCompleted++;
       logger.error('[FLOW_RUNNER] Flow execution failed', {
         name: entryPoint.name,
         error: error instanceof Error ? error.message : String(error),
       });
       results.push(this.createFailedTask(entryPoint, error));
+
+      this.emitProgress('flow_failed', {
+        name: entryPoint.name,
+        error: error instanceof Error ? error.message : String(error),
+      });
     } finally {
       release();
     }
@@ -285,9 +349,9 @@ export class FlowRunner {
       // 8. Track this flow name for branch dedup
       this.knownFlowNames.push(entryPoint.name);
 
-      // 9. Detect branch points on final page
+      // 9. Detect branch points on final page (also for partially-successful flows)
       let branchPoints: EntryPoint[] = [];
-      if (pipelineResult.success) {
+      if (pipelineResult.success || pipelineResult.progressScore > 30) {
         branchPoints = await this.detectBranchPoints(page, entryPoint, this.knownFlowNames);
       }
 
@@ -345,6 +409,25 @@ export class FlowRunner {
   private async performLogin(context: BrowserContext): Promise<void> {
     if (!this.config.credentials) return;
 
+    const goals = [
+      'Login with provided credentials',
+      'Find the email or username input field and fill it with credentials, then find the password field and fill it, then click the login or sign in button to submit the form',
+    ];
+
+    for (let attempt = 0; attempt < goals.length; attempt++) {
+      try {
+        const success = await this.tryLoginWithGoal(context, goals[attempt]);
+        if (success) return;
+        logger.warn('[FLOW_RUNNER] Login attempt failed', { attempt, goal: goals[attempt] });
+      } catch (error) {
+        logger.warn('[FLOW_RUNNER] Login attempt error', { attempt, error: String(error) });
+      }
+    }
+
+    logger.warn('[FLOW_RUNNER] All login attempts failed');
+  }
+
+  private async tryLoginWithGoal(context: BrowserContext, goal: string): Promise<boolean> {
     const page = await context.newPage();
 
     try {
@@ -364,7 +447,7 @@ export class FlowRunner {
       };
 
       const pipeline = new TestPipeline(integrations);
-      const result = await pipeline.run('Login with provided credentials', {
+      const result = await pipeline.run(goal, {
         url: page.url(),
         credentials: this.config.credentials,
         hasCredentials: true,
@@ -373,21 +456,23 @@ export class FlowRunner {
         timeoutMs: 60_000,
       });
 
+      networkTracker.stopTracking();
+      await page.close();
+
       if (result.success) {
         await this.stateManager.saveAuthState(context);
         this.loginCompleted = true;
         logger.info('[FLOW_RUNNER] Login successful, auth state cached');
-      } else {
-        logger.warn('[FLOW_RUNNER] Login failed', { reason: result.reason });
+        return true;
       }
 
-      networkTracker.stopTracking();
-      await page.close();
+      return false;
     } catch (error) {
       logger.error('[FLOW_RUNNER] Login error', {
         error: error instanceof Error ? error.message : String(error),
       });
       await page.close().catch(() => {});
+      return false;
     }
   }
 
