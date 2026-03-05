@@ -9,8 +9,9 @@
  * - Returns actionable follow-up steps
  */
 
-import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
+import { AICostManager, type AIModel } from '@/services/ai/cost/ai-cost-manager.service';
 import { logger } from '@/utils/core/logger';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import {
   MODAL_OVERLAY_SELECTORS,
   POSITIONAL_CANDIDATES_SELECTOR,
@@ -461,7 +462,7 @@ RULES:
 - If the executed action was a click and succeeded, do NOT suggest clicking the same button/element again`;
 
       const response = await getOpenAIClient().chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.actionAnalysis,
         messages: [
           { role: 'system', content: 'You are a QA automation expert. Respond with valid JSON only.' },
           { role: 'user', content: prompt },
@@ -480,7 +481,7 @@ RULES:
       if (costManager) {
         costManager.recordOperation({
           operation: 'post_action_analysis',
-          model: 'gpt-4o-mini',
+          model: AI_TASK_MODELS.actionAnalysis as AIModel,
           inputTokens: response.usage?.prompt_tokens || 0,
           outputTokens: response.usage?.completion_tokens || 0,
         });

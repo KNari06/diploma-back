@@ -7,21 +7,21 @@
 import { logger } from '@/utils/core/logger';
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PRICING (as of Nov 2024)
+// PRICING (as of Mar 2025)
 // ═══════════════════════════════════════════════════════════════════════════
 
 export const AI_PRICING = {
-  'gpt-4o': {
-    input: 0.0025 / 1000,  // $0.0025 per 1K input tokens
-    output: 0.01 / 1000,    // $0.01 per 1K output tokens
+  'gpt-4.1': {
+    input: 0.002 / 1000,   // $0.002 per 1K input tokens
+    output: 0.008 / 1000,   // $0.008 per 1K output tokens
   },
-  'gpt-4o-mini': {
-    input: 0.00015 / 1000, // $0.00015 per 1K input tokens
-    output: 0.0006 / 1000,  // $0.0006 per 1K output tokens
+  'gemini-2.5-flash-lite': {
+    input: 0.000075 / 1000, // $0.075 per 1M input tokens
+    output: 0.0003 / 1000,  // $0.30 per 1M output tokens
   },
-  'gpt-4o-vision': {
-    input: 0.0025 / 1000,  // Same as gpt-4o
-    output: 0.01 / 1000,
+  'gpt-4.1-vision': {
+    input: 0.002 / 1000,   // Same as gpt-4.1
+    output: 0.008 / 1000,
     imageBase: 0.00425,     // Base cost per image
     imagePerTile: 0.00085,  // Cost per 512x512 tile
   },
@@ -44,7 +44,7 @@ export const DEFAULT_BUDGET: BudgetConfig = {
   maxCostPerTest: 1.0,          // $1 per test
   warningThreshold: 0.7,        // Warning at 70%
   adaptiveMode: true,           // Enable adaptive mode
-  fallbackModel: 'gpt-4o-mini', // Fallback to mini
+  fallbackModel: 'gemini-2.5-flash-lite', // Fallback to flash-lite
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -172,10 +172,10 @@ export class AICostManager {
     cost += outputTokens * pricing.output;
 
     // Image costs (for vision models)
-    if (model === 'gpt-4o-vision' && imageCount > 0) {
+    if (model === 'gpt-4.1-vision' && imageCount > 0) {
       // Estimate tiles (assume 1024x1024 images = 4 tiles)
       const tilesPerImage = 4;
-      const visionPricing = AI_PRICING['gpt-4o-vision'];
+      const visionPricing = AI_PRICING['gpt-4.1-vision'];
       cost += imageCount * (visionPricing.imageBase + tilesPerImage * visionPricing.imagePerTile);
     }
 

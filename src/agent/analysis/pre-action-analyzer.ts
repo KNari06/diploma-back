@@ -14,6 +14,7 @@
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { Page } from 'playwright';
 import { DynamicAction } from '../types/intelligent-testing.types';
 import { getLocator, normalizeSelector } from '../utils/selectors/selector-utils';
@@ -43,7 +44,7 @@ const openai = new OpenAI({
 // ═══════════════════════════════════════════════════════════════════════════
 
 interface AICallOptions {
-  model?: 'gpt-4o-mini' | 'gpt-4o';
+  model?: string;
   maxTokens?: number;
   temperature?: number;
   systemPrompt: string;
@@ -61,7 +62,7 @@ interface AICallOptions {
  */
 async function callAI(options: AICallOptions): Promise<string | null> {
   const {
-    model = 'gpt-4o-mini',
+    model = AI_TASK_MODELS.actionAnalysis,
     maxTokens = 50,
     temperature = 0,
     systemPrompt,

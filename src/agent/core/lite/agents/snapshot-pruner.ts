@@ -9,7 +9,7 @@
  * - Replaces hardcoded slice(0, 80) with dynamic, goal-aware filtering
  * - Understands popups/modals/dropdowns naturally via LLM (no z-index heuristics)
  *
- * Model: gpt-4o-mini (~1-2s latency)
+ * Model: gemini-2.5-flash-lite (~1-2s latency)
  * Fallback: on timeout/error → returns null → caller uses legacy format() behavior
  */
 
@@ -175,7 +175,7 @@ export class SnapshotPruner {
 
     // 3. LLM call with timeout
     const result = await LitePromptBuilder.askJson<{ keep: string[] }>(prompt, {
-      model: AI_TASK_MODELS.snapshotPruning as 'gpt-4o-mini',
+      model: AI_TASK_MODELS.snapshotPruning as string,
       temperature: 0.0,
       maxTokens: 2000,
       timeoutMs: LITE_ENGINE_FLAGS.prunerTimeoutMs,
@@ -247,7 +247,7 @@ export class SnapshotPruner {
 
   /**
    * Build compact element list for pruner prompt.
-   * ~50-80 chars per element. For 300 elements = ~20KB, well within gpt-4o-mini context.
+   * ~50-80 chars per element. For 300 elements = ~20KB, well within gemini-2.5-flash-lite context.
    */
   private static buildCompactList(elements: LiteElement[]): string {
     return elements.map(el => {

@@ -1861,7 +1861,7 @@ If nothing matches:
 
 /**
  * LLM-first element selection: replaces embedding ranking + composite scoring + decision policy.
- * Uses gpt-4o-mini to directly select the best matching element from candidates.
+ * Uses gemini-2.5-flash-lite to directly select the best matching element from candidates.
  * Supports multilingual intent matching natively.
  */
 async function selectElementWithLLM(params: {
@@ -1908,7 +1908,7 @@ Select the single best matching element.`;
         { role: 'user', content: userPrompt },
       ],
       {
-        model: AI_TASK_MODELS.disambiguation, // gpt-4o-mini
+        model: AI_TASK_MODELS.disambiguation, // gemini-2.5-flash-lite
         temperature: 0.1,
         max_tokens: 200,
         response_format: { type: 'json_object' },
@@ -2282,7 +2282,7 @@ export async function resolveWithEmbeddings(params: {
   let llmSelectLatencyMs = 0;
 
   // ── PRIMARY PATH: LLM-based element selection ──
-  // gpt-4o-mini natively handles multilingual matching, context understanding,
+  // gemini-2.5-flash-lite natively handles multilingual matching, context understanding,
   // and disambiguation in a single call. Replaces: embeddings + composite scoring + decision policy + disambiguation.
   if (!isLlmSelectBreakerOpen()) {
     try {

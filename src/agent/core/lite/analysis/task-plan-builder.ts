@@ -1,7 +1,7 @@
 /**
  * TaskPlanBuilder
  * Generates a high-level task plan (list of target states) for autonomous navigation.
- * Uses gpt-4o-mini to create state-transition based plan, not action-based.
+ * Uses gemini-2.5-flash-lite to create state-transition based plan, not action-based.
  *
  * Key principles:
  * - Plans describe SUCCESS SIGNALS (expected states), not actions
@@ -12,6 +12,7 @@
 import { logger } from '@/utils/core/logger';
 import type { LiteSnapshot } from '../lite-types';
 import { LitePromptBuilder } from '../prompt/lite-prompt-builder';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 
 /**
  * Expected state for a plan step
@@ -124,7 +125,7 @@ export class TaskPlanBuilder {
           fail_signals: string[];
         }>;
       }>(prompt, {
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.taskPlanning,
         temperature: 0.2,
         maxTokens: 1200,
         timeoutMs: 15000,
@@ -219,7 +220,7 @@ export class TaskPlanBuilder {
         current_step: TaskPlanStep;
         next_step?: TaskPlanStep;
       }>(prompt, {
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.taskPlanning,
         temperature: 0.3,
         maxTokens: 800,
         timeoutMs: 12000,

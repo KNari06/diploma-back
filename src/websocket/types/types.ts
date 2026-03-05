@@ -258,6 +258,7 @@ export interface TestStepCompletedPayload {
       | 'heal_blocked'
       | 'timeout'
       | 'silent_backend_failure'
+      | 'unexpected_validation_error'
       | 'unknown';
     /** Human-readable explanation for failure (for CI reports) */
     failureExplanation?: string;
@@ -298,7 +299,7 @@ export interface TestStepCompletedPayload {
     /** Root cause classification from correlated signals */
     rootCause?: 'backend' | 'ui' | 'logic';
     /** Network verdict for this step */
-    networkVerdict?: 'backend_error' | 'clean' | 'warning';
+    networkVerdict?: 'backend_error' | 'clean' | 'warning' | 'expected_error' | 'validation_failure';
     /** Network errors correlated to this step execution window */
     networkEvidence?: Array<{
       method: string;

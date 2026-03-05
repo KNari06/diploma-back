@@ -6,6 +6,7 @@
 
 import { buildLogicAnalysisPrompt, buildPageAnalysisPrompt } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { AISelectorEngine } from '@/services/ai-selector/ai-selector-engine.service';
 import { DOMNodeExtractor } from '@/services/ai-selector/dom-node-extractor';
 import { analyzeDOMStructure } from '@/services/testing/ui/autonomous/dom-analyzer.service';
@@ -2061,7 +2062,7 @@ export class IntelligentPageAnalyzer {
       const prompt = buildPageAnalysisPrompt({ url, goal, previousContext, domContext });
 
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
+        model: AI_TASK_MODELS.pageAnalysisVision,
         messages: [
           {
             role: 'system',
@@ -2313,7 +2314,7 @@ export class IntelligentPageAnalyzer {
       });
 
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: AI_TASK_MODELS.elementAnalysis,
         messages: [
           {
             role: 'system',

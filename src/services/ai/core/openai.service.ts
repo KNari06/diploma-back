@@ -59,6 +59,23 @@ export async function getChatCompletionWithMessages(
 
     const model = options?.model || AI_MODELS.fast;
 
+    // Auto-route Gemini models to Gemini SDK
+    if (model.startsWith('gemini-')) {
+      const { getChatCompletionWithGemini } = await import('./gemini.service');
+      const geminiMessages = messages.map(m => ({
+        role: (m.role === 'tool' ? 'user' : m.role) as 'user' | 'assistant' | 'system',
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+      }));
+      const response = await getChatCompletionWithGemini({
+        messages: geminiMessages,
+        model: model as any,
+        temperature: options?.temperature,
+        maxTokens: options?.max_tokens,
+        jsonMode: !!options?.response_format,
+      });
+      return { content: response.content, usage: response.usage };
+    }
+
     if (options?.abortSignal?.aborted) {
       throw new Error('Request was cancelled. Please try again.');
     }

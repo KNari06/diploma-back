@@ -18,7 +18,7 @@ import { getBaselineCredits } from './api-agent-policy';
 const USD_PER_CREDIT = 0.0289; // Based on $28.9 / 1000 credits
 
 /** Model used for AI calls in agent */
-const DEFAULT_MODEL = AI_TASK_MODELS.creditDefault as 'gpt-4o' | 'gpt-4o-mini';
+const DEFAULT_MODEL = AI_TASK_MODELS.creditDefault as string;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CREDITS SERVICE

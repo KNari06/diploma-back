@@ -31,7 +31,7 @@ export class StrategistAgent {
     const prompt = StrategistAgent.buildPrompt(input);
 
     const result = await LitePromptBuilder.askJson<StrategistOutput>(prompt, {
-      model: LITE_ENGINE_FLAGS.coreBrainModel as 'gpt-4o' | 'gpt-4o-mini',
+      model: LITE_ENGINE_FLAGS.coreBrainModel as string,
       temperature: 0.15,
       maxTokens: 500,
       timeoutMs: LITE_ENGINE_FLAGS.multiAgentStrategistTimeoutMs,

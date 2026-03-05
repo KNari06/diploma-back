@@ -13,7 +13,7 @@
 
 import { PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
-import type { BindingHints, CompiledStepPlan, IntentActionType, IntentStep, StepEvidence } from './preview.types';
+import type { BindingHints, CompiledStepPlan, ExpectedStepOutcome, IntentActionType, IntentStep, StepEvidence } from './preview.types';
 
 /**
  * Extended PlaywrightCommand with intent metadata for runtime resolution
@@ -52,6 +52,8 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     lookaheadTimeoutMs?: number;
     /** V10: Press Enter after type action (from step.options.pressEnter) */
     pressEnter?: boolean;
+    /** V11: Expected outcome for 4xx detection (default: 'success') */
+    expectedOutcome?: ExpectedStepOutcome;
   };
 }
 
@@ -141,6 +143,42 @@ function buildPrimarySelector(compiled?: CompiledStepPlan): string | undefined {
 }
 
 /**
+ * Keyword-based heuristic to classify whether a step expects an error outcome.
+ *
+ * Uses description analysis. NO AI call — pure heuristic for speed.
+ * Deliberately conservative: only returns 'error' when signals are strong.
+ * Default is always 'success' (safe for existing tests).
+ *
+ * V11: Negative test auto-detection for 4xx handling in replay.
+ */
+function classifyExpectedOutcome(step: IntentStep): ExpectedStepOutcome {
+  const desc = (step.description || '').toLowerCase();
+
+  // Strong negative test indicators in description
+  const negativeKeywords = [
+    'invalid', 'wrong', 'incorrect', 'bad', 'expired', 'empty form',
+    'without', 'missing', 'fake', 'nonexistent', 'negative test',
+    'should fail', 'should error', 'submit empty', 'submit invalid',
+    'try submitting empty', 'enter invalid', 'enter wrong', 'enter incorrect',
+  ];
+
+  const hasNegativeKeyword = negativeKeywords.some(kw => desc.includes(kw));
+  if (!hasNegativeKeyword) return 'success';
+
+  // Only classify as 'error' for submit-like actions:
+  // - 'click': clicking a button/submit (any click on a negative-described step)
+  // - 'press': ONLY Enter/Return/NumpadEnter — NOT Tab, Escape, Space, etc.
+  //   Tab/Escape with negative keywords are navigation/dismiss actions, not form submissions.
+  const SUBMIT_KEYS = ['Enter', 'Return', 'NumpadEnter'];
+  const isSubmitLike =
+    step.type === 'click' ||
+    (step.type === 'press' && SUBMIT_KEYS.includes(step.value || ''));
+  if (isSubmitLike) return 'error';
+
+  return 'success'; // Conservative default
+}
+
+/**
  * Convert a single IntentStep to IntentPlaywrightCommand
  *
  * This is a "dumb" converter - it does NOT:
@@ -190,6 +228,8 @@ export function convertIntentStepToCommand(
       ...(step.options?.iframe?.selector && {
         iframeSelector: step.options.iframe.selector,
       }),
+      // V11: Expected outcome for 4xx detection in replay
+      expectedOutcome: step.expectedOutcome || classifyExpectedOutcome(step),
     },
   };
 

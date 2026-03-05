@@ -2,7 +2,7 @@
  * Exploration Confirmation Handler
  * Intercepts user responses to exploration confirmation prompts.
  * Uses Redis to store pending exploration state between messages.
- * Uses AI (gpt-4o-mini) to classify user intent (confirm/decline/other).
+ * Uses AI to classify user intent (confirm/decline/other).
  */
 
 import { Request, Response } from 'express';

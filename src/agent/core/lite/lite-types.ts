@@ -805,7 +805,7 @@ export interface GoalEval {
 
 /**
  * AI-based goal completion evaluator result.
- * gpt-4o-mini decides whether the goal is achieved by comparing before/after state.
+ * gemini-2.5-flash-lite decides whether the goal is achieved by comparing before/after state.
  */
 export interface GoalCompletionResult {
   /** AI verdict: whether the user goal is fully achieved. */

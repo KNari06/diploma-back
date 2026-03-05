@@ -90,7 +90,7 @@ function shouldOverrideSimpleChat(
  * All agents share a Blackboard for cross-agent context.
  *
  * Three paths:
- * - simple_chat: Router → Responder (no tools, gpt-4o-mini only, zero blackboard overhead)
+ * - simple_chat: Router → Responder (no tools, gemini-2.5-flash-lite only, zero blackboard overhead)
  * - single_tool: Router → Executor → [Reviewer] → Responder (filtered tools)
  * - multi_tool:  Router → Planner → Executor(s) → Reviewer → Responder (planned execution)
  *

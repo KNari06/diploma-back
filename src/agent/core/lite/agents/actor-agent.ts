@@ -49,7 +49,7 @@ export class ActorAgent {
     const prompt = ActorAgent.buildPrompt(input);
 
     const result = await LitePromptBuilder.askJson<ActorOutput>(prompt, {
-      model: LITE_ENGINE_FLAGS.coreBrainModel as 'gpt-4o' | 'gpt-4o-mini',
+      model: LITE_ENGINE_FLAGS.coreBrainModel as string,
       temperature: 0.0,
       maxTokens: 200,
       timeoutMs: LITE_ENGINE_FLAGS.multiAgentActorTimeoutMs,

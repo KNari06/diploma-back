@@ -17,7 +17,7 @@ import type { ReviewerResult, ToolExecutionRecord } from '../types';
  *
  * Two phases:
  * 1. Deterministic checks (0 tokens, <1ms) — plan completion, error detection
- * 2. AI assessment (gpt-4o-mini) — goal alignment, response guidance
+ * 2. AI assessment (gemini-2.5-flash-lite) — goal alignment, response guidance
  *
  * Key principle: Double-blind — does NOT see planner's reasoning.
  * Key safety: Defaults to 'approved' on any failure (never blocks pipeline).
@@ -144,7 +144,7 @@ export async function reviewExecution(
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // Phase 2: AI Assessment (gpt-4o-mini, double-blind)
+  // Phase 2: AI Assessment (gemini-2.5-flash-lite, double-blind)
   // Only reaches here for: partial failures, mixed results, ambiguous outcomes
   // ═══════════════════════════════════════════════════════════════════════
 

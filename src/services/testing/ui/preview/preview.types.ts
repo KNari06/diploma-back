@@ -440,7 +440,20 @@ export interface IntentStep {
   evidence?: StepEvidence;
   /** Compiled execution plan (generated after successful apply) */
   compiled?: CompiledStepPlan;
+  /**
+   * Expected outcome for this step (V11: negative test support)
+   * - 'success': Step should complete without errors (default)
+   * - 'error': Step is a negative test — expects 4xx / validation error / error toast
+   * Auto-classified from description keywords if not explicitly set.
+   */
+  expectedOutcome?: ExpectedStepOutcome;
 }
+
+/**
+ * Expected outcome classification for a test step.
+ * Used to distinguish negative tests (expected 4xx) from regression bugs (unexpected 4xx).
+ */
+export type ExpectedStepOutcome = 'success' | 'error';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LINT RESULT (from linting engine)
@@ -546,6 +559,7 @@ export type FailedReason =
   | 'heal_blocked'
   | 'timeout'
   | 'silent_backend_failure'
+  | 'unexpected_validation_error'
   | 'unknown';
 
 /**
@@ -567,7 +581,7 @@ export type RootCause = 'backend' | 'ui' | 'logic';
 /**
  * Network verdict classification
  */
-export type NetworkVerdict = 'backend_error' | 'clean' | 'warning';
+export type NetworkVerdict = 'backend_error' | 'clean' | 'warning' | 'expected_error' | 'validation_failure';
 
 /**
  * Runtime metadata for step execution

@@ -8,7 +8,7 @@
  * Architecture:
  * 1. Receives topK candidates already ranked by embeddings
  * 2. Builds a privacy-safe prompt with minimal element info
- * 3. Calls gpt-4o-mini for fast disambiguation
+ * 3. Calls gemini-2.5-flash-lite for fast disambiguation
  * 4. Validates response (ref must exist in candidate list)
  * 5. Returns selected ref + confidence or null if LLM can't decide
  *

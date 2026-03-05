@@ -42,10 +42,11 @@ export interface GeminiResponse {
  */
 export async function generateTextWithGemini(params: {
   prompt: string;
-  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp';
+  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
+  jsonMode?: boolean;
 }): Promise<GeminiResponse> {
   const {
     prompt,
@@ -53,6 +54,7 @@ export async function generateTextWithGemini(params: {
     temperature = 0,
     maxTokens = 100,
     timeout = 5000,
+    jsonMode = false,
   } = params;
 
   try {
@@ -62,6 +64,7 @@ export async function generateTextWithGemini(params: {
       generationConfig: {
         temperature,
         maxOutputTokens: maxTokens,
+        ...(jsonMode && { responseMimeType: 'application/json' }),
       },
     });
 
@@ -122,10 +125,11 @@ export async function generateTextWithGemini(params: {
  */
 export async function getChatCompletionWithGemini(params: {
   messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
-  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp';
+  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
+  jsonMode?: boolean;
 }): Promise<GeminiResponse> {
   const {
     messages,
@@ -133,6 +137,7 @@ export async function getChatCompletionWithGemini(params: {
     temperature = 0,
     maxTokens = 1000,
     timeout = 10000,
+    jsonMode = false,
   } = params;
 
   try {
@@ -142,6 +147,7 @@ export async function getChatCompletionWithGemini(params: {
       generationConfig: {
         temperature,
         maxOutputTokens: maxTokens,
+        ...(jsonMode && { responseMimeType: 'application/json' }),
       },
     });
 
@@ -239,7 +245,7 @@ export async function generateTextWithGeminiVision(params: {
   prompt: string;
   imageBase64: string;
   mimeType?: 'image/png' | 'image/jpeg';
-  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp';
+  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;

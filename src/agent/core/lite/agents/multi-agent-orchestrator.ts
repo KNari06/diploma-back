@@ -173,7 +173,7 @@ export class MultiAgentOrchestrator {
     // ═══════════════════════════════════════════════════════════════════════
     // Supervisor Layer — Manus Tiered Escalation
     // Tier 1: Deterministic blackboard (<5ms, 0 tokens)
-    // Tier 2: AI diagnosis (gpt-4o-mini) only when stuck 5+ iterations
+    // Tier 2: AI diagnosis (gemini-2.5-flash-lite) only when stuck 5+ iterations
     // ═══════════════════════════════════════════════════════════════════════
     let blackboard: SupervisorBlackboard | undefined;
 

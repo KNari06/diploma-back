@@ -6,6 +6,7 @@
 
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import type { TaskPlanStep } from '../analysis/task-plan-builder';
 import type { AIDecision, BlacklistedAction, GoalGuidance, ModalDismissInfo, StateDriftAuditResult, StuckCheck, VisionHints } from '../lite-types';
@@ -36,8 +37,8 @@ export interface ValidationErrorContext {
  * Options for askJson calls
  */
 export interface AskJsonOptions {
-  /** Model to use: 'gpt-4o-mini' (cheap/fast) or 'gpt-4o' (accurate/expensive) */
-  model?: 'gpt-4o-mini' | 'gpt-4o';
+  /** Model to use for the request */
+  model?: string;
   /** Temperature (0-1, lower = more deterministic) */
   temperature?: number;
   /** Max tokens for response */
@@ -402,7 +403,7 @@ Analyze state changes after each action. Success = state changed.`;
     try {
       // ✅ MY IDEA: Estimate total tokens and warn if too large
       const estimatedTokens = Math.ceil(prompt.length / 4); // Rough estimate: 1 token ~= 4 chars
-      const MODEL_CONTEXT_WINDOW = 128_000; // gpt-4o-mini context window
+      const MODEL_CONTEXT_WINDOW = 128_000; // gemini-2.5-flash-lite context window
       const MAX_SAFE_PROMPT_TOKENS = 120_000; // Leave 8k for response
 
       if (estimatedTokens > MAX_SAFE_PROMPT_TOKENS) {
@@ -911,7 +912,7 @@ What should the agent do next? Respond with JSON:
 
   /**
    * Generic JSON prompt helper
-   * Supports strategy prompts (gpt-4o-mini) and auditor prompts (gpt-4o)
+   * Supports strategy prompts (gemini-2.5-flash-lite) and auditor prompts (gpt-4.1)
    * Includes markdown cleanup and strict JSON response format
    *
    * @param prompt - Complete prompt string (must request JSON response)
@@ -923,7 +924,7 @@ What should the agent do next? Respond with JSON:
     options: AskJsonOptions = {}
   ): Promise<T | null> {
     const {
-      model = 'gpt-4o-mini',
+      model = AI_MODELS.fast,
       temperature = 0.1,
       maxTokens = 600,
       timeoutMs = 15000,

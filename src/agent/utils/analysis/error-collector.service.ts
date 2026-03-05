@@ -73,14 +73,43 @@ export class ErrorCollectorService {
     try {
       const status = response.status?.();
       if (typeof status === 'number' && status >= 400) {
-        this.networkErrors.push({
-          url: response.url?.() || '',
+        const url = response.url?.() || '';
+        const method = response.request?.().method?.() || '';
+        const errorEntry: ErrorSignals['networkErrors'][number] = {
+          url,
           status,
-          method: response.request?.().method?.() || '',
+          method,
           error: `HTTP ${status}`,
           timestamp: Date.now(),
-        });
-        logger.debug('[ERROR_COLLECTOR] HTTP error', { url: response.url?.(), status });
+        };
+
+        this.networkErrors.push(errorEntry);
+        logger.debug('[ERROR_COLLECTOR] HTTP error', { url, status });
+
+        // V11: Enhanced 4xx body capture for mutating requests (validation error detection)
+        if (status >= 400 && status < 500) {
+          const isMutating = ['POST', 'PUT', 'DELETE', 'PATCH'].includes(method);
+          if (isMutating) {
+            try {
+              const contentType = response.headers?.()?.['content-type'] || '';
+              if (contentType.includes('application/json')) {
+                const bodyPromise = response.json?.();
+                if (bodyPromise && typeof bodyPromise.then === 'function') {
+                  bodyPromise.then((parsed: any) => {
+                    if (parsed) {
+                      // Truncate large bodies to 2KB — store as raw string when truncating
+                      // (JSON.parse of a truncated string always throws — store string directly)
+                      const serialized = JSON.stringify(parsed);
+                      errorEntry.responseBody = serialized.length > 2048
+                        ? serialized.slice(0, 2048) : parsed;
+                      errorEntry.fieldErrors = ErrorCollectorService.parseFieldErrors(parsed);
+                    }
+                  }).catch(() => { /* non-fatal: body parsing failed */ });
+                }
+              }
+            } catch { /* non-fatal */ }
+          }
+        }
       }
 
       // Track ALL API responses with timing for performance metrics
@@ -525,5 +554,41 @@ export class ErrorCollectorService {
     }
 
     return parts.join(', ');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V11: Field-level validation error parsing
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Parse field-level validation errors from 4xx response body.
+   * Supports multiple API formats: Laravel/Rails, array-based, object-based.
+   */
+  private static parseFieldErrors(body: any): Array<{ field: string; message: string }> | undefined {
+    if (!body) return undefined;
+    const errors: Array<{ field: string; message: string }> = [];
+    try {
+      // Format 1: Object { errors: { email: ['invalid'], password: ['too short'] } } (Laravel/Rails)
+      if (body.errors && typeof body.errors === 'object' && !Array.isArray(body.errors)) {
+        for (const [field, msgs] of Object.entries(body.errors)) {
+          if (Array.isArray(msgs)) {
+            for (const m of msgs) {
+              errors.push({ field, message: String(m) });
+            }
+          } else if (typeof msgs === 'string') {
+            errors.push({ field, message: msgs });
+          }
+        }
+      }
+      // Format 2: Array [{ field: 'email', message: 'invalid' }]
+      else if (Array.isArray(body.errors)) {
+        for (const e of body.errors) {
+          if (e && typeof e === 'object' && e.field && e.message) {
+            errors.push({ field: String(e.field), message: String(e.message) });
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
+    return errors.length > 0 ? errors : undefined;
   }
 }

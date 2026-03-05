@@ -10,6 +10,7 @@ import { TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { GraphBuilder, GraphUpdate } from '@/agent/utils/visualization/graph-builder.service';
 import { TestProgressEmitter } from '@/agent/utils/visualization/progress-emitter';
 import { AdaptiveTimeoutConfig, computeAdaptiveTimeouts, LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Page } from 'playwright';
@@ -98,7 +99,7 @@ export class LiteEngine {
   private readonly MAX_RATE_LIMIT_BACKOFF_MS = 30000; // 30s max
   private readonly MAX_CONSECUTIVE_RATE_LIMITS = 3; // After 3 → blockedInfo
 
-  // ✅ NEW: Audit cooldown tracking (prevents expensive repeated gpt-4o calls)
+  // ✅ NEW: Audit cooldown tracking (prevents expensive repeated gpt-4.1 calls)
   // Cooldown: 3 iterations after auditor returns isDone=false
   // Bypass: if state hash or URL changes significantly
   private auditCooldownRemaining = 0;
@@ -2004,7 +2005,7 @@ export class LiteEngine {
         // POST-CREDENTIAL-FILL GOAL CHECK
         // When auto-fill completed (state='done') and URL redirected away from auth page,
         // the heuristic often fails because URL/form signals no longer match.
-        // In this case, proactively call auditor (gpt-4o) to verify login success.
+        // In this case, proactively call auditor (gpt-4.1) to verify login success.
         // ═══════════════════════════════════════════════════════════════════════
         if (
           this.credentialFillState === 'done' &&
@@ -2068,7 +2069,7 @@ export class LiteEngine {
                 payload: {
                   trigger: 'post_credential_fill',
                   goalContext: credGoalContext,
-                  model: 'gpt-4o',
+                  model: AI_TASK_MODELS.goalAuditor,
                 },
               });
 
@@ -2187,7 +2188,7 @@ export class LiteEngine {
             });
             // Continue to next iteration without completing
           } else {
-            // Call auditor (gpt-4o) for final validation
+            // Call auditor (gpt-4.1) for final validation
             logger.info('[LITE_ENGINE] Heuristic claims done, calling auditor for validation', {
               testId: this.config.testId,
               progressScore: Math.round(goalCheck.progressScore * 100) + '%',
@@ -2207,7 +2208,7 @@ export class LiteEngine {
                   trigger: 'heuristic_done',
                   goalContext,
                   lastOutcome: this.state.getLastOutcome(),
-                  model: 'gpt-4o', // Auditor uses gpt-4o
+                  model: AI_TASK_MODELS.goalAuditor,
                 },
               });
 
@@ -2706,7 +2707,7 @@ export class LiteEngine {
 
         // Check terminal states
         if (decision.done) {
-          // ✅ NEW: Validate AI's done claim with auditor (gpt-4o) with cooldown
+          // ✅ NEW: Validate AI's done claim with auditor (gpt-4.1) with cooldown
           const shouldCallAuditorForAIDone = this.auditCooldownRemaining === 0;
 
           if (!shouldCallAuditorForAIDone) {
@@ -2738,7 +2739,7 @@ export class LiteEngine {
                 trigger: 'ai_done',
                 goalContext,
                 aiThought: decision.thought,
-                model: 'gpt-4o', // Auditor uses gpt-4o
+                model: AI_TASK_MODELS.goalAuditor,
               },
             });
 
@@ -3618,7 +3619,7 @@ export class LiteEngine {
         }
 
         // AI-based post-action goal completion check.
-        // Sends before/after state to gpt-4o-mini which decides if the goal is achieved.
+        // Sends before/after state to gemini-2.5-flash-lite which decides if the goal is achieved.
         if (outcome === 'state_changed' || diff.urlChanged || enrichedDiff.progressSentiment === 'Major Progress') {
           const completionCheck = await withCancellation(
             this.config.testId,

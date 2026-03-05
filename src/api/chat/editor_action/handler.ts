@@ -9,6 +9,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { createRoomName, type PreviewPagePayload, type ChatMessagePayload } from '@/websocket/types/types';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { handleGeneralChat } from '../general/handler';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 
@@ -264,7 +265,7 @@ Examples:
       temperature: 0,
       max_tokens: 200,
       response_format: { type: 'json_object' },
-      model: 'gpt-4o-mini',
+      model: AI_TASK_MODELS.intentLint,
       abortSignal,
     });
 

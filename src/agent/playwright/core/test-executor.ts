@@ -551,6 +551,140 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               break;
             }
 
+            // ═══════════════════════════════════════════════════════════════
+            // Case D: 4xx validation error — expected (negative test) vs unexpected (regression)
+            // V11: Distinguishes intentional negative tests from real backend regressions.
+            // ═══════════════════════════════════════════════════════════════
+            const validation4xxErrors = stepErrors.networkErrors.filter(e => {
+              const isMutating = ['POST', 'PUT', 'DELETE', 'PATCH'].includes(e.method);
+              const is4xx = typeof e.status === 'number' && e.status >= 400 && e.status < 500;
+              return isMutating && is4xx && isSameOriginUrl(e.url, testData.url);
+            });
+
+            if (validation4xxErrors.length > 0) {
+              // Always scan UI for error toasts/banners when 4xx detected
+              try { await errorCollector.collectUIErrors(); } catch { /* non-fatal */ }
+              const updatedStepErrors = errorCollector.getErrorsSince(stepStartedAt);
+
+              const expectedOutcome = (command as any).intentMeta?.expectedOutcome || 'success';
+              const first4xx = validation4xxErrors[0];
+
+              if (expectedOutcome === 'error') {
+                // ✅ Negative test passed — 4xx is expected behavior
+                logger.info('[PLAYWRIGHT] Expected validation error (negative test passed)', {
+                  testId: testData.testId,
+                  stepIndex: currentStepIndex,
+                  stepDescription: intentMeta?.elementDescription || action,
+                  status: first4xx.status,
+                  url: first4xx.url,
+                });
+
+                // Enrich runtimeMeta with expected_error verdict but DON'T fail
+                if (stepResult.runtimeMeta) {
+                  (stepResult.runtimeMeta as any).networkVerdict = 'expected_error';
+                  (stepResult.runtimeMeta as any).networkEvidence = validation4xxErrors.map(e => ({
+                    method: e.method, url: e.url, status: e.status, error: e.error,
+                  }));
+                }
+
+                replayTrace.write({
+                  eventType: 'step_note', step: currentStepIndex, totalSteps,
+                  payload: {
+                    note: 'negative_test_passed',
+                    expectedOutcome: 'error',
+                    validation4xx: validation4xxErrors.map(e => ({
+                      method: e.method, url: e.url, status: e.status,
+                    })),
+                  },
+                });
+                // Continue to next step — step is a PASS
+              } else {
+                // 🚨 Unexpected 4xx — regression bug detected
+                // (stepDescription declared in outer scope at line ~476 — same value, no shadow needed)
+                logger.warn('[PLAYWRIGHT] Unexpected validation error detected (regression)', {
+                  testId: testData.testId,
+                  stepIndex: currentStepIndex,
+                  stepDescription,
+                  status: first4xx.status,
+                  url: first4xx.url,
+                  responseBody: first4xx.responseBody,
+                  fieldErrors: first4xx.fieldErrors,
+                  uiErrors: updatedStepErrors.uiErrors.length,
+                });
+
+                allSuccess = false;
+                finalError = `Unexpected validation error: ${first4xx.method} ${first4xx.url} → HTTP ${first4xx.status}`;
+
+                const bugScreenshotUrl = await captureBugScreenshot(
+                  activePage, testData, currentStepIndex, 'validation-error'
+                );
+
+                const enrichedMeta: NonNullable<TestStepCompletedPayload['runtimeMeta']> = {
+                  stepId: intentMeta?.stepId,
+                  ...(stepResult.runtimeMeta || {}),
+                  runtimeStatus: 'failed' as const,
+                  failedReason: 'unexpected_validation_error' as const,
+                  failureExplanation: `Step "${stepDescription}" triggered ${first4xx.status} on ${first4xx.method} ${first4xx.url}. ${
+                    first4xx.fieldErrors?.length
+                      ? `Field errors: ${first4xx.fieldErrors.map(fe => `${fe.field}: ${fe.message}`).join(', ').slice(0, 200)}`
+                      : first4xx.responseBody
+                        ? JSON.stringify(first4xx.responseBody).slice(0, 200)
+                        : first4xx.error
+                  }`,
+                  rootCause: 'backend' as const,
+                  networkVerdict: 'validation_failure' as const,
+                  networkEvidence: validation4xxErrors.map(e => ({
+                    method: e.method, url: e.url, status: e.status, error: e.error,
+                  })),
+                  stepErrors: {
+                    console: updatedStepErrors.consoleErrors.length,
+                    network: updatedStepErrors.networkErrors.length,
+                    ui: updatedStepErrors.uiErrors.length,
+                  },
+                  bugScreenshotUrl,
+                };
+
+                // V11: Write step_failed to replay trace (matches Case C + element-not-found path)
+                replayTrace.write({
+                  eventType: 'step_failed', step: currentStepIndex, totalSteps,
+                  payload: {
+                    action, success: false, durationMs: Date.now() - stepStartedAt,
+                    error: finalError,
+                    rootCause: 'backend',
+                    failedReason: 'unexpected_validation_error',
+                    networkEvidence: validation4xxErrors.map(e => ({
+                      method: e.method, url: e.url, status: e.status,
+                    })),
+                    errors: {
+                      console: updatedStepErrors.consoleErrors.length,
+                      network: updatedStepErrors.networkErrors.length,
+                      ui: updatedStepErrors.uiErrors.length,
+                    },
+                  },
+                });
+
+                try {
+                  webSocketService.emitTestStepCompleted(testData.testId, {
+                    testId: testData.testId,
+                    browser: testData.browser,
+                    step: currentStepIndex,
+                    stepDescription,
+                    success: false,
+                    timestamp: new Date().toISOString(),
+                    runtimeMeta: enrichedMeta,
+                  });
+                } catch (wsError) {
+                  logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/validation-fail)', {
+                    testId: testData.testId, step: currentStepIndex,
+                    error: wsError instanceof Error ? wsError.message : String(wsError),
+                  });
+                }
+
+                // Stop on first failure
+                break;
+              }
+            }
+
             const stepDurationMs = Date.now() - stepStartedAt;
             const meta = stepResult.runtimeMeta;
             logger.info('[PLAYWRIGHT] Replay step completed', {

@@ -6,7 +6,8 @@
 
 import { dbAdminService } from '@/db/supabase';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service'; // Self-healing service for automatic selector recovery
-import { AICostManager, getCostManager, removeCostManager } from '@/services/ai/cost/ai-cost-manager.service';
+import { AICostManager, getCostManager, removeCostManager, type AIModel } from '@/services/ai/cost/ai-cost-manager.service';
+import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -149,7 +150,7 @@ export class IntelligentTestOrchestrator {
         maxCostPerTest: 1.0,      // $1 per test
         warningThreshold: 0.7,     // Warning at 70%
         adaptiveMode: true,        // Enable adaptive mode
-        fallbackModel: 'gpt-4o-mini', // Fallback to mini
+        fallbackModel: AI_MODELS.fast as AIModel,
       });
     }
 

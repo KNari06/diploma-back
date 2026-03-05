@@ -27,16 +27,16 @@ export const TOKENS_PER_CREDIT = 562.5;
 /**
  * OpenAI API pricing (November 2024)
  */
-export const MODEL_PRICING = {
-  'gpt-4o': {
-    input: 0.005, // $ per 1K tokens
-    output: 0.015, // $ per 1K tokens
+export const MODEL_PRICING: Record<string, { input: number; output: number }> = {
+  'gpt-4.1': {
+    input: 0.002, // $ per 1K tokens
+    output: 0.008, // $ per 1K tokens
   },
-  'gpt-4o-mini': {
-    input: 0.00015, // $ per 1K tokens
-    output: 0.0006, // $ per 1K tokens
+  'gemini-2.5-flash-lite': {
+    input: 0.000075, // $ per 1K tokens
+    output: 0.0003, // $ per 1K tokens
   },
-} as const;
+};
 
 /**
  * Fixed credit costs for different test types
@@ -104,7 +104,7 @@ export class TokenCalculatorService {
   static calculateCostFromTokens(
     inputTokens: number,
     outputTokens: number,
-    model: 'gpt-4o' | 'gpt-4o-mini'
+    model: string
   ): number {
     // Validate inputs
     if (!Number.isFinite(inputTokens) || inputTokens < 0) {
@@ -115,8 +115,8 @@ export class TokenCalculatorService {
     }
 
     if (!MODEL_PRICING[model]) {
-      logger.warn('[TOKEN_CALCULATOR] Unknown model, using gpt-4o-mini', { model });
-      model = 'gpt-4o-mini';
+      logger.warn('[TOKEN_CALCULATOR] Unknown model, using gemini-2.5-flash-lite', { model });
+      model = 'gemini-2.5-flash-lite';
     }
 
     const pricing = MODEL_PRICING[model];

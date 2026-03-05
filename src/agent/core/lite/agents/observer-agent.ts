@@ -18,7 +18,7 @@ export class ObserverAgent {
     const prompt = ObserverAgent.buildPrompt(input);
 
     const result = await LitePromptBuilder.askJson<ObserverOutput>(prompt, {
-      model: LITE_ENGINE_FLAGS.coreBrainModel as 'gpt-4o' | 'gpt-4o-mini',
+      model: LITE_ENGINE_FLAGS.coreBrainModel as string,
       temperature: 0.05,
       maxTokens: 1000,
       timeoutMs: LITE_ENGINE_FLAGS.multiAgentObserverTimeoutMs,

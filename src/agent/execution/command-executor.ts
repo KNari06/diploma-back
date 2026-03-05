@@ -25,6 +25,30 @@ import {
 } from './url-pattern-matcher';
 
 /**
+ * V11: Accumulated state shared across retry attempts within a single step.
+ * Enables graduated retry strategy: later retries skip stages that failed deterministically.
+ */
+interface RetryContext {
+  /** Current attempt index (0, 1, 2) */
+  attempt: number;
+  /** Whether each stage failed deterministically (no transient error, just 0 results) */
+  stageDeterministicFail: {
+    compiled: boolean;
+    embeddings: boolean;
+    smart: boolean;
+    selfHeal: boolean;
+  };
+  /** Shared heal attempt count across all retries (NOT reset per call) */
+  healAttempts: number;
+  /** Timestamp of last DOM node collection (for reuse when delay is short) */
+  lastDomCollectionTs: number;
+  /** Cached DOM nodes from last collection (reuse if < 1.5s since last) */
+  cachedDomNodes: any[] | null;
+  /** Total candidates found across all stages on all previous attempts */
+  totalCandidatesEver: number;
+}
+
+/**
  * Execute Playwright commands on a page
  * ✅ NEW: With AI self-healing support
  * ✅ V2: With compiled locator plan support for IntentStep execution
@@ -2387,6 +2411,15 @@ export class CommandExecutor {
   };
 
   /**
+   * V11: Check if all stages failed deterministically (zero candidates, no transient errors).
+   * Used for fail-fast: if element truly doesn't exist, don't waste time retrying.
+   */
+  private allStagesDeterministicFail(ctx: RetryContext): boolean {
+    const s = ctx.stageDeterministicFail;
+    return s.compiled && s.embeddings && s.smart && s.selfHeal;
+  }
+
+  /**
    * Get locator for an intent-based command with retry logic
    *
    * Priority order:
@@ -2409,26 +2442,50 @@ export class CommandExecutor {
     const { maxRetries, retryDelayMs, retryBackoffMultiplier } = CommandExecutor.RETRY_CONFIG;
     let lastError: Error | undefined;
 
-    // Retry loop
+    // V11: Shared retry context — accumulated state across attempts
+    const retryCtx: RetryContext = {
+      attempt: 0,
+      stageDeterministicFail: { compiled: false, embeddings: false, smart: false, selfHeal: false },
+      healAttempts: 0,
+      lastDomCollectionTs: 0,
+      cachedDomNodes: null,
+      totalCandidatesEver: 0,
+    };
+
+    // Graduated retry loop
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      retryCtx.attempt = attempt;
+
       if (attempt > 0) {
+        // V11: FAIL-FAST — if zero candidates ever found and all stages failed deterministically, skip retries
+        if (retryCtx.totalCandidatesEver === 0 && this.allStagesDeterministicFail(retryCtx)) {
+          logger.info('[COMMAND_EXECUTOR] Fail-fast: all stages returned 0 candidates deterministically', {
+            stepId: command.intentMeta?.stepId,
+            attempt,
+          });
+          break; // Fall through to throw
+        }
+
         // Wait before retry with exponential backoff
         const delay = retryDelayMs * Math.pow(retryBackoffMultiplier, attempt - 1);
-        logger.info('[COMMAND_EXECUTOR] Retrying element resolution', {
+        logger.info('[COMMAND_EXECUTOR] Retrying element resolution (graduated)', {
           attempt: attempt + 1,
           maxRetries: maxRetries + 1,
           delayMs: Math.round(delay),
+          skippedStages: Object.entries(retryCtx.stageDeterministicFail)
+            .filter(([, v]) => v).map(([k]) => k),
         });
         await this.page.waitForTimeout(delay);
       }
 
       try {
-        return await this.tryGetLocatorForIntentCommand(command, actionType, timeout);
+        return await this.tryGetLocatorForIntentCommand(command, actionType, timeout, retryCtx);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
         logger.warn('[COMMAND_EXECUTOR] Element resolution attempt failed', {
           attempt: attempt + 1,
           error: lastError.message,
+          totalCandidatesEver: retryCtx.totalCandidatesEver,
         });
       }
     }
@@ -2439,11 +2496,13 @@ export class CommandExecutor {
 
   /**
    * Single attempt to get locator for intent command (called by retry wrapper)
+   * V11: Accepts RetryContext for graduated strategy — shares state across retries.
    */
   private async tryGetLocatorForIntentCommand(
     command: IntentPlaywrightCommand,
     actionType: string,
-    timeout: number
+    timeout: number,
+    retryCtx: RetryContext
   ): Promise<{
     locator: Locator;
     runtimeMeta: StepRuntimeMeta;
@@ -2453,11 +2512,15 @@ export class CommandExecutor {
     const stepId = intentMeta?.stepId || 'unknown';
     const iframeSelector = intentMeta?.iframeSelector;
 
-    // Track healing attempts for this step
-    let healAttempts = 0;
+    // V11: If no compiled plan exists, pre-mark compiled as deterministic fail so
+    // allStagesDeterministicFail() can return true for intent-only steps (no compiled plan).
+    // Without this, fail-fast is silently disabled for all intent-only steps.
+    if (!intentMeta?.compiled || this.skipCompiledPlan) {
+      retryCtx.stageDeterministicFail.compiled = true;
+    }
 
-    // 1. Try compiled locator plan first (skip on retry — already failed on previous attempt)
-    if (intentMeta?.compiled && !this.skipCompiledPlan) {
+    // 1. Try compiled locator plan first (skip if deterministic fail on previous attempt)
+    if (intentMeta?.compiled && !this.skipCompiledPlan && !retryCtx.stageDeterministicFail.compiled) {
       const compiledContext = iframeSelector
         ? await this.getFrameFromIframeSelector(iframeSelector, Math.min(timeout, 10000))
         : this.page;
@@ -2494,6 +2557,9 @@ export class CommandExecutor {
       // (even when subsequent healing succeeds, the compiled failure is useful for debugging)
       const compiledFailureMeta = buildRuntimeMeta(compiledResult, Date.now() - startTime);
       this.stepRuntimeMeta.set(stepId, compiledFailureMeta);
+
+      // V11: Mark compiled as deterministic failure (don't retry on next attempt)
+      retryCtx.stageDeterministicFail.compiled = true;
     }
 
     // 2. Try embeddings-based resolution (intent-aware, accurate)
@@ -2506,9 +2572,20 @@ export class CommandExecutor {
           actionType: intentMeta.actionType,
         });
 
-        // Collect fresh interactive nodes from current page
+        // V11: Reuse cached DOM nodes if collected recently (< 1.5s), or force fresh on attempt >= 2
         const { collectInteractiveNodes } = await import('./background-dom-collector');
-        const domNodes = await collectInteractiveNodes(this.page);
+        const shouldCollectFresh = retryCtx.attempt >= 2 ||
+          !retryCtx.cachedDomNodes ||
+          (Date.now() - retryCtx.lastDomCollectionTs > 1500);
+
+        const domNodes = shouldCollectFresh
+          ? await collectInteractiveNodes(this.page)
+          : retryCtx.cachedDomNodes!;
+
+        if (shouldCollectFresh) {
+          retryCtx.cachedDomNodes = domNodes;
+          retryCtx.lastDomCollectionTs = Date.now();
+        }
 
         if (domNodes.length === 0) {
           logger.warn('[COMMAND_EXECUTOR] No interactive nodes collected', { stepId });
@@ -2593,6 +2670,13 @@ export class CommandExecutor {
             }
           }
 
+          // V11: Track candidate count for fail-fast heuristic
+          if (resolveResult.candidates.length > 0) {
+            retryCtx.totalCandidatesEver += resolveResult.candidates.length;
+          } else {
+            retryCtx.stageDeterministicFail.embeddings = true;
+          }
+
           logger.info('[COMMAND_EXECUTOR] Embeddings resolution unsuccessful', {
             stepId,
             status: resolveResult.status,
@@ -2605,11 +2689,13 @@ export class CommandExecutor {
           stepId,
           error: embeddingsError instanceof Error ? embeddingsError.message : String(embeddingsError),
         });
+        // Transient error (network, timeout) — do NOT mark as deterministic fail
       }
     }
 
     // 3. Try smart locator from selector (legacy fallback)
-    if (command.selector) {
+    // V11: Skip on retry if it failed deterministically on previous attempt
+    if (command.selector && !(retryCtx.attempt >= 1 && retryCtx.stageDeterministicFail.smart)) {
       try {
         const smartResult = await getSmartLocator(
           this.page,
@@ -2646,18 +2732,35 @@ export class CommandExecutor {
           });
 
           return { locator: finalLocator, runtimeMeta };
+        } else {
+          // V11: No locator returned — deterministic fail
+          retryCtx.stageDeterministicFail.smart = true;
         }
       } catch (smartError) {
+        const smartErrMsg = smartError instanceof Error ? smartError.message : String(smartError);
         logger.warn('[COMMAND_EXECUTOR] Smart locator failed', {
           stepId,
-          error: smartError instanceof Error ? smartError.message : String(smartError),
+          error: smartErrMsg,
         });
+        // V11: Only mark smart as deterministic fail if it's a "not found" condition,
+        // NOT for transient errors (Playwright timeouts, detached frame, etc.).
+        // Transient errors may resolve on the next retry with fresh DOM.
+        const isTransientSmartError =
+          smartErrMsg.includes('Timeout') ||
+          smartErrMsg.includes('timeout') ||
+          smartErrMsg.includes('Target closed') ||
+          smartErrMsg.includes('detached') ||
+          smartErrMsg.includes('navigating');
+        if (!isTransientSmartError) {
+          retryCtx.stageDeterministicFail.smart = true;
+        }
       }
     }
 
     // 3. Try self-healing (if enabled and not exceeded max attempts)
-    if (this.selfHealingEnabled && healAttempts < this.maxHealAttempts) {
-      healAttempts++;
+    // V11: Uses shared healAttempts from RetryContext (persists across retries)
+    if (this.selfHealingEnabled && retryCtx.healAttempts < this.maxHealAttempts) {
+      retryCtx.healAttempts++;
 
       // Deduct 1 credit for self-heal retry
       if (this.metadata.userId) {
@@ -2829,13 +2932,32 @@ export class CommandExecutor {
               flaky: true,
             };
             this.stepRuntimeMeta.set(stepId, blockedMeta);
+            // V11: Blocked heal = deterministic fail (same element, same low confidence on retry)
+            retryCtx.stageDeterministicFail.selfHeal = true;
           }
         }
       } catch (healError) {
+        const healErrMsg = healError instanceof Error ? healError.message : String(healError);
         logger.warn('[COMMAND_EXECUTOR] Self-healing failed', {
           stepId,
-          error: healError instanceof Error ? healError.message : String(healError),
+          error: healErrMsg,
         });
+        // V11: Only mark self-heal as deterministic fail if it's NOT a transient AI/network error.
+        // Transient errors (API rate limits, network timeouts) may resolve on retry.
+        const isTransientHealError =
+          healErrMsg.includes('rate limit') ||
+          healErrMsg.includes('Rate limit') ||
+          healErrMsg.includes('ECONNRESET') ||
+          healErrMsg.includes('ETIMEDOUT') ||
+          healErrMsg.includes('fetch failed') ||
+          healErrMsg.includes('network') ||
+          healErrMsg.includes('timeout') ||
+          healErrMsg.includes('Timeout') ||
+          healErrMsg.includes('overloaded') ||
+          healErrMsg.includes('503');
+        if (!isTransientHealError) {
+          retryCtx.stageDeterministicFail.selfHeal = true;
+        }
       }
     }
 

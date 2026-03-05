@@ -5,6 +5,8 @@
  * to ensure tests complete within reasonable time and cost constraints.
  */
 
+import { AI_MODELS } from '@/config/ai/ai-models.config';
+
 export const INTELLIGENT_TEST_LIMITS = {
   /**
    * Maximum execution time for a single intelligent test run
@@ -159,8 +161,8 @@ export const LITE_ENGINE_FLAGS = {
   // ═══════════════════════════════════════════════════════════════════════════
   // CORE BRAIN MODEL CONFIGURATION
   // ═══════════════════════════════════════════════════════════════════════════
-  /** Model to use for core brain decision making (upgraded from gpt-4o-mini) */
-  coreBrainModel: 'gpt-4o' as const,
+  /** Model to use for core brain decision making */
+  coreBrainModel: AI_MODELS.smart,
 
   /** Maximum tokens for core brain responses */
   coreBrainMaxTokens: 800,
@@ -279,7 +281,7 @@ export const LITE_ENGINE_FLAGS = {
   supervisorForbiddenActionWindow: 3,
   /** Max element signatures in state hash */
   supervisorStateHashElementCount: 20,
-  /** Enable Tier 2 AI diagnosis (gpt-4o-mini) when Tier 1 exhausted */
+  /** Enable Tier 2 AI diagnosis (gemini-2.5-flash-lite) when Tier 1 exhausted */
   enableSupervisorTier2: true,
   /** Timeout for Tier 2 AI call (ms) */
   supervisorTier2TimeoutMs: 3000,

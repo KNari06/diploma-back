@@ -2,7 +2,7 @@
  * Test Recommendation Service
  * Provides AI-powered test recommendations based on project coverage,
  * recent failures, and test history.
- * Uses LLM classification (gpt-4o-mini) to suggest what to test next.
+ * Uses LLM classification (gemini-2.5-flash-lite) to suggest what to test next.
  */
 
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';

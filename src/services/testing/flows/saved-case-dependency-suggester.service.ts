@@ -1,7 +1,7 @@
 /**
  * Intent Case Dependency Suggester Service
  * Generates AI-powered dependency suggestions for intent_test_cases across a project.
- * Uses LLM classification (gpt-4o-mini) + URL continuity boost.
+ * Uses LLM classification (gemini-2.5-flash-lite) + URL continuity boost.
  *
  * NOTE: Service class name kept as SavedCaseDependencySuggester for API compatibility.
  * Now operates on intent_test_cases (unified table) instead of saved_test_cases.

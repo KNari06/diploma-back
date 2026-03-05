@@ -109,7 +109,7 @@ export class CriticAgent {
     const prompt = CriticAgent.buildRedTeamPrompt(input);
 
     const aiResult = await LitePromptBuilder.askJson<AICriticResponse>(prompt, {
-      model: LITE_ENGINE_FLAGS.coreBrainModel as 'gpt-4o' | 'gpt-4o-mini',
+      model: LITE_ENGINE_FLAGS.coreBrainModel as string,
       temperature: 0.0,
       maxTokens: LITE_ENGINE_FLAGS.criticMaxTokens,
       timeoutMs: LITE_ENGINE_FLAGS.multiAgentCriticTimeoutMs,

@@ -19,7 +19,7 @@ import { UserCreditsService } from './user-credits.service';
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
-  model: 'gpt-4o' | 'gpt-4o-mini';
+  model: string;
 }
 
 export interface CreditDeduction {
@@ -62,7 +62,7 @@ export class CreditCostTrackerService {
    * @returns Credits to charge
    */
   static trackAICall(
-    model: 'gpt-4o' | 'gpt-4o-mini',
+    model: string,
     inputTokens: number,
     outputTokens: number
   ): {
@@ -118,7 +118,7 @@ export class CreditCostTrackerService {
     const credits = TokenCalculatorService.tokensToCredits(totalTokens);
 
     // Cost: 700 input + 200 output
-    const costPerScreenshot = TokenCalculatorService.calculateCostFromTokens(700, 200, 'gpt-4o');
+    const costPerScreenshot = TokenCalculatorService.calculateCostFromTokens(700, 200, 'gpt-4.1');
     const costUSD = costPerScreenshot * count;
 
     logger.info('[CREDIT_COST_TRACKER] Screenshot analysis', {
@@ -185,7 +185,7 @@ export class CreditCostTrackerService {
             const cost = TokenCalculatorService.calculateCostFromTokens(
               call.inputTokens,
               call.outputTokens,
-              call.model || 'gpt-4o-mini'
+              call.model || 'gemini-2.5-flash-lite'
             );
             totalCost += cost;
           }

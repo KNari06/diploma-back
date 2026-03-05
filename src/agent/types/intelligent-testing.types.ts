@@ -137,6 +137,10 @@ export interface ErrorSignals {
     method: string;
     error: string;
     timestamp: number;
+    /** V11: Response body for 4xx errors on mutating requests (same-origin, JSON only) */
+    responseBody?: any;
+    /** V11: Parsed field-level validation errors from response body */
+    fieldErrors?: Array<{ field: string; message: string }>;
   }>;
   uiErrors: Array<{
     text: string;

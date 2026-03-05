@@ -535,7 +535,7 @@ export class ContextualActionGenerator {
    *
    * Uses AI to analyze the test progress, visited pages, errors, and current
    * page context to determine whether to continue, stop, wait, retry, or skip.
-   * Uses cheaper model (gpt-4o-mini) for cost efficiency.
+   * Uses cheaper model (gemini-2.5-flash-lite) for cost efficiency.
    *
    * @param state - Current test state with history and progress
    * @param context - Current page context
