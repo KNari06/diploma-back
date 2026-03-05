@@ -766,6 +766,10 @@ export interface RunReportStep {
     message: string;
     failedReason?: string;
     screenshot?: string;
+    /** V11: Root cause classification ('backend' | 'ui' | 'logic') */
+    rootCause?: string;
+    /** V11: Network verdict ('validation_failure' | 'backend_error' | 'expected_error' | 'clean' | 'warning') */
+    networkVerdict?: string;
   };
 }
 
