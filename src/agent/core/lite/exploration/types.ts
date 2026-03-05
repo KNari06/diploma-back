@@ -37,6 +37,19 @@ export type ExplorationProgressEvent = {
 /** Callback for exploration progress reporting */
 export type ExplorationProgressCallback = (event: ExplorationProgressEvent) => void;
 
+export interface RateLimitingConfig {
+  /** Min delay between Playwright navigations (ms). Default: 500 */
+  minDelayBetweenNavigationsMs?: number;
+  /** Min delay between AI API calls (ms). Default: 200 */
+  minDelayBetweenAiCallsMs?: number;
+  /** Max consecutive rate limits per target before degradation. Default: 3 */
+  maxConsecutiveRateLimits?: number;
+  /** Base backoff delay (ms). Default: 5000 */
+  baseBackoffMs?: number;
+  /** Max backoff delay (ms). Default: 30000 */
+  maxBackoffMs?: number;
+}
+
 export interface ExplorationConfig {
   /** Entry URL to start exploring */
   entryUrl: string;
@@ -65,6 +78,8 @@ export interface ExplorationConfig {
   workspaceId?: string;
   /** Optional callback for real-time progress reporting */
   onProgress?: ExplorationProgressCallback;
+  /** Rate limiting configuration for external requests */
+  rateLimiting?: RateLimitingConfig;
 }
 
 export interface ExplorationBudget {

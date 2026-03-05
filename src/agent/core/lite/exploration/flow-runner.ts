@@ -41,6 +41,7 @@ import type {
 import { FlowQueue } from './flow-queue';
 import { BudgetTracker } from './budget-tracker';
 import { StateManager } from './state-manager';
+import { RateLimiter } from './rate-limiter';
 import {
   buildBranchDetectionPrompt,
   parseBranchDetectionResponse,
@@ -86,6 +87,7 @@ export class FlowRunner {
     private readonly config: ExplorationConfig,
     private readonly budget: BudgetTracker,
     private readonly onProgress?: ExplorationProgressCallback,
+    private readonly rateLimiter?: RateLimiter,
   ) {
     this.stateManager = new StateManager(browser);
   }
@@ -297,10 +299,34 @@ export class FlowRunner {
 
       // 2. Navigate to the entry point's source page
       const targetUrl = entryPoint.sourcePageUrl || this.config.entryUrl;
-      await page.goto(targetUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15_000,
-      });
+      if (this.rateLimiter) {
+        const canNavigate = await this.rateLimiter.acquireSlot('navigation');
+        if (!canNavigate) {
+          throw new Error(`Target site degraded, cannot navigate to ${targetUrl}`);
+        }
+      }
+      try {
+        await page.goto(targetUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 15_000,
+        });
+        this.rateLimiter?.recordSuccess('target_site');
+      } catch (navError) {
+        if (this.rateLimiter && RateLimiter.isRateLimitError(navError as Error)) {
+          const result = await this.rateLimiter.recordFailure('target_site', navError as Error);
+          if (result.shouldRetry) {
+            await page.goto(targetUrl, {
+              waitUntil: 'domcontentloaded',
+              timeout: 15_000,
+            });
+            this.rateLimiter.recordSuccess('target_site');
+          } else {
+            throw new Error(`Rate limited navigating to ${targetUrl}`);
+          }
+        } else {
+          throw navError;
+        }
+      }
 
       // 3. Create pipeline integrations
       const actionExecutor = new ActionExecutor(page);
@@ -431,10 +457,34 @@ export class FlowRunner {
     const page = await context.newPage();
 
     try {
-      await page.goto(this.config.entryUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15_000,
-      });
+      if (this.rateLimiter) {
+        const canNavigate = await this.rateLimiter.acquireSlot('navigation');
+        if (!canNavigate) {
+          throw new Error(`Target site degraded, cannot navigate to ${this.config.entryUrl}`);
+        }
+      }
+      try {
+        await page.goto(this.config.entryUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 15_000,
+        });
+        this.rateLimiter?.recordSuccess('target_site');
+      } catch (navError) {
+        if (this.rateLimiter && RateLimiter.isRateLimitError(navError as Error)) {
+          const result = await this.rateLimiter.recordFailure('target_site', navError as Error);
+          if (result.shouldRetry) {
+            await page.goto(this.config.entryUrl, {
+              waitUntil: 'domcontentloaded',
+              timeout: 15_000,
+            });
+            this.rateLimiter.recordSuccess('target_site');
+          } else {
+            throw new Error(`Rate limited navigating to ${this.config.entryUrl}`);
+          }
+        } else {
+          throw navError;
+        }
+      }
 
       const actionExecutor = new ActionExecutor(page);
       const networkTracker = new NetworkTracker(page);
@@ -783,6 +833,11 @@ export class FlowRunner {
     completedEntry: EntryPoint,
     existingFlowNames: string[] = [],
   ): Promise<EntryPoint[]> {
+    // Skip if OpenAI is degraded — branch detection is optional enrichment
+    if (this.rateLimiter?.isDegraded('openai')) {
+      return [];
+    }
+
     try {
       const snapshot = await SnapshotCollector.collect(page);
       const formattedSnapshot = SnapshotCollector.format(snapshot);
@@ -794,6 +849,8 @@ export class FlowRunner {
         completedFlowGoal: completedEntry.goal,
         existingFlowNames,
       });
+
+      if (this.rateLimiter) await this.rateLimiter.acquireSlot('ai');
 
       const response = await Promise.race([
         getChatCompletionWithMessages(
@@ -816,6 +873,7 @@ export class FlowRunner {
         ),
       ]);
 
+      this.rateLimiter?.recordSuccess('openai');
       const branches = parseBranchDetectionResponse(response.content);
 
       return branches.map((bp, index) => ({
@@ -825,6 +883,10 @@ export class FlowRunner {
         sourcePageUrl: page.url(),
       }));
     } catch (error) {
+      if (this.rateLimiter && RateLimiter.isRateLimitError(error as Error)) {
+        await this.rateLimiter.recordFailure('openai', error as Error);
+        // No retry — branch detection is optional enrichment
+      }
       logger.warn('[FLOW_RUNNER] Branch detection failed — discovery quality degraded', {
         flow: completedEntry.name,
         error: error instanceof Error ? error.message : String(error),

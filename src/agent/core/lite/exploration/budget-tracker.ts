@@ -17,6 +17,7 @@ export class BudgetTracker {
   private pipelineRoundsUsed: number = 0;
   private pagesSurveyed: number = 0;
   private mutexPromise: Promise<void> = Promise.resolve();
+  private degradedTargets: Set<string> = new Set();
 
   constructor(private readonly budget: ExplorationBudget) {
     this.startTime = Date.now();
@@ -97,6 +98,16 @@ export class BudgetTracker {
     await this.withMutex(() => {
       this.pagesSurveyed++;
     });
+  }
+
+  async markDegraded(target: string): Promise<void> {
+    await this.withMutex(() => {
+      this.degradedTargets.add(target);
+    });
+  }
+
+  isTargetDegraded(target: string): boolean {
+    return this.degradedTargets.has(target);
   }
 
   // ═══════════════════════════════════════════════════════════════════════

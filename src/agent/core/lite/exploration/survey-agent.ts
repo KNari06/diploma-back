@@ -27,6 +27,7 @@ import type { LiteSnapshot } from '../lite-types';
 import type { ExplorationConfig, EntryPoint, NavigationAction, TestFlowCategory, FlowPriority } from './types';
 import { ExplorationTree } from './exploration-tree';
 import { BudgetTracker } from './budget-tracker';
+import { RateLimiter } from './rate-limiter';
 import {
   buildPageClassificationPrompt,
   parsePageClassificationResponse,
@@ -58,6 +59,7 @@ export class SurveyAgent {
     private readonly page: Page,
     private readonly config: ExplorationConfig,
     private readonly budget: BudgetTracker,
+    private readonly rateLimiter: RateLimiter,
   ) {
     this.tree = new ExplorationTree();
   }
@@ -78,16 +80,48 @@ export class SurveyAgent {
 
     // Navigate to entry URL
     try {
+      const canNavigate = await this.rateLimiter.acquireSlot('navigation');
+      if (!canNavigate) {
+        logger.error('[SURVEY] Target site degraded, cannot navigate to entry URL', {
+          url: this.config.entryUrl,
+        });
+        return this.tree;
+      }
       await this.page.goto(this.config.entryUrl, {
         waitUntil: 'domcontentloaded',
         timeout: NAV_TIMEOUT_MS,
       });
+      this.rateLimiter.recordSuccess('target_site');
     } catch (error) {
-      logger.error('[SURVEY] Failed to navigate to entry URL', {
-        url: this.config.entryUrl,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return this.tree;
+      if (RateLimiter.isRateLimitError(error as Error)) {
+        const result = await this.rateLimiter.recordFailure('target_site', error as Error);
+        if (result.shouldRetry) {
+          try {
+            await this.page.goto(this.config.entryUrl, {
+              waitUntil: 'domcontentloaded',
+              timeout: NAV_TIMEOUT_MS,
+            });
+            this.rateLimiter.recordSuccess('target_site');
+          } catch {
+            logger.error('[SURVEY] Failed to navigate to entry URL after retry', {
+              url: this.config.entryUrl,
+            });
+            return this.tree;
+          }
+        } else {
+          logger.error('[SURVEY] Entry URL rate limited, skipping', {
+            url: this.config.entryUrl,
+            degraded: result.isDegraded,
+          });
+          return this.tree;
+        }
+      } else {
+        logger.error('[SURVEY] Failed to navigate to entry URL', {
+          url: this.config.entryUrl,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return this.tree;
+      }
     }
 
     // Check if we got redirected to a login page
@@ -147,30 +181,64 @@ export class SurveyAgent {
       // Navigate to the page (unless we're already there)
       if (this.page.url() !== item.url) {
         try {
+          const canNavigate = await this.rateLimiter.acquireSlot('navigation');
+          if (!canNavigate) {
+            logger.warn('[SURVEY] Target site degraded, skipping page', { url: item.url });
+            await this.budget.recordPageSurvey();
+            continue;
+          }
           await this.page.goto(item.url, {
             waitUntil: 'domcontentloaded',
             timeout: NAV_TIMEOUT_MS,
           });
+          this.rateLimiter.recordSuccess('target_site');
         } catch (error) {
-          logger.warn('[SURVEY] Failed to navigate', {
-            url: item.url,
-            error: error instanceof Error ? error.message : String(error),
-          });
+          if (RateLimiter.isRateLimitError(error as Error)) {
+            const result = await this.rateLimiter.recordFailure('target_site', error as Error);
+            if (result.shouldRetry) {
+              try {
+                await this.page.goto(item.url, {
+                  waitUntil: 'domcontentloaded',
+                  timeout: NAV_TIMEOUT_MS,
+                });
+                this.rateLimiter.recordSuccess('target_site');
+              } catch (retryError) {
+                logger.warn('[SURVEY] Failed to navigate after retry', {
+                  url: item.url,
+                  error: retryError instanceof Error ? retryError.message : String(retryError),
+                });
+                await this.budget.recordPageSurvey();
+                continue;
+              }
+            } else {
+              logger.warn('[SURVEY] Navigation rate limited, skipping page', {
+                url: item.url,
+                degraded: result.isDegraded,
+              });
+              await this.budget.recordPageSurvey();
+              continue;
+            }
+          } else {
+            logger.warn('[SURVEY] Failed to navigate', {
+              url: item.url,
+              error: error instanceof Error ? error.message : String(error),
+            });
 
-          // Add error node
-          this.tree.addNode({
-            url: item.url,
-            title: 'Navigation Error',
-            pageType: 'error',
-            snapshot: { url: item.url, title: '', elements: [], timestamp: Date.now() },
-            entryPoints: [],
-            depth: item.depth,
-            requiresAuth: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
+            // Add error node
+            this.tree.addNode({
+              url: item.url,
+              title: 'Navigation Error',
+              pageType: 'error',
+              snapshot: { url: item.url, title: '', elements: [], timestamp: Date.now() },
+              entryPoints: [],
+              depth: item.depth,
+              requiresAuth: false,
+              error: error instanceof Error ? error.message : String(error),
+            });
 
-          await this.budget.recordPageSurvey();
-          continue;
+            await this.budget.recordPageSurvey();
+            continue;
+          }
         }
       }
 
@@ -315,6 +383,16 @@ export class SurveyAgent {
     depth: number,
     snapshot?: LiteSnapshot,
   ): Promise<ReturnType<typeof parsePageClassificationResponse>> {
+    // Early exit if AI is degraded — use heuristic fallback
+    if (this.rateLimiter.isDegraded('openai')) {
+      logger.info('[SURVEY] AI degraded, using heuristic fallback', { url });
+      return {
+        pageType: this.inferPageTypeFromUrl(url),
+        entryPoints: snapshot ? this.buildFallbackEntryPoints(snapshot, url) : [],
+        navigationLinks: [],
+      };
+    }
+
     const structureSummary = snapshot ? this.buildPageStructureSummary(snapshot) : undefined;
 
     const prompt = buildPageClassificationPrompt({
@@ -341,6 +419,8 @@ export class SurveyAgent {
         });
       }
 
+      await this.rateLimiter.acquireSlot('ai');
+
       const response = await Promise.race([
         getChatCompletionWithMessages(
           [
@@ -365,6 +445,7 @@ export class SurveyAgent {
         ),
       ]);
 
+      this.rateLimiter.recordSuccess('openai');
       const classification = parsePageClassificationResponse(response.content);
 
       // Fallback: if AI returned 0 entry points, use heuristic discovery
@@ -380,6 +461,43 @@ export class SurveyAgent {
 
       return classification;
     } catch (error) {
+      // Handle rate-limit errors with backoff + retry
+      if (RateLimiter.isRateLimitError(error as Error)) {
+        const result = await this.rateLimiter.recordFailure('openai', error as Error);
+        if (result.shouldRetry) {
+          try {
+            await this.rateLimiter.acquireSlot('ai');
+            const response = await Promise.race([
+              getChatCompletionWithMessages(
+                [
+                  {
+                    role: 'system',
+                    content: 'You are a QA test discovery agent. Analyze pages and identify all testable user flows. Respond with valid JSON only.',
+                  },
+                  {
+                    role: 'user',
+                    content: [{ type: 'text', text: prompt }],
+                  },
+                ],
+                {
+                  model: AI_MODELS.vision,
+                  temperature: 0.2,
+                  max_tokens: 2000,
+                  response_format: { type: 'json_object' },
+                },
+              ),
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error('AI classification timeout')), AI_TIMEOUT_MS),
+              ),
+            ]);
+            this.rateLimiter.recordSuccess('openai');
+            return parsePageClassificationResponse(response.content);
+          } catch {
+            // Fall through to heuristic fallback
+          }
+        }
+      }
+
       logger.warn('[SURVEY] AI classification failed, using heuristic fallback', {
         url,
         error: error instanceof Error ? error.message : String(error),

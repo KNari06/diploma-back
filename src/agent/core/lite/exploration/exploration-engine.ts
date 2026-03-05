@@ -36,6 +36,7 @@ import { logger } from '@/utils/core/logger';
 import type { ExplorationConfig, ExplorationResult, ExplorationProgressCallback } from './types';
 import { DEFAULT_EXPLORATION_BUDGET, DEFAULT_MAX_CONCURRENCY, DESKTOP_USER_AGENT } from './types';
 import { BudgetTracker } from './budget-tracker';
+import { RateLimiter } from './rate-limiter';
 import { SurveyAgent } from './survey-agent';
 import { FlowQueue } from './flow-queue';
 import { FlowRunner } from './flow-runner';
@@ -87,6 +88,7 @@ export class ExplorationEngine {
   async run(): Promise<ExplorationResult> {
     const startTime = Date.now();
     const budget = new BudgetTracker(this.config.budget);
+    const rateLimiter = new RateLimiter(this.config.rateLimiting, budget);
 
     logger.info('[EXPLORATION] Starting autonomous exploration', {
       explorationId: this.config.explorationId,
@@ -112,7 +114,7 @@ export class ExplorationEngine {
     let tree;
     try {
       const surveyPage = await surveyContext.newPage();
-      const surveyAgent = new SurveyAgent(surveyPage, this.config, budget);
+      const surveyAgent = new SurveyAgent(surveyPage, this.config, budget, rateLimiter);
       tree = await surveyAgent.survey();
       await surveyPage.close();
     } finally {
@@ -157,7 +159,7 @@ export class ExplorationEngine {
 
     logger.info('[EXPLORATION] Phase 2: Starting flow exploration');
 
-    const flowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress);
+    const flowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter);
     let flowTasks;
 
     try {
