@@ -81,8 +81,19 @@ export class GitWebhookJobHandler {
       return;
     }
 
-    // Check if a plan is linked to this integration
-    const planId = integration.plan_id as string | null;
+    // Use linked plan_id or try to auto-link by matching a plan's gitTriggers.repositoryUrl to this integration
+    let planId = integration.plan_id as string | null;
+    if (!planId) {
+      const linked = await tryAutoLinkPlanToIntegration(integration);
+      if (linked) {
+        planId = linked;
+        logger.info('[GIT_WEBHOOK_JOB] Auto-linked plan to integration', {
+          integrationId: integration.id,
+          planId: linked,
+          deliveryId,
+        });
+      }
+    }
     if (!planId) {
       logger.warn('[GIT_WEBHOOK_JOB] No plan linked to git integration, skipping', {
         integrationId: integration.id,
@@ -263,5 +274,54 @@ export class GitWebhookJobHandler {
       throw error;
     }
   }
+}
+
+/** Normalize repo URL for matching (trim, strip trailing slash and .git). */
+function normalizeRepoUrlForMatch(url: string): string {
+  const t = (url || '').trim().replace(/\/+$/, '');
+  return t.endsWith('.git') ? t.slice(0, -4) : t;
+}
+
+/**
+ * If integration has no plan_id, find a regression_plan in the same project with
+ * gitTriggers.repositoryUrl matching this integration's repository_url and link it.
+ * Returns plan_id if linked, null otherwise.
+ */
+async function tryAutoLinkPlanToIntegration(integration: {
+  id: string;
+  project_id: string;
+  repository_url: string;
+}): Promise<string | null> {
+  const targetUrl = normalizeRepoUrlForMatch(integration.repository_url);
+  if (!targetUrl) return null;
+
+  const { data: plans, error } = await supabaseAdmin
+    .from('regression_plans')
+    .select('id, automation_config')
+    .eq('project_id', integration.project_id);
+
+  if (error || !plans?.length) return null;
+
+  for (const plan of plans) {
+    const gt = (plan.automation_config as any)?.gitTriggers;
+    if (!gt?.enabled) continue;
+    const repoUrl = (gt.repositoryUrl || '').trim();
+    if (!repoUrl) continue;
+    if (normalizeRepoUrlForMatch(repoUrl) !== targetUrl) continue;
+
+    const { error: updateError } = await supabaseAdmin
+      .from('git_integrations')
+      .update({ plan_id: plan.id })
+      .eq('id', integration.id);
+
+    if (!updateError) return plan.id;
+    logger.warn('[GIT_WEBHOOK_JOB] Auto-link update failed', {
+      integrationId: integration.id,
+      planId: plan.id,
+      error: updateError.message,
+    });
+    return null;
+  }
+  return null;
 }
 

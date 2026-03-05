@@ -538,6 +538,8 @@ export interface PlanGitTriggersConfig {
   enabled: boolean;
   triggerTypes: GitTriggerType[];
   branch: string;
+  /** Git provider; when set, used for matching git_integrations (recommended with repositoryUrl). */
+  provider?: 'github' | 'gitlab';
   /** UUID of an existing git_integrations row (from GET /git-integrations). */
   integrationId?: string;
   /** Repository URL to find an existing git-integration by repo (e.g. https://github.com/owner/repo). */

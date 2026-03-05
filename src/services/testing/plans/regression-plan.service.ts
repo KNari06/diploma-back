@@ -1217,20 +1217,41 @@ export class RegressionPlanService {
           return;
         }
       } else if (gitConfig.repositoryUrl?.trim()) {
-        // Lookup existing integration by repo URL — no auto-creation
-        const existing = await GitIntegrationService.findByProjectAndRepositoryUrl(
+        const repositoryUrl = gitConfig.repositoryUrl.trim();
+        let existing = await GitIntegrationService.findByProjectAndRepositoryUrl(
           plan.projectId,
-          gitConfig.repositoryUrl.trim()
+          repositoryUrl
         );
         if (existing) {
           integration = { id: existing.id };
         } else {
-          logger.warn('[REGRESSION_PLAN_SERVICE] No git integration found for repositoryUrl — create one via POST /git-integrations first', {
-            planId: plan.id,
-            projectId: plan.projectId,
-            repositoryUrl: gitConfig.repositoryUrl,
-          });
-          return;
+          // Auto-create git_integrations row so webhooks find this plan (webhook_secret empty = no verification until user sets it)
+          try {
+            const provider = GitIntegrationService.detectProviderFromUrl(repositoryUrl);
+            const created = await GitIntegrationService.createIntegration({
+              projectId: plan.projectId,
+              userId: plan.userId,
+              provider,
+              repositoryUrl,
+              webhookSecret: '',
+              events: ['push', 'pull_request', 'release'],
+            });
+            integration = { id: created.id };
+            logger.info('[REGRESSION_PLAN_SERVICE] Auto-created git integration for plan', {
+              planId: plan.id,
+              integrationId: created.id,
+              repositoryUrl: created.repository_url,
+              provider: created.provider,
+            });
+          } catch (createError) {
+            logger.warn('[REGRESSION_PLAN_SERVICE] Could not auto-create git integration (e.g. access denied or duplicate)', {
+              planId: plan.id,
+              projectId: plan.projectId,
+              repositoryUrl,
+              error: createError instanceof Error ? createError.message : String(createError),
+            });
+            return;
+          }
         }
       } else {
         // Fallback: use first enabled integration for this project (backward compatible)
