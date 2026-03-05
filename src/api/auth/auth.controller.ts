@@ -1,4 +1,5 @@
 import { env, isDevelopment } from '@/config/environment/env';
+import { supabaseAdmin } from '@/db/supabase';
 import {
   exchangeCodeForSession,
   getCurrentUser,
@@ -279,6 +280,7 @@ export const completeOAuthHandler = async (req: Request, res: Response): Promise
           name: result.user.name,
           avatar: result.user.avatar,
           role: result.user.role,
+          status: result.user.status,
         },
       },
     });
@@ -532,6 +534,138 @@ export const updateProfile = async (req: Request, res: Response): Promise<void> 
       error: error.message || 'Failed to update profile',
       code: 'UPDATE_ERROR',
       timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+/**
+ * Get users pending approval
+ * GET /auth/users/pending
+ * Requires admin role
+ */
+export const getPendingUsers = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { data: users, error } = await supabaseAdmin
+      .from('users')
+      .select('id, email, name, role, status, created_at, updated_at')
+      .eq('status', 'pending_approval')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.error('[AUTH] Failed to fetch pending users', { error: error.message });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch pending users',
+      });
+      return;
+    }
+
+    // Enrich with workspace/onboarding data
+    const enrichedUsers = await Promise.all(
+      (users || []).map(async (user) => {
+        const { data: workspace } = await supabaseAdmin
+          .from('workspaces')
+          .select('id, name, settings, created_at')
+          .eq('user_id', user.id)
+          .order('created_at', { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        return {
+          ...user,
+          workspace: workspace
+            ? {
+                id: workspace.id,
+                name: workspace.name,
+                accountType: workspace.settings?.accountType,
+                companyName: workspace.settings?.companyName,
+                role: workspace.settings?.role,
+                baseUrls: workspace.settings?.baseUrls,
+                onboarding_completed: workspace.settings?.onboarding_completed,
+              }
+            : null,
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      data: enrichedUsers,
+      count: enrichedUsers.length,
+    });
+  } catch (error: any) {
+    logger.error('[AUTH] Get pending users error', { error: error.message });
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch pending users',
+    });
+  }
+};
+
+/**
+ * Update user approval status
+ * PATCH /auth/users/:userId/status
+ * Requires admin role
+ */
+export const updateUserStatus = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { userId } = req.params;
+    const { status } = req.body;
+
+    const validStatuses = ['pending_approval', 'approved', 'rejected'];
+    if (!status || !validStatuses.includes(status)) {
+      res.status(400).json({
+        success: false,
+        error: `Invalid status. Must be one of: ${validStatuses.join(', ')}`,
+      });
+      return;
+    }
+
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!userId || !uuidRegex.test(userId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid user ID format',
+      });
+      return;
+    }
+
+    const { data: updatedUser, error } = await supabaseAdmin
+      .from('users')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('id', userId)
+      .select('id, email, name, role, status, created_at, updated_at')
+      .single();
+
+    if (error) {
+      logger.error('[AUTH] Failed to update user status', {
+        userId,
+        status,
+        error: error.message,
+      });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to update user status',
+      });
+      return;
+    }
+
+    logger.info('[AUTH] User status updated', {
+      userId,
+      newStatus: status,
+      updatedBy: req.user?.id,
+    });
+
+    res.json({
+      success: true,
+      data: updatedUser,
+      message: `User status updated to ${status}`,
+    });
+  } catch (error: any) {
+    logger.error('[AUTH] Update user status error', { error: error.message });
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to update user status',
     });
   }
 };

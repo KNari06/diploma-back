@@ -36,6 +36,7 @@ import waitlistRoutes from '@/api/waitlist/waitlist.route';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
 import invitesRoutes from '@/api/workspace/invites.routes';
 import testCaseRoutes from '@/api/test-case/test-case.routes';
+import { requireAuth, requireApproved } from '@/middleware/auth.middleware';
 import { swaggerSpec } from '@/config/api/swagger';
 import { env, isDevelopment } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
@@ -1241,46 +1242,48 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
   }
 });
 
-// API routes
-app.use(`/api/${env.API_VERSION}/analytics`, analyticsRoutes); // ✅ NEW: Workspace analytics
+// API routes — no approval required (auth, onboarding, billing, waitlist)
 app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
-app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes);
+app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes); // Contains onboarding endpoints
 app.use(`/api/${env.API_VERSION}/invites`, invitesRoutes); // Workspace invites accept endpoint
-app.use(`/api/${env.API_VERSION}/projects`, projectRoutes);
-app.use(`/api/${env.API_VERSION}/manual-test`, manualTestRoutes);
-app.use(`/api/${env.API_VERSION}/intelligent-test`, intelligentTestRoutes);
-app.use(`/api/${env.API_VERSION}/test-case`, testCaseRoutes); // ✅ NEW: Structured test case execution
-app.use(`/api/${env.API_VERSION}/chat`, chatRoutes);
-app.use(`/api/${env.API_VERSION}/chat/feedback`, feedbackRoutes);
-app.use(`/api/${env.API_VERSION}/api-test`, apiTestRoutes);
-app.use(`/api/${env.API_VERSION}/api-config`, apiConfigRoutes);
-app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
-app.use(`/api/${env.API_VERSION}/kb/skills`, skillsRoutes);
-app.use(`/api/${env.API_VERSION}/kb/patterns`, patternsRoutes);
-app.use(`/api/${env.API_VERSION}/kb`, kbRoutes);
-app.use(`/api/${env.API_VERSION}/kb`, rulesReloadRoutes);
-app.use(`/api/${env.API_VERSION}/playwright`, playwrightRoutes);
-app.use(`/api/${env.API_VERSION}/reports`, reportsRoutes); // ✅ NEW: Test reports & Jira integration
-app.use(`/api/${env.API_VERSION}/test-visualization`, testVisualizationRoutes);
-app.use(`/api/${env.API_VERSION}/regression`, regressionRoutes); // ✅ NEW: Regression testing
-app.use(`/api/${env.API_VERSION}/platforms`, platformsRoutes); // Test platforms (web_ui/api)
-app.use(`/api/${env.API_VERSION}/modules`, modulesRoutes); // Test modules
-app.use(`/api/${env.API_VERSION}/flows`, flowsRoutes); // Test flows
-app.use(`/api/${env.API_VERSION}/schedules`, schedulesRoutes); // Test schedules
-app.use(`/api/${env.API_VERSION}/fixtures`, fixturesRoutes); // Test fixtures
-app.use(`/api/${env.API_VERSION}/regression-plans`, regressionPlansRoutes); // Regression plans
-app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes); // ✅ NEW: Git integrations (CRUD)
-app.use(`/api/${env.API_VERSION}/integrations`, integrationsRoutes); // ✅ NEW: Unified OAuth integrations (Jira, GitHub, Notion, etc.)
-app.use(`/api/${env.API_VERSION}/user`, userRoutes);
 app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
-app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications
-app.use(`/api/${env.API_VERSION}/queue`, queueStatusRoutes); // Queue monitoring
-app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // ✅ NEW: User issue reports
 app.use(`/api/${env.API_VERSION}/billing`, stripeRoutes); // Stripe billing endpoints
 app.use(`/api/${env.API_VERSION}/stripe`, stripeRoutes); // Stripe webhook endpoint
-app.use(`/api/${env.API_VERSION}/preview`, previewRoutes); // ✅ NEW: Step editor preview
-app.use(`/api/${env.API_VERSION}/saved-test-cases`, savedTestCasesRoutes); // Saved test cases with AI dependency suggestions
-app.use(`/api/${env.API_VERSION}/tests`, testsRoutes); // Unified test listing (Runs/Debug page)
+app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications (needed for pending users)
+app.use(`/api/${env.API_VERSION}/user`, userRoutes); // User profile (needed for pending users)
+app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // User issue reports
+
+// API routes — require approved account status (requireAuth sets req.user, requireApproved checks status)
+app.use(`/api/${env.API_VERSION}/analytics`, requireAuth, requireApproved, analyticsRoutes);
+app.use(`/api/${env.API_VERSION}/projects`, requireAuth, requireApproved, projectRoutes);
+app.use(`/api/${env.API_VERSION}/manual-test`, requireAuth, requireApproved, manualTestRoutes);
+app.use(`/api/${env.API_VERSION}/intelligent-test`, requireAuth, requireApproved, intelligentTestRoutes);
+app.use(`/api/${env.API_VERSION}/test-case`, requireAuth, requireApproved, testCaseRoutes);
+app.use(`/api/${env.API_VERSION}/chat`, requireAuth, requireApproved, chatRoutes);
+app.use(`/api/${env.API_VERSION}/chat/feedback`, requireAuth, requireApproved, feedbackRoutes);
+app.use(`/api/${env.API_VERSION}/api-test`, requireAuth, requireApproved, apiTestRoutes);
+app.use(`/api/${env.API_VERSION}/api-config`, requireAuth, requireApproved, apiConfigRoutes);
+app.use(`/api/${env.API_VERSION}/jira`, requireAuth, requireApproved, jiraRoutes);
+app.use(`/api/${env.API_VERSION}/kb/skills`, requireAuth, requireApproved, skillsRoutes);
+app.use(`/api/${env.API_VERSION}/kb/patterns`, requireAuth, requireApproved, patternsRoutes);
+app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, kbRoutes);
+app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, rulesReloadRoutes);
+app.use(`/api/${env.API_VERSION}/playwright`, requireAuth, requireApproved, playwrightRoutes);
+app.use(`/api/${env.API_VERSION}/reports`, requireAuth, requireApproved, reportsRoutes);
+app.use(`/api/${env.API_VERSION}/test-visualization`, requireAuth, requireApproved, testVisualizationRoutes);
+app.use(`/api/${env.API_VERSION}/regression`, requireAuth, requireApproved, regressionRoutes);
+app.use(`/api/${env.API_VERSION}/platforms`, requireAuth, requireApproved, platformsRoutes);
+app.use(`/api/${env.API_VERSION}/modules`, requireAuth, requireApproved, modulesRoutes);
+app.use(`/api/${env.API_VERSION}/flows`, requireAuth, requireApproved, flowsRoutes);
+app.use(`/api/${env.API_VERSION}/schedules`, requireAuth, requireApproved, schedulesRoutes);
+app.use(`/api/${env.API_VERSION}/fixtures`, requireAuth, requireApproved, fixturesRoutes);
+app.use(`/api/${env.API_VERSION}/regression-plans`, requireAuth, requireApproved, regressionPlansRoutes);
+app.use(`/api/${env.API_VERSION}/git-integrations`, requireAuth, requireApproved, gitIntegrationRoutes);
+app.use(`/api/${env.API_VERSION}/integrations`, requireAuth, requireApproved, integrationsRoutes);
+app.use(`/api/${env.API_VERSION}/queue`, requireAuth, requireApproved, queueStatusRoutes);
+app.use(`/api/${env.API_VERSION}/preview`, requireAuth, requireApproved, previewRoutes);
+app.use(`/api/${env.API_VERSION}/saved-test-cases`, requireAuth, requireApproved, savedTestCasesRoutes);
+app.use(`/api/${env.API_VERSION}/tests`, requireAuth, requireApproved, testsRoutes);
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
