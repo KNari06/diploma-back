@@ -1,3 +1,4 @@
+import os from 'os';
 import { Queue, Worker } from 'bullmq';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
@@ -24,7 +25,7 @@ export class QueueMonitor {
 
         const memPercent = this._getMemPercent();
         const newConcurrency = this._decide(waiting, memPercent);
-        const current = worker.concurrency;
+        const current = worker.concurrency ?? env.TEST_RUN_CONCURRENCY_MIN;
 
         if (newConcurrency !== current) {
           worker.concurrency = newConcurrency;
@@ -72,8 +73,9 @@ export class QueueMonitor {
   }
 
   private _getMemPercent(): number {
-    const { heapUsed, heapTotal } = process.memoryUsage();
-    return (heapUsed / heapTotal) * 100;
+    const totalRam = os.totalmem();
+    const freeRam = os.freemem();
+    return ((totalRam - freeRam) / totalRam) * 100;
   }
 }
 
