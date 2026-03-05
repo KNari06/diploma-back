@@ -17,9 +17,7 @@ import { checkRequestAborted } from '../shared/request-cancellation';
 import { emitProcessingStep, normalizeUrl } from '../shared/utils';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
-import { ExplorationEngine } from '@/agent/core/lite/exploration/exploration-engine';
-import type { ExplorationConfig } from '@/agent/core/lite/exploration/types';
-import { DEFAULT_EXPLORATION_BUDGET } from '@/agent/core/lite/exploration/types';
+import { QueueManager } from '@/config/infrastructure/queues';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // REDIS LOCK HELPER: Prevents concurrent test starts for the same chat session
@@ -484,6 +482,11 @@ export async function handlePlatformTest(
           });
         }
 
+        if (lockAcquired && chatSessionId) {
+          await releaseChatTestLock(chatSessionId);
+          lockAcquired = false;
+        }
+
         res.json({
           reply: '📝 I need some more information to set up the test:',
           questions: result.questions,
@@ -642,122 +645,60 @@ export async function handlePlatformTest(
     // EXPLORATION BRANCH — autonomous BFS discovery + multi-flow execution
     // ═══════════════════════════════════════════════════════════════════════
     if (executionStrategy === 'exploration') {
-      logger.info('[PLATFORM_TEST] Running exploration mode', {
+      const explorationId = `expl-${Date.now()}-${userId.slice(0, 8)}`;
+
+      logger.info('[PLATFORM_TEST] Dispatching exploration to queue', {
+        explorationId,
         url: extractedUrl,
         userId,
         project_id,
-        hasCredentials: !!finalCredentials,
       });
 
-      emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Starting site exploration...', 50);
-
-      const { chromium } = await import('playwright');
-      let browser;
       try {
-        browser = await chromium.launch({ headless: true });
-
-        const explorationConfig: ExplorationConfig = {
+        await QueueManager.addExplorationJob({
+          explorationId,
           entryUrl: extractedUrl.trim(),
-          explorationId: `expl-${Date.now()}-${userId.slice(0, 8)}`,
           projectId: project_id,
           userId,
           chatSessionId,
           workspaceId: workspace_id,
           scopeHint: parsedIntent?.target || parsedIntent?.scope || undefined,
           credentials: finalCredentials || undefined,
-          budget: { ...DEFAULT_EXPLORATION_BUDGET },
           maxConcurrency: 5,
-          onProgress: (event) => {
-            const messages: Record<string, string> = {
-              page_discovered: `Discovered page: ${event.data.url || 'new page'}`,
-              survey_complete: `Survey complete: ${event.data.pagesVisited || 0} pages, ${event.data.entryPointsFound || 0} entry points`,
-              flow_started: `Testing: ${event.data.name || 'flow'}...`,
-              flow_completed: `Completed: ${event.data.name || 'flow'}`,
-              flow_failed: `Failed: ${event.data.name || 'flow'}`,
-              flow_blocked: `Blocked: ${event.data.name || 'flow'}`,
-              branch_found: `Found ${event.data.branchCount || 0} new flows after ${event.data.flow || 'flow'}`,
-            };
-            const message = messages[event.event] || `Exploring... (${event.progressPercent}%)`;
-            emitProcessingStepWithLogging(chatSessionId, 'executing_test', message, event.progressPercent);
-          },
-        };
+        });
 
-        emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Surveying pages...', 60);
-
-        // Keep parity with standard branch: respect request cancellation + handler timeout budget.
-        const remainingFlowTimeoutMs = Math.max(5_000, flowTimeout - (Date.now() - flowStartTime));
-        const explorationEngine = new ExplorationEngine(browser, explorationConfig);
-        const explorationResult = await runWithTimeoutAndAbort(
-          explorationEngine.run(),
-          remainingFlowTimeoutMs,
-          abortSignal,
-          'Exploration',
-        );
-
-        emitProcessingStepWithLogging(chatSessionId, 'executing_test', 'Exploration complete!', 100);
-
-        const summary = explorationResult.summary;
-        const replyMessage =
-          `**Exploration Complete**\n\n` +
-          `Explored **${extractedUrl}** autonomously.\n\n` +
-          `**Results:**\n` +
-          `- Pages surveyed: ${summary.pagesSurveyed}\n` +
-          `- Entry points discovered: ${summary.entryPointsDiscovered}\n` +
-          `- Flows explored: ${summary.flowsExplored}\n` +
-          `- Passed: ${summary.flowsPassed} | Failed: ${summary.flowsFailed} | Blocked: ${summary.flowsBlocked}\n` +
-          `- Test cases generated: ${explorationResult.testCases.length}\n` +
-          `- Total steps discovered: ${summary.totalStepsDiscovered}\n` +
-          `- Duration: ${Math.round(explorationResult.durationMs / 1000)}s\n\n` +
-          `Exploration ID: \`${explorationResult.explorationId}\``;
-
+        // Save user message to chat
         if (chatSessionId) {
           ChatService.saveChatMessages(chatSessionId, [
             { role: 'user', content: message },
             {
               role: 'ai',
-              content: replyMessage,
-              metadata: {
-                explorationId: explorationResult.explorationId,
-                mode: 'exploration',
-                url: extractedUrl,
-                testCasesCount: explorationResult.testCases.length,
-              },
+              content: `Starting exploration of **${extractedUrl}**... I'll notify you when test cases are discovered.`,
+              metadata: { explorationId, mode: 'exploration', url: extractedUrl },
             },
           ]).catch(() => {});
         }
 
-        res.json({
-          success: true,
-          reply: replyMessage,
-          mode: 'exploration',
-          explorationId: explorationResult.explorationId,
-          explorationResult,
-          timestamp: new Date().toISOString(),
-          sessionId: chatSessionId,
-        });
-
-        logger.info('[PLATFORM_TEST] Exploration completed successfully', {
-          explorationId: explorationResult.explorationId,
-          testCases: explorationResult.testCases.length,
-          duration: explorationResult.durationMs,
-        });
-
-        // Release lock in exploration success path (standard path releases later with mapping).
+        // Release lock — job runs in worker
         if (lockAcquired && chatSessionId) {
           await releaseChatTestLock(chatSessionId);
           lockAcquired = false;
         }
 
+        res.json({
+          success: true,
+          reply: `Exploration started for **${extractedUrl}**. I'll notify you when test cases are discovered.`,
+          mode: 'exploration',
+          explorationId,
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
         return;
       } catch (explorationError) {
-        logger.error('[PLATFORM_TEST] Exploration failed, falling back to standard', {
+        logger.error('[PLATFORM_TEST] Failed to queue exploration, falling back to standard', {
           error: explorationError instanceof Error ? explorationError.message : String(explorationError),
         });
         // Fallback: continue to standard run below
-      } finally {
-        if (browser) {
-          await browser.close().catch(() => {});
-        }
       }
     }
 

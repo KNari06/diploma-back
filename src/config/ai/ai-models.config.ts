@@ -82,6 +82,8 @@ export const AI_TASK_MODELS = {
   targetAudit: AI_MODELS.fast,
   /** Task plan building */
   taskPlanning: AI_MODELS.fast,
+  /** Pre-LLM snapshot pruner (fast context-aware element filter) */
+  snapshotPruning: AI_MODELS.fast,
 
   // ── Analysis ───────────────────────────────────────────────────────────
   /** Page analysis with vision */

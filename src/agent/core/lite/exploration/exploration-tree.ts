@@ -18,6 +18,7 @@ import type {
   ExplorationEdge,
   EntryPoint,
   NavigationAction,
+  TreeCheckpoint,
 } from './types';
 import type { LiteSnapshot } from '../lite-types';
 
@@ -148,6 +149,20 @@ export class ExplorationTree {
     return this.visitedContentHashes.has(hash);
   }
 
+  /**
+   * Compute content hash for external use (SPA detection in SurveyAgent).
+   */
+  computeContentHashPublic(snapshot: LiteSnapshot): string {
+    return this.computeContentHash(snapshot);
+  }
+
+  /**
+   * Check if a specific content hash has been visited.
+   */
+  isContentHashVisited(hash: string): boolean {
+    return this.visitedContentHashes.has(hash);
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // SAME-TEMPLATE DETECTION
   // ═══════════════════════════════════════════════════════════════════════
@@ -174,6 +189,30 @@ export class ExplorationTree {
 
   toJSON(): ExplorationNode[] {
     return this.getAllNodes();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CHECKPOINT / RESUME
+  // ═══════════════════════════════════════════════════════════════════════
+
+  toCheckpoint(): TreeCheckpoint {
+    return {
+      nodes: this.getAllNodes(),
+      visitedUrls: Array.from(this.visitedUrls),
+      visitedContentHashes: Array.from(this.visitedContentHashes),
+      allEntryPoints: Array.from(this.allEntryPoints.entries()),
+      nodeIdCounter: this.nodeIdCounter,
+    };
+  }
+
+  static fromCheckpoint(cp: TreeCheckpoint): ExplorationTree {
+    const tree = new ExplorationTree();
+    for (const node of cp.nodes) tree.nodes.set(node.id, node);
+    for (const url of cp.visitedUrls) tree.visitedUrls.add(url);
+    for (const hash of cp.visitedContentHashes) tree.visitedContentHashes.add(hash);
+    for (const [id, ep] of cp.allEntryPoints) tree.allEntryPoints.set(id, ep);
+    tree.nodeIdCounter = cp.nodeIdCounter;
+    return tree;
   }
 
   // ═══════════════════════════════════════════════════════════════════════

@@ -23,7 +23,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
 
-import type { LiteSnapshot } from '../lite-types';
+import type { LiteSnapshot, LiteElement } from '../lite-types';
 import type { ExplorationConfig, EntryPoint, NavigationAction, TestFlowCategory, FlowPriority } from './types';
 import { ExplorationTree } from './exploration-tree';
 import { BudgetTracker } from './budget-tracker';
@@ -43,7 +43,10 @@ const NAV_TIMEOUT_MS = 15_000;
 const AI_TIMEOUT_MS = 20_000;
 
 /** Max fallback entry points when AI returns 0 */
-const MAX_FALLBACK_ENTRY_POINTS = 5;
+const MAX_FALLBACK_ENTRY_POINTS = 8;
+
+/** Max SPA route clicks per page during BFS */
+const MAX_SPA_CLICKS_PER_PAGE = 5;
 
 /** Common login URL patterns */
 const LOGIN_URL_PATTERNS = [
@@ -249,10 +252,10 @@ export class SurveyAgent {
         // Ignore timeout
       }
 
-      // Collect snapshot
+      // Collect snapshot (with scroll to trigger lazy-loaded content)
       let snapshot;
       try {
-        snapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+        snapshot = await this.collectFullSnapshot();
       } catch (error) {
         logger.warn('[SURVEY] Failed to collect snapshot', {
           url: item.url,
@@ -367,8 +370,97 @@ export class SurveyAgent {
             });
           }
         }
+
+        // SPA navigation: click elements that may trigger client-side route changes
+        await this.discoverSpaRoutes(snapshot, queue, item, nodeId);
       }
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // SCROLL-AWARE SNAPSHOT COLLECTION (lazy-loaded content detection)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Collect snapshot with progressive scrolling to trigger lazy-loaded content.
+   * Scrolls down in viewport-sized chunks, collects new elements at each position,
+   * and merges unique elements into a single snapshot.
+   */
+  private async collectFullSnapshot(): Promise<LiteSnapshot> {
+    // First snapshot at current scroll position
+    const initialSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+
+    // Check if page is scrollable
+    let scrollHeight: number;
+    let viewportHeight: number;
+    try {
+      scrollHeight = await this.page.evaluate(() => (globalThis as any).document.documentElement.scrollHeight);
+      viewportHeight = await this.page.evaluate(() => (globalThis as any).window.innerHeight);
+    } catch {
+      return initialSnapshot;
+    }
+
+    // Not scrollable or very short → return initial snapshot
+    if (scrollHeight <= viewportHeight * 1.5) return initialSnapshot;
+
+    // Progressive scroll: up to 3 scroll steps
+    const MAX_SCROLLS = 3;
+    const allElements = new Map<string, LiteElement>(); // ref → element (dedup)
+
+    for (const el of initialSnapshot.elements) {
+      allElements.set(el.ref, el);
+    }
+
+    let prevElementCount = allElements.size;
+
+    for (let i = 0; i < MAX_SCROLLS; i++) {
+      // Scroll down
+      try {
+        await this.page.evaluate(() => {
+          const w = (globalThis as any).window;
+          w.scrollBy(0, w.innerHeight * 0.8);
+        });
+        await this.page.waitForTimeout(800); // Wait for lazy load
+      } catch {
+        break;
+      }
+
+      // Check if URL changed (scroll triggered navigation)
+      if (this.page.url() !== initialSnapshot.url) {
+        try {
+          await this.page.evaluate(() => (globalThis as any).window.scrollTo(0, 0));
+        } catch { /* ignore */ }
+        break;
+      }
+
+      // Collect new elements
+      try {
+        const scrollSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+        for (const el of scrollSnapshot.elements) {
+          if (!allElements.has(el.ref)) {
+            allElements.set(el.ref, el);
+          }
+        }
+      } catch {
+        break;
+      }
+
+      // No new elements → stop scrolling
+      if (allElements.size === prevElementCount) break;
+      prevElementCount = allElements.size;
+    }
+
+    // Scroll back to top
+    try {
+      await this.page.evaluate(() => (globalThis as any).window.scrollTo(0, 0));
+      await this.page.waitForTimeout(300);
+    } catch { /* ignore */ }
+
+    // Return merged snapshot
+    return {
+      ...initialSnapshot,
+      elements: Array.from(allElements.values()),
+    };
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -467,6 +559,13 @@ export class SurveyAgent {
         if (result.shouldRetry) {
           try {
             await this.rateLimiter.acquireSlot('ai');
+            const retryContent: any[] = [{ type: 'text', text: prompt }];
+            if (screenshotBase64) {
+              retryContent.push({
+                type: 'image_url',
+                image_url: { url: `data:image/png;base64,${screenshotBase64}`, detail: 'low' },
+              });
+            }
             const response = await Promise.race([
               getChatCompletionWithMessages(
                 [
@@ -476,7 +575,7 @@ export class SurveyAgent {
                   },
                   {
                     role: 'user',
-                    content: [{ type: 'text', text: prompt }],
+                    content: retryContent,
                   },
                 ],
                 {
@@ -581,8 +680,156 @@ export class SurveyAgent {
     if (/search/i.test(path)) return 'search';
     if (/contact/i.test(path)) return 'contact';
     if (/about/i.test(path)) return 'about';
+    if (/admin/i.test(path)) return 'admin';
+    if (/api|docs|documentation/i.test(path)) return 'documentation';
+    if (/faq|help|support/i.test(path)) return 'support';
+    if (/blog|article|post|news/i.test(path)) return 'blog';
+    if (/pricing|plan/i.test(path)) return 'pricing';
     if (path === '/' || path === '') return 'home';
     return 'other';
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // SPA NAVIGATION DISCOVERY
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Detect SPA route elements: framework-bound click handlers that look like
+   * navigation but have no href (React Router <Link>, Vue <router-link>, etc.).
+   */
+  private findSpaRouteElements(snapshot: LiteSnapshot): LiteElement[] {
+    return snapshot.elements.filter(el =>
+      el.visible &&
+      !el.disabled &&
+      // Framework-bound click handlers or explicit onclick
+      (el.frameworkClickable || el.hasOnclick) &&
+      // Looks like navigation (link-like role or nav context)
+      (el.role === 'link' || el.role === 'tab' || el.role === 'menuitem' ||
+       (el.tag === 'a' && !el.href)) && // <a> without href = SPA link
+      // Not a form submit
+      !/submit/i.test(el.type || '') &&
+      // Not already followed via URL-based BFS
+      !el.href
+    ).slice(0, MAX_SPA_CLICKS_PER_PAGE);
+  }
+
+  /**
+   * Click SPA route elements to discover content changes without URL changes.
+   * Adds newly discovered pages (by content hash) to the BFS queue.
+   */
+  private async discoverSpaRoutes(
+    snapshot: LiteSnapshot,
+    queue: Array<{ url: string; depth: number; parentNodeId: string | null; navAction: NavigationAction | null }>,
+    item: { url: string; depth: number },
+    nodeId: string,
+  ): Promise<void> {
+    const spaElements = this.findSpaRouteElements(snapshot);
+    if (spaElements.length === 0) return;
+
+    logger.debug('[SURVEY] Checking SPA route elements', {
+      url: item.url,
+      count: spaElements.length,
+    });
+
+    for (const el of spaElements) {
+      if (!this.budget.canSurveyMorePages()) break;
+
+      const canProceed = await this.rateLimiter.acquireSlot('navigation');
+      if (!canProceed) break;
+
+      const urlBefore = this.page.url();
+      const contentHashBefore = this.tree.computeContentHashPublic(snapshot);
+
+      try {
+        await this.page.locator(`[data-agent-ref="${el.ref}"]`).click({ timeout: 3000 });
+        await this.page.waitForTimeout(1000); // Wait for SPA transition
+
+        const urlAfter = this.page.url();
+
+        // Case 1: URL changed → standard BFS will handle, go back
+        if (urlAfter !== urlBefore) {
+          this.rateLimiter.recordSuccess('target_site');
+          if (!this.tree.isVisited(urlAfter) && this.isSameOrigin(urlAfter)) {
+            queue.push({
+              url: urlAfter,
+              depth: item.depth + 1,
+              parentNodeId: nodeId,
+              navAction: { type: 'click_button', ref: el.ref, label: el.name || 'SPA link' },
+            });
+          }
+          await this.page.goBack({ timeout: 5000 }).catch(() => {});
+          await this.page.waitForTimeout(500);
+          continue;
+        }
+
+        // Case 2: URL same but content changed → SPA route, treat as new page
+        const newSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+        const contentHashAfter = this.tree.computeContentHashPublic(newSnapshot);
+
+        if (contentHashAfter !== contentHashBefore && !this.tree.isContentHashVisited(contentHashAfter)) {
+          this.rateLimiter.recordSuccess('target_site');
+          logger.info('[SURVEY] SPA content change detected', {
+            element: el.name || el.ref,
+            url: urlBefore,
+          });
+
+          // Classify and add as virtual page
+          const formattedSnapshot = SnapshotCollector.format(newSnapshot);
+          let screenshotBase64: string | undefined;
+          try {
+            const buf = await this.page.screenshot({ type: 'png', fullPage: false });
+            screenshotBase64 = buf.toString('base64');
+          } catch { /* ignore */ }
+
+          const classification = await this.classifyPage(
+            formattedSnapshot,
+            screenshotBase64,
+            urlBefore,
+            await this.page.title(),
+            item.depth + 1,
+            newSnapshot,
+          );
+
+          const entryPoints: EntryPoint[] = classification.entryPoints.map((ep) => ({
+            ...ep,
+            id: `ep-${this.entryPointCounter++}`,
+            sourceNodeId: '',
+            sourcePageUrl: urlBefore,
+            requiresAuth: ep.requiresAuth,
+          }));
+
+          // Use a virtual URL to prevent dedup collision with the parent page
+          const virtualUrl = `${urlBefore}#spa-${el.ref}`;
+          const spaNodeId = this.tree.addNode({
+            url: virtualUrl,
+            title: await this.page.title(),
+            pageType: classification.pageType,
+            snapshot: newSnapshot,
+            entryPoints,
+            depth: item.depth + 1,
+            requiresAuth: false,
+          });
+
+          if (spaNodeId) {
+            for (const ep of entryPoints) {
+              ep.sourceNodeId = spaNodeId;
+            }
+            this.tree.addEdge(nodeId, spaNodeId, {
+              type: 'click_button',
+              ref: el.ref,
+              label: el.name || 'SPA route',
+            });
+            await this.budget.recordPageSurvey();
+          }
+        }
+
+        // Navigate back (goBack or reload the original page)
+        await this.page.goBack({ timeout: 5000 }).catch(() => {});
+        await this.page.waitForTimeout(500);
+      } catch {
+        await this.page.keyboard.press('Escape').catch(() => {});
+      }
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -889,7 +1136,7 @@ export class SurveyAgent {
     }
 
     // 4. Detect prominent CTA buttons (non-submit, meaningful text)
-    const ctaPatterns = /sign up|register|get started|try|subscribe|contact|book|schedule/i;
+    const ctaPatterns = /sign up|register|get started|try|subscribe|contact|book|schedule|download|add to cart|buy|checkout|learn more|explore|apply|submit|create|new/i;
     const ctaButtons = buttons.filter(el =>
       el.name && ctaPatterns.test(el.name) && !el.disabled,
     );
@@ -904,6 +1151,69 @@ export class SurveyAgent {
         estimatedComplexity: 'medium',
         relatedElements: [{ ref: cta.ref, role: cta.role, name: cta.name, tag: cta.tag }],
       });
+    }
+
+    // 5. Data tables (CRUD operations)
+    if (entryPoints.length < MAX_FALLBACK_ENTRY_POINTS) {
+      const tables = elements.filter(el => el.tag === 'table' || el.role === 'grid');
+      if (tables.length > 0) {
+        const tableActions = buttons.filter(el =>
+          /edit|delete|remove|view|detail|update/i.test(el.name || ''),
+        );
+        if (tableActions.length > 0) {
+          entryPoints.push({
+            name: 'Data Table Operations',
+            goal: 'Interact with the data table: view details, edit or delete entries',
+            category: 'crud',
+            priority: 'high',
+            requiresAuth: false,
+            estimatedComplexity: 'medium',
+            relatedElements: [...tables, ...tableActions].slice(0, 5).map(el => ({
+              ref: el.ref, role: el.role, name: el.name, tag: el.tag,
+            })),
+          });
+        }
+      }
+    }
+
+    // 6. File upload inputs
+    if (entryPoints.length < MAX_FALLBACK_ENTRY_POINTS) {
+      const fileInputs = inputs.filter(el => el.type === 'file');
+      if (fileInputs.length > 0) {
+        entryPoints.push({
+          name: 'File Upload',
+          goal: 'Upload a file using the file upload functionality',
+          category: 'form_submission',
+          priority: 'medium',
+          requiresAuth: false,
+          estimatedComplexity: 'medium',
+          relatedElements: fileInputs.slice(0, 3).map(el => ({
+            ref: el.ref, role: el.role, name: el.name, tag: el.tag,
+          })),
+        });
+      }
+    }
+
+    // 7. Navigation menu items (important links in nav areas)
+    if (entryPoints.length < MAX_FALLBACK_ENTRY_POINTS) {
+      const navLinks = elements.filter(el =>
+        el.tag === 'a' && el.href && el.visible &&
+        (el.role === 'menuitem' || el.role === 'link') &&
+        el.name && el.name.length > 1 && el.name.length < 50,
+      );
+      if (navLinks.length >= 3) {
+        entryPoints.push({
+          name: 'Navigation Flow',
+          goal: 'Navigate through the main navigation menu and verify page loading',
+          category: 'navigation',
+          priority: 'medium',
+          requiresAuth: false,
+          estimatedComplexity: 'simple',
+          relatedElements: navLinks.slice(0, 5).map(el => ({
+            ref: el.ref, role: el.role, name: el.name, tag: el.tag,
+          })),
+        });
+      }
     }
 
     return entryPoints.slice(0, MAX_FALLBACK_ENTRY_POINTS);

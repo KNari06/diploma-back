@@ -39,6 +39,7 @@ import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
 import { PageWatcher } from './execution/page-watcher';
 import { MultiAgentOrchestrator } from './agents/multi-agent-orchestrator';
+import { SnapshotPruner } from './agents/snapshot-pruner';
 import type { MultiAgentInput } from './agents/types';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
 import { LiteState } from './lite-state';
@@ -135,6 +136,8 @@ export class LiteEngine {
 
   // Multi-Agent Brain: Observer → Strategist → Actor orchestrator
   private multiAgentOrchestrator: MultiAgentOrchestrator | null = null;
+  // Pre-LLM Pruner: context-aware element filtering before main LLM
+  private snapshotPruner: SnapshotPruner | null = null;
   // Manus-style: Store previous snapshot for spatial diff
   private previousFormattedSnapshot: string | null = null;
   /** Last iteration's console/network errors for Supervisor blocker detection */
@@ -188,6 +191,11 @@ export class LiteEngine {
     // Multi-Agent Brain: Initialize orchestrator if enabled
     if (LITE_ENGINE_FLAGS.enableMultiAgentBrain) {
       this.multiAgentOrchestrator = new MultiAgentOrchestrator();
+    }
+
+    // Pre-LLM Pruner: Initialize if enabled
+    if (LITE_ENGINE_FLAGS.enableSnapshotPruning) {
+      this.snapshotPruner = new SnapshotPruner();
     }
 
     // WebSocket progress
@@ -1017,6 +1025,7 @@ export class LiteEngine {
     this.downloadApprovalAskedForRefs.clear();
     this.deniedDownloadRefs.clear();
     this.skillsContext = '';
+    this.snapshotPruner?.clear();
   }
 
   /**
@@ -1398,7 +1407,7 @@ export class LiteEngine {
         }
 
         // 2. Collect snapshot BEFORE (with visual stability)
-        let snapshotBefore = await SnapshotCollector.collect(this.page);
+        let snapshotBefore = await SnapshotCollector.collect(this.page, { fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
         const pageErrorsBefore = await ErrorCollector.collectFromPage(this.page);
 
         // 2a. Guard: check if snapshot is too empty (page still loading)
@@ -1410,7 +1419,7 @@ export class LiteEngine {
           });
           await this.page.waitForLoadState('domcontentloaded');
           await this.page.waitForTimeout(2000);
-          snapshotBefore = await SnapshotCollector.collect(this.page);
+          snapshotBefore = await SnapshotCollector.collect(this.page, { fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
         }
 
         // 2b. Guard: stale snapshot after credential fill.
@@ -1438,12 +1447,49 @@ export class LiteEngine {
             } catch {
               // Timeout OK — maybe it's a real login failure
             }
-            snapshotBefore = await SnapshotCollector.collect(this.page);
+            snapshotBefore = await SnapshotCollector.collect(this.page, { fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
           }
         }
 
-        // ✅ NEW: Trace snapshot
-        const formattedSnapshot = SnapshotCollector.format(snapshotBefore);
+        // ✅ Pre-LLM Pruner: context-aware element filtering before format
+        let prunerKeepRefs: Set<string> | undefined;
+        if (this.snapshotPruner) {
+          try {
+            const contentHash = this.state.computeContentHash(snapshotBefore);
+            const prunerResult = await this.snapshotPruner.prune({
+              elements: snapshotBefore.elements,
+              goal: this.config.goal,
+              url: snapshotBefore.url,
+              contentHash,
+              activeModalRef: snapshotBefore.activeModalRef,
+            });
+            if (prunerResult) {
+              prunerKeepRefs = prunerResult.keepRefs;
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'snapshot',
+                eventType: 'pruner_result',
+                spanId: this.traceWriter.generateSpanId(),
+                parentSpanId: iterationSpanId,
+                payload: {
+                  total: snapshotBefore.elements.length,
+                  kept: prunerResult.keepRefs.size,
+                  pruned: snapshotBefore.elements.length - prunerResult.keepRefs.size,
+                  fromCache: prunerResult.fromCache,
+                  durationMs: prunerResult.durationMs,
+                },
+              });
+            }
+          } catch (prunerError) {
+            logger.warn('[LITE_ENGINE] Snapshot pruner failed, using legacy format', {
+              testId: this.config.testId,
+              error: prunerError instanceof Error ? prunerError.message : String(prunerError),
+            });
+          }
+        }
+
+        // Trace snapshot
+        const formattedSnapshot = SnapshotCollector.format(snapshotBefore, prunerKeepRefs);
         this.traceWriter.write({
           iteration: i,
           stage: 'snapshot',
@@ -3766,6 +3812,11 @@ export class LiteEngine {
           }
         }
 
+        // 13b3. Snapshot Pruner: Invalidate cache on state change or URL change
+        if (this.snapshotPruner && (outcome === 'state_changed' || diff.urlChanged)) {
+          this.snapshotPruner.invalidateForUrl(snapshotBefore.url);
+        }
+
         // 13c. State Drift Auditor: Record tracking data
         if (LITE_ENGINE_FLAGS.enableStateDriftAuditor) {
           this.state.recordUrlVisit(snapshotAfter.url);
@@ -4212,6 +4263,7 @@ export class LiteEngine {
     // ✅ NEW: Clear semantic weight cache and log stats
     const semanticStats = this.semanticWeightCalculator.getStats();
     this.semanticWeightCalculator.clearCache();
+    this.snapshotPruner?.clear();
     logger.info('[LITE_ENGINE] Semantic weight stats', {
       testId: this.config.testId,
       cacheHits: semanticStats.cacheStats.hits,
@@ -4779,6 +4831,7 @@ export class LiteEngine {
     try {
       this.semanticWeightCalculator.clearCache();
       this.state.clearVisualSignatures();
+      this.snapshotPruner?.clear();
     } catch {
       // Best-effort cache clearing
     }

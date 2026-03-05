@@ -57,6 +57,7 @@ export interface ClientToServerEvents {
 
   // Clarification
   'test:clarification:response': (data: { testId: string; questionId: string; answer: string }) => void;
+  'exploration:clarification:response': (data: { questionId: string; answer: string }) => void;
 
   // Heartbeat
   ping: () => void;
@@ -111,6 +112,11 @@ export interface ServerToClientEvents {
 
   // Regression run events
   'regression:run:progress': (data: RegressionRunProgressPayload) => void;
+
+  // Exploration events
+  'exploration:progress': (data: ExplorationProgressPayload) => void;
+  'exploration:completed': (data: ExplorationCompletedPayload) => void;
+  'exploration:clarification:request': (data: ExplorationClarificationPayload) => void;
 
   // System events
   'system:error': (data: SystemErrorPayload) => void;
@@ -756,6 +762,40 @@ export interface RegressionRunProgressPayload {
     failed?: number;
     skipped?: number;
   };
+  timestamp: string;
+}
+
+// ============================================================================
+// EXPLORATION EVENTS
+// ============================================================================
+
+export interface ExplorationProgressPayload {
+  explorationId: string;
+  phase: 'survey' | 'flow' | 'complete';
+  event: string;
+  progressPercent: number;
+  data: Record<string, any>;
+  timestamp: string;
+  chatSessionId?: string;
+}
+
+export interface ExplorationCompletedPayload {
+  explorationId: string;
+  testCasesCount: number;
+  summary: Record<string, any>;
+  status: 'completed' | 'failed';
+  errorMessage?: string;
+  timestamp: string;
+  chatSessionId?: string;
+}
+
+export interface ExplorationClarificationPayload {
+  explorationId: string;
+  questionId: string;
+  question: string;
+  type: 'captcha_solve' | '2fa_code';
+  timeout: number;
+  chatSessionId: string;
   timestamp: string;
 }
 

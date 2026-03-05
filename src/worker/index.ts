@@ -4,6 +4,7 @@ import { env } from '@/config/environment/env';
 import { connection, QUEUE_NAMES, testRunQueue } from '@/config/infrastructure/queues';
 import { GitWebhookJobHandler } from '@/jobs/git-webhook.job';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
+import { ExplorationRunJobHandler } from '@/jobs/exploration-run.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
 import { logger } from '@/utils/core/logger';
 import { Worker } from 'bullmq';
@@ -216,6 +217,55 @@ const gitWebhookWorker = new Worker(
   workerOptions
 );
 
+const explorationWorker = new Worker(
+  QUEUE_NAMES.EXPLORATION,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    const startTime = Date.now();
+    logger.info(`[EXPLORATION_WORKER] Processing job: ${job.id}`, {
+      explorationId: job.data?.explorationId,
+      entryUrl: job.data?.entryUrl,
+    });
+
+    try {
+      if (!ExplorationRunJobHandler || typeof ExplorationRunJobHandler.process !== 'function') {
+        throw new Error('ExplorationRunJobHandler.process is not a function');
+      }
+
+      await ExplorationRunJobHandler.process(job);
+      const duration = Date.now() - startTime;
+
+      logger.info(`[EXPLORATION_WORKER] Job completed: ${job.id}`, {
+        explorationId: job.data?.explorationId,
+        duration: `${duration}ms`,
+      });
+    } catch (error) {
+      const duration = Date.now() - startTime;
+
+      logger.error(`[EXPLORATION_WORKER] Job failed: ${job.id}`, {
+        explorationId: job.data?.explorationId,
+        duration: `${duration}ms`,
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
+      });
+      throw error;
+    }
+  },
+  {
+    ...workerOptions,
+    concurrency: 2, // Exploration is heavy — browser + AI calls
+    lockDuration: 20 * 60 * 1000, // 20 min — exploration can take 15 min
+    stalledInterval: 5 * 60 * 1000, // 5 min
+    maxStalledCount: 1, // Checkpoint/resume handles crash recovery; prevent duplicate concurrent runs
+  }
+);
+
 // Worker event listeners
 const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('ready', () => {
@@ -336,6 +386,7 @@ setupWorkerEvents(aiAnalysisWorker, 'AIAnalysis');
 setupWorkerEvents(notificationWorker, 'Notification');
 setupWorkerEvents(webhookWorker, 'Webhook');
 setupWorkerEvents(gitWebhookWorker, 'GitWebhook');
+setupWorkerEvents(explorationWorker, 'Exploration');
 
 // Graceful shutdown
 let isShuttingDown = false;
@@ -368,6 +419,7 @@ const gracefulShutdown = async (signal: string) => {
       notificationWorker.close(),
       webhookWorker.close(),
       gitWebhookWorker.close(),
+      explorationWorker.close(),
       // Abort all active test runs (closes contexts, stops video streams)
       (async () => {
         try {
@@ -413,7 +465,7 @@ const gracefulShutdown = async (signal: string) => {
     // Log any failures but continue shutdown
     closeResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'testRunRegistry', 'videoStreams', 'browserPool'];
+        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'testRunRegistry', 'videoStreams', 'browserPool'];
         logger.warn(`[WORKER] Failed to close ${workerNames[index]}`, {
           error: result.reason instanceof Error ? result.reason.message : String(result.reason),
         });
@@ -474,6 +526,7 @@ logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`
 
 export {
   aiAnalysisWorker,
+  explorationWorker,
   gitWebhookWorker,
   notificationWorker,
   testResultWorker,

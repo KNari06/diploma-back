@@ -251,6 +251,20 @@ export const LITE_ENGINE_FLAGS = {
   snapshotMaxElements: 80,
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // SNAPSHOT PRUNER (Pre-LLM Context-Aware Element Filtering)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable Pre-LLM snapshot pruner for context-aware element filtering */
+  enableSnapshotPruning: true,
+  /** Timeout for pruner LLM call (ms). Must be fast (<2s) to not slow iteration. */
+  prunerTimeoutMs: 2000,
+  /** Pruner cache TTL (ms). Longer than ObserverCache because page content changes less often. */
+  prunerCacheTtlMs: 15_000,
+  /** Maximum pruner cache entries */
+  prunerCacheMaxEntries: 10,
+  /** Enable fullPage snapshot collection in main iteration loop (see beyond viewport) */
+  enableFullPageSnapshot: true,
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // SUPERVISOR LAYER (Manus Tiered Escalation)
   // ═══════════════════════════════════════════════════════════════════════════
   /** Enable Supervisor layer */

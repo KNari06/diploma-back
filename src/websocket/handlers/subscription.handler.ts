@@ -726,6 +726,25 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
     }
   });
 
+  // Handle exploration clarification response (captcha/2FA)
+  socket.on('exploration:clarification:response', ({ questionId, answer }) => {
+    logger.info('[SubscriptionHandler] Received exploration clarification response', {
+      socketId: socket.id,
+      userId,
+      questionId,
+    });
+
+    try {
+      const { ClarificationService } = require('@/agent/utils/context/clarification.service');
+      ClarificationService.handleExplorationClarificationResponse(questionId, answer);
+    } catch (error) {
+      logger.error('[SubscriptionHandler] Failed to handle exploration clarification response', {
+        error: error instanceof Error ? error.message : String(error),
+        questionId,
+      });
+    }
+  });
+
   // Cleanup on disconnect
   socket.on('disconnect', () => {
     try {

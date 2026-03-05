@@ -551,3 +551,56 @@ export interface BudgetUsage {
   pipelineRoundsUsed: number;
   pipelineRoundsRemaining: number;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CHECKPOINT / RESUME (crash recovery)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface ExplorationCheckpoint {
+  version: 1;
+  phase: 'survey' | 'flow';
+  timestamp: number;
+
+  /** ExplorationTree state */
+  tree: TreeCheckpoint;
+
+  /** BudgetTracker state */
+  budget: BudgetCheckpoint;
+
+  /** FlowQueue state (only if phase === 'flow') */
+  queue?: QueueCheckpoint;
+
+  /** FlowRunner state (only if phase === 'flow') */
+  flowRunner?: FlowRunnerCheckpoint;
+
+  /** Auth state (cached storageState JSON) */
+  authState?: object;
+}
+
+export interface TreeCheckpoint {
+  nodes: ExplorationNode[];
+  visitedUrls: string[];
+  visitedContentHashes: string[];
+  allEntryPoints: Array<[string, EntryPoint]>;
+  nodeIdCounter: number;
+}
+
+export interface BudgetCheckpoint {
+  flowsCompleted: number;
+  pipelineRoundsUsed: number;
+  pagesSurveyed: number;
+  startTime: number;
+}
+
+export interface QueueCheckpoint {
+  queue: EntryPoint[];
+  completed: string[];
+  allGoals: Array<[string, string]>;
+}
+
+export interface FlowRunnerCheckpoint {
+  loginCompleted: boolean;
+  knownFlowNames: string[];
+  flowsCompleted: number;
+  completedTasks: FlowExplorationTask[];
+}

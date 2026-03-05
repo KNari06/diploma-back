@@ -32,6 +32,7 @@ import type {
   EntryPoint,
   FlowExplorationTask,
   FlowExplorationStatus,
+  FlowRunnerCheckpoint,
   DiscoveredStep,
   FlowError,
   ErrorClassification,
@@ -46,6 +47,7 @@ import {
   buildBranchDetectionPrompt,
   parseBranchDetectionResponse,
 } from './prompts';
+import { ClarificationService } from '@/agent/utils/context/clarification.service';
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -75,12 +77,16 @@ class Semaphore {
   }
 }
 
+/** Callback for periodic checkpoint saves during flow execution */
+export type CheckpointCallback = (completedTasks: FlowExplorationTask[]) => Promise<void>;
+
 export class FlowRunner {
   private stateManager: StateManager;
   private loginCompleted: boolean = false;
   private knownFlowNames: string[] = [];
   private flowsCompleted: number = 0;
   private totalFlows: number = 0;
+  private checkpointCallback?: CheckpointCallback;
 
   constructor(
     private readonly browser: Browser,
@@ -90,6 +96,28 @@ export class FlowRunner {
     private readonly rateLimiter?: RateLimiter,
   ) {
     this.stateManager = new StateManager(browser);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CHECKPOINT / RESUME
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setCheckpointCallback(cb: CheckpointCallback): void {
+    this.checkpointCallback = cb;
+  }
+
+  isLoginCompleted(): boolean {
+    return this.loginCompleted;
+  }
+
+  getKnownFlowNames(): string[] {
+    return [...this.knownFlowNames];
+  }
+
+  restoreFromCheckpoint(cp: FlowRunnerCheckpoint): void {
+    this.loginCompleted = cp.loginCompleted;
+    this.knownFlowNames = [...cp.knownFlowNames];
+    this.flowsCompleted = cp.flowsCompleted;
   }
 
   private emitProgress(
@@ -128,8 +156,8 @@ export class FlowRunner {
     const results: FlowExplorationTask[] = [];
     const inFlight: Set<Promise<void>> = new Set();
 
-    this.totalFlows = queue.size();
-    this.flowsCompleted = 0;
+    this.totalFlows = queue.size() + this.flowsCompleted;
+    // Don't reset flowsCompleted — it may be restored from checkpoint
 
     logger.info('[FLOW_RUNNER] Starting flow exploration', {
       queueSize: queue.size(),
@@ -233,6 +261,13 @@ export class FlowRunner {
 
       // Record budget usage
       await this.budget.recordFlowCompletion(task.roundsUsed);
+
+      // Trigger checkpoint callback if configured
+      if (this.checkpointCallback) {
+        try {
+          await this.checkpointCallback(results);
+        } catch { /* never let checkpoint saving crash flow execution */ }
+      }
 
       // Emit appropriate completion event
       const progressEvent = task.status === 'blocked' ? 'flow_blocked' as const
@@ -393,6 +428,80 @@ export class FlowRunner {
         const blockerInfo = this.extractBlockerInfo(pipelineResult.insights);
         blockerType = blockerInfo.type;
         canUserHelp = blockerInfo.canUserHelp;
+
+        // 10a. Request user help for captcha/2FA if possible
+        if (
+          canUserHelp &&
+          (blockerType === 'captcha' || blockerType === '2fa') &&
+          this.config.chatSessionId
+        ) {
+          const clarificationQuestion = blockerType === 'captcha'
+            ? 'A CAPTCHA was encountered during exploration. Please solve it in the browser and click "Done".'
+            : 'A 2FA verification code is required. Please enter the code.';
+
+          const answer = await ClarificationService.requestClarificationViaRedis({
+            explorationId: this.config.explorationId,
+            chatSessionId: this.config.chatSessionId,
+            question: clarificationQuestion,
+            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            timeout: 120_000,
+          });
+
+          if (answer) {
+            // User solved it or provided code → retry the flow from the same page
+            logger.info('[FLOW_RUNNER] User resolved blocker, retrying flow', {
+              name: entryPoint.name,
+              blockerType,
+            });
+
+            try {
+              // If 2FA: type the code the user provided
+              if (blockerType === '2fa' && answer !== 'done') {
+                const codeInputs = await page.$$('input[type="text"], input[type="tel"], input[type="number"]');
+                if (codeInputs.length > 0) {
+                  await codeInputs[0].fill(answer);
+                  await page.keyboard.press('Enter');
+                  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+                }
+              }
+
+              // Stop first tracker before creating a new one for retry
+              networkTracker.stopTracking();
+
+              // Re-run pipeline from current state
+              const retryIntegrations: PipelineIntegrations = {
+                page,
+                actionExecutor: new ActionExecutor(page),
+                networkTracker: new NetworkTracker(page),
+                goalDetector: new GoalDetector(entryPoint.goal, entryPoint.id),
+                browserContext: context,
+              };
+              const retryPipeline = new TestPipeline(retryIntegrations);
+              const retryConfig: PipelineConfig = {
+                url: page.url(),
+                credentials: this.config.credentials,
+                hasCredentials: !!this.config.credentials,
+                testId: entryPoint.id,
+                maxRounds: Math.max(1, Math.min(5, allocatedRounds)),
+                timeoutMs: Math.max(5_000, flowTimeoutMs - (Date.now() - startTime)),
+              };
+              const retryResult = await retryPipeline.run(entryPoint.goal, retryConfig);
+
+              if (retryResult.success) {
+                status = 'completed';
+                blockerType = undefined;
+                canUserHelp = undefined;
+                // Merge steps
+                discoveredSteps.push(...this.extractSteps(retryResult));
+              }
+            } catch (retryError) {
+              logger.warn('[FLOW_RUNNER] Retry after user help failed', {
+                name: entryPoint.name,
+                error: retryError instanceof Error ? retryError.message : String(retryError),
+              });
+            }
+          }
+        }
       } else if (Date.now() - startTime >= flowTimeoutMs) {
         status = 'timeout';
       } else {

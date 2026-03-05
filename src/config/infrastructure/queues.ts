@@ -1,9 +1,28 @@
 import { AgentResponse, TestJobData } from '@/types';
+import type { ExplorationBudget, RateLimitingConfig } from '@/agent/core/lite/exploration/types';
 import { handleQueueError } from '@/utils/core/error-handler';
 import { logQueueEvent, logger } from '@/utils/core/logger';
 import { Queue, QueueEvents } from 'bullmq';
 import IORedis from 'ioredis';
 import { env } from '../environment/env';
+
+// ═══════════════════════════════════════════════════════════════════════
+// EXPLORATION JOB DATA
+// ═══════════════════════════════════════════════════════════════════════
+
+export interface ExplorationJobData {
+  explorationId: string;
+  entryUrl: string;
+  projectId: string;
+  userId: string;
+  chatSessionId?: string;
+  workspaceId?: string;
+  scopeHint?: string;
+  credentials?: { email?: string; username?: string; phone?: string; password: string };
+  budget?: Partial<ExplorationBudget>;
+  maxConcurrency?: number;
+  rateLimiting?: RateLimitingConfig;
+}
 
 // Helper to check if Redis is available
 let redisAvailable = false;
@@ -99,6 +118,7 @@ export const QUEUE_NAMES = {
   NOTIFICATION: 'notification',
   WEBHOOK: 'webhook',
   GIT_WEBHOOK: 'git-webhook',
+  EXPLORATION: 'exploration',
 } as const;
 
 // Test run queue - for executing tests
@@ -203,10 +223,26 @@ export const gitWebhookQueue = new Queue<{
   },
 });
 
+// Exploration queue - for autonomous site exploration
+export const explorationQueue = new Queue<ExplorationJobData>(QUEUE_NAMES.EXPLORATION, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 50,
+    removeOnFail: 25,
+    attempts: 2, // Allow 1 automatic retry on stall — resumes from checkpoint
+    backoff: {
+      type: 'fixed',
+      delay: 5000,
+    },
+  },
+});
+
 // Queue events for monitoring
 export const testRunQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RUN, { connection, prefix: env.QUEUE_PREFIX });
 export const testResultQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RESULT, { connection, prefix: env.QUEUE_PREFIX });
 export const aiAnalysisQueueEvents = new QueueEvents(QUEUE_NAMES.AI_ANALYSIS, { connection, prefix: env.QUEUE_PREFIX });
+export const explorationQueueEvents = new QueueEvents(QUEUE_NAMES.EXPLORATION, { connection, prefix: env.QUEUE_PREFIX });
 
 // Queue event listeners
 testRunQueueEvents.on('completed', (args: { jobId: string; returnvalue: string; prev?: string }) => {
@@ -235,6 +271,18 @@ aiAnalysisQueueEvents.on('completed', (args: { jobId: string; returnvalue: strin
 
 aiAnalysisQueueEvents.on('failed', (args: { jobId: string; failedReason: string; prev?: string }) => {
   logQueueEvent('failed', args.jobId, { queue: QUEUE_NAMES.AI_ANALYSIS, error: args.failedReason });
+});
+
+explorationQueueEvents.on('completed', (args: { jobId: string; returnvalue: string; prev?: string }) => {
+  logQueueEvent('completed', args.jobId, { queue: QUEUE_NAMES.EXPLORATION });
+});
+
+explorationQueueEvents.on('failed', (args: { jobId: string; failedReason: string; prev?: string }) => {
+  logQueueEvent('failed', args.jobId, { queue: QUEUE_NAMES.EXPLORATION, error: args.failedReason });
+});
+
+explorationQueueEvents.on('stalled', (args: { jobId: string }) => {
+  logQueueEvent('stalled', args.jobId, { queue: QUEUE_NAMES.EXPLORATION });
 });
 
 // Queue management functions
@@ -387,6 +435,35 @@ export class QueueManager {
   }
 
   /**
+   * Add exploration job to queue
+   */
+  static async addExplorationJob(jobData: ExplorationJobData) {
+    try {
+      if (!redisAvailable) {
+        const error = new Error('Redis is not available. Cannot add exploration job to queue.');
+        logger.error('❌ [QUEUE] Redis unavailable for exploration', {
+          explorationId: jobData.explorationId,
+        });
+        throw error;
+      }
+
+      const job = await explorationQueue.add('exploration', jobData, {
+        priority: 5,
+        jobId: jobData.explorationId,
+      });
+
+      logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.EXPLORATION, explorationId: jobData.explorationId });
+      return job;
+    } catch (error) {
+      logger.error('❌ Failed to add exploration job', {
+        error: error instanceof Error ? error.message : String(error),
+        explorationId: jobData.explorationId,
+      });
+      throw handleQueueError(error);
+    }
+  }
+
+  /**
    * Get queue statistics
    */
   static async getQueueStats() {
@@ -399,17 +476,18 @@ export class QueueManager {
         notificationQueue.getJobCounts(),
         webhookQueue.getJobCounts(),
         gitWebhookQueue.getJobCounts(),
+        explorationQueue.getJobCounts(),
       ]);
 
       // Extract successful results, use empty object for failed ones
-      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats, gitWebhookStats] = results.map(
+      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats, gitWebhookStats, explorationStats] = results.map(
         (result) => result.status === 'fulfilled' ? result.value : {}
       );
 
       // Log any failures but don't fail the whole operation
       results.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration'];
           logger.warn(`Failed to get stats for ${queueNames[index]} queue`, { error: result.reason });
         }
       });
@@ -421,6 +499,7 @@ export class QueueManager {
         notification: notificationStats,
         webhook: webhookStats,
         gitWebhook: gitWebhookStats,
+        exploration: explorationStats,
       };
     } catch (error) {
       logger.error('Failed to get queue stats:', error);
@@ -487,6 +566,8 @@ export class QueueManager {
         return webhookQueue;
       case QUEUE_NAMES.GIT_WEBHOOK:
         return gitWebhookQueue;
+      case QUEUE_NAMES.EXPLORATION:
+        return explorationQueue;
       default:
         throw new Error(`Unknown queue: ${queueName}`);
     }
@@ -557,11 +638,12 @@ export const gracefulShutdown = async () => {
         notificationQueue.close(),
         webhookQueue.close(),
         gitWebhookQueue.close(),
+        explorationQueue.close(),
       ]);
 
       closeQueueResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration'];
           logger.warn(`Failed to close ${queueNames[index]} queue`, { error: result.reason });
         }
       });
@@ -571,11 +653,12 @@ export const gracefulShutdown = async () => {
         testRunQueueEvents.close(),
         testResultQueueEvents.close(),
         aiAnalysisQueueEvents.close(),
+        explorationQueueEvents.close(),
       ]);
 
       closeQueueEventsResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents'];
+          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents', 'explorationEvents'];
           logger.warn(`Failed to close ${eventNames[index]}`, { error: result.reason });
         }
       });

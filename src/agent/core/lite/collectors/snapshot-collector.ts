@@ -195,14 +195,15 @@ export class SnapshotCollector {
             if (elStyle.position !== 'fixed' && elStyle.position !== 'absolute') continue;
 
             const zIdx = parseInt(elStyle.zIndex, 10);
-            if (isNaN(zIdx) || zIdx < 10) continue; // Must have meaningful z-index
+            if (isNaN(zIdx) || zIdx < 3) continue; // z-index >= 3: catch custom popups (lowered from 10)
 
             const elRect = el.getBoundingClientRect();
             const elArea = elRect.width * elRect.height;
             const coverage = viewportArea2 > 0 ? elArea / viewportArea2 : 0;
 
-            // Must be meaningful size (>10% viewport) with interactive content or many children
-            if (coverage < 0.1) continue;
+            // Must be meaningful size (>3% viewport) — lowered from 10% to catch
+            // small popups, autocomplete dropdowns, context menus, tooltips with forms
+            if (coverage < 0.03) continue;
 
             // ── Q5 FIX: Exclude structural navigation elements (sidebars, headers, footers) ──
             // Sidebars: flush to left/right edge + tall (>70% viewport height)
@@ -717,6 +718,10 @@ export class SnapshotCollector {
           '[role="treeitem"]',
           // ✅ FIX: Alert dialogs with confirm/cancel (browser-like alerts)
           '[role="alertdialog"]',
+          // ✅ FIX: Data grid roles (Salesforce, SAP, AG Grid, enterprise tables)
+          '[role="rowheader"]', '[role="columnheader"]', '[role="gridcell"]',
+          // ✅ FIX: Toolbar containers (action bars, editor toolbars)
+          '[role="toolbar"]',
 
           // ── Attribute-based interactive elements ──
           '[onclick]', '[tabindex]:not([tabindex="-1"])',
@@ -1011,7 +1016,11 @@ export class SnapshotCollector {
             // Skip hidden elements
             const style = window.getComputedStyle(el);
             if (style.display === 'none' || style.visibility === 'hidden') return;
-            if (parseFloat(style.opacity) < 0.1) return;
+            if (parseFloat(style.opacity) < 0.01) return; // 0.01 instead of 0.1: catch fade-in animations
+            // Skip elements inside aria-hidden containers (not accessible to users)
+            if (el.closest('[aria-hidden="true"]')) return;
+            // Skip non-interactive elements (pointer-events:none = can't be clicked)
+            if (style.pointerEvents === 'none') return;
 
             // Skip if too small
             const rect = el.getBoundingClientRect();
@@ -1256,7 +1265,7 @@ export class SnapshotCollector {
               href: el.tagName === 'A' ? (el as HTMLAnchorElement).href || undefined : undefined,
               placeholder: isInput ? input.placeholder : undefined,
               checked: input.checked || undefined,
-              disabled: input.disabled || el.hasAttribute('disabled'),
+              disabled: input.disabled || el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true',
               visible: true,
               context: getParentContext(el),  // Parent context (legacy, keep for compatibility)
               isInsideActiveModal,  // Mark elements inside modal
@@ -1673,7 +1682,7 @@ export class SnapshotCollector {
             }
 
             const iframeElements = await frame.evaluate((fName: string) => {
-              const selectors = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [onclick], [tabindex]:not([tabindex="-1"])';
+              const selectors = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [role="option"], [role="combobox"], [role="switch"], [role="menuitem"], [role="slider"], [role="searchbox"], [role="textbox"], [role="gridcell"], [role="rowheader"], [role="columnheader"], [onclick], [tabindex]:not([tabindex="-1"]), [contenteditable="true"]';
               const els: any[] = [];
               let idx = 0;
               const MAX_IFRAME_ELEMENTS = 50;
@@ -1742,36 +1751,42 @@ export class SnapshotCollector {
    * @param snapshot - Snapshot to format
    * @returns Formatted string for AI
    */
-  static format(snapshot: LiteSnapshot): string {
+  static format(snapshot: LiteSnapshot, keepRefs?: Set<string>): string {
     if (snapshot.elements.length === 0) {
       return 'No interactive elements found on page.';
     }
 
-    // Cap elements to prevent token explosion on heavy pages
-    const maxElements = LITE_ENGINE_FLAGS.snapshotMaxElements;
+    // Filter elements: pruner-based (dynamic) or legacy (priority sort + cap)
     let elements = snapshot.elements;
-    if (maxElements > 0 && snapshot.elements.length > maxElements) {
-      const priorityScore = (el: LiteElement): number => {
-        // P4: Form inputs — highest priority (user needs to fill these)
-        if (el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select') return 4;
-        // P4: ARIA input widgets (combobox, slider, spinbutton, switch, searchbox, textbox)
-        const inputRoles = ['combobox', 'slider', 'spinbutton', 'switch', 'searchbox', 'textbox'];
-        if (inputRoles.includes(el.role)) return 4;
-        // P3: Buttons, headings, and actionable elements
-        if (el.tag === 'button' || el.role === 'button') return 3;
-        if (el.tag === 'h1' || el.tag === 'h2' || el.tag === 'h3') return 3;
-        // P3: Dropdown options/menu items — critical for selection flows
-        const actionRoles = ['option', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'treeitem'];
-        if (actionRoles.includes(el.role)) return 3;
-        // P2: Links, tabs, summary (accordion triggers)
-        if (el.tag === 'a' || el.role === 'link') return 2;
-        if (el.role === 'tab' || el.tag === 'summary') return 2;
-        // P1: Everything else (containers, listbox, menu, canvas, etc.)
-        return 1;
-      };
-      elements = [...snapshot.elements]
-        .sort((a, b) => priorityScore(b) - priorityScore(a))
-        .slice(0, maxElements);
+    if (keepRefs && keepRefs.size > 0) {
+      // Pre-LLM pruner: keep only elements the pruner selected (dynamic cap)
+      elements = snapshot.elements.filter(el => keepRefs.has(el.ref));
+    } else {
+      // Legacy fallback: priority sort + hardcoded cap
+      const maxElements = LITE_ENGINE_FLAGS.snapshotMaxElements;
+      if (maxElements > 0 && snapshot.elements.length > maxElements) {
+        const priorityScore = (el: LiteElement): number => {
+          // P4: Form inputs — highest priority (user needs to fill these)
+          if (el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select') return 4;
+          // P4: ARIA input widgets (combobox, slider, spinbutton, switch, searchbox, textbox)
+          const inputRoles = ['combobox', 'slider', 'spinbutton', 'switch', 'searchbox', 'textbox'];
+          if (inputRoles.includes(el.role)) return 4;
+          // P3: Buttons, headings, and actionable elements
+          if (el.tag === 'button' || el.role === 'button') return 3;
+          if (el.tag === 'h1' || el.tag === 'h2' || el.tag === 'h3') return 3;
+          // P3: Dropdown options/menu items — critical for selection flows
+          const actionRoles = ['option', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'treeitem'];
+          if (actionRoles.includes(el.role)) return 3;
+          // P2: Links, tabs, summary (accordion triggers)
+          if (el.tag === 'a' || el.role === 'link') return 2;
+          if (el.role === 'tab' || el.tag === 'summary') return 2;
+          // P1: Everything else (containers, listbox, menu, canvas, etc.)
+          return 1;
+        };
+        elements = [...snapshot.elements]
+          .sort((a, b) => priorityScore(b) - priorityScore(a))
+          .slice(0, maxElements);
+      }
     }
 
     // Group elements by role
