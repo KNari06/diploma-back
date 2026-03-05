@@ -141,6 +141,8 @@ export interface ErrorSignals {
     responseBody?: any;
     /** V11: Parsed field-level validation errors from response body */
     fieldErrors?: Array<{ field: string; message: string }>;
+    /** V11: Internal promise for async body capture — await before reading responseBody/fieldErrors */
+    _bodyPromise?: Promise<void>;
   }>;
   uiErrors: Array<{
     text: string;

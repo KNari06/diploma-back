@@ -87,6 +87,7 @@ export class ErrorCollectorService {
         logger.debug('[ERROR_COLLECTOR] HTTP error', { url, status });
 
         // V11: Enhanced 4xx body capture for mutating requests (validation error detection)
+        // Store the promise on the entry so consumers can await it before reading responseBody/fieldErrors
         if (status >= 400 && status < 500) {
           const isMutating = ['POST', 'PUT', 'DELETE', 'PATCH'].includes(method);
           if (isMutating) {
@@ -95,7 +96,7 @@ export class ErrorCollectorService {
               if (contentType.includes('application/json')) {
                 const bodyPromise = response.json?.();
                 if (bodyPromise && typeof bodyPromise.then === 'function') {
-                  bodyPromise.then((parsed: any) => {
+                  errorEntry._bodyPromise = bodyPromise.then((parsed: any) => {
                     if (parsed) {
                       // Truncate large bodies to 2KB — store as raw string when truncating
                       // (JSON.parse of a truncated string always throws — store string directly)

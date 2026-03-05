@@ -88,6 +88,41 @@ function reduceProgressPayload(payload: any): any {
   return safeCloneForStorage(payload, { maxDepth: 4, maxStringLen: 2000, maxArrayLen: 50, maxObjectKeys: 50 });
 }
 
+function reduceRuntimeMeta(meta: any): any {
+  if (!meta || typeof meta !== 'object') return undefined;
+  return {
+    stepId: truncateString(meta.stepId, 128),
+    runtimeStatus: truncateString(meta.runtimeStatus, 32),
+    source: truncateString(meta.source, 32),
+    confidenceTier: truncateString(meta.confidenceTier, 16),
+    failedReason: truncateString(meta.failedReason, 64),
+    failureExplanation: truncateString(meta.failureExplanation, 2000),
+    executionMs: typeof meta.executionMs === 'number' ? meta.executionMs : undefined,
+    rootCause: truncateString(meta.rootCause, 32),
+    networkVerdict: truncateString(meta.networkVerdict, 64),
+    bugScreenshotUrl: truncateString(meta.bugScreenshotUrl, 2000),
+    healConfidence: typeof meta.healConfidence === 'number' ? meta.healConfidence : undefined,
+    needsReview: typeof meta.needsReview === 'boolean' ? meta.needsReview : undefined,
+    flaky: typeof meta.flaky === 'boolean' ? meta.flaky : undefined,
+    resolutionPath: truncateString(meta.resolutionPath, 32),
+    networkEvidence: Array.isArray(meta.networkEvidence)
+      ? meta.networkEvidence.slice(0, 10).map((e: any) => ({
+          method: truncateString(e?.method, 16),
+          url: truncateString(e?.url, 500),
+          status: typeof e?.status === 'number' ? e.status : undefined,
+          error: truncateString(e?.error, 500),
+        }))
+      : undefined,
+    stepErrors: meta.stepErrors && typeof meta.stepErrors === 'object'
+      ? {
+          console: typeof meta.stepErrors.console === 'number' ? meta.stepErrors.console : 0,
+          network: typeof meta.stepErrors.network === 'number' ? meta.stepErrors.network : 0,
+          ui: typeof meta.stepErrors.ui === 'number' ? meta.stepErrors.ui : 0,
+        }
+      : undefined,
+  };
+}
+
 function reduceStepCompletedPayload(payload: any): any {
   if (payload && typeof payload === 'object') {
     return {
@@ -97,6 +132,8 @@ function reduceStepCompletedPayload(payload: any): any {
       stepDescription: truncateString(payload.stepDescription, 2000),
       success: typeof payload.success === 'boolean' ? payload.success : undefined,
       timestamp: truncateString(payload.timestamp, 64),
+      // V11: Preserve runtimeMeta so V11 data survives Redis → Postgres persistence
+      runtimeMeta: reduceRuntimeMeta(payload.runtimeMeta),
     };
   }
 

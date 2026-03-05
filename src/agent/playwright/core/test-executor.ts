@@ -562,6 +562,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             });
 
             if (validation4xxErrors.length > 0) {
+              // V11: Await async body capture promises before reading responseBody/fieldErrors
+              const bodyPromises = validation4xxErrors
+                .map(e => e._bodyPromise)
+                .filter((p): p is Promise<void> => !!p);
+              if (bodyPromises.length > 0) {
+                await Promise.race([
+                  Promise.allSettled(bodyPromises),
+                  new Promise(resolve => setTimeout(resolve, 2000)), // 2s timeout to avoid hanging
+                ]);
+              }
+
               // Always scan UI for error toasts/banners when 4xx detected
               try { await errorCollector.collectUIErrors(); } catch { /* non-fatal */ }
               const updatedStepErrors = errorCollector.getErrorsSince(stepStartedAt);
