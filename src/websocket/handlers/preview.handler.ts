@@ -350,6 +350,53 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           devtoolsRegistry.start(previewSessionId, room, newPage, nsp);
 
           logger.info('[PREVIEW_STREAM] Streams restarted after page switch', { previewSessionId });
+
+          // V11: Force-emit a fresh DOM snapshot after page switch.
+          // DOM tick may have been blocked by pageSwitchInProgress, so we need to send
+          // the first valid snapshot explicitly. Retry up to 3 times if nodeCount is 0
+          // (page may still be rendering).
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
+                force: true,
+                includeDomNodes: true,
+              });
+              if (snapshot) {
+                const payload: PreviewPagePayload = {
+                  previewSessionId,
+                  url: snapshot.url,
+                  domVersion: snapshot.domVersion,
+                  pageSignature: snapshot.pageSignature,
+                  domNodes: snapshot.domNodes,
+                  timestamp: new Date().toISOString(),
+                };
+                nsp.to(room).emit('preview:page', payload);
+                videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+
+                logger.info('[PREVIEW_STREAM] Emitted fresh snapshot after page switch', {
+                  previewSessionId,
+                  attempt,
+                  domVersion: snapshot.domVersion,
+                  nodeCount: snapshot.domNodes?.length || 0,
+                });
+
+                // If we got actual DOM nodes, we're done
+                if (snapshot.domNodes && snapshot.domNodes.length > 0) {
+                  break;
+                }
+              }
+              // Wait before retry (page may still be rendering)
+              if (attempt < 3) {
+                await new Promise(r => setTimeout(r, 1000));
+              }
+            } catch (snapshotError) {
+              logger.warn('[PREVIEW_STREAM] Failed to emit snapshot after page switch', {
+                previewSessionId,
+                attempt,
+                error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError),
+              });
+            }
+          }
         } catch (restartError) {
           logger.warn('[PREVIEW_STREAM] Failed to restart streams after page switch', {
             previewSessionId,

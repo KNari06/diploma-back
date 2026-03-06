@@ -114,6 +114,9 @@ interface InternalSession extends PreviewSession {
 
   /** V11: Callback invoked when session switches to a new page (popup/navigation) */
   onPageSwitch?: (newPage: Page, previousUrl: string) => void;
+
+  /** V11: True while page switch is in progress — blocks DOM tick from collecting stale/empty snapshots */
+  pageSwitchInProgress?: boolean;
 }
 
 /**
@@ -1104,6 +1107,11 @@ export class PreviewSessionService {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
 
+    // V11: Block snapshot collection during page switch to prevent stale/empty DOM emission
+    if (session.pageSwitchInProgress) {
+      return null;
+    }
+
     const now = Date.now();
     const includeScreenshot = options?.includeScreenshot === true; // Default false now
 
@@ -1431,6 +1439,9 @@ export class PreviewSessionService {
           newUrl,
         });
 
+        // V11: Block snapshot collection during page switch to prevent stale/empty DOM
+        session.pageSwitchInProgress = true;
+
         // Close old page (best-effort, don't fail if already closed)
         const oldPage = session.page;
         try {
@@ -1447,9 +1458,20 @@ export class PreviewSessionService {
         this.attachCrashHandler(newPage, previewSessionId);
         this.attachPageDownloadHandler(newPage, previewSessionId);
 
+        // V11: Wait for new page to be fully loaded before allowing snapshot collection.
+        // This prevents race conditions where DOM tick collects empty/partial DOM.
+        try {
+          await newPage.waitForLoadState('load', { timeout: 8000 });
+        } catch {
+          // Timeout is acceptable — page may have slow resources. DOM should still be ready.
+        }
+
         // Reset snapshot state so next getSnapshot() forces a fresh collect
         session.lastSnapshotEmit = 0;
         session.lastPageSignature = '';
+
+        // V11: Unblock snapshot collection now that new page is loaded
+        session.pageSwitchInProgress = false;
 
         // Update recording URL baseline if recording
         if (session.recording) {
@@ -1485,6 +1507,11 @@ export class PreviewSessionService {
           previewSessionId,
           error: error instanceof Error ? error.message : String(error),
         });
+
+        // V11: Ensure pageSwitchInProgress is cleared even on error
+        if (session) {
+          session.pageSwitchInProgress = false;
+        }
 
         // If we can't switch, close the popup to avoid orphaned pages
         try {

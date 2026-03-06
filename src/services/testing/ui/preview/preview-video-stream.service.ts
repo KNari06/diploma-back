@@ -62,7 +62,7 @@ export class PreviewVideoStreamService {
   // Socket.IO namespace for direct emit
   private nsp: Namespace | null = null;
 
-  // Frame tracking
+  // Frame tracking (seq starts at 0 or inherits from previous stream on page switch)
   private seq = 0;
   private lastFrameTime = 0;
   private pendingFrames = 0;
@@ -87,10 +87,18 @@ export class PreviewVideoStreamService {
   // Stats interval
   private statsInterval: NodeJS.Timeout | null = null;
 
-  constructor(previewSessionId: string, userId: string, room: string) {
+  constructor(previewSessionId: string, userId: string, room: string, initialSeq?: number) {
     this.previewSessionId = previewSessionId;
     this.userId = userId;
     this.room = room;
+    if (initialSeq !== undefined) {
+      this.seq = initialSeq;
+    }
+  }
+
+  /** Get current seq value (for passing to replacement stream on page switch) */
+  getSeq(): number {
+    return this.seq;
   }
 
   /**
@@ -571,10 +579,14 @@ export class PreviewVideoStreamRegistry {
     page: Page,
     nsp: Namespace
   ): Promise<boolean> {
+    // Capture seq from old stream before stopping (for continuity on page switch)
+    const oldStream = this.streams.get(previewSessionId);
+    const inheritedSeq = oldStream ? oldStream.getSeq() : undefined;
+
     // Stop existing stream if any
     await this.stopStream(previewSessionId);
 
-    const stream = new PreviewVideoStreamService(previewSessionId, userId, room);
+    const stream = new PreviewVideoStreamService(previewSessionId, userId, room, inheritedSeq);
     const started = await stream.start(page, nsp);
 
     if (started) {
