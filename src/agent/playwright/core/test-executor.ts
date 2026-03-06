@@ -26,6 +26,7 @@ import { createRunKey, TestRunRegistry } from './test-run-registry';
 import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { waitForStepReadiness, shouldSkipLookaheadAfter } from '@/services/testing/ui/preview/step-readiness.service';
 import type { IntentStep, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
+import { setupThirdPartyBlocker } from '../execution/third-party-blocker';
 
 /**
  * Resolve workspaceId from projectId (for AI usage tracking).
@@ -205,6 +206,33 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     page = await context.newPage();
     if (!page) {
       throw new Error('Failed to create page');
+    }
+
+    // ✅ Block third-party requests (analytics, tracking, chat widgets)
+    // This prevents Playwright's waitForNavigation/networkidle from waiting
+    // for slow third-party services (Intercom, Google Analytics, etc.)
+    try {
+      const blocker = await setupThirdPartyBlocker(page);
+      // Cleanup will happen when page/context closes; log stats at the end
+      page.on('close', async () => {
+        const stats = blocker.getStats();
+        if (stats.totalBlocked > 0) {
+          logger.info('[PLAYWRIGHT] Third-party blocker stats', {
+            testId: testData.testId,
+            totalBlocked: stats.totalBlocked,
+            topDomains: Array.from(stats.blockedByDomain.entries())
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 5)
+              .map(([domain, count]) => `${domain}:${count}`),
+          });
+        }
+      });
+    } catch (blockerError) {
+      // Non-fatal: test should still work without blocking
+      logger.warn('[PLAYWRIGHT] Failed to setup third-party blocker', {
+        testId: testData.testId,
+        error: blockerError instanceof Error ? blockerError.message : String(blockerError),
+      });
     }
 
     // Register test run in global registry for abort capability

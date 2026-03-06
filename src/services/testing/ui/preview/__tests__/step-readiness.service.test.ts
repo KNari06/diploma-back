@@ -110,7 +110,7 @@ describe('step-readiness.service', () => {
       expect(result.skipReason).toBe('disableLookaheadWait flag set');
     });
 
-    it('should skip for navigate action (non-targeting)', async () => {
+    it('should apply blind settle for navigate action (needs JS hydration)', async () => {
       const step: IntentStep = {
         id: 'test-2',
         type: 'navigate',
@@ -121,7 +121,7 @@ describe('step-readiness.service', () => {
 
       expect(result.ready).toBe(true);
       expect(result.waited).toBe(0);
-      expect(result.skipReason).toContain('Non-targeting action');
+      expect(result.skipReason).toContain('No locator');
     });
 
     it('should skip for wait action', async () => {

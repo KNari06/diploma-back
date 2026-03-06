@@ -37,22 +37,46 @@ export async function navigateToUrl(
   });
 
   // Try navigation with different wait strategies
+  // Use 'load' to ensure JS hydration completes (SPA frameworks like Framer, React, Next.js)
   let navigationResponse = null;
+  let usedWaitStrategy: 'load' | 'domcontentloaded' | 'networkidle' = 'load';
+  const navStartMs = Date.now();
   try {
     navigationResponse = await page.goto(testData.url, {
-      waitUntil: 'domcontentloaded', // Faster and more reliable than 'load'
-      timeout: 45000, // Increase timeout
+      waitUntil: 'load',
+      timeout: 45000,
     });
   } catch (timeoutError) {
-    // Try with 'networkidle' as fallback
-    logger.warn('[PLAYWRIGHT] Navigation with domcontentloaded timed out, trying networkidle', {
+    usedWaitStrategy = 'domcontentloaded';
+    logger.warn('[PLAYWRIGHT] Navigation with load timed out, trying domcontentloaded', {
       testId: testData.testId,
+      elapsedMs: Date.now() - navStartMs,
     });
-    navigationResponse = await page.goto(testData.url, {
-      waitUntil: 'networkidle',
-      timeout: 30000,
-    });
+    try {
+      navigationResponse = await page.goto(testData.url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000,
+      });
+    } catch (timeoutError2) {
+      usedWaitStrategy = 'networkidle';
+      logger.warn('[PLAYWRIGHT] Navigation with domcontentloaded timed out, trying networkidle', {
+        testId: testData.testId,
+        elapsedMs: Date.now() - navStartMs,
+      });
+      navigationResponse = await page.goto(testData.url, {
+        waitUntil: 'networkidle',
+        timeout: 30000,
+      });
+    }
   }
+  const navDurationMs = Date.now() - navStartMs;
+
+  logger.info('[PLAYWRIGHT] Initial page load complete', {
+    testId: testData.testId,
+    waitStrategy: usedWaitStrategy,
+    navDurationMs,
+    url: testData.url,
+  });
 
   // ✅ FIX: Check response status
   if (navigationResponse) {

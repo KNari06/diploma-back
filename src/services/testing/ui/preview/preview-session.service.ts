@@ -12,6 +12,7 @@ import { Browser, BrowserContext, Page, chromium } from 'playwright';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { DomAnalysisExtractorService } from './dom-analysis-extractor.service';
 import type { InteractiveNode, PreviewSession } from './preview.types';
+import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
 
 // Configuration (balanced limits to avoid OOM)
 const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -306,6 +307,13 @@ export class PreviewSessionService {
 
         page = await context.newPage();
 
+        // Block third-party requests to prevent slow networkidle waits
+        try {
+          await setupThirdPartyBlocker(page);
+        } catch {
+          // Non-fatal: preview should work without blocker
+        }
+
         // Navigate to start URL
         await page.goto(safeStartUrl, {
           waitUntil: 'domcontentloaded',
@@ -459,6 +467,13 @@ export class PreviewSessionService {
       });
 
       newPage = await newContext.newPage();
+
+      // Block third-party requests to prevent slow networkidle waits
+      try {
+        await setupThirdPartyBlocker(newPage);
+      } catch {
+        // Non-fatal: preview should work without blocker
+      }
 
       await newPage.goto(startUrl, {
         waitUntil: 'domcontentloaded',

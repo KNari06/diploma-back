@@ -249,7 +249,7 @@ export class CommandExecutor {
         case 'goto':
           if (!url) throw new Error('URL is required for goto action');
           await this.page.goto(url, {
-            waitUntil: command.waitFor || 'domcontentloaded',
+            waitUntil: command.waitFor || 'load',
             timeout: timeout || 30000,
           });
           break;
@@ -3665,12 +3665,16 @@ export class CommandExecutor {
     // Priority: changedFrom > regex > glob > substring > domain
 
     if (matcher.changedFrom) {
-      // Wait until URL changes from the specified value
+      // Wait until URL changes from the specified value.
+      // Use page.waitForURL which is navigation-lifecycle-aware:
+      // - Checks current URL immediately (catches already-changed case)
+      // - Listens for frame.navigated events (catches in-flight navigation)
+      // - Waits for waitUntil load state after URL matches (ensures page is ready)
+      // - Handles both full-page nav and SPA pushState
       const prevUrl = matcher.changedFrom;
-      await this.page.waitForFunction(
-        (prev: string) => String((globalThis as any).location?.href ?? '') !== prev,
-        prevUrl,
-        { timeout: timeoutMs }
+      await this.page.waitForURL(
+        (url) => url.toString() !== prevUrl,
+        { timeout: timeoutMs, waitUntil: 'domcontentloaded' }
       );
       logger.debug('[COMMAND_EXECUTOR] URL changed from previous value', {
         prevUrl,

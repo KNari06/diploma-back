@@ -225,15 +225,16 @@ export class GitWebhookService {
   static async updateDeliveryStatus(
     provider: GitProvider,
     deliveryId: string,
-    params: { status: 'received' | 'queued' | 'processed' | 'ignored' | 'failed'; error?: string }
+    params: { status: 'received' | 'queued' | 'processed' | 'ignored' | 'failed'; error?: string; regressionRunId?: string }
   ): Promise<void> {
-    const { status, error } = params;
+    const { status, error, regressionRunId } = params;
 
     const update: any = { status };
     if (status === 'processed' || status === 'failed' || status === 'ignored') {
       update.processed_at = new Date().toISOString();
     }
     if (error) update.error = error;
+    if (regressionRunId) update.regression_run_id = regressionRunId;
 
     const { error: updateError } = await supabaseAdmin
       .from('git_webhook_deliveries')

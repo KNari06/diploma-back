@@ -252,7 +252,7 @@ export function convertIntentStepToCommand(
     case 'navigate':
       // For navigate, use the value as URL, or fallback to test case startUrl
       command.url = step.value || testCaseStartUrl;
-      command.waitFor = 'domcontentloaded';
+      command.waitFor = 'load';
       break;
 
     case 'press':
@@ -373,7 +373,7 @@ export function convertIntentStepsToCommands(
     {
       action: 'goto',
       url: startUrl,
-      waitFor: 'domcontentloaded',
+      waitFor: 'load',
       timeout: 30000,
       description: `Navigate to ${startUrl}`,
     },
@@ -387,6 +387,18 @@ export function convertIntentStepsToCommands(
     // V2: Add intentTestCaseId for heal persistence
     if (intentTestCaseId && command.intentMeta) {
       command.intentMeta.intentTestCaseId = intentTestCaseId;
+    }
+
+    // Peek ahead: if next step expects URL change, mark this command to await navigation.
+    // This makes performClick use Promise.all([page.waitForNavigation(), locator.click()])
+    // which correctly captures navigation triggered by the click.
+    if (i < steps.length - 1) {
+      const nextStep = steps[i + 1];
+      if (nextStep.type === 'wait_for' && nextStep.options?.urlMatcher?.changedFrom) {
+        if (['click', 'open', 'close', 'toggle'].includes(step.type)) {
+          command.awaitNavigation = true;
+        }
+      }
     }
 
     commands.push(command);
