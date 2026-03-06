@@ -71,7 +71,7 @@ export interface LookaheadOptions {
 
 /** Action types that don't target elements (skip lookahead entirely) */
 const NON_TARGETING_ACTIONS: Set<IntentActionType> = new Set([
-  'navigate',
+  // 'navigate' removed — goto needs lookahead for JS hydration after domcontentloaded
   'wait',
   'wait_for',
   'ai_check',
@@ -87,6 +87,7 @@ const NAVIGATION_TRIGGER_ACTIONS: Set<IntentActionType> = new Set([
   'close',
   'toggle',
   'press',
+  'navigate', // goto triggers full page navigation, needs networkIdle + DOM settle
 ]);
 
 /** Action types that require visible + enabled */

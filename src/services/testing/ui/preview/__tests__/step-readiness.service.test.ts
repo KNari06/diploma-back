@@ -58,8 +58,8 @@ describe('step-readiness.service', () => {
   // ─────────────────────────────────────────────────────────────────────────
 
   describe('shouldSkipLookaheadAfter', () => {
-    it('should return true for navigate action', () => {
-      expect(shouldSkipLookaheadAfter('navigate')).toBe(true);
+    it('should return false for navigate action (goto needs lookahead for JS hydration)', () => {
+      expect(shouldSkipLookaheadAfter('navigate')).toBe(false);
     });
 
     it('should return true for wait action', () => {
