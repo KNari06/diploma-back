@@ -3,7 +3,7 @@
  * Automatically repairs broken selectors using AI Selector Engine
  *
  * Resolution pipeline:
- *   1. Fast mode: DOM-only embeddings + LLM disambiguation
+ *   1. Fast mode: DOM-only LLM resolver
  *   2. Accurate mode (escalation): DOM + screenshot → Gemini Vision
  *
  * Escalation triggers when fast mode fails:
@@ -102,7 +102,7 @@ export class SelfHealingService {
         // ── Phase 1: Vision fallback in accurate mode ───────────────────
         // If we have a screenshot (accurate mode), try Gemini Vision as last resort
         if (mode === 'accurate' && screenshot) {
-          logger.info('[SELF_HEALING] Embeddings failed in accurate mode, trying vision resolution', {
+          logger.info('[SELF_HEALING] LLM resolver failed in accurate mode, trying vision resolution', {
             oldSelector,
             intent: intent.substring(0, 100),
           });
@@ -389,7 +389,7 @@ export class SelfHealingService {
 
   /**
    * Resolve element using Gemini Vision (screenshot + DOM nodes + intent).
-   * Called when embeddings-based resolution fails in accurate mode.
+   * Called when LLM-based resolution fails in accurate mode.
    *
    * Sends a page screenshot alongside the interactive node list and intent
    * to Gemini 2.0 Flash for visual element identification.

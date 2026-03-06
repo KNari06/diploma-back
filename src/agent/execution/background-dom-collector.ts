@@ -8,7 +8,7 @@
  * - Collects interactive elements with all attributes needed for resolution
  * - Injects temporary data-agent-ref attributes for targeting
  * - No preview session or WebSocket dependency
- * - Compatible with embeddings-based resolution
+ * - Compatible with LLM-based element resolution
  */
 
 import type { InteractiveNode } from '@/services/testing/ui/preview/preview.types';

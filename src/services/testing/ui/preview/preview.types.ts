@@ -203,11 +203,11 @@ export interface ResolutionMeta {
   allowedCount: number;
   /** Rule IDs that were applied */
   usedRules?: string[];
-  /** Whether embeddings were used for ranking */
-  usedEmbeddings: boolean;
+  /** Whether LLM was used for element resolution */
+  usedLLM: boolean;
   /** Confidence tier based on resolution quality */
   confidenceTier: ConfidenceTier;
-  /** Top similarity score (if embeddings used) */
+  /** Top similarity score from LLM resolution */
   topSimilarity?: number;
 }
 
@@ -514,26 +514,18 @@ export interface LintResult {
   clarificationQuestion?: string;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // V4: Embeddings-based resolver fields
+  // V7: LLM-based resolver fields
   // ═══════════════════════════════════════════════════════════════════════════
-  /** True if embeddings failed and rule-based fallback was used */
+  /** True if LLM resolver failed and rule-based fallback was used */
   degradedMode?: boolean;
-  /** Reason for degraded mode (e.g., "embeddings_timeout", "rate_limited") */
+  /** Reason for degraded mode (e.g., "llm_circuit_breaker", "rate_limited") */
   degradedReason?: string;
-  /** Top similarity score from embeddings ranking */
+  /** Top similarity score from LLM resolution */
   topSimilarity?: number;
   /** Delta between top and second similarity */
   similarityDelta?: number;
-  /** Whether embeddings cache was hit */
+  /** Whether LLM cache was hit */
   cacheHit?: boolean;
-  /** Embeddings latency in milliseconds */
-  embeddingsLatencyMs?: number;
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // V5: LLM disambiguation fields
-  // ═══════════════════════════════════════════════════════════════════════════
-  /** True if LLM disambiguation was used to select the element */
-  llmDisambiguationUsed?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -568,8 +560,7 @@ export type FailedReason =
 export type ResolutionPath = 
   | 'compiled'
   | 'evidence'
-  | 'embeddings'
-  | 'llm_disambiguation'
+  | 'llm_resolver'
   | 'rule_fallback'
   | 'self_heal';
 

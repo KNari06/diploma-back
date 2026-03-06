@@ -228,7 +228,7 @@ export class DOMNodeExtractor {
             const attributes = getAttributes(element);
             const role = element.getAttribute('role') || undefined;
 
-            // Resolve associated <label> text (critical for embeddings accuracy)
+            // Resolve associated <label> text (critical for LLM resolution accuracy)
             // Follows: <label for="id"> → aria-labelledby → wrapping <label>
             let resolvedLabel = '';
             const elId = element.getAttribute('id');

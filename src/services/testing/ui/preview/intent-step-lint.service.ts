@@ -1,7 +1,7 @@
 /**
- * Intent Step Lint Service V4
- * Embeddings-based linting for step editor (primary) with rule-based fallback
- * Resolves intent steps to candidate elements using multilingual semantic matching
+ * Intent Step Lint Service V7
+ * LLM-based linting for step editor (primary) with rule-based fallback
+ * Resolves intent steps to candidate elements using LLM semantic matching
  */
 
 import {
@@ -15,11 +15,9 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { extractKeywordsSync } from '@/utils/text-processing/ai-keyword-extractor';
 import {
-    invalidateEmbeddingCache,
-    prefetchEmbeddings,
-    resolveWithEmbeddings,
+    resolveElement,
     sanitizeIntent,
-} from './embeddings-resolver.service';
+} from './element-resolver.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type {
     IntentStep,
@@ -29,8 +27,6 @@ import type {
     LintStatus,
 } from './preview.types';
 
-// Re-export for external use
-export { invalidateEmbeddingCache, prefetchEmbeddings };
 
 // Scoring weights (V2: higher weights for labels, hierarchy bonus)
 const WEIGHTS = {
@@ -108,7 +104,7 @@ function normalizeText(text: string | undefined): string {
  *
  * Why:
  * - Users often type intents without spaces ("logout"), while UI text may contain spaces ("Log out").
- * - In degraded modes (embeddings unavailable), rule-based fallback must still match reliably.
+ * - In degraded modes (LLM unavailable), rule-based fallback must still match reliably.
  *
  * We intentionally only remove whitespace here (not all punctuation) to keep behavior predictable.
  */
@@ -135,7 +131,7 @@ function containsKeywords(text: string, keywords: string[]): boolean {
 /**
  * Score a candidate element against an intent step (V2)
  * Includes state-awareness, better label scoring, and hierarchy disambiguation
- * V4: Uses extractKeywordsSync for fallback mode (when embeddings unavailable)
+ * V4: Uses extractKeywordsSync for fallback mode (when LLM unavailable)
  */
 function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: number; reasons: string[]; hardReject: boolean } {
   let score = 0;
@@ -696,12 +692,12 @@ export class IntentStepLintService {
   }
 
   /**
-   * V5: Lint step with embeddings-based semantic matching (PRIMARY)
+   * V7: Lint step with LLM-based element resolution (PRIMARY)
    *
-   * Architecture (V3/V5):
+   * Architecture:
    * 1. Evidence shortcut (if enabled) with action-type validation
-   * 2. Embeddings-based resolver with HardAllowed/SoftAllowed sets
-   * 3. Count-based decision: 0→AI, 1→resolved, >1→needs_clarification
+   * 2. LLM-based resolver with HardAllowed/SoftAllowed sets
+   * 3. Count-based decision: 0→AI rescue, 1→resolved, >1→LLM selection
    * 4. For needs_clarification: generate LLM message (no candidates by default)
    * 5. Candidates only returned when includeAlternatives=true
    */
@@ -715,7 +711,7 @@ export class IntentStepLintService {
   }): Promise<LintResult> {
     const { previewSessionId, stepDraft, userId, includeAlternatives = false } = params;
 
-    logger.debug('[INTENT_LINT_V5] Linting step with embeddings', {
+    logger.debug('[INTENT_LINT_V7] Linting step with LLM resolver', {
       previewSessionId,
       stepType: stepDraft.type,
       description: stepDraft.description.slice(0, 50),
@@ -835,21 +831,20 @@ export class IntentStepLintService {
       } // if (!urlMismatch)
     }
 
-    // Step 1: Try embeddings-based resolver (PRIMARY) with includeAlternatives flag
-    const embeddingsResult = await resolveWithEmbeddings({
+    // Step 1: Try LLM-based resolver (PRIMARY) with includeAlternatives flag
+    const resolverResult = await resolveElement({
       previewSessionId,
       stepDraft,
       domNodes,
       pageUrl: snapshot.url,
-      disableCaching,
-      includeAlternatives, // V5: Pass flag to control candidate inclusion
+      includeAlternatives,
     });
 
-    // Step 2: If embeddings failed, fall back to rule-based + LLM
-    if (embeddingsResult.degradedMode) {
-      logger.warn('[INTENT_LINT_V5] Embeddings degraded, falling back to rule-based', {
+    // Step 2: If LLM resolver failed, fall back to rule-based
+    if (resolverResult.degradedMode) {
+      logger.warn('[INTENT_LINT_V7] LLM resolver degraded, falling back to rule-based', {
         previewSessionId,
-        degradedReason: embeddingsResult.degradedReason,
+        degradedReason: resolverResult.degradedReason,
       });
 
       // Use old rule-based + LLM fallback
@@ -858,10 +853,10 @@ export class IntentStepLintService {
 
     // Step 2.5: V2 - Handle semantic-zero with explicit AI fallback
     // When we found elements but none semantically match the description
-    if (embeddingsResult.needsAiFallback && (embeddingsResult as any).aiFallbackReason === 'semantic_zero') {
+    if (resolverResult.needsAiFallback && (resolverResult as any).aiFallbackReason === 'semantic_zero') {
       logger.info('[INTENT_LINT_V5] Semantic-zero detected, triggering AI fallback', {
         previewSessionId,
-        topSimilarity: embeddingsResult.topSimilarity,
+        topSimilarity: resolverResult.topSimilarity,
       });
 
       // Generate a helpful clarification message using AI
@@ -869,7 +864,7 @@ export class IntentStepLintService {
         userIntent: sanitizeIntent(stepDraft),
         actionType: stepDraft.type,
         pageUrl: snapshot.url,
-        candidates: embeddingsResult.candidates.slice(0, 5), // Use top candidates for context
+        candidates: resolverResult.candidates.slice(0, 5), // Use top candidates for context
         domNodes,
         isSemanticZero: true, // V2: Flag for semantic-zero specific messaging
       });
@@ -883,7 +878,7 @@ export class IntentStepLintService {
       }
 
       return {
-        ...embeddingsResult,
+        ...resolverResult,
         status: 'needs_clarification', // Change to needs_clarification for UI handling
         message,
         clarificationQuestion: clarifyResult.question,
@@ -894,18 +889,17 @@ export class IntentStepLintService {
     }
 
     // Step 3: If needs_clarification, generate LLM clarification message
-    if (embeddingsResult.status === 'needs_clarification') {
+    if (resolverResult.status === 'needs_clarification') {
       // For clarification, we always need candidates for LLM context (even if not returned to frontend)
       // Temporarily fetch candidates for LLM if not already included
-      let candidatesForLLM = embeddingsResult.candidates;
+      let candidatesForLLM = resolverResult.candidates;
       if (candidatesForLLM.length === 0) {
         // Re-resolve with includeAlternatives=true just for LLM context
-        const withCandidates = await resolveWithEmbeddings({
+        const withCandidates = await resolveElement({
           previewSessionId,
           stepDraft,
           domNodes,
           pageUrl: snapshot.url,
-          disableCaching: true, // Don't cache this auxiliary call
           includeAlternatives: true,
         });
         candidatesForLLM = withCandidates.candidates;
@@ -921,26 +915,26 @@ export class IntentStepLintService {
       });
 
       // Build the message with examples if available
-      let message = clarifyResult.question || embeddingsResult.message;
+      let message = clarifyResult.question || resolverResult.message;
       if (clarifyResult.examples && clarifyResult.examples.length > 0) {
         message += `\n\nExamples:\n${clarifyResult.examples.map(e => `• "${e}"`).join('\n')}`;
       }
 
       return {
-        ...embeddingsResult,
+        ...resolverResult,
         message,
         clarificationQuestion: clarifyResult.question,
         interpretation: clarifyResult.interpretation,
-        // V5: candidates and highlight already controlled by includeAlternatives in embeddingsResult
+        // candidates and highlight already controlled by includeAlternatives in resolverResult
       };
     }
 
-    // Step 4: Return embeddings result as-is
-    return embeddingsResult;
+    // Step 4: Return resolver result as-is
+    return resolverResult;
   }
 
   /**
-   * V4: Rule-based fallback (used when embeddings fail)
+   * V4: Rule-based fallback (used when LLM resolver fails)
    * IMPORTANT: LLM is allowed ONLY to generate clarification text (never selects refs).
    */
   private static async lintStepWithRuleBasedFallback(
@@ -962,7 +956,7 @@ export class IntentStepLintService {
       return {
         ...ruleResult,
         degradedMode: true,
-        degradedReason: 'embeddings_unavailable',
+        degradedReason: 'llm_unavailable',
       };
     }
 
@@ -971,7 +965,7 @@ export class IntentStepLintService {
       return {
         ...ruleResult,
         degradedMode: true,
-        degradedReason: 'embeddings_unavailable',
+        degradedReason: 'llm_unavailable',
       };
     }
 
@@ -988,7 +982,7 @@ export class IntentStepLintService {
         candidates: [],
         highlight: [],
         degradedMode: true,
-        degradedReason: 'embeddings_unavailable',
+        degradedReason: 'llm_unavailable',
       };
     }
 
@@ -1020,7 +1014,7 @@ export class IntentStepLintService {
       clarificationQuestion: clarifyResult.question,
       needsAiFallback: false,
       degradedMode: true,
-      degradedReason: 'embeddings_unavailable',
+      degradedReason: 'llm_unavailable',
     };
   }
 

@@ -317,7 +317,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       const { ErrorCollectorService } = await import('@/agent/utils/analysis/error-collector.service');
 
       // Create executor with self-healing enabled (for AI fallback without clarification)
-      // On retry attempts: skip compiled plan (Stage 1) and go straight to embeddings (Stage 2)
+      // On retry attempts: skip compiled plan (Stage 1) and go straight to LLM resolver (Stage 2)
       const executor = new CommandExecutor(page, {
         selfHealingEnabled: true,
         skipCompiledPlan: retryAttempt > 0,

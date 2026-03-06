@@ -3,7 +3,7 @@
  * Lookahead wait mechanism for inter-step stability
  *
  * Provides fast Playwright-based element readiness checks before executing next step.
- * Uses ONLY fast DOM checks (isVisible, isEnabled, count) - NO embeddings or AI resolution.
+ * Uses ONLY fast DOM checks (isVisible, isEnabled, count) - NO LLM or AI resolution.
  *
  * Key features:
  * - Fast precondition checks using compiled locatorPlan or evidence.lastSuccessRef
@@ -399,7 +399,7 @@ function buildFastLocators(page: Page, step: IntentStep): Locator[] {
 
 /**
  * Check if element meets preconditions for action type.
- * Uses ONLY fast Playwright checks — no embeddings or AI.
+ * Uses ONLY fast Playwright checks — no LLM or AI.
  * Playwright's isVisible()/isEnabled()/count() are non-waiting and return instantly.
  */
 async function checkPreconditionsSingle(

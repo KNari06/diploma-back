@@ -316,18 +316,18 @@ export class TestCompletionHandlerService {
 // ═══════════════════════════════════════════════════════════════════════════
 // AI SELECTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════════════
-// Resolves selectors using embeddings-based element matching.
-// Converts DOMNode[] → InteractiveNode[], calls resolveWithEmbeddings(),
+// Resolves selectors using LLM-based element matching.
+// Converts DOMNode[] → InteractiveNode[], calls resolveElement(),
 // and builds Playwright-compatible selectors from the result.
 
 import type { DOMNode, SelectorCandidate, SelectorResolveRequest, SelectorResolveResponse, SelectorType } from './types';
-import { resolveWithEmbeddings } from '@/services/testing/ui/preview/embeddings-resolver.service';
+import { resolveElement } from '@/services/testing/ui/preview/element-resolver.service';
 import type { InteractiveNode } from '@/services/testing/ui/preview/preview.types';
 
 export class AISelectorEngine {
   /**
-   * Resolve selector using embeddings-based element matching.
-   * Converts DOMNode[] to InteractiveNode[], runs resolveWithEmbeddings(),
+   * Resolve selector using LLM-based element matching.
+   * Converts DOMNode[] to InteractiveNode[], runs resolveElement(),
    * and returns the best Playwright selector with fallbacks.
    */
   static async resolve(request: SelectorResolveRequest): Promise<SelectorResolveResponse> {
@@ -346,22 +346,20 @@ export class AISelectorEngine {
         };
       }
 
-      // Build a minimal IntentStep for resolveWithEmbeddings
+      // Build a minimal IntentStep for resolveElement
       const stepDraft = {
         id: `ai-selector-${Date.now()}`,
         type: AISelectorEngine.inferActionType(request.intent) as any,
         description: request.intent,
       };
 
-      // Call embeddings resolver
-      const lintResult = await resolveWithEmbeddings({
+      // Call LLM element resolver
+      const lintResult = await resolveElement({
         previewSessionId: `self-heal-${request.metadata.projectId || 'unknown'}`,
         stepDraft,
         domNodes: interactiveNodes,
         pageUrl: request.metadata.url,
-        disableCaching: true, // Self-healing should always use fresh data
         includeAlternatives: true,
-        enableLLMDisambiguation: true,
       });
 
       const aiDuration = Date.now() - startTime;
@@ -371,7 +369,7 @@ export class AISelectorEngine {
         return {
           success: false,
           fallbackSelectors: [],
-          explanation: lintResult.message || 'No matching element found via embeddings',
+          explanation: lintResult.message || 'No matching element found via LLM resolver',
           metrics: { totalDuration: Date.now() - startTime, aiDuration, cacheHit: false },
         };
       }
@@ -425,7 +423,7 @@ export class AISelectorEngine {
         success: true,
         selectedNode,
         fallbackSelectors,
-        explanation: `Resolved via embeddings: ${bestCandidate.reason}`,
+        explanation: `Resolved via LLM: ${bestCandidate.reason}`,
         metrics: { totalDuration: Date.now() - startTime, aiDuration, cacheHit: false },
       };
     } catch (error) {
@@ -444,7 +442,7 @@ export class AISelectorEngine {
   }
 
   /**
-   * Convert DOMNode to InteractiveNode for embeddings resolver.
+   * Convert DOMNode to InteractiveNode for LLM resolver.
    * Uses enriched attributes from DOMNodeExtractor (__resolvedLabel, __containerTitles,
    * __isTopMostAtCenter) to provide the same data quality as background-dom-collector.
    */

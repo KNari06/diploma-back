@@ -294,8 +294,7 @@ export interface TestStepCompletedPayload {
     resolutionPath?:
       | 'compiled'
       | 'evidence'
-      | 'embeddings'
-      | 'llm_disambiguation'
+      | 'llm_resolver'
       | 'rule_fallback'
       | 'self_heal';
     /** Root cause classification from correlated signals */

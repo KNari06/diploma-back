@@ -64,7 +64,7 @@ export async function executePlaywrightTestWithRetry(
 
     try {
       // Pass attempt number so executor can adapt strategy:
-      // - Skip compiled plan on retry (go straight to embeddings)
+      // - Skip compiled plan on retry (go straight to LLM resolver)
       // - Enable video on retry (test already failed, need debug recording)
       const testDataWithRetry = {
         ...testData,

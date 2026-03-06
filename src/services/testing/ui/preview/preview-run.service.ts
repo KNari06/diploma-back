@@ -387,7 +387,7 @@ export class PreviewRunService {
 
             // ─────────────────────────────────────────────────────────────────────
             // Lookahead wait: check next step readiness before executing it
-            // Uses fast Playwright checks only (no AI/embeddings)
+            // Uses fast Playwright checks only (no AI/LLM)
             // ─────────────────────────────────────────────────────────────────────
             if (i < savedSteps.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
               const nextStep = savedSteps[i + 1];

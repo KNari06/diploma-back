@@ -601,26 +601,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             });
           }
 
-          // V4: Prefetch embeddings for faster first lint (async, non-blocking)
-          if (snapshot.domNodes && snapshot.domNodes.length > 0) {
-            setImmediate(async () => {
-              try {
-                const { prefetchEmbeddings } = await import('@/services/testing/ui/preview/intent-step-lint.service');
-                await prefetchEmbeddings({
-                  previewSessionId: normalizedPreviewSessionId,
-                  domNodes: snapshot.domNodes!,
-                  pageUrl: snapshot.url,
-                });
-              } catch (prefetchError) {
-                // Don't fail - prefetch is optimization only
-                logger.debug('[WebSocket] Embeddings prefetch failed (non-critical)', {
-                  socketId: socket.id,
-                  previewSessionId,
-                  error: prefetchError instanceof Error ? prefetchError.message : String(prefetchError),
-                });
-              }
-            });
-          }
         }
       } catch (snapshotError) {
         logger.warn('[WebSocket] Failed to emit initial preview:page', {

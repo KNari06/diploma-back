@@ -8,9 +8,9 @@
 // ============================================================================
 
 /**
- * V4: Simplified prompt for fallback mode only
- * Primary matching is now done via multilingual embeddings
- * LLM is used for: ranking refinement and clarification text generation
+ * V7: Prompt for rule-based fallback mode
+ * Primary matching is done via LLM resolver (Gemini Flash Lite)
+ * This prompt is used for: clarification text generation in fallback mode
  */
 export const EDITOR_RESOLVER_SYSTEM_PROMPT = `You are an AI UI action resolver inside a browser testing editor.
 
