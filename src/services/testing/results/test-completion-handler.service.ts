@@ -327,6 +327,11 @@ export class TestCompletionHandlerService {
   /**
    * Update unified test_executions rows that reference a completed UI test via result->>testId.
    * This enables unified reporting for runs that mix UI and API tests.
+   *
+   * Race-condition guard: regression-run.service writes result.testId AFTER dispatching the
+   * BullMQ job (runTest → updateStatus). If the job finishes before updateStatus completes,
+   * this handler won't find the execution on the first attempt. We retry up to 3 times with
+   * exponential backoff (500ms → 1s → 2s) to let the write land.
    */
   private static async updateTestExecutionsForCompletedUiTest(test: {
     id: string;
@@ -354,22 +359,49 @@ export class TestCompletionHandlerService {
           ? Math.max(0, new Date(test.completed_at).getTime() - new Date(test.created_at).getTime())
           : undefined;
 
-      const { data, error } = await supabaseAdmin
-        .from('test_executions')
-        .update({
-          status: mappedStatus,
-          completed_at: test.completed_at || new Date().toISOString(),
-          duration_ms: durationMs,
-        })
-        .eq('result->>testId', testId)
-        .select('id, run_id');
+      // Retry loop: result->>testId may not be written yet due to race condition
+      // between BullMQ job completion and ExecutionService.updateStatus in regression-run.service.
+      const MAX_ATTEMPTS = 4;
+      let data: any[] | null = null;
 
-      if (error) {
-        logger.warn('[TEST_COMPLETION] Failed to update test_executions for UI test', {
-          error,
-          testId,
-        });
-        return;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const { data: rows, error } = await supabaseAdmin
+          .from('test_executions')
+          .update({
+            status: mappedStatus,
+            completed_at: test.completed_at || new Date().toISOString(),
+            duration_ms: durationMs,
+          })
+          .eq('result->>testId', testId)
+          .select('id, run_id');
+
+        if (error) {
+          logger.warn('[TEST_COMPLETION] Failed to update test_executions for UI test', {
+            error,
+            testId,
+            attempt,
+          });
+          return;
+        }
+
+        if (rows && rows.length > 0) {
+          data = rows;
+          if (attempt > 1) {
+            logger.info('[TEST_COMPLETION] Found test_execution after retry (race condition resolved)', {
+              testId, attempt,
+            });
+          }
+          break;
+        }
+
+        // No rows matched — result.testId may not be persisted yet
+        if (attempt < MAX_ATTEMPTS) {
+          const delay = 500 * Math.pow(2, attempt - 1); // 500ms → 1s → 2s
+          logger.debug('[TEST_COMPLETION] No test_execution found for testId, retrying', {
+            testId, attempt, nextRetryMs: delay,
+          });
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
       }
 
       if (data && data.length > 0) {
@@ -405,6 +437,11 @@ export class TestCompletionHandlerService {
             });
           } catch { /* non-fatal */ }
         }
+      } else {
+        // After all retries, still no execution found — this test may not be part of a regression run
+        logger.debug('[TEST_COMPLETION] No test_execution linked to testId (may not be a regression test)', {
+          testId,
+        });
       }
     } catch (error) {
       logger.warn('[TEST_COMPLETION] Error updating test_executions for UI test', {
