@@ -1324,7 +1324,6 @@ export async function resolveElement(params: {
           type: 'success',
         }],
         cacheHit: false,
-  
         degradedMode: false,
       };
     }
@@ -1371,7 +1370,6 @@ export async function resolveElement(params: {
           candidates: [lintCandidate],
           highlight: [{ ref: rescuedNode.ref, boundingBox: rescuedNode.boundingBox, type: 'success' }],
           cacheHit: false,
-    
           degradedMode: false,
         };
       }
@@ -1429,7 +1427,6 @@ export async function resolveElement(params: {
         type: 'success',
       }],
       cacheHit: false,
-
       degradedMode: false,
     };
   }
@@ -1499,7 +1496,6 @@ export async function resolveElement(params: {
               type: 'success',
             }],
             cacheHit,
-      
             degradedMode: false,
           };
         }
@@ -1547,7 +1543,6 @@ export async function resolveElement(params: {
             candidates: includeAlternatives ? lintCandidates : [],
             highlight,
             cacheHit,
-      
             degradedMode: false,
           };
         }

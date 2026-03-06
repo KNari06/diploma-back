@@ -138,6 +138,7 @@ router.post('/query', kbController.queryKB);
  *       200:
  *         description: List of files
  */
+router.get('/project-files/chunks', kbController.getDocumentChunks);
 router.get('/project-files', kbController.getProjectFiles);
 
 /**

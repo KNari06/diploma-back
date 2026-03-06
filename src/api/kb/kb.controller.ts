@@ -158,7 +158,10 @@ export async function uploadProjectKB(req: Request, res: Response): Promise<void
     successResponse(res, {
       message: 'Project KB file uploaded successfully',
       fileName: file.originalname,
+      name: file.originalname,
       chunkCount: result.chunkCount,
+      chunks: result.chunkCount,
+      status: 'ready',
     });
   } catch (error: any) {
     logger.error('Upload project KB failed', { error });
@@ -434,6 +437,65 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
     }
 
     errorResponse(res, error.message || 'Failed to get stats', 500);
+  }
+}
+
+/**
+ * Get document chunks for preview
+ * GET /api/kb/project-files/chunks?projectId=xxx&fileName=xxx
+ */
+export async function getDocumentChunks(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      errorResponse(res, 'Unauthorized', 401);
+      return;
+    }
+
+    const projectId = req.query.projectId as string;
+    const fileName = req.query.fileName as string;
+
+    if (!projectId || !fileName) {
+      errorResponse(res, 'projectId and fileName are required', 400);
+      return;
+    }
+
+    if (!UUID_REGEX.test(projectId)) {
+      errorResponse(res, 'Invalid project ID format', 400);
+      return;
+    }
+
+    const isOwner = await isProjectOwner(userId, projectId);
+    if (!isOwner) {
+      errorResponse(res, 'Access denied to this project', 403);
+      return;
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('project_kb_chunks')
+      .select('id, content, metadata')
+      .eq('project_id', projectId)
+      .eq('file_name', fileName)
+      .order('metadata->chunkIndex', { ascending: true });
+
+    if (error) {
+      logger.error('[KB_API] Failed to fetch document chunks', { error: error.message, projectId, fileName });
+      errorResponse(res, 'Failed to fetch chunks', 500);
+      return;
+    }
+
+    const chunks = (data || []).map((row, idx) => ({
+      id: row.id,
+      index: row.metadata?.chunkIndex ?? idx,
+      content: row.content,
+      tokenCount: row.metadata?.tokenCount,
+    }));
+
+    successResponse(res, { fileName, totalChunks: chunks.length, chunks });
+  } catch (error: any) {
+    logger.error('[KB_API] Get document chunks failed', { error });
+    if (res.headersSent) return;
+    errorResponse(res, error.message || 'Failed to get chunks', 500);
   }
 }
 
