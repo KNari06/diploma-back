@@ -337,12 +337,23 @@ export async function handleGeneralChat(
           domSummaryLength: editorPageContext.domSummary.length,
           hasTestSteps: !!editorPageContext.testSteps?.length,
         });
+      } else {
+        logger.warn('[GENERAL_CHAT] Editor mode: getPageContext returned null', {
+          previewSessionId: parsedContext.previewSessionId,
+          userId: userId.substring(0, 8) + '...',
+        });
       }
     } catch (editorError) {
       logger.warn('[GENERAL_CHAT] Editor mode: failed to get page context', {
         error: editorError instanceof Error ? editorError.message : String(editorError),
+        previewSessionId: parsedContext.previewSessionId,
       });
     }
+  } else if (mode === 'editor' && !parsedContext?.previewSessionId) {
+    logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context', {
+      hasContext: !!parsedContext,
+      contextKeys: parsedContext ? Object.keys(parsedContext) : [],
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -420,7 +431,8 @@ export async function handleGeneralChat(
   let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId);
 
   // Append editor-specific instructions if in editor mode
-  if (mode === 'editor') {
+  if (mode === 'editor' && editorPageContext) {
+    // Full editor prompt — page context IS available
     systemPrompt += `\n\n--- EDITOR MODE (CRITICAL) ---
 You are connected to the user's AI Editor with a live browser preview.
 You CAN see the current page. A "CURRENT PAGE CONTEXT" system message contains the URL and interactive elements (buttons, inputs, links) visible on the page right now.
@@ -446,6 +458,18 @@ WHEN THE PAGE DOESN'T MATCH THE REQUEST:
 - You CAN include a "navigate" step as the first step to go to the right URL, then describe the remaining steps generically (they'll be resolved at runtime by the element resolver).
 
 When generating test steps, be SPECIFIC — use actual element labels, placeholders, and ref IDs from the page context. Don't generate generic steps like "enter username" — generate "type 'student' into input ref=i1 (Username field)".`;
+  } else if (mode === 'editor' && !editorPageContext) {
+    // Limited editor prompt — page context is NOT available (session expired, snapshot failed, etc.)
+    systemPrompt += `\n\n--- EDITOR MODE (LIMITED) ---
+You are connected to the user's AI Editor, but the live page context is temporarily unavailable.
+This may happen if the preview browser session has expired or the page hasn't finished loading.
+Do NOT say "I can't see images or screenshots" — instead explain that the page preview connection is temporarily unavailable.
+Suggest the user to:
+1. Refresh the preview page (click the refresh button in the preview toolbar)
+2. Re-enter the URL in the AI Editor to start a new preview session
+3. Try sending the message again after the page loads
+
+You can still help with general questions, saved test cases, and test management even without live page context.`;
   }
 
   // Enhance system prompt with old context summary from vector search
