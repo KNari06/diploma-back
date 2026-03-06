@@ -1678,14 +1678,18 @@ export class RegressionRunService {
       return;
     }
 
-    // If only API tests exist, finalize run immediately
-    const finalStatus = apiFailed > 0 ? 'failed' : 'passed';
+    // If only API tests exist, finalize run immediately.
+    // NOTE: regression_runs.status uses 'completed' (not 'passed') for success — match DB convention.
+    const hasFails = apiFailed > 0;
+    const persistedStatus = hasFails ? 'failed' : 'completed';
     await supabaseAdmin
       .from('regression_runs')
       .update({
-        status: finalStatus,
+        status: persistedStatus,
         summary: {
           total: testCases.length,
+          passed: apiPassed,
+          failed: apiFailed,
           api_passed: apiPassed,
           api_failed: apiFailed,
           skipped: skippedCount,
@@ -1696,8 +1700,8 @@ export class RegressionRunService {
       .eq('id', runId);
 
     emitProgress(
-      finalStatus === 'passed' ? 'completed' : 'failed',
-      `Regression run ${finalStatus}: ${apiPassed} passed, ${apiFailed} failed, ${skippedCount} skipped`
+      persistedStatus === 'completed' ? 'completed' : 'failed',
+      `Regression run ${persistedStatus}: ${apiPassed} passed, ${apiFailed} failed, ${skippedCount} skipped`
     );
   }
 

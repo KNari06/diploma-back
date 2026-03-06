@@ -750,7 +750,7 @@ export interface SystemMaintenancePayload {
 export interface RegressionRunProgressPayload {
   runId: string;
   userId: string;
-  status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed';
+  status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed' | 'cancelled';
   progress: number; // 0-100
   message: string;
   /** Machine-readable error code for specific failure reasons (e.g. 'INSUFFICIENT_CREDITS') */

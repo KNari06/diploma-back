@@ -897,10 +897,13 @@ export class TestCompletionHandlerService {
 
           // Emit WebSocket completion event so frontend updates immediately (no polling delay)
           try {
+            const wsStatus = finalStatus === 'passed' ? 'completed'
+              : finalStatus === 'cancelled' ? 'cancelled'
+              : 'failed';
             webSocketService.emitRegressionRunProgress(run.user_id, {
               runId: run.id,
               userId: run.user_id,
-              status: finalStatus === 'passed' ? 'completed' : 'failed',
+              status: wsStatus,
               progress: 100,
               message: finalStatus === 'passed'
                 ? `Run completed: ${summary.passed} passed, ${summary.failed} failed`
@@ -1064,10 +1067,13 @@ export class TestCompletionHandlerService {
 
         // Emit WebSocket completion event (fallback path)
         try {
+          const wsStatus = finalStatus === 'passed' ? 'completed'
+            : finalStatus === 'cancelled' ? 'cancelled'
+            : 'failed';
           webSocketService.emitRegressionRunProgress(run.user_id, {
             runId: run.id,
             userId: run.user_id,
-            status: finalStatus === 'passed' ? 'completed' : 'failed',
+            status: wsStatus,
             progress: 100,
             message: finalStatus === 'passed'
               ? `Run completed: ${passed} passed, ${failed} failed`
