@@ -447,6 +447,8 @@ export interface IntentStep {
    * Auto-classified from description keywords if not explicitly set.
    */
   expectedOutcome?: ExpectedStepOutcome;
+  /** True if this step was auto-injected (e.g., auto wait_for URL change). Soft failure — won't fail the test. */
+  isAutoInjected?: boolean;
 }
 
 /**

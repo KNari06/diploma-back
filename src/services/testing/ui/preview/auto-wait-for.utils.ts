@@ -96,10 +96,11 @@ function createAutoWaitForStep(prevUrl: string): IntentStep {
     id: uuid(),
     type: 'wait_for',
     description: 'Auto: wait for URL change',
+    isAutoInjected: true,
     options: {
       urlMatcher: {
         changedFrom: prevUrl,
-        timeoutMs: 15000,
+        timeoutMs: 5000,
       },
     },
   };

@@ -391,7 +391,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Execute commands step-by-step (wrapped in AI context for self-healing token tracking)
       // Capture narrowed references before entering withAIContext callback
       const commands = testData.commands;
-      const activePage = page!;
+      let activePage = page!;
       let currentStepIndex = 0;
       let needsVideoOnRetry = false; // Set to true if self-healing triggers
       const totalSteps = commands.length;
@@ -447,6 +447,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             stepIndex: currentStepIndex,
             commandType: action,
             description: intentMeta?.elementDescription,
+            currentUrl: activePage.url(),
+            expectedUrl: (command as any).intentMeta?.compiled?.context?.pageUrl,
+            continueOnError: (command as any).continueOnError || undefined,
           });
 
           // Log step_start to replay trace
@@ -486,6 +489,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             // Execute command via CommandExecutor
             // This supports compiled plans, self-healing, AI fallback (no clarification in background)
             const stepResult = await executor.executeCommand(command);
+
+            // Sync activePage — CommandExecutor may have switched to a new tab after click
+            const executorPage = executor.getActivePage();
+            if (executorPage !== activePage) {
+              logger.info('[PLAYWRIGHT] Active page changed (new tab detected)', {
+                testId: testData.testId,
+                oldUrl: activePage.url(),
+                newUrl: executorPage.url(),
+              });
+              activePage = executorPage;
+            }
 
             // Get errors that occurred during this step's execution window
             const stepErrors = errorCollector.getErrorsSince(stepStartedAt);
@@ -724,14 +738,20 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               }
             }
 
+            // Soft failure: continueOnError step returned success=false without throwing
+            const isSoftFailure = !stepResult.success && (command as any).continueOnError;
+
             const stepDurationMs = Date.now() - stepStartedAt;
             const meta = stepResult.runtimeMeta;
-            logger.info('[PLAYWRIGHT] Replay step completed', {
+            logger.info(`[PLAYWRIGHT] Replay step ${isSoftFailure ? 'soft-failed (continueOnError)' : 'completed'}`, {
               testId: testData.testId,
               step: `${currentStepIndex}/${totalSteps}`,
               action,
               description: intentMeta?.elementDescription,
               durationMs: stepDurationMs,
+              success: stepResult.success,
+              softFailure: isSoftFailure || undefined,
+              softFailureError: isSoftFailure ? stepResult.error : undefined,
               source: meta?.source,
               resolutionPath: meta?.resolutionPath,
               confidence: meta?.confidenceTier,
@@ -739,6 +759,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               healConfidence: meta?.healConfidence,
               usedStrategy: meta?.usedLocatorStrategy,
               autoWait: meta?.autoWaitApplied ? `${meta.autoWaitMs}ms` : undefined,
+              currentUrl: isSoftFailure ? activePage.url() : undefined,
               errors: {
                 console: stepErrors.consoleErrors.length,
                 network: stepErrors.networkErrors.length,
@@ -753,9 +774,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
             // Log step_completed to replay trace
             replayTrace.write({
-              eventType: 'step_completed', step: currentStepIndex, totalSteps,
+              eventType: isSoftFailure ? 'step_soft_failed' : 'step_completed', step: currentStepIndex, totalSteps,
               payload: {
-                action, success: true, durationMs: stepDurationMs,
+                action, success: stepResult.success, durationMs: stepDurationMs,
+                softFailure: isSoftFailure || undefined,
+                softFailureError: isSoftFailure ? stepResult.error : undefined,
                 source: meta?.source, resolutionPath: meta?.resolutionPath,
                 usedStrategy: meta?.usedLocatorStrategy, confidence: meta?.confidenceTier,
                 healed: meta?.source === 'self_heal', healConfidence: meta?.healConfidence,
@@ -767,19 +790,19 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               },
             });
 
-            // Emit test:step:completed with success (non-fatal)
+            // Emit test:step:completed (non-fatal)
             try {
               webSocketService.emitTestStepCompleted(testData.testId, {
                 testId: testData.testId,
                 browser: testData.browser,
                 step: currentStepIndex,
                 stepDescription,
-                success: true,
+                success: stepResult.success,
                 timestamp: new Date().toISOString(),
                 runtimeMeta: stepResult.runtimeMeta,
               });
             } catch (wsError) {
-              logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/success)', {
+              logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed)', {
                 testId: testData.testId, step: currentStepIndex,
                 error: wsError instanceof Error ? wsError.message : String(wsError),
               });

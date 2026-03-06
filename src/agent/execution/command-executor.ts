@@ -110,6 +110,13 @@ export class CommandExecutor {
   }
 
   /**
+   * Get the current active page (may change if click opens a new tab)
+   */
+  getActivePage(): Page {
+    return this.page;
+  }
+
+  /**
    * ✅ FIX 1: Cleanup resources (call when done with executor)
    */
   dispose(): void {
@@ -263,13 +270,47 @@ export class CommandExecutor {
             // ✅ Wait for enabled: Ensure element is not disabled
             await this.waitForEnabled(locator, 5000);
             if (awaitNavigation) {
-              // Wait for navigation if expected
-              await Promise.all([
-                this.page.waitForNavigation({ timeout: timeout || 30000 }).catch(() => {
-                  logger.debug('[COMMAND_EXECUTOR] Navigation timeout after click, continuing');
-                }),
-                locator.click({ timeout: timeout || 30000 }),
-              ]);
+              // Capture URL before click to detect navigation
+              const urlBeforeClick = this.page.url();
+              const pagesBefore = this.page.context().pages().length;
+              await locator.click({ timeout: timeout || 30000 });
+              // Wait for URL to change (replaces deprecated waitForNavigation)
+              try {
+                await this.page.waitForURL(
+                  (url) => url.toString() !== urlBeforeClick,
+                  { timeout: 15000, waitUntil: 'load' }
+                );
+                logger.debug('[COMMAND_EXECUTOR] Navigation after click detected', {
+                  from: urlBeforeClick,
+                  to: this.page.url(),
+                });
+              } catch {
+                // URL didn't change — check if a new tab/popup opened
+                const allPages = this.page.context().pages();
+                if (allPages.length > pagesBefore) {
+                  // New tab opened — switch to it
+                  const newPage = allPages[allPages.length - 1];
+                  // Wait for new page to be ready
+                  try {
+                    await newPage.waitForLoadState('load', { timeout: 10000 });
+                  } catch {
+                    // Fallback: at least wait for domcontentloaded
+                    await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+                  }
+                  const newUrl = newPage.url();
+                  logger.info('[COMMAND_EXECUTOR] Click opened new tab, switching page', {
+                    urlBeforeClick,
+                    newTabUrl: newUrl,
+                    totalPages: allPages.length,
+                  });
+                  this.page = newPage;
+                } else {
+                  logger.warn('[COMMAND_EXECUTOR] No navigation or new tab detected after click within 15s', {
+                    urlBeforeClick,
+                    currentUrl: this.page.url(),
+                  });
+                }
+              }
             } else {
               await locator.click({ timeout: timeout || 30000 });
             }
@@ -914,8 +955,8 @@ export class CommandExecutor {
         // V5: SPA-safe URL waiting (Momentic-like matchers)
         case 'waitFor': {
           const matcher = command.urlMatcher;
-          // V5.1: timeout is now primary (from command.timeout), urlMatcher.timeoutMs is fallback
-          const waitForTimeout = timeout ?? matcher?.timeoutMs ?? 15000;
+          // V5.2: urlMatcher.timeoutMs takes priority (set explicitly per matcher type)
+          const waitForTimeout = matcher?.timeoutMs ?? timeout ?? 15000;
           await this.executeWaitFor(matcher, waitForTimeout);
           break;
         }
@@ -3674,7 +3715,7 @@ export class CommandExecutor {
       const prevUrl = matcher.changedFrom;
       await this.page.waitForURL(
         (url) => url.toString() !== prevUrl,
-        { timeout: timeoutMs, waitUntil: 'domcontentloaded' }
+        { timeout: timeoutMs, waitUntil: 'load' }
       );
       logger.debug('[COMMAND_EXECUTOR] URL changed from previous value', {
         prevUrl,

@@ -204,7 +204,8 @@ export function convertIntentStepToCommand(
     action,
     description: step.description,
     timeout: step.options?.timeout || 30000,
-    continueOnError: false,
+    continueOnError: step.isAutoInjected === true
+      || (step.type === 'wait_for' && !!step.options?.urlMatcher?.changedFrom),
 
     // Intent metadata for runtime resolution
     intentMeta: {
