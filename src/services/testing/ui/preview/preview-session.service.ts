@@ -336,6 +336,7 @@ export class PreviewSessionService {
           startUrl: safeStartUrl,
           pageState: {
             url: initialUrl,
+            pageTitle: await page.title().catch(() => undefined),
             domNodes: domAnalysis.interactiveNodes,
             pageText: snapshot.pageTextForExtraction?.slice(0, 3000),
           },
@@ -555,6 +556,93 @@ export class PreviewSessionService {
       });
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Page refresh failed', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Navigate back in browser history
+   */
+  async goBack(sessionId: string, userId: string): Promise<{
+    url: string;
+    domNodes?: InteractiveNode[];
+    domVersion: number;
+    pageSignature: string;
+    changed: boolean;
+  } | null> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+
+    try {
+      const previousUrl = session.page.url();
+      logger.info('[PREVIEW_SESSION] Navigating back', { sessionId, currentUrl: previousUrl });
+
+      const response = await session.page.goBack({
+        waitUntil: 'domcontentloaded',
+        timeout: 10000,
+      });
+
+      // goBack returns null if there's no history to go back to
+      if (!response) {
+        logger.debug('[PREVIEW_SESSION] No history to go back', { sessionId });
+        return null;
+      }
+
+      await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+      return this.getSnapshot(sessionId, userId, {
+        force: true,
+        includeDomNodes: true,
+        onlyIfChanged: false,
+      });
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] goBack failed', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Navigate forward in browser history
+   */
+  async goForward(sessionId: string, userId: string): Promise<{
+    url: string;
+    domNodes?: InteractiveNode[];
+    domVersion: number;
+    pageSignature: string;
+    changed: boolean;
+  } | null> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+
+    try {
+      const previousUrl = session.page.url();
+      logger.info('[PREVIEW_SESSION] Navigating forward', { sessionId, currentUrl: previousUrl });
+
+      const response = await session.page.goForward({
+        waitUntil: 'domcontentloaded',
+        timeout: 10000,
+      });
+
+      if (!response) {
+        logger.debug('[PREVIEW_SESSION] No history to go forward', { sessionId });
+        return null;
+      }
+
+      await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+      return this.getSnapshot(sessionId, userId, {
+        force: true,
+        includeDomNodes: true,
+        onlyIfChanged: false,
+      });
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] goForward failed', {
         sessionId,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -1098,6 +1186,7 @@ export class PreviewSessionService {
     }
   ): Promise<{
     url: string;
+    pageTitle?: string;
     domNodes?: InteractiveNode[];  // Only included when DOM changed or forced
     domVersion: number;
     pageSignature: string;
@@ -1123,6 +1212,7 @@ export class PreviewSessionService {
       const shouldIncludeDomNodes = options?.includeDomNodes === true;
       return {
         url: session.pageState.url,
+        pageTitle: session.pageState.pageTitle,
         domNodes: shouldIncludeDomNodes ? session.pageState.domNodes : undefined,
         domVersion: session.domVersion,
         pageSignature: session.lastPageSignature,
@@ -1135,8 +1225,11 @@ export class PreviewSessionService {
       const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
       const currentUrl = session.page.url();
 
+      const currentTitle = await session.page.title().catch(() => undefined);
+
       session.pageState = {
         url: currentUrl,
+        pageTitle: currentTitle,
         domNodes: domAnalysis.interactiveNodes,
         pageText: snapshot.pageTextForExtraction?.slice(0, 3000),
       };
@@ -1156,6 +1249,7 @@ export class PreviewSessionService {
       if (options?.onlyIfChanged && !changed) {
         return {
           url: session.pageState.url,
+          pageTitle: session.pageState.pageTitle,
           domVersion: session.domVersion,
           pageSignature: session.lastPageSignature,
           changed: false,
@@ -1180,6 +1274,7 @@ export class PreviewSessionService {
 
       return {
         url: session.pageState.url,
+        pageTitle: session.pageState.pageTitle,
         domNodes: shouldIncludeDomNodes ? session.pageState.domNodes : undefined,
         domVersion: session.domVersion,
         pageSignature: session.lastPageSignature,

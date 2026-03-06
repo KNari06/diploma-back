@@ -165,6 +165,15 @@ export class PreviewVideoStreamService {
         resolution: `${PREVIEW_VIDEO_CONFIG.maxWidth}x${PREVIEW_VIDEO_CONFIG.maxHeight}`,
       });
 
+      // V11: Inject an immediate screenshot frame after start.
+      // CDP screencast may not emit frames on already-loaded/static pages,
+      // so we guarantee at least one frame reaches the frontend.
+      setTimeout(() => {
+        if (this.isStreaming && !this.isStopped && !this.cdpSessionClosed) {
+          this.injectFrame().catch(() => {});
+        }
+      }, 500);
+
       return true;
     } catch (error) {
       logger.warn('[PREVIEW_VIDEO] Failed to start streaming', {
@@ -587,6 +596,14 @@ export class PreviewVideoStreamRegistry {
     await this.stopStream(previewSessionId);
 
     const stream = new PreviewVideoStreamService(previewSessionId, userId, room, inheritedSeq);
+
+    if (inheritedSeq !== undefined) {
+      logger.info('[PREVIEW_VIDEO] Stream restart with inherited seq', {
+        previewSessionId,
+        inheritedSeq,
+      });
+    }
+
     const started = await stream.start(page, nsp);
 
     if (started) {

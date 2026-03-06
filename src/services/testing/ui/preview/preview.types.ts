@@ -722,6 +722,7 @@ export interface PreviewSession {
   /** Current page state */
   pageState: {
     url: string;
+    pageTitle?: string;
     pageType?: string;
     domNodes: InteractiveNode[];
     screenshot?: string;

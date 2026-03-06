@@ -44,9 +44,11 @@ export interface ClientToServerEvents {
   'preview:recording:start': (data: PreviewRecordingRequest) => void;
   'preview:recording:stop': (data: PreviewRecordingRequest) => void;
 
-  // Preview page actions (refresh, reset)
+  // Preview page actions (refresh, reset, back, forward)
   'preview:page:refresh': (data: { previewSessionId: string }) => void;
   'preview:page:reset': (data: { previewSessionId: string }) => void;
+  'preview:page:back': (data: { previewSessionId: string }) => void;
+  'preview:page:forward': (data: { previewSessionId: string }) => void;
 
   // Preview DevTools (on-demand requests)
   'preview:network:detail:request': (data: PreviewNetworkDetailRequest) => void;
@@ -986,6 +988,7 @@ export interface PreviewHighlight {
 export interface PreviewPagePayload {
   previewSessionId: string;
   url: string;
+  pageTitle?: string;        // Page <title> for browser-like tab display
   domVersion: number;        // Monotonically increasing int, incremented on DOM changes
   pageSignature: string;     // Hash of URL + interactive element refs
   domNodes?: PreviewInteractiveNode[]; // Only sent when domVersion changes
@@ -1279,7 +1282,7 @@ export interface PreviewMouseProbeResultPayload {
  */
 export interface PreviewPageActionResultPayload {
   previewSessionId: string;
-  action: 'refresh' | 'reset';
+  action: 'refresh' | 'reset' | 'back' | 'forward';
   success: boolean;
   error?: string;
   timestamp: string;
