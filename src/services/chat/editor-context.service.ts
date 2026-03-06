@@ -44,24 +44,10 @@ export async function getPageContext(previewSessionId: string, userId?: string):
       return null;
     }
 
-    // Capture DevTools data BEFORE the async snapshot to avoid temporal mismatch.
-    // (Snapshot is async and can take 100-500ms; new console/network events during that
-    // time would create a state where the AI sees old DOM + new errors.)
-    let consoleErrors: string | undefined;
-    let networkSummary: string | undefined;
-    try {
-      const devtools = getPreviewDevToolsRegistry().get(previewSessionId);
-      if (devtools) {
-        consoleErrors = compressConsoleForChat(devtools.getConsoleEntries());
-        networkSummary = compressNetworkForChat(devtools.getNetworkItems());
-      }
-    } catch (devtoolsError) {
-      logger.warn('[EDITOR_CONTEXT] Failed to collect devtools data (non-critical)', {
-        error: devtoolsError instanceof Error ? devtoolsError.message : String(devtoolsError),
-      });
-    }
-
-    // Collect a fresh snapshot so DOM nodes are up-to-date
+    // 1. Collect a fresh snapshot FIRST so DOM nodes are up-to-date.
+    //    Snapshot must come before DevTools to ensure both reflect the same page state.
+    //    (If DevTools is collected first and user navigates during the 100-500ms snapshot,
+    //    we'd have console/network from URL A + DOM from URL B.)
     try {
       await service.getSnapshot(previewSessionId, userId, { force: true, includeDomNodes: true });
     } catch (snapshotError) {
@@ -77,18 +63,40 @@ export async function getPageContext(previewSessionId: string, userId?: string):
       return null;
     }
 
-    // Compress DOM nodes into a compact summary
+    // 2. Capture DevTools data AFTER snapshot so both are from the same page state.
+    let consoleErrors: string | undefined;
+    let networkSummary: string | undefined;
+    try {
+      const devtools = getPreviewDevToolsRegistry().get(previewSessionId);
+      if (devtools) {
+        consoleErrors = compressConsoleForChat(devtools.getConsoleEntries());
+        networkSummary = compressNetworkForChat(devtools.getNetworkItems());
+      }
+    } catch (devtoolsError) {
+      logger.warn('[EDITOR_CONTEXT] Failed to collect devtools data (non-critical)', {
+        error: devtoolsError instanceof Error ? devtoolsError.message : String(devtoolsError),
+      });
+    }
+
+    // 3. Compress DOM nodes into a compact summary
     const domSummary = compressDomForChat(pageState.domNodes || []);
 
     // Extract non-interactive content summary (headings, images, tables)
     // Called after snapshot so page is fresh and loaded
     const contentSummary = await extractContentSummary(previewSessionId, userId);
 
+    // 4. Truncate pageText to prevent token budget overrun (~5000 chars ≈ 1250 tokens)
+    const MAX_PAGE_TEXT = 5000;
+    let pageText = pageState.pageText;
+    if (pageText && pageText.length > MAX_PAGE_TEXT) {
+      pageText = pageText.substring(0, MAX_PAGE_TEXT) + '\n[... truncated]';
+    }
+
     return {
-      url: pageState.url || session.startUrl,
+      url: pageState.url?.trim() || session.startUrl?.trim() || 'about:blank',
       title: undefined,
       domSummary,
-      pageText: pageState.pageText,
+      pageText,
       consoleErrors,
       networkSummary,
       contentSummary,
@@ -197,7 +205,8 @@ export function compressConsoleForChat(entries: PreviewConsoleEntry[]): string |
   return filtered
     .map(e => {
       const level = e.level === 'error' ? 'ERROR' : 'WARN';
-      const text = e.text.length > 120 ? e.text.substring(0, 120) + '...' : e.text;
+      const raw = e.text || '';
+      const text = raw.length > 120 ? raw.substring(0, 120) + '...' : raw;
       const loc = e.location ? ` (${e.location})` : '';
       return `[${level}] ${text}${loc}`;
     })
@@ -228,9 +237,9 @@ export function compressNetworkForChat(items: PreviewNetworkItem[]): string | un
       const duration = item.durationMs ? ` (${item.durationMs}ms)` : '';
       let path = item.path;
       if (!path) {
-        try { path = new URL(item.url, 'http://localhost').pathname; } catch { path = item.url?.slice(0, 60) || '/unknown'; }
+        try { path = new URL(item.url || '', 'http://localhost').pathname; } catch { path = item.url?.slice(0, 60) || '/unknown'; }
       }
-      return `[${status}] ${item.method} ${path}${duration}`;
+      return `[${status}] ${item.method || 'GET'} ${path}${duration}`;
     })
     .join('\n');
 }
