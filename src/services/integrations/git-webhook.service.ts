@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { QueueManager } from '@/config/infrastructure/queues';
-import { GitIntegrationService, GitProvider } from './git-integration.service';
+import { GitIntegrationService, GitProvider, type GitIntegrationRow } from './git-integration.service';
 
 export type GitWebhookEventType = 'pull_request' | 'merge_request' | 'push' | 'release';
 
@@ -123,16 +123,21 @@ export class GitWebhookService {
       throw new Error('Repository URL not found in webhook payload');
     }
 
-    const integration = await GitIntegrationService.findByProviderAndRepositoryUrl(provider, repositoryUrlRaw);
+    let integration = await GitIntegrationService.findByProviderAndRepositoryUrl(provider, repositoryUrlRaw);
 
-    // Validate signature/token BEFORE persisting (prevents audit trail poisoning)
-    if (integration) {
+    // If no integration, try to create one from a matching regression plan (same repo URL in gitTriggers)
+    if (!integration) {
+      const created = await this.tryCreateIntegrationFromMatchingPlan(provider, repositoryUrlRaw);
+      if (created) integration = created;
+    }
+
+    // Validate signature/token when secret is configured (skip when empty — no verification)
+    if (integration && integration.webhook_secret) {
       if (provider === 'github') {
         if (!signature || !this.verifyGitHubSignature(rawBody, signature, integration.webhook_secret)) {
           throw new Error('Invalid GitHub webhook signature');
         }
       } else {
-        // For GitLab we store token in `signature` field for audit (header value)
         if (!signature || !this.verifyGitLabToken(signature, integration.webhook_secret)) {
           throw new Error('Invalid GitLab webhook token');
         }
@@ -157,10 +162,13 @@ export class GitWebhookService {
     }
 
     if (!integration) {
+      const normalizedForLog = this.normalizeRepositoryUrl(repositoryUrlRaw, provider);
       logger.warn('[GIT_WEBHOOK] No git integration found for repo', {
         provider,
         repositoryUrl: repositoryUrlRaw,
+        repositoryUrlNormalized: normalizedForLog,
         deliveryId,
+        hint: 'Create integration via POST /api/v1/git-integrations or scripts/create-git-integration.ts; repository_url in DB must match normalized URL.',
       });
       await this.updateDeliveryStatus(provider, deliveryId, { status: 'ignored', error: 'integration_not_found' });
       return { queued: false, ignored: true, reason: 'integration_not_found' };
@@ -171,6 +179,12 @@ export class GitWebhookService {
     await this.updateDeliveryStatus(provider, deliveryId, { status: 'queued' });
 
     return { queued: true, ignored: false };
+  }
+
+  /** Normalize repo URL for matching (trim, strip trailing slash and .git). */
+  private static normalizeRepoUrlForMatch(url: string): string {
+    const t = (url || '').trim().replace(/\/+$/, '');
+    return t.endsWith('.git') ? t.slice(0, -4) : t;
   }
 
   private static normalizeRepositoryUrl(input: string, provider: GitProvider): string {
@@ -250,6 +264,78 @@ export class GitWebhookService {
         error: updateError.message,
       });
     }
+  }
+
+  /**
+   * When no git_integrations row exists, find a regression plan with matching gitTriggers.repositoryUrl
+   * and create the integration so the webhook can be processed (e.g. different env where integration was not created).
+   */
+  private static async tryCreateIntegrationFromMatchingPlan(
+    provider: GitProvider,
+    repositoryUrlRaw: string
+  ): Promise<GitIntegrationRow | null> {
+    const targetNormalized = this.normalizeRepoUrlForMatch(repositoryUrlRaw);
+    if (!targetNormalized) return null;
+
+    const { data: plans, error } = await supabaseAdmin
+      .from('regression_plans')
+      .select('id, project_id, user_id, automation_config')
+      .not('automation_config', 'is', null);
+
+    if (error || !plans?.length) return null;
+
+    for (const plan of plans) {
+      const gt = (plan.automation_config as any)?.gitTriggers;
+      if (!gt?.enabled) continue;
+      const planUrl = (gt.repositoryUrl || '').trim();
+      if (!planUrl || this.normalizeRepoUrlForMatch(planUrl) !== targetNormalized) continue;
+
+      try {
+        const created = await GitIntegrationService.createIntegration({
+          projectId: plan.project_id,
+          userId: plan.user_id,
+          provider,
+          repositoryUrl: repositoryUrlRaw,
+          webhookSecret: '',
+          events: ['push', 'pull_request', 'release'],
+        });
+        const { error: updateErr } = await supabaseAdmin
+          .from('git_integrations')
+          .update({ plan_id: plan.id })
+          .eq('id', created.id);
+        if (!updateErr) {
+          logger.info('[GIT_WEBHOOK] Auto-created git integration from matching plan', {
+            integrationId: created.id,
+            planId: plan.id,
+            repositoryUrl: created.repository_url,
+          });
+          return { ...created, plan_id: plan.id } as GitIntegrationRow;
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const isDuplicate = /duplicate|unique constraint/i.test(msg);
+        if (isDuplicate) {
+          const existing = await GitIntegrationService.findByProjectAndRepositoryUrl(
+            plan.project_id,
+            repositoryUrlRaw
+          );
+          if (existing) {
+            await supabaseAdmin
+              .from('git_integrations')
+              .update({ plan_id: plan.id })
+              .eq('id', existing.id);
+            logger.info('[GIT_WEBHOOK] Using existing git integration and linked plan', {
+              integrationId: existing.id,
+              planId: plan.id,
+            });
+            return { ...existing, plan_id: plan.id } as GitIntegrationRow;
+          }
+        }
+        logger.warn('[GIT_WEBHOOK] Auto-create integration failed', { planId: plan.id, error: msg });
+      }
+      return null;
+    }
+    return null;
   }
 }
 

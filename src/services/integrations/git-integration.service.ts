@@ -199,6 +199,8 @@ export class GitIntegrationService {
       .eq('provider', provider)
       .eq('repository_url', normalizedRepositoryUrl)
       .eq('enabled', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     if (error) {
@@ -266,13 +268,18 @@ export class GitIntegrationService {
       throw new ValidationError('Repository URL is required');
     }
 
+    let url: string;
     if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-      return trimmed.replace(/\/+$/, '');
+      url = trimmed.replace(/\/+$/, '');
+    } else {
+      const base = provider === 'github' ? 'https://github.com/' : 'https://gitlab.com/';
+      url = (base + trimmed).replace(/\/+$/, '');
     }
-
-    // owner/repo → normalize to provider URL
-    const base = provider === 'github' ? 'https://github.com/' : 'https://gitlab.com/';
-    return (base + trimmed).replace(/\/+$/, '');
+    // Strip trailing .git so https://host/owner/repo.git matches https://host/owner/repo
+    if (url.endsWith('.git')) {
+      url = url.slice(0, -4);
+    }
+    return url;
   }
 
   private static validateRepositoryUrl(url: string, provider: GitProvider): void {
