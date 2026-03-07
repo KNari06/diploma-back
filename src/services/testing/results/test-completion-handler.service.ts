@@ -5,6 +5,7 @@ import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapp
 import { SaveSuggestionMeta } from '@/types/testing.types';
 import { ChatService } from '@/services/utils/chat.service';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { getTelegramToken, sendMessage as sendTelegramMessage } from '@/services/api/telegram.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -535,8 +536,15 @@ export class TestCompletionHandlerService {
       });
 
       // Update each run
+      const invalidatedProjects = new Set<string>();
       for (const run of runs) {
         await this.recomputeRunStatus(run);
+        if (run.project_id) invalidatedProjects.add(run.project_id);
+      }
+
+      // Invalidate plans list cache for affected projects
+      for (const projectId of invalidatedProjects) {
+        await cache.delByPattern(`qait:cache:plans:proj:${projectId}:*`);
       }
     } catch (error) {
       logger.error('[TEST_COMPLETION] Error updating regression runs', {

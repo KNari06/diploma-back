@@ -11,6 +11,7 @@ import type {
     UpdateTestModuleParams,
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 
 /**
  * Service for managing test modules
@@ -55,6 +56,9 @@ export class ModuleService {
       logger.error('[MODULE_SERVICE] Failed to create module', { error });
       throw new Error(`Failed to create module: ${error.message}`);
     }
+
+    // Invalidate platform tree cache
+    await cache.delByPattern(`qait:cache:ptree:base:${projectId}:*`);
 
     return this.mapToTestModule(data);
   }
@@ -183,6 +187,11 @@ export class ModuleService {
       throw new Error(`Failed to update module: ${error.message}`);
     }
 
+    // Invalidate platform tree cache
+    if (data?.project_id) {
+      await cache.delByPattern(`qait:cache:ptree:base:${data.project_id}:*`);
+    }
+
     return this.mapToTestModule(data);
   }
 
@@ -195,6 +204,14 @@ export class ModuleService {
   static async delete(id: string, userId: string): Promise<boolean> {
     logger.info('[MODULE_SERVICE] Deleting module', { id });
 
+    // Fetch project_id before delete for cache invalidation
+    const { data: mod } = await supabaseAdmin
+      .from('test_modules')
+      .select('project_id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .maybeSingle();
+
     const { error } = await supabaseAdmin
       .from('test_modules')
       .delete()
@@ -204,6 +221,11 @@ export class ModuleService {
     if (error) {
       logger.error('[MODULE_SERVICE] Failed to delete module', { error, id });
       throw new Error(`Failed to delete module: ${error.message}`);
+    }
+
+    // Invalidate platform tree cache
+    if (mod?.project_id) {
+      await cache.delByPattern(`qait:cache:ptree:base:${mod.project_id}:*`);
     }
 
     return true;

@@ -10,6 +10,7 @@ import type {
   TestPlatform,
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 
 /**
  * Service for managing test platforms
@@ -175,6 +176,9 @@ export class PlatformService {
       throw new Error(`Failed to create platform: ${error.message}`);
     }
 
+    // Invalidate platform tree cache
+    await cache.delByPattern(`qait:cache:ptree:base:${projectId}:*`);
+
     return this.mapToTestPlatform(data);
   }
 
@@ -211,6 +215,11 @@ export class PlatformService {
     if (error) {
       logger.error('[PLATFORM_SERVICE] Failed to update platform', { error, id });
       throw new Error(`Failed to update platform: ${error.message}`);
+    }
+
+    // Invalidate platform tree cache
+    if (data?.project_id) {
+      await cache.delByPattern(`qait:cache:ptree:base:${data.project_id}:*`);
     }
 
     return this.mapToTestPlatform(data);

@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { ProjectCreateRequest } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import {
   PERMISSIONS,
   WorkspaceAccessService,
@@ -139,6 +140,10 @@ export class ProjectService {
         name: data.name,
         workspaceId: projectData.workspace_id,
       });
+
+      // Invalidate project list caches
+      await cache.delByPattern(`qait:cache:projects:ws:${projectData.workspace_id}:*`);
+      await cache.delByPattern(`qait:cache:projects:user:*`);
 
       return data;
     } catch (error) {
@@ -345,6 +350,10 @@ export class ProjectService {
         throw error;
       }
 
+      // Invalidate project list caches
+      await cache.delByPattern(`qait:cache:projects:ws:${project.workspace_id}:*`);
+      await cache.delByPattern(`qait:cache:projects:user:*`);
+
       return data;
     } catch (error) {
       logger.error('[PROJECT] Failed to update project', {
@@ -403,6 +412,10 @@ export class ProjectService {
       }
 
       logger.info('[PROJECT] Deleted project', { projectId, userId });
+
+      // Invalidate project list caches
+      await cache.delByPattern(`qait:cache:projects:ws:${project.workspace_id}:*`);
+      await cache.delByPattern(`qait:cache:projects:user:*`);
     } catch (error) {
       logger.error('[PROJECT] Failed to delete project', {
         error: error instanceof Error ? error.message : String(error),

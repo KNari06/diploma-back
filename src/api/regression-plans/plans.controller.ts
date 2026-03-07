@@ -11,6 +11,7 @@ import { TestReportGeneratorService } from '@/services/testing/results/test-repo
 import { NotFoundError, ValidationError } from '@/types';
 import type { PlanItemType, TestType } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { Request, Response } from 'express';
 
 interface AuthenticatedRequest extends Request {
@@ -93,7 +94,18 @@ export async function listPlans(req: AuthenticatedRequest, res: Response): Promi
 
     const userId = getUserId(req);
 
+    // Check cache first
+    const cacheKey = `qait:cache:plans:proj:${projectId}:${userId}`;
+    const cached = await cache.get(cacheKey);
+    if (cached) {
+      res.json({ success: true, data: cached, timestamp: new Date() });
+      return;
+    }
+
     const plans = await RegressionPlanService.listByProject(projectId, userId);
+
+    // Cache for 30 minutes
+    await cache.set(cacheKey, plans, 1800);
 
     res.json({ success: true, data: plans, timestamp: new Date() });
   } catch (error) {

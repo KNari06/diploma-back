@@ -126,23 +126,16 @@ export class PlatformTreeService {
       return { platforms: { items: [] } };
     }
 
-    // Fetch paginated modules + count per platform in parallel
+    // Fetch paginated modules + count per platform in parallel (single query per platform)
     const platformResults = await Promise.all(
       sortedPlatforms.map(async (p: any) => {
-        const [modulesResult, countResult] = await Promise.all([
-          supabaseAdmin
-            .from('test_modules')
-            .select('id, platform_id, name, description, priority')
-            .eq('platform_id', p.id)
-            .eq('user_id', userId)
-            .order('created_at', { ascending: false })
-            .range(offset, offset + limit - 1),
-          supabaseAdmin
-            .from('test_modules')
-            .select('id', { count: 'exact', head: true })
-            .eq('platform_id', p.id)
-            .eq('user_id', userId),
-        ]);
+        const modulesResult = await supabaseAdmin
+          .from('test_modules')
+          .select('id, platform_id, name, description, priority', { count: 'exact' })
+          .eq('platform_id', p.id)
+          .eq('user_id', userId)
+          .order('created_at', { ascending: false })
+          .range(offset, offset + limit - 1);
 
         if (modulesResult.error) {
           logger.error('[PLATFORM_TREE] Failed to get modules', { error: modulesResult.error, platformId: p.id });
@@ -167,7 +160,7 @@ export class PlatformTreeService {
             pageInfo: {
               limit,
               offset,
-              total: countResult.count || 0,
+              total: modulesResult.count || 0,
             },
           },
         };

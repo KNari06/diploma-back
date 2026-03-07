@@ -15,6 +15,7 @@ import type {
   ExecutableTestCase,
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { topologicalSort } from '@/utils/graph/topological-sort';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { executionCompletionEmitter } from '../executions/execution-completion-emitter';
@@ -720,6 +721,9 @@ export class RegressionRunService {
       if (runError || !run) {
         throw new Error(`Failed to create plan run: ${runError?.message}`);
       }
+
+      // Invalidate plans list cache (new run affects lastRun display)
+      await cache.delByPattern(`qait:cache:plans:proj:${plan.projectId}:*`);
 
       // 3. Create execution records for all test cases
       let executions;

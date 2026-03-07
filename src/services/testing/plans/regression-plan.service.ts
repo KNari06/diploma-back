@@ -7,6 +7,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { GitIntegrationService } from '@/services/integrations/git-integration.service';
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import { ValidationError } from '@/types';
+import { cache } from '@/utils/core/redis-cache';
 import type {
     AddPlanItemParams,
     CreateRegressionPlanParams,
@@ -87,6 +88,9 @@ export class RegressionPlanService {
         plan.scheduleId = scheduleId;
       }
     }
+
+    // Invalidate plans list cache
+    await cache.delByPattern(`qait:cache:plans:proj:${projectId}:*`);
 
     return plan;
   }
@@ -406,27 +410,30 @@ export class RegressionPlanService {
   ): Promise<
     Map<string, { id: string; plan_id: string; status: string; started_at: string; completed_at: string | null }>
   > {
-    // Fetch the single latest run per plan using parallel queries (uses idx_regression_runs_plan index).
-    const entries = await Promise.all(
-      planIds.map(async (planId) => {
-        const { data: row } = await supabaseAdmin
-          .from('regression_runs')
-          .select('id, plan_id, status, started_at, completed_at')
-          .eq('plan_id', planId)
-          .order('started_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
+    if (planIds.length === 0) return new Map();
 
-        return row ? ([planId, row] as const) : null;
-      })
-    );
+    // Single query for all plans, ordered by started_at DESC.
+    // Deduplicate in JS to keep only the latest run per plan_id.
+    // Uses composite index idx_regression_runs_plan_started.
+    const { data, error } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, plan_id, status, started_at, completed_at')
+      .in('plan_id', planIds)
+      .order('started_at', { ascending: false });
+
+    if (error) {
+      logger.error('[REGRESSION_PLAN_SERVICE] batchGetLatestRuns failed', { error });
+      return new Map();
+    }
 
     const result = new Map<
       string,
       { id: string; plan_id: string; status: string; started_at: string; completed_at: string | null }
     >();
-    for (const entry of entries) {
-      if (entry) result.set(entry[0], entry[1]);
+    for (const row of data || []) {
+      if (!result.has(row.plan_id)) {
+        result.set(row.plan_id, row);
+      }
     }
 
     return result;
@@ -584,6 +591,9 @@ export class RegressionPlanService {
       }
     }
 
+    // Invalidate plans list cache
+    await cache.delByPattern(`qait:cache:plans:proj:${plan.projectId}:*`);
+
     return plan;
   }
 
@@ -614,6 +624,11 @@ export class RegressionPlanService {
     if (error) {
       logger.error('[REGRESSION_PLAN_SERVICE] Failed to delete plan', { error, id });
       throw new Error(`Failed to delete plan: ${error.message}`);
+    }
+
+    // Invalidate plans list cache
+    if (plan) {
+      await cache.delByPattern(`qait:cache:plans:proj:${plan.projectId}:*`);
     }
 
     return true;
@@ -783,6 +798,16 @@ export class RegressionPlanService {
       throw new Error(`Failed to add item: ${error.message}`);
     }
 
+    // Invalidate plans list cache (scope changed)
+    const { data: planForCache } = await supabaseAdmin
+      .from('regression_plans')
+      .select('project_id')
+      .eq('id', planId)
+      .maybeSingle();
+    if (planForCache) {
+      await cache.delByPattern(`qait:cache:plans:proj:${planForCache.project_id}:*`);
+    }
+
     return this.mapToRegressionPlanItem(data);
   }
 
@@ -820,6 +845,9 @@ export class RegressionPlanService {
       logger.error('[REGRESSION_PLAN_SERVICE] Failed to remove item', { error, itemId });
       throw new Error(`Failed to remove item: ${error.message}`);
     }
+
+    // Invalidate plans list cache (scope changed)
+    await cache.delByPattern(`qait:cache:plans:proj:${plan.projectId}:*`);
   }
 
   /**
@@ -1353,81 +1381,87 @@ export class RegressionPlanService {
       platformKey: 'web_ui' | 'api';
     }>;
   }> {
-    // 1. Fetch modules + platforms, flows + module platform, and all test cases in parallel
-    const [modulesResult, flowsResult, uiTestCasesResult, apiTestCasesResult] = await Promise.all([
-      // Modules with platform_key
-      supabaseAdmin
-        .from('test_modules')
-        .select('id, name, platform_id, test_platforms!inner(platform_key)')
-        .eq('project_id', projectId)
-        .eq('user_id', userId)
-        .order('name', { ascending: true }),
+    // Phase 1: Fetch modules (scoped by project_id)
+    const modulesResult = await supabaseAdmin
+      .from('test_modules')
+      .select('id, name, platform_id, test_platforms!inner(platform_key)')
+      .eq('project_id', projectId)
+      .eq('user_id', userId)
+      .order('name', { ascending: true });
 
-      // Flows with module_id (to resolve platformKey via module)
+    if (modulesResult.error) {
+      throw new Error(`Failed to get modules: ${modulesResult.error.message}`);
+    }
+
+    const modules = modulesResult.data || [];
+    if (modules.length === 0) {
+      return { modules: [], flows: [], testCases: [] };
+    }
+
+    // Build lookup: moduleId → platformKey
+    const modulePlatformMap = new Map<string, 'web_ui' | 'api'>();
+    const moduleIds: string[] = [];
+    for (const m of modules) {
+      const pk = (m.test_platforms as any)?.platform_key as 'web_ui' | 'api';
+      modulePlatformMap.set(m.id, pk);
+      moduleIds.push(m.id);
+    }
+
+    // Phase 2: Fetch flows (scoped by project's moduleIds) + UI test cases in parallel
+    const [flowsResult, uiTestCasesResult] = await Promise.all([
       supabaseAdmin
         .from('test_flows')
         .select('id, module_id, name, flow_type')
+        .in('module_id', moduleIds)
         .eq('user_id', userId)
         .order('order_index', { ascending: true }),
 
-      // UI test cases
       supabaseAdmin
         .from('intent_test_cases')
         .select('id, flow_id, name')
         .eq('project_id', projectId)
         .eq('user_id', userId)
         .order('created_at', { ascending: false }),
-
-      // API test cases
-      supabaseAdmin
-        .from('api_test_configs')
-        .select('id, flow_id, name')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false }),
     ]);
 
-    if (modulesResult.error) {
-      throw new Error(`Failed to get modules: ${modulesResult.error.message}`);
-    }
     if (flowsResult.error) {
       throw new Error(`Failed to get flows: ${flowsResult.error.message}`);
     }
 
-    const modules = modulesResult.data || [];
-    const allFlows = flowsResult.data || [];
+    const projectFlows = flowsResult.data || [];
     const uiTestCases = uiTestCasesResult.data || [];
-    const apiTestCases = apiTestCasesResult.data || [];
+    const projectFlowIds = projectFlows.map((f: any) => f.id);
 
-    // Build lookup: moduleId → platformKey
-    const modulePlatformMap = new Map<string, 'web_ui' | 'api'>();
-    const moduleIdSet = new Set<string>();
-    for (const m of modules) {
-      const pk = (m.test_platforms as any)?.platform_key as 'web_ui' | 'api';
-      modulePlatformMap.set(m.id, pk);
-      moduleIdSet.add(m.id);
+    // Phase 3: Fetch API test cases (scoped by project's flowIds)
+    let apiTestCases: any[] = [];
+    if (projectFlowIds.length > 0) {
+      const apiResult = await supabaseAdmin
+        .from('api_test_configs')
+        .select('id, flow_id, name')
+        .in('flow_id', projectFlowIds)
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+      apiTestCases = apiResult.data || [];
     }
-
-    // Filter flows to only those belonging to this project's modules
-    const projectFlows = allFlows.filter((f: any) => moduleIdSet.has(f.module_id));
 
     // Build lookup: flowId → moduleId
     const flowModuleMap = new Map<string, string>();
     for (const f of projectFlows) {
       flowModuleMap.set(f.id, f.module_id);
     }
-    const projectFlowIds = new Set(projectFlows.map((f: any) => f.id));
+    const projectFlowIdSet = new Set(projectFlowIds);
 
     // Count test cases per flow
     const flowUiCount = new Map<string, number>();
     const flowApiCount = new Map<string, number>();
 
     for (const tc of uiTestCases) {
-      if (tc.flow_id && projectFlowIds.has(tc.flow_id)) {
+      if (tc.flow_id && projectFlowIdSet.has(tc.flow_id)) {
         flowUiCount.set(tc.flow_id, (flowUiCount.get(tc.flow_id) || 0) + 1);
       }
     }
     for (const tc of apiTestCases) {
-      if (tc.flow_id && projectFlowIds.has(tc.flow_id)) {
+      if (tc.flow_id && projectFlowIdSet.has(tc.flow_id)) {
         flowApiCount.set(tc.flow_id, (flowApiCount.get(tc.flow_id) || 0) + 1);
       }
     }
@@ -1471,7 +1505,7 @@ export class RegressionPlanService {
     }> = [];
 
     for (const tc of uiTestCases) {
-      if (tc.flow_id && projectFlowIds.has(tc.flow_id)) {
+      if (tc.flow_id && projectFlowIdSet.has(tc.flow_id)) {
         const moduleId = flowModuleMap.get(tc.flow_id) || '';
         scopeTestCases.push({
           id: tc.id,
@@ -1485,7 +1519,7 @@ export class RegressionPlanService {
     }
 
     for (const tc of apiTestCases) {
-      if (tc.flow_id && projectFlowIds.has(tc.flow_id)) {
+      if (tc.flow_id && projectFlowIdSet.has(tc.flow_id)) {
         const moduleId = flowModuleMap.get(tc.flow_id) || '';
         scopeTestCases.push({
           id: tc.id,

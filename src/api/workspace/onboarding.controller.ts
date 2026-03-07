@@ -2,6 +2,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { WorkspaceOnboardingRequest, WorkspaceOnboardingResponse } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { Request, Response } from 'express';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -304,6 +305,12 @@ export const saveOnboarding = async (req: Request, res: Response): Promise<void>
       logo_url: updatedWorkspace.logo_url,
     };
 
+    // Invalidate onboarding cache
+    const onboardingUserId = req.user?.id;
+    if (onboardingUserId) {
+      await cache.del(`qait:cache:onboarding:${onboardingUserId}`);
+    }
+
     res.status(200).json({
       success: true,
       data: response,
@@ -351,6 +358,14 @@ export const getOnboarding = async (req: Request, res: Response): Promise<void> 
         error: 'Invalid user ID format',
         timestamp: new Date().toISOString(),
       });
+      return;
+    }
+
+    // Check cache first
+    const cacheKey = `qait:cache:onboarding:${userId}`;
+    const cached = await cache.get(cacheKey);
+    if (cached) {
+      res.json({ success: true, data: cached, timestamp: new Date().toISOString() });
       return;
     }
 
@@ -435,6 +450,9 @@ export const getOnboarding = async (req: Request, res: Response): Promise<void> 
       companyName: settings.companyName,
       logo_url: workspace.logo_url,
     };
+
+    // Cache for 24 hours
+    await cache.set(cacheKey, response, 86400);
 
     res.json({
       success: true,
