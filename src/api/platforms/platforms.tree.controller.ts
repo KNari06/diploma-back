@@ -12,6 +12,7 @@ import { PlatformTreeService } from '@/services/testing/platforms/platform-tree.
 import { PlatformService } from '@/services/testing/platforms/platform.service';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { Request, Response } from 'express';
 
 interface AuthenticatedRequest extends Request {
@@ -89,6 +90,14 @@ export async function getPlatformTree(req: AuthenticatedRequest, res: Response):
 
     logger.info('[PLATFORM_TREE_API] Base mode', { projectId, userId, limit, offset });
 
+    // Check cache first (base mode only)
+    const cacheKey = `qait:cache:ptree:base:${projectId}:${userId}:${limit}:${offset}`;
+    const cached = await cache.get(cacheKey);
+    if (cached) {
+      res.json({ success: true, mode: 'base', data: cached, timestamp: new Date() });
+      return;
+    }
+
     let result = await PlatformTreeService.getBaseModeTree(projectId, userId, { limit, offset });
 
     // Auto-seed platforms only if none exist (first-time project setup)
@@ -96,6 +105,9 @@ export async function getPlatformTree(req: AuthenticatedRequest, res: Response):
       await PlatformService.ensurePlatformsExist(projectId, userId);
       result = await PlatformTreeService.getBaseModeTree(projectId, userId, { limit, offset });
     }
+
+    // Cache for 30 minutes
+    await cache.set(cacheKey, result, 1800);
 
     res.json({
       success: true,

@@ -30,7 +30,7 @@
  *   - All existing collector/analysis infrastructure
  */
 
-import type { Browser, BrowserContext } from 'playwright';
+import type { Browser } from 'playwright';
 import { logger } from '@/utils/core/logger';
 
 import type { ExplorationConfig, ExplorationResult, ExplorationProgressCallback, ExplorationCheckpoint } from './types';
@@ -116,9 +116,16 @@ export class ExplorationEngine {
       userAgent: DESKTOP_USER_AGENT,
     });
 
-    let tree;
+    let tree: ExplorationTree;
     try {
       const surveyPage = await surveyContext.newPage();
+
+      // Block third-party requests for faster page discovery
+      try {
+        const { setupThirdPartyBlocker } = await import('@/agent/playwright/execution/third-party-blocker');
+        await setupThirdPartyBlocker(surveyPage);
+      } catch { /* non-fatal */ }
+
       const surveyAgent = new SurveyAgent(surveyPage, this.config, budget, rateLimiter);
       tree = await surveyAgent.survey();
       await surveyPage.close();

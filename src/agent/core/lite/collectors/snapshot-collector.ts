@@ -1045,9 +1045,13 @@ export class SnapshotCollector {
             // filtered out by elementFromPoint — the user interacts with the popup, not the background.
             // This mirrors real user behavior: when a popup is open, you see and click its elements.
             // ═══════════════════════════════════════════════════════════════
+            // ✅ FIX: Only check modal containment when an active modal was detected.
+            // Previous fallback `secondaryPassElements.has(el)` caused massive false positives —
+            // it marked ALL framework-bound elements (React onClick, cursor:pointer, etc.)
+            // as "inside modal" even when NO modal exists on the page (e.g. jobescape.me).
             const isInsideModal = activeModalElement
               ? activeModalElement.contains(el)
-              : secondaryPassElements.has(el);
+              : false;
 
             // Universal visibility check via elementFromPoint.
             // The browser tells us exactly what the user sees at the element's center pixel.

@@ -839,7 +839,7 @@ export class AnalyticsQueryService {
 
       const { data: deliveries } = await supabaseAdmin
         .from('git_webhook_deliveries')
-        .select('id, integration_id, provider, event_type, payload, status, received_at')
+        .select('id, integration_id, provider, event_type, payload, status, received_at, regression_run_id')
         .in('integration_id', integrationIds)
         .in('status', ['processed', 'received', 'queued'])
         .order('received_at', { ascending: false })
@@ -849,20 +849,53 @@ export class AnalyticsQueryService {
         return { deployments: [] };
       }
 
+      // Collect run IDs to look up their statuses
+      const runIds = deliveries
+        .map((d: any) => d.regression_run_id)
+        .filter((id: string | null): id is string => !!id);
+
+      let runStatusMap = new Map<string, string>();
+      if (runIds.length > 0) {
+        const { data: runs } = await supabaseAdmin
+          .from('regression_runs')
+          .select('id, status')
+          .in('id', runIds);
+
+        if (runs) {
+          for (const run of runs) {
+            runStatusMap.set(run.id, run.status);
+          }
+        }
+      }
+
       const deployments: DeploymentEntry[] = deliveries.map((d: any) => {
         const payload = d.payload || {};
         const version = payload.release?.tag_name || payload.ref?.split('/').pop() || null;
         const branch = payload.ref || null;
+        const runId = d.regression_run_id || null;
+
+        // Determine deployment status from linked regression run
+        let deploymentStatus: 'passed' | 'regression_flagged' | 'pending' | 'no_tests' = 'no_tests';
+        if (runId && runStatusMap.has(runId)) {
+          const runStatus = runStatusMap.get(runId)!;
+          if (runStatus === 'passed' || runStatus === 'completed') {
+            deploymentStatus = 'passed';
+          } else if (runStatus === 'failed') {
+            deploymentStatus = 'regression_flagged';
+          } else if (['pending', 'running', 'queued'].includes(runStatus)) {
+            deploymentStatus = 'pending';
+          }
+        }
 
         return {
           id: d.id,
           version,
           eventType: d.event_type,
           provider: d.provider,
-          status: 'no_tests' as const,
+          status: deploymentStatus,
           branch,
           deliveredAt: d.received_at,
-          runId: null,
+          runId,
         };
       });
 

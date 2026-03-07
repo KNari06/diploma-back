@@ -3,6 +3,30 @@ import { logger } from '@/utils/core/logger';
 import { executePlaywrightTest } from './test-executor';
 
 /**
+ * Errors that are deterministic and should NOT be retried.
+ * These indicate application-level failures, not transient infra issues.
+ * Checked via substring match (case-insensitive).
+ */
+const NON_RETRYABLE_ERROR_PATTERNS = [
+  'insufficient credits',
+  'goal not reached',
+  'assertion failed',
+  'test goal was not achieved',
+  'max iterations reached',
+  'navigation timeout',       // Page itself is broken, retry won't help
+  'net::err_name_not_resolved', // DNS failure for target URL
+  'net::err_connection_refused', // Target server is down
+];
+
+/**
+ * Check if an error message indicates a deterministic (non-retryable) failure.
+ */
+function isDeterministicError(errorMsg: string): boolean {
+  const lower = errorMsg.toLowerCase();
+  return NON_RETRYABLE_ERROR_PATTERNS.some((pattern) => lower.includes(pattern));
+}
+
+/**
  * Execute Playwright test with automatic retry
  */
 export async function executePlaywrightTestWithRetry(
@@ -40,7 +64,7 @@ export async function executePlaywrightTestWithRetry(
 
     try {
       // Pass attempt number so executor can adapt strategy:
-      // - Skip compiled plan on retry (go straight to embeddings)
+      // - Skip compiled plan on retry (go straight to LLM resolver)
       // - Enable video on retry (test already failed, need debug recording)
       const testDataWithRetry = {
         ...testData,
@@ -79,8 +103,18 @@ export async function executePlaywrightTestWithRetry(
         return result;
       }
 
+      // ✅ Do not retry deterministic errors (credits, DNS, goal failures with error string)
+      if (result.error && isDeterministicError(String(result.error))) {
+        logger.info('[PLAYWRIGHT_RETRY] Not retrying deterministic error', {
+          testId: testData.testId,
+          attempt: attempt + 1,
+          error: result.error,
+        });
+        return result;
+      }
+
       lastError = result.error;
-      logger.warn('[PLAYWRIGHT_RETRY] Test attempt returned failure', {
+      logger.warn('[PLAYWRIGHT_RETRY] Test attempt returned failure (retryable)', {
         testId: testData.testId,
         attempt: attempt + 1,
         maxAttempts: maxRetries + 1,
@@ -109,8 +143,29 @@ export async function executePlaywrightTestWithRetry(
         };
       }
 
+      // ✅ Do not retry deterministic exceptions
+      if (error instanceof Error && isDeterministicError(error.message)) {
+        logger.info('[PLAYWRIGHT_RETRY] Not retrying deterministic exception', {
+          testId: testData.testId,
+          attempt: attempt + 1,
+          error: error.message,
+        });
+        return {
+          success: false,
+          status: 'failed',
+          logs: [],
+          networkLogs: [],
+          errors: [{
+            type: 'other',
+            message: error.message,
+            timestamp: new Date(),
+          }],
+          error: error.message,
+        };
+      }
+
       lastError = error;
-      logger.warn('[PLAYWRIGHT_RETRY] Test attempt threw exception', {
+      logger.warn('[PLAYWRIGHT_RETRY] Test attempt threw exception (retryable)', {
         testId: testData.testId,
         attempt: attempt + 1,
         url: testData.url,

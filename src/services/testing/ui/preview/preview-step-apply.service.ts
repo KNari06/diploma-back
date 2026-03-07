@@ -7,7 +7,7 @@
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import type { FrameLocator, Locator, Page } from 'playwright';
-import { sanitizeIntent } from './embeddings-resolver.service';
+import { sanitizeIntent } from './element-resolver.service';
 import { IntentStepLintService } from './intent-step-lint.service';
 import { LocatorPlanBuilder } from './locator-plan-builder.service';
 import { getPreviewSessionService } from './preview-session.service';
@@ -1260,7 +1260,7 @@ export class PreviewStepApplyService {
               resolutionMeta: {
                 allowedCount: 1,
                 usedRules: ['ai_check'],
-                usedEmbeddings: false,
+                usedLLM: false,
                 confidenceTier: (aiCheckResult.confidence || 0) >= 0.85 ? 'high' :
                                 (aiCheckResult.confidence || 0) >= 0.6 ? 'medium' : 'low',
               },
@@ -1347,7 +1347,7 @@ export class PreviewStepApplyService {
           const resolutionMeta: ResolutionMeta = {
             allowedCount: 1,
             usedRules: ['user_confirmed'],
-            usedEmbeddings: false,
+            usedLLM: false,
             confidenceTier: 'high' as ConfidenceTier,
           };
 
@@ -1396,7 +1396,7 @@ export class PreviewStepApplyService {
 
       // ═══════════════════════════════════════════════════════════════════════
       // V7: Try compiled locator plan first (if available) before lint
-      // This is a fast path that avoids expensive embeddings/AI when we have
+      // This is a fast path that avoids expensive AI/LLM resolution when we have
       // a cached, validated locator from a previous successful resolution
       // ═══════════════════════════════════════════════════════════════════════
       if (stepDraft.compiled && stepDraft.compiled.locatorPlan && stepDraft.compiled.locatorPlan.length > 0) {
@@ -1444,7 +1444,7 @@ export class PreviewStepApplyService {
               const resolutionMeta: ResolutionMeta = {
                 allowedCount: 1,
                 usedRules: ['compiled_plan'],
-                usedEmbeddings: false,
+                usedLLM: false,
                 confidenceTier: 'high' as ConfidenceTier,
               };
 
@@ -1661,8 +1661,8 @@ export class PreviewStepApplyService {
 
           const resolutionMeta: ResolutionMeta = {
             allowedCount: lintResult.candidates.length,
-            usedRules: [], // TODO: Populate from embeddings resolver if available
-            usedEmbeddings: !lintResult.degradedMode,
+            usedRules: [],
+            usedLLM: !lintResult.degradedMode,
             confidenceTier,
             topSimilarity: lintResult.topSimilarity,
           };

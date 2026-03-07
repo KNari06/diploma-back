@@ -80,7 +80,7 @@ export class ManualTestRunJobHandler {
     // This protects against: stalled job retries, post-processing errors causing retries
     const existingTest = await dbAdminService.getTest(testId) as any;
     if (existingTest) {
-      const finalStatuses = ['completed', 'failed', 'cancelled'];
+      const finalStatuses = ['completed', 'failed', 'cancelled', 'timeout'];
       if (finalStatuses.includes(existingTest.status)) {
         logger.info(`[TEST-RUN] Test already finalized, skipping job execution`, {
           testId,
@@ -774,15 +774,16 @@ export class ManualTestResultJobHandler {
         expectedBrowsers.every((b) => latestByBrowser.has(b));
 
       const latestResults = Array.from(latestByBrowser.values());
-      // ✅ FIX #8: Include 'cancelled' in final results
+      // ✅ FIX #8: Include 'cancelled' and 'timeout' in final results
       const finalResults = latestResults.filter((r: any) =>
-        r.status === 'completed' || r.status === 'failed' || r.status === 'cancelled'
+        r.status === 'completed' || r.status === 'failed' || r.status === 'cancelled' || r.status === 'timeout'
       );
 
       // Determine overall test status
-      // ✅ FIX #8: Priority: cancelled > failed > completed
+      // ✅ FIX #8: Priority: cancelled > timeout > failed > completed
       const hasCancelled = finalResults.some((r: any) => r.status === 'cancelled');
-      const hasFailed = finalResults.some((r: any) => r.status === 'failed');
+      const hasTimeout = finalResults.some((r: any) => r.status === 'timeout');
+      const hasFailed = finalResults.some((r: any) => r.status === 'failed' || r.status === 'timeout');
       const allCompleted = hasAllResults && finalResults.length === expectedBrowsersCount;
 
       let status: 'running' | 'completed' | 'failed' | 'cancelled' = 'running';

@@ -1,6 +1,7 @@
 import { ProjectService } from '@/services/core/project.service';
 import { ProjectCreateRequest } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { Request, Response } from 'express';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -173,10 +174,26 @@ export const getProjects = async (req: Request, res: Response): Promise<void> =>
         return;
       }
 
+      // Check cache first
+      const cacheKey = `qait:cache:projects:ws:${workspaceId}:${userId}`;
+      const cached = await cache.get<any[]>(cacheKey);
+      if (cached) {
+        res.json({ success: true, data: cached, count: cached.length, timestamp: new Date().toISOString() });
+        return;
+      }
+
       projects = await ProjectService.getProjectsByWorkspace(workspaceId, userId);
+      await cache.set(cacheKey, projects, 3600); // 1 hour TTL
     } else {
-      // Get all projects for user (across all workspaces)
+      const cacheKey = `qait:cache:projects:user:${userId}`;
+      const cached = await cache.get<any[]>(cacheKey);
+      if (cached) {
+        res.json({ success: true, data: cached, count: cached.length, timestamp: new Date().toISOString() });
+        return;
+      }
+
       projects = await ProjectService.getUserProjects(userId);
+      await cache.set(cacheKey, projects, 3600); // 1 hour TTL
     }
 
     res.json({

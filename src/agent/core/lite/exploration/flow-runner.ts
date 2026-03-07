@@ -332,6 +332,12 @@ export class FlowRunner {
 
       const page = await context.newPage();
 
+      // Block third-party requests for faster navigation
+      try {
+        const { setupThirdPartyBlocker } = await import('@/agent/playwright/execution/third-party-blocker');
+        await setupThirdPartyBlocker(page);
+      } catch { /* non-fatal */ }
+
       // 2. Navigate to the entry point's source page
       const targetUrl = entryPoint.sourcePageUrl || this.config.entryUrl;
       if (this.rateLimiter) {
@@ -564,6 +570,12 @@ export class FlowRunner {
 
   private async tryLoginWithGoal(context: BrowserContext, goal: string): Promise<boolean> {
     const page = await context.newPage();
+
+    // Block third-party requests for faster navigation
+    try {
+      const { setupThirdPartyBlocker } = await import('@/agent/playwright/execution/third-party-blocker');
+      await setupThirdPartyBlocker(page);
+    } catch { /* non-fatal */ }
 
     try {
       if (this.rateLimiter) {

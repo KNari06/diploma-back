@@ -211,12 +211,12 @@ function cleanupRateLimits(socketId: string): void {
 }
 
 /**
- * Emit action result for page actions (refresh/reset)
+ * Emit action result for page actions (refresh/reset/back/forward)
  */
 function emitPageActionResult(
   socket: TypedSocket,
   previewSessionId: string,
-  action: 'refresh' | 'reset',
+  action: 'refresh' | 'reset' | 'back' | 'forward',
   success: boolean,
   error?: string
 ): void {
@@ -300,6 +300,7 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           const payload: PreviewPagePayload = {
             previewSessionId,
             url: snapshot.url,
+            pageTitle: snapshot.pageTitle,
             domVersion: snapshot.domVersion,
             pageSignature: snapshot.pageSignature,
             domNodes: snapshot.domNodes, // Only included when changed
@@ -341,8 +342,7 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
       // Restart video + devtools on the new page (async, non-blocking)
       setImmediate(async () => {
         try {
-          // Restart video stream
-          await videoRegistry.stopStream(previewSessionId);
+          // Restart video stream (startStream internally stops the old one and inherits seq)
           await videoRegistry.startStream(previewSessionId, userId, room, newPage, nsp);
 
           // Restart devtools collectors
@@ -350,6 +350,54 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           devtoolsRegistry.start(previewSessionId, room, newPage, nsp);
 
           logger.info('[PREVIEW_STREAM] Streams restarted after page switch', { previewSessionId });
+
+          // V11: Force-emit a fresh DOM snapshot after page switch.
+          // DOM tick may have been blocked by pageSwitchInProgress, so we need to send
+          // the first valid snapshot explicitly. Retry up to 3 times if nodeCount is 0
+          // (page may still be rendering).
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
+                force: true,
+                includeDomNodes: true,
+              });
+              if (snapshot) {
+                const payload: PreviewPagePayload = {
+                  previewSessionId,
+                  url: snapshot.url,
+                  pageTitle: snapshot.pageTitle,
+                  domVersion: snapshot.domVersion,
+                  pageSignature: snapshot.pageSignature,
+                  domNodes: snapshot.domNodes,
+                  timestamp: new Date().toISOString(),
+                };
+                nsp.to(room).emit('preview:page', payload);
+                videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+
+                logger.info('[PREVIEW_STREAM] Emitted fresh snapshot after page switch', {
+                  previewSessionId,
+                  attempt,
+                  domVersion: snapshot.domVersion,
+                  nodeCount: snapshot.domNodes?.length || 0,
+                });
+
+                // If we got actual DOM nodes, we're done
+                if (snapshot.domNodes && snapshot.domNodes.length > 0) {
+                  break;
+                }
+              }
+              // Wait before retry (page may still be rendering)
+              if (attempt < 3) {
+                await new Promise(r => setTimeout(r, 1000));
+              }
+            } catch (snapshotError) {
+              logger.warn('[PREVIEW_STREAM] Failed to emit snapshot after page switch', {
+                previewSessionId,
+                attempt,
+                error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError),
+              });
+            }
+          }
         } catch (restartError) {
           logger.warn('[PREVIEW_STREAM] Failed to restart streams after page switch', {
             previewSessionId,
@@ -525,6 +573,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           socket.emit('preview:page', {
             previewSessionId: normalizedPreviewSessionId,
             url: snapshot.url,
+            pageTitle: snapshot.pageTitle,
             domVersion: snapshot.domVersion,
             pageSignature: snapshot.pageSignature,
             domNodes: snapshot.domNodes,
@@ -552,26 +601,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             });
           }
 
-          // V4: Prefetch embeddings for faster first lint (async, non-blocking)
-          if (snapshot.domNodes && snapshot.domNodes.length > 0) {
-            setImmediate(async () => {
-              try {
-                const { prefetchEmbeddings } = await import('@/services/testing/ui/preview/intent-step-lint.service');
-                await prefetchEmbeddings({
-                  previewSessionId: normalizedPreviewSessionId,
-                  domNodes: snapshot.domNodes!,
-                  pageUrl: snapshot.url,
-                });
-              } catch (prefetchError) {
-                // Don't fail - prefetch is optimization only
-                logger.debug('[WebSocket] Embeddings prefetch failed (non-critical)', {
-                  socketId: socket.id,
-                  previewSessionId,
-                  error: prefetchError instanceof Error ? prefetchError.message : String(prefetchError),
-                });
-              }
-            });
-          }
         }
       } catch (snapshotError) {
         logger.warn('[WebSocket] Failed to emit initial preview:page', {
@@ -1053,6 +1082,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const payload: PreviewPagePayload = {
                 previewSessionId,
                 url: snapshot.url,
+                pageTitle: snapshot.pageTitle,
                 domVersion: snapshot.domVersion,
                 pageSignature: snapshot.pageSignature,
                 domNodes: snapshot.domNodes,
@@ -2162,6 +2192,95 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
       if (data.previewSessionId) {
         emitPageActionResult(socket, data.previewSessionId, 'refresh', false, 'Internal error');
+      }
+    }
+  });
+
+  // Handle page back (browser history)
+  socket.on('preview:page:back', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'pageAction')) return;
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) return;
+
+      logger.info('[WebSocket] Preview goBack requested', { previewSessionId, userId: ensuredUserId });
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.goBack(previewSessionId, ensuredUserId);
+
+      if (result) {
+        emitPageActionResult(socket, previewSessionId, 'back', true);
+        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+
+        // Inject a fresh frame so frontend doesn't show stale content
+        setImmediate(async () => {
+          try {
+            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
+          } catch {
+            // Non-critical
+          }
+        });
+      } else {
+        emitPageActionResult(socket, previewSessionId, 'back', false, 'No history to go back or session not found');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:page:back', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (data.previewSessionId) {
+        emitPageActionResult(socket, data.previewSessionId, 'back', false, 'Internal error');
+      }
+    }
+  });
+
+  // Handle page forward (browser history)
+  socket.on('preview:page:forward', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'pageAction')) return;
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) return;
+
+      logger.info('[WebSocket] Preview goForward requested', { previewSessionId, userId: ensuredUserId });
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.goForward(previewSessionId, ensuredUserId);
+
+      if (result) {
+        emitPageActionResult(socket, previewSessionId, 'forward', true);
+        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+
+        setImmediate(async () => {
+          try {
+            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
+          } catch {
+            // Non-critical
+          }
+        });
+      } else {
+        emitPageActionResult(socket, previewSessionId, 'forward', false, 'No history to go forward or session not found');
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:page:forward', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (data.previewSessionId) {
+        emitPageActionResult(socket, data.previewSessionId, 'forward', false, 'Internal error');
       }
     }
   });

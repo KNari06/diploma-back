@@ -62,7 +62,7 @@ export class PreviewVideoStreamService {
   // Socket.IO namespace for direct emit
   private nsp: Namespace | null = null;
 
-  // Frame tracking
+  // Frame tracking (seq starts at 0 or inherits from previous stream on page switch)
   private seq = 0;
   private lastFrameTime = 0;
   private pendingFrames = 0;
@@ -87,10 +87,18 @@ export class PreviewVideoStreamService {
   // Stats interval
   private statsInterval: NodeJS.Timeout | null = null;
 
-  constructor(previewSessionId: string, userId: string, room: string) {
+  constructor(previewSessionId: string, userId: string, room: string, initialSeq?: number) {
     this.previewSessionId = previewSessionId;
     this.userId = userId;
     this.room = room;
+    if (initialSeq !== undefined) {
+      this.seq = initialSeq;
+    }
+  }
+
+  /** Get current seq value (for passing to replacement stream on page switch) */
+  getSeq(): number {
+    return this.seq;
   }
 
   /**
@@ -156,6 +164,15 @@ export class PreviewVideoStreamService {
         quality: PREVIEW_VIDEO_CONFIG.quality,
         resolution: `${PREVIEW_VIDEO_CONFIG.maxWidth}x${PREVIEW_VIDEO_CONFIG.maxHeight}`,
       });
+
+      // V11: Inject an immediate screenshot frame after start.
+      // CDP screencast may not emit frames on already-loaded/static pages,
+      // so we guarantee at least one frame reaches the frontend.
+      setTimeout(() => {
+        if (this.isStreaming && !this.isStopped && !this.cdpSessionClosed) {
+          this.injectFrame().catch(() => {});
+        }
+      }, 500);
 
       return true;
     } catch (error) {
@@ -571,10 +588,22 @@ export class PreviewVideoStreamRegistry {
     page: Page,
     nsp: Namespace
   ): Promise<boolean> {
+    // Capture seq from old stream before stopping (for continuity on page switch)
+    const oldStream = this.streams.get(previewSessionId);
+    const inheritedSeq = oldStream ? oldStream.getSeq() : undefined;
+
     // Stop existing stream if any
     await this.stopStream(previewSessionId);
 
-    const stream = new PreviewVideoStreamService(previewSessionId, userId, room);
+    const stream = new PreviewVideoStreamService(previewSessionId, userId, room, inheritedSeq);
+
+    if (inheritedSeq !== undefined) {
+      logger.info('[PREVIEW_VIDEO] Stream restart with inherited seq', {
+        previewSessionId,
+        inheritedSeq,
+      });
+    }
+
     const started = await stream.start(page, nsp);
 
     if (started) {

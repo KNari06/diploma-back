@@ -1143,7 +1143,7 @@ router.get('/:id/summary', requireAuth, asyncHandler(async (req: Request, res: R
     overallStats: {
       totalBrowsers: test.data?.browsers?.length || 0,
       completedBrowsers: results.data?.filter(r => r.status === 'completed').length || 0,
-      failedBrowsers: results.data?.filter(r => r.status === 'failed').length || 0,
+      failedBrowsers: results.data?.filter(r => r.status === 'failed' || r.status === 'timeout').length || 0,
       totalBugs: results.data?.reduce((sum, r) => sum + (r.aiSummary?.bugs?.length || 0), 0) || 0,
       criticalBugs: results.data?.reduce((sum, r) =>
         sum + (r.aiSummary?.bugs?.filter((b: any) => b.severity === 'critical').length || 0), 0) || 0,

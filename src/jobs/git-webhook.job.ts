@@ -212,7 +212,10 @@ export class GitWebhookJobHandler {
         deliveryId,
       });
 
-      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, { status: 'processed' });
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'processed',
+        regressionRunId: result.runId,
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       

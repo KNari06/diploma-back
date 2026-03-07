@@ -26,10 +26,10 @@ export async function checkAndHandleTestCompletion(testId: string): Promise<void
     const resultsResponse = await getTestResults(testId);
     const results = resultsResponse.data || [];
 
-    // Check if all browsers have completed (either 'completed', 'failed', or 'cancelled')
+    // Check if all browsers have completed (either 'completed', 'failed', 'cancelled', or 'timeout')
     const expectedBrowsers = test.browsers || [];
     const completedBrowsers = results.filter(result =>
-      ['completed', 'failed', 'cancelled'].includes(result.status)
+      ['completed', 'failed', 'cancelled', 'timeout'].includes(result.status)
     );
 
     const isTestComplete = expectedBrowsers.length > 0 &&
@@ -46,9 +46,10 @@ export async function checkAndHandleTestCompletion(testId: string): Promise<void
 
     if (isTestComplete) {
       // ✅ FIX #8: Determine final status based on results (not always 'completed')
-      // Priority: cancelled > failed > completed
+      // Priority: cancelled > timeout > failed > completed
       const hasCancelled = results.some(r => r.status === 'cancelled');
-      const hasFailed = results.some(r => r.status === 'failed');
+      const hasTimeout = results.some(r => r.status === 'timeout');
+      const hasFailed = results.some(r => r.status === 'failed' || r.status === 'timeout');
 
       let finalStatus: 'completed' | 'failed' | 'cancelled';
       if (hasCancelled) {

@@ -34,7 +34,7 @@ interface RetryContext {
   /** Whether each stage failed deterministically (no transient error, just 0 results) */
   stageDeterministicFail: {
     compiled: boolean;
-    embeddings: boolean;
+    resolver: boolean;
     smart: boolean;
     selfHeal: boolean;
   };
@@ -107,6 +107,13 @@ export class CommandExecutor {
     this.extractedData.clear();
     this.stepRuntimeMeta.clear();
     logger.debug('[COMMAND_EXECUTOR] Run state reset');
+  }
+
+  /**
+   * Get the current active page (may change if click opens a new tab)
+   */
+  getActivePage(): Page {
+    return this.page;
   }
 
   /**
@@ -249,7 +256,7 @@ export class CommandExecutor {
         case 'goto':
           if (!url) throw new Error('URL is required for goto action');
           await this.page.goto(url, {
-            waitUntil: command.waitFor || 'domcontentloaded',
+            waitUntil: command.waitFor || 'load',
             timeout: timeout || 30000,
           });
           break;
@@ -263,13 +270,47 @@ export class CommandExecutor {
             // ✅ Wait for enabled: Ensure element is not disabled
             await this.waitForEnabled(locator, 5000);
             if (awaitNavigation) {
-              // Wait for navigation if expected
-              await Promise.all([
-                this.page.waitForNavigation({ timeout: timeout || 30000 }).catch(() => {
-                  logger.debug('[COMMAND_EXECUTOR] Navigation timeout after click, continuing');
-                }),
-                locator.click({ timeout: timeout || 30000 }),
-              ]);
+              // Capture URL before click to detect navigation
+              const urlBeforeClick = this.page.url();
+              const pagesBefore = this.page.context().pages().length;
+              await locator.click({ timeout: timeout || 30000 });
+              // Wait for URL to change (replaces deprecated waitForNavigation)
+              try {
+                await this.page.waitForURL(
+                  (url) => url.toString() !== urlBeforeClick,
+                  { timeout: 15000, waitUntil: 'load' }
+                );
+                logger.debug('[COMMAND_EXECUTOR] Navigation after click detected', {
+                  from: urlBeforeClick,
+                  to: this.page.url(),
+                });
+              } catch {
+                // URL didn't change — check if a new tab/popup opened
+                const allPages = this.page.context().pages();
+                if (allPages.length > pagesBefore) {
+                  // New tab opened — switch to it
+                  const newPage = allPages[allPages.length - 1];
+                  // Wait for new page to be ready
+                  try {
+                    await newPage.waitForLoadState('load', { timeout: 10000 });
+                  } catch {
+                    // Fallback: at least wait for domcontentloaded
+                    await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+                  }
+                  const newUrl = newPage.url();
+                  logger.info('[COMMAND_EXECUTOR] Click opened new tab, switching page', {
+                    urlBeforeClick,
+                    newTabUrl: newUrl,
+                    totalPages: allPages.length,
+                  });
+                  this.page = newPage;
+                } else {
+                  logger.warn('[COMMAND_EXECUTOR] No navigation or new tab detected after click within 15s', {
+                    urlBeforeClick,
+                    currentUrl: this.page.url(),
+                  });
+                }
+              }
             } else {
               await locator.click({ timeout: timeout || 30000 });
             }
@@ -571,7 +612,7 @@ export class CommandExecutor {
             }
           };
 
-          // Intent command path — compiled plan → embeddings → smart → self-heal
+          // Intent command path — compiled plan → LLM resolver → smart → self-heal
           if (isIntentCommand && intentCommand.intentMeta) {
             const { locator: intentCheckLocator } = await this.getLocatorForIntentCommand(
               intentCommand, 'check', timeout || 30000
@@ -914,8 +955,8 @@ export class CommandExecutor {
         // V5: SPA-safe URL waiting (Momentic-like matchers)
         case 'waitFor': {
           const matcher = command.urlMatcher;
-          // V5.1: timeout is now primary (from command.timeout), urlMatcher.timeoutMs is fallback
-          const waitForTimeout = timeout ?? matcher?.timeoutMs ?? 15000;
+          // V5.2: urlMatcher.timeoutMs takes priority (set explicitly per matcher type)
+          const waitForTimeout = matcher?.timeoutMs ?? timeout ?? 15000;
           await this.executeWaitFor(matcher, waitForTimeout);
           break;
         }
@@ -946,7 +987,7 @@ export class CommandExecutor {
             if (!isVis) throw new Error(`Element not visible: ${selector}`);
           };
 
-          // Intent command path — compiled plan → embeddings → smart → self-heal
+          // Intent command path — compiled plan → LLM resolver → smart → self-heal
           if (isIntentCommand && intentCommand.intentMeta) {
             const { locator: intentAssertVisLoc } = await this.getLocatorForIntentCommand(
               intentCommand, 'click', timeout || 5000
@@ -1000,7 +1041,7 @@ export class CommandExecutor {
             logger.info('Assertion passed: Text matches', { selector, expected: expectedText, actual: actualText });
           };
 
-          // Intent command path — compiled plan → embeddings → smart → self-heal
+          // Intent command path — compiled plan → LLM resolver → smart → self-heal
           if (isIntentCommand && intentCommand.intentMeta) {
             const { locator: intentAssertTxtLoc } = await this.getLocatorForIntentCommand(
               intentCommand, 'click', timeout || 5000
@@ -1726,7 +1767,7 @@ export class CommandExecutor {
                   confidenceTier: 'high',
                   failedReason: 'assertion_failed',
                   failureExplanation: aiCheckResult.explanation,
-                  resolutionPath: 'embeddings', // ai_check uses embeddings-based resolution
+                  resolutionPath: 'llm_resolver',
                 });
               }
               throw new Error(aiCheckResult.explanation);
@@ -1739,7 +1780,7 @@ export class CommandExecutor {
                 source: 'resolver',
                 confidenceTier: aiCheckResult.confidence && aiCheckResult.confidence >= 0.85 ? 'high' :
                                 aiCheckResult.confidence && aiCheckResult.confidence >= 0.6 ? 'medium' : 'low',
-                resolutionPath: 'embeddings',
+                resolutionPath: 'llm_resolver',
               });
             }
           } catch (error) {
@@ -1751,7 +1792,7 @@ export class CommandExecutor {
                 confidenceTier: 'low',
                 failedReason: 'assertion_failed',
                 failureExplanation: error instanceof Error ? error.message : String(error),
-                resolutionPath: 'embeddings',
+                resolutionPath: 'llm_resolver',
               });
             }
             throw error;
@@ -1959,7 +2000,7 @@ export class CommandExecutor {
 
         // ─────────────────────────────────────────────────────────────────────
         // Lookahead wait: check next command's element readiness before executing
-        // Uses fast Playwright checks only (no AI/embeddings).
+        // Uses fast Playwright checks only (no AI/LLM).
         // Passes prevActionType + prevUrl so the service can:
         //   1. Detect SPA navigation (URL changed after click/open/close/toggle)
         //   2. Calibrate DOM stability threshold dynamically
@@ -2416,7 +2457,7 @@ export class CommandExecutor {
    */
   private allStagesDeterministicFail(ctx: RetryContext): boolean {
     const s = ctx.stageDeterministicFail;
-    return s.compiled && s.embeddings && s.smart && s.selfHeal;
+    return s.compiled && s.resolver && s.smart && s.selfHeal;
   }
 
   /**
@@ -2445,7 +2486,7 @@ export class CommandExecutor {
     // V11: Shared retry context — accumulated state across attempts
     const retryCtx: RetryContext = {
       attempt: 0,
-      stageDeterministicFail: { compiled: false, embeddings: false, smart: false, selfHeal: false },
+      stageDeterministicFail: { compiled: false, resolver: false, smart: false, selfHeal: false },
       healAttempts: 0,
       lastDomCollectionTs: 0,
       cachedDomNodes: null,
@@ -2562,11 +2603,11 @@ export class CommandExecutor {
       retryCtx.stageDeterministicFail.compiled = true;
     }
 
-    // 2. Try embeddings-based resolution (intent-aware, accurate)
-    // This is the P0 critical fix: collect fresh DOM + use embeddings for resolution
+    // 2. Try LLM-based resolution (intent-aware, accurate)
+    // Collect fresh DOM + use LLM resolver for element resolution
     if (intentMeta?.intentDescription && intentMeta?.actionType) {
       try {
-        logger.info('[COMMAND_EXECUTOR] Trying embeddings-based resolution', {
+        logger.info('[COMMAND_EXECUTOR] Trying LLM-based resolution', {
           stepId,
           intent: intentMeta.intentDescription.slice(0, 80),
           actionType: intentMeta.actionType,
@@ -2590,9 +2631,9 @@ export class CommandExecutor {
         if (domNodes.length === 0) {
           logger.warn('[COMMAND_EXECUTOR] No interactive nodes collected', { stepId });
         } else {
-          // Run embeddings-based resolution
-          const { resolveWithEmbeddings } = await import('@/services/testing/ui/preview/embeddings-resolver.service');
-          const resolveResult = await resolveWithEmbeddings({
+          // Run LLM-based element resolution
+          const { resolveElement } = await import('@/services/testing/ui/preview/element-resolver.service');
+          const resolveResult = await resolveElement({
             previewSessionId: 'background', // Not a preview session
             stepDraft: {
               id: stepId,
@@ -2603,9 +2644,7 @@ export class CommandExecutor {
             },
             domNodes,
             pageUrl: this.page.url(),
-            disableCaching: true, // Always fresh resolution in background
             includeAlternatives: false,
-            enableLLMDisambiguation: true, // Use aggressive LLM disambiguation
           });
 
           if (resolveResult.status === 'resolved' && resolveResult.candidates.length > 0) {
@@ -2641,24 +2680,24 @@ export class CommandExecutor {
 
               const runtimeMeta: StepRuntimeMeta = {
                 runtimeStatus: 'healed', // Mark as healed since compiled failed
-                source: 'resolver', // Embeddings-based resolution from resolver service
+                source: 'resolver',
                 confidenceTier: topCandidate.confidence >= 0.85 ? 'high' :
                                topCandidate.confidence >= 0.6 ? 'medium' : 'low',
                 executionMs: Date.now() - startTime,
-                usedLocatorStrategy: 'embeddings',
+                usedLocatorStrategy: 'llm_resolver',
                 healConfidence: topCandidate.confidence,
-                resolutionPath: 'embeddings',
+                resolutionPath: 'llm_resolver',
                 needsReview: topCandidate.confidence < 0.85,
                 flaky: topCandidate.confidence < 0.75,
               };
               this.stepRuntimeMeta.set(stepId, runtimeMeta);
 
-              logger.info('[COMMAND_EXECUTOR] Embeddings resolution succeeded', {
+              logger.info('[COMMAND_EXECUTOR] LLM resolution succeeded', {
                 stepId,
                 ref: topCandidate.ref,
                 confidence: topCandidate.confidence,
                 label: topCandidate.label?.slice(0, 50),
-                resolutionPath: 'embeddings',
+                resolutionPath: 'llm_resolver',
               });
 
               // TODO P1: Persist healed ref back to intent test case for future runs
@@ -2674,20 +2713,20 @@ export class CommandExecutor {
           if (resolveResult.candidates.length > 0) {
             retryCtx.totalCandidatesEver += resolveResult.candidates.length;
           } else {
-            retryCtx.stageDeterministicFail.embeddings = true;
+            retryCtx.stageDeterministicFail.resolver = true;
           }
 
-          logger.info('[COMMAND_EXECUTOR] Embeddings resolution unsuccessful', {
+          logger.info('[COMMAND_EXECUTOR] LLM resolution unsuccessful', {
             stepId,
             status: resolveResult.status,
             candidateCount: resolveResult.candidates.length,
             message: resolveResult.message,
           });
         }
-      } catch (embeddingsError) {
-        logger.warn('[COMMAND_EXECUTOR] Embeddings resolution failed', {
+      } catch (resolverError) {
+        logger.warn('[COMMAND_EXECUTOR] LLM resolution failed', {
           stepId,
-          error: embeddingsError instanceof Error ? embeddingsError.message : String(embeddingsError),
+          error: resolverError instanceof Error ? resolverError.message : String(resolverError),
         });
         // Transient error (network, timeout) — do NOT mark as deterministic fail
       }
@@ -2718,8 +2757,8 @@ export class CommandExecutor {
             confidenceTier: 'medium',
             executionMs: Date.now() - startTime,
             usedLocatorStrategy: 'smart',
-            // getSmartLocator() does NOT use embeddings; it uses deterministic scoring and (optionally) LLM disambiguation.
-            resolutionPath: smartResult.usedAI ? 'llm_disambiguation' : 'rule_fallback',
+            // getSmartLocator() uses deterministic scoring (separate from LLM resolver).
+            resolutionPath: smartResult.usedAI ? 'llm_resolver' : 'rule_fallback',
           };
           this.stepRuntimeMeta.set(stepId, runtimeMeta);
 
@@ -3667,12 +3706,16 @@ export class CommandExecutor {
     // Priority: changedFrom > regex > glob > substring > domain
 
     if (matcher.changedFrom) {
-      // Wait until URL changes from the specified value
+      // Wait until URL changes from the specified value.
+      // Use page.waitForURL which is navigation-lifecycle-aware:
+      // - Checks current URL immediately (catches already-changed case)
+      // - Listens for frame.navigated events (catches in-flight navigation)
+      // - Waits for waitUntil load state after URL matches (ensures page is ready)
+      // - Handles both full-page nav and SPA pushState
       const prevUrl = matcher.changedFrom;
-      await this.page.waitForFunction(
-        (prev: string) => String((globalThis as any).location?.href ?? '') !== prev,
-        prevUrl,
-        { timeout: timeoutMs }
+      await this.page.waitForURL(
+        (url) => url.toString() !== prevUrl,
+        { timeout: timeoutMs, waitUntil: 'load' }
       );
       logger.debug('[COMMAND_EXECUTOR] URL changed from previous value', {
         prevUrl,

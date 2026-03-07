@@ -15,6 +15,7 @@ import type {
   ExecutableTestCase,
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { topologicalSort } from '@/utils/graph/topological-sort';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { executionCompletionEmitter } from '../executions/execution-completion-emitter';
@@ -720,6 +721,9 @@ export class RegressionRunService {
       if (runError || !run) {
         throw new Error(`Failed to create plan run: ${runError?.message}`);
       }
+
+      // Invalidate plans list cache (new run affects lastRun display)
+      await cache.delByPattern(`qait:cache:plans:proj:${plan.projectId}:*`);
 
       // 3. Create execution records for all test cases
       let executions;
@@ -1678,14 +1682,18 @@ export class RegressionRunService {
       return;
     }
 
-    // If only API tests exist, finalize run immediately
-    const finalStatus = apiFailed > 0 ? 'failed' : 'passed';
+    // If only API tests exist, finalize run immediately.
+    // NOTE: regression_runs.status uses 'completed' (not 'passed') for success — match DB convention.
+    const hasFails = apiFailed > 0;
+    const persistedStatus = hasFails ? 'failed' : 'completed';
     await supabaseAdmin
       .from('regression_runs')
       .update({
-        status: finalStatus,
+        status: persistedStatus,
         summary: {
           total: testCases.length,
+          passed: apiPassed,
+          failed: apiFailed,
           api_passed: apiPassed,
           api_failed: apiFailed,
           skipped: skippedCount,
@@ -1696,8 +1704,8 @@ export class RegressionRunService {
       .eq('id', runId);
 
     emitProgress(
-      finalStatus === 'passed' ? 'completed' : 'failed',
-      `Regression run ${finalStatus}: ${apiPassed} passed, ${apiFailed} failed, ${skippedCount} skipped`
+      persistedStatus === 'completed' ? 'completed' : 'failed',
+      `Regression run ${persistedStatus}: ${apiPassed} passed, ${apiFailed} failed, ${skippedCount} skipped`
     );
   }
 

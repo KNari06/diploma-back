@@ -101,6 +101,7 @@ export async function emitSnapshotIfChanged(
       const payload = {
         previewSessionId,
         url: snapshot.url,
+        pageTitle: snapshot.pageTitle,
         domVersion: snapshot.domVersion,
         pageSignature: snapshot.pageSignature,
         domNodes: snapshot.domNodes,

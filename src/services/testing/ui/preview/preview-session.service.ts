@@ -12,6 +12,7 @@ import { Browser, BrowserContext, Page, chromium } from 'playwright';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { DomAnalysisExtractorService } from './dom-analysis-extractor.service';
 import type { InteractiveNode, PreviewSession } from './preview.types';
+import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
 
 // Configuration (balanced limits to avoid OOM)
 const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -114,6 +115,9 @@ interface InternalSession extends PreviewSession {
 
   /** V11: Callback invoked when session switches to a new page (popup/navigation) */
   onPageSwitch?: (newPage: Page, previousUrl: string) => void;
+
+  /** V11: True while page switch is in progress — blocks DOM tick from collecting stale/empty snapshots */
+  pageSwitchInProgress?: boolean;
 }
 
 /**
@@ -303,6 +307,13 @@ export class PreviewSessionService {
 
         page = await context.newPage();
 
+        // Block third-party requests to prevent slow networkidle waits
+        try {
+          await setupThirdPartyBlocker(page);
+        } catch {
+          // Non-fatal: preview should work without blocker
+        }
+
         // Navigate to start URL
         await page.goto(safeStartUrl, {
           waitUntil: 'domcontentloaded',
@@ -333,6 +344,7 @@ export class PreviewSessionService {
           startUrl: safeStartUrl,
           pageState: {
             url: initialUrl,
+            pageTitle: await page.title().catch(() => undefined),
             domNodes: domAnalysis.interactiveNodes,
             pageText: snapshot.pageTextForExtraction?.slice(0, 3000),
           },
@@ -456,6 +468,13 @@ export class PreviewSessionService {
 
       newPage = await newContext.newPage();
 
+      // Block third-party requests to prevent slow networkidle waits
+      try {
+        await setupThirdPartyBlocker(newPage);
+      } catch {
+        // Non-fatal: preview should work without blocker
+      }
+
       await newPage.goto(startUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 30000,
@@ -552,6 +571,93 @@ export class PreviewSessionService {
       });
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Page refresh failed', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Navigate back in browser history
+   */
+  async goBack(sessionId: string, userId: string): Promise<{
+    url: string;
+    domNodes?: InteractiveNode[];
+    domVersion: number;
+    pageSignature: string;
+    changed: boolean;
+  } | null> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+
+    try {
+      const previousUrl = session.page.url();
+      logger.info('[PREVIEW_SESSION] Navigating back', { sessionId, currentUrl: previousUrl });
+
+      const response = await session.page.goBack({
+        waitUntil: 'domcontentloaded',
+        timeout: 10000,
+      });
+
+      // goBack returns null if there's no history to go back to
+      if (!response) {
+        logger.debug('[PREVIEW_SESSION] No history to go back', { sessionId });
+        return null;
+      }
+
+      await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+      return this.getSnapshot(sessionId, userId, {
+        force: true,
+        includeDomNodes: true,
+        onlyIfChanged: false,
+      });
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] goBack failed', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Navigate forward in browser history
+   */
+  async goForward(sessionId: string, userId: string): Promise<{
+    url: string;
+    domNodes?: InteractiveNode[];
+    domVersion: number;
+    pageSignature: string;
+    changed: boolean;
+  } | null> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+
+    try {
+      const previousUrl = session.page.url();
+      logger.info('[PREVIEW_SESSION] Navigating forward', { sessionId, currentUrl: previousUrl });
+
+      const response = await session.page.goForward({
+        waitUntil: 'domcontentloaded',
+        timeout: 10000,
+      });
+
+      if (!response) {
+        logger.debug('[PREVIEW_SESSION] No history to go forward', { sessionId });
+        return null;
+      }
+
+      await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+      return this.getSnapshot(sessionId, userId, {
+        force: true,
+        includeDomNodes: true,
+        onlyIfChanged: false,
+      });
+    } catch (error) {
+      logger.warn('[PREVIEW_SESSION] goForward failed', {
         sessionId,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -1095,6 +1201,7 @@ export class PreviewSessionService {
     }
   ): Promise<{
     url: string;
+    pageTitle?: string;
     domNodes?: InteractiveNode[];  // Only included when DOM changed or forced
     domVersion: number;
     pageSignature: string;
@@ -1103,6 +1210,11 @@ export class PreviewSessionService {
   } | null> {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
+
+    // V11: Block snapshot collection during page switch to prevent stale/empty DOM emission
+    if (session.pageSwitchInProgress) {
+      return null;
+    }
 
     const now = Date.now();
     const includeScreenshot = options?.includeScreenshot === true; // Default false now
@@ -1115,6 +1227,7 @@ export class PreviewSessionService {
       const shouldIncludeDomNodes = options?.includeDomNodes === true;
       return {
         url: session.pageState.url,
+        pageTitle: session.pageState.pageTitle,
         domNodes: shouldIncludeDomNodes ? session.pageState.domNodes : undefined,
         domVersion: session.domVersion,
         pageSignature: session.lastPageSignature,
@@ -1127,8 +1240,11 @@ export class PreviewSessionService {
       const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
       const currentUrl = session.page.url();
 
+      const currentTitle = await session.page.title().catch(() => undefined);
+
       session.pageState = {
         url: currentUrl,
+        pageTitle: currentTitle,
         domNodes: domAnalysis.interactiveNodes,
         pageText: snapshot.pageTextForExtraction?.slice(0, 3000),
       };
@@ -1148,6 +1264,7 @@ export class PreviewSessionService {
       if (options?.onlyIfChanged && !changed) {
         return {
           url: session.pageState.url,
+          pageTitle: session.pageState.pageTitle,
           domVersion: session.domVersion,
           pageSignature: session.lastPageSignature,
           changed: false,
@@ -1172,6 +1289,7 @@ export class PreviewSessionService {
 
       return {
         url: session.pageState.url,
+        pageTitle: session.pageState.pageTitle,
         domNodes: shouldIncludeDomNodes ? session.pageState.domNodes : undefined,
         domVersion: session.domVersion,
         pageSignature: session.lastPageSignature,
@@ -1431,6 +1549,9 @@ export class PreviewSessionService {
           newUrl,
         });
 
+        // V11: Block snapshot collection during page switch to prevent stale/empty DOM
+        session.pageSwitchInProgress = true;
+
         // Close old page (best-effort, don't fail if already closed)
         const oldPage = session.page;
         try {
@@ -1447,9 +1568,20 @@ export class PreviewSessionService {
         this.attachCrashHandler(newPage, previewSessionId);
         this.attachPageDownloadHandler(newPage, previewSessionId);
 
+        // V11: Wait for new page to be fully loaded before allowing snapshot collection.
+        // This prevents race conditions where DOM tick collects empty/partial DOM.
+        try {
+          await newPage.waitForLoadState('load', { timeout: 8000 });
+        } catch {
+          // Timeout is acceptable — page may have slow resources. DOM should still be ready.
+        }
+
         // Reset snapshot state so next getSnapshot() forces a fresh collect
         session.lastSnapshotEmit = 0;
         session.lastPageSignature = '';
+
+        // V11: Unblock snapshot collection now that new page is loaded
+        session.pageSwitchInProgress = false;
 
         // Update recording URL baseline if recording
         if (session.recording) {
@@ -1485,6 +1617,11 @@ export class PreviewSessionService {
           previewSessionId,
           error: error instanceof Error ? error.message : String(error),
         });
+
+        // V11: Ensure pageSwitchInProgress is cleared even on error
+        if (session) {
+          session.pageSwitchInProgress = false;
+        }
 
         // If we can't switch, close the popup to avoid orphaned pages
         try {

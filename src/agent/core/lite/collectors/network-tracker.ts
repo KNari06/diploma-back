@@ -7,6 +7,7 @@
 import { logger } from '@/utils/core/logger';
 import type { Page, Request, Response } from 'playwright';
 import type { NetworkSuccess, NetworkValidationError } from '../lite-types';
+import { THIRD_PARTY_DOMAINS } from '@/agent/playwright/execution/third-party-blocker';
 
 /**
  * Network error structure (Pro-grade)
@@ -46,133 +47,8 @@ export class NetworkTracker {
   private capturedRequestBodies: Map<string, any> = new Map();
 
   // Manus Style: Analytics blacklist (ignore even POST to these domains)
-  private static readonly ANALYTICS_DOMAINS = [
-    // Core analytics platforms
-    'google-analytics.com',
-    'analytics.google.com',
-    'googletagmanager.com',
-    'googleadservices.com',
-    'doubleclick.net',
-    'googleads.g.doubleclick.net',
-
-    // Error tracking & monitoring
-    'sentry.io',
-    'sentry-cdn.com',
-    'bugsnag.com',
-    'rollbar.com',
-    'airbrake.io',
-    'raygun.io',
-
-    // Product analytics
-    'mixpanel.com',
-    'amplitude.com',
-    'heap.io',
-    'segment.com',
-    'segment.io',
-    'posthog.com',
-    'posthog.net',
-    'kissmetrics.com',
-    'kissmetrics.io',
-
-    // Session replay & heatmaps
-    'hotjar.com',
-    'hotjar.io',
-    'fullstory.com',
-    'fullstoryapp.com',
-    'logrocket.com',
-    'logrocket.io',
-    'mouseflow.com',
-    'inspectlet.com',
-    'crazyegg.com',
-    'clarity.microsoft.com',
-
-    // Marketing & advertising pixels
-    'facebook.com',
-    'facebook.net',
-    'fbcdn.net',
-    'linkedin.com',
-    'licdn.com',
-    'twitter.com',
-    'twimg.com',
-    'pinterest.com',
-    'pinterestads.com',
-    'snapchat.com',
-    'sc-static.net',
-    'tiktok.com',
-    'tiktokcdn.com',
-    'vk.com',
-    'vk-cdn.net',
-
-    // Customer messaging (often used for tracking)
-    'intercom.io',
-    'intercomcdn.com',
-    'drift.com',
-    'drift-api.com',
-    'zendesk.com',
-    'zendesk-chat.com',
-    'olark.com',
-    'livechatinc.com',
-    'tawk.to',
-
-    // Marketing automation
-    'hubspot.com',
-    'hs-scripts.com',
-    'hsappstatic.net',
-    'marketo.com',
-    'marketo.net',
-    'pardot.com',
-    'pardot.net',
-
-    // A/B testing & optimization
-    'optimizely.com',
-    'optimizelyapis.com',
-    'vwo.com',
-    'wingify.com',
-    'convert.com',
-    'convertapi.com',
-    'unbounce.com',
-    'unbouncepages.com',
-
-    // APM & monitoring
-    'datadoghq.com',
-    'datadoghq.net',
-    'newrelic.com',
-    'nr-data.net',
-    'dynatrace.com',
-    'dynatrace-managed.com',
-    'appdynamics.com',
-
-    // Other analytics
-    'adobe.com',
-    'omniture.com',
-    '2o7.net',
-    'demdex.net',
-    'adobedtm.com',
-    'cloudflare.com',
-    'cloudflareinsights.com',
-    'yandex.ru',
-    'yandex.net',
-    'metrica.yandex.ru',
-    'baidu.com',
-    'baidu-analytics.com',
-    'matomo.org',
-    'piwik.pro',
-    'plausible.io',
-    'fathomanalytics.com',
-    'simpleanalytics.com',
-    'clicky.com',
-    'statcounter.com',
-    'gosquared.com',
-    'chartbeat.com',
-    'parsely.com',
-
-    // Lead generation & enrichment
-    'clearbit.com',
-    'clearbitstatic.com',
-    '6sense.com',
-    'demandbase.com',
-    'leadfeeder.com',
-  ];
+  // Uses shared domain list from ThirdPartyBlocker for consistency
+  private static readonly ANALYTICS_DOMAINS: readonly string[] = THIRD_PARTY_DOMAINS;
 
   // Manus Style: Track only dynamic resource types
   private static readonly RELEVANT_RESOURCE_TYPES = ['fetch', 'xhr'];
