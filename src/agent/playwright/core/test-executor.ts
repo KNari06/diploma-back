@@ -193,13 +193,14 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     });
 
     // Setup browser and page
-    // For replay mode: disable video on initial attempt (save resources).
-    // Video is enabled on retry attempts (attempt 1+) — the test already failed, we need video for debugging.
+    // For replay mode: disable video + tracing on initial attempt (save RAM).
+    // Both are enabled on retry attempts (attempt 1+) — the test already failed, we need artifacts for debugging.
     const isReplayMode = !testData.intelligentMode && testData.commands && testData.commands.length > 0;
     const retryAttempt = testData._retryAttempt ?? 0;
     const disableVideo = isReplayMode && retryAttempt === 0;
+    const disableTracing = isReplayMode && retryAttempt === 0;
     const browser = await getBrowserWithProgress(testData);
-    const setupResult = await setupBrowserContext(testData, browser, { disableVideo });
+    const setupResult = await setupBrowserContext(testData, browser, { disableVideo, disableTracing });
     context = setupResult.context;
     tracePath = setupResult.tracePath;
 
@@ -346,9 +347,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
       // Create executor with self-healing enabled (for AI fallback without clarification)
       // On retry attempts: skip compiled plan (Stage 1) and go straight to LLM resolver (Stage 2)
+      const { MAX_NODES_REPLAY } = await import('@/agent/execution/background-dom-collector');
       const executor = new CommandExecutor(page, {
         selfHealingEnabled: true,
         skipCompiledPlan: retryAttempt > 0,
+        maxDomNodes: MAX_NODES_REPLAY,
         metadata: {
           url: testData.url,
           projectId: testData.projectId,
@@ -499,6 +502,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 newUrl: executorPage.url(),
               });
               activePage = executorPage;
+              // Re-attach error collector to new page
+              errorCollector.switchPage(activePage);
             }
 
             // Get errors that occurred during this step's execution window

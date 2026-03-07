@@ -167,6 +167,38 @@ export class ErrorCollectorService {
   }
 
   /**
+   * Switch to a new page (e.g., after new tab opened).
+   * Re-attaches listeners to the new page while preserving collected errors.
+   */
+  switchPage(newPage: Page): void {
+    if (this.page === newPage) return;
+
+    // Detach from old page
+    if (this.isListening) {
+      try {
+        this.page.off('console', this.onConsole);
+        this.page.off('pageerror', this.onPageError);
+        this.page.off('requestfailed', this.onRequestFailed);
+        this.page.off('response', this.onResponse);
+      } catch {
+        // old page may already be closed
+      }
+    }
+
+    this.page = newPage;
+
+    // Re-attach to new page
+    if (this.isListening) {
+      this.page.on('console', this.onConsole);
+      this.page.on('pageerror', this.onPageError);
+      this.page.on('requestfailed', this.onRequestFailed);
+      this.page.on('response', this.onResponse);
+    }
+
+    logger.info('[ERROR_COLLECTOR] Switched to new page', { url: newPage.url() });
+  }
+
+  /**
    * Stop collecting errors
    */
   stopCollecting(): void {

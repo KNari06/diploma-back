@@ -102,9 +102,22 @@ class BrowserPool {
   }
 
   /**
+   * Get total context count across all browsers
+   */
+  getTotalContextCount(): number {
+    let total = 0;
+    for (const [, browser] of this.browsers) {
+      if (browser.isConnected()) {
+        total += browser.contexts().length;
+      }
+    }
+    return total;
+  }
+
+  /**
    * Health check for browser pool
    */
-  getStatus(): { total: number; connected: number; browsers: string[] } {
+  getStatus(): { total: number; connected: number; browsers: string[]; contexts: number } {
     const connected = Array.from(this.browsers.entries())
       .filter(([, browser]) => browser.isConnected())
       .map(([type]) => type);
@@ -113,6 +126,7 @@ class BrowserPool {
       total: this.browsers.size,
       connected: connected.length,
       browsers: connected,
+      contexts: this.getTotalContextCount(),
     };
   }
 }

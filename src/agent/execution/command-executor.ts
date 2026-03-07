@@ -65,6 +65,7 @@ export class CommandExecutor {
   private selfHealingConfidenceThreshold: number = 0.85; // ✅ FIX 7: Configurable threshold
   private maxHealAttempts: number = 1; // ✅ V2: Limit self-heal attempts to expose flakiness
   private skipCompiledPlan: boolean = false; // Skip Stage 1 on retry attempts
+  private maxDomNodes?: number; // Configurable DOM node limit (saves memory in replay mode)
   /** Runtime metadata for each step (keyed by stepId) */
   private stepRuntimeMeta: Map<string, StepRuntimeMeta> = new Map();
   /** V10: Current command index in executeCommands loop (for next-step lookahead) */
@@ -81,6 +82,7 @@ export class CommandExecutor {
       costManager?: AICostManager;
       selfHealingConfidenceThreshold?: number; // ✅ NEW: Configurable confidence
       skipCompiledPlan?: boolean; // Skip compiled locator plan (Stage 1) — used on retry attempts
+      maxDomNodes?: number; // Limit DOM nodes collected (saves memory in replay mode)
     } = {}
   ) {
     this.page = page;
@@ -89,6 +91,7 @@ export class CommandExecutor {
     this.costManager = options.costManager;
     this.selfHealingConfidenceThreshold = options.selfHealingConfidenceThreshold ?? 0.85;
     this.skipCompiledPlan = options.skipCompiledPlan ?? false;
+    this.maxDomNodes = options.maxDomNodes;
 
     this.abortController = new AbortController();
 
@@ -2620,7 +2623,7 @@ export class CommandExecutor {
           (Date.now() - retryCtx.lastDomCollectionTs > 1500);
 
         const domNodes = shouldCollectFresh
-          ? await collectInteractiveNodes(this.page)
+          ? await collectInteractiveNodes(this.page, this.maxDomNodes)
           : retryCtx.cachedDomNodes!;
 
         if (shouldCollectFresh) {

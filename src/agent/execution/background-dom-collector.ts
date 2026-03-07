@@ -15,8 +15,11 @@ import type { InteractiveNode } from '@/services/testing/ui/preview/preview.type
 import { logger } from '@/utils/core/logger';
 import type { Page } from 'playwright';
 
-/** Maximum interactive nodes to collect (higher limit for background runs) */
-const MAX_NODES_BACKGROUND = 500;
+/** Maximum interactive nodes to collect (default for exploration/intelligent mode) */
+const MAX_NODES_DEFAULT = 500;
+
+/** Reduced node limit for replay mode (saves memory) */
+export const MAX_NODES_REPLAY = 200;
 
 /** Attribute name for temporary refs */
 const TEMP_REF_ATTR = 'data-agent-ref';
@@ -31,12 +34,13 @@ const DOM_STABILITY_TIMEOUT_MS = 1500;
 const DOM_STABILITY_CHECK_INTERVAL_MS = 200;
 
 /**
- * Browser-side script to extract interactive elements
- * Returns array of element data with all needed attributes
+ * Build browser-side script to extract interactive elements
+ * @param maxNodes - Maximum number of nodes to collect
  */
-const EXTRACT_SCRIPT = `
+function buildExtractScript(maxNodes: number): string {
+  return `
 (function extractInteractiveNodes() {
-  const MAX_NODES = ${MAX_NODES_BACKGROUND};
+  const MAX_NODES = ${maxNodes};
   const MAX_TEXT_LENGTH = 100;
   const MAX_PARENT_CHAIN = 6;
 
@@ -295,6 +299,7 @@ const EXTRACT_SCRIPT = `
   return results;
 })();
 `;
+}
 
 /**
  * Collect interactive nodes from current page state
@@ -303,9 +308,10 @@ const EXTRACT_SCRIPT = `
  * @param page - Playwright Page
  * @returns Array of InteractiveNode with temporary refs
  */
-export async function collectInteractiveNodes(page: Page): Promise<InteractiveNode[]> {
+export async function collectInteractiveNodes(page: Page, maxNodes?: number): Promise<InteractiveNode[]> {
   try {
     const startTime = Date.now();
+    const limit = maxNodes ?? MAX_NODES_DEFAULT;
 
     // CRITICAL: Remove stale bg-X refs from previous resolution steps
     // Without this, multi-step tests accumulate duplicate refs causing wrong element targeting
@@ -315,10 +321,10 @@ export async function collectInteractiveNodes(page: Page): Promise<InteractiveNo
     await waitForPageStability(page);
 
     // Step 2: Collect from main frame
-    const mainNodes = await page.evaluate(EXTRACT_SCRIPT) as InteractiveNode[];
+    const mainNodes = await page.evaluate(buildExtractScript(limit)) as InteractiveNode[];
 
     // Step 3: Collect from accessible iframes
-    const iframeNodes = await collectFromIframes(page);
+    const iframeNodes = await collectFromIframes(page, limit);
 
     const nodes = [...mainNodes, ...iframeNodes];
     const elapsed = Date.now() - startTime;
@@ -388,7 +394,7 @@ async function waitForPageStability(page: Page): Promise<void> {
  * @param page - Playwright Page
  * @returns InteractiveNode[] from all accessible iframes
  */
-async function collectFromIframes(page: Page): Promise<InteractiveNode[]> {
+async function collectFromIframes(page: Page, maxNodes: number = MAX_NODES_DEFAULT): Promise<InteractiveNode[]> {
   const allIframeNodes: InteractiveNode[] = [];
 
   try {
@@ -403,7 +409,7 @@ async function collectFromIframes(page: Page): Promise<InteractiveNode[]> {
 
       try {
         // Try to evaluate in the frame — will fail for cross-origin
-        const frameNodes = await frame.evaluate(EXTRACT_SCRIPT) as InteractiveNode[];
+        const frameNodes = await frame.evaluate(buildExtractScript(maxNodes)) as InteractiveNode[];
 
         if (frameNodes.length > 0) {
           // Prefix refs with frame identifier to avoid collisions with main frame refs
