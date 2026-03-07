@@ -3,6 +3,7 @@ import { WorkspaceAccessService, PERMISSIONS } from '@/services/core/workspace-a
 import { WorkspaceLogoStorageService } from '@/services/storage/workspace-logo-storage.service';
 import { WorkspaceLogoUploadResponse } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { Request, Response } from 'express';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -148,6 +149,9 @@ export const uploadWorkspaceLogo = async (req: Request, res: Response): Promise<
       });
       throw updateError;
     }
+
+    // Invalidate onboarding cache — logo is part of onboarding workspace data
+    await cache.del(`qait:cache:onboarding:${userId}`);
 
     const response: WorkspaceLogoUploadResponse = {
       logo_url: publicUrl,
@@ -300,6 +304,9 @@ export const deleteWorkspaceLogo = async (req: Request, res: Response): Promise<
       });
       throw updateError;
     }
+
+    // Invalidate onboarding cache — logo is part of onboarding workspace data
+    await cache.del(`qait:cache:onboarding:${userId}`);
 
     res.status(200).json({
       success: true,

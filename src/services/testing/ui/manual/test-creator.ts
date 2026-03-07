@@ -2,6 +2,7 @@ import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { Test, TestRunRequest } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { v4 as uuidv4 } from 'uuid';
 
 /**
@@ -124,6 +125,10 @@ export async function getOrCreateUserProject(userId: string): Promise<string> {
       projectName: newProject.name,
       workspaceId: workspace_id
     });
+
+    // Invalidate projects cache — new project added
+    await cache.delByPattern(`qait:cache:projects:ws:${workspace_id}:*`);
+    await cache.delByPattern(`qait:cache:projects:user:*`);
 
     return newProject.id;
   } catch (error) {

@@ -11,6 +11,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/testing/flows/saved-case-dependency-suggester.service';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { Request, Response } from 'express';
 
 // ============================================================================
@@ -255,6 +256,14 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
       throw new Error(`Failed to update saved test case: ${error.message}`);
     }
 
+    // Invalidate ptree:flow cache for any affected flow
+    if (data.flow_id) {
+      await cache.delByPattern(`qait:cache:ptree:flow:${data.flow_id}:*`);
+    }
+    if (flowId !== undefined && flowId !== data.flow_id) {
+      await cache.delByPattern(`qait:cache:ptree:flow:${flowId}:*`);
+    }
+
     // Generate AI suggestions if case has a flow_id
     let suggestedDependsOn: DependencySuggestion[] = [];
     if (data.flow_id) {
@@ -355,6 +364,9 @@ export async function assignToFlow(req: AuthenticatedRequest, res: Response): Pr
       }
       throw new Error(`Failed to assign to flow: ${error.message}`);
     }
+
+    // Invalidate ptree:flow cache for the assigned flow
+    await cache.delByPattern(`qait:cache:ptree:flow:${flowId}:*`);
 
     // Generate AI suggestions
     const suggestedDependsOn = await SavedCaseDependencySuggester.suggestForCase(

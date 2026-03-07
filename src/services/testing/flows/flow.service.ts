@@ -200,10 +200,10 @@ export class FlowService {
   static async delete(id: string, userId: string): Promise<boolean> {
     logger.info('[FLOW_SERVICE] Deleting flow', { id });
 
-    // Fetch module_id before delete for cache invalidation
+    // Fetch module_id and project_id before delete for cache invalidation
     const { data: flow } = await supabaseAdmin
       .from('test_flows')
-      .select('module_id')
+      .select('module_id, test_modules!inner(project_id)')
       .eq('id', id)
       .eq('user_id', userId)
       .maybeSingle();
@@ -236,6 +236,12 @@ export class FlowService {
       await cache.delByPattern(`qait:cache:ptree:module:${flow.module_id}:*`);
     }
     await cache.delByPattern(`qait:cache:ptree:flow:${id}:*`);
+
+    // Invalidate plans cache — deleting a flow removes its regression_plan_items as side-effect
+    const projectId = (flow as any)?.test_modules?.project_id;
+    if (projectId) {
+      await cache.delByPattern(`qait:cache:plans:proj:${projectId}:*`);
+    }
 
     return true;
   }

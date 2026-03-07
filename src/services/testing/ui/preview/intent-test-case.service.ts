@@ -280,10 +280,10 @@ export class IntentTestCaseService {
   static async delete(id: string, userId: string): Promise<boolean> {
     logger.info('[INTENT_TEST_CASE] Deleting test case', { id });
 
-    // Fetch flow_id before delete for cache invalidation
+    // Fetch flow_id and project_id before delete for cache invalidation
     const { data: tc } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('flow_id')
+      .select('flow_id, project_id')
       .eq('id', id)
       .eq('user_id', userId)
       .maybeSingle();
@@ -314,6 +314,11 @@ export class IntentTestCaseService {
     // Invalidate flow mode cache
     if (tc?.flow_id) {
       await cache.delByPattern(`qait:cache:ptree:flow:${tc.flow_id}:*`);
+    }
+
+    // Invalidate plans cache — deleting a test case removes its regression_plan_items as side-effect
+    if (tc?.project_id) {
+      await cache.delByPattern(`qait:cache:plans:proj:${tc.project_id}:*`);
     }
 
     return true;

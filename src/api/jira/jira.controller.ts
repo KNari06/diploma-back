@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { handlePlatformTest } from '@/api/chat/ai_test/handler';
 import { handleApiTest } from '@/api/chat/api_test/handler';
 import { handleClarificationRequest } from '@/api/chat/shared/clarification';
@@ -914,7 +915,7 @@ export const updateJiraSettings = async (req: Request, res: Response): Promise<v
 
     const { data: project, error: fetchError } = await supabaseAdmin
       .from('projects')
-      .select('id, settings')
+      .select('id, settings, workspace_id')
       .eq('id', resolvedId)
       .eq('user_id', userId)
       .maybeSingle();
@@ -953,6 +954,12 @@ export const updateJiraSettings = async (req: Request, res: Response): Promise<v
       res.status(500).json({ success: false, error: 'Failed to update Jira settings' });
       return;
     }
+
+    // Invalidate projects cache — project settings changed
+    if ((project as any).workspace_id) {
+      await cache.delByPattern(`qait:cache:projects:ws:${(project as any).workspace_id}:*`);
+    }
+    await cache.delByPattern(`qait:cache:projects:user:*`);
 
     res.json({ success: true, data: updates });
   } catch (error) {

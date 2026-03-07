@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
+import { cache } from '@/utils/core/redis-cache';
 import { ExecutionService } from '@/services/testing/executions/execution.service';
 import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/testing/flows/saved-case-dependency-suggester.service';
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
@@ -118,6 +119,9 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
       if (updateError) {
         throw new Error(`Failed to assign intent test case to flow: ${updateError.message}`);
       }
+
+      // Invalidate ptree:flow cache for the assigned flow
+      await cache.delByPattern(`qait:cache:ptree:flow:${flowId}:*`);
 
       // Get AI suggestions
       suggestedDependsOn = await SavedCaseDependencySuggester.suggestForCase(
@@ -823,7 +827,7 @@ export async function cancelRun(req: AuthenticatedRequest, res: Response): Promi
     // Verify access and get run data
     const { data: run, error: runError } = await supabaseAdmin
       .from('regression_runs')
-      .select('id, user_id, status, test_ids')
+      .select('id, user_id, status, test_ids, project_id')
       .eq('id', runId)
       .eq('user_id', userId)
       .single();
@@ -880,6 +884,11 @@ export async function cancelRun(req: AuthenticatedRequest, res: Response): Promi
       cancelledTests,
       totalTestIds: testIds.length,
     });
+
+    // Invalidate vizoverall cache — run status changed
+    if (run.project_id) {
+      await cache.delByPattern(`qait:cache:vizoverall:${run.project_id}:*`);
+    }
 
     res.json({
       success: true,
