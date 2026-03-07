@@ -10,6 +10,7 @@ import type {
     UpdateTestFlowParams,
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 
 /**
  * Service for managing test flows
@@ -76,6 +77,9 @@ export class FlowService {
       logger.error('[FLOW_SERVICE] Failed to create flow', { error });
       throw new Error(`Failed to create flow: ${error.message}`);
     }
+
+    // Invalidate module mode cache (flow list changed)
+    await cache.delByPattern(`qait:cache:ptree:module:${moduleId}:*`);
 
     return this.mapToTestFlow(data);
   }
@@ -181,6 +185,9 @@ export class FlowService {
       throw new Error(`Failed to update flow: ${error.message}`);
     }
 
+    // Invalidate module mode cache (flow metadata changed)
+    await cache.delByPattern(`qait:cache:ptree:module:${data.module_id}:*`);
+
     return this.mapToTestFlow(data);
   }
 
@@ -192,6 +199,14 @@ export class FlowService {
    */
   static async delete(id: string, userId: string): Promise<boolean> {
     logger.info('[FLOW_SERVICE] Deleting flow', { id });
+
+    // Fetch module_id and project_id before delete for cache invalidation
+    const { data: flow } = await supabaseAdmin
+      .from('test_flows')
+      .select('module_id, test_modules!inner(project_id)')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .maybeSingle();
 
     // Clean up regression plan items referencing this flow
     const { error: planCleanupError } = await supabaseAdmin
@@ -214,6 +229,18 @@ export class FlowService {
     if (error) {
       logger.error('[FLOW_SERVICE] Failed to delete flow', { error, id });
       throw new Error(`Failed to delete flow: ${error.message}`);
+    }
+
+    // Invalidate module mode + flow mode caches
+    if (flow?.module_id) {
+      await cache.delByPattern(`qait:cache:ptree:module:${flow.module_id}:*`);
+    }
+    await cache.delByPattern(`qait:cache:ptree:flow:${id}:*`);
+
+    // Invalidate plans cache — deleting a flow removes its regression_plan_items as side-effect
+    const projectId = (flow as any)?.test_modules?.project_id;
+    if (projectId) {
+      await cache.delByPattern(`qait:cache:plans:proj:${projectId}:*`);
     }
 
     return true;
@@ -251,6 +278,9 @@ export class FlowService {
       });
       throw new Error('Failed to reorder flows');
     }
+
+    // Invalidate module mode cache (flow order changed)
+    await cache.delByPattern(`qait:cache:ptree:module:${moduleId}:*`);
   }
 
   /**

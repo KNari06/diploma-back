@@ -188,6 +188,11 @@ export class TestCompletionHandlerService {
       await this.updateTestExecutionsForCompletedUiTest(test);
       await this.updateRegressionRuns(testId);
 
+      // Invalidate visualization overall cache (test completion changes the planet view)
+      if (test.project_id) {
+        await cache.delByPattern(`qait:cache:vizoverall:${test.project_id}:*`);
+      }
+
       // Fire automation actions for test-level events (non-blocking)
       AutomationActionService.fireEvent({
         triggerEvent: test.status === 'failed' ? 'test_failed' : 'test_completed',

@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 
 /**
  * Workspace Service
@@ -118,6 +119,9 @@ export class WorkspaceService {
       name: newWorkspace.name,
     });
 
+    // Invalidate onboarding cache — workspace creation changes onboarding state
+    await cache.del(`qait:cache:onboarding:${userId}`);
+
     return { workspace_id: newWorkspace.id };
   }
 
@@ -199,6 +203,9 @@ export class WorkspaceService {
         logger.error('[WORKSPACE] Error creating workspace', { error, userId, name });
         throw error;
       }
+
+      // Invalidate onboarding cache — workspace creation changes onboarding state
+      await cache.del(`qait:cache:onboarding:${userId}`);
 
       return data.id;
     } catch (error) {

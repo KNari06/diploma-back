@@ -6,6 +6,7 @@
 
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import type { CompiledStepPlan, IntentStep, IntentTestCase, StepEvidence } from './preview.types';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 
@@ -59,6 +60,11 @@ export class IntentTestCaseService {
     if (error) {
       logger.error('[INTENT_TEST_CASE] Failed to create', { error });
       throw new Error(`Failed to create test case: ${error.message}`);
+    }
+
+    // Invalidate flow mode cache (test case list changed)
+    if (flowId) {
+      await cache.delByPattern(`qait:cache:ptree:flow:${flowId}:*`);
     }
 
     return this.mapToIntentTestCase(data);
@@ -260,6 +266,11 @@ export class IntentTestCaseService {
       throw new Error(`Failed to update test case: ${error.message}`);
     }
 
+    // Invalidate flow mode cache
+    if (data.flow_id) {
+      await cache.delByPattern(`qait:cache:ptree:flow:${data.flow_id}:*`);
+    }
+
     return this.mapToIntentTestCase(data);
   }
 
@@ -268,6 +279,14 @@ export class IntentTestCaseService {
    */
   static async delete(id: string, userId: string): Promise<boolean> {
     logger.info('[INTENT_TEST_CASE] Deleting test case', { id });
+
+    // Fetch flow_id and project_id before delete for cache invalidation
+    const { data: tc } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('flow_id, project_id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .maybeSingle();
 
     // Clean up regression plan items referencing this test case
     const { error: planCleanupError } = await supabaseAdmin
@@ -290,6 +309,16 @@ export class IntentTestCaseService {
     if (error) {
       logger.error('[INTENT_TEST_CASE] Failed to delete', { error, id });
       throw new Error(`Failed to delete test case: ${error.message}`);
+    }
+
+    // Invalidate flow mode cache
+    if (tc?.flow_id) {
+      await cache.delByPattern(`qait:cache:ptree:flow:${tc.flow_id}:*`);
+    }
+
+    // Invalidate plans cache — deleting a test case removes its regression_plan_items as side-effect
+    if (tc?.project_id) {
+      await cache.delByPattern(`qait:cache:plans:proj:${tc.project_id}:*`);
     }
 
     return true;

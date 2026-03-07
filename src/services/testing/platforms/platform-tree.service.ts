@@ -173,7 +173,7 @@ export class PlatformTreeService {
   /**
    * Module mode: return module with paginated flows
    *
-   * Queries: 1 (module + join) + 2 parallel (flows page + count) = 3 queries
+   * Queries: 1 (module + join) + 1 (flows page + count) = 2 queries
    */
   static async getModuleModeTree(
     moduleId: string,
@@ -194,21 +194,14 @@ export class PlatformTreeService {
       throw new Error('Module not found or access denied');
     }
 
-    // Get paginated flows + count in parallel
-    const [flowsResult, countResult] = await Promise.all([
-      supabaseAdmin
-        .from('test_flows')
-        .select('id, module_id, name, flow_type, priority, order_index, created_at, updated_at')
-        .eq('module_id', moduleId)
-        .eq('user_id', userId)
-        .order('order_index', { ascending: true })
-        .range(offset, offset + limit - 1),
-      supabaseAdmin
-        .from('test_flows')
-        .select('id', { count: 'exact', head: true })
-        .eq('module_id', moduleId)
-        .eq('user_id', userId),
-    ]);
+    // Get paginated flows + count in single query
+    const flowsResult = await supabaseAdmin
+      .from('test_flows')
+      .select('id, module_id, name, flow_type, priority, order_index, created_at, updated_at', { count: 'exact' })
+      .eq('module_id', moduleId)
+      .eq('user_id', userId)
+      .order('order_index', { ascending: true })
+      .range(offset, offset + limit - 1);
 
     if (flowsResult.error) {
       logger.error('[PLATFORM_TREE] Failed to get flows', { error: flowsResult.error });
@@ -238,7 +231,7 @@ export class PlatformTreeService {
         pageInfo: {
           limit,
           offset,
-          total: countResult.count || 0,
+          total: flowsResult.count || 0,
         },
       },
     };
@@ -251,7 +244,7 @@ export class PlatformTreeService {
    * Over-fetch slightly (limit from each source) to ensure correct merged ordering,
    * then trim to the requested page size.
    *
-   * Queries: 1 (flow) + 4 parallel (ui page + api page + ui count + api count) = 5 queries
+   * Queries: 1 (flow) + 2 parallel (ui page+count + api page+count) = 3 queries
    */
   static async getFlowModeTree(
     flowId: string,
@@ -260,8 +253,8 @@ export class PlatformTreeService {
   ): Promise<FlowModeResponse> {
     const { limit = 20, offset = 0 } = options;
 
-    // Fetch flow + counts + paginated data all in parallel
-    const [flowResult, uiCountResult, apiCountResult, uiDataResult, apiDataResult] = await Promise.all([
+    // Fetch flow + paginated data+counts all in parallel
+    const [flowResult, uiDataResult, apiDataResult] = await Promise.all([
       // 1. Flow itself
       supabaseAdmin
         .from('test_flows')
@@ -269,30 +262,18 @@ export class PlatformTreeService {
         .eq('id', flowId)
         .eq('user_id', userId)
         .single(),
-      // 2. UI test case count
+      // 2. UI test cases — data + count in one query
       supabaseAdmin
         .from('intent_test_cases')
-        .select('id', { count: 'exact', head: true })
-        .eq('flow_id', flowId)
-        .eq('user_id', userId),
-      // 3. API test case count
-      supabaseAdmin
-        .from('api_test_configs')
-        .select('id', { count: 'exact', head: true })
-        .eq('flow_id', flowId)
-        .eq('user_id', userId),
-      // 4. UI test cases — fetch offset+limit rows (enough to cover the merge window)
-      supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, name, priority, status, created_at')
+        .select('id, name, priority, status, created_at', { count: 'exact' })
         .eq('flow_id', flowId)
         .eq('user_id', userId)
         .order('created_at', { ascending: false })
         .range(0, offset + limit - 1),
-      // 5. API test cases — same window
+      // 3. API test cases — data + count in one query
       supabaseAdmin
         .from('api_test_configs')
-        .select('id, name, priority, created_at')
+        .select('id, name, priority, created_at', { count: 'exact' })
         .eq('flow_id', flowId)
         .eq('user_id', userId)
         .order('created_at', { ascending: false })
@@ -310,7 +291,7 @@ export class PlatformTreeService {
     }
 
     const flowData = flowResult.data;
-    const totalTestCases = (uiCountResult.count || 0) + (apiCountResult.count || 0);
+    const totalTestCases = (uiDataResult.count || 0) + (apiDataResult.count || 0);
 
     // Merge and tag with testType
     const merged: TestCaseSummary[] = [

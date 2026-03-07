@@ -1,5 +1,6 @@
 import { OverallBuilderService } from '@/services/testing/visualization/overall-builder.service';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import { exportGraph, parsePlaywrightTestSteps } from '@/utils/parsing/playwrightParser';
 import { Request, Response } from 'express';
 import { supabaseAdmin } from '../../db/supabase';
@@ -1147,8 +1148,19 @@ export async function getProjectOverall(req: Request, res: Response): Promise<vo
 
     logger.info('[TEST_VISUALIZATION] Getting project overall', { projectId, userId });
 
+    // Check cache first
+    const cacheKey = `qait:cache:vizoverall:${projectId}:${userId}`;
+    const cached = await cache.get(cacheKey);
+    if (cached) {
+      res.json({ success: true, data: cached, timestamp: new Date() });
+      return;
+    }
+
     // Build overall data
     const overallData = await OverallBuilderService.buildProjectOverall(projectId, userId);
+
+    // Cache for 30 minutes
+    await cache.set(cacheKey, overallData, 1800);
 
     res.json({
       success: true,
