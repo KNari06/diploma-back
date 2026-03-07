@@ -65,15 +65,6 @@ export class OverallBuilderService {
       // 2. Get all tests for project (with limit for performance)
       const tests = await this.getProjectTests(projectId);
 
-      if (tests.length > MAX_TESTS_FOR_OVERALL) {
-        logger.warn('[OVERALL_BUILDER] Too many tests, limiting to most recent', {
-          projectId,
-          totalTests: tests.length,
-          limitedTo: MAX_TESTS_FOR_OVERALL,
-        });
-        tests.splice(MAX_TESTS_FOR_OVERALL);
-      }
-
       // 3. Get intelligent sessions with graph_data for tests
       const sessionsMap = await this.getIntelligentSessions(
         tests.map(t => t.id)
@@ -254,6 +245,14 @@ export class OverallBuilderService {
     sessionsMap: Map<string, any>,
     fingerprints: Map<string, CommandFingerprint>
   ): Promise<OverallNode[]> {
+    // Batch: collect all session IDs to check findings in one query
+    const sessionIds: string[] = [];
+    for (const group of groups.values()) {
+      const session = sessionsMap.get(group.representative.id);
+      if (session?.id) sessionIds.push(session.id);
+    }
+    const findingsSet = await this.batchCheckForFindings(sessionIds);
+
     const nodes: OverallNode[] = [];
 
     for (const [groupKey, group] of groups) {
@@ -321,12 +320,9 @@ export class OverallBuilderService {
         meta.fingerprint = fp;
       }
 
-      // Check for findings (representative only)
-      if (session?.id) {
-        const hasFindings = await this.checkForFindings(session.id);
-        if (hasFindings) {
-          meta.hasFindings = true;
-        }
+      // Check for findings (from batched result)
+      if (session?.id && findingsSet.has(session.id)) {
+        meta.hasFindings = true;
       }
 
       nodes.push({
@@ -403,9 +399,10 @@ export class OverallBuilderService {
   private static async getProjectTests(projectId: string): Promise<any[]> {
     const { data: tests, error } = await supabaseAdmin
       .from('tests')
-      .select('*')
+      .select('id, url, status, browsers, project_id, user_id, options, commands, test_goal, intelligent_mode, created_at, completed_at')
       .eq('project_id', projectId)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .limit(MAX_TESTS_FOR_OVERALL);
 
     if (error) {
       throw new Error(`Failed to get tests: ${error.message}`);
@@ -428,27 +425,36 @@ export class OverallBuilderService {
     const BATCH_SIZE = 100;
     const sessionsMap = new Map();
 
+    // Build batches and fetch in parallel
+    const batches: string[][] = [];
     for (let i = 0; i < testIds.length; i += BATCH_SIZE) {
-      const batch = testIds.slice(i, i + BATCH_SIZE);
+      batches.push(testIds.slice(i, i + BATCH_SIZE));
+    }
 
-      const { data: sessions, error } = await supabaseAdmin
-        .from('intelligent_test_sessions')
-        .select(
-          'id, test_id, graph_data, goal, summary, pages_visited, actions_taken, duration_ms, success'
-        )
-        .in('test_id', batch);
+    const results = await Promise.all(
+      batches.map(async (batch, idx) => {
+        const { data: sessions, error } = await supabaseAdmin
+          .from('intelligent_test_sessions')
+          .select(
+            'id, test_id, graph_data, goal, summary, pages_visited, actions_taken, duration_ms, success'
+          )
+          .in('test_id', batch);
 
-      if (error) {
-        logger.warn('[OVERALL_BUILDER] Failed to get intelligent sessions', {
-          error,
-          batchIndex: i / BATCH_SIZE,
-        });
-        continue;
-      }
+        if (error) {
+          logger.warn('[OVERALL_BUILDER] Failed to get intelligent sessions', {
+            error,
+            batchIndex: idx,
+          });
+          return [];
+        }
+        return sessions || [];
+      })
+    );
 
-      (sessions || []).forEach(session => {
+    for (const sessions of results) {
+      for (const session of sessions) {
         sessionsMap.set(session.test_id, session);
-      });
+      }
     }
 
     return sessionsMap;
@@ -538,19 +544,27 @@ export class OverallBuilderService {
   }
 
   /**
-   * Check if session has findings
+   * Batch check which sessions have findings (single query instead of N+1)
+   * @returns Set of session IDs that have at least one finding
    */
-  private static async checkForFindings(sessionId: string): Promise<boolean> {
-    const { count, error } = await supabaseAdmin
-      .from('intelligent_test_findings')
-      .select('*', { count: 'exact', head: true })
-      .eq('session_id', sessionId);
+  private static async batchCheckForFindings(sessionIds: string[]): Promise<Set<string>> {
+    if (sessionIds.length === 0) return new Set();
 
-    if (error) {
-      logger.warn('[OVERALL_BUILDER] Failed to check findings', { error, sessionId });
-      return false;
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('intelligent_test_findings')
+        .select('session_id')
+        .in('session_id', sessionIds);
+
+      if (error) {
+        logger.warn('[OVERALL_BUILDER] Failed to batch check findings', { error });
+        return new Set();
+      }
+
+      return new Set((data || []).map((r: any) => r.session_id));
+    } catch (err) {
+      logger.warn('[OVERALL_BUILDER] batchCheckForFindings failed', { error: (err as Error).message });
+      return new Set();
     }
-
-    return (count || 0) > 0;
   }
 }

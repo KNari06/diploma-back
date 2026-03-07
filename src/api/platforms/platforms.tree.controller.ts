@@ -53,7 +53,15 @@ export async function getPlatformTree(req: AuthenticatedRequest, res: Response):
       // Flow mode: return flow + paginated testCases
       logger.info('[PLATFORM_TREE_API] Flow mode', { flowId, userId, limit, offset });
 
+      const flowCacheKey = `qait:cache:ptree:flow:${flowId}:${userId}:${limit}:${offset}`;
+      const flowCached = await cache.get(flowCacheKey);
+      if (flowCached) {
+        res.json({ success: true, mode: 'flow', data: flowCached, timestamp: new Date() });
+        return;
+      }
+
       const result = await PlatformTreeService.getFlowModeTree(flowId, userId, { limit, offset });
+      await cache.set(flowCacheKey, result, 1800);
 
       res.json({
         success: true,
@@ -68,7 +76,15 @@ export async function getPlatformTree(req: AuthenticatedRequest, res: Response):
       // Module mode: return module + paginated flows
       logger.info('[PLATFORM_TREE_API] Module mode', { moduleId, userId, limit, offset });
 
+      const modCacheKey = `qait:cache:ptree:module:${moduleId}:${userId}:${limit}:${offset}`;
+      const modCached = await cache.get(modCacheKey);
+      if (modCached) {
+        res.json({ success: true, mode: 'module', data: modCached, timestamp: new Date() });
+        return;
+      }
+
       const result = await PlatformTreeService.getModuleModeTree(moduleId, userId, { limit, offset });
+      await cache.set(modCacheKey, result, 1800);
 
       res.json({
         success: true,
