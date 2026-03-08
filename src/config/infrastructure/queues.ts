@@ -1,5 +1,6 @@
 import { AgentResponse, TestJobData } from '@/types';
 import type { ExplorationBudget, RateLimitingConfig } from '@/agent/core/lite/exploration/types';
+import type { MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import { handleQueueError } from '@/utils/core/error-handler';
 import { logQueueEvent, logger } from '@/utils/core/logger';
 import { Queue, QueueEvents } from 'bullmq';
@@ -119,6 +120,7 @@ export const QUEUE_NAMES = {
   WEBHOOK: 'webhook',
   GIT_WEBHOOK: 'git-webhook',
   EXPLORATION: 'exploration',
+  MOBILE_TEST_RUN: 'mobile-test-run',
 } as const;
 
 // Test run queue - for executing tests
@@ -238,11 +240,23 @@ export const explorationQueue = new Queue<ExplorationJobData>(QUEUE_NAMES.EXPLOR
   },
 });
 
+// Mobile test run queue - for mobile device test execution
+export const mobileTestRunQueue = new Queue<MobileTestJobData>(QUEUE_NAMES.MOBILE_TEST_RUN, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 50,
+    removeOnFail: 25,
+    attempts: 1, // No auto-retry — mobile runner handles step-level failures
+  },
+});
+
 // Queue events for monitoring
 export const testRunQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RUN, { connection, prefix: env.QUEUE_PREFIX });
 export const testResultQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RESULT, { connection, prefix: env.QUEUE_PREFIX });
 export const aiAnalysisQueueEvents = new QueueEvents(QUEUE_NAMES.AI_ANALYSIS, { connection, prefix: env.QUEUE_PREFIX });
 export const explorationQueueEvents = new QueueEvents(QUEUE_NAMES.EXPLORATION, { connection, prefix: env.QUEUE_PREFIX });
+export const mobileTestRunQueueEvents = new QueueEvents(QUEUE_NAMES.MOBILE_TEST_RUN, { connection, prefix: env.QUEUE_PREFIX });
 
 // Queue event listeners
 testRunQueueEvents.on('completed', (args: { jobId: string; returnvalue: string; prev?: string }) => {
@@ -283,6 +297,18 @@ explorationQueueEvents.on('failed', (args: { jobId: string; failedReason: string
 
 explorationQueueEvents.on('stalled', (args: { jobId: string }) => {
   logQueueEvent('stalled', args.jobId, { queue: QUEUE_NAMES.EXPLORATION });
+});
+
+mobileTestRunQueueEvents.on('completed', (args: { jobId: string; returnvalue: string; prev?: string }) => {
+  logQueueEvent('completed', args.jobId, { queue: QUEUE_NAMES.MOBILE_TEST_RUN });
+});
+
+mobileTestRunQueueEvents.on('failed', (args: { jobId: string; failedReason: string; prev?: string }) => {
+  logQueueEvent('failed', args.jobId, { queue: QUEUE_NAMES.MOBILE_TEST_RUN, error: args.failedReason });
+});
+
+mobileTestRunQueueEvents.on('stalled', (args: { jobId: string }) => {
+  logQueueEvent('stalled', args.jobId, { queue: QUEUE_NAMES.MOBILE_TEST_RUN });
 });
 
 // Queue management functions
@@ -464,6 +490,36 @@ export class QueueManager {
   }
 
   /**
+   * Add mobile test run job to queue
+   */
+  static async addMobileTestRunJob(jobData: MobileTestJobData) {
+    try {
+      if (!redisAvailable) {
+        throw new Error('Redis is not available. Cannot add mobile test job to queue.');
+      }
+
+      const job = await mobileTestRunQueue.add('mobile-test-run', jobData, {
+        priority: 5,
+        jobId: `${jobData.testId}-${jobData.browser}`,
+      });
+
+      logQueueEvent('added', job.id!, {
+        queue: QUEUE_NAMES.MOBILE_TEST_RUN,
+        testId: jobData.testId,
+        platform: jobData.platform,
+      });
+      return job;
+    } catch (error) {
+      logger.error('Failed to add mobile test run job', {
+        error: error instanceof Error ? error.message : String(error),
+        testId: jobData.testId,
+        platform: jobData.platform,
+      });
+      throw handleQueueError(error);
+    }
+  }
+
+  /**
    * Get queue statistics
    */
   static async getQueueStats() {
@@ -477,17 +533,18 @@ export class QueueManager {
         webhookQueue.getJobCounts(),
         gitWebhookQueue.getJobCounts(),
         explorationQueue.getJobCounts(),
+        mobileTestRunQueue.getJobCounts(),
       ]);
 
       // Extract successful results, use empty object for failed ones
-      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats, gitWebhookStats, explorationStats] = results.map(
+      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats, gitWebhookStats, explorationStats, mobileTestRunStats] = results.map(
         (result) => result.status === 'fulfilled' ? result.value : {}
       );
 
       // Log any failures but don't fail the whole operation
       results.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun'];
           logger.warn(`Failed to get stats for ${queueNames[index]} queue`, { error: result.reason });
         }
       });
@@ -500,6 +557,7 @@ export class QueueManager {
         webhook: webhookStats,
         gitWebhook: gitWebhookStats,
         exploration: explorationStats,
+        mobileTestRun: mobileTestRunStats,
       };
     } catch (error) {
       logger.error('Failed to get queue stats:', error);
@@ -568,6 +626,8 @@ export class QueueManager {
         return gitWebhookQueue;
       case QUEUE_NAMES.EXPLORATION:
         return explorationQueue;
+      case QUEUE_NAMES.MOBILE_TEST_RUN:
+        return mobileTestRunQueue;
       default:
         throw new Error(`Unknown queue: ${queueName}`);
     }
@@ -639,11 +699,12 @@ export const gracefulShutdown = async () => {
         webhookQueue.close(),
         gitWebhookQueue.close(),
         explorationQueue.close(),
+        mobileTestRunQueue.close(),
       ]);
 
       closeQueueResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun'];
           logger.warn(`Failed to close ${queueNames[index]} queue`, { error: result.reason });
         }
       });
@@ -654,11 +715,12 @@ export const gracefulShutdown = async () => {
         testResultQueueEvents.close(),
         aiAnalysisQueueEvents.close(),
         explorationQueueEvents.close(),
+        mobileTestRunQueueEvents.close(),
       ]);
 
       closeQueueEventsResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents', 'explorationEvents'];
+          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents', 'explorationEvents', 'mobileTestRunEvents'];
           logger.warn(`Failed to close ${eventNames[index]}`, { error: result.reason });
         }
       });

@@ -20,6 +20,8 @@ export function calculateRequiredCredits(
     'edge': 1,
     'mobile-chrome': 2,
     'mobile-safari': 2,
+    'mobile-android': 3,
+    'mobile-ios': 3,
   };
 
   // 1. Calculate base browser cost

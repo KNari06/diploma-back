@@ -69,7 +69,7 @@ export interface TestOptions {
   mode?: 'lite' | 'pro'; // Persisted execution mode (used by retry logic)
 }
 
-export type BrowserType = 'chrome' | 'firefox' | 'safari' | 'edge' | 'mobile-chrome' | 'mobile-safari';
+export type BrowserType = 'chrome' | 'firefox' | 'safari' | 'edge' | 'mobile-chrome' | 'mobile-safari' | 'mobile-android' | 'mobile-ios';
 
 export interface TestResult {
   id: string;

@@ -175,6 +175,7 @@ const envSchema = z.object({
   // Mobile Runner (qait-mobile-runner microservice)
   MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
   MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),
+  MOBILE_RUNNER_API_KEY: z.string().optional().default(''),
 });
 
 // Parse and validate environment variables
