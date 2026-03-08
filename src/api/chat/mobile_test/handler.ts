@@ -207,7 +207,7 @@ export async function handleMobileTest(
           testId,
           chatSessionId,
           userId,
-          metadata: { trigger: 'chat', platform },
+          metadata: { trigger: 'chat' },
         });
       } catch (err) {
         logger.warn('[MOBILE_TEST] Failed to save test-chat mapping', {

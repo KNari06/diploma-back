@@ -244,6 +244,12 @@ AVAILABLE INTENTS: ${intents.join(', ')}
    - Only when user has a live preview session (previewSessionId in context)
    - NOT for questions about the page — use general_chat for those
 
+11. "mobile_test" - RUN a mobile (Android/iOS) test on recorded steps
+   - User explicitly mentions mobile, android, ios, emulator, APK, app, мобильный, приложение, андроид, эмулятор
+   - User wants to run recorded steps on a mobile device/emulator
+   - Keywords: "run on mobile", "test on android", "test on ios", "mobile test", "запусти мобильный тест", "тест на андроиде"
+   - Output: mobilePlatform ("android" or "ios"), appPackage (if specified), intentSteps (from context)
+
 ${regressionContextStr}
 ${buildEditorModeSection(context)}
 --- DECISION TREE ---
@@ -274,9 +280,11 @@ ${buildEditorModeSection(context)}
    - Run reports: "show last run results", "результаты последнего запуска"
    - Plan listing: "how many regression plans?", "list plans"
 
-6. Questions about past/status, explanations, discussions → general_chat
+6. Mobile testing ("run on mobile", "test android", "мобильный тест", "эмулятор") → mobile_test
 
-7. Missing critical info after checking all above → needs_clarification
+7. Questions about past/status, explanations, discussions → general_chat
+
+8. Missing critical info after checking all above → needs_clarification
 
 CRITICAL anti-hallucination rule:
   "Did you test the API?" → general_chat (ASKING about past, not requesting test!)
@@ -300,7 +308,7 @@ If the user provides login credentials in their message (ANY language), extract 
 
 REQUIRED FIELDS (always include):
 {
-  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis" | "editor_action",
+  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis" | "editor_action" | "mobile_test",
   "intent_confidence": 0.0-1.0,
   "rawText": string
 }
@@ -321,7 +329,9 @@ OPTIONAL FIELDS (include if relevant):
   "sourceTestId": string | null,
   "suggestedName": string | null,
   "savedTestCaseId": string | null,
-  "credentials": {"login": string, "loginType": "email" | "phone" | "username" | "id" | "other" | string, "password": string} | null
+  "credentials": {"login": string, "loginType": "email" | "phone" | "username" | "id" | "other" | string, "password": string} | null,
+  "mobilePlatform": "android" | "ios" | null,
+  "appPackage": string | null
 }
 
 REQUIRED FOR needs_clarification (MUST NOT OMIT):

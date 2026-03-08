@@ -189,17 +189,23 @@ export class MobileTestRunJobHandler {
       });
 
       // Emit step-level progress
-      for (const stepResult of runResult.steps) {
+      for (let i = 0; i < runResult.steps.length; i++) {
+        const stepResult = runResult.steps[i];
         try {
           webSocketService.emitTestStepCompleted(testId, {
             testId,
             browser,
-            stepIndex: runResult.steps.indexOf(stepResult),
-            totalSteps: runResult.totalSteps,
-            stepName: `Step: ${stepResult.stepId}`,
-            stepStatus: stepResult.success ? 'passed' : 'failed',
-            error: stepResult.error,
+            step: i + 1,
+            stepDescription: `Step: ${stepResult.stepId}`,
+            success: stepResult.success,
             timestamp: new Date().toISOString(),
+            runtimeMeta: {
+              stepId: stepResult.stepId,
+              runtimeStatus: stepResult.success ? 'executed' : 'failed',
+              executionMs: stepResult.durationMs,
+              failedReason: stepResult.error ? 'unknown' : undefined,
+              failureExplanation: stepResult.error,
+            },
           });
         } catch { /* non-fatal */ }
       }
@@ -246,22 +252,25 @@ export class MobileTestRunJobHandler {
         webSocketService.emitTestBrowserCompleted(testId, {
           testId,
           browser,
-          status: testPassed ? 'passed' : 'failed',
+          status: testPassed ? 'completed' : 'failed',
           timestamp: new Date().toISOString(),
         });
 
         webSocketService.emitTestCompleted(testId, {
           testId,
-          status: finalStatus,
-          browsers: [browser],
+          status: 'completed',
+          totalBrowsers: 1,
+          completedBrowsers: testPassed ? 1 : 0,
+          failedBrowsers: testPassed ? 0 : 1,
           timestamp: new Date().toISOString(),
         });
 
         if (testResultId) {
           webSocketService.emitResultReady(testId, {
             testId,
-            testResultId,
+            resultId: testResultId,
             browser,
+            status: testPassed ? 'completed' : 'failed',
             timestamp: new Date().toISOString(),
           });
         }
@@ -353,7 +362,8 @@ export class MobileTestRunJobHandler {
     workspaceId: string,
   ): Promise<string | null> {
     try {
-      const result = await dbAdminService.createTestResult({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result: any = await dbAdminService.createTestResult({
         test_id: testId,
         browser,
         status: runResult.status === 'passed' ? 'passed' : 'failed',
@@ -375,7 +385,7 @@ export class MobileTestRunJobHandler {
         },
       });
 
-      return result?.id || null;
+      return result?.id ?? null;
     } catch (error) {
       logger.error('[MOBILE-TEST] Failed to create test result', {
         testId,

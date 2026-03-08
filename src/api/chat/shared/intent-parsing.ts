@@ -539,6 +539,9 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
     case 'add_to_plan':
       return 'Got it! Updating regression plan...';
 
+    case 'mobile_test':
+      return 'Got it! Starting mobile test...';
+
     default:
       return 'Intent understood!';
   }
