@@ -38,6 +38,10 @@ export interface InteractiveNode {
   labelText?: string;
   /** ARIA label */
   ariaLabel?: string;
+  /** HTML title attribute (tooltip text — useful for icon-only buttons) */
+  title?: string;
+  /** True if element is an icon-only button (SVG/img child, no visible text) */
+  isIconButton?: boolean;
   /** HTML name attribute */
   name?: string;
   /** Placeholder text */

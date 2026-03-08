@@ -171,6 +171,10 @@ const envSchema = z.object({
   // Staged rollout: enable reads first, then writes, then credits cutover
   FEATURE_ORG_MEMBERS_ENABLED: z.string().transform(v => v === 'true').default('true'),
   FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
+
+  // Mobile Runner (qait-mobile-runner microservice)
+  MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
+  MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),
 });
 
 // Parse and validate environment variables

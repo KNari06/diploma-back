@@ -193,6 +193,12 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   if (element.ariaLabel) {
     node.ariaLabel = truncateText(element.ariaLabel);
   }
+  if (element.title) {
+    node.title = truncateText(element.title);
+  }
+  if (element.isIconButton) {
+    node.isIconButton = true;
+  }
   if (element.labelText) {
     node.labelText = truncateText(element.labelText);
   }

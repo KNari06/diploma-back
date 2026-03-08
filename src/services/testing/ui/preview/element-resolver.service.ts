@@ -724,13 +724,23 @@ export function buildCandidateText(node: InteractiveNode): string {
     parts.push(node.ariaLabel);
   }
 
+  // Title attribute (tooltip — especially useful for icon-only buttons)
+  if (node.title && node.title !== node.labelText && node.title !== node.ariaLabel && node.title !== node.text) {
+    parts.push(`title: ${node.title}`);
+  }
+
+  // Icon-only button hint (helps LLM bridge visual ↔ semantic gap)
+  if (node.isIconButton) {
+    parts.push('icon-button');
+  }
+
   // Secondary hints
   if (node.placeholder) {
     parts.push(`placeholder: ${node.placeholder}`);
   }
 
-  // Text content (if different from label and short enough)
-  if (node.text && node.text !== node.labelText && node.text.length <= 50) {
+  // Text content (if different from all previously emitted labels and short enough)
+  if (node.text && node.text !== node.labelText && node.text !== node.ariaLabel && node.text !== node.title && node.text.length <= 50) {
     parts.push(node.text);
   }
 
@@ -747,6 +757,18 @@ export function buildCandidateText(node: InteractiveNode): string {
   // Test ID (useful for disambiguation)
   if (node.testIdAttr) {
     parts.push(`testid: ${node.testIdAttr}`);
+  }
+
+  // ARIA state hints (helps LLM match "selected tab", "expanded menu", "pressed toggle")
+  const stateHints: string[] = [];
+  if (node.ariaSelected === true) stateHints.push('selected');
+  if (node.ariaPressed === true) stateHints.push('pressed');
+  if (node.ariaExpanded === true) stateHints.push('expanded');
+  else if (node.ariaExpanded === false) stateHints.push('collapsed');
+  if (node.ariaChecked === true || node.checked === true) stateHints.push('checked');
+  else if (node.ariaChecked === 'mixed') stateHints.push('indeterminate');
+  if (stateHints.length > 0) {
+    parts.push(`[${stateHints.join(', ')}]`);
   }
 
   // Phase 4: Custom component signals (rich text editor, framework buttons)
@@ -836,6 +858,8 @@ async function rescueWithGeminiFlash(params: {
     const attrs: string[] = [];
     if (n.labelText) attrs.push(`label="${n.labelText}"`);
     if (n.ariaLabel) attrs.push(`aria-label="${n.ariaLabel}"`);
+    if (n.title) attrs.push(`title="${n.title}"`);
+    if (n.isIconButton) attrs.push(`icon-button`);
     if (n.placeholder) attrs.push(`placeholder="${n.placeholder}"`);
     if (n.text && n.text.length <= 50) attrs.push(`text="${n.text}"`);
     if (n.name) attrs.push(`name="${n.name}"`);
@@ -857,13 +881,14 @@ ACTION-TYPE SEMANTICS:
 - hover/press/scroll: prefer the closest matching interactive element.
 
 RULES:
-1. Match by semantic meaning of the intent to the element's label/aria-label/placeholder/text.
+1. Match by semantic meaning of the intent to the element's label/aria-label/placeholder/text/title.
 2. Consider action type — e.g., for "type", only editable fields are valid.
 3. Use multilingual semantic understanding; do NOT translate literally.
-4. If multiple elements could match, pick the one whose label/text is semantically closest.
-5. Only use refs from the provided list — never invent refs.
-6. If no element is a confident match, return ref as null.
-7. Respond ONLY with valid JSON, no markdown or extra text.
+4. ICON BUTTONS: Elements marked "icon-button" have no text — only an icon. Match the user's visual description to the semantic label (e.g., "eye button" = "toggle password visibility", "X" = "close", "trash" = "delete").
+5. If multiple elements could match, pick the one whose label/text is semantically closest.
+6. Only use refs from the provided list — never invent refs.
+7. If no element is a confident match, return ref as null.
+8. Respond ONLY with valid JSON, no markdown or extra text.
 
 OUTPUT FORMAT:
 {"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
@@ -1018,10 +1043,18 @@ RULES:
    - select: prefer dropdowns, select elements, listboxes
    - check/uncheck/toggle: prefer checkboxes, radios, switches
    - hover: prefer any interactive element
-3. Consider: label text, aria-label, placeholder, visible text, container context
-4. If 2+ elements are equally valid, return alternatives (not a single pick)
-5. ONLY use refs from the provided list — never invent refs
-6. Respond ONLY with valid JSON, no markdown
+3. Consider: label text, aria-label, placeholder, visible text, title attribute, container context
+4. ICON BUTTONS: Elements marked "icon-button" have no visible text — only an icon (SVG/image).
+   Match the user's VISUAL description of the icon to the element's semantic aria-label or title:
+   - "eye button" / "show/hide password" = "toggle password visibility"
+   - "X button" / "close" = "dismiss" / "close dialog"
+   - "hamburger menu" / "three lines" = "open navigation" / "menu"
+   - "arrow" / "back" = "go back" / "navigate back"
+   - "trash" / "delete icon" = "remove" / "delete item"
+   - "pencil" / "edit icon" = "edit" / "modify"
+5. If 2+ elements are equally valid, return alternatives (not a single pick)
+6. ONLY use refs from the provided list — never invent refs
+7. Respond ONLY with valid JSON, no markdown
 
 OUTPUT FORMAT:
 {"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
