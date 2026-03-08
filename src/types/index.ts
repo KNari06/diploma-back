@@ -371,8 +371,10 @@ export interface PaginatedResponse<T> extends ApiResponse<T[]> {
   pagination: {
     page: number;
     limit: number;
+    offset?: number;
     total: number;
     totalPages: number;
+    has_more?: boolean;
   };
 }
 

@@ -242,7 +242,7 @@ export class ExecutionService {
   ): ExecutionStats {
     const total = records.length;
     const passed = records.filter((r) => r.status === 'passed').length;
-    const failed = records.filter((r) => r.status === 'failed').length;
+    const failed = records.filter((r) => r.status === 'failed' || r.status === 'timeout').length;
     const skipped = records.filter((r) => r.status === 'skipped').length;
     const pending = records.filter((r) => r.status === 'pending').length;
     const running = records.filter((r) => r.status === 'running').length;

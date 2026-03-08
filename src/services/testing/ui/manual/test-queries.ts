@@ -160,14 +160,17 @@ export async function getTestsByUser(
       runId,
     });
 
+    const total = count || 0;
     return {
       success: true,
       data: enrichedTests,
       pagination: {
         page,
         limit,
-        total: count || 0,
+        offset,
+        total,
         totalPages,
+        has_more: offset + limit < total,
       },
       timestamp: new Date(),
     };

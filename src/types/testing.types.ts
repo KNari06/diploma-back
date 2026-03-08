@@ -31,7 +31,8 @@ export type ExecutionStatus =
   | 'passed'
   | 'failed'
   | 'skipped'
-  | 'cancelled';
+  | 'cancelled'
+  | 'timeout';
 
 /**
  * Trigger types for test runs
