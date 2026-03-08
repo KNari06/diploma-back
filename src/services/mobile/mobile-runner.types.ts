@@ -183,6 +183,15 @@ export interface MobileTestJobData {
   appStoragePath?: string;
   /** Original filename of the APK/IPA */
   appOriginalName?: string;
+  // ── CI/CD fields ──────────────────────────────────────────────
+  /** CI run ID for tracking grouped test executions */
+  ciRunId?: string;
+  /** URL to POST results when test completes (outbound webhook) */
+  callbackUrl?: string;
+  /** Saved test case ID (for mapping results back) */
+  testCaseId?: string;
+  /** Saved test case name (for display in results) */
+  testCaseName?: string;
 }
 
 // ── Error ─────────────────────────────────────────────────────────

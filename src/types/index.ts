@@ -303,6 +303,8 @@ export interface ProjectCreateRequest {
     defaultBrowsers?: BrowserType[];
     /** Mobile app metadata (APK/IPA) — set via mobile upload API */
     mobileApp?: Record<string, unknown> | null;
+    /** CI/CD API key metadata — set via CI key management API */
+    ciApiKey?: { hash: string; prefix: string; createdAt: string } | null;
   };
 }
 

@@ -21,3 +21,5 @@ export type {
   MobileTestJobData,
 } from './mobile-runner.types';
 export { MobileRunnerError } from './mobile-runner.types';
+export { CiRunService } from './ci-run.service';
+export type { CiRunData, CiRunStatus } from './ci-run.service';

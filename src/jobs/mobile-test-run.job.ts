@@ -19,6 +19,7 @@ import { dbAdminService } from '@/db/supabase';
 import { logQueueEvent, logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
+import { CiRunService } from '@/services/mobile/ci-run.service';
 import { Job } from 'bullmq';
 import type { MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
@@ -72,6 +73,7 @@ export class MobileTestRunJobHandler {
       runnerApiKey,
       appStoragePath,
       appOriginalName,
+      ciRunId,
     } = job.data;
 
     // Validate
@@ -336,6 +338,20 @@ export class MobileTestRunJobHandler {
         }
       } catch { /* non-fatal */ }
 
+      // ── Phase 8: CI run tracking ──────────────────────────────
+      if (ciRunId) {
+        try {
+          await CiRunService.markTestComplete(ciRunId, testId, finalStatus);
+          logger.debug('[MOBILE-TEST] CI run updated', { testId, ciRunId, status: finalStatus });
+        } catch (err) {
+          logger.warn('[MOBILE-TEST] Failed to update CI run', {
+            testId,
+            ciRunId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
       logger.info('[MOBILE-TEST] Job completed successfully', {
         testId,
         browser,
@@ -368,6 +384,13 @@ export class MobileTestRunJobHandler {
           timestamp: new Date().toISOString(),
         });
       } catch { /* non-fatal */ }
+
+      // CI run tracking on failure
+      if (ciRunId) {
+        try {
+          await CiRunService.markTestComplete(ciRunId, testId, 'failed');
+        } catch { /* non-fatal */ }
+      }
 
       throw error;
     } finally {
