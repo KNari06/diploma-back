@@ -149,6 +149,14 @@ export class FullTestDataService {
       ? await TestExecutedStepsRedisService.getLive(testId)
       : rawExecutedSteps;
 
+    // Strip cost/token fields from intelligent session before returning
+    if (intelligentSession?.session) {
+      delete intelligentSession.session.cost_usd;
+      delete intelligentSession.session.tokens_used;
+      delete intelligentSession.session.total_cost_usd;
+      delete intelligentSession.session.total_tokens;
+    }
+
     return {
       test: {
         id: test.id,
