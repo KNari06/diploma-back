@@ -18,6 +18,7 @@ import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { logQueueEvent, logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { Job } from 'bullmq';
 import type { MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
@@ -69,6 +70,8 @@ export class MobileTestRunJobHandler {
       geminiApiKey,
       runnerUrl,
       runnerApiKey,
+      appStoragePath,
+      appOriginalName,
     } = job.data;
 
     // Validate
@@ -151,6 +154,64 @@ export class MobileTestRunJobHandler {
         platform,
       });
 
+      // ── Phase 3b: Install app (if project has APK/IPA) ───────
+      if (appStoragePath) {
+        try {
+          webSocketService.emitTestProgress(testId, {
+            testId,
+            browser,
+            progress: 15,
+            phase: 'initializing',
+            currentStep: `Installing app on ${platform}...`,
+            status: 'running',
+            timestamp: new Date().toISOString(),
+            userId,
+            sessionId: chatSessionId,
+          });
+        } catch { /* non-fatal */ }
+
+        logger.info('[MOBILE-TEST] Downloading app from storage', {
+          testId,
+          appStoragePath,
+          appOriginalName,
+        });
+
+        // Download from Supabase Storage
+        const appBuffer = await MobileAppStorageService.downloadApp(appStoragePath);
+
+        // Upload to runner
+        const uploadResult = await client.uploadApp(
+          appBuffer,
+          appOriginalName || 'app.apk',
+        );
+
+        logger.info('[MOBILE-TEST] App uploaded to runner, installing', {
+          testId,
+          runnerPath: uploadResult.path,
+          size: uploadResult.size,
+        });
+
+        // Install via run-steps with a single install_app + open_app step
+        const installSteps = [
+          {
+            id: '__install_app',
+            type: 'open_app' as const,
+            description: appPackage || 'app',
+            value: appPackage,
+            options: { continueOnError: false },
+          },
+        ];
+
+        await client.runSteps(sessionId, installSteps, {
+          screenshotEachStep: false,
+        });
+
+        logger.info('[MOBILE-TEST] App installed and launched', {
+          testId,
+          appPackage,
+        });
+      }
+
       // ── Phase 4: Run steps ────────────────────────────────────
       try {
         webSocketService.emitTestProgress(testId, {
@@ -174,7 +235,6 @@ export class MobileTestRunJobHandler {
       }
 
       const runResult = await client.runSteps(sessionId, intentSteps, {
-        autoScreenshot: true,
         screenshotEachStep: true,
       });
 

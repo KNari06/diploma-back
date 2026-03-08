@@ -93,14 +93,14 @@ export class MobileRunnerClient {
     sessionId: string,
     intentSteps: MobileIntentStep[],
     opts?: {
-      autoScreenshot?: boolean;
       screenshotEachStep?: boolean;
+      stopOnFailure?: boolean;
     },
   ): Promise<MobileRunStepsResponse> {
     const body: MobileRunStepsRequest = {
-      intentSteps,
-      autoScreenshot: opts?.autoScreenshot ?? true,
+      steps: intentSteps,
       screenshotEachStep: opts?.screenshotEachStep ?? true,
+      stopOnFailure: opts?.stopOnFailure,
     };
 
     return this.request<MobileRunStepsResponse>(
@@ -111,6 +111,79 @@ export class MobileRunnerClient {
         timeoutMs: CLIENT_CONFIG.runStepsTimeoutMs,
       },
     );
+  }
+
+  // ── App upload (multipart → runner) ────────────────────────────
+
+  /**
+   * Upload APK/IPA to runner via multipart POST /upload/apk.
+   * Runner saves file to disk and returns { path, filename, originalName, size }.
+   */
+  async uploadApp(
+    fileBuffer: Buffer,
+    originalName: string,
+  ): Promise<{ path: string; filename: string; originalName: string; size: number }> {
+    if (!env.MOBILE_RUNNER_ENABLED) {
+      throw new MobileRunnerError('Mobile testing is not enabled', 503, 'DISABLED');
+    }
+
+    const url = `${this.baseUrl}/upload/apk`;
+    const timeoutMs = 120_000; // 2 min for large APKs
+
+    // Build multipart form data
+    const boundary = `----FormBoundary${Date.now()}`;
+    const header = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${originalName}"\r\n` +
+      `Content-Type: application/octet-stream\r\n\r\n`,
+    );
+    const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([header, fileBuffer, footer]);
+
+    const headers: Record<string, string> = {
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    };
+    if (this.apiKey) {
+      headers['X-API-Key'] = this.apiKey;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timer);
+
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => '');
+        throw new MobileRunnerError(
+          `Upload failed: ${response.status} ${errorBody}`,
+          response.status,
+          'UPLOAD_ERROR',
+        );
+      }
+
+      return (await response.json()) as {
+        path: string;
+        filename: string;
+        originalName: string;
+        size: number;
+      };
+    } catch (error) {
+      clearTimeout(timer);
+      if (error instanceof MobileRunnerError) throw error;
+      throw new MobileRunnerError(
+        `Failed to upload app to runner: ${error instanceof Error ? error.message : String(error)}`,
+        0,
+        'NETWORK_ERROR',
+      );
+    }
   }
 
   // ── Artifacts ───────────────────────────────────────────────────

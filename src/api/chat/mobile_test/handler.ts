@@ -216,6 +216,29 @@ export async function handleMobileTest(
       }
     }
 
+    // ── Step 6b: Lookup project's mobile app (APK/IPA) ────────────
+    let appStoragePath: string | undefined;
+    let appOriginalName: string | undefined;
+    const projectId = parsedIntent?.projectId || workspace_id;
+
+    try {
+      const project = (await dbAdminService.getProject(projectId)) as any;
+      const mobileApp = project?.settings?.mobileApp;
+      if (mobileApp?.storagePath) {
+        appStoragePath = mobileApp.storagePath;
+        appOriginalName = mobileApp.originalName;
+        logger.info('[MOBILE_TEST] Found project APK', {
+          testId,
+          appStoragePath,
+          appOriginalName,
+        });
+      }
+    } catch (err) {
+      logger.warn('[MOBILE_TEST] Failed to lookup project app (will skip install)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     // ── Step 7: Queue BullMQ job ──────────────────────────────────
     const jobData: MobileTestJobData = {
       testId,
@@ -229,6 +252,8 @@ export async function handleMobileTest(
       geminiApiKey: parsedIntent?.geminiApiKey,
       runnerUrl: env.MOBILE_RUNNER_URL,
       runnerApiKey: env.MOBILE_RUNNER_API_KEY,
+      appStoragePath,
+      appOriginalName,
     };
 
     await QueueManager.addMobileTestRunJob(jobData);

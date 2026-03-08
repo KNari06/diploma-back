@@ -23,31 +23,85 @@ export interface MobileSessionConfig {
   snapshotName?: string;
 }
 
-// ── IntentStep (mirrors backend's own IntentStep subset) ─────────
+// ── Action Types (mirror of runner's IntentActionType) ───────────
+
+export type MobileIntentActionType =
+  // Web-compatible actions (mapped to mobile commands by runner)
+  | 'click' | 'type' | 'scroll' | 'press' | 'hover'
+  | 'assert' | 'ai_check' | 'navigate' | 'wait' | 'screenshot'
+  | 'select' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'wait_for'
+  // Mobile-specific actions
+  | 'open_app'           // launch app by package/bundle ID
+  | 'close_app'          // terminate app
+  | 'open_notifications' // pull down notification shade
+  | 'swipe'              // swipe gesture
+  | 'long_press'         // long tap / press and hold
+  | 'double_tap'         // double tap
+  | 'drag'               // drag and drop
+  | 'pinch'              // pinch zoom
+  | 'go_back'            // Android back / iOS swipe-back
+  | 'go_home'            // Home button
+  // Biometric & auth
+  | 'biometric' | 'otp' | 'permission' | 'clipboard'
+  // Network simulation
+  | 'network';
+
+// ── IntentStep (mirror of runner's IntentStep) ──────────────────
+
+export interface MobileBindingHints {
+  role?: string;
+  label?: string;
+  placeholder?: string;
+  nearText?: string;
+  type?: string;
+  autocomplete?: string;
+}
+
+export interface MobileIntentStepOptions {
+  timeout?: number;
+  replaceContent?: boolean;
+  pressEnter?: boolean;
+  scrollDirection?: 'up' | 'down' | 'left' | 'right';
+  scrollAmount?: number;
+  continueOnError?: boolean;
+  // App management
+  activityName?: string;
+  clearData?: boolean;
+  // Gesture options
+  startX?: number;
+  startY?: number;
+  endX?: number;
+  endY?: number;
+  durationMs?: number;
+  pinchDirection?: 'in' | 'out';
+  pinchScale?: number;
+  // Biometric
+  biometricAction?: 'enroll' | 'match' | 'fail';
+  biometricType?: 'fingerprint' | 'faceId' | 'touchId';
+  fingerId?: number;
+  // OTP
+  otpAction?: 'read_sms' | 'read_clipboard' | 'read_notification' | 'generate_totp' | 'type_otp';
+  totpSecret?: string;
+  otpCode?: string;
+  otpExtractPattern?: string;
+  otpSenderFilter?: string;
+  // Permission dialog
+  permissionAction?: 'allow' | 'deny' | 'allow_always';
+  // Network simulation
+  networkPreset?: '2g' | '3g' | '4g' | '5g' | 'wifi' | 'offline';
+  networkLatencyMs?: number;
+  networkBandwidthKbps?: number;
+  networkPacketLossPercent?: number;
+}
 
 export interface MobileIntentStep {
   id: string;
-  type: string;
+  type: MobileIntentActionType;
   description: string;
   value?: string;
   assertionText?: string;
-  bindingHints?: {
-    role?: string;
-    name?: string;
-    label?: string;
-    placeholder?: string;
-    type?: string;
-    autocomplete?: string;
-  };
-  options?: {
-    timeout?: number;
-    replaceContent?: boolean;
-    pressEnterAfterFill?: boolean;
-    continueOnError?: boolean;
-    direction?: string;
-    scrollAmount?: number;
-    key?: string;
-  };
+  bindingHints?: MobileBindingHints;
+  options?: MobileIntentStepOptions;
   isAutoInjected?: boolean;
   expectedOutcome?: 'success' | 'error';
 }
@@ -66,10 +120,12 @@ export interface MobileStepResult {
 // ── Run Steps ────────────────────────────────────────────────────
 
 export interface MobileRunStepsRequest {
-  intentSteps: MobileIntentStep[];
-  autoScreenshot?: boolean;
-  autoA11ySnapshot?: boolean;
+  /** Steps to execute (runner expects field name 'steps') */
+  steps: MobileIntentStep[];
+  testRunId?: string;
+  testName?: string;
   screenshotEachStep?: boolean;
+  stopOnFailure?: boolean;
 }
 
 export interface MobileRunStepsResponse {
@@ -123,6 +179,10 @@ export interface MobileTestJobData {
   /** URL of the mobile runner */
   runnerUrl: string;
   runnerApiKey?: string;
+  /** Supabase Storage path for APK/IPA (if project has uploaded app) */
+  appStoragePath?: string;
+  /** Original filename of the APK/IPA */
+  appOriginalName?: string;
 }
 
 // ── Error ─────────────────────────────────────────────────────────

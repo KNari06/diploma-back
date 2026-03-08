@@ -301,6 +301,8 @@ export interface ProjectCreateRequest {
     common_elements?: Record<string, string>;
     common_scope?: string;
     defaultBrowsers?: BrowserType[];
+    /** Mobile app metadata (APK/IPA) — set via mobile upload API */
+    mobileApp?: Record<string, unknown> | null;
   };
 }
 

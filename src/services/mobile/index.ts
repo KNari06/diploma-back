@@ -6,6 +6,9 @@
 export { MobileRunnerClient, getMobileRunnerClient } from './mobile-runner-client';
 export type {
   MobilePlatform,
+  MobileIntentActionType,
+  MobileBindingHints,
+  MobileIntentStepOptions,
   MobileSessionResponse,
   MobileSessionConfig,
   MobileIntentStep,
