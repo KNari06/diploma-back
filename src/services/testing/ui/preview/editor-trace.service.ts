@@ -70,13 +70,17 @@ export class EditorTraceService {
     return activeWriters.get(previewSessionId) ?? null;
   }
 
-  /** Close and remove writer for a session */
-  static async close(previewSessionId: string): Promise<void> {
+  /** Close and remove writer for a session. Returns metadata for upload, or null if no active writer. */
+  static async close(previewSessionId: string): Promise<{ filePath: string; userId: string } | null> {
     const instance = activeWriters.get(previewSessionId);
     if (instance) {
       activeWriters.delete(previewSessionId);
+      const filePath = instance.writer.getFilePath();
+      const userId = instance.userId;
       await instance.writer.close();
+      return { filePath, userId };
     }
+    return null;
   }
 
   // ─────────────────────────────────────────────────────────────────────────

@@ -444,7 +444,7 @@ export interface IntentStep {
    * Expected outcome for this step (V11: negative test support)
    * - 'success': Step should complete without errors (default)
    * - 'error': Step is a negative test — expects 4xx / validation error / error toast
-   * Auto-classified from description keywords if not explicitly set.
+   * Must be explicitly set by the LLM or user. Falls back to 'success' if not set.
    */
   expectedOutcome?: ExpectedStepOutcome;
   /** True if this step was auto-injected (e.g., auto wait_for URL change). Soft failure — won't fail the test. */

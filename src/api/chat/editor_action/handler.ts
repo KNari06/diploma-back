@@ -109,7 +109,7 @@ export async function handleEditorAction(
     const actionValue = extracted.value;
 
     // Step 3: Build IntentStep
-    const stepId = `ea_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const stepId = `ea_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     const stepDraft: IntentStep = {
       id: stepId,
       type: actionType,

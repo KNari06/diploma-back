@@ -525,7 +525,7 @@ export async function deleteLiteTraceLogFromStorage(storagePath: string): Promis
  */
 export async function insertTraceFileRecord(params: {
   userId: string;
-  testId: string;
+  testId: string | null;
   fileName: string;
   storagePath: string;
   fileSize: number;

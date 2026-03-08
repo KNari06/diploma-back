@@ -21,8 +21,9 @@ import type {
     UrlMatcher,
 } from './preview.types';
 
-// Max attempts to try different candidates
-const MAX_ATTEMPTS = 3;
+import { STEP_APPLY_CONFIG } from '@/config/testing/playwright-tuning';
+
+const MAX_ATTEMPTS = STEP_APPLY_CONFIG.maxAttempts;
 
 /**
  * V2: Build bindingHints from resolved InteractiveNode
@@ -44,8 +45,8 @@ function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
 
   return hints;
 }
-const ACTION_TIMEOUT = 10000; // 10 seconds
-const POST_ACTION_SETTLE_TIMEOUT = 5000; // 5 seconds
+const ACTION_TIMEOUT = STEP_APPLY_CONFIG.actionTimeoutMs;
+const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 
 // V2: Action types that support state verification
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
@@ -805,7 +806,7 @@ async function executeAction(
       case 'navigate': {
         if (!step.value) throw new Error('No URL for navigate action');
         const safeUrl = sanitizeUrl(step.value);
-        await page.goto(safeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(safeUrl, { waitUntil: 'domcontentloaded', timeout: STEP_APPLY_CONFIG.navigateTimeoutMs });
         break;
       }
 

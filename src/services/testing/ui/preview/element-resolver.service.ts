@@ -34,14 +34,11 @@ import type {
 // CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Maximum length for candidate text (characters) */
-const MAX_CANDIDATE_TEXT_LENGTH = 200;
+import { ELEMENT_RESOLVER_CONFIG } from '@/config/testing/playwright-tuning';
 
-/** Maximum length for intent text (characters) */
-const MAX_INTENT_TEXT_LENGTH = 500;
-
-/** Maximum candidates to send to LLM in one call */
-const MAX_CANDIDATES_FOR_LLM = 50;
+const MAX_CANDIDATE_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxCandidateTextLength;
+const MAX_INTENT_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxIntentTextLength;
+const MAX_CANDIDATES_FOR_LLM = ELEMENT_RESOLVER_CONFIG.maxCandidatesForLlm;
 
 /**
  * Action type to expected element tags mapping (HardAllowed filter)
@@ -943,7 +940,7 @@ Select the single best matching element. If unsure, return ref: null.`;
         : 0;
     const confidence = Number.isFinite(rawConfidence) ? Math.min(1, Math.max(0, rawConfidence)) : 0;
 
-    if (confidence < 0.7) return null;
+    if (confidence < ELEMENT_RESOLVER_CONFIG.confidenceThreshold) return null;
 
     return {
       ref: parsed.ref || '',
@@ -964,14 +961,12 @@ Select the single best matching element. If unsure, return ref: null.`;
 // LLM-BASED ELEMENT SELECTION
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** LLM element selection timeout */
-const LLM_SELECT_TIMEOUT_MS = 7000;
+const LLM_SELECT_TIMEOUT_MS = ELEMENT_RESOLVER_CONFIG.llmCircuitBreaker.timeoutMs;
 
-/** LLM element selection circuit breaker */
 let llmSelectFailures = 0;
 let llmSelectBreakerOpenUntil = 0;
-const LLM_SELECT_BREAKER_THRESHOLD = 3;
-const LLM_SELECT_BREAKER_COOLDOWN_MS = 60000;
+const LLM_SELECT_BREAKER_THRESHOLD = ELEMENT_RESOLVER_CONFIG.llmCircuitBreaker.failureThreshold;
+const LLM_SELECT_BREAKER_COOLDOWN_MS = ELEMENT_RESOLVER_CONFIG.llmCircuitBreaker.cooldownMs;
 
 function isLlmSelectBreakerOpen(): boolean {
   if (llmSelectFailures < LLM_SELECT_BREAKER_THRESHOLD) return false;
@@ -995,8 +990,8 @@ function recordLlmSelectSuccess(): void {
 
 /** LLM selection result cache */
 const llmSelectCache = new Map<string, { result: LlmSelectResult; createdAt: number }>();
-const LLM_SELECT_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-const LLM_SELECT_CACHE_MAX_SIZE = 100;
+const LLM_SELECT_CACHE_TTL_MS = ELEMENT_RESOLVER_CONFIG.llmCache.ttlMs;
+const LLM_SELECT_CACHE_MAX_SIZE = ELEMENT_RESOLVER_CONFIG.llmCache.maxSize;
 
 interface LlmSelectResult {
   status: 'resolved' | 'needs_clarification' | 'not_found';

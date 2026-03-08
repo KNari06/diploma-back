@@ -2697,6 +2697,7 @@ export async function handleUpdateTestCaseSteps(
         evidence: stepModified ? undefined : (incoming.evidence || prev.evidence),
         compiled: stepModified ? undefined : (incoming.compiled || prev.compiled),
         options: incoming.options || prev.options,
+        expectedOutcome: incoming.expectedOutcome ?? prev.expectedOutcome,
       };
     });
 

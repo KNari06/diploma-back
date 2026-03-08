@@ -7,6 +7,7 @@ import type { IntentPlaywrightCommand } from '@/services/testing/ui/preview/inte
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
+import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Frame, Locator, Page } from 'playwright';
@@ -62,8 +63,8 @@ export class CommandExecutor {
   private isAborted: boolean = false;
   private costManager?: AICostManager;
   private externalAbortHandler?: () => void; // ✅ FIX 1: Store handler for cleanup
-  private selfHealingConfidenceThreshold: number = 0.85; // ✅ FIX 7: Configurable threshold
-  private maxHealAttempts: number = 1; // ✅ V2: Limit self-heal attempts to expose flakiness
+  private selfHealingConfidenceThreshold: number = COMMAND_EXECUTOR_CONFIG.selfHealingConfidenceThreshold;
+  private maxHealAttempts: number = COMMAND_EXECUTOR_CONFIG.maxHealAttempts;
   private skipCompiledPlan: boolean = false; // Skip Stage 1 on retry attempts
   private maxDomNodes?: number; // Configurable DOM node limit (saves memory in replay mode)
   /** Runtime metadata for each step (keyed by stepId) */
@@ -89,7 +90,7 @@ export class CommandExecutor {
     this.selfHealingEnabled = options.selfHealingEnabled ?? true;
     this.metadata = options.metadata || { url: '' };
     this.costManager = options.costManager;
-    this.selfHealingConfidenceThreshold = options.selfHealingConfidenceThreshold ?? 0.85;
+    this.selfHealingConfidenceThreshold = options.selfHealingConfidenceThreshold ?? COMMAND_EXECUTOR_CONFIG.selfHealingConfidenceThreshold;
     this.skipCompiledPlan = options.skipCompiledPlan ?? false;
     this.maxDomNodes = options.maxDomNodes;
 
@@ -281,7 +282,7 @@ export class CommandExecutor {
               try {
                 await this.page.waitForURL(
                   (url) => url.toString() !== urlBeforeClick,
-                  { timeout: 15000, waitUntil: 'load' }
+                  { timeout: COMMAND_EXECUTOR_CONFIG.clickNavigationTimeoutMs, waitUntil: 'load' }
                 );
                 logger.debug('[COMMAND_EXECUTOR] Navigation after click detected', {
                   from: urlBeforeClick,
@@ -295,10 +296,10 @@ export class CommandExecutor {
                   const newPage = allPages[allPages.length - 1];
                   // Wait for new page to be ready
                   try {
-                    await newPage.waitForLoadState('load', { timeout: 10000 });
+                    await newPage.waitForLoadState('load', { timeout: COMMAND_EXECUTOR_CONFIG.newPageLoadTimeoutMs });
                   } catch {
                     // Fallback: at least wait for domcontentloaded
-                    await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+                    await newPage.waitForLoadState('domcontentloaded', { timeout: COMMAND_EXECUTOR_CONFIG.newPageFallbackTimeoutMs }).catch(() => {});
                   }
                   const newUrl = newPage.url();
                   logger.info('[COMMAND_EXECUTOR] Click opened new tab, switching page', {

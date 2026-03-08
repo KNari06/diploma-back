@@ -633,6 +633,7 @@ export class PreviewRunService {
       }
 
       // 9. Close trace writer (flushes pending writes)
+      const traceFilePath = traceWriter.getFilePath();
       try {
         await traceWriter.close();
       } catch (closeError) {
@@ -641,6 +642,17 @@ export class PreviewRunService {
           error: closeError instanceof Error ? closeError.message : String(closeError),
         });
       }
+
+      // Fire-and-forget upload to Supabase Storage (runs regardless of close() success)
+      import('./editor-trace-upload').then(({ uploadEditorTrace }) => {
+        uploadEditorTrace({
+          filePath: traceFilePath,
+          userId,
+          previewSessionId,
+          traceType: 'preview_run',
+          intentTestCaseId,
+        }).catch(() => {});
+      }).catch(() => {});
 
       // 10. Cleanup run state
       activeRuns.delete(previewSessionId);
