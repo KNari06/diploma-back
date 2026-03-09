@@ -24,6 +24,7 @@ import { Job } from 'bullmq';
 import type { MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
+import { claimWarmedSession } from '@/api/mobile/session.controller';
 
 // ============================================================================
 // JOB HANDLER
@@ -63,6 +64,7 @@ export class MobileTestRunJobHandler {
       testId,
       userId,
       workspaceId,
+      projectId,
       chatSessionId,
       platform,
       browser,
@@ -132,7 +134,7 @@ export class MobileTestRunJobHandler {
       // ── Phase 2: Update test status ───────────────────────────
       await this.updateTestStatus(testId, 'running', browser);
 
-      // ── Phase 3: Create session on runner ─────────────────────
+      // ── Phase 3: Create session on runner (or reuse warmed) ───
       try {
         webSocketService.emitTestProgress(testId, {
           testId,
@@ -147,14 +149,29 @@ export class MobileTestRunJobHandler {
         });
       } catch { /* non-fatal */ }
 
-      const session = await client.createSession(platform);
-      sessionId = session.id;
+      // Try to reuse a warmed session (eager start from editor)
+      if (projectId) {
+        const warmed = await claimWarmedSession(projectId, userId);
+        if (warmed && warmed.platform === platform) {
+          sessionId = warmed.sessionId;
+          logger.info('[MOBILE-TEST] Reusing warmed session', {
+            testId,
+            sessionId,
+            platform,
+          });
+        }
+      }
 
-      logger.info('[MOBILE-TEST] Session created', {
-        testId,
-        sessionId,
-        platform,
-      });
+      // Cold start: create a new session
+      if (!sessionId) {
+        const session = await client.createSession(platform);
+        sessionId = session.id;
+        logger.info('[MOBILE-TEST] Session created (cold start)', {
+          testId,
+          sessionId,
+          platform,
+        });
+      }
 
       // ── Phase 3b: Install app (if project has APK/IPA) ───────
       if (appStoragePath) {

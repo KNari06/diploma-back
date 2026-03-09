@@ -170,6 +170,7 @@ export interface MobileTestJobData {
   testId: string;
   userId: string;
   workspaceId: string;
+  projectId?: string;
   chatSessionId?: string;
   platform: MobilePlatform;
   browser: 'mobile-android' | 'mobile-ios';

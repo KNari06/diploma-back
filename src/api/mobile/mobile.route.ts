@@ -17,6 +17,7 @@ import multer from 'multer';
 import { deleteMobileApp, getMobileApp, uploadMobileApp } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
 import { triggerCiRun, getCiRunStatus } from './ci.controller';
+import { warmupSession, destroySession } from './session.controller';
 
 // ── Multer config for APK/IPA uploads ────────────────────────────
 
@@ -80,6 +81,34 @@ router.delete(
   '/projects/:projectId/app',
   requireAuth,
   asyncHandler(deleteMobileApp),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMULATOR SESSION MANAGEMENT (eager warm-up)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/mobile/sessions/warmup
+ * Warm up an emulator session for a project (eager start)
+ *
+ * Body: { projectId, platform: 'android' | 'ios' }
+ */
+router.post(
+  '/sessions/warmup',
+  requireAuth,
+  asyncHandler(warmupSession),
+);
+
+/**
+ * DELETE /api/v1/mobile/sessions/:sessionId
+ * Destroy a warmed emulator session
+ *
+ * Query: ?projectId=<uuid>
+ */
+router.delete(
+  '/sessions/:sessionId',
+  requireAuth,
+  asyncHandler(destroySession),
 );
 
 // ═══════════════════════════════════════════════════════════════════════════

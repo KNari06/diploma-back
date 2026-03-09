@@ -244,6 +244,7 @@ export async function handleMobileTest(
       testId,
       userId,
       workspaceId: workspace_id,
+      projectId,
       chatSessionId,
       platform,
       browser: browser as 'mobile-android' | 'mobile-ios',

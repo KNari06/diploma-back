@@ -21,7 +21,12 @@ import { Request, Response } from 'express';
  * Body: multipart/form-data with field "file" + optional "packageName", "platform"
  */
 export async function uploadMobileApp(req: Request, res: Response): Promise<void> {
-  const userId = (req as any).userId;
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
   const { projectId } = req.params;
   const platform = (req.body.platform as 'android' | 'ios') || 'android';
   const packageName = req.body.packageName as string | undefined;
@@ -94,7 +99,12 @@ export async function uploadMobileApp(req: Request, res: Response): Promise<void
  * Get current mobile app metadata for a project.
  */
 export async function getMobileApp(req: Request, res: Response): Promise<void> {
-  const userId = (req as any).userId;
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
   const { projectId } = req.params;
 
   const project = await ProjectService.getProject(projectId, userId);
@@ -123,7 +133,12 @@ export async function getMobileApp(req: Request, res: Response): Promise<void> {
  * Delete mobile app from storage and clear project settings.
  */
 export async function deleteMobileApp(req: Request, res: Response): Promise<void> {
-  const userId = (req as any).userId;
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
   const { projectId } = req.params;
 
   const project = await ProjectService.getProject(projectId, userId);

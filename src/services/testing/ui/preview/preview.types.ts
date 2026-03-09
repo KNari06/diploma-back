@@ -770,6 +770,11 @@ export type IntentTestCaseStatus = 'draft' | 'published' | 'archived';
 export type IntentTestCaseKind = 'standalone' | 'regression_member';
 
 /**
+ * Testing platform for test cases
+ */
+export type IntentTestCasePlatform = 'web' | 'mobile_android' | 'mobile_ios';
+
+/**
  * Replay strategy for test execution
  */
 export type ReplayStrategy = 'commands' | 'graph_extract';
@@ -789,6 +794,8 @@ export interface CreateIntentTestCaseRequest {
   status?: IntentTestCaseStatus;
   /** Classification */
   kind?: IntentTestCaseKind;
+  /** Testing platform (defaults to 'web') */
+  platform?: IntentTestCasePlatform;
 }
 
 /**
@@ -813,6 +820,7 @@ export interface IntentTestCase {
   // Lifecycle
   status: IntentTestCaseStatus;
   kind: IntentTestCaseKind;
+  platform?: IntentTestCasePlatform;
 
   // Replay data (populated when saved from completed test or published)
   replayStrategy?: ReplayStrategy;

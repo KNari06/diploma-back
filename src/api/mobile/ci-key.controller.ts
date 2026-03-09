@@ -25,7 +25,12 @@ import crypto from 'crypto';
  * Returns the cleartext key ONCE — store it securely.
  */
 export async function generateCiKey(req: Request, res: Response): Promise<void> {
-  const userId = (req as any).userId;
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
   const { projectId } = req.params;
 
   // Verify project access (write required)
@@ -81,7 +86,12 @@ export async function generateCiKey(req: Request, res: Response): Promise<void> 
  * Revoke the CI API key for a project.
  */
 export async function revokeCiKey(req: Request, res: Response): Promise<void> {
-  const userId = (req as any).userId;
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
   const { projectId } = req.params;
 
   const project = await ProjectService.getProject(projectId, userId);
@@ -114,7 +124,12 @@ export async function revokeCiKey(req: Request, res: Response): Promise<void> {
  * Does NOT return the key itself — only prefix + metadata.
  */
 export async function getCiKeyStatus(req: Request, res: Response): Promise<void> {
-  const userId = (req as any).userId;
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
   const { projectId } = req.params;
 
   const project = await ProjectService.getProject(projectId, userId);

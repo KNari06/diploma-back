@@ -230,12 +230,12 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
     if (testCases.length === 0) {
       res.status(400).json({
         success: false,
-        error: 'No test cases found',
+        error: 'No mobile test cases found',
         message: savedTestCaseIds
-          ? 'None of the provided savedTestCaseIds were found or have steps.'
+          ? 'None of the provided savedTestCaseIds were found or have steps. Make sure the test cases have platform set to "mobile_android" or "mobile_ios".'
           : planId
-            ? 'The regression plan contains no mobile test cases with steps.'
-            : 'This project has no saved test cases with steps.',
+            ? 'The regression plan contains no mobile test cases with steps. Make sure test cases have platform set to "mobile_android" or "mobile_ios".'
+            : 'This project has no saved mobile test cases. Create test cases with platform "mobile_android" or "mobile_ios" in the editor.',
       });
       return;
     }
@@ -283,6 +283,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         testId,
         userId,
         workspaceId,
+        projectId,
         platform,
         browser: browser as 'mobile-android' | 'mobile-ios',
         intentSteps: tc.intentSteps,
@@ -379,6 +380,7 @@ export async function getCiRunStatus(req: Request, res: Response): Promise<void>
 
 /**
  * Fetch specific saved test cases by IDs and extract their IntentSteps.
+ * Filters to mobile platform test cases only.
  */
 async function fetchTestCaseSteps(
   testCaseIds: string[],
@@ -386,9 +388,10 @@ async function fetchTestCaseSteps(
 ): Promise<Array<{ id: string; name: string; intentSteps: MobileIntentStep[] }>> {
   const { data: rows, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, name, steps_json, commands, graph_ref, replay_strategy')
+    .select('id, name, platform, steps_json, commands, graph_ref, replay_strategy')
     .in('id', testCaseIds)
-    .eq('project_id', projectId);
+    .eq('project_id', projectId)
+    .in('platform', ['mobile_android', 'mobile_ios']);
 
   if (error) {
     logger.error('[CI] Failed to fetch test cases', { error, testCaseIds });
@@ -405,15 +408,16 @@ async function fetchTestCaseSteps(
 }
 
 /**
- * Fetch ALL saved test cases for a project.
+ * Fetch ALL mobile saved test cases for a project.
  */
 async function fetchAllProjectTestCases(
   projectId: string,
 ): Promise<Array<{ id: string; name: string; intentSteps: MobileIntentStep[] }>> {
   const { data: rows, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, name, steps_json, commands, graph_ref, replay_strategy')
+    .select('id, name, platform, steps_json, commands, graph_ref, replay_strategy')
     .eq('project_id', projectId)
+    .in('platform', ['mobile_android', 'mobile_ios'])
     .neq('status', 'archived')
     .limit(50);
 
