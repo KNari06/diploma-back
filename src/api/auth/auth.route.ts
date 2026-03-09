@@ -1,7 +1,10 @@
 import { requireAuth, requireAdmin } from '@/middleware/auth.middleware';
 import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
 import { Request, Response, Router } from 'express';
+import multer from 'multer';
+import path from 'path';
 import { z } from 'zod';
+import { deleteAvatar, uploadAvatar } from './auth-avatar.controller';
 import {
   completeOAuthHandler,
   getOAuthUrlHandler,
@@ -699,6 +702,47 @@ router.put('/profile', asyncHandler(async (req: Request, res: Response) => {
     handleValidationError(error);
   }
 }));
+
+// ============================================================================
+// AVATAR UPLOAD CONFIGURATION
+// ============================================================================
+
+const avatarStorage = multer.memoryStorage();
+
+const avatarFileFilter = (
+  req: any,
+  file: Express.Multer.File,
+  cb: multer.FileFilterCallback
+) => {
+  const allowedExtensions = ['.png', '.jpg', '.jpeg', '.webp'];
+  const ext = path.extname(file.originalname).toLowerCase();
+
+  if (allowedExtensions.includes(ext)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Only PNG, JPG, and WebP files are allowed'));
+  }
+};
+
+const uploadAvatarMulter = multer({
+  storage: avatarStorage,
+  fileFilter: avatarFileFilter,
+  limits: {
+    fileSize: 2 * 1024 * 1024, // 2MB max
+  },
+});
+
+/**
+ * POST /auth/avatar
+ * Upload user avatar (authenticated)
+ */
+router.post('/avatar', requireAuth, uploadAvatarMulter.single('avatar'), asyncHandler(uploadAvatar));
+
+/**
+ * DELETE /auth/avatar
+ * Delete user avatar (authenticated)
+ */
+router.delete('/avatar', requireAuth, asyncHandler(deleteAvatar));
 
 // ============================================================================
 // ADMIN: User approval management

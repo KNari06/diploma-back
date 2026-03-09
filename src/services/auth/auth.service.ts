@@ -198,7 +198,7 @@ export async function signInWithEmail(
     // Fetch role and status from public.users
     const { data: userData } = await supabaseAdmin
       .from('users')
-      .select('role, name, status')
+      .select('role, name, status, avatar_url')
       .eq('id', data.user.id)
       .maybeSingle();
 
@@ -209,6 +209,7 @@ export async function signInWithEmail(
         name: userData?.name || data.user.user_metadata?.name,
         role: userData?.role || 'user',
         status: userData?.status || 'pending_approval',
+        avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
       },
       tokens: {
         access_token: data.session.access_token,
@@ -539,7 +540,7 @@ export async function exchangeCodeForSession(
       // Fetch role and status from public.users
       const { data: dbUser } = await supabaseAdmin
         .from('users')
-        .select('role, name, status')
+        .select('role, name, status, avatar_url')
         .eq('id', userData.user.id)
         .maybeSingle();
 
@@ -550,7 +551,7 @@ export async function exchangeCodeForSession(
           name: dbUser?.name || userData.user.user_metadata?.name || userData.user.email?.split('@')[0] || 'User',
           role: dbUser?.role || 'user',
           status: dbUser?.status || 'pending_approval',
-          avatar: userData.user.user_metadata?.avatar_url,
+          avatar: dbUser?.avatar_url || userData.user.user_metadata?.avatar_url,
         },
         tokens: {
           access_token: tokenData.access_token,
@@ -584,7 +585,7 @@ export async function exchangeCodeForSession(
       // Fetch role and status from public.users
       const { data: dbUser } = await supabaseAdmin
         .from('users')
-        .select('role, name, status')
+        .select('role, name, status, avatar_url')
         .eq('id', data.user.id)
         .maybeSingle();
 
@@ -595,7 +596,7 @@ export async function exchangeCodeForSession(
           name: dbUser?.name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
           role: dbUser?.role || 'user',
           status: dbUser?.status || 'pending_approval',
-          avatar: data.user.user_metadata?.avatar_url,
+          avatar: dbUser?.avatar_url || data.user.user_metadata?.avatar_url,
         },
         tokens: {
           access_token: data.session.access_token,
@@ -740,7 +741,7 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
     // Use maybeSingle() to handle case when user not found (trigger may not have run yet)
     const { data: userData, error: dbError } = await supabaseAdmin
       .from('users')
-      .select('role, name, status')
+      .select('role, name, status, avatar_url')
       .eq('id', data.user.id)
       .maybeSingle();
 
@@ -759,6 +760,7 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
       name: userData?.name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
       role: userData?.role || 'user',
       status: userData?.status || 'pending_approval',
+      avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
     };
   } catch (error) {
     // Log error but don't throw - return null to indicate invalid token
@@ -876,6 +878,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
             name: retryUserData.name,
             role: retryUserData.role,
             status: retryUserData.status || 'pending_approval',
+            avatar: retryUserData.avatar_url,
             credits: creditsBalance,
             subscription: retryUserData.subscription,
             created_at: retryUserData.created_at,
@@ -908,6 +911,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
         name: createdUser.name,
         role: createdUser.role,
         status: createdUser.status || 'pending_approval',
+        avatar: createdUser.avatar_url,
         credits: creditsBalance,
         subscription: createdUser.subscription,
         created_at: createdUser.created_at,
@@ -925,6 +929,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
       name: userData.name,
       role: userData.role || 'user',
       status: userData.status || 'pending_approval',
+      avatar: userData.avatar_url,
       credits: creditsBalance,
       subscription: userData.subscription,
       created_at: userData.created_at,
@@ -1168,6 +1173,7 @@ export async function updateUserProfile(
           email: userEmail,
           name: updatedUser.name,
           role: updatedUser.role || 'user',
+          avatar: updatedUser.avatar_url,
           credits: creditsBalance,
           subscription: updatedUser.subscription,
           createdAt: updatedUser.created_at,
@@ -1200,6 +1206,7 @@ export async function updateUserProfile(
       email: userEmail,
       name: userData.name || trimmedName,
       role: userData.role || 'user',
+      avatar: userData.avatar_url,
       credits: creditsBalance,
       subscription: userData.subscription,
       createdAt: userData.created_at,
