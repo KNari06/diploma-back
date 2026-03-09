@@ -99,21 +99,22 @@ export class PlatformService {
   }
 
   /**
-   * Ensure both platforms exist for a project (seed if missing)
+   * Ensure all platforms exist for a project (seed if missing)
    * Called when creating first module or on project setup
    * @param projectId - Project ID
    * @param userId - User ID
-   * @returns Object with web_ui and api platform IDs
+   * @returns Object with web_ui, api, and mobile platform IDs
    */
   static async ensurePlatformsExist(
     projectId: string,
     userId: string
-  ): Promise<{ webUi: TestPlatform; api: TestPlatform }> {
+  ): Promise<{ webUi: TestPlatform; api: TestPlatform; mobile: TestPlatform }> {
     // Try to get existing platforms
     const existing = await this.listByProject(projectId, userId);
-    
+
     let webUi = existing.find(p => p.platformKey === 'web_ui');
     let api = existing.find(p => p.platformKey === 'api');
+    let mobile = existing.find(p => p.platformKey === 'mobile');
 
     // Create missing platforms
     if (!webUi) {
@@ -136,7 +137,17 @@ export class PlatformService {
       });
     }
 
-    return { webUi, api };
+    if (!mobile) {
+      mobile = await this.create({
+        projectId,
+        userId,
+        platformKey: 'mobile',
+        name: 'Mobile UI tests',
+        description: 'Mobile UI test modules (Android & iOS)',
+      });
+    }
+
+    return { webUi, api, mobile };
   }
 
   /**

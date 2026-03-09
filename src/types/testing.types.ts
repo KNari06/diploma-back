@@ -75,7 +75,7 @@ export type PlanItemType = 'module' | 'flow' | 'test_case';
 /**
  * Platform key types (top-level test category)
  */
-export type PlatformKey = 'web_ui' | 'api';
+export type PlatformKey = 'web_ui' | 'api' | 'mobile';
 
 // ============================================================================
 // FAILURE ANALYSIS TYPES
@@ -203,7 +203,7 @@ export interface CreateTestPlatformParams {
 
 /**
  * Test module - functional area of the product (Auth, Payments, Profile)
- * Belongs to a platform (web_ui or api)
+ * Belongs to a platform (web_ui, api, or mobile)
  */
 export interface TestModule {
   id: string;

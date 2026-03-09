@@ -448,7 +448,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_test_modules',
       description:
-        'List test modules (organizational groups) for the project. Each module belongs to a platform (web_ui or api). Returns id, name, description, platformKey, tags, priority.',
+        'List test modules (organizational groups) for the project. Each module belongs to a platform (web_ui, api, or mobile). Returns id, name, description, platformKey, tags, priority.',
       parameters: {
         type: 'object',
         properties: {
@@ -458,7 +458,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           platform_key: {
             type: 'string',
-            enum: ['web_ui', 'api'],
+            enum: ['web_ui', 'api', 'mobile'],
             description: 'Filter by platform type',
           },
         },
@@ -1357,7 +1357,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_manage_module',
       description:
-        '⚠️ WRITE operation — Create or update test modules. Create needs: project_id, name, platform_key (web_ui or api). Describe changes → get approval → confirm=true.',
+        '⚠️ WRITE operation — Create or update test modules. Create needs: project_id, name, platform_key (web_ui, api, or mobile). Describe changes → get approval → confirm=true.',
       parameters: {
         type: 'object',
         properties: {
@@ -1380,7 +1380,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           platform_key: {
             type: 'string',
-            enum: ['web_ui', 'api'],
+            enum: ['web_ui', 'api', 'mobile'],
             description: 'Platform type (required for create)',
           },
           description: {
