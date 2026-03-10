@@ -1337,8 +1337,13 @@ export class PreviewStepApplyService {
           // Wait for page to settle
           await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
 
+          // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
+          if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
+            const sess = sessionService.getSession(previewSessionId);
+            if (sess) sess.lastSnapshotEmit = 0;
+          }
+
           // Try to get the node from current session for compiled plan
-          const sessionService = getPreviewSessionService();
           const isOwned = sessionService.isSessionOwned(previewSessionId, userId);
           const session = isOwned ? sessionService.getSession(previewSessionId) : undefined;
           const resolvedNode = session?.pageState?.domNodes?.find(n => n.ref === selectedRef);
@@ -1462,6 +1467,12 @@ export class PreviewStepApplyService {
             if (result.success) {
               // Wait for page to settle
               await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
+
+              // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
+              if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
+                const sess = sessionService.getSession(previewSessionId);
+                if (sess) sess.lastSnapshotEmit = 0;
+              }
 
               // Build resolution meta for compiled success
               const resolutionMeta: ResolutionMeta = {
@@ -1625,6 +1636,12 @@ export class PreviewStepApplyService {
         if (result.success) {
           // Wait for page to settle
           await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
+
+          // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
+          if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
+            const sess = sessionService.getSession(previewSessionId);
+            if (sess) sess.lastSnapshotEmit = 0;
+          }
 
           // V2: Post-action verification for state-aware actions
           let verified = false;
