@@ -603,6 +603,93 @@ async function waitForHoverEffect(
 }
 
 /**
+ * Dispatch a synthetic file drop event onto a target element.
+ * Used as a last-resort fallback for drag-and-drop-only upload zones
+ * that have no hidden <input type="file"> and don't trigger a fileChooser on click.
+ *
+ * Reads the file from disk, passes it as base64 into the browser context,
+ * and dispatches dragenter → dragover → drop events with a DataTransfer payload.
+ */
+async function dispatchFileDrop(
+  page: Page,
+  locator: Locator,
+  localFilePath: string,
+  filename: string,
+  contentType?: string,
+): Promise<void> {
+  const fs = await import('fs/promises');
+  const path = await import('path');
+
+  // Read file from disk and encode as base64
+  const fileBuffer = await fs.readFile(localFilePath);
+  const base64Data = fileBuffer.toString('base64');
+  const resolvedFilename = filename || path.basename(localFilePath);
+  const resolvedContentType = contentType || 'application/octet-stream';
+
+  // Dispatch synthetic drag-and-drop events in the browser context
+  await locator.evaluate(
+    (el: any, { base64, fname, ctype }) => {
+      const g = globalThis as any;
+      // Decode base64 back to binary
+      const binaryStr = g.atob(base64);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+      }
+      const file = new g.File([bytes], fname, { type: ctype });
+
+      // Build DataTransfer with the file
+      const dt = new g.DataTransfer();
+      dt.items.add(file);
+
+      const shared = { bubbles: true, cancelable: true, dataTransfer: dt };
+
+      // Full drag sequence: dragenter → dragover → drop
+      el.dispatchEvent(new g.DragEvent('dragenter', shared));
+      el.dispatchEvent(new g.DragEvent('dragover', shared));
+      el.dispatchEvent(new g.DragEvent('drop', shared));
+    },
+    { base64: base64Data, fname: resolvedFilename, ctype: resolvedContentType },
+  );
+}
+
+/**
+ * Upload via fileChooser interception, with drag-drop fallback.
+ *
+ * Strategy:
+ * 1. Try fileChooser interception (short 3s timeout) — works with programmatic input.click()
+ * 2. If fileChooser times out (e.g., drag-only dropzone), fall back to synthetic drop event
+ *
+ * This prevents wasting the full action timeout on drag-only zones that will never
+ * emit a filechooser event.
+ */
+async function uploadViaFileChooserOrDrop(
+  page: Page,
+  locator: Locator,
+  localFilePath: string,
+  filename: string,
+  contentType?: string,
+  timeout = 10_000,
+): Promise<void> {
+  const FILECHOOSER_QUICK_TIMEOUT = 3_000;
+
+  try {
+    const [fileChooser] = await Promise.all([
+      page.waitForEvent('filechooser', { timeout: FILECHOOSER_QUICK_TIMEOUT }),
+      locator.click({ timeout: FILECHOOSER_QUICK_TIMEOUT }),
+    ]);
+    await fileChooser.setFiles(localFilePath);
+  } catch {
+    // FileChooser didn't fire — likely a drag-and-drop-only upload zone.
+    // Fall back to synthetic drop event.
+    logger.info('[PREVIEW_APPLY] FileChooser not triggered, falling back to synthetic drop', {
+      filename,
+    });
+    await dispatchFileDrop(page, locator, localFilePath, filename, contentType);
+  }
+}
+
+/**
  * V10 Fix #7: Detect how long a dropdown animation takes to complete.
  * Polls for new visible ARIA containers (listbox/menu) or role=option elements.
  * Returns elapsed time + a safety margin so we know how long to wait in each phase.
@@ -1035,7 +1122,7 @@ async function executeAction(
         break;
       }
 
-      // V6: File upload
+      // V6: File upload — supports both native <input type="file"> and trigger-button patterns
       case 'upload': {
         if (!locator) throw new Error('No selector for upload action');
 
@@ -1044,6 +1131,8 @@ async function executeAction(
 
         const uploadOpts = step.options?.upload;
         let localFilePath: string;
+        let downloadedFilename: string = '';
+        let downloadedContentType: string | undefined;
         let needsCleanup = false;
 
         // Both 'url' and 'storage' source types use public URLs — download to temp dir
@@ -1054,13 +1143,97 @@ async function executeAction(
             maxSizeBytes: uploadOpts?.maxSizeBytes,
           });
           localFilePath = result.localPath;
+          downloadedFilename = result.filename;
+          downloadedContentType = result.contentType;
           needsCleanup = true;
         }
 
         try {
-          // File inputs are often hidden; use 'attached' not 'visible'
-          await locator.waitFor({ state: 'attached', timeout });
-          await locator.setInputFiles(localFilePath, { timeout });
+          // Check if the resolved element is already an <input type="file">
+          const tagName = await locator.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => '');
+          const inputType = await locator.evaluate((el: any) => el.type?.toLowerCase()).catch(() => '');
+          const isFileInput = tagName === 'input' && inputType === 'file';
+
+          if (isFileInput) {
+            // Direct path: element is already a file input
+            await locator.waitFor({ state: 'attached', timeout });
+            await locator.setInputFiles(localFilePath, { timeout });
+          } else {
+            // Trigger-button pattern: the resolved element is a <button>/<div>/<label> that
+            // opens a native file dialog. The real <input type="file"> is hidden via CSS.
+            // Strategy: 1) Try to find a hidden file input nearby in DOM
+            //           2) Fall back to fileChooser event interception (most universal)
+
+            // Attempt 1: Search for a hidden file input associated with this trigger element.
+            // Checks: children, shadow DOM children, parent containers (up to 3 levels),
+            // shadow roots in parent trees, and label[for] association.
+            const nearbyFileInput = await locator.evaluate((el: any) => {
+              // Helper: check a root and its open shadow roots for input[type="file"]
+              const findFileInput = (root: any): boolean => {
+                if (!root) return false;
+                if (root.querySelector?.('input[type="file"]')) return true;
+                // Traverse open shadow roots of all child elements
+                const children = root.querySelectorAll?.('*') || [];
+                for (const child of children) {
+                  if (child.shadowRoot?.querySelector('input[type="file"]')) return true;
+                }
+                return false;
+              };
+
+              // Check element itself (children + shadow)
+              if (findFileInput(el)) return true;
+              if (el.shadowRoot && findFileInput(el.shadowRoot)) return true;
+
+              // Check parent containers (up to 3 levels) for a file input
+              let parent = el.parentElement;
+              for (let i = 0; i < 3 && parent; i++) {
+                if (findFileInput(parent)) return true;
+                parent = parent.parentElement;
+              }
+
+              // Check by label[for] association
+              if (el.tagName === 'LABEL' && el.htmlFor) {
+                const target = el.ownerDocument.getElementById(el.htmlFor);
+                if (target?.type === 'file') return true;
+              }
+
+              return false;
+            }).catch(() => false);
+
+            if (nearbyFileInput) {
+              // Found a nearby hidden file input — locate and use it
+              const fileInputLocator = await (async () => {
+                // Try child first (Playwright pierces open shadow DOM)
+                const child = locator.locator('input[type="file"]');
+                if (await child.count() > 0) return child.first();
+
+                // Try parent containers (up to 3 levels)
+                for (let i = 1; i <= 3; i++) {
+                  const ancestor = locator.locator(`xpath=${'..'.concat('/..'.repeat(i - 1))}`);
+                  const input = ancestor.locator('input[type="file"]');
+                  if (await input.count() > 0) return input.first();
+                }
+
+                // No page-level fallback — too risky with multiple file inputs.
+                // Fall through to fileChooser interception instead.
+                return null;
+              })();
+
+              if (fileInputLocator) {
+                await fileInputLocator.waitFor({ state: 'attached', timeout });
+                await fileInputLocator.setInputFiles(localFilePath, { timeout });
+              } else {
+                // Nearby input detected in evaluate() but Playwright locator couldn't reach it
+                // (e.g., closed shadow DOM). Fall back to fileChooser → drag-drop chain.
+                await uploadViaFileChooserOrDrop(page, locator, localFilePath, downloadedFilename, downloadedContentType, timeout);
+              }
+            } else {
+              // Attempt 2: No hidden file input found anywhere near the trigger.
+              // Try fileChooser interception first (works with programmatic input.click()),
+              // then fall back to synthetic drag-drop (for drop-only zones).
+              await uploadViaFileChooserOrDrop(page, locator, localFilePath, downloadedFilename, downloadedContentType, timeout);
+            }
+          }
         } finally {
           if (needsCleanup) {
             const { cleanupUploadTempFile } = await import('@/agent/execution/file-download.service');

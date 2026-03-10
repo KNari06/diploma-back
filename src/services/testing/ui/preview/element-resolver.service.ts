@@ -57,6 +57,7 @@ const ACTION_TO_TAGS: Record<string, string[]> = {
   hover: ['button', 'a', 'div', 'span', 'img'],
   scroll: ['div', 'section', 'main', 'body', 'html'],
   press: ['input', 'textarea', 'button', 'div', 'span'], // FIX #4: contenteditable + role=textbox divs
+  upload: ['input', 'button', 'label', 'div', 'span'], // File inputs are often hidden; trigger is a button/label/div
 };
 
 /**
