@@ -772,6 +772,11 @@ export function buildCandidateText(node: InteractiveNode): string {
     parts.push(`[${stateHints.join(', ')}]`);
   }
 
+  // Active layer hint (element is inside the foreground modal/popup/dropdown overlay)
+  if (node.isInsideActiveModal) {
+    parts.push('[active-layer]');
+  }
+
   // Phase 4: Custom component signals (rich text editor, framework buttons)
   if (node.isContentEditable) {
     parts.push('editable');
@@ -794,6 +799,40 @@ export function buildCandidateText(node: InteractiveNode): string {
   // Join and cap length
   const result = parts.join(' | ');
   return result.slice(0, MAX_CANDIDATE_TEXT_LENGTH);
+}
+
+/**
+ * Build a brief page scene summary from candidate nodes.
+ * Gives the LLM a top-down understanding of the page state
+ * (which dropdowns are open, which tabs are selected, whether a modal is active).
+ */
+function buildSceneSummary(
+  candidates: Array<{ node: InteractiveNode; candidateText: string }>
+): string {
+  const scenes: string[] = [];
+
+  // Detect expanded containers (open dropdowns, accordions, menus)
+  const expanded = candidates.filter(c => c.node.ariaExpanded === true);
+  for (const c of expanded) {
+    const label = c.node.labelText || c.node.ariaLabel || c.node.text || c.node.tag;
+    scenes.push(`"${label}" is expanded/open`);
+  }
+
+  // Detect selected tabs
+  const selected = candidates.filter(c => c.node.ariaSelected === true);
+  for (const c of selected) {
+    const label = c.node.labelText || c.node.ariaLabel || c.node.text || c.node.tag;
+    scenes.push(`"${label}" tab is selected`);
+  }
+
+  // Detect active modal/popup layer
+  const modalElements = candidates.filter(c => c.node.isInsideActiveModal === true);
+  if (modalElements.length > 0) {
+    scenes.push(`A modal/popup is open with ${modalElements.length} interactive elements`);
+  }
+
+  if (scenes.length === 0) return '';
+  return scenes.slice(0, 5).join('; ');
 }
 
 /**
@@ -1053,9 +1092,28 @@ RULES:
    - "arrow" / "back" = "go back" / "navigate back"
    - "trash" / "delete icon" = "remove" / "delete item"
    - "pencil" / "edit icon" = "edit" / "modify"
-5. If 2+ elements are equally valid, return alternatives (not a single pick)
-6. ONLY use refs from the provided list — never invent refs
-7. Respond ONLY with valid JSON, no markdown
+5. PAGE STATE AWARENESS: Use the PAGE STATE line and element state hints to understand the live page:
+   - [expanded] = container/dropdown/menu is currently OPEN — its children are visible targets
+   - [collapsed] = container is CLOSED — its children are NOT the target
+   - [selected] = tab/option is currently active — content within is visible
+   - [active-layer] = element is inside the foreground modal/popup/overlay
+   When the user says "inside dropdown/menu/popup/dialog":
+   - Find elements that are CHILDREN of an expanded/open container (check [container] prefixes)
+   - Prefer [active-layer] elements over background elements
+   - The trigger element (the one with [expanded]) is NOT the target — the content INSIDE is
+6. PARTIAL / ABBREVIATED DESCRIPTIONS: Users often shorten element descriptions:
+   - Match the MOST SPECIFIC candidate, not the broadest
+   - If a keyword appears in both a parent section/tab AND a child element, prefer the CHILD —
+     users describe what they want to interact with, using the parent as scope
+   - [Section > Subsection] prefixes are LOCATION context: "X inside Y" = find X within Y container
+7. DISAMBIGUATION when 2+ candidates share a keyword:
+   - Prefer candidates with more context overlap with the intent
+   - Prefer deeper-nested [A > B > C] elements over shallow [A] — more specific
+   - Prefer action-oriented text ("Create", "Add", "Delete", "Edit") for click/hover actions
+   - Prefer elements inside [expanded] containers or [active-layer] over background elements
+8. If 2+ elements are equally valid, return alternatives (not a single pick)
+9. ONLY use refs from the provided list — never invent refs
+10. Respond ONLY with valid JSON, no markdown
 
 OUTPUT FORMAT:
 {"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
@@ -1095,9 +1153,13 @@ async function selectElementWithLLM(params: {
     })
     .join('\n');
 
+  // Build page scene summary for top-down context
+  const sceneSummary = buildSceneSummary(candidates);
+  const sceneContext = sceneSummary ? `\nPAGE STATE: ${sceneSummary}` : '';
+
   const userPrompt = `INTENT: "${intentText}"
 ACTION: ${actionType}
-PAGE: ${pageUrl}
+PAGE: ${pageUrl}${sceneContext}
 
 ELEMENTS (${candidates.length}):
 ${candidateList}
