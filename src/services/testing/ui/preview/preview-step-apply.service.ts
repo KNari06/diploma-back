@@ -21,7 +21,7 @@ import type {
     UrlMatcher,
 } from './preview.types';
 
-import { STEP_APPLY_CONFIG } from '@/config/testing/playwright-tuning';
+import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 
 const MAX_ATTEMPTS = STEP_APPLY_CONFIG.maxAttempts;
 
@@ -53,6 +53,10 @@ const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 
 
 // V11: Actions that don't target elements — skip modal check
 const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check']);
+
+// Actions that mutate DOM and require a fresh snapshot for the next step's lint.
+// After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
+const DOM_MUTATING_ACTIONS = new Set(['hover', 'click', 'open', 'close', 'toggle', 'dblclick', 'contextmenu', 'drag_and_drop']);
 
 /**
  * V11: Detect if a modal/popup/overlay is currently blocking the page.
@@ -767,7 +771,16 @@ async function executeAction(
 
       case 'hover': {
         if (!locator) throw new Error('No selector for hover action');
-        await locator.hover({ timeout });
+        // Scroll element into viewport before hovering (prevents out-of-viewport misses)
+        await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
+        try {
+          await locator.hover({ timeout });
+        } catch {
+          // Retry with force:true if blocked by an overlay (another tooltip, sticky header, etc.)
+          await locator.hover({ timeout, force: true });
+        }
+        // Post-hover settle — let tooltips/submenus animate in before next step runs
+        await sleepMs(page, STEP_READINESS_CONFIG.domStableThresholdMs.assertion);
         break;
       }
 
@@ -794,6 +807,8 @@ async function executeAction(
             (globalThis as any).scrollBy(0, dy);
           }, deltaY);
         }
+        // Post-scroll settle — give lazy-loaded content time to appear
+        await sleepMs(page, STEP_READINESS_CONFIG.domStableThresholdMs.assertion);
         break;
       }
 
@@ -806,7 +821,7 @@ async function executeAction(
       case 'navigate': {
         if (!step.value) throw new Error('No URL for navigate action');
         const safeUrl = sanitizeUrl(step.value);
-        await page.goto(safeUrl, { waitUntil: 'domcontentloaded', timeout: STEP_APPLY_CONFIG.navigateTimeoutMs });
+        await page.goto(safeUrl, { waitUntil: 'load', timeout: STEP_APPLY_CONFIG.navigateTimeoutMs });
         break;
       }
 
@@ -897,17 +912,24 @@ async function executeAction(
 
         if (dragData?.from && dragData?.to) {
           // Coordinate-based drag (recorded from mouse events)
-          await page.mouse.move(dragData.from.x, dragData.from.y);
-          await page.mouse.down();
-          // Gradual move for realistic drag behaviour
-          const steps = Math.max(5, Math.round(
-            Math.sqrt(
-              Math.pow(dragData.to.x - dragData.from.x, 2) +
-              Math.pow(dragData.to.y - dragData.from.y, 2)
-            ) / 10
-          ));
-          await page.mouse.move(dragData.to.x, dragData.to.y, { steps });
-          await page.mouse.up();
+          // Wrapped in try/catch: if drag fails mid-way, mouse.up() must still be called
+          // to prevent the mouse staying "stuck" in down state and corrupting subsequent steps
+          try {
+            await page.mouse.move(dragData.from.x, dragData.from.y);
+            await page.mouse.down();
+            // Gradual move for realistic drag behaviour
+            const steps = Math.max(5, Math.round(
+              Math.sqrt(
+                Math.pow(dragData.to.x - dragData.from.x, 2) +
+                Math.pow(dragData.to.y - dragData.from.y, 2)
+              ) / 10
+            ));
+            await page.mouse.move(dragData.to.x, dragData.to.y, { steps });
+            await page.mouse.up();
+          } catch (dragError) {
+            await page.mouse.up().catch(() => {});
+            throw dragError;
+          }
         } else if (step.options?.dropTarget) {
           // Element-based drag: drag source locator to a target selector
           const targetLocator = (getLocatorContext(page, step) as Page | FrameLocator)

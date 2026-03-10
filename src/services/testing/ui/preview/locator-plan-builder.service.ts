@@ -179,6 +179,9 @@ function determinePostconditions(actionType: string, node?: InteractiveNode): ('
     case 'open':
     case 'close':
       return ['domChange', 'stateChange'];
+    case 'hover':
+      // Hover can trigger tooltips, submenus, and popover DOM changes
+      return ['domChange'];
     default:
       return [];
   }
