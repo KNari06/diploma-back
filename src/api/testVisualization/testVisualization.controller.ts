@@ -654,6 +654,14 @@ async function getComprehensiveTestData(testId: string, userId?: string): Promis
       logger.debug('[TEST_VISUALIZATION] API configs table not accessible', { testId });
     }
 
+    // Strip cost/token fields from intelligent session before returning
+    if (intelligentSession?.session) {
+      delete intelligentSession.session.cost_usd;
+      delete intelligentSession.session.tokens_used;
+      delete intelligentSession.session.total_cost_usd;
+      delete intelligentSession.session.total_tokens;
+    }
+
     return {
       test,
       results: results || [],

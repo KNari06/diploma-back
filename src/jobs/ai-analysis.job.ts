@@ -717,10 +717,25 @@ export class NotificationJobHandler {
 
 /**
  * Webhook job handler
+ *
+ * Sends outbound HTTP POST to external webhook URLs.
+ * Used for CI/CD callbacks and event notifications.
+ * Retries are handled by BullMQ (3 attempts, exponential backoff).
  */
 export class WebhookJobHandler {
+  /** Timeout for outbound webhook requests (10s) */
+  private static readonly TIMEOUT_MS = 10_000;
+
   /**
-   * Process webhook job
+   * CI/CD events that should always be delivered.
+   * Legacy events (test.completed, etc.) remain log-only until explicitly enabled
+   * to avoid surprising existing projects that had a webhook URL configured
+   * when the handler was a no-op stub.
+   */
+  private static readonly LIVE_EVENT_PREFIXES = ['mobile_ci_run.'];
+
+  /**
+   * Process webhook job — sends HTTP POST to the target URL.
    */
   static async process(job: Job<{
     url: string;
@@ -728,22 +743,104 @@ export class WebhookJobHandler {
     data: any;
     headers?: Record<string, string>;
   }>) {
-    const { url, event, data } = job.data;
+    const { url, event, data, headers: customHeaders } = job.data;
 
-    logger.info(`Processing webhook: ${event} to ${url}`);
+    logger.info('[WEBHOOK] Processing outbound webhook', {
+      jobId: job.id,
+      event,
+      url,
+      attempt: job.attemptsMade + 1,
+    });
     logQueueEvent('processing', job.id!, { event, url });
 
+    // Guard: only CI/CD events are delivered for now.
+    // Legacy events (test.completed, bug.found, etc.) stay log-only
+    // to avoid breaking production for projects that set a webhook URL
+    // when the handler was a stub. Remove this guard when ready to go live.
+    const isLiveEvent = this.LIVE_EVENT_PREFIXES.some((p) => event.startsWith(p));
+    if (!isLiveEvent) {
+      logger.info('[WEBHOOK] Legacy event — log only (not delivered)', {
+        jobId: job.id,
+        event,
+        url,
+      });
+      return;
+    }
+
     try {
-      // In a real implementation, you would make HTTP requests
-      // For now, just log the webhook
-      logger.info(`Webhook sent: ${event} to ${url}`);
-      logger.info(`Data: ${JSON.stringify(data, null, 2)}`);
+      const body = JSON.stringify(data);
 
-      // TODO: Implement actual webhook sending with retry logic
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'QAIT-Webhook/1.0',
+        'X-QAIT-Event': event,
+        ...customHeaders,
+      };
 
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.TIMEOUT_MS);
+
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers,
+          body,
+          signal: controller.signal,
+        });
+
+        clearTimeout(timer);
+
+        if (!response.ok) {
+          const responseBody = await response.text().catch(() => '');
+          const errorMsg = `Webhook returned ${response.status}: ${responseBody.slice(0, 200)}`;
+
+          logger.warn('[WEBHOOK] Non-OK response', {
+            jobId: job.id,
+            event,
+            url,
+            status: response.status,
+            responseBody: responseBody.slice(0, 200),
+          });
+
+          // Throw to trigger BullMQ retry for 5xx errors
+          if (response.status >= 500) {
+            throw new Error(errorMsg);
+          }
+
+          // 4xx errors — log but don't retry (client error)
+          logger.error('[WEBHOOK] Client error (no retry)', {
+            jobId: job.id,
+            event,
+            url,
+            status: response.status,
+          });
+          return;
+        }
+
+        logger.info('[WEBHOOK] Webhook delivered successfully', {
+          jobId: job.id,
+          event,
+          url,
+          status: response.status,
+        });
+      } catch (fetchError) {
+        clearTimeout(timer);
+
+        if (fetchError instanceof DOMException && fetchError.name === 'AbortError') {
+          throw new Error(`Webhook timed out after ${this.TIMEOUT_MS}ms: ${url}`);
+        }
+
+        throw fetchError;
+      }
     } catch (error) {
-      logger.error(`Webhook failed: ${event} to ${url}`, error);
-      throw error;
+      logger.error('[WEBHOOK] Webhook delivery failed', {
+        jobId: job.id,
+        event,
+        url,
+        attempt: job.attemptsMade + 1,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error; // Re-throw for BullMQ retry
     }
   }
 }

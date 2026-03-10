@@ -31,7 +31,8 @@ export type ExecutionStatus =
   | 'passed'
   | 'failed'
   | 'skipped'
-  | 'cancelled';
+  | 'cancelled'
+  | 'timeout';
 
 /**
  * Trigger types for test runs
@@ -74,7 +75,7 @@ export type PlanItemType = 'module' | 'flow' | 'test_case';
 /**
  * Platform key types (top-level test category)
  */
-export type PlatformKey = 'web_ui' | 'api';
+export type PlatformKey = 'web_ui' | 'api' | 'mobile';
 
 // ============================================================================
 // FAILURE ANALYSIS TYPES
@@ -202,7 +203,7 @@ export interface CreateTestPlatformParams {
 
 /**
  * Test module - functional area of the product (Auth, Payments, Profile)
- * Belongs to a platform (web_ui or api)
+ * Belongs to a platform (web_ui, api, or mobile)
  */
 export interface TestModule {
   id: string;
@@ -538,6 +539,8 @@ export interface PlanGitTriggersConfig {
   enabled: boolean;
   triggerTypes: GitTriggerType[];
   branch: string;
+  /** Git provider; when set, used for matching git_integrations (recommended with repositoryUrl). */
+  provider?: 'github' | 'gitlab';
   /** UUID of an existing git_integrations row (from GET /git-integrations). */
   integrationId?: string;
   /** Repository URL to find an existing git-integration by repo (e.g. https://github.com/owner/repo). */

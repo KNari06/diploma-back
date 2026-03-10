@@ -60,24 +60,32 @@ const CONFIDENCE = {
 
 // Action type to element type mappings (V2: added check/uncheck/toggle/open/close)
 const ACTION_TO_ELEMENT_TYPES: Record<string, string[]> = {
-  type: ['input', 'textarea'],
-  fill: ['input', 'textarea'],
-  click: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'summary'],
-  select: ['select'],
-  hover: ['button', 'a', 'div', 'span', 'img'],
+  type: ['input', 'textarea', 'div', 'span'],       // div/span for contenteditable (rich text editors)
+  fill: ['input', 'textarea', 'div', 'span'],       // div/span for contenteditable
+  click: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'summary', 'select', 'option', 'details'],
+  select: ['select', 'option', 'button', 'div', 'span', 'input', 'li'],  // li for custom dropdowns
+  hover: ['button', 'a', 'div', 'span', 'img', 'li', 'td', 'tr'],
   scroll: ['div', 'section', 'main', 'body'],
-  press: ['input', 'textarea', 'button'],
+  press: ['input', 'textarea', 'button', 'div'],    // div for contenteditable
   wait: [],
   assert: [],
   navigate: [],
   // V2: State-aware action types
-  check: ['input'],
-  uncheck: ['input'],
-  toggle: ['input', 'button', 'div', 'span'],
-  open: ['button', 'div', 'select', 'summary'],
-  close: ['button', 'div', 'summary'],
+  check: ['input', 'label'],                        // label wrapping checkbox
+  uncheck: ['input', 'label'],
+  toggle: ['input', 'button', 'div', 'span', 'label'],
+  open: ['button', 'div', 'select', 'summary', 'details'],
+  close: ['button', 'div', 'summary', 'details'],
+  // V3: AI-powered assertion
+  ai_check: [],
+  // V5: URL wait
+  wait_for: [],
   // V6: File upload
   upload: ['input'],
+  // V10: Advanced interaction types
+  dblclick: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'summary'],
+  contextmenu: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg'],
+  drag_and_drop: ['div', 'span', 'li', 'img', 'tr', 'td', 'a', 'button'],
 };
 
 // V2: Actions that require writable state

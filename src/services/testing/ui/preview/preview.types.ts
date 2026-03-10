@@ -38,6 +38,10 @@ export interface InteractiveNode {
   labelText?: string;
   /** ARIA label */
   ariaLabel?: string;
+  /** HTML title attribute (tooltip text — useful for icon-only buttons) */
+  title?: string;
+  /** True if element is an icon-only button (SVG/img child, no visible text) */
+  isIconButton?: boolean;
   /** HTML name attribute */
   name?: string;
   /** Placeholder text */
@@ -444,7 +448,7 @@ export interface IntentStep {
    * Expected outcome for this step (V11: negative test support)
    * - 'success': Step should complete without errors (default)
    * - 'error': Step is a negative test — expects 4xx / validation error / error toast
-   * Auto-classified from description keywords if not explicitly set.
+   * Must be explicitly set by the LLM or user. Falls back to 'success' if not set.
    */
   expectedOutcome?: ExpectedStepOutcome;
   /** True if this step was auto-injected (e.g., auto wait_for URL change). Soft failure — won't fail the test. */
@@ -766,6 +770,11 @@ export type IntentTestCaseStatus = 'draft' | 'published' | 'archived';
 export type IntentTestCaseKind = 'standalone' | 'regression_member';
 
 /**
+ * Testing platform for test cases
+ */
+export type IntentTestCasePlatform = 'web' | 'mobile_android' | 'mobile_ios';
+
+/**
  * Replay strategy for test execution
  */
 export type ReplayStrategy = 'commands' | 'graph_extract';
@@ -785,6 +794,8 @@ export interface CreateIntentTestCaseRequest {
   status?: IntentTestCaseStatus;
   /** Classification */
   kind?: IntentTestCaseKind;
+  /** Testing platform (defaults to 'web') */
+  platform?: IntentTestCasePlatform;
 }
 
 /**
@@ -809,6 +820,7 @@ export interface IntentTestCase {
   // Lifecycle
   status: IntentTestCaseStatus;
   kind: IntentTestCaseKind;
+  platform?: IntentTestCasePlatform;
 
   // Replay data (populated when saved from completed test or published)
   replayStrategy?: ReplayStrategy;

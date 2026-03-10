@@ -448,7 +448,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_test_modules',
       description:
-        'List test modules (organizational groups) for the project. Each module belongs to a platform (web_ui or api). Returns id, name, description, platformKey, tags, priority.',
+        'List test modules (organizational groups) for the project. Each module belongs to a platform (web_ui, api, or mobile). Returns id, name, description, platformKey, tags, priority.',
       parameters: {
         type: 'object',
         properties: {
@@ -458,7 +458,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           platform_key: {
             type: 'string',
-            enum: ['web_ui', 'api'],
+            enum: ['web_ui', 'api', 'mobile'],
             description: 'Filter by platform type',
           },
         },
@@ -962,7 +962,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           steps: {
             type: 'array',
-            description: 'Full array of steps to replace existing steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string}',
+            description: 'Full array of steps to replace existing steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string, expectedOutcome?: "success"|"error"}',
             items: {
               type: 'object',
               properties: {
@@ -975,6 +975,11 @@ const QA_TOOLS: ChatCompletionTool[] = [
                 description: { type: 'string', description: 'Human-readable description of what this step does' },
                 value: { type: 'string', description: 'Value for type/press actions (e.g., text to type)' },
                 assertionText: { type: 'string', description: 'Assertion text for ai_check steps' },
+                expectedOutcome: {
+                  type: 'string',
+                  enum: ['success', 'error'],
+                  description: 'Expected outcome. Use "error" for negative test steps that intentionally submit invalid/wrong data and expect validation errors or 4xx responses. Default: "success".',
+                },
               },
               required: ['id', 'type', 'description'],
             },
@@ -1097,7 +1102,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           steps: {
             type: 'array',
-            description: 'Array of steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string}',
+            description: 'Array of steps. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string, expectedOutcome?: "success"|"error"}',
             items: {
               type: 'object',
               properties: {
@@ -1110,6 +1115,11 @@ const QA_TOOLS: ChatCompletionTool[] = [
                 description: { type: 'string', description: 'What this step does' },
                 value: { type: 'string', description: 'Value for type/press actions' },
                 assertionText: { type: 'string', description: 'Assertion text for ai_check steps' },
+                expectedOutcome: {
+                  type: 'string',
+                  enum: ['success', 'error'],
+                  description: 'Expected outcome. Use "error" for negative test steps that intentionally submit invalid/wrong data and expect validation errors or 4xx responses. Default: "success".',
+                },
               },
               required: ['id', 'type', 'description'],
             },
@@ -1347,7 +1357,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_manage_module',
       description:
-        '⚠️ WRITE operation — Create or update test modules. Create needs: project_id, name, platform_key (web_ui or api). Describe changes → get approval → confirm=true.',
+        '⚠️ WRITE operation — Create or update test modules. Create needs: project_id, name, platform_key (web_ui, api, or mobile). Describe changes → get approval → confirm=true.',
       parameters: {
         type: 'object',
         properties: {
@@ -1370,7 +1380,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           platform_key: {
             type: 'string',
-            enum: ['web_ui', 'api'],
+            enum: ['web_ui', 'api', 'mobile'],
             description: 'Platform type (required for create)',
           },
           description: {

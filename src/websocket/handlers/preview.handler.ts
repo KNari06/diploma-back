@@ -28,6 +28,7 @@ import {
     validateInputRequest,
 } from './preview-input-helpers';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
+import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 
@@ -2388,7 +2389,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           const resetTrace = EditorTraceService.get(previewSessionId);
           if (resetTrace) {
             resetTrace.writeRecordingStop('user');
-            EditorTraceService.close(previewSessionId).catch(() => {});
+            EditorTraceService.close(previewSessionId).then((meta) => {
+              if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' });
+            }).catch(() => {});
           }
 
           logger.info('[RECORDING] Stopped due to page reset', { previewSessionId, userId: ensuredUserId });
@@ -2787,7 +2790,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         const runStopTrace = EditorTraceService.get(previewSessionId);
         if (runStopTrace) {
           runStopTrace.writeRecordingStop('user');
-          EditorTraceService.close(previewSessionId).catch(() => {});
+          EditorTraceService.close(previewSessionId).then((meta) => {
+            if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor', intentTestCaseId });
+          }).catch(() => {});
         }
         logger.info('[RECORDING] Stopped due to run:start', { previewSessionId, userId });
       }
@@ -3175,7 +3180,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const recStopTrace = EditorTraceService.get(previewSessionId);
       if (recStopTrace) {
         recStopTrace.writeRecordingStop('user');
-        EditorTraceService.close(previewSessionId).catch(() => {});
+        EditorTraceService.close(previewSessionId).then((meta) => {
+          if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' });
+        }).catch(() => {});
       }
 
       socket.nsp.to(room).emit('preview:recording:state', {
@@ -3270,7 +3277,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const dcTrace = EditorTraceService.get(previewSessionId);
               if (dcTrace) {
                 dcTrace.writeRecordingStop('disconnect');
-                EditorTraceService.close(previewSessionId).catch(() => {});
+                EditorTraceService.close(previewSessionId).then((meta) => {
+                  if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' });
+                }).catch(() => {});
               }
             } catch (error) {
               logger.debug('[WebSocket] Recording cleanup failed on disconnect', {

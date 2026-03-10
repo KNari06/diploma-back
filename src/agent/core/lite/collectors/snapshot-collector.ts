@@ -1226,7 +1226,61 @@ export class SnapshotCollector {
             // STEP EDITOR V2: Extract labels
             // ═══════════════════════════════════════════════════════════════
             const ariaLabel = el.getAttribute('aria-label') || undefined;
+            const titleAttr = el.getAttribute('title') || undefined;
             const labelText = getLabelText(el);
+
+            // Detect icon-only buttons/links: element has child SVG/img but no visible text.
+            // Covers: <button>, <a>, any element with role="button", and clickable
+            // div/span wrappers common in React/Vue/Angular component libraries.
+            const isIconButton = (() => {
+              try {
+                const tag = el.tagName.toLowerCase();
+                const role = el.getAttribute('role');
+                const tabIdx = el.getAttribute('tabindex');
+                const isClickable = tag === 'button' || tag === 'a'
+                  || role === 'button' || role === 'link' || role === 'menuitem'
+                  || el.hasAttribute('onclick')
+                  || (tabIdx !== null && parseInt(tabIdx, 10) >= 0);
+                if (!isClickable) return false;
+                // Look for icon children: SVG, img, <i> with class (Font Awesome / Material),
+                // or small span/div whose class contains "icon" (but exclude the element itself).
+                // Icon child selectors: SVG, img, Font Awesome (<i class="fa...">),
+                // Material Icons, generic icon classes, and data-icon attributes.
+                const iconSelector = 'svg, img, i[class*="icon"], i[class^="fa"], i[class*=" fa"], i.material-icons, i.material-symbols-outlined, span.icon, [data-icon]';
+                const hasIconChild = el.querySelector(iconSelector) !== null;
+                if (!hasIconChild) return false;
+                // Check if there is meaningful visible text beyond the icon children
+                const clone = el.cloneNode(true) as HTMLElement;
+                clone.querySelectorAll(iconSelector).forEach(icon => icon.remove());
+                const remainingText = (clone.textContent || '').replace(/\s+/g, '').trim();
+                return remainingText.length === 0;
+              } catch { return false; }
+            })();
+
+            // For icon-only buttons: extract child <img alt> or <svg><title> as fallback label.
+            // This covers avatar buttons, icon buttons with descriptive alt/title on children.
+            let iconChildLabel: string | undefined;
+            if (isIconButton && !ariaLabel && !titleAttr) {
+              try {
+                // Try <img alt="..."> first
+                const img = el.querySelector('img[alt]');
+                if (img) {
+                  const alt = (img.getAttribute('alt') || '').trim();
+                  if (alt.length > 0 && alt.length <= 100) iconChildLabel = alt;
+                }
+                // Try <svg> <title> (can be nested inside <g>, <defs>, etc.)
+                if (!iconChildLabel) {
+                  const svg = el.querySelector('svg');
+                  if (svg) {
+                    const svgTitle = svg.querySelector('title');
+                    if (svgTitle) {
+                      const svgText = (svgTitle.textContent || '').trim();
+                      if (svgText.length > 0 && svgText.length <= 100) iconChildLabel = svgText;
+                    }
+                  }
+                }
+              } catch { /* ignore */ }
+            }
 
             // ═══════════════════════════════════════════════════════════════
             // STEP EDITOR V2: Extract parent chain
@@ -1309,6 +1363,8 @@ export class SnapshotCollector {
               hasValue: hasValue || undefined,
               // Labels
               ariaLabel,
+              title: titleAttr || iconChildLabel,
+              isIconButton: isIconButton || undefined,
               labelText,
               // Hierarchy
               parentRefChain: parentRefChain.length > 0 ? parentRefChain : undefined,

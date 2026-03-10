@@ -11,8 +11,8 @@ import { browserPool } from '../../browser/browser-pool';
 export async function setupBrowserContext(
   testData: TestJobData,
   browser: Browser,
-  options?: { disableVideo?: boolean }
-): Promise<{ context: BrowserContext; tracePath: string }> {
+  options?: { disableVideo?: boolean; disableTracing?: boolean }
+): Promise<{ context: BrowserContext; tracePath: string | undefined }> {
   // ✅ FIX: Prepare video & trace directories
   const fs = await import('fs/promises');
   const path = await import('path');
@@ -79,18 +79,22 @@ export async function setupBrowserContext(
 
   const context = await browser.newContext(contextOptions);
 
-  // ✅ NEW: Start tracing
-  const tracePath = path.join(tracesDir, `trace-${testData.testId}-${Date.now()}.zip`);
-  await context.tracing.start({
-    screenshots: true,
-    snapshots: true,
-    sources: true,
-  });
+  // ✅ Start tracing (skip on initial replay attempts to save RAM)
+  let tracePath: string | undefined;
+  if (!options?.disableTracing) {
+    tracePath = path.join(tracesDir, `trace-${testData.testId}-${Date.now()}.zip`);
+    await context.tracing.start({
+      screenshots: true,
+      snapshots: true,
+      sources: true,
+    });
+  }
 
-  logger.info('[PLAYWRIGHT] Video & Trace recording started', {
+  logger.info('[PLAYWRIGHT] Browser context created', {
     testId: testData.testId,
-    videoDir: videosDir,
-    tracePath,
+    videoEnabled: !options?.disableVideo,
+    tracingEnabled: !options?.disableTracing,
+    tracePath: tracePath || 'disabled',
   });
 
   return { context, tracePath };

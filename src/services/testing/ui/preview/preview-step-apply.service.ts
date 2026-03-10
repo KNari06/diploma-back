@@ -21,8 +21,9 @@ import type {
     UrlMatcher,
 } from './preview.types';
 
-// Max attempts to try different candidates
-const MAX_ATTEMPTS = 3;
+import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
+
+const MAX_ATTEMPTS = STEP_APPLY_CONFIG.maxAttempts;
 
 /**
  * V2: Build bindingHints from resolved InteractiveNode
@@ -44,14 +45,18 @@ function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
 
   return hints;
 }
-const ACTION_TIMEOUT = 10000; // 10 seconds
-const POST_ACTION_SETTLE_TIMEOUT = 5000; // 5 seconds
+const ACTION_TIMEOUT = STEP_APPLY_CONFIG.actionTimeoutMs;
+const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 
 // V2: Action types that support state verification
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
 // V11: Actions that don't target elements — skip modal check
 const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check']);
+
+// Actions that mutate DOM and require a fresh snapshot for the next step's lint.
+// After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
+const DOM_MUTATING_ACTIONS = new Set(['hover', 'click', 'open', 'close', 'toggle', 'dblclick', 'contextmenu', 'drag_and_drop']);
 
 /**
  * V11: Detect if a modal/popup/overlay is currently blocking the page.
@@ -505,6 +510,99 @@ async function ensureStability(
 }
 
 /**
+ * Adaptive post-hover settle: waits for DOM to stabilize after hover triggers
+ * tooltips, submenus, or popovers. Instead of a fixed 150ms, we observe the DOM
+ * for new elements appearing and wait until mutations stop.
+ *
+ * Strategy:
+ * 1. Snapshot current DOM element count
+ * 2. Poll for new visible elements (tooltip, menu, popover patterns)
+ * 3. Once detected OR minWaitMs passed — wait for mutations to stop (stableMs gap)
+ * 4. Safety cap at maxWaitMs to avoid hanging on non-reactive hovers
+ *
+ * @returns elapsed time in ms
+ */
+async function waitForHoverEffect(
+  page: Page,
+  maxWaitMs = 2000,
+  stableMs = 150,
+): Promise<number> {
+  const start = Date.now();
+
+  // Selectors for elements commonly created by hover (tooltips, menus, popovers)
+  const hoverEffectSelector = [
+    '[role="tooltip"]:visible',
+    '[role="menu"]:visible',
+    '[role="listbox"]:visible',
+    '[role="dialog"]:visible',
+    '[data-radix-popper-content-wrapper]:visible',
+    '[class*="tooltip"]:visible',
+    '[class*="popover"]:visible',
+    '[class*="dropdown"]:visible',
+    '.tippy-box:visible',
+    '.MuiTooltip-tooltip:visible',
+    '.MuiMenu-list:visible',
+    '.ant-tooltip:visible',
+    '.ant-dropdown:visible',
+  ].join(', ');
+
+  // Phase 1: Quick check — did hover produce any visible effect?
+  // Race between effect appearing and a minimum wait (avoids 0ms exit on static hovers)
+  const minWaitMs = STEP_READINESS_CONFIG.domStableThresholdMs.assertion; // 150ms
+  try {
+    await Promise.race([
+      page.waitForSelector(hoverEffectSelector, { state: 'visible', timeout: maxWaitMs }),
+      page.waitForTimeout(minWaitMs),
+    ]);
+  } catch {
+    // No effect found within maxWaitMs — hover probably doesn't trigger visible DOM changes
+    return Date.now() - start;
+  }
+
+  // Phase 2: Wait for the effect to stabilize (animation to finish).
+  // Use MutationObserver-based idle detection: wait until no new DOM mutations
+  // occur for stableMs. This catches CSS transitions that add/remove classes.
+  const remainingMs = maxWaitMs - (Date.now() - start);
+  if (remainingMs > stableMs) {
+    try {
+      await page.evaluate(
+        ({ stableMs: stMs, timeoutMs }) => new Promise<void>((resolve) => {
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          const reset = () => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(() => {
+              observer.disconnect();
+              resolve();
+            }, stMs);
+          };
+          const MO = (globalThis as any).MutationObserver;
+          const observer = new MO(() => reset());
+          observer.observe((globalThis as any).document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class', 'style', 'aria-hidden', 'hidden', 'data-state'],
+          });
+          // Safety cap
+          setTimeout(() => {
+            observer.disconnect();
+            if (timer) clearTimeout(timer);
+            resolve();
+          }, timeoutMs);
+          // Start the idle timer immediately
+          reset();
+        }),
+        { stableMs, timeoutMs: Math.min(remainingMs, maxWaitMs) },
+      );
+    } catch {
+      // page.evaluate can fail if page navigated — fall through
+    }
+  }
+
+  return Date.now() - start;
+}
+
+/**
  * V10 Fix #7: Detect how long a dropdown animation takes to complete.
  * Polls for new visible ARIA containers (listbox/menu) or role=option elements.
  * Returns elapsed time + a safety margin so we know how long to wait in each phase.
@@ -766,7 +864,17 @@ async function executeAction(
 
       case 'hover': {
         if (!locator) throw new Error('No selector for hover action');
-        await locator.hover({ timeout });
+        // Scroll element into viewport before hovering (prevents out-of-viewport misses)
+        await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
+        try {
+          await locator.hover({ timeout });
+        } catch {
+          // Retry with force:true if blocked by an overlay (another tooltip, sticky header, etc.)
+          await locator.hover({ timeout, force: true });
+        }
+        // Adaptive post-hover settle — waits for hover-triggered DOM changes to stabilize
+        // (tooltips, submenus, popovers) instead of a fixed delay
+        await waitForHoverEffect(page);
         break;
       }
 
@@ -793,6 +901,8 @@ async function executeAction(
             (globalThis as any).scrollBy(0, dy);
           }, deltaY);
         }
+        // Post-scroll settle — give lazy-loaded content time to appear
+        await sleepMs(page, STEP_READINESS_CONFIG.domStableThresholdMs.assertion);
         break;
       }
 
@@ -805,7 +915,7 @@ async function executeAction(
       case 'navigate': {
         if (!step.value) throw new Error('No URL for navigate action');
         const safeUrl = sanitizeUrl(step.value);
-        await page.goto(safeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(safeUrl, { waitUntil: 'load', timeout: STEP_APPLY_CONFIG.navigateTimeoutMs });
         break;
       }
 
@@ -896,17 +1006,24 @@ async function executeAction(
 
         if (dragData?.from && dragData?.to) {
           // Coordinate-based drag (recorded from mouse events)
-          await page.mouse.move(dragData.from.x, dragData.from.y);
-          await page.mouse.down();
-          // Gradual move for realistic drag behaviour
-          const steps = Math.max(5, Math.round(
-            Math.sqrt(
-              Math.pow(dragData.to.x - dragData.from.x, 2) +
-              Math.pow(dragData.to.y - dragData.from.y, 2)
-            ) / 10
-          ));
-          await page.mouse.move(dragData.to.x, dragData.to.y, { steps });
-          await page.mouse.up();
+          // Wrapped in try/catch: if drag fails mid-way, mouse.up() must still be called
+          // to prevent the mouse staying "stuck" in down state and corrupting subsequent steps
+          try {
+            await page.mouse.move(dragData.from.x, dragData.from.y);
+            await page.mouse.down();
+            // Gradual move for realistic drag behaviour
+            const steps = Math.max(5, Math.round(
+              Math.sqrt(
+                Math.pow(dragData.to.x - dragData.from.x, 2) +
+                Math.pow(dragData.to.y - dragData.from.y, 2)
+              ) / 10
+            ));
+            await page.mouse.move(dragData.to.x, dragData.to.y, { steps });
+            await page.mouse.up();
+          } catch (dragError) {
+            await page.mouse.up().catch(() => {});
+            throw dragError;
+          }
         } else if (step.options?.dropTarget) {
           // Element-based drag: drag source locator to a target selector
           const targetLocator = (getLocatorContext(page, step) as Page | FrameLocator)
@@ -1314,8 +1431,13 @@ export class PreviewStepApplyService {
           // Wait for page to settle
           await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
 
+          // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
+          if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
+            const sess = sessionService.getSession(previewSessionId);
+            if (sess) sess.lastSnapshotEmit = 0;
+          }
+
           // Try to get the node from current session for compiled plan
-          const sessionService = getPreviewSessionService();
           const isOwned = sessionService.isSessionOwned(previewSessionId, userId);
           const session = isOwned ? sessionService.getSession(previewSessionId) : undefined;
           const resolvedNode = session?.pageState?.domNodes?.find(n => n.ref === selectedRef);
@@ -1439,6 +1561,12 @@ export class PreviewStepApplyService {
             if (result.success) {
               // Wait for page to settle
               await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
+
+              // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
+              if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
+                const sess = sessionService.getSession(previewSessionId);
+                if (sess) sess.lastSnapshotEmit = 0;
+              }
 
               // Build resolution meta for compiled success
               const resolutionMeta: ResolutionMeta = {
@@ -1602,6 +1730,12 @@ export class PreviewStepApplyService {
         if (result.success) {
           // Wait for page to settle
           await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
+
+          // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
+          if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
+            const sess = sessionService.getSession(previewSessionId);
+            if (sess) sess.lastSnapshotEmit = 0;
+          }
 
           // V2: Post-action verification for state-aware actions
           let verified = false;

@@ -85,6 +85,10 @@ export interface LiteElement {
   // Label extraction (separate fields for better scoring)
   /** Direct aria-label attribute */
   ariaLabel?: string;
+  /** HTML title attribute (separate from name cascade, useful for icon buttons) */
+  title?: string;
+  /** True if element is an icon-only button/link (contains only SVG/img, no text) */
+  isIconButton?: boolean;
   /** Computed label text (from <label for=>, wrapping <label>, aria-labelledby) */
   labelText?: string;
 

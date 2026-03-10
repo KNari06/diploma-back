@@ -115,7 +115,7 @@ export async function getSavedTestCase(req: AuthenticatedRequest, res: Response)
  */
 export async function listSavedTestCases(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, flowId, limit = '100' } = req.query;
+    const { projectId, flowId, platform, limit = '100' } = req.query;
     const userId = getUserId(req);
 
     if (!projectId || typeof projectId !== 'string') {
@@ -140,6 +140,15 @@ export async function listSavedTestCases(req: AuthenticatedRequest, res: Respons
 
     if (flowId && typeof flowId === 'string') {
       query = query.eq('flow_id', flowId);
+    }
+
+    // Filter by platform: 'web', 'mobile_android', 'mobile_ios', or 'mobile' (both android + ios)
+    if (platform && typeof platform === 'string') {
+      if (platform === 'mobile') {
+        query = query.in('platform', ['mobile_android', 'mobile_ios']);
+      } else {
+        query = query.eq('platform', platform);
+      }
     }
 
     const { data, error } = await query;
@@ -697,6 +706,7 @@ function mapToResponse(row: any): any {
     name: row.name,
     description: row.description || undefined,
     kind: row.kind,
+    platform: row.platform || 'web',
     replayStrategy: row.replay_strategy,
     url: row.url,
     flowId: row.flow_id || undefined,

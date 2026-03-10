@@ -7,7 +7,7 @@ export interface WorkspaceInviteEmailData {
   workspaceName?: string;
   invitedByName?: string;
   recipientEmail: string;
-  role: 'full_access' | 'view';
+  role: 'owner' | 'full_access' | 'view';
   frontendUrl: string;
 }
 

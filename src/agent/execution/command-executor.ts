@@ -7,6 +7,7 @@ import type { IntentPlaywrightCommand } from '@/services/testing/ui/preview/inte
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
+import { COMMAND_EXECUTOR_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Frame, Locator, Page } from 'playwright';
@@ -23,6 +24,87 @@ import {
   matchSubstring,
   parseRegexString,
 } from './url-pattern-matcher';
+
+/**
+ * Adaptive post-hover settle: waits for hover-triggered DOM effects (tooltips, menus, popovers)
+ * to appear and stabilize, instead of using a fixed timeout.
+ *
+ * Phase 1: Quick-poll for known hover-effect selectors (ARIA roles + popular component libraries).
+ * Phase 2: MutationObserver-based idle detection — waits until DOM stops mutating for `stableMs`.
+ * Safety cap: never waits longer than `maxWaitMs` total.
+ */
+async function waitForHoverEffect(
+  page: Page,
+  maxWaitMs = 2000,
+  stableMs = 150,
+): Promise<number> {
+  const start = Date.now();
+
+  const hoverEffectSelector = [
+    '[role="tooltip"]:visible',
+    '[role="menu"]:visible',
+    '[role="listbox"]:visible',
+    '[role="dialog"]:visible',
+    '[data-radix-popper-content-wrapper]:visible',
+    '[class*="tooltip"]:visible',
+    '[class*="popover"]:visible',
+    '[class*="dropdown"]:visible',
+    '.tippy-box:visible',
+    '.MuiTooltip-tooltip:visible',
+    '.MuiMenu-list:visible',
+    '.ant-tooltip:visible',
+    '.ant-dropdown:visible',
+  ].join(', ');
+
+  // Phase 1: Quick check — did hover produce any visible effect?
+  const minWaitMs = STEP_READINESS_CONFIG.domStableThresholdMs.assertion; // 150ms
+  try {
+    await Promise.race([
+      page.waitForSelector(hoverEffectSelector, { state: 'visible', timeout: maxWaitMs }),
+      page.waitForTimeout(minWaitMs),
+    ]);
+  } catch {
+    return Date.now() - start;
+  }
+
+  // Phase 2: MutationObserver-based idle detection
+  const remainingMs = maxWaitMs - (Date.now() - start);
+  if (remainingMs > stableMs) {
+    try {
+      await page.evaluate(
+        ({ stableMs: stMs, timeoutMs }) => new Promise<void>((resolve) => {
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          const reset = () => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(() => {
+              observer.disconnect();
+              resolve();
+            }, stMs);
+          };
+          const MO = (globalThis as any).MutationObserver;
+          const observer = new MO(() => reset());
+          observer.observe((globalThis as any).document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class', 'style', 'aria-hidden', 'hidden', 'data-state'],
+          });
+          setTimeout(() => {
+            observer.disconnect();
+            if (timer) clearTimeout(timer);
+            resolve();
+          }, timeoutMs);
+          reset();
+        }),
+        { stableMs, timeoutMs: Math.min(remainingMs, maxWaitMs) },
+      );
+    } catch {
+      // page.evaluate can fail if page navigated
+    }
+  }
+
+  return Date.now() - start;
+}
 
 /**
  * V11: Accumulated state shared across retry attempts within a single step.
@@ -62,9 +144,10 @@ export class CommandExecutor {
   private isAborted: boolean = false;
   private costManager?: AICostManager;
   private externalAbortHandler?: () => void; // ✅ FIX 1: Store handler for cleanup
-  private selfHealingConfidenceThreshold: number = 0.85; // ✅ FIX 7: Configurable threshold
-  private maxHealAttempts: number = 1; // ✅ V2: Limit self-heal attempts to expose flakiness
+  private selfHealingConfidenceThreshold: number = COMMAND_EXECUTOR_CONFIG.selfHealingConfidenceThreshold;
+  private maxHealAttempts: number = COMMAND_EXECUTOR_CONFIG.maxHealAttempts;
   private skipCompiledPlan: boolean = false; // Skip Stage 1 on retry attempts
+  private maxDomNodes?: number; // Configurable DOM node limit (saves memory in replay mode)
   /** Runtime metadata for each step (keyed by stepId) */
   private stepRuntimeMeta: Map<string, StepRuntimeMeta> = new Map();
   /** V10: Current command index in executeCommands loop (for next-step lookahead) */
@@ -81,14 +164,16 @@ export class CommandExecutor {
       costManager?: AICostManager;
       selfHealingConfidenceThreshold?: number; // ✅ NEW: Configurable confidence
       skipCompiledPlan?: boolean; // Skip compiled locator plan (Stage 1) — used on retry attempts
+      maxDomNodes?: number; // Limit DOM nodes collected (saves memory in replay mode)
     } = {}
   ) {
     this.page = page;
     this.selfHealingEnabled = options.selfHealingEnabled ?? true;
     this.metadata = options.metadata || { url: '' };
     this.costManager = options.costManager;
-    this.selfHealingConfidenceThreshold = options.selfHealingConfidenceThreshold ?? 0.85;
+    this.selfHealingConfidenceThreshold = options.selfHealingConfidenceThreshold ?? COMMAND_EXECUTOR_CONFIG.selfHealingConfidenceThreshold;
     this.skipCompiledPlan = options.skipCompiledPlan ?? false;
+    this.maxDomNodes = options.maxDomNodes;
 
     this.abortController = new AbortController();
 
@@ -278,7 +363,7 @@ export class CommandExecutor {
               try {
                 await this.page.waitForURL(
                   (url) => url.toString() !== urlBeforeClick,
-                  { timeout: 15000, waitUntil: 'load' }
+                  { timeout: COMMAND_EXECUTOR_CONFIG.clickNavigationTimeoutMs, waitUntil: 'load' }
                 );
                 logger.debug('[COMMAND_EXECUTOR] Navigation after click detected', {
                   from: urlBeforeClick,
@@ -292,10 +377,10 @@ export class CommandExecutor {
                   const newPage = allPages[allPages.length - 1];
                   // Wait for new page to be ready
                   try {
-                    await newPage.waitForLoadState('load', { timeout: 10000 });
+                    await newPage.waitForLoadState('load', { timeout: COMMAND_EXECUTOR_CONFIG.newPageLoadTimeoutMs });
                   } catch {
                     // Fallback: at least wait for domcontentloaded
-                    await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+                    await newPage.waitForLoadState('domcontentloaded', { timeout: COMMAND_EXECUTOR_CONFIG.newPageFallbackTimeoutMs }).catch(() => {});
                   }
                   const newUrl = newPage.url();
                   logger.info('[COMMAND_EXECUTOR] Click opened new tab, switching page', {
@@ -713,6 +798,8 @@ export class CommandExecutor {
               intentCommand, 'hover', timeout || 30000
             );
             await performHover(intentHoverLocator);
+            // Adaptive post-hover settle — wait for tooltips/submenus to appear and stabilize
+            await waitForHoverEffect(this.page);
             break;
           }
 
@@ -742,6 +829,8 @@ export class CommandExecutor {
               { selector, intent: description || 'hover element', action: 'hover', timeout }
             );
           }
+          // Adaptive post-hover settle — wait for tooltips/submenus to appear and stabilize
+          await waitForHoverEffect(this.page);
           break;
         }
 
@@ -2620,7 +2709,7 @@ export class CommandExecutor {
           (Date.now() - retryCtx.lastDomCollectionTs > 1500);
 
         const domNodes = shouldCollectFresh
-          ? await collectInteractiveNodes(this.page)
+          ? await collectInteractiveNodes(this.page, this.maxDomNodes)
           : retryCtx.cachedDomNodes!;
 
         if (shouldCollectFresh) {

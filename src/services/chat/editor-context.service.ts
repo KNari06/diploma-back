@@ -2,6 +2,7 @@ import { getPreviewSessionService, getPreviewDevToolsRegistry } from '@/services
 import type { InteractiveNode } from '@/services/testing/ui/preview/preview.types';
 import type { PreviewConsoleEntry, PreviewNetworkItem } from '@/websocket/types/types';
 import { logger } from '@/utils/core/logger';
+import { PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 
 /**
  * Editor Context Service
@@ -128,10 +129,10 @@ export function compressDomForChat(nodes: InteractiveNode[]): string {
   // Filter to visible, interactive nodes only
   const visible = nodes.filter(n => n.isVisible !== false && !n.isDisabled);
 
-  // Sort by viewport priority: elements within viewport (y < 720) first, then off-viewport
+  // Sort by viewport priority: elements within viewport first, then off-viewport
   const sorted = [...visible].sort((a, b) => {
-    const aInViewport = (a.boundingBox?.y ?? Infinity) < 720 ? 0 : 1;
-    const bInViewport = (b.boundingBox?.y ?? Infinity) < 720 ? 0 : 1;
+    const aInViewport = (a.boundingBox?.y ?? Infinity) < PREVIEW_SESSION_CONFIG.viewport.height ? 0 : 1;
+    const bInViewport = (b.boundingBox?.y ?? Infinity) < PREVIEW_SESSION_CONFIG.viewport.height ? 0 : 1;
     return aInViewport - bInViewport;
   });
 

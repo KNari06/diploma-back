@@ -419,6 +419,12 @@ export async function parseIntent(
         logger.warn('[CHAT] platform_test blocked in editor mode, redirecting to general_chat', { userId });
         parsedIntent.intent = 'general_chat';
       }
+
+      // Hard guard: mobile_test is only valid in editor mode (not from chat)
+      if (mode !== 'editor' && parsedIntent.intent === 'mobile_test') {
+        logger.warn('[CHAT] mobile_test blocked outside editor mode, redirecting to general_chat', { userId });
+        parsedIntent.intent = 'general_chat';
+      }
     } catch (intentError) {
       logger.error('[CHAT] parseUserIntent failed', {
         error: intentError instanceof Error ? intentError.message : String(intentError),
@@ -538,6 +544,9 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
 
     case 'add_to_plan':
       return 'Got it! Updating regression plan...';
+
+    case 'mobile_test':
+      return 'Got it! Starting mobile test...';
 
     default:
       return 'Intent understood!';

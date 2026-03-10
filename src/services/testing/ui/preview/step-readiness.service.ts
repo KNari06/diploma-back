@@ -18,6 +18,7 @@
 import { logger } from '@/utils/core/logger';
 import type { Locator, Page } from 'playwright';
 import type { IntentActionType, IntentStep } from './preview.types';
+import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -112,30 +113,10 @@ const NEEDS_ATTACHED_ONLY: Set<IntentActionType> = new Set([
   'press',
 ]);
 
-/**
- * Dynamic DOM-stability thresholds per action risk profile (ms).
- * Higher values after actions that likely cause significant re-renders.
- */
-const DOM_STABLE_THRESHOLD_MS: Record<'navigation' | 'input' | 'assertion' | 'default', number> = {
-  navigation: 500, // after click/open/close/toggle that may trigger route change
-  input:      300, // after type/select — form re-renders are lighter
-  assertion:  150, // after assert/hover — almost no side effects
-  default:    300,
-};
-
-/** Blind settle duration when no locator is available (ms). Avoids complete skip. */
-const BLIND_SETTLE_MS = 800;
-
-/** Max time to wait for SPA URL change after a navigation-trigger action (ms) */
-const SPA_NAV_DETECT_MS = 1500;
-
-/** Default configuration values */
-const DEFAULTS = {
-  maxWaitMs: 10000,
-  settleMs: 3000,
-  autoWaitThresholdMs: 2000,
-  maxRetries: 3,
-};
+const DOM_STABLE_THRESHOLD_MS = STEP_READINESS_CONFIG.domStableThresholdMs;
+const BLIND_SETTLE_MS = STEP_READINESS_CONFIG.blindSettleMs;
+const SPA_NAV_DETECT_MS = STEP_READINESS_CONFIG.spaNavDetectMs;
+const DEFAULTS = STEP_READINESS_CONFIG.defaults;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DOM STABILITY THRESHOLD — DYNAMIC

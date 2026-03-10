@@ -4,6 +4,7 @@ import {
   WorkspaceRole,
 } from '@/services/core/workspace-access.service';
 import { WorkspaceMembersService } from '@/services/core/workspace-members.service';
+import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -379,7 +380,8 @@ export const createInvite = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    if (!email || typeof email !== 'string' || !email.includes('@')) {
+    const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!email || typeof email !== 'string' || !EMAIL_REGEX.test(email.trim())) {
       res.status(400).json({
         success: false,
         error: 'Invalid email address',
@@ -568,6 +570,7 @@ export const resendInvite = async (req: Request, res: Response): Promise<void> =
 
     const result = await WorkspaceMembersService.resendInvite(
       inviteId,
+      workspaceId,
       userId,
       getAuditContext(req)
     );
@@ -652,6 +655,7 @@ export const revokeInvite = async (req: Request, res: Response): Promise<void> =
 
     const result = await WorkspaceMembersService.revokeInvite(
       inviteId,
+      workspaceId,
       userId,
       getAuditContext(req)
     );
@@ -677,6 +681,99 @@ export const revokeInvite = async (req: Request, res: Response): Promise<void> =
       error: 'Failed to revoke invite',
       timestamp: new Date().toISOString(),
     });
+  }
+};
+
+/**
+ * GET /api/v1/invites/info?token=<inviteId>
+ * Get invite details for the accept/decline page (no auth required)
+ */
+export const getInviteInfo = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const token = req.query.token as string;
+
+    if (!token || !UUID_REGEX.test(token)) {
+      res.status(400).json({ success: false, error: 'Invalid invite token', timestamp: new Date().toISOString() });
+      return;
+    }
+
+    const invite = await WorkspaceMembersService.getInvite(token);
+    if (!invite) {
+      res.status(404).json({ success: false, error: 'Invite not found', timestamp: new Date().toISOString() });
+      return;
+    }
+
+    if (invite.status === 'revoked') {
+      res.status(400).json({ success: false, error: 'This invite has been revoked', timestamp: new Date().toISOString() });
+      return;
+    }
+    if (invite.status === 'accepted') {
+      res.status(400).json({ success: false, error: 'This invite has already been accepted', timestamp: new Date().toISOString() });
+      return;
+    }
+    if (invite.status === 'expired' || new Date(invite.expires_at) < new Date()) {
+      res.status(400).json({ success: false, error: 'This invite has expired', timestamp: new Date().toISOString() });
+      return;
+    }
+
+    const [{ data: workspace }, { data: inviter }] = await Promise.all([
+      supabaseAdmin.from('workspaces').select('project_name').eq('id', invite.workspace_id).single(),
+      supabaseAdmin.from('users').select('name, email').eq('id', invite.invited_by_user_id).single(),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        workspace_name: workspace?.project_name || null,
+        inviter_name: inviter?.name || inviter?.email || null,
+        role: invite.role,
+        email: invite.email,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error getting invite info', { error });
+    res.status(500).json({ success: false, error: 'Failed to get invite info', timestamp: new Date().toISOString() });
+  }
+};
+
+/**
+ * POST /api/v1/invites/:inviteId/decline
+ * Decline an invite (authenticated user)
+ */
+export const declineInvite = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const inviteId = req.params.inviteId;
+
+    if (!inviteId || !UUID_REGEX.test(inviteId)) {
+      res.status(400).json({ success: false, error: 'Invalid invite ID', timestamp: new Date().toISOString() });
+      return;
+    }
+
+    const invite = await WorkspaceMembersService.getInvite(inviteId);
+    if (!invite) {
+      res.status(404).json({ success: false, error: 'Invite not found', timestamp: new Date().toISOString() });
+      return;
+    }
+
+    if (invite.status !== 'invited') {
+      res.status(400).json({
+        success: false,
+        error: 'Invite cannot be declined (already accepted, revoked, or expired)',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    await supabaseAdmin
+      .from('workspace_invites')
+      .update({ status: 'revoked', updated_at: new Date().toISOString() })
+      .eq('id', inviteId);
+
+    res.json({ success: true, message: 'Invite declined', timestamp: new Date().toISOString() });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error declining invite', { error });
+    res.status(500).json({ success: false, error: 'Failed to decline invite', timestamp: new Date().toISOString() });
   }
 };
 

@@ -14,6 +14,7 @@ import { handleRunRegressionIntent } from '../regression/run-regression.handler'
 import { handleSaveTestIntent } from '../regression/save-test.handler';
 import { handleTestRecommendationsIntent } from '../regression/test-recommendations.handler';
 import { handleEditorAction } from '../editor_action/handler';
+import { handleMobileTest as handleMobileTestOriginal } from '../mobile_test/handler';
 import { handleClarificationRequest as handleClarificationOriginal } from './clarification';
 
 /**
@@ -130,6 +131,24 @@ const handleClarificationRequest: IntentHandler = async (req, res, params) => {
 };
 
 /**
+ * Wrapper for mobile_test handler
+ * Adapts original handler signature to IntentHandler type
+ */
+const handleMobileTest: IntentHandler = async (req, res, params) => {
+  return handleMobileTestOriginal(req, res, {
+    message: params.message,
+    parsedIntent: params.parsedIntent,
+    userId: params.userId,
+    workspace_id: params.workspace_id,
+    chatSessionId: params.chatSessionId,
+    conversationId: params.conversationId,
+    answers: params.answers,
+    abortSignal: params.abortSignal,
+    mode: params.mode,
+  });
+};
+
+/**
  * Registry of all available intent handlers
  * Single source of truth for intent routing
  */
@@ -158,6 +177,9 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
 
   // Editor mode intent
   editor_action: handleEditorAction,
+
+  // Mobile testing intent
+  mobile_test: handleMobileTest,
 };
 
 /**
@@ -216,5 +238,6 @@ export function getIntentDescriptions(): Record<string, string> {
     test_recommendations: 'User wants suggestions on what to test next',
     coverage_analysis: 'User wants to see test coverage gaps and what\'s not tested',
     editor_action: 'User wants to perform a direct action on the live page in editor mode',
+    mobile_test: 'User wants to run a mobile (Android/iOS) test on recorded steps',
   };
 }

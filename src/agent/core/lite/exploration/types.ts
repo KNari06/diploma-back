@@ -455,6 +455,13 @@ export function toIntentSteps(steps: DiscoveredStep[]): IntentStep[] {
       intentStep.assertionText = step.expectedOutcome;
     }
 
+    // Propagate expectedOutcome — DiscoveredStep stores a string description,
+    // but IntentStep uses 'success' | 'error' enum. Only set 'error' if the
+    // exploration agent explicitly marked the step with that exact value.
+    if (step.expectedOutcome === 'error') {
+      intentStep.expectedOutcome = 'error';
+    }
+
     // Add binding hints from step metadata
     if (step.ref || step.selector) {
       intentStep.bindingHints = {

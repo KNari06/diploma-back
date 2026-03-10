@@ -14,6 +14,7 @@ import { logger } from '@/utils/core/logger';
 import { CDPSession, Page } from 'playwright';
 import type { Namespace } from 'socket.io';
 import type { PreviewVideoFramePayload } from '@/websocket/types/types';
+import { PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 
 // ============================================================================
 // CONFIGURATION
@@ -22,9 +23,9 @@ import type { PreviewVideoFramePayload } from '@/websocket/types/types';
 const PREVIEW_VIDEO_CONFIG = {
   // CDP Screencast settings
   fps: 10,
-  maxWidth: 1280,
-  maxHeight: 720,
-  quality: 60,
+  maxWidth: PREVIEW_SESSION_CONFIG.viewport.width,
+  maxHeight: PREVIEW_SESSION_CONFIG.viewport.height,
+  quality: PREVIEW_SESSION_CONFIG.screenshot.quality,
   format: 'jpeg' as const,
 
   // Throttle settings (target ~10 fps = 100ms between frames)

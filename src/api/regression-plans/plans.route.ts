@@ -100,6 +100,10 @@ const router = Router();
  *                       branch:
  *                         type: string
  *                         description: Branch to trigger on (e.g. main, develop)
+ *                       provider:
+ *                         type: string
+ *                         enum: [github, gitlab]
+ *                         description: Git provider (recommended with repositoryUrl for correct matching).
  *                       integrationId:
  *                         type: string
  *                         format: uuid

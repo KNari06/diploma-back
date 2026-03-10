@@ -21,6 +21,7 @@
  */
 
 import { logger } from '@/utils/core/logger';
+import { REPLAY_TRACE_CONFIG } from '@/config/testing/playwright-tuning';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -51,25 +52,11 @@ export interface ReplayTraceWriterConfig {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
-const DEFAULT_MAX_PAYLOAD_CHARS = 50_000;
-const DEFAULT_LOGS_DIR = path.join(process.cwd(), 'test_logs', 'replay');
-
-const SENSITIVE_PATTERNS = [
-  /password/i,
-  /token/i,
-  /secret/i,
-  /authorization/i,
-  /cookie/i,
-  /api[_-]?key/i,
-  /auth/i,
-  /bearer/i,
-  /session/i,
-  /credentials?/i,
-];
-
-/** Summary events that are always written even when file size limit is reached */
-const SUMMARY_EVENTS = new Set(['run_start', 'run_end', 'step_failed']);
+const DEFAULT_MAX_FILE_SIZE = REPLAY_TRACE_CONFIG.maxFileSizeBytes;
+const DEFAULT_MAX_PAYLOAD_CHARS = REPLAY_TRACE_CONFIG.maxPayloadChars;
+const DEFAULT_LOGS_DIR = REPLAY_TRACE_CONFIG.logsDir;
+const SENSITIVE_PATTERNS = REPLAY_TRACE_CONFIG.sensitivePatterns;
+const SUMMARY_EVENTS: Set<string> = new Set(REPLAY_TRACE_CONFIG.summaryEvents);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // REPLAY TRACE WRITER

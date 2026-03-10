@@ -292,12 +292,21 @@ export class WorkspaceMembersService {
         );
 
         // Rollback: restore current owner to 'owner'
-        await supabaseAdmin
+        const { error: rollbackError } = await supabaseAdmin
           .from('workspace_members')
           .update({ role: 'owner', updated_at: new Date().toISOString() })
           .eq('workspace_id', workspaceId)
           .eq('user_id', currentOwnerUserId)
           .eq('status', 'active');
+
+        if (rollbackError) {
+          // CRITICAL: workspace is now ownerless. Log as critical for immediate alerting.
+          logger.error('[WORKSPACE_MEMBERS] CRITICAL: Rollback failed - workspace has no owner!', {
+            workspaceId,
+            currentOwnerUserId,
+            rollbackError: rollbackError.message,
+          });
+        }
 
         return { success: false, error: 'Failed to transfer ownership' };
       }
@@ -549,11 +558,13 @@ export class WorkspaceMembersService {
    */
   static async getInvites(workspaceId: string): Promise<WorkspaceInvite[]> {
     try {
+      const now = new Date().toISOString();
       const { data, error } = await supabaseAdmin
         .from('workspace_invites')
         .select('*')
         .eq('workspace_id', workspaceId)
         .eq('status', 'invited') // Only return pending invites
+        .gt('expires_at', now) // Exclude expired invites
         .order('created_at', { ascending: false });
 
       if (error) {
@@ -608,6 +619,7 @@ export class WorkspaceMembersService {
    */
   static async revokeInvite(
     inviteId: string,
+    workspaceId: string,
     actorUserId: string,
     auditContext?: { ipAddress?: string; userAgent?: string }
   ): Promise<{ success: boolean; error?: string }> {
@@ -615,6 +627,11 @@ export class WorkspaceMembersService {
       // Get invite
       const invite = await this.getInvite(inviteId);
       if (!invite) {
+        return { success: false, error: 'Invite not found' };
+      }
+
+      // Ensure invite belongs to the specified workspace (prevent IDOR)
+      if (invite.workspace_id !== workspaceId) {
         return { success: false, error: 'Invite not found' };
       }
 
@@ -665,6 +682,7 @@ export class WorkspaceMembersService {
    */
   static async resendInvite(
     inviteId: string,
+    workspaceId: string,
     actorUserId: string,
     auditContext?: { ipAddress?: string; userAgent?: string }
   ): Promise<{ success: boolean; error?: string; emailSent?: boolean }> {
@@ -672,6 +690,11 @@ export class WorkspaceMembersService {
       // Get invite
       const invite = await this.getInvite(inviteId);
       if (!invite) {
+        return { success: false, error: 'Invite not found' };
+      }
+
+      // Ensure invite belongs to the specified workspace (prevent IDOR)
+      if (invite.workspace_id !== workspaceId) {
         return { success: false, error: 'Invite not found' };
       }
 
@@ -699,7 +722,7 @@ export class WorkspaceMembersService {
         return { success: false, error: 'Failed to resend invite' };
       }
 
-      // Resend Supabase auth invite
+      // Resend email - branch on whether the user already exists (same logic as createInvite)
       let emailResent = false;
       try {
         const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
@@ -711,26 +734,66 @@ export class WorkspaceMembersService {
           inviteId,
         });
 
-        const { data: authInvite, error: authError } = await supabaseAdmin.auth.admin.inviteUserByEmail(
-          invite.email,
-          { redirectTo }
-        );
+        // Check if user already exists in our system
+        const { data: existingUser } = await supabaseAdmin
+          .from('users')
+          .select('id')
+          .eq('email', invite.email)
+          .maybeSingle();
 
-        if (authError) {
-          logger.error('[WORKSPACE_MEMBERS] Supabase auth resend failed', {
-            error: authError.message,
-            errorCode: authError.code,
-            email: invite.email,
+        if (existingUser) {
+          // Existing user: send custom email (Supabase won't re-invite confirmed users)
+          const { data: workspace } = await supabaseAdmin
+            .from('workspaces')
+            .select('project_name')
+            .eq('id', invite.workspace_id)
+            .single();
+
+          const emailResult = await EmailService.sendWorkspaceInvite({
+            inviteId: invite.id,
+            workspaceId: invite.workspace_id,
+            workspaceName: workspace?.project_name,
+            recipientEmail: invite.email,
+            role: invite.role,
+            frontendUrl,
           });
+
+          emailResent = emailResult.success;
+
+          if (!emailResent) {
+            logger.warn('[WORKSPACE_MEMBERS] Custom email resend failed for existing user', {
+              email: invite.email,
+              error: emailResult.error,
+            });
+          } else {
+            logger.info('[WORKSPACE_MEMBERS] Invite email resent successfully (existing user)', {
+              email: invite.email,
+              inviteId,
+            });
+          }
         } else {
-          emailResent = true;
-          logger.info('[WORKSPACE_MEMBERS] Invite email resent successfully', {
-            email: invite.email,
-            inviteId,
-          });
+          // New user: use Supabase auth invite
+          const { data: authInvite, error: authError } = await supabaseAdmin.auth.admin.inviteUserByEmail(
+            invite.email,
+            { redirectTo }
+          );
+
+          if (authError) {
+            logger.error('[WORKSPACE_MEMBERS] Supabase auth resend failed', {
+              error: authError.message,
+              errorCode: authError.code,
+              email: invite.email,
+            });
+          } else if (authInvite?.user?.id) {
+            emailResent = true;
+            logger.info('[WORKSPACE_MEMBERS] Invite email resent successfully (new user)', {
+              email: invite.email,
+              inviteId,
+            });
+          }
         }
       } catch (authError) {
-        logger.error('[WORKSPACE_MEMBERS] Exception resending Supabase auth invite', {
+        logger.error('[WORKSPACE_MEMBERS] Exception resending invite email', {
           error: authError instanceof Error ? authError.message : String(authError),
           stack: authError instanceof Error ? authError.stack : undefined,
           email: invite.email,
@@ -834,16 +897,20 @@ export class WorkspaceMembersService {
         return { success: true, membership: existingMembership };
       }
 
-      // Create membership
+      // Create or reactivate membership (UPSERT handles re-invite after removal)
       const { data: membership, error: memberError } = await supabaseAdmin
         .from('workspace_members')
-        .insert({
-          workspace_id: invite.workspace_id,
-          user_id: userId,
-          role: invite.role,
-          status: 'active',
-          invited_by_user_id: invite.invited_by_user_id,
-        })
+        .upsert(
+          {
+            workspace_id: invite.workspace_id,
+            user_id: userId,
+            role: invite.role,
+            status: 'active',
+            invited_by_user_id: invite.invited_by_user_id,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'workspace_id,user_id' }
+        )
         .select()
         .single();
 

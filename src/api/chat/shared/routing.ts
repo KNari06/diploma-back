@@ -120,6 +120,8 @@ function getRoutingMessage(intent: string): string {
       return 'Preparing regression plan...';
     case 'editor_action':
       return 'Executing action...';
+    case 'mobile_test':
+      return 'Preparing mobile emulator...';
     default:
       return 'Processing your request...';
   }

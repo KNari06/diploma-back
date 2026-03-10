@@ -95,24 +95,22 @@ export class FullTestDataService {
       }))
       .filter(s => s.url !== null);
 
-    // 7. Collect videos
-    const videos = [
-      ...(results as any[]).filter(r => r.video_url || r.videoUrl).map(r => ({
-        browser: r.browser,
-        url: r.video_url || r.videoUrl,
-        video_url: r.video_url || r.videoUrl,
-        status: r.status,
-        completed_at: r.completedAt ?? r.completed_at,
-      })),
-      ...(traceFiles || []).filter(tf => tf.public_url && tf.file_name?.endsWith('.webm')).map(tf => ({
-        browser: tf.browser,
-        url: tf.public_url,
-        video_url: tf.public_url,
-        file_name: tf.file_name,
-        file_size: tf.file_size,
-        created_at: tf.created_at,
-      })),
-    ];
+    // 7. Collect videos (deduplicated — prefer test_results, fall back to trace_files)
+    const seenVideoUrls = new Set<string>();
+    const videos: Array<Record<string, unknown>> = [];
+    for (const r of results as any[]) {
+      const url = r.video_url || r.videoUrl;
+      if (url && !seenVideoUrls.has(url)) {
+        seenVideoUrls.add(url);
+        videos.push({ browser: r.browser, url, status: r.status, completed_at: r.completedAt ?? r.completed_at });
+      }
+    }
+    for (const tf of (traceFiles || []).filter((t: any) => t.public_url && t.file_name?.endsWith('.webm'))) {
+      if (!seenVideoUrls.has(tf.public_url)) {
+        seenVideoUrls.add(tf.public_url);
+        videos.push({ browser: tf.browser, url: tf.public_url, file_name: tf.file_name, file_size: tf.file_size, created_at: tf.created_at });
+      }
+    }
 
     // 8. Collect logs
     const allLogs = results
@@ -150,6 +148,14 @@ export class FullTestDataService {
     const executedSteps = (isRunning && (!rawExecutedSteps || (Array.isArray(rawExecutedSteps) && rawExecutedSteps.length === 0)))
       ? await TestExecutedStepsRedisService.getLive(testId)
       : rawExecutedSteps;
+
+    // Strip cost/token fields from intelligent session before returning
+    if (intelligentSession?.session) {
+      delete intelligentSession.session.cost_usd;
+      delete intelligentSession.session.tokens_used;
+      delete intelligentSession.session.total_cost_usd;
+      delete intelligentSession.session.total_tokens;
+    }
 
     return {
       test: {

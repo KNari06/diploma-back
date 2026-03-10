@@ -45,7 +45,7 @@ export async function getChatCompletionWithMessages(
     temperature?: number;
     max_tokens?: number;
     response_format?: { type: 'json_object' };
-    model?: string; // Allow custom model (e.g., gpt-3.5-turbo)
+    model?: string;
     abortSignal?: AbortSignal;
     tools?: ChatCompletionTool[];
     tool_choice?: 'auto' | 'none' | 'required';

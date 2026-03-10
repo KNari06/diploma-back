@@ -28,8 +28,9 @@ export class IntentTestCaseService {
     flowId?: string;
     status?: 'draft' | 'published' | 'archived';
     kind?: 'standalone' | 'regression_member';
+    platform?: 'web' | 'mobile_android' | 'mobile_ios';
   }): Promise<IntentTestCase> {
-    const { projectId, userId, name, description, startUrl, steps, flowId, status = 'draft', kind = 'standalone' } = params;
+    const { projectId, userId, name, description, startUrl, steps, flowId, status = 'draft', kind = 'standalone', platform = 'web' } = params;
 
     logger.info('[INTENT_TEST_CASE] Creating test case', {
       projectId,
@@ -53,6 +54,7 @@ export class IntentTestCaseService {
         flow_id: flowId || null,
         status,
         kind,
+        platform,
       })
       .select('*')
       .single();
@@ -364,6 +366,7 @@ export class IntentTestCaseService {
       // Lifecycle
       status: row.status || 'draft',
       kind: row.kind || 'standalone',
+      platform: row.platform || 'web',
 
       // Replay data
       replayStrategy: row.replay_strategy || undefined,

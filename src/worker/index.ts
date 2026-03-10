@@ -6,6 +6,7 @@ import { GitWebhookJobHandler } from '@/jobs/git-webhook.job';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
 import { ExplorationRunJobHandler } from '@/jobs/exploration-run.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
+import { MobileTestRunJobHandler } from '@/jobs/mobile-test-run.job';
 import { logger } from '@/utils/core/logger';
 import { Worker } from 'bullmq';
 import { queueMonitor } from './queue-monitor';
@@ -266,6 +267,57 @@ const explorationWorker = new Worker(
   }
 );
 
+// Mobile test run worker
+const mobileTestRunWorker = new Worker(
+  QUEUE_NAMES.MOBILE_TEST_RUN,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    const startTime = Date.now();
+    logger.info(`[MOBILE_TEST_WORKER] Processing job: ${job.id}`, {
+      testId: job.data?.testId,
+      platform: job.data?.platform,
+      browser: job.data?.browser,
+    });
+
+    try {
+      if (!MobileTestRunJobHandler || typeof MobileTestRunJobHandler.process !== 'function') {
+        throw new Error('MobileTestRunJobHandler.process is not a function');
+      }
+
+      await MobileTestRunJobHandler.process(job);
+      const duration = Date.now() - startTime;
+
+      logger.info(`[MOBILE_TEST_WORKER] Job completed: ${job.id}`, {
+        testId: job.data?.testId,
+        duration: `${duration}ms`,
+      });
+    } catch (error) {
+      const duration = Date.now() - startTime;
+
+      logger.error(`[MOBILE_TEST_WORKER] Job failed: ${job.id}`, {
+        testId: job.data?.testId,
+        duration: `${duration}ms`,
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack,
+        } : String(error),
+      });
+      throw error;
+    }
+  },
+  {
+    ...workerOptions,
+    concurrency: 2, // Mobile tests — limited by emulator/device count
+    lockDuration: 10 * 60 * 1000, // 10 min — mobile tests can be slow
+    stalledInterval: 3 * 60 * 1000, // 3 min
+    maxStalledCount: 1,
+  }
+);
+
 // Worker event listeners
 const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('ready', () => {
@@ -387,6 +439,7 @@ setupWorkerEvents(notificationWorker, 'Notification');
 setupWorkerEvents(webhookWorker, 'Webhook');
 setupWorkerEvents(gitWebhookWorker, 'GitWebhook');
 setupWorkerEvents(explorationWorker, 'Exploration');
+setupWorkerEvents(mobileTestRunWorker, 'MobileTestRun');
 
 // Graceful shutdown
 let isShuttingDown = false;
@@ -420,6 +473,7 @@ const gracefulShutdown = async (signal: string) => {
       webhookWorker.close(),
       gitWebhookWorker.close(),
       explorationWorker.close(),
+      mobileTestRunWorker.close(),
       // Abort all active test runs (closes contexts, stops video streams)
       (async () => {
         try {
@@ -528,6 +582,7 @@ export {
   aiAnalysisWorker,
   explorationWorker,
   gitWebhookWorker,
+  mobileTestRunWorker,
   notificationWorker,
   testResultWorker,
   testRunWorker,

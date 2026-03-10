@@ -69,7 +69,7 @@ export interface TestOptions {
   mode?: 'lite' | 'pro'; // Persisted execution mode (used by retry logic)
 }
 
-export type BrowserType = 'chrome' | 'firefox' | 'safari' | 'edge' | 'mobile-chrome' | 'mobile-safari';
+export type BrowserType = 'chrome' | 'firefox' | 'safari' | 'edge' | 'mobile-chrome' | 'mobile-safari' | 'mobile-android' | 'mobile-ios';
 
 export interface TestResult {
   id: string;
@@ -301,6 +301,10 @@ export interface ProjectCreateRequest {
     common_elements?: Record<string, string>;
     common_scope?: string;
     defaultBrowsers?: BrowserType[];
+    /** Mobile app metadata (APK/IPA) — set via mobile upload API */
+    mobileApp?: Record<string, unknown> | null;
+    /** CI/CD API key metadata — set via CI key management API */
+    ciApiKey?: { hash: string; prefix: string; createdAt: string } | null;
   };
 }
 
@@ -371,8 +375,10 @@ export interface PaginatedResponse<T> extends ApiResponse<T[]> {
   pagination: {
     page: number;
     limit: number;
+    offset?: number;
     total: number;
     totalPages: number;
+    has_more?: boolean;
   };
 }
 

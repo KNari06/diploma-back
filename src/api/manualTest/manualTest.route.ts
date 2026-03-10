@@ -54,9 +54,16 @@ const testResultSchema = z.object({
 });
 
 const paginationSchema = z.object({
-  page: z.string().transform(Number).refine(n => n > 0, 'Page must be positive').optional().default('1'),
+  page: z.string().transform(Number).refine(n => n > 0, 'Page must be positive').optional(),
+  offset: z.string().transform(Number).optional(),
   limit: z.string().transform(Number).refine(n => n > 0 && n <= 100, 'Limit must be between 1 and 100').optional().default('20'),
   runId: z.string().uuid().optional(),
+}).transform(val => {
+  // Frontend sends offset, backend uses page internally.
+  // Derive page from offset when page is not explicitly provided.
+  const limit = val.limit;
+  const page = val.page ?? (val.offset != null ? Math.floor(val.offset / limit) + 1 : 1);
+  return { page, limit, runId: val.runId };
 });
 
 /**
@@ -473,16 +480,12 @@ router.get('/:id/result', requireAuth, asyncHandler(async (req: Request, res: Re
       userId
     );
 
-    // Update results with converted URLs and ensure video/trace URLs are available
-    // ✅ FIX: Map snake_case (DB) to camelCase (TypeScript) for consistency
+    // Update results with converted URLs and normalize field naming
     result.data = rawResults.map(r => ({
       ...r,
       screenshot: screenshotUrlMap.get(r.id) || undefined,
-      // ✅ NEW: Ensure video_url and trace_url are available (from DB snake_case)
-      videoUrl: r.video_url || r.videoUrl, // Support both formats
-      traceUrl: r.trace_url || r.traceUrl, // Support both formats
-      video_url: r.video_url || r.videoUrl, // Keep snake_case for API consistency
-      trace_url: r.trace_url || r.traceUrl, // Keep snake_case for API consistency
+      video_url: r.video_url || r.videoUrl || undefined,
+      trace_url: r.trace_url || r.traceUrl || undefined,
     }));
   }
 

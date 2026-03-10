@@ -2697,6 +2697,7 @@ export async function handleUpdateTestCaseSteps(
         evidence: stepModified ? undefined : (incoming.evidence || prev.evidence),
         compiled: stepModified ? undefined : (incoming.compiled || prev.compiled),
         options: incoming.options || prev.options,
+        expectedOutcome: incoming.expectedOutcome ?? prev.expectedOutcome,
       };
     });
 
@@ -3901,8 +3902,8 @@ export async function handleManageModule(
         if (!name) {
           return { success: false, message: 'Missing required field: name', displayToUser: false };
         }
-        if (!platformKey || !['web_ui', 'api'].includes(platformKey)) {
-          return { success: false, message: 'Missing or invalid platform_key. Must be web_ui or api.', displayToUser: false };
+        if (!platformKey || !['web_ui', 'api', 'mobile'].includes(platformKey)) {
+          return { success: false, message: 'Missing or invalid platform_key. Must be web_ui, api, or mobile.', displayToUser: false };
         }
 
         // Resolve platform_key → platform_id

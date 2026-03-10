@@ -1,4 +1,5 @@
 import analyticsRoutes from '@/api/analytics/analytics.route';
+import dashboardRoutes from '@/api/dashboard/dashboard.route';
 import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import authRoutes from '@/api/auth/auth.route';
@@ -21,6 +22,7 @@ import notificationsRoutes from '@/api/notifications/notifications.routes';
 import platformsRoutes from '@/api/platforms/platforms.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
 import previewRoutes from '@/api/preview/preview.route';
+import mobileRoutes from '@/api/mobile/mobile.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionPlansRoutes from '@/api/regression-plans/plans.route';
 import regressionRoutes from '@/api/regression/regression.route';
@@ -1255,7 +1257,9 @@ app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // User issue reports
 
 // API routes — require approved account status (requireAuth sets req.user, requireApproved checks status)
 app.use(`/api/${env.API_VERSION}/analytics`, requireAuth, requireApproved, analyticsRoutes);
+app.use(`/api/${env.API_VERSION}/dashboard`, requireAuth, requireApproved, dashboardRoutes);
 app.use(`/api/${env.API_VERSION}/projects`, requireAuth, requireApproved, projectRoutes);
+app.use(`/api/${env.API_VERSION}/mobile`, requireAuth, requireApproved, mobileRoutes);
 app.use(`/api/${env.API_VERSION}/manual-test`, requireAuth, requireApproved, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/intelligent-test`, requireAuth, requireApproved, intelligentTestRoutes);
 app.use(`/api/${env.API_VERSION}/test-case`, requireAuth, requireApproved, testCaseRoutes);

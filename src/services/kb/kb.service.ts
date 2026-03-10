@@ -321,7 +321,7 @@ export async function detectLanguage(message: string): Promise<'en' | 'ru' | 'ne
 }
 
 /**
- * AI-powered language detection using GPT-3.5-turbo
+ * AI-powered language detection
  * @param message - Message to detect language for
  * @returns Detected language
  */

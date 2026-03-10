@@ -5,12 +5,10 @@ import { Page } from 'playwright';
 
 /**
  * AI-powered helper functions
- * Uses GPT-3.5-turbo for cost-effective simple tasks
  */
 
 /**
  * Detect login page using AI (fallback to hardcode)
- * Uses GPT-3.5-turbo for cost efficiency
  */
 export async function detectLoginPage(
   baseUrl: string,
@@ -111,7 +109,6 @@ Response:`;
 /**
  * Validate selector using AI
  * Checks if selector is optimal and suggests improvements
- * Uses GPT-3.5-turbo
  */
 export async function validateSelector(
   selector: string,
@@ -196,7 +193,6 @@ Return JSON:
 
 /**
  * Parse natural language answers to structured format
- * Uses GPT-3.5-turbo for cost efficiency
  */
 export async function parseNaturalAnswers(
   userMessage: string,
@@ -285,7 +281,6 @@ Extracted answers (JSON only):`;
 
 /**
  * Smart navigation - AI helps find target page
- * Uses GPT-3.5-turbo
  */
 export async function smartNavigate(
   page: Page,
@@ -380,7 +375,7 @@ Which option should we click? Return ONLY the number (1-${navOptions.length}) or
 // const URL_EXTRACTION_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
 /**
- * Extract URL and HTTP method from chat messages using GPT-3.5-turbo
+ * Extract URL and HTTP method from chat messages
  * This is a GLOBAL utility that can be used anywhere in the codebase
  *
  * @param messages - Array of chat messages (only user messages recommended)

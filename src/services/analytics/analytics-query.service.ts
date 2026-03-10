@@ -6,6 +6,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { AIUsageQueryService } from '@/services/ai/tracking/ai-usage-query.service';
+import { cache } from '@/utils/core/redis-cache';
 import type {
   AnalyticsFilters,
   SummaryData,
@@ -24,6 +25,9 @@ import type {
   TimeSeriesPoint,
   TimeSeriesInterval,
 } from './analytics.types';
+
+// Analytics results change at most once per regression run, so 2 minutes is plenty.
+const ANALYTICS_CACHE_TTL = 120; // seconds
 
 /**
  * Analytics Query Service
@@ -219,6 +223,11 @@ export class AnalyticsQueryService {
    * Get summary data (top cards + status + performance)
    */
   static async getSummary(filters: AnalyticsFilters): Promise<SummaryData> {
+    // Cache key includes all filter dimensions so different date ranges don't collide
+    const cKey = `qait:cache:analytics:summary:${filters.workspaceId}:${filters.projectId ?? '*'}:${filters.startDate?.toISOString() ?? '*'}:${filters.endDate?.toISOString() ?? '*'}`;
+    const cached = await cache.get<SummaryData>(cKey);
+    if (cached) return cached;
+
     try {
       const projectIds = await this.getWorkspaceProjectIds(filters.workspaceId, filters.projectId);
 
@@ -243,7 +252,7 @@ export class AnalyticsQueryService {
           .from('regression_runs')
           .select('id, status, started_at, completed_at')
           .in('project_id', projectIds)
-          .gte('started_at', filters.startDate?.toISOString() || '2020-01-01')
+          .gte('started_at', filters.startDate?.toISOString() || '2020-01-01T00:00:00.000Z')
           .lte('started_at', filters.endDate?.toISOString() || new Date().toISOString())
           .order('completed_at', { ascending: false }),
 
@@ -340,7 +349,7 @@ export class AnalyticsQueryService {
           : 0;
       }
 
-      return {
+      const result: SummaryData = {
         summary: {
           testStepsRun,
           totalRuns,
@@ -370,6 +379,13 @@ export class AnalyticsQueryService {
           runsPerMinute,
         },
       };
+
+      // Cache the result — fire-and-forget (don't block the response)
+      cache.set(cKey, result, ANALYTICS_CACHE_TTL).catch((err) =>
+        logger.warn('[ANALYTICS] Failed to cache summary', { err })
+      );
+
+      return result;
     } catch (error) {
       logger.error('[ANALYTICS] Failed to get summary', { error, filters });
       throw error;
@@ -434,6 +450,11 @@ export class AnalyticsQueryService {
    * Get results overview (donut chart data)
    */
   static async getResultsOverview(filters: AnalyticsFilters): Promise<ResultsOverview> {
+    // Cache key includes all filter dimensions
+    const cKey = `qait:cache:analytics:results-overview:${filters.workspaceId}:${filters.projectId ?? '*'}:${filters.startDate?.toISOString() ?? '*'}:${filters.endDate?.toISOString() ?? '*'}`;
+    const cached = await cache.get<ResultsOverview>(cKey);
+    if (cached) return cached;
+
     try {
       const projectIds = await this.getWorkspaceProjectIds(filters.workspaceId, filters.projectId);
 
@@ -474,10 +495,17 @@ export class AnalyticsQueryService {
       const apiPassed = apiTestExecs.filter((e: any) => e.success === true).length;
       const apiFailed = apiTestExecs.filter((e: any) => e.success === false).length;
 
-      return {
+      const result: ResultsOverview = {
         passed, failed, skipped, flaky, total, percentages,
         apiTests: apiTotal > 0 ? { total: apiTotal, passed: apiPassed, failed: apiFailed } : undefined,
       };
+
+      // Cache the result — fire-and-forget
+      cache.set(cKey, result, ANALYTICS_CACHE_TTL).catch((err) =>
+        logger.warn('[ANALYTICS] Failed to cache results overview', { err })
+      );
+
+      return result;
     } catch (error) {
       logger.error('[ANALYTICS] Failed to get results overview', { error, filters });
       throw error;

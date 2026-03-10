@@ -13,28 +13,17 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { DomAnalysisExtractorService } from './dom-analysis-extractor.service';
 import type { InteractiveNode, PreviewSession } from './preview.types';
 import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
+import { PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 
-// Configuration (balanced limits to avoid OOM)
-const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // Check every minute
-const SNAPSHOT_THROTTLE_MS = 500; // Min time between snapshot emissions
-const MAX_SESSIONS = 20; // Safety limit (balanced: ~2-4GB RAM max)
-
-// Screenshot configuration
-const SCREENSHOT_CONFIG = {
-  quality: 60,           // JPEG quality (0-100)
-  maxSizeBytes: 900_000, // Skip if larger than 900KB
-  throttleMs: 500,       // Min time between screenshot emissions per session
-};
-
-// Input throttling (anti-flood)
-// IMPORTANT:
-// - Mouse/wheel events are high-volume and expensive (affect page + snapshots)
-// - Keyboard typing should feel responsive, so it gets a much smaller throttle window
-const MOUSE_INPUT_THROTTLE_MS = 50; // ~20 mouse events/sec max
-const WHEEL_INPUT_THROTTLE_MS = 50; // ~20 wheel events/sec max
-const KEYBOARD_TYPE_THROTTLE_MS = 10; // ~100 type events/sec max (frontend may still debounce)
-const KEYBOARD_PRESS_THROTTLE_MS = 20; // ~50 press events/sec max
+const SESSION_TTL_MS = PREVIEW_SESSION_CONFIG.sessionTtlMs;
+const SESSION_CLEANUP_INTERVAL_MS = PREVIEW_SESSION_CONFIG.sessionCleanupIntervalMs;
+const SNAPSHOT_THROTTLE_MS = PREVIEW_SESSION_CONFIG.snapshotThrottleMs;
+const MAX_SESSIONS = PREVIEW_SESSION_CONFIG.maxSessions;
+const SCREENSHOT_CONFIG = PREVIEW_SESSION_CONFIG.screenshot;
+const MOUSE_INPUT_THROTTLE_MS = PREVIEW_SESSION_CONFIG.inputThrottle.mouseMs;
+const WHEEL_INPUT_THROTTLE_MS = PREVIEW_SESSION_CONFIG.inputThrottle.wheelMs;
+const KEYBOARD_TYPE_THROTTLE_MS = PREVIEW_SESSION_CONFIG.inputThrottle.keyboardTypeMs;
+const KEYBOARD_PRESS_THROTTLE_MS = PREVIEW_SESSION_CONFIG.inputThrottle.keyboardPressMs;
 
 /**
  * Sanitize Playwright close errors.
@@ -301,7 +290,7 @@ export class PreviewSessionService {
         });
 
         context = await browser.newContext({
-          viewport: { width: 1280, height: 720 },
+          viewport: PREVIEW_SESSION_CONFIG.viewport,
           userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         });
 
@@ -461,7 +450,7 @@ export class PreviewSessionService {
       // 2) Swap session references.
       // 3) Close old resources after swap.
       newContext = await browser.newContext({
-        viewport: { width: 1280, height: 720 },
+        viewport: PREVIEW_SESSION_CONFIG.viewport,
         userAgent:
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       });
@@ -684,6 +673,16 @@ export class PreviewSessionService {
     try {
       logger.info('[PREVIEW_SESSION] Stopping session', { sessionId });
 
+      // Safety-net: close and upload editor trace (idempotent — no-op if already closed)
+      try {
+        const { EditorTraceService } = await import('./editor-trace.service');
+        const meta = await EditorTraceService.close(sessionId);
+        if (meta) {
+          const { uploadEditorTrace } = await import('./editor-trace-upload');
+          uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId: sessionId, traceType: 'editor' }).catch(() => {});
+        }
+      } catch { /* non-fatal */ }
+
       // Safe cleanup of browser resources
       await this.safeCloseBrowserResources(session.browser, session.context, session.page);
 
@@ -709,6 +708,16 @@ export class PreviewSessionService {
     }
 
     logger.info('[PREVIEW_SESSION] Stopping session (internal)', { sessionId, userId: session.userId });
+
+    // Safety-net: close and upload editor trace (idempotent — no-op if already closed)
+    try {
+      const { EditorTraceService } = await import('./editor-trace.service');
+      const meta = await EditorTraceService.close(sessionId);
+      if (meta) {
+        const { uploadEditorTrace } = await import('./editor-trace-upload');
+        uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId: sessionId, traceType: 'editor' }).catch(() => {});
+      }
+    } catch { /* non-fatal */ }
 
     try {
       // Safe cleanup of browser resources
@@ -813,7 +822,7 @@ export class PreviewSessionService {
 
     const viewport = session.page.viewportSize();
     if (!viewport) {
-      return { width: 1280, height: 720, devicePixelRatio: 1 };
+      return { width: PREVIEW_SESSION_CONFIG.viewport.width, height: PREVIEW_SESSION_CONFIG.viewport.height, devicePixelRatio: 1 };
     }
 
     return {
