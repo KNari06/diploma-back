@@ -7,7 +7,7 @@ import type { IntentPlaywrightCommand } from '@/services/testing/ui/preview/inte
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
-import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
+import { COMMAND_EXECUTOR_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Frame, Locator, Page } from 'playwright';
@@ -24,6 +24,87 @@ import {
   matchSubstring,
   parseRegexString,
 } from './url-pattern-matcher';
+
+/**
+ * Adaptive post-hover settle: waits for hover-triggered DOM effects (tooltips, menus, popovers)
+ * to appear and stabilize, instead of using a fixed timeout.
+ *
+ * Phase 1: Quick-poll for known hover-effect selectors (ARIA roles + popular component libraries).
+ * Phase 2: MutationObserver-based idle detection — waits until DOM stops mutating for `stableMs`.
+ * Safety cap: never waits longer than `maxWaitMs` total.
+ */
+async function waitForHoverEffect(
+  page: Page,
+  maxWaitMs = 2000,
+  stableMs = 150,
+): Promise<number> {
+  const start = Date.now();
+
+  const hoverEffectSelector = [
+    '[role="tooltip"]:visible',
+    '[role="menu"]:visible',
+    '[role="listbox"]:visible',
+    '[role="dialog"]:visible',
+    '[data-radix-popper-content-wrapper]:visible',
+    '[class*="tooltip"]:visible',
+    '[class*="popover"]:visible',
+    '[class*="dropdown"]:visible',
+    '.tippy-box:visible',
+    '.MuiTooltip-tooltip:visible',
+    '.MuiMenu-list:visible',
+    '.ant-tooltip:visible',
+    '.ant-dropdown:visible',
+  ].join(', ');
+
+  // Phase 1: Quick check — did hover produce any visible effect?
+  const minWaitMs = STEP_READINESS_CONFIG.domStableThresholdMs.assertion; // 150ms
+  try {
+    await Promise.race([
+      page.waitForSelector(hoverEffectSelector, { state: 'visible', timeout: maxWaitMs }),
+      page.waitForTimeout(minWaitMs),
+    ]);
+  } catch {
+    return Date.now() - start;
+  }
+
+  // Phase 2: MutationObserver-based idle detection
+  const remainingMs = maxWaitMs - (Date.now() - start);
+  if (remainingMs > stableMs) {
+    try {
+      await page.evaluate(
+        ({ stableMs: stMs, timeoutMs }) => new Promise<void>((resolve) => {
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          const reset = () => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(() => {
+              observer.disconnect();
+              resolve();
+            }, stMs);
+          };
+          const MO = (globalThis as any).MutationObserver;
+          const observer = new MO(() => reset());
+          observer.observe((globalThis as any).document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class', 'style', 'aria-hidden', 'hidden', 'data-state'],
+          });
+          setTimeout(() => {
+            observer.disconnect();
+            if (timer) clearTimeout(timer);
+            resolve();
+          }, timeoutMs);
+          reset();
+        }),
+        { stableMs, timeoutMs: Math.min(remainingMs, maxWaitMs) },
+      );
+    } catch {
+      // page.evaluate can fail if page navigated
+    }
+  }
+
+  return Date.now() - start;
+}
 
 /**
  * V11: Accumulated state shared across retry attempts within a single step.
@@ -717,6 +798,8 @@ export class CommandExecutor {
               intentCommand, 'hover', timeout || 30000
             );
             await performHover(intentHoverLocator);
+            // Adaptive post-hover settle — wait for tooltips/submenus to appear and stabilize
+            await waitForHoverEffect(this.page);
             break;
           }
 
@@ -746,6 +829,8 @@ export class CommandExecutor {
               { selector, intent: description || 'hover element', action: 'hover', timeout }
             );
           }
+          // Adaptive post-hover settle — wait for tooltips/submenus to appear and stabilize
+          await waitForHoverEffect(this.page);
           break;
         }
 

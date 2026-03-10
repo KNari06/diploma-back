@@ -510,6 +510,99 @@ async function ensureStability(
 }
 
 /**
+ * Adaptive post-hover settle: waits for DOM to stabilize after hover triggers
+ * tooltips, submenus, or popovers. Instead of a fixed 150ms, we observe the DOM
+ * for new elements appearing and wait until mutations stop.
+ *
+ * Strategy:
+ * 1. Snapshot current DOM element count
+ * 2. Poll for new visible elements (tooltip, menu, popover patterns)
+ * 3. Once detected OR minWaitMs passed — wait for mutations to stop (stableMs gap)
+ * 4. Safety cap at maxWaitMs to avoid hanging on non-reactive hovers
+ *
+ * @returns elapsed time in ms
+ */
+async function waitForHoverEffect(
+  page: Page,
+  maxWaitMs = 2000,
+  stableMs = 150,
+): Promise<number> {
+  const start = Date.now();
+
+  // Selectors for elements commonly created by hover (tooltips, menus, popovers)
+  const hoverEffectSelector = [
+    '[role="tooltip"]:visible',
+    '[role="menu"]:visible',
+    '[role="listbox"]:visible',
+    '[role="dialog"]:visible',
+    '[data-radix-popper-content-wrapper]:visible',
+    '[class*="tooltip"]:visible',
+    '[class*="popover"]:visible',
+    '[class*="dropdown"]:visible',
+    '.tippy-box:visible',
+    '.MuiTooltip-tooltip:visible',
+    '.MuiMenu-list:visible',
+    '.ant-tooltip:visible',
+    '.ant-dropdown:visible',
+  ].join(', ');
+
+  // Phase 1: Quick check — did hover produce any visible effect?
+  // Race between effect appearing and a minimum wait (avoids 0ms exit on static hovers)
+  const minWaitMs = STEP_READINESS_CONFIG.domStableThresholdMs.assertion; // 150ms
+  try {
+    await Promise.race([
+      page.waitForSelector(hoverEffectSelector, { state: 'visible', timeout: maxWaitMs }),
+      page.waitForTimeout(minWaitMs),
+    ]);
+  } catch {
+    // No effect found within maxWaitMs — hover probably doesn't trigger visible DOM changes
+    return Date.now() - start;
+  }
+
+  // Phase 2: Wait for the effect to stabilize (animation to finish).
+  // Use MutationObserver-based idle detection: wait until no new DOM mutations
+  // occur for stableMs. This catches CSS transitions that add/remove classes.
+  const remainingMs = maxWaitMs - (Date.now() - start);
+  if (remainingMs > stableMs) {
+    try {
+      await page.evaluate(
+        ({ stableMs: stMs, timeoutMs }) => new Promise<void>((resolve) => {
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          const reset = () => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(() => {
+              observer.disconnect();
+              resolve();
+            }, stMs);
+          };
+          const MO = (globalThis as any).MutationObserver;
+          const observer = new MO(() => reset());
+          observer.observe((globalThis as any).document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class', 'style', 'aria-hidden', 'hidden', 'data-state'],
+          });
+          // Safety cap
+          setTimeout(() => {
+            observer.disconnect();
+            if (timer) clearTimeout(timer);
+            resolve();
+          }, timeoutMs);
+          // Start the idle timer immediately
+          reset();
+        }),
+        { stableMs, timeoutMs: Math.min(remainingMs, maxWaitMs) },
+      );
+    } catch {
+      // page.evaluate can fail if page navigated — fall through
+    }
+  }
+
+  return Date.now() - start;
+}
+
+/**
  * V10 Fix #7: Detect how long a dropdown animation takes to complete.
  * Polls for new visible ARIA containers (listbox/menu) or role=option elements.
  * Returns elapsed time + a safety margin so we know how long to wait in each phase.
@@ -779,8 +872,9 @@ async function executeAction(
           // Retry with force:true if blocked by an overlay (another tooltip, sticky header, etc.)
           await locator.hover({ timeout, force: true });
         }
-        // Post-hover settle — let tooltips/submenus animate in before next step runs
-        await sleepMs(page, STEP_READINESS_CONFIG.domStableThresholdMs.assertion);
+        // Adaptive post-hover settle — waits for hover-triggered DOM changes to stabilize
+        // (tooltips, submenus, popovers) instead of a fixed delay
+        await waitForHoverEffect(page);
         break;
       }
 
