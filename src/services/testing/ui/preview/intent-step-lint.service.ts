@@ -80,8 +80,8 @@ const ACTION_TO_ELEMENT_TYPES: Record<string, string[]> = {
   ai_check: [],
   // V5: URL wait
   wait_for: [],
-  // V6: File upload
-  upload: ['input'],
+  // V6: File upload — includes trigger elements (button/label/div) since real file input is often hidden
+  upload: ['input', 'button', 'label', 'div', 'span'],
   // V10: Advanced interaction types
   dblclick: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'summary'],
   contextmenu: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg'],
@@ -1397,12 +1397,16 @@ export function isEvidenceShortcutNodeCompatible(
     }
 
     case 'upload': {
-      // Upload requires input[type=file]
+      // Upload works with either a real file input OR a trigger element (button/label/div)
+      // that opens the file dialog. The executor handles the fallback to fileChooser.
       const isFileInput = tag === 'input' && inputType === 'file';
-      if (!isFileInput) {
-        return { ok: false, reason: `upload_action_requires_input_file (got ${tag}/${inputType || 'none'})` };
-      }
-      return { ok: true };
+      if (isFileInput) return { ok: true };
+
+      // Allow common trigger elements — executor will find the hidden file input or use fileChooser
+      const uploadTriggerTags = ['button', 'label', 'div', 'span', 'a'];
+      if (uploadTriggerTags.includes(tag)) return { ok: true };
+
+      return { ok: false, reason: `upload_action_requires_file_input_or_trigger (got ${tag}/${inputType || 'none'})` };
     }
 
     case 'scroll': {

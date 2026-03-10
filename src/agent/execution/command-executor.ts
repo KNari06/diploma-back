@@ -107,6 +107,74 @@ async function waitForHoverEffect(
 }
 
 /**
+ * Dispatch a synthetic file drop event onto a target element.
+ * Last-resort fallback for drag-and-drop-only upload zones without hidden <input type="file">.
+ */
+async function dispatchFileDrop(
+  page: Page,
+  locator: Locator,
+  localFilePath: string,
+  filename: string,
+  contentType?: string,
+): Promise<void> {
+  const fs = await import('fs/promises');
+  const path = await import('path');
+
+  const fileBuffer = await fs.readFile(localFilePath);
+  const base64Data = fileBuffer.toString('base64');
+  const resolvedFilename = filename || path.basename(localFilePath);
+  const resolvedContentType = contentType || 'application/octet-stream';
+
+  await locator.evaluate(
+    (el: any, { base64, fname, ctype }) => {
+      const g = globalThis as any;
+      const binaryStr = g.atob(base64);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+      }
+      const file = new g.File([bytes], fname, { type: ctype });
+      const dt = new g.DataTransfer();
+      dt.items.add(file);
+      const shared = { bubbles: true, cancelable: true, dataTransfer: dt };
+      el.dispatchEvent(new g.DragEvent('dragenter', shared));
+      el.dispatchEvent(new g.DragEvent('dragover', shared));
+      el.dispatchEvent(new g.DragEvent('drop', shared));
+    },
+    { base64: base64Data, fname: resolvedFilename, ctype: resolvedContentType },
+  );
+}
+
+/**
+ * Upload via fileChooser interception with drag-drop fallback.
+ * Tries fileChooser with a short 3s timeout; if it doesn't fire,
+ * falls back to synthetic drop event for drag-only upload zones.
+ */
+async function uploadViaFileChooserOrDrop(
+  page: Page,
+  locator: Locator,
+  localFilePath: string,
+  filename: string,
+  contentType?: string,
+  timeout = 10_000,
+): Promise<void> {
+  const FILECHOOSER_QUICK_TIMEOUT = 3_000;
+
+  try {
+    const [fileChooser] = await Promise.all([
+      page.waitForEvent('filechooser', { timeout: FILECHOOSER_QUICK_TIMEOUT }),
+      locator.click({ timeout: FILECHOOSER_QUICK_TIMEOUT }),
+    ]);
+    await fileChooser.setFiles(localFilePath);
+  } catch {
+    logger.info('[COMMAND_EXECUTOR] FileChooser not triggered, falling back to synthetic drop', {
+      filename,
+    });
+    await dispatchFileDrop(page, locator, localFilePath, filename, contentType);
+  }
+}
+
+/**
  * V11: Accumulated state shared across retry attempts within a single step.
  * Enables graduated retry strategy: later retries skip stages that failed deterministically.
  */
@@ -1923,10 +1991,77 @@ export class CommandExecutor {
             });
 
             // Step 2: Resolve the file input locator and upload
-            const performUpload = async (locator: Locator) => {
-              // File inputs are often hidden; wait for attached instead of visible
-              await locator.waitFor({ state: 'attached', timeout: timeout || 10000 });
-              await locator.setInputFiles(localFilePath, { timeout: timeout || 30000 });
+            // Supports both <input type="file"> and trigger-button patterns.
+            const uploadToLocator = async (loc: Locator) => {
+              const tagName = await loc.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => '');
+              const elType = await loc.evaluate((el: any) => el.type?.toLowerCase()).catch(() => '');
+              const isFileInput = tagName === 'input' && elType === 'file';
+
+              if (isFileInput) {
+                await loc.waitFor({ state: 'attached', timeout: timeout || 10000 });
+                await loc.setInputFiles(localFilePath, { timeout: timeout || 30000 });
+                return;
+              }
+
+              // Trigger-button pattern: find nearby hidden file input or use fileChooser
+              // Searches children, open shadow DOM, parent containers (3 levels), label[for]
+              const nearbyFileInput = await loc.evaluate((el: any) => {
+                const findFileInput = (root: any): boolean => {
+                  if (!root) return false;
+                  if (root.querySelector?.('input[type="file"]')) return true;
+                  const children = root.querySelectorAll?.('*') || [];
+                  for (const child of children) {
+                    if (child.shadowRoot?.querySelector('input[type="file"]')) return true;
+                  }
+                  return false;
+                };
+                if (findFileInput(el)) return true;
+                if (el.shadowRoot && findFileInput(el.shadowRoot)) return true;
+                let parent = el.parentElement;
+                for (let i = 0; i < 3 && parent; i++) {
+                  if (findFileInput(parent)) return true;
+                  parent = parent.parentElement;
+                }
+                if (el.tagName === 'LABEL' && el.htmlFor) {
+                  const target = el.ownerDocument.getElementById(el.htmlFor);
+                  if (target?.type === 'file') return true;
+                }
+                return false;
+              }).catch(() => false);
+
+              if (nearbyFileInput) {
+                // Find the hidden file input via Playwright locator (pierces open shadow DOM)
+                const fileInputLoc = await (async () => {
+                  const child = loc.locator('input[type="file"]');
+                  if (await child.count() > 0) return child.first();
+                  for (let i = 1; i <= 3; i++) {
+                    const ancestor = loc.locator(`xpath=${'..'.concat('/..'.repeat(i - 1))}`);
+                    const inp = ancestor.locator('input[type="file"]');
+                    if (await inp.count() > 0) return inp.first();
+                  }
+                  // No page-level fallback — too risky with multiple file inputs
+                  return null;
+                })();
+
+                if (fileInputLoc) {
+                  await fileInputLoc.waitFor({ state: 'attached', timeout: timeout || 10000 });
+                  await fileInputLoc.setInputFiles(localFilePath, { timeout: timeout || 30000 });
+                } else {
+                  // Nearby input found in evaluate but not reachable via locator
+                  await uploadViaFileChooserOrDrop(
+                    this.page, loc, localFilePath,
+                    downloadResult?.filename || '', downloadResult?.contentType,
+                    timeout || 30000,
+                  );
+                }
+              } else {
+                // No hidden file input found — fileChooser interception + drag-drop fallback
+                await uploadViaFileChooserOrDrop(
+                  this.page, loc, localFilePath,
+                  downloadResult?.filename || '', downloadResult?.contentType,
+                  timeout || 30000,
+                );
+              }
             };
 
             // Intent-based locator resolution
@@ -1936,7 +2071,7 @@ export class CommandExecutor {
                 'upload',
                 timeout || 30000
               );
-              await performUpload(intentLocator);
+              await uploadToLocator(intentLocator);
             } else {
               // Standard selector-based flow
               if (!selector) throw new Error('Selector is required for upload action');
@@ -1949,7 +2084,7 @@ export class CommandExecutor {
               );
 
               try {
-                await performUpload(uploadSmartResult.locator);
+                await uploadToLocator(uploadSmartResult.locator);
               } catch (uploadError) {
                 logger.warn('[COMMAND_EXECUTOR] Smart locator upload failed, trying self-healing', {
                   selector: selector.substring(0, 50),
@@ -1958,9 +2093,8 @@ export class CommandExecutor {
 
                 await this.executeWithSelfHealing(
                   async () => {
-                    const locator = getLocator(this.page, selector);
-                    await locator.waitFor({ state: 'attached', timeout: timeout || 30000 });
-                    await locator.setInputFiles(localFilePath, { timeout: timeout || 30000 });
+                    const loc = getLocator(this.page, selector);
+                    await uploadToLocator(loc);
                   },
                   {
                     selector,
@@ -3716,7 +3850,17 @@ export class CommandExecutor {
       case 'upload':
         // Upload in self-healing context: value holds the local file path
         if (value) {
-          await locator.setInputFiles(String(value), { timeout: defaultTimeout });
+          const filePath = String(value);
+          const elTag = await locator.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => '');
+          const elInputType = await locator.evaluate((el: any) => el.type?.toLowerCase()).catch(() => '');
+          if (elTag === 'input' && elInputType === 'file') {
+            await locator.setInputFiles(filePath, { timeout: defaultTimeout });
+          } else {
+            // Trigger-button: fileChooser → synthetic drop fallback
+            await uploadViaFileChooserOrDrop(
+              this.page, locator, filePath, '', undefined, defaultTimeout,
+            );
+          }
         } else {
           logger.warn('[COMMAND_EXECUTOR] Upload action in self-healing has no file path', { actionType });
         }

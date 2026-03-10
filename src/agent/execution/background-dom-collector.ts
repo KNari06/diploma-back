@@ -140,6 +140,57 @@ function buildExtractScript(maxNodes: number): string {
     }
   }
 
+  // ── Active modal/popup detection (mirrors snapshot-collector.ts) ──
+  // Find the topmost dialog/alertdialog/popup element to determine which elements
+  // are inside the active overlay layer. This enables page-state-aware LLM resolution.
+  var activeModalElement = null;
+  (function detectActiveModal() {
+    // 1. HTML <dialog open>
+    var openDialogs = document.querySelectorAll('dialog[open]');
+    if (openDialogs.length > 0) {
+      activeModalElement = openDialogs[openDialogs.length - 1]; // Last = topmost
+      return;
+    }
+    // 2. ARIA role="dialog" or role="alertdialog" that is visible
+    var ariaDialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
+    for (var d = ariaDialogs.length - 1; d >= 0; d--) {
+      var dlg = ariaDialogs[d];
+      if (dlg.offsetWidth > 0 || dlg.offsetHeight > 0) {
+        activeModalElement = dlg;
+        return;
+      }
+    }
+    // 3. High z-index positioned elements that cover significant viewport area
+    // (catches custom modals without role="dialog")
+    // Optimization: only scan direct children of body + up to 2 levels deep
+    // to avoid getComputedStyle on every element (layout thrashing on large pages)
+    var vpWidth = window.innerWidth;
+    var vpHeight = window.innerHeight;
+    var vpArea = vpWidth * vpHeight;
+    var bestCandidate = null;
+    var bestZIndex = 0;
+    var modalCandidates = document.querySelectorAll(
+      'body > *, body > * > *, [class*="modal"], [class*="overlay"], [class*="dialog"], [class*="popup"], [class*="drawer"]'
+    );
+    for (var m = 0; m < modalCandidates.length; m++) {
+      var mel = modalCandidates[m];
+      var mStyle = window.getComputedStyle(mel);
+      if (mStyle.position !== 'fixed' && mStyle.position !== 'absolute') continue;
+      var mz = parseInt(mStyle.zIndex, 10);
+      if (isNaN(mz) || mz < 100) continue; // Skip low z-index
+      var mRect = mel.getBoundingClientRect();
+      var mArea = mRect.width * mRect.height;
+      // Must cover at least 30% of viewport
+      if (mArea / vpArea >= 0.3 && mz > bestZIndex) {
+        bestCandidate = mel;
+        bestZIndex = mz;
+      }
+    }
+    if (bestCandidate) {
+      activeModalElement = bestCandidate;
+    }
+  })();
+
   const results = [];
 
   // Generate unique ref for each element
@@ -246,6 +297,58 @@ function buildExtractScript(maxNodes: number): string {
       depth++;
     }
 
+    // ── Modal layer detection ──
+    const isInsideActiveModal = activeModalElement ? activeModalElement.contains(el) : false;
+
+    // ── Icon-button detection (SVG/img child, no visible text) ──
+    let isIconButton = false;
+    if (el.tagName === 'BUTTON' || (el.getAttribute('role') || '') === 'button') {
+      const textLen = (el.textContent || '').trim().length;
+      const hasSvgOrImg = !!(el.querySelector('svg') || el.querySelector('img'));
+      if (textLen <= 2 && hasSvgOrImg) {
+        isIconButton = true;
+      }
+    }
+
+    // ── Title attribute (tooltip text — useful for icon-only buttons) ──
+    const title = el.getAttribute('title') || undefined;
+
+    // ── Nearest semantic container (form/dialog/section) ──
+    // Note: parentRefChain is NOT collected here because parent containers
+    // are typically non-interactive (div, section, form) and don't get
+    // data-agent-ref assigned in this same pass. containerRef uses the
+    // parent's existing ref if available, otherwise skips (the container
+    // context is already captured in containerTitles above).
+    let containerRef = undefined;
+    {
+      let pEl = el.parentElement;
+      let pDepth = 0;
+      while (pEl && pDepth < MAX_PARENT_CHAIN) {
+        const pTag = pEl.tagName;
+        const pRole = (pEl.getAttribute('role') || '').toLowerCase();
+        if (pTag === 'FORM' || pTag === 'DIALOG' || pTag === 'SECTION' ||
+            pTag === 'FIELDSET' || pTag === 'NAV' || pTag === 'ASIDE' ||
+            pRole === 'dialog' || pRole === 'form' || pRole === 'region') {
+          // Use existing ref if the container was already processed, otherwise use id
+          const pRef = pEl.getAttribute('${TEMP_REF_ATTR}') || pEl.getAttribute('id');
+          if (pRef) {
+            containerRef = pRef;
+            break;
+          }
+        }
+        pEl = pEl.parentElement;
+        pDepth++;
+      }
+    }
+
+    // ── Dynamic ID detection ──
+    const elId = el.getAttribute('id') || '';
+    const isDynamicId = elId.length > 0 && (
+      /[0-9a-f]{8,}/i.test(elId) || // UUID-like
+      /^[a-z]+[-_][a-z0-9]{6,}/i.test(elId) || // prefix-randomstring
+      /:r[0-9]+:/.test(elId) // React :r0:, :r1: etc.
+    );
+
     // Build node data
     const node = {
       ref,
@@ -256,9 +359,12 @@ function buildExtractScript(maxNodes: number): string {
       text: el.textContent?.trim().substring(0, MAX_TEXT_LENGTH) || undefined,
       labelText: labelText.substring(0, MAX_TEXT_LENGTH) || undefined,
       ariaLabel: el.getAttribute('aria-label') || undefined,
+      title,
+      isIconButton: isIconButton || undefined,
       name: el.getAttribute('name') || undefined,
       placeholder: el.getAttribute('placeholder') || undefined,
       id: el.getAttribute('id') || undefined,
+      isDynamicId: isDynamicId || undefined,
       testIdAttr: el.getAttribute('data-testid') || el.getAttribute('data-test') || undefined,
       autocomplete: el.getAttribute('autocomplete') || undefined,
       boundingBox,
@@ -266,6 +372,7 @@ function buildExtractScript(maxNodes: number): string {
       isInteractive: true,
       isDisabled,
       isTopMostAtCenter,
+      isInsideActiveModal: isInsideActiveModal || undefined,
 
       // ARIA state
       // ✅ FIX: Use el.checked (runtime property) instead of hasAttribute('checked') (HTML default)
@@ -274,6 +381,7 @@ function buildExtractScript(maxNodes: number): string {
       ariaExpanded: (el.getAttribute('aria-expanded') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-expanded') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
       ariaPressed: (el.getAttribute('aria-pressed') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-pressed') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
       ariaSelected: (el.getAttribute('aria-selected') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-selected') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
+      ariaChecked: (el.getAttribute('aria-checked') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-checked') || '').replace(/["']/g, '').trim() === 'mixed' ? 'mixed' : ((el.getAttribute('aria-checked') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined)),
 
       // Validation state
       required: el.hasAttribute('required') || (el.getAttribute('aria-required') || '').replace(/["']/g, '').trim() === 'true',
@@ -281,6 +389,8 @@ function buildExtractScript(maxNodes: number): string {
       invalid: (el.getAttribute('aria-invalid') || '').replace(/["']/g, '').trim() === 'true' || el.matches(':invalid'),
       hasValue: !!(el.value && el.value.length > 0),
 
+      // Hierarchy
+      containerRef,
       // Container info (Phase 7: expanded detection)
       containerTitles: containerTitles.filter(Boolean).slice(0, 5),
       nearestLandmark: nearestLandmark || undefined,
